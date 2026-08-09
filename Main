@@ -1,1 +1,65 @@
+local RunService = game:GetService("RunService")
 
+local REPO_RAW_BASE = 'https://raw.githubusercontent.com/iamdookie1/Rblx2/main/'
+local WATCH_DURATION = 5
+
+-- Maps a PlaceId to the game-specific script hosted in this repo's Games/ folder.
+local Games = {
+    [9391468976] = { Name = 'Jujutsu Shenanigans', Script = 'Games/Jjs' },
+}
+
+local Centrl = loadstring(game:HttpGet('https://raw.githubusercontent.com/iamdookie1/Ui/main/Lib2.lua'))()
+
+local Window = Centrl:Window({
+    Title = 'hub',
+    SubTitle = 'game loader',
+    Folder = 'Hub',
+    ToggleKey = Enum.KeyCode.RightShift,
+    Accent = Color3.fromRGB(60, 140, 255),
+})
+
+local MainTab = Window:Tab({ Title = 'load', Icon = 'gamepad-2' })
+
+local Status = MainTab:Section({ Title = 'status', Side = 'left' })
+local Load = MainTab:Section({ Title = 'load', Side = 'right' })
+
+local StatusLabel = Status:Label({ Title = 'Watching for supported game...' })
+
+local MatchedGame = nil
+
+local LoadButton = Load:Button({
+    Title = 'load game',
+    Callback = function()
+        if not MatchedGame then return end
+        local scriptUrl = REPO_RAW_BASE .. MatchedGame.Script
+        local loader = loadstring(game:HttpGet(scriptUrl))
+        Centrl:Unload()
+        loader()
+    end,
+})
+
+Window:Load()
+
+-- Watch for a supported game for up to WATCH_DURATION seconds after load, then stop.
+task.spawn(function()
+    local start = os.clock()
+    while os.clock() - start < WATCH_DURATION do
+        local match = Games[game.PlaceId]
+        if match then
+            MatchedGame = match
+            StatusLabel:Set('Detected: ' .. match.Name)
+            Centrl:Notify({
+                Title = 'hub',
+                Content = match.Name .. ' detected. Press "load game" to run it.',
+                Type = 'success',
+                Duration = 5,
+            })
+            return
+        end
+        RunService.Heartbeat:Wait()
+    end
+
+    if not MatchedGame then
+        StatusLabel:Set('No supported game detected')
+    end
+end)
