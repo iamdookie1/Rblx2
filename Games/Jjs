@@ -1,0 +1,184 @@
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local LocalPlayer = Players.LocalPlayer
+
+local Config = {
+    Enabled = false,
+    Chance = 100,
+}
+
+local BLACKFLASH_DELAY = 0.212
+local VARIANT4_DELAY = 0.4
+
+local Services = ReplicatedStorage.Knit.Knit.Services
+local Activated = Services.DivergentFistService.RE.Activated
+local RightActivated = Services.ItadoriService.RE.RightActivated
+
+local AnimVariants = ReplicatedStorage.Animations.Itadori.Variants
+
+local DIVERGENT_IDS = {
+    [AnimVariants.DivergentFist1.AnimationId] = 1,
+    [AnimVariants.DivergentFist2.AnimationId] = 2,
+    [AnimVariants.DivergentFist3.AnimationId] = 3,
+    [AnimVariants.DivergentFist4.AnimationId] = 4,
+}
+
+local function getCharFolder()
+    local chars = workspace:FindFirstChild("Characters")
+    if not chars then return nil end
+    return chars:FindFirstChild(LocalPlayer.Name)
+end
+
+local function getDivergentFistArg()
+    local folder = getCharFolder()
+    if not folder then return nil end
+    local moveset = folder:FindFirstChild("Moveset")
+    if not moveset then return nil end
+    return moveset:FindFirstChild("Divergent Fist")
+end
+
+local function hookTrack(track, id)
+    local variant = DIVERGENT_IDS[id]
+    if not variant then return end
+
+    if variant == 4 then
+        task.delay(VARIANT4_DELAY, function()
+            if not Config.Enabled then return end
+            if not track.IsPlaying then return end
+            RightActivated:FireServer()
+        end)
+        return
+    end
+
+    local shouldFire = math.random(1, 100) <= Config.Chance
+    if not shouldFire then return end
+
+    task.delay(BLACKFLASH_DELAY, function()
+        if not Config.Enabled then return end
+        if not track.IsPlaying then return end
+        local arg = getDivergentFistArg()
+        if arg then
+            Activated:FireServer(arg)
+        end
+    end)
+end
+
+local function connectHumanoid(hum)
+    hum.AnimationPlayed:Connect(function(track)
+        if not Config.Enabled then return end
+        local id = track.Animation and track.Animation.AnimationId
+        if id then
+            hookTrack(track, id)
+        end
+    end)
+end
+
+local function onCharacterAdded(char)
+    local hum = char:FindFirstChildOfClass("Humanoid")
+        or char:WaitForChild("Humanoid", 5)
+    if hum then
+        connectHumanoid(hum)
+    end
+end
+
+local function watchForCharacter()
+    local chars = workspace:FindFirstChild("Characters")
+    if not chars then
+        workspace.ChildAdded:Connect(function(child)
+            if child.Name == "Characters" then
+                local playerFolder = child:WaitForChild(LocalPlayer.Name, 10)
+                if playerFolder then
+                    onCharacterAdded(playerFolder)
+                    playerFolder.ChildAdded:Connect(function(child2)
+                        if child2:IsA("Humanoid") then
+                            connectHumanoid(child2)
+                        end
+                    end)
+                end
+            end
+        end)
+        return
+    end
+
+    local playerFolder = chars:FindFirstChild(LocalPlayer.Name)
+    if playerFolder then
+        onCharacterAdded(playerFolder)
+        playerFolder.ChildAdded:Connect(function(child)
+            if child:IsA("Humanoid") then
+                connectHumanoid(child)
+            end
+        end)
+    else
+        chars.ChildAdded:Connect(function(child)
+            if child.Name == LocalPlayer.Name then
+                onCharacterAdded(child)
+                child.ChildAdded:Connect(function(child2)
+                    if child2:IsA("Humanoid") then
+                        connectHumanoid(child2)
+                    end
+                end)
+            end
+        end)
+    end
+end
+
+watchForCharacter()
+
+LocalPlayer.CharacterAdded:Connect(function()
+    task.wait(1)
+    watchForCharacter()
+end)
+
+local Centrl = loadstring(game:HttpGet('https://raw.githubusercontent.com/iamdookie1/Ui/main/Lib2.lua'))()
+
+local Window = Centrl:Window({
+    Title = 'itadori',
+    SubTitle = 'black flash',
+    Folder = 'AutoBlackFlash',
+    ToggleKey = Enum.KeyCode.RightShift,
+    Accent = Color3.fromRGB(180, 60, 255),
+})
+
+local FlashTab = Window:Tab({ Title = 'black flash', Icon = 'zap' })
+
+local Flash = FlashTab:Section({ Title = 'auto black flash', Side = 'left' })
+
+Flash:Toggle({
+    Title = 'enabled',
+    Flag = 'bf_enabled',
+    Default = false,
+    Callback = function(state) Config.Enabled = state end,
+})
+
+Flash:Slider({
+    Title = 'chance',
+    Flag = 'bf_chance',
+    Min = 0,
+    Max = 100,
+    Increment = 1,
+    Default = 100,
+    Suffix = '%',
+    Callback = function(v) Config.Chance = v end,
+})
+
+local FlashInfo = FlashTab:Section({ Title = 'timing', Side = 'right' })
+
+FlashInfo:Paragraph({
+    Title = 'fists 1-3',
+    Text = 'Black flash fires 0.212s after the animation starts, via DivergentFistService.Activated. Chance applies here only.',
+})
+
+FlashInfo:Paragraph({
+    Title = 'fist 4',
+    Text = 'No black flash. Fires ItadoriService.RightActivated 0.4s after the animation starts, every time.',
+})
+
+Window:Load()
+
+Centrl:Notify({
+    Title = 'itadori',
+    Content = 'Loaded. RightShift toggles the menu.',
+    Type = 'success',
+    Duration = 5,
+})
