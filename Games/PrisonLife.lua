@@ -218,30 +218,46 @@ local function hookedCast(p1, p2, p3)
     return normalCast(p1, p2, p3)
 end
 
-local silentAimHookAvailable = typeof(getgc) == "function" and typeof(hookfunction) == "function"
+local silentAimAPIAvailable = typeof(getgc) == "function" and typeof(hookfunction) == "function"
     and typeof(debug) == "table" and typeof(debug.getinfo) == "function"
 
-if silentAimHookAvailable then
-    -- getgc(true) walks the entire live-object heap - expensive enough that
-    -- running it a fixed 20 times regardless of outcome isn't worth it.
-    -- Different weapon behaviors (hitscan vs shotgun vs taser) can each
-    -- compile their own castRay closure, and some only exist once that
-    -- weapon's module actually gets required (e.g. on first equip), so this
-    -- keeps scanning - just backs off once nothing new has turned up for a
-    -- couple of passes instead of grinding through the full 20 unconditionally.
+-- Whether the real castRay hook has actually landed (not just whether the
+-- API exists) - the camera-lock fallback below checks this, not the API
+-- flag, so a scan that never finds anything still leaves silent aim working
+-- (visually, via the camera) instead of silently doing nothing.
+local castRayHookFound = false
+local hookScanStarted = false
+
+-- getgc(true) - the `true` requests every live TABLE in the game on top of
+-- functions/userdata, which in a running Roblox client is easily hundreds
+-- of thousands of objects. We only ever check type(func) == "function", so
+-- tables were never needed - getgc() alone (functions/userdata only) is the
+-- cheap version and was the actual crash cause, not the retry loop around
+-- it. Also no longer runs unconditionally at script load - it only starts
+-- the first time Silent Aim is actually turned on.
+local function startSilentAimHookScan()
+    if hookScanStarted or not silentAimAPIAvailable then return end
+    hookScanStarted = true
+
     task.spawn(function()
         local hooked = {}
         local quietPasses = 0
+        -- Different weapon behaviors (hitscan vs shotgun vs taser) can each
+        -- compile their own castRay closure, and some only exist once that
+        -- weapon's module actually gets required (e.g. on first equip), so
+        -- this keeps scanning - just backs off once nothing new has turned
+        -- up for a couple of passes instead of grinding through all 20.
         for _ = 1, 20 do
             local foundNew = false
             pcall(function()
-                for _, func in next, getgc(true) do
+                for _, func in next, getgc() do
                     if type(func) == "function" and not hooked[func] then
                         local info = debug.getinfo(func, "nS")
                         if info and info.name == "castRay" then
                             pcall(hookfunction, func, hookedCast)
                             hooked[func] = true
                             foundNew = true
+                            castRayHookFound = true
                         end
                     end
                 end
@@ -259,20 +275,23 @@ if silentAimHookAvailable then
             task.wait(3)
         end
     end)
-else
-    -- Fallback: camera-lock at Camera render priority + 1, so any mouse-aimed
-    -- fire logic reads the redirected orientation without us touching the
-    -- camera module's own stored angles. Unbind first in case the script
-    -- got run more than once this session - BindToRenderStep errors on a
-    -- name that's already bound.
-    pcall(RunService.UnbindFromRenderStep, RunService, "PrisonLifeSilentAimFallback")
-    RunService:BindToRenderStep("PrisonLifeSilentAimFallback", Enum.RenderPriority.Camera.Value + 1, function()
-        if not Config.SilentAim then return end
-        local target = getSilentAimTarget(Camera.CFrame.Position)
-        if not target then return end
-        Camera.CFrame = CFrame.lookAt(Camera.CFrame.Position, target.Position)
-    end)
 end
+
+-- Camera-lock fallback: always registered (cheap - it's a no-op the moment
+-- Silent Aim is off), but only actually moves the camera while the real
+-- castRay hook hasn't been confirmed yet. Once that lands the raycast
+-- itself is redirected, so snapping the camera too would just be a visible,
+-- redundant giveaway - this is what keeps silent aim working at all if the
+-- scan above never finds a match. Unbound first in case the script got run
+-- more than once this session - BindToRenderStep errors on a name that's
+-- already bound.
+pcall(RunService.UnbindFromRenderStep, RunService, "PrisonLifeSilentAimFallback")
+RunService:BindToRenderStep("PrisonLifeSilentAimFallback", Enum.RenderPriority.Camera.Value + 1, function()
+    if not Config.SilentAim or castRayHookFound then return end
+    local target = getSilentAimTarget(Camera.CFrame.Position)
+    if not target then return end
+    Camera.CFrame = CFrame.lookAt(Camera.CFrame.Position, target.Position)
+end)
 
 local fovCircle = nil
 if typeof(Drawing) == "table" then
@@ -655,7 +674,20 @@ SilentAimSection:Toggle({
     Title = 'silent aim',
     Flag = 'pl_silent_aim',
     Default = false,
-    Callback = function(v) Config.SilentAim = v end,
+    Callback = function(v)
+        Config.SilentAim = v
+        if v then
+            startSilentAimHookScan()
+            if not silentAimAPIAvailable then
+                Centrl:Notify({
+                    Title = 'prison life',
+                    Content = 'getgc/hookfunction not available on this executor - using the visible camera-lock fallback instead.',
+                    Type = 'warning',
+                    Duration = 5,
+                })
+            end
+        end
+    end,
 })
 
 SilentAimSection:Toggle({
