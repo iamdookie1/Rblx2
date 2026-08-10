@@ -72,7 +72,13 @@ local function iTeammate(plr)
         return false
     end
 
-    return mySlot.Value == theirSlot.Value
+    -- Slot.Value references each player's own numbered slot instance under
+    -- Arena.Slots.Left.<n> / Arena.Slots.Right.<n> (never the same instance
+    -- across two players, even on the same side), so teammates share a side,
+    -- not a slot. Compare the Left/Right parent, not the slot itself.
+    local mySide = mySlot.Value.Parent
+    local theirSide = theirSlot.Value.Parent
+    return mySide ~= nil and mySide == theirSide
 end
 
 local function isAlive(plr)
