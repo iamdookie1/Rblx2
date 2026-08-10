@@ -14,6 +14,14 @@ local VARIANT4_DELAY = 0.4
 local Services = ReplicatedStorage.Knit.Knit.Services
 local Activated = Services.DivergentFistService.RE.Activated
 local RightActivated = Services.ItadoriService.RE.RightActivated
+local DashRemote = Services.MovementService.RE.Dash
+
+local Knit = require(ReplicatedStorage.Knit.Knit)
+
+local DashConfig = {
+    Enabled = false,
+    Cooldown = 0.5,
+}
 
 local AnimVariants = ReplicatedStorage.Animations.Itadori.Variants
 
@@ -23,6 +31,86 @@ local DIVERGENT_IDS = {
     [AnimVariants.DivergentFist3.AnimationId] = 3,
     [AnimVariants.DivergentFist4.AnimationId] = 4,
 }
+
+-- Dash cooldown changer: hooks MovementController.DashRequest so a custom
+-- cooldown applies to Back/Left/Right dashes. Front dash is a separate
+-- "chase" ability (routed to the original handler untouched) since it
+-- doesn't go through the same movement-dash cooldown or remote at all.
+local LastCustomDash = 0
+local OriginalDashRequest = nil
+
+local function getMovementController()
+    local ok, controller = pcall(function()
+        return Knit.GetController("MovementController")
+    end)
+    if ok then return controller end
+    return nil
+end
+
+local function getDashDirection(humanoid, hrp)
+    local camLook = workspace.CurrentCamera.CFrame.LookVector
+    local flat = CFrame.new(hrp.Position, hrp.Position + Vector3.new(camLook.X, 0, camLook.Z))
+    local forward = math.round(humanoid.MoveDirection:Dot(flat.LookVector))
+    local right = math.round(humanoid.MoveDirection:Dot(flat.RightVector))
+    if forward == 1 then return "Front" end
+    if forward == -1 then return "Back" end
+    if right == 1 then return "Right" end
+    if right == -1 then return "Left" end
+    return "Front"
+end
+
+local function hookDashRequest()
+    if OriginalDashRequest then return true end
+
+    local Controller = getMovementController()
+    if not Controller then return false end
+
+    OriginalDashRequest = Controller.DashRequest
+
+    Controller.DashRequest = function(self, ...)
+        if not DashConfig.Enabled then
+            return OriginalDashRequest(self, ...)
+        end
+
+        local character = LocalPlayer.Character
+        local hrp = character and character:FindFirstChild("HumanoidRootPart")
+        local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+        local info = character and character:FindFirstChild("Info")
+        if not (character and hrp and humanoid and info) then
+            return OriginalDashRequest(self, ...)
+        end
+
+        -- Unconditional knockback/burst escape dash: never gated by cooldown.
+        if info:FindFirstChild("Knockback")
+            or (character:GetAttribute("Burst") and not info:GetAttribute("Burst"))
+            or (info:FindFirstChild("ForceEsc") and info.ForceEsc.Value) then
+            return OriginalDashRequest(self, ...)
+        end
+
+        local direction = getDashDirection(humanoid, hrp)
+        if direction == "Front" then
+            return OriginalDashRequest(self, ...)
+        end
+
+        -- Preserve the game's own movement-state guards; only the cooldown changes.
+        if info:FindFirstChild("Block") then return end
+        if info:FindFirstChild("Stun") then return end
+        if character:GetAttribute("Ragdoll") > 0 then return end
+        local inSkill = info:FindFirstChild("InSkill")
+        if inSkill and inSkill.Value == false then return end
+        if info:FindFirstChild("NoDash") then return end
+        local noSprint = info:FindFirstChild("NoSprint")
+        if noSprint and noSprint.Value == false then return end
+
+        if tick() - LastCustomDash < DashConfig.Cooldown then return end
+        LastCustomDash = tick()
+
+        DashRemote:FireServer(direction)
+        self:Dash(LocalPlayer, character, direction)
+    end
+
+    return true
+end
 
 local function getCharFolder()
     local chars = workspace:FindFirstChild("Characters")
@@ -130,6 +218,13 @@ LocalPlayer.CharacterAdded:Connect(function()
     watchForCharacter()
 end)
 
+task.spawn(function()
+    for _ = 1, 20 do
+        if hookDashRequest() then return end
+        task.wait(0.5)
+    end
+end)
+
 local Centrl = loadstring(game:HttpGet('https://raw.githubusercontent.com/iamdookie1/Ui/main/Lib2.lua'))()
 
 local Window = Centrl:Window({
@@ -172,6 +267,43 @@ FlashInfo:Paragraph({
 FlashInfo:Paragraph({
     Title = 'fist 4',
     Text = 'No black flash. Fires ItadoriService.RightActivated 0.4s after the animation starts, every time.',
+})
+
+local DashTab = Window:Tab({ Title = 'dash', Icon = 'wind' })
+
+local DashSection = DashTab:Section({ Title = 'dash cooldown', Side = 'left' })
+
+DashSection:Toggle({
+    Title = 'enabled',
+    Flag = 'dash_cd_enabled',
+    Default = false,
+    Callback = function(state)
+        DashConfig.Enabled = state
+        if state then hookDashRequest() end
+    end,
+})
+
+DashSection:Slider({
+    Title = 'cooldown',
+    Flag = 'dash_cd_value',
+    Min = 0,
+    Max = 2,
+    Increment = 0.05,
+    Default = 0.5,
+    Suffix = 's',
+    Callback = function(v) DashConfig.Cooldown = v end,
+})
+
+local DashInfo = DashTab:Section({ Title = 'behavior', Side = 'right' })
+
+DashInfo:Paragraph({
+    Title = 'back / left / right',
+    Text = 'These dashes use the cooldown set above instead of the game default (normally 2s, or 0.3s+charges on some movesets).',
+})
+
+DashInfo:Paragraph({
+    Title = 'front',
+    Text = 'Untouched. Front dash is actually a separate chase/lunge ability and keeps its original cooldown and behavior.',
 })
 
 Window:Load()
