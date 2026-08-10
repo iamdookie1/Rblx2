@@ -6,7 +6,7 @@ local WATCH_DURATION = 5
 -- Maps a PlaceId to the game-specific script hosted in this repo's Games/ folder.
 local Games = {
     [9391468976] = { Name = 'Jujutsu Shenanigans', Script = 'Games/Jjs' },
-    [106920577206536] = { Name = 'Survival', Script = 'Games/Survival.lua' },
+    [106920577206536] = { Name = 'A Quiet Place', Script = 'Games/Survival.lua' },
 }
 
 local Centrl = loadstring(game:HttpGet('https://raw.githubusercontent.com/iamdookie1/Ui/main/Lib2.lua'))()

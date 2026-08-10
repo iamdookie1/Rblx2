@@ -36,6 +36,9 @@ local Config = {
 
     SpeedEnabled = false,
     WalkSpeed = 32,
+    SpeedBoost = 0,
+
+    InfiniteStats = false,
 }
 
 local ESPConfig = {
@@ -45,6 +48,7 @@ local ESPConfig = {
     ShowNames = true,
     Players = true,
     Monsters = true,
+    Items = false,
 }
 
 --// Targeting --------------------------------------------------------------------
@@ -75,7 +79,7 @@ local function collectCandidates()
                 local char = plr.Character
                 local hum = char and char:FindFirstChildOfClass("Humanoid")
                 if char and hum and hum.Health > 0 then
-                    list[#list + 1] = { Model = char, IsMonster = false }
+                    list[#list + 1] = { Model = char }
                 end
             end
         end
@@ -87,7 +91,7 @@ local function collectCandidates()
                 if model:IsA("Model") then
                     local hum = model:FindFirstChildOfClass("Humanoid")
                     if hum and hum.Health > 0 then
-                        list[#list + 1] = { Model = model, IsMonster = true }
+                        list[#list + 1] = { Model = model }
                     end
                 end
             end
@@ -176,7 +180,10 @@ end
 
 RunService.RenderStepped:Connect(function()
     if not fovCircle then return end
-    local show = Config.SilentAim and Config.FOVEnabled
+    -- Only gated on the fov toggle itself, not on silent aim also being on -
+    -- tying it to SilentAim meant the circle never appeared unless aim
+    -- assist was already engaged, which read as "fov isn't drawn at all".
+    local show = Config.FOVEnabled
     fovCircle.Visible = show
     if show then
         fovCircle.Radius = Config.FOVRadius
@@ -189,11 +196,25 @@ RunService.RenderStepped:Connect(function()
 end)
 
 --// ESP ------------------------------------------------------------------------
+-- "Kind" instead of a plain isMonster boolean, since world items (Workspace.
+-- _Items - loose pickups like guns/food lying around, each a Model with a
+-- Handle part) get ESP'd too now, and they don't have a Humanoid or a
+-- Head/HumanoidRootPart rig the way players/monsters do.
 local espObjects = {} -- [model] = objs
 
-local function espColorFor(isMonster)
-    if isMonster then return Color3.fromRGB(255, 170, 60) end
+local function espColorFor(kind)
+    if kind == "Monster" then return Color3.fromRGB(255, 170, 60) end
+    if kind == "Item" then return Color3.fromRGB(255, 220, 60) end
     return Color3.fromRGB(230, 60, 60)
+end
+
+-- Player/monster models use HumanoidRootPart (falling back to Head); items
+-- only ever have a Handle.
+local function espAnchor(model, kind)
+    if kind == "Item" then
+        return model:FindFirstChild("Handle") or model.PrimaryPart
+    end
+    return model:FindFirstChild("HumanoidRootPart") or model:FindFirstChild("Head")
 end
 
 local function destroyEsp(model)
@@ -206,10 +227,10 @@ local function destroyEsp(model)
     espObjects[model] = nil
 end
 
-local function buildEsp(model, name, isMonster)
+local function buildEsp(model, name, kind)
     destroyEsp(model)
-    local color = espColorFor(isMonster)
-    local objs = { Method = ESPConfig.Method, ShowNames = ESPConfig.ShowNames, IsMonster = isMonster }
+    local color = espColorFor(kind)
+    local objs = { Method = ESPConfig.Method, ShowNames = ESPConfig.ShowNames, Kind = kind }
     espObjects[model] = objs
 
     if ESPConfig.Method == "Highlight" then
@@ -240,10 +261,10 @@ local function buildEsp(model, name, isMonster)
     end
 
     if ESPConfig.ShowNames then
-        local head = model:FindFirstChild("Head")
+        local anchor = espAnchor(model, kind)
         local billboard = Instance.new("BillboardGui")
         billboard.Name = "SurvivalESPName"
-        billboard.Adornee = head or model.PrimaryPart
+        billboard.Adornee = anchor or model.PrimaryPart
         billboard.Size = UDim2.fromOffset(160, 36)
         billboard.StudsOffset = Vector3.new(0, 1.2, 0)
         billboard.AlwaysOnTop = true
@@ -281,11 +302,11 @@ task.spawn(function()
                             seen[char] = true
                             local objs = espObjects[char]
                             if not objs or objs.Method ~= ESPConfig.Method or objs.ShowNames ~= ESPConfig.ShowNames then
-                                buildEsp(char, plr.Name, false)
+                                buildEsp(char, plr.Name, "Player")
                                 objs = espObjects[char]
                             end
                             if objs then
-                                local color = espColorFor(false)
+                                local color = espColorFor("Player")
                                 if objs.Highlight then
                                     objs.Highlight.FillTransparency = ESPConfig.Transparency
                                     objs.Highlight.FillColor = color
@@ -312,11 +333,11 @@ task.spawn(function()
                                 seen[model] = true
                                 local objs = espObjects[model]
                                 if not objs or objs.Method ~= ESPConfig.Method or objs.ShowNames ~= ESPConfig.ShowNames then
-                                    buildEsp(model, model.Name, true)
+                                    buildEsp(model, model.Name, "Monster")
                                     objs = espObjects[model]
                                 end
                                 if objs then
-                                    local color = espColorFor(true)
+                                    local color = espColorFor("Monster")
                                     if objs.Highlight then
                                         objs.Highlight.FillTransparency = ESPConfig.Transparency
                                         objs.Highlight.FillColor = color
@@ -327,6 +348,35 @@ task.spawn(function()
                                         local dist = hrp and (Camera.CFrame.Position - hrp.Position).Magnitude or 0
                                         objs.NameLabel.Text = ("%s [%d]"):format(model.Name, math.floor(dist))
                                     end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+
+            if ESPConfig.Items then
+                local items = Workspace:FindFirstChild("_Items")
+                if items then
+                    for _, model in ipairs(items:GetChildren()) do
+                        if model:IsA("Model") and model:FindFirstChild("Handle") then
+                            seen[model] = true
+                            local objs = espObjects[model]
+                            if not objs or objs.Method ~= ESPConfig.Method or objs.ShowNames ~= ESPConfig.ShowNames then
+                                buildEsp(model, model.Name, "Item")
+                                objs = espObjects[model]
+                            end
+                            if objs then
+                                local color = espColorFor("Item")
+                                if objs.Highlight then
+                                    objs.Highlight.FillTransparency = ESPConfig.Transparency
+                                    objs.Highlight.FillColor = color
+                                    objs.Highlight.OutlineColor = color
+                                end
+                                if objs.NameLabel then
+                                    local handle = model:FindFirstChild("Handle")
+                                    local dist = handle and (Camera.CFrame.Position - handle.Position).Magnitude or 0
+                                    objs.NameLabel.Text = ("%s [%d]"):format(model.Name, math.floor(dist))
                                 end
                             end
                         end
@@ -351,13 +401,22 @@ RunService.RenderStepped:Connect(function()
         if not model.Parent then
             destroyEsp(model)
         else
-            local hrp = model:FindFirstChild("HumanoidRootPart")
-            local color = espColorFor(objs.IsMonster)
+            local anchor = espAnchor(model, objs.Kind)
+            local color = espColorFor(objs.Kind)
 
-            if objs.Box and hrp then
-                local head = model:FindFirstChild("Head")
-                local topPos = head and (head.Position + Vector3.new(0, 0.5, 0)) or (hrp.Position + Vector3.new(0, 2, 0))
-                local bottomPos = hrp.Position - Vector3.new(0, 3, 0)
+            if objs.Box and anchor then
+                -- Players/monsters get a head-to-knee box off their rig;
+                -- items have no rig at all, so just a small fixed box around
+                -- the Handle.
+                local topPos, bottomPos
+                if objs.Kind == "Item" then
+                    topPos = anchor.Position + Vector3.new(0, 0.75, 0)
+                    bottomPos = anchor.Position - Vector3.new(0, 0.75, 0)
+                else
+                    local head = model:FindFirstChild("Head")
+                    topPos = head and (head.Position + Vector3.new(0, 0.5, 0)) or (anchor.Position + Vector3.new(0, 2, 0))
+                    bottomPos = anchor.Position - Vector3.new(0, 3, 0)
+                end
                 local topScreen, topOnScreen = Camera:WorldToViewportPoint(topPos)
                 local bottomScreen = Camera:WorldToViewportPoint(bottomPos)
                 if topOnScreen then
@@ -373,8 +432,8 @@ RunService.RenderStepped:Connect(function()
                 end
             end
 
-            if objs.Tracer and hrp then
-                local screenPoint, onScreen = Camera:WorldToViewportPoint(hrp.Position)
+            if objs.Tracer and anchor then
+                local screenPoint, onScreen = Camera:WorldToViewportPoint(anchor.Position)
                 if onScreen then
                     objs.Tracer.Visible = true
                     objs.Tracer.Color = color
@@ -394,24 +453,65 @@ Players.PlayerRemoving:Connect(function(plr)
 end)
 
 --// Player: speed ------------------------------------------------------------------
+-- Plain WalkSpeed overriding alone is what's getting reverted: this game's
+-- own Controller LocalScript recalculates and reassigns Humanoid.WalkSpeed
+-- itself on movement-state changes (sprint/crouch/weight), and depending on
+-- event order it can win that race - and if a Running-state connection
+-- fires the instant WalkSpeed changes, no per-frame reassertion beats that,
+-- because the correction happens inside the same tick as our write.
+-- "extra boost" sidesteps the property entirely: it nudges the
+-- HumanoidRootPart directly along whatever direction Humanoid.MoveDirection
+-- already says you're heading, stacked on top of normal movement, so
+-- there's no WalkSpeed change for anything watching that property to react
+-- to. If this game instead validates raw position deltas server-side
+-- (a proper anti-speed check, not just a property watchdog), no purely
+-- client-side technique reliably beats that without knowing its tolerance -
+-- start the boost slider low and raise it until movement stops
+-- rubber-banding back.
 local originalWalkSpeed = nil
 
-local function getMyHumanoid()
+RunService.Heartbeat:Connect(function(dt)
     local char = LocalPlayer.Character
-    return char and char:FindFirstChildOfClass("Humanoid")
-end
-
-RunService.Heartbeat:Connect(function()
-    local hum = getMyHumanoid()
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
     if not hum then return end
+
     if Config.SpeedEnabled then
         if originalWalkSpeed == nil then
             originalWalkSpeed = hum.WalkSpeed
         end
         hum.WalkSpeed = Config.WalkSpeed
+
+        if hrp and Config.SpeedBoost > 0 then
+            local moveDir = hum.MoveDirection
+            if moveDir.Magnitude > 0.05 then
+                hrp.CFrame = hrp.CFrame + moveDir.Unit * Config.SpeedBoost * dt
+            end
+        end
     elseif originalWalkSpeed ~= nil then
         hum.WalkSpeed = originalWalkSpeed
         originalWalkSpeed = nil
+    end
+end)
+
+--// Player: infinite stats (best effort) --------------------------------------
+-- Stamina/Hydration/Satiation are ordinary NumberValues that deplete and
+-- replicate down over time, which looks server-driven - forcing them here
+-- can't guarantee the server agrees your stats are actually full, but
+-- reasserting every frame keeps the client-side value (and whatever HUD
+-- reads it) pinned at max even if a server tick knocks it down in between.
+local MAX_STAT = 100
+
+RunService.Heartbeat:Connect(function()
+    if not Config.InfiniteStats then return end
+    local char = LocalPlayer.Character
+    local values = char and char:FindFirstChild("Values")
+    if not values then return end
+    for _, name in ipairs({ "Stamina", "Hydration", "Satiation" }) do
+        local stat = values:FindFirstChild(name)
+        if stat and stat.Value < MAX_STAT then
+            stat.Value = MAX_STAT
+        end
     end
 end)
 
@@ -419,16 +519,16 @@ end)
 local Centrl = loadstring(game:HttpGet('https://raw.githubusercontent.com/iamdookie1/Rblx2/main/UI/Lib2.lua'))()
 
 local Window = Centrl:Window({
-    Title = 'survival',
+    Title = 'a quiet place',
     SubTitle = 'assist',
-    Folder = 'SurvivalAssist',
+    Folder = 'AQuietPlaceAssist',
     ToggleKey = Enum.KeyCode.RightShift,
     Accent = Color3.fromRGB(70, 200, 130),
 })
 
 if not RequestCharacterAction then
     Centrl:Notify({
-        Title = 'survival',
+        Title = 'a quiet place',
         Content = 'Could not find Events.Remotes.RequestCharacterAction - silent aim will not work. The game may have changed since this was built.',
         Type = 'error',
         Duration = 8,
@@ -447,7 +547,7 @@ AimSection:Toggle({
         Config.SilentAim = v
         if v and Config.AimMode == "Silent" and not HAS_NAMECALL_HOOK then
             Centrl:Notify({
-                Title = 'survival',
+                Title = 'a quiet place',
                 Content = 'hookmetamethod/getnamecallmethod not available on this executor - switch aim mode to Camera instead.',
                 Type = 'warning',
                 Duration = 5,
@@ -578,6 +678,13 @@ EspSection:Toggle({
     Callback = function(v) ESPConfig.Monsters = v end,
 })
 
+EspSection:Toggle({
+    Title = 'esp items',
+    Flag = 'sv_esp_items',
+    Default = false,
+    Callback = function(v) ESPConfig.Items = v end,
+})
+
 local EspConfigSection = VisualTab:Section({ Title = 'esp config', Side = 'right' })
 
 EspConfigSection:Slider({
@@ -610,10 +717,40 @@ SpeedSection:Slider({
     Callback = function(v) Config.WalkSpeed = v end,
 })
 
+SpeedSection:Slider({
+    Title = 'extra boost',
+    Flag = 'sv_speed_boost',
+    Min = 0,
+    Max = 100,
+    Increment = 2,
+    Default = 0,
+    Suffix = ' studs/s',
+    Callback = function(v) Config.SpeedBoost = v end,
+})
+
+SpeedSection:Paragraph({
+    Title = 'about the anti-speed',
+    Text = 'Plain walkspeed alone gets fought/reverted by this game\'s own movement script. "Extra boost" moves you directly instead of touching walkspeed, which routes around a walkspeed-property watchdog - but if the server is actually checking raw movement distance, nothing purely client-side beats that outright. Start low and raise it until you stop getting snapped back.',
+})
+
+local StatsSection = PlayerTab:Section({ Title = 'stats', Side = 'right' })
+
+StatsSection:Toggle({
+    Title = 'infinite stamina / hydration / satiation',
+    Flag = 'sv_infinite_stats',
+    Default = false,
+    Callback = function(v) Config.InfiniteStats = v end,
+})
+
+StatsSection:Paragraph({
+    Title = 'heads up',
+    Text = 'These look server-driven (depleted and synced down over time), so this forces the client-side value back to full every frame rather than guaranteeing the server agrees - it should keep your HUD pinned at max, but treat it as best-effort.',
+})
+
 Window:Load()
 
 Centrl:Notify({
-    Title = 'survival',
+    Title = 'a quiet place',
     Content = 'Loaded. RightShift toggles the menu.',
     Type = 'success',
     Duration = 5,
