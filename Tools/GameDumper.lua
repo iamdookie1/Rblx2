@@ -8,6 +8,7 @@ local HAS_APPENDFILE = typeof(appendfile) == "function"
 local HAS_READFILE = typeof(readfile) == "function"
 local HAS_MAKEFOLDER = typeof(makefolder) == "function"
 local HAS_ISFOLDER = typeof(isfolder) == "function"
+local HAS_ISFILE = typeof(isfile) == "function"
 local HAS_DECOMPILE = typeof(decompile) == "function"
 
 local Config = {
@@ -43,19 +44,27 @@ local SEP = string.rep("=", 80)
 local FileWriter = {}
 FileWriter.__index = FileWriter
 
-function FileWriter.new(path)
+function FileWriter.new(path, opts)
+    opts = opts or {}
     local self = setmetatable({}, FileWriter)
     self.path = path
     self.buffer = {}
     self.bufferChars = 0
-    pcall(writefile, path, "")
+    self.flushThreshold = opts.flushThreshold or 32768
+    -- truncate defaults to true (fresh file); pass truncate = false to keep
+    -- whatever's already on disk, which is what resuming a crashed dump
+    -- needs - the new run's writes should land after the old ones, not wipe
+    -- them.
+    if opts.truncate ~= false then
+        pcall(writefile, path, "")
+    end
     return self
 end
 
 function FileWriter:write(text)
     self.buffer[#self.buffer + 1] = text
     self.bufferChars = self.bufferChars + #text
-    if self.bufferChars >= 32768 then
+    if self.bufferChars >= self.flushThreshold then
         self:flush()
     end
 end
@@ -91,14 +100,65 @@ local function tryGetFullName(inst)
     return ok and name or "?"
 end
 
-local function writeScriptEntry(inst, className, writer, stats)
-    local fullName = tryGetFullName(inst)
+-- Crash-survivable progress: DONE/ATTEMPT lines keyed by an instance's
+-- FullName (the only identity that survives a client restart - object
+-- references don't). An ATTEMPT with no matching DONE means a previous run
+-- started decompiling that instance and never got the chance to record
+-- success, which is the strongest signal available for "this is probably
+-- what took the client down" - so it gets treated as a crash suspect and
+-- skipped instead of retried. Fully finished instances (DONE) are skipped
+-- too, so a resumed run doesn't redo work or risk hitting the same crash a
+-- second time before it even gets back to where it died.
+local function loadState(path)
+    local doneSet, attempted, doneCount = {}, {}, 0
+    local canRead = HAS_READFILE and (not HAS_ISFILE or isfile(path))
+    if canRead then
+        local ok, content = pcall(readfile, path)
+        if ok and typeof(content) == "string" then
+            for line in content:gmatch("[^\r\n]+") do
+                local tag, name = line:match("^(%a+)\t(.+)$")
+                if tag == "DONE" and not doneSet[name] then
+                    doneSet[name] = true
+                    doneCount = doneCount + 1
+                elseif tag == "ATTEMPT" then
+                    attempted[name] = true
+                end
+            end
+        end
+    end
+
+    local crashSuspects = {}
+    for name in pairs(attempted) do
+        if not doneSet[name] then
+            crashSuspects[name] = true
+        end
+    end
+
+    return doneSet, crashSuspects, doneCount
+end
+
+local function writeScriptEntry(inst, className, writer, stats, fullName, stateWriter, isSuspect)
     writer:write(("%s\n%s | Type: %s | Method: decompile\nLocation: %s\n%s\n\n"):format(
         SEP, inst.Name, className, fullName, SEP))
 
     if not HAS_DECOMPILE then
         writer:write("-- [decompile unavailable on this executor]\n\n")
         return
+    end
+
+    if isSuspect then
+        writer:write("-- [skipped: this instance was mid-decompile when a previous dump attempt crashed, so it's assumed to be the cause and left un-decompiled]\n\n")
+        stats.suspectsSkipped = stats.suspectsSkipped + 1
+        return
+    end
+
+    -- Flushed to disk immediately, before decompile runs - if decompiling
+    -- this specific instance is what takes the whole client down, this line
+    -- is what lets the next run recognize it and skip it instead of dying
+    -- in the same place again.
+    if stateWriter then
+        stateWriter:write("ATTEMPT\t" .. fullName .. "\n")
+        stateWriter:flush()
     end
 
     -- pcall only catches the decompiler erroring, not it hanging - a
@@ -122,16 +182,16 @@ local function writeScriptEntry(inst, className, writer, stats)
     stats.scripts = stats.scripts + 1
 end
 
-local function writeRemoteEntry(inst, className, writer, stats)
-    writer:write(("[%s] %s\n"):format(className, tryGetFullName(inst)))
+local function writeRemoteEntry(inst, className, writer, stats, fullName)
+    writer:write(("[%s] %s\n"):format(className, fullName))
     stats.remotes = stats.remotes + 1
 end
 
-local function writeValueEntry(inst, className, writer, stats)
+local function writeValueEntry(inst, className, writer, stats, fullName)
     local okVal, value = pcall(function() return inst.Value end)
     if not okVal then return end
     local okStr, str = pcall(tostring, value)
-    writer:write(("%-16s %-70s = %s\n"):format(className, tryGetFullName(inst), okStr and str or "<unreadable>"))
+    writer:write(("%-16s %-70s = %s\n"):format(className, fullName, okStr and str or "<unreadable>"))
     stats.values = stats.values + 1
 end
 
@@ -188,8 +248,12 @@ local function pushChildren(stack, inst, depth, prefix)
     end
 end
 
-local function runDump(writers, progress, isCancelled)
-    local stats = { instances = 0, scripts = 0, remotes = 0, values = 0, decompileFailures = 0, truncated = 0, skippedDuplicates = 0 }
+local function runDump(writers, progress, isCancelled, doneSet, crashSuspects)
+    local stats = {
+        instances = 0, scripts = 0, remotes = 0, values = 0,
+        decompileFailures = 0, truncated = 0, skippedDuplicates = 0,
+        resumedSkipped = 0, suspectsSkipped = 0,
+    }
 
     -- Roots overlap on purpose (Players contains LocalPlayer, which already
     -- has Backpack/PlayerGui/PlayerScripts as real children before we also
@@ -226,18 +290,34 @@ local function runDump(writers, progress, isCancelled)
             stats.instances = stats.instances + 1
             processed = processed + 1
 
-            if Config.DumpTree then
-                local branch = frame.depth == 0 and "" or (frame.isLast and "`-- " or "|-- ")
-                writers.tree:write(frame.prefix .. branch .. name .. " (" .. className .. ")\n")
-            end
+            local fullName = tryGetFullName(inst)
+            local alreadyDone = doneSet and doneSet[fullName]
 
-            if Config.DumpScripts and (className == "Script" or className == "LocalScript" or className == "ModuleScript") then
-                writeScriptEntry(inst, className, writers.scripts, stats)
-            elseif Config.DumpRemotes and (className == "RemoteEvent" or className == "RemoteFunction"
-                or className == "BindableEvent" or className == "BindableFunction") then
-                writeRemoteEntry(inst, className, writers.remotes, stats)
-            elseif Config.DumpValues and className:match("Value$") then
-                writeValueEntry(inst, className, writers.values, stats)
+            if alreadyDone then
+                stats.resumedSkipped = stats.resumedSkipped + 1
+            else
+                if Config.DumpTree then
+                    local branch = frame.depth == 0 and "" or (frame.isLast and "`-- " or "|-- ")
+                    writers.tree:write(frame.prefix .. branch .. name .. " (" .. className .. ")\n")
+                end
+
+                if Config.DumpScripts and (className == "Script" or className == "LocalScript" or className == "ModuleScript") then
+                    local isSuspect = crashSuspects and crashSuspects[fullName]
+                    writeScriptEntry(inst, className, writers.scripts, stats, fullName, writers.state, isSuspect)
+                elseif Config.DumpRemotes and (className == "RemoteEvent" or className == "RemoteFunction"
+                    or className == "BindableEvent" or className == "BindableFunction") then
+                    writeRemoteEntry(inst, className, writers.remotes, stats, fullName)
+                elseif Config.DumpValues and className:match("Value$") then
+                    writeValueEntry(inst, className, writers.values, stats, fullName)
+                end
+
+                -- Marks the instance fully handled regardless of type - not
+                -- just scripts - so a resumed run can skip straight past
+                -- everything already written on the tree/remote/value side
+                -- too, not only the decompile-risk path.
+                if writers.state then
+                    writers.state:write("DONE\t" .. fullName .. "\n")
+                end
             end
 
             local childPrefix = frame.prefix
@@ -330,6 +410,21 @@ local Run = Tab:Section({ Title = 'run', Side = 'left' })
 local StatusLabel = Run:Label({ Title = 'status: idle' })
 local CountLabel = Run:Label({ Title = 'instances: 0  scripts: 0  remotes: 0  values: 0' })
 
+local function dumpFolder()
+    -- Stable per-place name (no timestamp) is what makes resuming possible -
+    -- a crashed run and the retry that resumes it need to land in the same
+    -- folder and see the same State.txt.
+    return ('GameDump_%d'):format(game.PlaceId)
+end
+
+local function dumpFilePath(name)
+    local folder = dumpFolder()
+    if HAS_MAKEFOLDER then
+        return folder .. '/' .. name
+    end
+    return folder .. '_' .. name
+end
+
 local dumping = false
 local cancelRequested = false
 
@@ -353,47 +448,63 @@ StartButton = Run:Button({
         StatusLabel:Set('status: running')
 
         task.spawn(function()
-            local folder = ('GameDump_%d_%s'):format(game.PlaceId, os.date('%Y%m%d_%H%M%S'))
+            local folder = dumpFolder()
             if HAS_MAKEFOLDER and not (HAS_ISFOLDER and isfolder(folder)) then
                 pcall(makefolder, folder)
             end
 
-            -- Without makefolder, a path like "<folder>/Scripts.txt" points
-            -- at a directory that was never created and writefile would
-            -- just fail into it silently - flatten to "<folder>_Scripts.txt"
-            -- instead so output still lands somewhere real.
-            local function filePath(name)
-                if HAS_MAKEFOLDER then
-                    return folder .. '/' .. name
-                end
-                return folder .. '_' .. name
+            local statePath = dumpFilePath('State.txt')
+            local doneSet, crashSuspects, doneCount = loadState(statePath)
+            local resuming = doneCount > 0
+
+            if resuming then
+                StatusLabel:Set('status: resuming previous dump')
+                Centrl:Notify({
+                    Title = 'game dumper',
+                    Content = ('Resuming previous dump - %d instance(s) already done will be skipped.'):format(doneCount),
+                    Type = 'info',
+                    Duration = 6,
+                })
             end
 
+            -- Resuming means appending past what's already on disk, not
+            -- wiping it - only a fresh (non-resumed) run truncates.
             local writers = {
-                scripts = FileWriter.new(filePath('Scripts.txt')),
-                tree = FileWriter.new(filePath('Tree.txt')),
-                remotes = FileWriter.new(filePath('Remotes.txt')),
-                values = FileWriter.new(filePath('Values.txt')),
+                scripts = FileWriter.new(dumpFilePath('Scripts.txt'), { truncate = not resuming }),
+                tree = FileWriter.new(dumpFilePath('Tree.txt'), { truncate = not resuming }),
+                remotes = FileWriter.new(dumpFilePath('Remotes.txt'), { truncate = not resuming }),
+                values = FileWriter.new(dumpFilePath('Values.txt'), { truncate = not resuming }),
+                state = FileWriter.new(statePath, { truncate = not resuming, flushThreshold = 512 }),
             }
 
             local startTime = os.clock()
             local ok, stats = pcall(runDump, writers, function(s, queued)
-                CountLabel:Set(('instances: %d  scripts: %d  remotes: %d  values: %d  dupes skipped: %d  (queued: %d)')
-                    :format(s.instances, s.scripts, s.remotes, s.values, s.skippedDuplicates, queued))
-            end, function() return cancelRequested end)
+                CountLabel:Set(('instances: %d  scripts: %d  remotes: %d  values: %d  dupes: %d  resumed: %d  suspects: %d  (queued: %d)')
+                    :format(s.instances, s.scripts, s.remotes, s.values, s.skippedDuplicates, s.resumedSkipped, s.suspectsSkipped, queued))
+            end, function() return cancelRequested end, doneSet, crashSuspects)
 
             for _, writer in pairs(writers) do
                 writer:close()
             end
 
             local duration = os.clock() - startTime
-            local summary = FileWriter.new(filePath('Summary.txt'))
+            local summary = FileWriter.new(dumpFilePath('Summary.txt'))
             if ok then
-                summary:write(("Place: %d\nGenerated: %s\nDuration: %.1fs\nCancelled: %s\n\n"):format(
-                    game.PlaceId, os.date('%Y-%m-%d %H:%M:%S'), duration, tostring(cancelRequested)))
-                summary:write(("Instances: %d\nDuplicate visits skipped: %d\nScripts decompiled: %d\nDecompile failures: %d\nTruncated scripts: %d\nRemotes: %d\nValues: %d\n"):format(
-                    stats.instances, stats.skippedDuplicates, stats.scripts, stats.decompileFailures, stats.truncated, stats.remotes, stats.values))
+                summary:write(("Place: %d\nGenerated: %s\nDuration: %.1fs\nCancelled: %s\nResumed: %s\n\n"):format(
+                    game.PlaceId, os.date('%Y-%m-%d %H:%M:%S'), duration, tostring(cancelRequested), tostring(resuming)))
+                summary:write(("Instances: %d\nDuplicate visits skipped: %d\nAlready-done (resumed) skipped: %d\nCrash-suspect scripts skipped: %d\nScripts decompiled: %d\nDecompile failures: %d\nTruncated scripts: %d\nRemotes: %d\nValues: %d\n"):format(
+                    stats.instances, stats.skippedDuplicates, stats.resumedSkipped, stats.suspectsSkipped,
+                    stats.scripts, stats.decompileFailures, stats.truncated, stats.remotes, stats.values))
                 summary:close()
+
+                local finishedClean = not cancelRequested
+                if finishedClean then
+                    -- The "forget" half: a dump that actually finished
+                    -- doesn't need its crash-resume trail anymore, so clear
+                    -- it - otherwise a later, genuinely fresh dump would
+                    -- silently skip everything as "already done".
+                    pcall(writefile, statePath, "")
+                end
 
                 StatusLabel:Set(cancelRequested and 'status: cancelled' or 'status: done')
                 Centrl:Notify({
@@ -411,6 +522,27 @@ StartButton = Run:Button({
 
             setRunning(false)
         end)
+    end,
+})
+
+Run:Button({
+    Title = 'reset progress',
+    Callback = function()
+        if dumping then return end
+        if not HAS_WRITEFILE then return end
+
+        for _, name in ipairs({ 'State.txt', 'Scripts.txt', 'Tree.txt', 'Remotes.txt', 'Values.txt', 'Summary.txt' }) do
+            pcall(writefile, dumpFilePath(name), "")
+        end
+
+        StatusLabel:Set('status: idle')
+        CountLabel:Set('instances: 0  scripts: 0  remotes: 0  values: 0')
+        Centrl:Notify({
+            Title = 'game dumper',
+            Content = 'Progress cleared - next dump starts fresh.',
+            Type = 'success',
+            Duration = 4,
+        })
     end,
 })
 
