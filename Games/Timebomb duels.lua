@@ -4,15 +4,22 @@ local RunService = game:GetService("RunService")
 local LocalPlayer = Players.LocalPlayer
 
 local Config = {
-    Enabled = false,
+    AutoPlay = false,
     InArenaCheck = true,
     MaxDistance = 0,
 
+    UseHug = true,
     ApproachSpeed = 28,
     HugDistance = 3,
 
     StickyTarget = true,
     StickyThreshold = 8,
+
+    HitboxEnabled = false,
+    HitboxMultiplier = 3,
+
+    AutoTPEnabled = false,
+    AutoTPThreshold = 3,
 }
 
 local function getChar()
@@ -103,6 +110,29 @@ local function findBestTarget(myHRP)
     return best
 end
 
+-- The bomb's remaining-time display is driven by a server script we can't
+-- read (marked unreadable in the dump), so there's no attribute name to
+-- trust. The TimeLeft label itself is real and live though, so read the
+-- number straight out of its Text instead of guessing at the attribute.
+local function parseTimeLeft(text)
+    if not text or text == "" then return nil end
+    local mins, secs = text:match("^(%d+):(%d+)$")
+    if mins then
+        return tonumber(mins) * 60 + tonumber(secs)
+    end
+    local n = text:match("(%d+%.?%d*)")
+    return n and tonumber(n) or nil
+end
+
+local function getBombTimeLeft()
+    local char = getChar()
+    local tool = char and char:FindFirstChildOfClass("Tool")
+    local handle = tool and tool:FindFirstChild("BombHandle")
+    local ui = handle and handle:FindFirstChild("UIAttachment") and handle.UIAttachment:FindFirstChild("UI")
+    local label = ui and ui:FindFirstChild("TimeLeft")
+    return label and parseTimeLeft(label.Text)
+end
+
 local lockedTarget = nil
 local chasing = false
 local originalWalkSpeed = nil
@@ -128,19 +158,37 @@ local function stopChasing(humanoid)
     originalWalkSpeed = nil
 end
 
+-- Lands just short of the target rather than exactly on top of them, from
+-- whichever side we're already approaching from, matching their height
+-- exactly so the landing spot is guaranteed to overlap their hitbox instead
+-- of leaving a vertical gap on stairs/platforms.
+local TP_LAND_DISTANCE = 1.5
+
+local function teleportNear(myHRP, targetHRP)
+    local away = myHRP.Position - targetHRP.Position
+    local flatAway = Vector3.new(away.X, 0, away.Z)
+    if flatAway.Magnitude < 0.1 then
+        flatAway = Vector3.new(1, 0, 0)
+    end
+    local landPos = targetHRP.Position + flatAway.Unit * TP_LAND_DISTANCE
+    landPos = Vector3.new(landPos.X, targetHRP.Position.Y, landPos.Z)
+    myHRP.CFrame = CFrame.lookAt(landPos, targetHRP.Position)
+end
+
 local lastMoveTo = 0
 local MOVE_TO_INTERVAL = 0.15
 
 -- BombHandle carries a TouchInterest (i.e. the transfer is a real physical
--- Touched collision, not a remote call), so "auto rotate" has to do two
--- separate jobs: face the target's *current* position exactly every frame
--- (rotation only, never fights whatever is driving position), and actually
--- close the distance to them (position), snapping the last few studs so the
--- bomb's hitbox genuinely overlaps theirs instead of stopping just short.
+-- Touched collision, not a remote call), so auto play has to do two separate
+-- jobs: face the target's *current* position exactly every frame (rotation
+-- only, never fights whatever is driving position), and actually close the
+-- distance to them (position), snapping the last few studs so the bomb's
+-- hitbox genuinely overlaps theirs instead of stopping just short. When the
+-- timer's critical, auto tp skips the walk entirely and lands next to them.
 RunService.Heartbeat:Connect(function(dt)
     local humanoid = getHumanoid()
 
-    if not Config.Enabled or (Config.InArenaCheck and not isInArena()) or not iHaveBomb() then
+    if not Config.AutoPlay or (Config.InArenaCheck and not isInArena()) or not iHaveBomb() then
         stopChasing(humanoid)
         return
     end
@@ -182,18 +230,27 @@ RunService.Heartbeat:Connect(function(dt)
     startChasing(humanoid)
 
     local tHRP = target.Character.HumanoidRootPart
+
+    if Config.AutoTPEnabled then
+        local timeLeft = getBombTimeLeft()
+        if timeLeft and timeLeft <= Config.AutoTPThreshold then
+            teleportNear(myHRP, tHRP)
+            return
+        end
+    end
+
     local toTarget = tHRP.Position - myHRP.Position
     local flatToTarget = Vector3.new(toTarget.X, 0, toTarget.Z)
-    local dist = flatToTarget.Magnitude
+    local dist3D = toTarget.Magnitude
 
-    if dist > 0.05 then
+    if flatToTarget.Magnitude > 0.05 then
         myHRP.CFrame = CFrame.lookAt(myHRP.Position, myHRP.Position + flatToTarget)
     end
 
-    if dist <= Config.HugDistance then
-        local step = math.min(dist, Config.ApproachSpeed * dt)
-        if flatToTarget.Magnitude > 0.05 then
-            myHRP.CFrame = myHRP.CFrame + flatToTarget.Unit * step
+    if Config.UseHug and dist3D <= Config.HugDistance then
+        local step = math.min(dist3D, Config.ApproachSpeed * dt)
+        if toTarget.Magnitude > 0.05 then
+            myHRP.CFrame = myHRP.CFrame + toTarget.Unit * step
         end
     elseif os.clock() - lastMoveTo > MOVE_TO_INTERVAL then
         lastMoveTo = os.clock()
@@ -207,25 +264,67 @@ LocalPlayer.CharacterAdded:Connect(function()
     originalWalkSpeed = nil
 end)
 
-local Centrl = loadstring(game:HttpGet('https://raw.githubusercontent.com/iamdookie1/Ui/main/Lib2.lua'))()
+-- Hitbox expander: R6 characters here, so "Torso" is the one part that's
+-- both large and actually collidable/touchable (arms/legs are thin and
+-- HumanoidRootPart doesn't collide) - enlarging it makes it far easier for
+-- either side's BombHandle to land a touch. Runs independently of auto play
+-- so it's usable on its own.
+local hitboxOriginalSizes = {}
+
+local function applyHitboxSize(plr)
+    local char = plr.Character
+    local torso = char and char:FindFirstChild("Torso")
+    if not torso then return end
+    if not hitboxOriginalSizes[torso] then
+        hitboxOriginalSizes[torso] = torso.Size
+    end
+    local desired = hitboxOriginalSizes[torso] * Config.HitboxMultiplier
+    if (torso.Size - desired).Magnitude > 0.05 then
+        torso.Size = desired
+    end
+end
+
+local function restoreAllHitboxSizes()
+    for torso, size in pairs(hitboxOriginalSizes) do
+        if torso and torso.Parent then
+            torso.Size = size
+        end
+    end
+    hitboxOriginalSizes = {}
+end
+
+task.spawn(function()
+    while true do
+        task.wait(0.3)
+        if Config.HitboxEnabled then
+            for _, plr in ipairs(Players:GetPlayers()) do
+                if plr ~= LocalPlayer then
+                    applyHitboxSize(plr)
+                end
+            end
+        end
+    end
+end)
+
+local Centrl = loadstring(game:HttpGet('https://raw.githubusercontent.com/iamdookie1/Rblx2/main/UI/Lib2.lua'))()
 
 local Window = Centrl:Window({
     Title = 'timebomb',
-    SubTitle = 'auto rotate',
+    SubTitle = 'auto play',
     Folder = 'TimebombAutoRotate',
     ToggleKey = Enum.KeyCode.RightShift,
     Accent = Color3.fromRGB(255, 90, 60),
 })
 
-local RotateTab = Window:Tab({ Title = 'auto rotate', Icon = 'crosshair' })
+local PlayTab = Window:Tab({ Title = 'auto play', Icon = 'crosshair' })
 
-local Main = RotateTab:Section({ Title = 'main', Side = 'left' })
+local Main = PlayTab:Section({ Title = 'main', Side = 'left' })
 
 Main:Toggle({
-    Title = 'auto rotate',
-    Flag = 'tb_enabled',
+    Title = 'auto play',
+    Flag = 'tb_autoplay',
     Default = false,
-    Callback = function(v) Config.Enabled = v end,
+    Callback = function(v) Config.AutoPlay = v end,
 })
 
 Main:Toggle({
@@ -246,7 +345,14 @@ Main:Slider({
     Callback = function(v) Config.MaxDistance = v end,
 })
 
-local Movement = RotateTab:Section({ Title = 'movement', Side = 'right' })
+local Movement = PlayTab:Section({ Title = 'movement', Side = 'right' })
+
+Movement:Toggle({
+    Title = 'use hug with auto play',
+    Flag = 'tb_use_hug',
+    Default = true,
+    Callback = function(v) Config.UseHug = v end,
+})
 
 Movement:Slider({
     Title = 'approach speed',
@@ -269,14 +375,14 @@ Movement:Slider({
     Title = 'hug distance',
     Flag = 'tb_hug_distance',
     Min = 1,
-    Max = 8,
+    Max = 20,
     Increment = 0.5,
     Default = 3,
     Suffix = ' studs',
     Callback = function(v) Config.HugDistance = v end,
 })
 
-local Targeting = RotateTab:Section({ Title = 'targeting', Side = 'left' })
+local Targeting = PlayTab:Section({ Title = 'targeting', Side = 'left' })
 
 Targeting:Toggle({
     Title = 'sticky target',
@@ -296,7 +402,27 @@ Targeting:Slider({
     Callback = function(v) Config.StickyThreshold = v end,
 })
 
-local Live = RotateTab:Section({ Title = 'live state', Side = 'right' })
+local AutoTP = PlayTab:Section({ Title = 'auto tp', Side = 'right' })
+
+AutoTP:Toggle({
+    Title = 'auto tp',
+    Flag = 'tb_auto_tp',
+    Default = false,
+    Callback = function(v) Config.AutoTPEnabled = v end,
+})
+
+AutoTP:Slider({
+    Title = 'tp when bomb timer at',
+    Flag = 'tb_auto_tp_threshold',
+    Min = 1,
+    Max = 5,
+    Increment = 1,
+    Default = 3,
+    Suffix = 's',
+    Callback = function(v) Config.AutoTPThreshold = v end,
+})
+
+local Live = PlayTab:Section({ Title = 'live state', Side = 'left' })
 local HasBombLabel = Live:Label({ Title = 'has bomb: no' })
 local InArenaLabel = Live:Label({ Title = 'in arena: no' })
 local TargetLabel = Live:Label({ Title = 'target: none' })
@@ -320,6 +446,36 @@ task.spawn(function()
         end
     end
 end)
+
+local HitboxTab = Window:Tab({ Title = 'hitbox', Icon = 'maximize' })
+local Hitbox = HitboxTab:Section({ Title = 'hitbox expander', Side = 'left' })
+
+Hitbox:Toggle({
+    Title = 'hitbox expander',
+    Flag = 'tb_hitbox_enabled',
+    Default = false,
+    Callback = function(v)
+        Config.HitboxEnabled = v
+        if not v then restoreAllHitboxSizes() end
+    end,
+})
+
+Hitbox:Slider({
+    Title = 'size multiplier',
+    Flag = 'tb_hitbox_multiplier',
+    Min = 1,
+    Max = 8,
+    Increment = 0.5,
+    Default = 3,
+    Suffix = 'x',
+    Callback = function(v) Config.HitboxMultiplier = v end,
+})
+
+local HitboxInfo = HitboxTab:Section({ Title = 'behavior', Side = 'right' })
+HitboxInfo:Paragraph({
+    Title = 'other players only',
+    Text = "Enlarges every other player's Torso (the actual collidable part on this R6 rig) so it's easier for the bomb to land a touch, either direction.",
+})
 
 Window:Load()
 
