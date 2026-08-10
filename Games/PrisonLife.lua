@@ -222,9 +222,18 @@ local silentAimHookAvailable = typeof(getgc) == "function" and typeof(hookfuncti
     and typeof(debug) == "table" and typeof(debug.getinfo) == "function"
 
 if silentAimHookAvailable then
+    -- getgc(true) walks the entire live-object heap - expensive enough that
+    -- running it a fixed 20 times regardless of outcome isn't worth it.
+    -- Different weapon behaviors (hitscan vs shotgun vs taser) can each
+    -- compile their own castRay closure, and some only exist once that
+    -- weapon's module actually gets required (e.g. on first equip), so this
+    -- keeps scanning - just backs off once nothing new has turned up for a
+    -- couple of passes instead of grinding through the full 20 unconditionally.
     task.spawn(function()
         local hooked = {}
+        local quietPasses = 0
         for _ = 1, 20 do
+            local foundNew = false
             pcall(function()
                 for _, func in next, getgc(true) do
                     if type(func) == "function" and not hooked[func] then
@@ -232,17 +241,31 @@ if silentAimHookAvailable then
                         if info and info.name == "castRay" then
                             pcall(hookfunction, func, hookedCast)
                             hooked[func] = true
+                            foundNew = true
                         end
                     end
                 end
             end)
+
+            if foundNew then
+                quietPasses = 0
+            else
+                quietPasses = quietPasses + 1
+                if next(hooked) and quietPasses >= 2 then
+                    break
+                end
+            end
+
             task.wait(3)
         end
     end)
 else
     -- Fallback: camera-lock at Camera render priority + 1, so any mouse-aimed
     -- fire logic reads the redirected orientation without us touching the
-    -- camera module's own stored angles.
+    -- camera module's own stored angles. Unbind first in case the script
+    -- got run more than once this session - BindToRenderStep errors on a
+    -- name that's already bound.
+    pcall(RunService.UnbindFromRenderStep, RunService, "PrisonLifeSilentAimFallback")
     RunService:BindToRenderStep("PrisonLifeSilentAimFallback", Enum.RenderPriority.Camera.Value + 1, function()
         if not Config.SilentAim then return end
         local target = getSilentAimTarget(Camera.CFrame.Position)
@@ -357,6 +380,10 @@ end
 
 Players.PlayerRemoving:Connect(destroyEspFor)
 
+-- Highlight color/transparency and the name+distance text only need to
+-- track loosely, not every frame - bundled into the same roster-refresh poll
+-- so RenderStepped below stays limited to what actually needs per-frame
+-- smoothness (Box/Tracer screen positions, which move with the camera).
 task.spawn(function()
     while true do
         task.wait(0.5)
@@ -369,6 +396,24 @@ task.spawn(function()
                         if objs then destroyEspFor(plr) end
                     elseif not objs or objs.Char ~= char or objs.Method ~= ESPConfig.Method or objs.ShowNames ~= ESPConfig.ShowNames then
                         buildEspFor(plr, char)
+                        objs = espObjects[plr]
+                    end
+
+                    if objs then
+                        local hrp = char:FindFirstChild("HumanoidRootPart")
+                        local color = espColorFor(plr)
+
+                        if objs.Highlight then
+                            objs.Highlight.FillTransparency = ESPConfig.Transparency
+                            objs.Highlight.FillColor = color
+                            objs.Highlight.OutlineColor = color
+                        end
+
+                        if objs.NameLabel and hrp then
+                            local dist = (Camera.CFrame.Position - hrp.Position).Magnitude
+                            objs.NameLabel.Text = ("%s [%d]"):format(plr.Name, math.floor(dist))
+                            objs.NameLabel.TextColor3 = color
+                        end
                     end
                 end
             end
@@ -389,18 +434,6 @@ RunService.RenderStepped:Connect(function()
         else
             local hrp = char:FindFirstChild("HumanoidRootPart")
             local color = espColorFor(plr)
-
-            if objs.Highlight then
-                objs.Highlight.FillTransparency = ESPConfig.Transparency
-                objs.Highlight.FillColor = color
-                objs.Highlight.OutlineColor = color
-            end
-
-            if objs.NameLabel and hrp then
-                local dist = (Camera.CFrame.Position - hrp.Position).Magnitude
-                objs.NameLabel.Text = ("%s [%d]"):format(plr.Name, math.floor(dist))
-                objs.NameLabel.TextColor3 = color
-            end
 
             if objs.Box and hrp then
                 local head = char:FindFirstChild("Head")
@@ -443,8 +476,10 @@ end)
 -- functionally matter vs. get silently re-validated server-side is unverified.
 -- Applied to every Tool in both Character and Backpack that already has the
 -- attribute, so it covers your whole loadout, not just whatever's equipped.
--- Every toggle/slider applies immediately on change (not just the poll loop
--- below) so dragging a slider updates your held gun's behavior right away.
+-- Every toggle/slider applies immediately on change, so the poll loop below
+-- only exists to catch the game resetting an attribute back on its own
+-- (e.g. a reload resetting CurrentAmmo) - it doesn't need to run anywhere
+-- near every frame to do that.
 local GunModStats = {
     { Key = "Damage", Title = "damage", Min = 1, Max = 300, Increment = 1, Default = 19 },
     { Key = "FireRate", Title = "fire rate", Min = 0.02, Max = 1, Increment = 0.01, Default = 0.12, Suffix = "s" },
@@ -501,7 +536,7 @@ end
 
 task.spawn(function()
     while true do
-        task.wait(0.03)
+        task.wait(0.5)
         applyGunModsNow()
     end
 end)
@@ -515,18 +550,33 @@ end)
 -- __namecall replays whatever real call the game's own script makes N times
 -- instead of reimplementing hit detection - it only ever fires calls the
 -- unmodified game logic already decided were legitimate.
+--
+-- __namecall fires for every method call anywhere in the game, so the hook
+-- itself has to return immediately - the repeat-fire work is handed off to a
+-- background task instead of looped synchronously inline. With the slider
+-- now going up to 1000, firing that many FireServer calls back-to-back in a
+-- single frame is exactly the kind of thing that freezes/crashes the
+-- client, so they're sent in small batches with a yield between each.
 local meleeEvent = ReplicatedStorage:WaitForChild("meleeEvent")
 local originalNamecall = nil
 local instaKillHookAvailable = false
+
+local INSTA_KILL_BATCH_SIZE = 20
 
 if typeof(hookmetamethod) == "function" and typeof(getnamecallmethod) == "function" then
     local ok = pcall(function()
         originalNamecall = hookmetamethod(game, "__namecall", function(self, ...)
             if Config.InstaKillPunch and self == meleeEvent and getnamecallmethod() == "FireServer" then
                 local args = { ... }
-                for _ = 1, Config.PunchHits do
-                    originalNamecall(self, table.unpack(args))
-                end
+                local hits = Config.PunchHits
+                task.spawn(function()
+                    for i = 1, hits do
+                        originalNamecall(self, table.unpack(args))
+                        if i % INSTA_KILL_BATCH_SIZE == 0 then
+                            task.wait()
+                        end
+                    end
+                end)
                 return
             end
             return originalNamecall(self, ...)
