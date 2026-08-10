@@ -3731,11 +3731,150 @@ local function add_menu_icon(win)
     end))
 end
 
+-- Native topbar (unibar) show/hide button, next to the chat icon -----------
+-- Ported from https://raw.githubusercontent.com/iamdookie1/inf/refs/heads/main/source.txt
+-- (search that file for "Interface visibility" / "UnibarLeftFrame"), which
+-- reverse-engineers CoreGui.TopBarApp.TopBarApp.UnibarLeftFrame.UnibarMenu:
+-- chat and nine_dot are 44x44 Frames sitting edge to edge under a numbered
+-- frame ("3") with a hardcoded pixel width, inside a pill background that's
+-- sized as a proportion of its parent and therefore tracks automatically.
+-- Adding our own icon means widening every literal-pixel-width ancestor up
+-- to (and including) UnibarLeftFrame by the icon's width, and re-measuring
+-- on a timer since Roblox can add/remove/resize its own icons at any time.
+--
+-- Unlike inf (mobile-only button, desktop gets a keybind instead), this
+-- always shows the icon - it's the library's one and only show/hide entry
+-- point now, replacing the floating MobileButton entirely (forced off
+-- below) rather than sitting alongside it.
+local function add_unibar_icon(win)
+    local ok = pcall(function()
+        local ICON_MARGIN = 4
+
+        local icon, icon_row
+
+        local function find_icon_row()
+            local app = CoreGui:FindFirstChild('TopBarApp')
+            local inner = app and app:FindFirstChild('TopBarApp')
+            local left_frame = inner and inner:FindFirstChild('UnibarLeftFrame')
+            local menu = left_frame and left_frame:FindFirstChild('UnibarMenu')
+            if not menu then return nil end
+            local sibling = menu:FindFirstChild('chat', true) or menu:FindFirstChild('nine_dot', true)
+            if not sibling or not sibling:IsA('GuiObject') or not sibling.Parent then return nil end
+            return sibling.Parent, sibling, left_frame
+        end
+
+        local function native_content_width(row)
+            local edge = 0
+            local row_left = row.AbsolutePosition.X
+            for _, child in row:GetChildren() do
+                if child ~= icon and child:IsA('GuiObject') and child.Visible and child.AbsoluteSize.X > 0 then
+                    local right = (child.AbsolutePosition.X - row_left) + child.AbsoluteSize.X
+                    if right > edge then edge = right end
+                end
+            end
+            return edge
+        end
+
+        local function widen(frame, target_width)
+            if frame.Size.X.Scale ~= 0 then return end
+            if frame.AutomaticSize == Enum.AutomaticSize.X or frame.AutomaticSize == Enum.AutomaticSize.XY then
+                return
+            end
+            local size = frame.Size
+            if size.X.Offset == target_width then return end
+            frame.Size = UDim2.new(size.X.Scale, target_width, size.Y.Scale, size.Y.Offset)
+        end
+
+        local function fit_icon(row, sibling, left_frame)
+            if not icon then return end
+            local native_width = native_content_width(row)
+            icon.Size = sibling.Size
+            icon.Position = UDim2.new(0, math.floor(native_width + 0.5), sibling.Position.Y.Scale, sibling.Position.Y.Offset)
+            icon.TextSize = math.clamp(math.floor(sibling.AbsoluteSize.Y * 0.55 + 0.5), 11, 22)
+
+            local target_width = math.floor(native_width + icon.Size.X.Offset + ICON_MARGIN + 0.5)
+            local node = row
+            while node and node:IsA('GuiObject') do
+                widen(node, target_width)
+                if node == left_frame then break end
+                node = node.Parent
+            end
+        end
+
+        local function paint_icon()
+            if not icon then return end
+            tween(icon, QUAD, { TextTransparency = win.Visible and 0 or 0.45 })
+        end
+
+        local function build_icon(row, sibling)
+            icon = Instance.new('TextButton')
+            icon.Name = 'menu'
+            icon.AutoButtonColor = false
+            icon.BackgroundTransparency = 1
+            icon.BorderSizePixel = 0
+            icon.Font = Enum.Font.GothamBold
+            icon.Text = '\226\137\161' -- "≡"
+            icon.TextColor3 = Color3.new(1, 1, 1)
+            icon.ZIndex = sibling.ZIndex
+            pcall(function() icon.AnchorPoint = sibling.AnchorPoint end)
+            pcall(function() icon.AutoLocalize = false end)
+            icon.Parent = row
+
+            track(icon.MouseButton1Click:Connect(function()
+                win:SetVisible(not win.Visible)
+                paint_icon()
+            end))
+            local function press(down)
+                tween(icon, TweenInfo.new(0.08), { TextTransparency = down and 0.6 or (win.Visible and 0 or 0.45) })
+            end
+            track(icon.InputBegan:Connect(function(input)
+                if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+                    press(true)
+                end
+            end))
+            track(icon.InputEnded:Connect(function(input)
+                if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+                    press(false)
+                end
+            end))
+            icon.TextTransparency = win.Visible and 0 or 0.45
+        end
+
+        local function refresh_icon()
+            local row, sibling, left_frame = find_icon_row()
+            if not row then return end
+            if icon and not icon:IsDescendantOf(game) then
+                icon:Destroy()
+                icon = nil
+            end
+            if not icon then
+                build_icon(row, sibling)
+            elseif icon.Parent ~= row then
+                icon.Parent = row
+            end
+            icon_row = row
+            fit_icon(row, sibling, left_frame)
+        end
+
+        refresh_icon()
+        task.spawn(function()
+            while icon and icon:IsDescendantOf(game) do
+                task.wait(2)
+                pcall(refresh_icon)
+            end
+        end)
+    end)
+    return ok
+end
+
 local _original_window = Library.Window
 function Library:Window(options)
+    options = options or {}
+    options.MobileButton = false -- replaced by the unibar icon below, not layered alongside it
     local win = _original_window(self, options)
     reflow_rail_to_top(win)
     add_menu_icon(win)
+    add_unibar_icon(win)
     return win
 end
 Library.window = Library.Window

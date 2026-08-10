@@ -5,6 +5,8 @@ local LocalPlayer = Players.LocalPlayer
 
 local Config = {
     AutoPlay = false,
+    AutoRotate = false,
+    RotateSpeed = 24,
     InArenaCheck = true,
     MaxDistance = 0,
 
@@ -20,6 +22,12 @@ local Config = {
 
     AutoTPEnabled = false,
     AutoTPThreshold = 3,
+
+    SpeedEnabled = false,
+    WalkSpeed = 16,
+    JumpEnabled = false,
+    JumpPower = 50,
+    InfiniteJump = false,
 }
 
 local function getChar()
@@ -133,46 +141,47 @@ local function getBombTimeLeft()
     return label and parseTimeLeft(label.Text)
 end
 
-local lockedTarget = nil
-local chasing = false
-local originalWalkSpeed = nil
+--// Auto rotate / auto play movement -----------------------------------------
+-- Two separate toggles sharing one target lock: AutoRotate alone only drives
+-- facing (for someone who wants to keep manually walking with WASD but
+-- always face whoever they'd hand the bomb to); AutoPlay additionally drives
+-- position. Either one disables the Humanoid's own AutoRotate property so
+-- Roblox's built-in movement-direction facing doesn't fight our manual
+-- CFrame rotation the moment the player presses a movement key.
 
-local function startChasing(humanoid)
-    if chasing then return end
-    chasing = true
-    originalWalkSpeed = humanoid.WalkSpeed
-    humanoid.AutoRotate = false
-    humanoid.WalkSpeed = Config.ApproachSpeed
+local lockedTarget = nil
+local engaged = false
+local originalWalkSpeed = nil
+local originalHumanoidAutoRotate = nil
+local platformStandOn = false
+
+-- Humanoid's own ground-state logic re-corrects HumanoidRootPart.CFrame's Y
+-- every physics step to keep the character grounded, which silently undid
+-- the hug nudge's vertical component no matter what we set it to.
+-- PlatformStand fully hands position control to us for as long as it's on,
+-- so the Y write actually sticks - it's only toggled on for the brief final
+-- few studs, not the whole approach.
+local function setPlatformStand(humanoid, state)
+    if not humanoid or platformStandOn == state then return end
+    platformStandOn = state
+    humanoid.PlatformStand = state
 end
 
-local function stopChasing(humanoid)
-    if not chasing then return end
-    chasing = false
+local function disengage(humanoid)
+    if not engaged then return end
+    engaged = false
     lockedTarget = nil
     if humanoid then
-        humanoid.AutoRotate = true
+        if originalHumanoidAutoRotate ~= nil then
+            humanoid.AutoRotate = originalHumanoidAutoRotate
+        end
         if originalWalkSpeed then
             humanoid.WalkSpeed = originalWalkSpeed
         end
+        setPlatformStand(humanoid, false)
     end
+    originalHumanoidAutoRotate = nil
     originalWalkSpeed = nil
-end
-
--- Lands just short of the target rather than exactly on top of them, from
--- whichever side we're already approaching from, matching their height
--- exactly so the landing spot is guaranteed to overlap their hitbox instead
--- of leaving a vertical gap on stairs/platforms.
-local TP_LAND_DISTANCE = 1.5
-
-local function teleportNear(myHRP, targetHRP)
-    local away = myHRP.Position - targetHRP.Position
-    local flatAway = Vector3.new(away.X, 0, away.Z)
-    if flatAway.Magnitude < 0.1 then
-        flatAway = Vector3.new(1, 0, 0)
-    end
-    local landPos = targetHRP.Position + flatAway.Unit * TP_LAND_DISTANCE
-    landPos = Vector3.new(landPos.X, targetHRP.Position.Y, landPos.Z)
-    myHRP.CFrame = CFrame.lookAt(landPos, targetHRP.Position)
 end
 
 local lastMoveTo = 0
@@ -183,19 +192,21 @@ local MOVE_TO_INTERVAL = 0.15
 -- jobs: face the target's *current* position exactly every frame (rotation
 -- only, never fights whatever is driving position), and actually close the
 -- distance to them (position), snapping the last few studs so the bomb's
--- hitbox genuinely overlaps theirs instead of stopping just short. When the
--- timer's critical, auto tp skips the walk entirely and lands next to them.
+-- hitbox genuinely overlaps theirs instead of stopping just short.
 RunService.Heartbeat:Connect(function(dt)
     local humanoid = getHumanoid()
+    local wantActive = (Config.AutoPlay or Config.AutoRotate)
+        and iHaveBomb()
+        and not (Config.InArenaCheck and not isInArena())
 
-    if not Config.AutoPlay or (Config.InArenaCheck and not isInArena()) or not iHaveBomb() then
-        stopChasing(humanoid)
+    if not wantActive or not humanoid then
+        disengage(humanoid)
         return
     end
 
     local myHRP = getHRP()
-    if not myHRP or not humanoid then
-        stopChasing(humanoid)
+    if not myHRP then
+        disengage(humanoid)
         return
     end
 
@@ -223,84 +234,195 @@ RunService.Heartbeat:Connect(function(dt)
     end
 
     if not target then
-        stopChasing(humanoid)
+        disengage(humanoid)
         return
     end
     lockedTarget = target
-    startChasing(humanoid)
+
+    if not engaged then
+        engaged = true
+        originalHumanoidAutoRotate = humanoid.AutoRotate
+    end
+    humanoid.AutoRotate = false
 
     local tHRP = target.Character.HumanoidRootPart
-
-    if Config.AutoTPEnabled then
-        local timeLeft = getBombTimeLeft()
-        if timeLeft and timeLeft <= Config.AutoTPThreshold then
-            teleportNear(myHRP, tHRP)
-            return
-        end
-    end
-
     local toTarget = tHRP.Position - myHRP.Position
     local flatToTarget = Vector3.new(toTarget.X, 0, toTarget.Z)
     local dist3D = toTarget.Magnitude
 
     if flatToTarget.Magnitude > 0.05 then
-        myHRP.CFrame = CFrame.lookAt(myHRP.Position, myHRP.Position + flatToTarget)
+        local lookCF = CFrame.lookAt(myHRP.Position, myHRP.Position + flatToTarget)
+        myHRP.CFrame = myHRP.CFrame:Lerp(lookCF, math.min(Config.RotateSpeed * dt, 1))
     end
 
+    if not Config.AutoPlay then
+        -- Rotate-only mode: leave position entirely to the player.
+        if originalWalkSpeed then
+            humanoid.WalkSpeed = originalWalkSpeed
+            originalWalkSpeed = nil
+        end
+        setPlatformStand(humanoid, false)
+        return
+    end
+
+    if not originalWalkSpeed then
+        originalWalkSpeed = humanoid.WalkSpeed
+    end
+    humanoid.WalkSpeed = Config.ApproachSpeed
+
     if Config.UseHug and dist3D <= Config.HugDistance then
+        setPlatformStand(humanoid, true)
         local step = math.min(dist3D, Config.ApproachSpeed * dt)
         if toTarget.Magnitude > 0.05 then
             myHRP.CFrame = myHRP.CFrame + toTarget.Unit * step
         end
-    elseif os.clock() - lastMoveTo > MOVE_TO_INTERVAL then
-        lastMoveTo = os.clock()
-        humanoid:MoveTo(tHRP.Position)
-    end
-end)
-
-LocalPlayer.CharacterAdded:Connect(function()
-    chasing = false
-    lockedTarget = nil
-    originalWalkSpeed = nil
-end)
-
--- Hitbox expander: R6 characters here, so "Torso" is the one part that's
--- both large and actually collidable/touchable (arms/legs are thin and
--- HumanoidRootPart doesn't collide) - enlarging it makes it far easier for
--- either side's BombHandle to land a touch. Runs independently of auto play
--- so it's usable on its own.
-local hitboxOriginalSizes = {}
-
-local function applyHitboxSize(plr)
-    local char = plr.Character
-    local torso = char and char:FindFirstChild("Torso")
-    if not torso then return end
-    if not hitboxOriginalSizes[torso] then
-        hitboxOriginalSizes[torso] = torso.Size
-    end
-    local desired = hitboxOriginalSizes[torso] * Config.HitboxMultiplier
-    if (torso.Size - desired).Magnitude > 0.05 then
-        torso.Size = desired
-    end
-end
-
-local function restoreAllHitboxSizes()
-    for torso, size in pairs(hitboxOriginalSizes) do
-        if torso and torso.Parent then
-            torso.Size = size
+    else
+        setPlatformStand(humanoid, false)
+        if os.clock() - lastMoveTo > MOVE_TO_INTERVAL then
+            lastMoveTo = os.clock()
+            humanoid:MoveTo(tHRP.Position)
         end
     end
-    hitboxOriginalSizes = {}
+end)
+
+--// Auto tp -------------------------------------------------------------------
+-- Deliberately outside the AutoPlay/AutoRotate gate above - this is its own
+-- feature with its own toggle, and needs to work even with both of those
+-- off. Lands just short of the target (matching their height exactly, same
+-- as the hug fix) rather than exactly on top of them, then waits for the
+-- bomb to actually be gone before returning to where it teleported from, so
+-- it never yanks the player back while they're still the one holding it.
+local TP_LAND_DISTANCE = 1.5
+local TP_RETURN_TIMEOUT = 8
+
+local function teleportNear(myHRP, targetHRP)
+    local away = myHRP.Position - targetHRP.Position
+    local flatAway = Vector3.new(away.X, 0, away.Z)
+    if flatAway.Magnitude < 0.1 then
+        flatAway = Vector3.new(1, 0, 0)
+    end
+    local landPos = targetHRP.Position + flatAway.Unit * TP_LAND_DISTANCE
+    landPos = Vector3.new(landPos.X, targetHRP.Position.Y, landPos.Z)
+    myHRP.CFrame = CFrame.lookAt(landPos, targetHRP.Position)
+end
+
+local tpInProgress = false
+
+task.spawn(function()
+    while true do
+        task.wait(0.1)
+        if not tpInProgress and Config.AutoTPEnabled and iHaveBomb()
+            and not (Config.InArenaCheck and not isInArena()) then
+            local timeLeft = getBombTimeLeft()
+            if timeLeft and timeLeft <= Config.AutoTPThreshold then
+                local myHRP = getHRP()
+                local target = myHRP and findBestTarget(myHRP)
+                local tHRP = target and target.Character and target.Character:FindFirstChild("HumanoidRootPart")
+                if myHRP and tHRP then
+                    tpInProgress = true
+                    local originalChar = getChar()
+                    local originalCFrame = myHRP.CFrame
+                    teleportNear(myHRP, tHRP)
+
+                    task.spawn(function()
+                        local deadline = os.clock() + TP_RETURN_TIMEOUT
+                        while iHaveBomb() and os.clock() < deadline do
+                            task.wait(0.05)
+                        end
+                        if not iHaveBomb() and getChar() == originalChar then
+                            local backHRP = getHRP()
+                            if backHRP then
+                                backHRP.CFrame = originalCFrame
+                            end
+                        end
+                        tpInProgress = false
+                    end)
+                end
+            end
+        end
+    end
+end)
+
+--// Hitbox expander -----------------------------------------------------------
+-- Client-side Size changes never replicate anywhere - not to the server, not
+-- to other clients - regardless of which part gets resized. Resizing other
+-- players' Torso only ever changed what this client sees; the server's own
+-- copy (the one that decides whether a touch actually counts) never moved.
+-- BombHandle is network-owned by whoever's holding it, so while we hold the
+-- bomb, we ARE the one simulating that part's physics - resizing it here is
+-- a change the server actually receives back through the TouchTransmitter,
+-- unlike resizing anyone else's anything.
+local hitboxBaseSize = nil
+
+local function getMyBombHandle()
+    local char = getChar()
+    local tool = char and char:FindFirstChildOfClass("Tool")
+    return tool and tool:FindFirstChild("BombHandle")
+end
+
+local function restoreHitboxSize()
+    local handle = getMyBombHandle()
+    if handle and hitboxBaseSize then
+        handle.Size = hitboxBaseSize
+    end
 end
 
 task.spawn(function()
     while true do
-        task.wait(0.3)
+        task.wait(0.05)
         if Config.HitboxEnabled then
-            for _, plr in ipairs(Players:GetPlayers()) do
-                if plr ~= LocalPlayer then
-                    applyHitboxSize(plr)
+            local handle = getMyBombHandle()
+            if handle then
+                if not hitboxBaseSize then
+                    hitboxBaseSize = handle.Size
                 end
+                local desired = hitboxBaseSize * Config.HitboxMultiplier
+                if (handle.Size - desired).Magnitude > 0.01 then
+                    handle.Size = desired
+                end
+            end
+        end
+    end
+end)
+
+--// Player tab (speed / jump) -------------------------------------------------
+-- Yields to the auto-play chase while it's actively driving WalkSpeed, so
+-- the two don't fight over the same property every frame.
+local function walkSpeedOwnedByChase()
+    return engaged and Config.AutoPlay
+end
+
+local function setupCharacter(char)
+    local humanoid = char:WaitForChild("Humanoid", 5)
+    if not humanoid then return end
+    humanoid.StateChanged:Connect(function(_, new)
+        if Config.InfiniteJump and new == Enum.HumanoidStateType.Landed then
+            humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
+        end
+    end)
+end
+
+setupCharacter(getChar() or LocalPlayer.CharacterAdded:Wait())
+
+LocalPlayer.CharacterAdded:Connect(function(char)
+    engaged = false
+    lockedTarget = nil
+    originalWalkSpeed = nil
+    originalHumanoidAutoRotate = nil
+    platformStandOn = false
+    setupCharacter(char)
+end)
+
+task.spawn(function()
+    while true do
+        task.wait(0.1)
+        local humanoid = getHumanoid()
+        if humanoid and not walkSpeedOwnedByChase() then
+            if Config.SpeedEnabled then
+                humanoid.WalkSpeed = Config.WalkSpeed
+            end
+            if Config.JumpEnabled then
+                humanoid.JumpPower = Config.JumpPower
             end
         end
     end
@@ -325,6 +447,23 @@ Main:Toggle({
     Flag = 'tb_autoplay',
     Default = false,
     Callback = function(v) Config.AutoPlay = v end,
+})
+
+Main:Toggle({
+    Title = 'auto rotate',
+    Flag = 'tb_autorotate',
+    Default = false,
+    Callback = function(v) Config.AutoRotate = v end,
+})
+
+Main:Slider({
+    Title = 'rotate speed',
+    Flag = 'tb_rotate_speed',
+    Min = 2,
+    Max = 60,
+    Increment = 1,
+    Default = 24,
+    Callback = function(v) Config.RotateSpeed = v end,
 })
 
 Main:Toggle({
@@ -364,7 +503,7 @@ Movement:Slider({
     Suffix = ' studs/s',
     Callback = function(v)
         Config.ApproachSpeed = v
-        if chasing then
+        if engaged and Config.AutoPlay then
             local humanoid = getHumanoid()
             if humanoid then humanoid.WalkSpeed = v end
         end
@@ -422,6 +561,11 @@ AutoTP:Slider({
     Callback = function(v) Config.AutoTPThreshold = v end,
 })
 
+AutoTP:Paragraph({
+    Title = 'works standalone',
+    Text = "Fires off its own toggle and the bomb timer alone - doesn't need auto play or auto rotate on. Teleports back once the bomb is confirmed gone.",
+})
+
 local Live = PlayTab:Section({ Title = 'live state', Side = 'left' })
 local HasBombLabel = Live:Label({ Title = 'has bomb: no' })
 local InArenaLabel = Live:Label({ Title = 'in arena: no' })
@@ -447,6 +591,50 @@ task.spawn(function()
     end
 end)
 
+local PlayerTab = Window:Tab({ Title = 'player', Icon = 'user' })
+local PlayerMovement = PlayerTab:Section({ Title = 'movement', Side = 'left' })
+
+PlayerMovement:Toggle({
+    Title = 'speed',
+    Flag = 'tb_speed_enabled',
+    Default = false,
+    Callback = function(v) Config.SpeedEnabled = v end,
+})
+
+PlayerMovement:Slider({
+    Title = 'walkspeed',
+    Flag = 'tb_walkspeed',
+    Min = 16,
+    Max = 200,
+    Increment = 1,
+    Default = 16,
+    Callback = function(v) Config.WalkSpeed = v end,
+})
+
+PlayerMovement:Toggle({
+    Title = 'jump',
+    Flag = 'tb_jump_enabled',
+    Default = false,
+    Callback = function(v) Config.JumpEnabled = v end,
+})
+
+PlayerMovement:Slider({
+    Title = 'jump power',
+    Flag = 'tb_jumppower',
+    Min = 50,
+    Max = 300,
+    Increment = 5,
+    Default = 50,
+    Callback = function(v) Config.JumpPower = v end,
+})
+
+PlayerMovement:Toggle({
+    Title = 'infinite jump',
+    Flag = 'tb_infinite_jump',
+    Default = false,
+    Callback = function(v) Config.InfiniteJump = v end,
+})
+
 local HitboxTab = Window:Tab({ Title = 'hitbox', Icon = 'maximize' })
 local Hitbox = HitboxTab:Section({ Title = 'hitbox expander', Side = 'left' })
 
@@ -456,7 +644,7 @@ Hitbox:Toggle({
     Default = false,
     Callback = function(v)
         Config.HitboxEnabled = v
-        if not v then restoreAllHitboxSizes() end
+        if not v then restoreHitboxSize() end
     end,
 })
 
@@ -473,8 +661,8 @@ Hitbox:Slider({
 
 local HitboxInfo = HitboxTab:Section({ Title = 'behavior', Side = 'right' })
 HitboxInfo:Paragraph({
-    Title = 'other players only',
-    Text = "Enlarges every other player's Torso (the actual collidable part on this R6 rig) so it's easier for the bomb to land a touch, either direction.",
+    Title = 'your bomb only, not their body',
+    Text = "Resizing another player's body only ever changes what this client sees - the server's own copy never moves, so it can't affect a real touch. BombHandle is network-owned by whoever's holding it, so enlarging it while you hold the bomb is a change the server actually simulates.",
 })
 
 Window:Load()
