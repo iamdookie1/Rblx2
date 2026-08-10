@@ -189,7 +189,18 @@ local function pushChildren(stack, inst, depth, prefix)
 end
 
 local function runDump(writers, progress, isCancelled)
-    local stats = { instances = 0, scripts = 0, remotes = 0, values = 0, decompileFailures = 0, truncated = 0 }
+    local stats = { instances = 0, scripts = 0, remotes = 0, values = 0, decompileFailures = 0, truncated = 0, skippedDuplicates = 0 }
+
+    -- Roots overlap on purpose (Players contains LocalPlayer, which already
+    -- has Backpack/PlayerGui/PlayerScripts as real children before we also
+    -- list them as their own roots for convenience) and a big, active game
+    -- can reparent things mid-scan, so the same instance can genuinely turn
+    -- up twice. Weak-keyed so an entry stops pinning memory the moment the
+    -- instance itself is actually gone (destroyed and unreferenced
+    -- elsewhere) instead of holding every instance we've ever seen alive
+    -- in our own table for the rest of a long run - remembers just long
+    -- enough to dedupe, forgets as soon as that's no longer needed.
+    local visited = setmetatable({}, { __mode = "k" })
 
     local stack = {}
     local roots = getRoots()
@@ -208,7 +219,10 @@ local function runDump(writers, progress, isCancelled)
         local okName, name = pcall(function() return inst.Name end)
         local okClass, className = pcall(function() return inst.ClassName end)
 
-        if okName and okClass then
+        if okName and okClass and visited[inst] then
+            stats.skippedDuplicates = stats.skippedDuplicates + 1
+        elseif okName and okClass then
+            visited[inst] = true
             stats.instances = stats.instances + 1
             processed = processed + 1
 
@@ -364,8 +378,8 @@ StartButton = Run:Button({
 
             local startTime = os.clock()
             local ok, stats = pcall(runDump, writers, function(s, queued)
-                CountLabel:Set(('instances: %d  scripts: %d  remotes: %d  values: %d  (queued: %d)')
-                    :format(s.instances, s.scripts, s.remotes, s.values, queued))
+                CountLabel:Set(('instances: %d  scripts: %d  remotes: %d  values: %d  dupes skipped: %d  (queued: %d)')
+                    :format(s.instances, s.scripts, s.remotes, s.values, s.skippedDuplicates, queued))
             end, function() return cancelRequested end)
 
             for _, writer in pairs(writers) do
@@ -377,8 +391,8 @@ StartButton = Run:Button({
             if ok then
                 summary:write(("Place: %d\nGenerated: %s\nDuration: %.1fs\nCancelled: %s\n\n"):format(
                     game.PlaceId, os.date('%Y-%m-%d %H:%M:%S'), duration, tostring(cancelRequested)))
-                summary:write(("Instances: %d\nScripts decompiled: %d\nDecompile failures: %d\nTruncated scripts: %d\nRemotes: %d\nValues: %d\n"):format(
-                    stats.instances, stats.scripts, stats.decompileFailures, stats.truncated, stats.remotes, stats.values))
+                summary:write(("Instances: %d\nDuplicate visits skipped: %d\nScripts decompiled: %d\nDecompile failures: %d\nTruncated scripts: %d\nRemotes: %d\nValues: %d\n"):format(
+                    stats.instances, stats.skippedDuplicates, stats.scripts, stats.decompileFailures, stats.truncated, stats.remotes, stats.values))
                 summary:close()
 
                 StatusLabel:Set(cancelRequested and 'status: cancelled' or 'status: done')
