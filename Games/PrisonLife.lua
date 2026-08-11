@@ -330,9 +330,23 @@ local function normalCast(p1, p2, p3)
     return nil, origin + direction.Unit * range
 end
 
+-- The genuine original, captured the first time a hook lands. Delegating to
+-- it when silent aim is off is both more faithful than re-implementing the
+-- raycast and cheaper - normalCast is only the fallback for when we somehow
+-- never got a real original to call.
+local originalCastRay = nil
+
+local function passthroughCast(p1, p2, p3)
+    if originalCastRay then
+        local ok, a, b = pcall(originalCastRay, p1, p2, p3)
+        if ok then return a, b end
+    end
+    return normalCast(p1, p2, p3)
+end
+
 local function hookedCast(p1, p2, p3)
     if not Aim.SilentAim then
-        return normalCast(p1, p2, p3)
+        return passthroughCast(p1, p2, p3)
     end
 
     local origin
@@ -353,48 +367,91 @@ local function hookedCast(p1, p2, p3)
         end
     end
 
-    return normalCast(p1, p2, p3)
+    return passthroughCast(p1, p2, p3)
+end
+
+-- Every function we've already replaced. Without this the scan re-hooks the
+-- same castRay on every pass, and hookfunction stacks: each new hook wraps
+-- the previous one, so after a few minutes a single shot walks a chain
+-- hundreds of trampolines deep. That is a slow-building framerate leak that
+-- ends in a crash, and it also silently defeated the old backoff (a pass
+-- that "successfully" re-hooked always looked productive, so the scan never
+-- went quiet). Weak-keyed so a function that gets collected stops being
+-- pinned here.
+local hookedFunctions = setmetatable({}, { __mode = "k" })
+
+-- One pass over the GC. Returns how many genuinely new functions it hooked.
+local function scanForCastRay()
+    if not silentAimAPIAvailable then return 0 end
+
+    local newHooks = 0
+    pcall(function()
+        for _, object in ipairs(getgc()) do
+            if type(object) == "function"
+                and not hookedFunctions[object]
+                -- Never hook our own replacements, or the hook ends up
+                -- calling itself.
+                and object ~= hookedCast
+                and object ~= passthroughCast
+                and object ~= normalCast
+            then
+                local info = debug.getinfo(object)
+                if info and info.name == "castRay" then
+                    local ok, previous = pcall(hookfunction, object, hookedCast)
+                    if ok then
+                        hookedFunctions[object] = true
+                        if type(previous) == "function" and previous ~= hookedCast then
+                            originalCastRay = originalCastRay or previous
+                        end
+                        castRayHookFound = true
+                        newHooks = newHooks + 1
+                    end
+                end
+            end
+        end
+    end)
+    return newHooks
+end
+
+-- A gun only registers a new castRay when it's actually equipped, so that's
+-- the event worth reacting to - far cheaper and more accurate than walking
+-- the whole heap on a timer forever.
+local function scanSoon()
+    if not silentAimAPIAvailable or Unloading then return end
+    task.delay(0.35, function()
+        if not Unloading and Aim.SilentAim then scanForCastRay() end
+    end)
+end
+
+local function watchCharacterForTools(char)
+    track(char.ChildAdded:Connect(function(child)
+        if child:IsA("Tool") then scanSoon() end
+    end))
 end
 
 local function startSilentAimHookScan()
     if hookScanStarted or not silentAimAPIAvailable then return end
     hookScanStarted = true
 
+    local char = getCharacter()
+    if char then watchCharacterForTools(char) end
+    track(LocalPlayer.CharacterAdded:Connect(function(newChar)
+        watchCharacterForTools(newChar)
+        scanSoon()
+    end))
+
     spawnLoop(function()
-        local quietPasses = 0
-        while not Unloading do
-            local hookedThisPass = false
-            local ok = pcall(function()
-                for _, object in ipairs(getgc()) do
-                    if type(object) == "function" then
-                        local info = debug.getinfo(object)
-                        if info and info.name == "castRay" then
-                            local hooked = pcall(hookfunction, object, hookedCast)
-                            if hooked then
-                                castRayHookFound = true
-                                hookedThisPass = true
-                            end
-                        end
-                    end
-                end
-            end)
-
-            if not ok then break end
-
-            -- Guns re-register their cast function when re-equipped, so the
-            -- scan keeps running - but backs right off once things go quiet
-            -- so it isn't a permanent tax on the client.
-            if hookedThisPass then
-                quietPasses = 0
-            elseif castRayHookFound then
-                quietPasses = quietPasses + 1
-                if quietPasses >= 2 then
-                    task.wait(5)
-                    quietPasses = 0
-                end
+        -- A few opening passes to catch a gun that was already equipped
+        -- before silent aim was switched on, then this loop is done for
+        -- good - equip events take over from here.
+        local emptyPasses = 0
+        while not Unloading and emptyPasses < 4 do
+            if scanForCastRay() > 0 then
+                emptyPasses = 0
+            else
+                emptyPasses = emptyPasses + 1
             end
-
-            task.wait(1.5)
+            task.wait(2)
         end
     end)
 end
@@ -534,9 +591,16 @@ end)
 -- times in a row is the whole "insta kill" trick - there's no damage
 -- argument to inflate, just repetition.
 local INSTA_KILL_BATCH = 20
+local INSTA_KILL_MAX_BURSTS = 2
+local instaKillBursts = 0
 
 local function queueInstaKill(target)
     if not MeleeEvent then return end
+    -- Holding down punch fires this repeatedly, and each burst can be up to
+    -- PunchHits remote calls - without a cap they stack into a self-inflicted
+    -- flood that lags the client long before it kills anything.
+    if instaKillBursts >= INSTA_KILL_MAX_BURSTS then return end
+    instaKillBursts = instaKillBursts + 1
     spawnLoop(function()
         -- Minus one: the punch that triggered this hook is already on its
         -- way, so PunchHits counts total hits, not extra ones.
@@ -551,6 +615,7 @@ local function queueInstaKill(target)
             -- the hook fired on.
             task.wait()
         end
+        instaKillBursts = instaKillBursts - 1
     end)
 end
 
@@ -679,7 +744,10 @@ local function setNoclip(state)
     end
     -- PreSimulation, not PostSimulation: collisions have to be off *before*
     -- the physics step resolves them, not after it already pushed us out.
-    noclipConnection = track(PreSimulation:Connect(function()
+    -- Deliberately not registered in Connections - it's owned by
+    -- noclipConnection and replaced on every toggle, so tracking it would
+    -- just grow that list by one dead entry per toggle.
+    noclipConnection = PreSimulation:Connect(function()
         if not Move.Noclip or Unloading then return end
         local char = getCharacter()
         if not char then return end
@@ -688,7 +756,7 @@ local function setNoclip(state)
                 part.CanCollide = false
             end
         end
-    end))
+    end)
 end
 
 local function stopFly()
@@ -1733,9 +1801,14 @@ spawnLoop(function()
         if not silentAimAPIAvailable then
             text = 'castRay hook: unsupported executor'
         elseif castRayHookFound then
-            text = 'castRay hook: active (true silent aim)'
+            local count = 0
+            for _ in pairs(hookedFunctions) do count = count + 1 end
+            -- The count should settle at a small number and stay there. If it
+            -- climbs steadily, something is re-hooking and the frame time is
+            -- about to go with it.
+            text = ('castRay hook: active (%d hooked)'):format(count)
         elseif hookScanStarted then
-            text = 'castRay hook: scanning (camera lock covering)'
+            text = 'castRay hook: none found - camera lock covering'
         else
             text = 'castRay hook: not attempted'
         end
