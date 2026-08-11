@@ -7,6 +7,7 @@ local WATCH_DURATION = 5
 local Games = {
     [9391468976] = { Name = 'Jujutsu Shenanigans', Script = 'Games/Jjs' },
     [106920577206536] = { Name = 'A Quiet Place', Script = 'Games/Survival.lua' },
+    [155615604] = { Name = 'Prison Life', Script = 'Games/PrisonLife.lua' },
 }
 
 local Centrl = loadstring(game:HttpGet('https://raw.githubusercontent.com/iamdookie1/Ui/main/Lib2.lua'))()
