@@ -79,6 +79,8 @@ local RemotesFolder = waitForPath(ReplicatedStorage, { "Remotes" })
 local ArrestPlayer = RemotesFolder and RemotesFolder:FindFirstChild("ArrestPlayer")
 local RequestTeamChange = RemotesFolder and RemotesFolder:FindFirstChild("RequestTeamChange")
 local MeleeEvent = ReplicatedStorage:FindFirstChild("meleeEvent")
+local GunRemotes = ReplicatedStorage:FindFirstChild("GunRemotes")
+local ShootEvent = GunRemotes and GunRemotes:FindFirstChild("ShootEvent")
 
 local DEFAULT_WALKSPEED = 16
 local DEFAULT_JUMPPOWER = 50
@@ -214,14 +216,16 @@ local function canDamage(plr)
     return true
 end
 
+local visionParams = RaycastParams.new()
+visionParams.FilterType = Enum.RaycastFilterType.Exclude
+visionParams.IgnoreWater = true
+
 local function isVisible(char, origin)
     if not Aim.WallCheck then return true end
     local target = char:FindFirstChild(Aim.AimPart) or char:FindFirstChild("HumanoidRootPart")
     if not target then return false end
-    local params = RaycastParams.new()
-    params.FilterType = Enum.RaycastFilterType.Exclude
+    local params = visionParams
     params.FilterDescendantsInstances = { getCharacter(), char }
-    params.IgnoreWater = true
     local direction = target.Position - origin
     local ok, result = pcall(function() return Workspace:Raycast(origin, direction, params) end)
     if not ok then return true end
@@ -269,6 +273,32 @@ local function getTarget(origin)
     return best
 end
 
+--// Target cache ----------------------------------------------------------------
+-- getTarget raycasts once per player, and the shot path can call into it a
+-- lot: ProjectileCount up to 20 means 20 casts per shot, and FireRate down
+-- to 0.02 means 50 shots a second. That is 1000 casts/sec, each previously
+-- doing a full player scan with a raycast each - tens of thousands of
+-- raycasts per second on a busy server, which is what was actually killing
+-- the client whenever gun mods were on.
+--
+-- Nothing about the answer changes 1000 times a second, so it's computed at
+-- most once per frame and every cast just reads the result. This makes the
+-- shot path O(1) no matter how the gun is configured.
+local cachedTarget = nil
+local cachedTargetAt = 0
+local TARGET_CACHE_SECONDS = 1 / 30
+
+local function getCachedTarget(origin)
+    local now = os.clock()
+    if cachedTarget and cachedTarget.Parent and (now - cachedTargetAt) < TARGET_CACHE_SECONDS then
+        return cachedTarget
+    end
+    cachedTargetAt = now
+    local ok, result = pcall(getTarget, origin)
+    cachedTarget = ok and result or nil
+    return cachedTarget
+end
+
 --// Silent aim -----------------------------------------------------------------
 -- The gun tool's fire script never appears in a dump (it only exists in your
 -- Backpack while a gun is actually held, and it isn't decompilable from
@@ -298,6 +328,10 @@ end
 -- The real castRay is called with a flexible argument order depending on the
 -- gun, so both wrappers below sniff the arguments by type rather than
 -- assuming positions.
+local castParams = RaycastParams.new()
+castParams.FilterType = Enum.RaycastFilterType.Exclude
+castParams.CollisionGroup = "ClientBullet"
+
 local function normalCast(p1, p2, p3)
     local origin, aim, tool
     if typeof(p1) == "Vector3" then
@@ -318,10 +352,11 @@ local function normalCast(p1, p2, p3)
     if direction.Magnitude <= 0 then direction = Vector3.new(0, 0, -1) end
 
     local range = toolAttribute(tool, "Range") or 200
-    local params = RaycastParams.new()
-    params.FilterType = Enum.RaycastFilterType.Exclude
+    -- Reused rather than allocated per cast: this runs on the shot path,
+    -- which a modded fire rate and projectile count can drive into the
+    -- hundreds of calls a second.
+    local params = castParams
     params.FilterDescendantsInstances = getCharacter() and { getCharacter() } or {}
-    params.CollisionGroup = "ClientBullet"
 
     local result = Workspace:Raycast(origin, direction.Unit * range, params)
     if result then
@@ -330,23 +365,14 @@ local function normalCast(p1, p2, p3)
     return nil, origin + direction.Unit * range
 end
 
--- The genuine original, captured the first time a hook lands. Delegating to
--- it when silent aim is off is both more faithful than re-implementing the
--- raycast and cheaper - normalCast is only the fallback for when we somehow
--- never got a real original to call.
-local originalCastRay = nil
-
-local function passthroughCast(p1, p2, p3)
-    if originalCastRay then
-        local ok, a, b = pcall(originalCastRay, p1, p2, p3)
-        if ok then return a, b end
-    end
-    return normalCast(p1, p2, p3)
-end
-
+-- Deliberately never delegates to a captured "original". hookfunction hands
+-- back a callable trampoline which is itself a live function named castRay,
+-- so a later scan could hook that too - and then calling the original would
+-- re-enter the hook and recurse until the stack blew. Falling back to our
+-- own normalCast has no such cycle.
 local function hookedCast(p1, p2, p3)
     if not Aim.SilentAim then
-        return passthroughCast(p1, p2, p3)
+        return normalCast(p1, p2, p3)
     end
 
     local origin
@@ -360,14 +386,14 @@ local function hookedCast(p1, p2, p3)
         -- anything far from us is somebody else's shot being simulated
         -- locally, and rewriting those does nothing but corrupt visuals.
         if root and (origin - root.Position).Magnitude <= 75 then
-            local ok, target = pcall(getTarget, origin)
-            if ok and target and target.Parent then
+            local target = getCachedTarget(origin)
+            if target and target.Parent then
                 return target, target.Position
             end
         end
     end
 
-    return passthroughCast(p1, p2, p3)
+    return normalCast(p1, p2, p3)
 end
 
 -- Every function we've already replaced. Without this the scan re-hooks the
@@ -392,7 +418,6 @@ local function scanForCastRay()
                 -- Never hook our own replacements, or the hook ends up
                 -- calling itself.
                 and object ~= hookedCast
-                and object ~= passthroughCast
                 and object ~= normalCast
             then
                 local info = debug.getinfo(object)
@@ -400,8 +425,11 @@ local function scanForCastRay()
                     local ok, previous = pcall(hookfunction, object, hookedCast)
                     if ok then
                         hookedFunctions[object] = true
-                        if type(previous) == "function" and previous ~= hookedCast then
-                            originalCastRay = originalCastRay or previous
+                        -- The returned trampoline is itself a live function
+                        -- named castRay; mark it hooked so a later pass
+                        -- never wraps it and builds a cycle.
+                        if type(previous) == "function" then
+                            hookedFunctions[previous] = true
                         end
                         castRayHookFound = true
                         newHooks = newHooks + 1
@@ -473,7 +501,9 @@ RunService:BindToRenderStep(CAMERA_LOCK_BIND, Enum.RenderPriority.Camera.Value +
     local wantLock = Aim.CameraLock or (Aim.SilentAim and not castRayHookFound)
     if not wantLock then return end
 
-    local target = getTarget(Camera.CFrame.Position)
+    -- Shares the cache with the shot path so turning both on doesn't scan
+    -- the player list twice per frame.
+    local target = getCachedTarget(Camera.CFrame.Position)
     if not target then return end
 
     local goal = CFrame.new(Camera.CFrame.Position, target.Position)
@@ -619,15 +649,89 @@ local function queueInstaKill(target)
     end)
 end
 
-if typeof(hookmetamethod) == "function" and typeof(getnamecallmethod) == "function" and MeleeEvent then
+-- Recorded from the first real ShootEvent call so the argument shape can be
+-- read off the settings tab instead of guessed at.
+local shootSignature = nil
+
+local function describeArgs(...)
+    local parts = {}
+    for i = 1, select("#", ...) do
+        local value = select(i, ...)
+        local kind = typeof(value)
+        if kind == "Instance" then
+            parts[#parts + 1] = ("%d:%s(%s)"):format(i, kind, value.ClassName)
+        else
+            parts[#parts + 1] = ("%d:%s"):format(i, kind)
+        end
+    end
+    return table.concat(parts, "  ")
+end
+
+-- Rewrites whatever in the outgoing shot describes what was hit. The gun
+-- script isn't dumpable so the exact parameter order isn't known, but it
+-- doesn't need to be: any argument that is another character's BasePart
+-- becomes our target's part, and any Vector3 that reads as a hit position
+-- becomes our target's position. Everything else passes through untouched.
+local function redirectShotArgs(target, ...)
+    local args = table.pack(...)
+    local changed = false
+
+    for i = 1, args.n do
+        local value = args[i]
+        local kind = typeof(value)
+        if kind == "Instance" and value:IsA("BasePart") then
+            local model = value:FindFirstAncestorOfClass("Model")
+            if model and model ~= LocalPlayer.Character and model:FindFirstChildOfClass("Humanoid") then
+                args[i] = target
+                changed = true
+            end
+        elseif kind == "Vector3" then
+            local root = getRoot()
+            -- Only positions out in the world, not local offsets/directions.
+            if root and (value - root.Position).Magnitude > 1 then
+                args[i] = target.Position
+                changed = true
+            end
+        end
+    end
+
+    if not changed then return false end
+    return true, table.unpack(args, 1, args.n)
+end
+
+if typeof(hookmetamethod) == "function" and typeof(getnamecallmethod) == "function" then
     local originalNamecall
     originalNamecall = hookmetamethod(game, "__namecall", function(self, ...)
-        if not Unloading and Combat.InstaKillPunch and self == MeleeEvent and getnamecallmethod() == "FireServer" then
-            local target = ...
-            -- Return immediately and let the repeats happen off-frame: this
-            -- metamethod fires for every method call in the entire game, so
-            -- blocking in here is not an option.
-            queueInstaKill(target)
+        if not Unloading then
+            local method = getnamecallmethod()
+
+            if Combat.InstaKillPunch and self == MeleeEvent and method == "FireServer" then
+                local target = ...
+                -- Return immediately and let the repeats happen off-frame:
+                -- this metamethod fires for every method call in the entire
+                -- game, so blocking in here is not an option.
+                queueInstaKill(target)
+
+            elseif self == ShootEvent and method == "FireServer" then
+                if not shootSignature then
+                    shootSignature = describeArgs(...)
+                end
+                -- The deterministic half of silent aim. Hooking castRay
+                -- depends on finding a function by name in the GC, which is
+                -- fragile and was silently doing nothing some rounds; this
+                -- fires on the actual shot every time. Reads the cached
+                -- target, so a 20-pellet burst costs one lookup, not twenty
+                -- player scans.
+                if Aim.SilentAim then
+                    local target = getCachedTarget(Camera.CFrame.Position)
+                    if target and target.Parent then
+                        local ok, a, b, c, d, e, f = redirectShotArgs(target, ...)
+                        if ok then
+                            return originalNamecall(self, a, b, c, d, e, f)
+                        end
+                    end
+                end
+            end
         end
         return originalNamecall(self, ...)
     end)
@@ -1793,10 +1897,12 @@ InfoSection:Paragraph({
 InfoSection:Label({ Title = 'RightShift toggles the menu' })
 
 local statusLabel = InfoSection:Label({ Title = 'castRay hook: not attempted' })
+local remoteLabel = InfoSection:Label({ Title = 'shoot remote: waiting for a shot' })
 
 spawnLoop(function()
     while not Unloading do
         task.wait(1)
+
         local text
         if not silentAimAPIAvailable then
             text = 'castRay hook: unsupported executor'
@@ -1808,13 +1914,28 @@ spawnLoop(function()
             -- about to go with it.
             text = ('castRay hook: active (%d hooked)'):format(count)
         elseif hookScanStarted then
-            text = 'castRay hook: none found - camera lock covering'
+            text = 'castRay hook: none found - shoot remote covering'
         else
             text = 'castRay hook: not attempted'
         end
         pcall(function() statusLabel:Set(text) end)
+
+        local remoteText
+        if not ShootEvent then
+            remoteText = 'shoot remote: GunRemotes.ShootEvent not found'
+        elseif shootSignature then
+            remoteText = 'shoot args: ' .. shootSignature
+        else
+            remoteText = 'shoot remote: waiting for a shot'
+        end
+        pcall(function() remoteLabel:Set(remoteText) end)
     end
 end)
+
+InfoSection:Paragraph({
+    Title = 'if silent aim misses',
+    Text = 'Send me the "shoot args" line above. It records the real argument shape of the first shot you fire, which is the one thing the script cannot learn from a dump - the gun code only exists while a gun is held and does not decompile. With that line the redirect stops being generic and becomes exact.',
+})
 
 local ControlSection = SettingsTab:Section({ Title = 'control', Side = 'right' })
 
