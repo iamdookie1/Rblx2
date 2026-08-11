@@ -22,6 +22,12 @@ local VoidConfig = {
     ProbeDepth = 900,
     -- How far out the edge scan is willing to look.
     MaxTravel = 2500,
+    -- Instant hops when the way is clear; off falls back to stepped flying.
+    InstantHops = true,
+    -- How far a single escape hop may reach, and how many hops before the
+    -- router gives up rather than pinballing around a room forever.
+    HopRange = 400,
+    MaxHops = 12,
     Status = "idle",
     LastFollowGap = -1,
 }
@@ -380,10 +386,121 @@ local moveParams = RaycastParams.new()
 moveParams.FilterType = Enum.RaycastFilterType.Exclude
 moveParams.IgnoreWater = true
 
--- Incremental, raycast-checked movement. The point of stepping instead of
--- teleporting is that every step is verified against geometry first, so the
--- character never passes through a wall - which is the thing most likely to be
--- noticed, far more than speed is.
+local function setMoveFilter(victimChar)
+    local ignore = { getOwnCharacter() }
+    if victimChar then ignore[#ignore + 1] = victimChar end
+    moveParams.FilterDescendantsInstances = ignore
+end
+
+-- Roughly the volume a character occupies. Sweeping this instead of a bare
+-- line stops the router calling a doorframe-width gap "clear" and then
+-- shoving a body through the wall next to it.
+local HULL = Vector3.new(4, 6, 4)
+
+local function pathClear(from, to)
+    local delta = to - from
+    if delta.Magnitude < 0.1 then return true end
+
+    local ok, result = pcall(function()
+        return workspace:Blockcast(CFrame.new(from), HULL, delta, moveParams)
+    end)
+    if ok then return result == nil end
+
+    -- Blockcast is not on every client; four parallel rays offset around the
+    -- travel axis approximate the same thing.
+    if workspace:Raycast(from, delta, moveParams) then return false end
+    local axis = delta.Unit
+    local side = axis:Cross(Vector3.new(0, 1, 0))
+    if side.Magnitude < 0.01 then side = axis:Cross(Vector3.new(1, 0, 0)) end
+    side = side.Unit * 2
+    local up = Vector3.new(0, 3, 0)
+    local offsets = { side, -side, up, -up }
+    for _, offset in ipairs(offsets) do
+        if workspace:Raycast(from + offset, delta, moveParams) then return false end
+    end
+    return true
+end
+
+-- How far we can get along a direction before something blocks it. This is
+-- what turns "there is a wall in the way" into "there is a gap over there".
+local function furthestClearAlong(from, direction, maxDistance)
+    local best = nil
+    local step = 15
+    local distance = step
+    while distance <= maxDistance do
+        local candidate = from + direction * distance
+        if pathClear(from, candidate) then
+            best = candidate
+        else
+            break
+        end
+        distance = distance + step
+    end
+    return best
+end
+
+-- Directions worth probing for a way out: the compass at eye level, the same
+-- angled upward (windows, balconies, open roofs), and straight up.
+local ESCAPE_DIRECTIONS = {}
+do
+    for _, dir in ipairs(COMPASS) do
+        ESCAPE_DIRECTIONS[#ESCAPE_DIRECTIONS + 1] = dir
+        ESCAPE_DIRECTIONS[#ESCAPE_DIRECTIONS + 1] = (dir + Vector3.new(0, 0.85, 0)).Unit
+    end
+    ESCAPE_DIRECTIONS[#ESCAPE_DIRECTIONS + 1] = Vector3.new(0, 1, 0)
+end
+
+-- Greedy line-of-sight routing. If the destination is already in the clear it
+-- is taken in one hop; otherwise it looks for the reachable spot that gets
+-- closest to the goal - an opening, a rooftop, a doorway - hops there and
+-- tries again. Every hop is hull-swept first, so nothing is ever moved
+-- through geometry even though the hops themselves are instant.
+local function travelTo(goal, victimChar, deadline)
+    setMoveFilter(victimChar)
+
+    for _ = 1, VoidConfig.MaxHops do
+        if tick() > deadline then return false, "timed out" end
+
+        local root = getOwnRoot()
+        if not root then return false, "no character" end
+        local current = root.Position
+
+        if (goal - current).Magnitude <= 3 then return true end
+
+        if pathClear(current, goal) then
+            root.CFrame = CFrame.new(goal, goal + root.CFrame.LookVector)
+            return true
+        end
+
+        -- Blocked: find the reachable waypoint that improves things most.
+        local currentGap = (goal - current).Magnitude
+        local bestPoint, bestGap = nil, currentGap
+        for _, direction in ipairs(ESCAPE_DIRECTIONS) do
+            local reach = furthestClearAlong(current, direction, VoidConfig.HopRange)
+            if reach then
+                local gap = (goal - reach).Magnitude
+                if gap < bestGap - 5 then
+                    bestGap = gap
+                    bestPoint = reach
+                end
+            end
+        end
+
+        if not bestPoint then
+            return false, "boxed in"
+        end
+
+        root.CFrame = CFrame.new(bestPoint, bestPoint + root.CFrame.LookVector)
+        if not VoidConfig.InstantHops then
+            task.wait(math.min(0.12, (bestPoint - current).Magnitude / math.max(VoidConfig.FlySpeed, 1)))
+        end
+    end
+
+    return false, "no route out"
+end
+
+-- Kept for when instant hops are switched off: same raycast-checked stepping
+-- as before, just slower and less conspicuous.
 local function flyTo(goal, victimChar, deadline)
     local root = getOwnRoot()
     if not root then return false end
@@ -463,11 +580,27 @@ local function runVoidCarry(victimChar)
                 return tick() + 1.5 + (to - from).Magnitude / math.max(VoidConfig.FlySpeed, 1)
             end
 
-            VoidConfig.Status = "ascending"
-            if not flyTo(rise, victimChar, deadlineFor(startPos, rise)) then
-                VoidConfig.Status = "blocked on ascent"
-                return
+            local function goTo(destination, from, label)
+                local deadline = deadlineFor(from, destination)
+                if VoidConfig.InstantHops then
+                    -- Routing is instant, but a room with no way out still has
+                    -- to be given time to be searched.
+                    deadline = tick() + 4
+                    local reached, why = travelTo(destination, victimChar, deadline)
+                    if not reached then
+                        VoidConfig.Status = label .. ": " .. tostring(why)
+                    end
+                    return reached
+                end
+                if not flyTo(destination, victimChar, deadline) then
+                    VoidConfig.Status = label .. ": blocked"
+                    return false
+                end
+                return true
             end
+
+            VoidConfig.Status = "ascending"
+            if not goTo(rise, startPos, "ascent") then return end
 
             local currentRoot = getOwnRoot()
             local cruisePos = currentRoot and currentRoot.Position or rise
@@ -480,10 +613,7 @@ local function runVoidCarry(victimChar)
             end
 
             VoidConfig.Status = "crossing out"
-            if not flyTo(voidPoint, victimChar, deadlineFor(cruisePos, voidPoint)) then
-                VoidConfig.Status = "blocked crossing out"
-                return
-            end
+            if not goTo(voidPoint, cruisePos, "crossing") then return end
 
             VoidConfig.Status = "over the void"
 
@@ -721,6 +851,46 @@ VoidTuning:Slider({
     Callback = function(v) VoidConfig.ProbeDepth = v end,
 })
 
+local VoidRouting = VoidTab:Section({ Title = 'routing', Side = 'right' })
+
+VoidRouting:Toggle({
+    Title = 'instant hops',
+    Flag = 'void_instant',
+    Default = true,
+    Callback = function(v) VoidConfig.InstantHops = v end,
+})
+
+VoidRouting:Slider({
+    Title = 'hop range',
+    Flag = 'void_hop_range',
+    Min = 50,
+    Max = 1500,
+    Increment = 50,
+    Default = 400,
+    Suffix = ' studs',
+    Callback = function(v) VoidConfig.HopRange = v end,
+})
+
+VoidRouting:Slider({
+    Title = 'max hops',
+    Flag = 'void_max_hops',
+    Min = 2,
+    Max = 40,
+    Increment = 1,
+    Default = 12,
+    Callback = function(v) VoidConfig.MaxHops = v end,
+})
+
+VoidRouting:Paragraph({
+    Title = 'how it moves',
+    Text = 'If the destination is already in open air it is taken in a single instant hop. If something is in the way it looks for the reachable spot that gets closest to the goal - a doorway, a window, a rooftop, the gap above a wall - hops there, and tries again from the new position. Every hop is swept with a character-sized box first, so nothing is ever moved through geometry even though the hops are instant.',
+})
+
+VoidRouting:Paragraph({
+    Title = 'if it trips something',
+    Text = 'Turn instant hops off and it reverts to the old stepped flight at the fly speed above, which is slower but reads as ordinary movement. The routing logic is identical either way, only the pace changes.',
+})
+
 VoidTuning:Slider({
     Title = 'lift when blocked',
     Flag = 'void_lift',
@@ -735,6 +905,11 @@ VoidTuning:Slider({
 VoidTuning:Paragraph({
     Title = 'how the edge is found',
     Text = 'It climbs, then raycasts straight down from candidate spots in eight directions at growing range, and the first one that hits nothing is the void. Scanning outward means it picks the nearest edge, so the trip is short. The camera direction is checked first, so when several edges are equally close it leaves the way you are facing.',
+})
+
+VoidTuning:Paragraph({
+    Title = 'if it cannot get out',
+    Text = 'A status of "boxed in" means there was no reachable opening from where you were standing - fully enclosed, with no gap wide enough for a character. Raising hop range lets it consider openings further away, and raising max hops lets it work through more rooms before giving up.',
 })
 
 VoidTuning:Paragraph({
