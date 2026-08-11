@@ -15,9 +15,13 @@ local VoidConfig = {
     Enabled = false,
     FlySpeed = 320,
     Clearance = 70,
-    VoidMargin = 260,
+    VoidMargin = 120,
     CarryDuration = 1.2,
     StepBlockedLift = 25,
+    -- How far down a spot has to be clear before it counts as void.
+    ProbeDepth = 900,
+    -- How far out the edge scan is willing to look.
+    MaxTravel = 2500,
     Status = "idle",
     LastFollowGap = -1,
 }
@@ -299,43 +303,77 @@ if CursedStrikesActivated and typeof(hookmetamethod) == "function" and typeof(ge
     end)
 end
 
--- The dump carries no world positions, so the map's extents are measured live
--- rather than hardcoded - that also means this keeps working if the arena
--- changes.
-local function getMapBounds()
+-- Deliberately NOT Map:GetBoundingBox(). The game's debris PartCache parks
+-- 2000 spare parts at CFrame.new(0, 10000000, 0) inside workspace.Map.Data, so
+-- the map's bounding box is about five million studs tall - aiming at the top
+-- of it just flies straight up forever, which is exactly what this used to do.
+--
+-- Instead the void is found the way it is actually defined: a spot where a ray
+-- pointed straight down hits nothing. The filter mirrors the game's own ground
+-- checks (Map + Domains), minus the Data folder holding the parked cache.
+local voidParams = RaycastParams.new()
+voidParams.FilterType = Enum.RaycastFilterType.Include
+voidParams.IgnoreWater = true
+
+local function refreshVoidFilter()
+    local include = {}
     local map = workspace:FindFirstChild("Map")
-    if not map then return nil end
-    local ok, cf, size = pcall(function()
-        local a, b = map:GetBoundingBox()
-        return a, b
-    end)
-    if not ok or not cf or not size then return nil end
-    return cf.Position, size
+    if map then
+        for _, child in ipairs(map:GetChildren()) do
+            if child.Name ~= "Data" then
+                include[#include + 1] = child
+            end
+        end
+    end
+    local domains = workspace:FindFirstChild("Domains")
+    if domains then include[#include + 1] = domains end
+    voidParams.FilterDescendantsInstances = include
+    return #include > 0
 end
 
--- Somewhere past the edge of the arena, at altitude. Height is what keeps this
--- survivable: we sit above the map rather than dropping to the kill plane, so
--- the victim is the only one who falls.
-local function computeVoidPoint(fromPosition)
-    local center, size = getMapBounds()
-    if not center then return nil end
-    local half = size / 2
+local function isOverVoid(position)
+    local hit = workspace:Raycast(position, Vector3.new(0, -VoidConfig.ProbeDepth, 0), voidParams)
+    return hit == nil
+end
 
-    -- Leave by whichever horizontal axis we are already nearest to, so the
-    -- trip out is as short as possible.
-    local dx = fromPosition.X - center.X
-    local dz = fromPosition.Z - center.Z
-    local outX, outZ
-    if math.abs(dx) / math.max(half.X, 1) >= math.abs(dz) / math.max(half.Z, 1) then
-        outX = center.X + (dx >= 0 and 1 or -1) * (half.X + VoidConfig.VoidMargin)
-        outZ = fromPosition.Z
-    else
-        outX = fromPosition.X
-        outZ = center.Z + (dz >= 0 and 1 or -1) * (half.Z + VoidConfig.VoidMargin)
+-- Scans outward by increasing radius so the first hit is the nearest edge,
+-- which keeps the trip short. Pure raycasting, no movement - the character
+-- does not budge until a destination is already known to be over nothing.
+local COMPASS = {
+    Vector3.new(1, 0, 0), Vector3.new(-1, 0, 0),
+    Vector3.new(0, 0, 1), Vector3.new(0, 0, -1),
+    Vector3.new(0.707, 0, 0.707), Vector3.new(-0.707, 0, 0.707),
+    Vector3.new(0.707, 0, -0.707), Vector3.new(-0.707, 0, -0.707),
+}
+
+local function findVoidTarget(fromPosition)
+    if not refreshVoidFilter() then return nil, "no Map to scan" end
+
+    -- Bias the search toward where the camera is already pointing, so when
+    -- several edges are equally close it picks the one in front of you.
+    local look = workspace.CurrentCamera and workspace.CurrentCamera.CFrame.LookVector
+    local ordered = {}
+    if look then
+        local flat = Vector3.new(look.X, 0, look.Z)
+        if flat.Magnitude > 0.01 then ordered[1] = flat.Unit end
+    end
+    for _, dir in ipairs(COMPASS) do ordered[#ordered + 1] = dir end
+
+    local step = 40
+    for distance = step, VoidConfig.MaxTravel, step do
+        for _, dir in ipairs(ordered) do
+            local candidate = fromPosition + dir * distance
+            if isOverVoid(candidate) then
+                -- Push a little further past the lip so the victim is clearly
+                -- out over nothing rather than teetering on the edge.
+                local final = fromPosition + dir * (distance + VoidConfig.VoidMargin)
+                if isOverVoid(final) then return final end
+                return candidate
+            end
+        end
     end
 
-    local topY = center.Y + half.Y + VoidConfig.Clearance
-    return Vector3.new(outX, topY, outZ), topY
+    return nil, "no void found within range"
 end
 
 local moveParams = RaycastParams.new()
@@ -412,22 +450,37 @@ local function runVoidCarry(victimChar)
 
     task.spawn(function()
         local ok = pcall(function()
-            local voidPoint, safeY = computeVoidPoint(root.Position)
-            if not voidPoint then
-                VoidConfig.Status = "no Map to measure"
-                return
+            local startPos = root.Position
+
+            -- Altitude is relative to where you already are, not derived from
+            -- the map, so it is always a sane number of studs.
+            local cruiseY = startPos.Y + VoidConfig.Clearance
+            local rise = Vector3.new(startPos.X, cruiseY, startPos.Z)
+
+            -- Deadlines scale with the distance actually being covered rather
+            -- than a flat guess, so a long crossing is not cut off halfway.
+            local function deadlineFor(from, to)
+                return tick() + 1.5 + (to - from).Magnitude / math.max(VoidConfig.FlySpeed, 1)
             end
 
-            local hardDeadline = tick() + 6
-
-            -- Straight up first: clears whatever is around without touching it.
-            local rise = Vector3.new(root.Position.X, safeY, root.Position.Z)
-            if not flyTo(rise, victimChar, hardDeadline) then
+            VoidConfig.Status = "ascending"
+            if not flyTo(rise, victimChar, deadlineFor(startPos, rise)) then
                 VoidConfig.Status = "blocked on ascent"
                 return
             end
 
-            if not flyTo(voidPoint, victimChar, hardDeadline) then
+            local currentRoot = getOwnRoot()
+            local cruisePos = currentRoot and currentRoot.Position or rise
+
+            VoidConfig.Status = "looking for an edge"
+            local voidPoint, reason = findVoidTarget(cruisePos)
+            if not voidPoint then
+                VoidConfig.Status = reason or "no void found"
+                return
+            end
+
+            VoidConfig.Status = "crossing out"
+            if not flyTo(voidPoint, victimChar, deadlineFor(cruisePos, voidPoint)) then
                 VoidConfig.Status = "blocked crossing out"
                 return
             end
@@ -625,7 +678,7 @@ VoidSection:Button({
 local VoidTuning = VoidTab:Section({ Title = 'positioning', Side = 'right' })
 
 VoidTuning:Slider({
-    Title = 'height above map',
+    Title = 'climb height',
     Flag = 'void_clearance',
     Min = 20,
     Max = 400,
@@ -636,14 +689,36 @@ VoidTuning:Slider({
 })
 
 VoidTuning:Slider({
-    Title = 'distance past map edge',
+    Title = 'push past the edge',
     Flag = 'void_margin',
-    Min = 50,
-    Max = 1500,
-    Increment = 25,
-    Default = 260,
+    Min = 0,
+    Max = 600,
+    Increment = 20,
+    Default = 120,
     Suffix = ' studs',
     Callback = function(v) VoidConfig.VoidMargin = v end,
+})
+
+VoidTuning:Slider({
+    Title = 'edge scan range',
+    Flag = 'void_max_travel',
+    Min = 500,
+    Max = 8000,
+    Increment = 250,
+    Default = 2500,
+    Suffix = ' studs',
+    Callback = function(v) VoidConfig.MaxTravel = v end,
+})
+
+VoidTuning:Slider({
+    Title = 'void probe depth',
+    Flag = 'void_probe_depth',
+    Min = 200,
+    Max = 3000,
+    Increment = 100,
+    Default = 900,
+    Suffix = ' studs',
+    Callback = function(v) VoidConfig.ProbeDepth = v end,
 })
 
 VoidTuning:Slider({
@@ -658,13 +733,18 @@ VoidTuning:Slider({
 })
 
 VoidTuning:Paragraph({
-    Title = 'why it goes up first',
-    Text = 'Every step is raycast against the map before it is taken, and a blocked step climbs over the obstruction instead of moving through it - passing through walls is far more noticeable than moving fast. It rises above the arena before crossing out, so the path is clear air the whole way.',
+    Title = 'how the edge is found',
+    Text = 'It climbs, then raycasts straight down from candidate spots in eight directions at growing range, and the first one that hits nothing is the void. Scanning outward means it picks the nearest edge, so the trip is short. The camera direction is checked first, so when several edges are equally close it leaves the way you are facing.',
+})
+
+VoidTuning:Paragraph({
+    Title = 'why not the map bounds',
+    Text = 'The game parks 2000 spare debris parts at Y = 10,000,000 inside workspace.Map.Data, so the map bounding box is about five million studs tall. Aiming at the top of it just flew straight up until the timer ran out, which is what this used to do. Probing for a hole in the floor avoids the whole problem.',
 })
 
 VoidTuning:Paragraph({
     Title = 'staying alive',
-    Text = 'The destination sits above the top of the map, not down in the void, so you are never below the kill plane - only whatever is dropped out there falls. Your position is restored the moment the carry ends, and it aborts early if your health hits zero.',
+    Text = 'Cruise altitude is your own height plus the climb above, never anything derived from the map, so you stay well above the kill plane while only what gets dropped falls. Position is restored the moment the carry ends, and it aborts early on death.',
 })
 
 local VoidInfo = VoidTab:Section({ Title = 'detection', Side = 'left' })
