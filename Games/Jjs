@@ -1,11 +1,25 @@
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
 
 local LocalPlayer = Players.LocalPlayer
 
 local Config = {
     Enabled = false,
     Chance = 100,
+}
+
+-- Void carry: when Cursed Strikes connects, ride the combo out past the edge
+-- of the map so the victim is dropped over nothing, then return.
+local VoidConfig = {
+    Enabled = false,
+    FlySpeed = 320,
+    Clearance = 70,
+    VoidMargin = 260,
+    CarryDuration = 1.2,
+    StepBlockedLift = 25,
+    Status = "idle",
+    LastFollowGap = -1,
 }
 
 local BLACKFLASH_DELAY = 0.212
@@ -15,6 +29,11 @@ local Services = ReplicatedStorage.Knit.Knit.Services
 local Activated = Services.DivergentFistService.RE.Activated
 local RightActivated = Services.ItadoriService.RE.RightActivated
 local DashRemote = Services.MovementService.RE.Dash
+
+local CursedStrikesRE = Services:FindFirstChild("CursedStrikesService")
+CursedStrikesRE = CursedStrikesRE and CursedStrikesRE:FindFirstChild("RE")
+local CursedStrikesActivated = CursedStrikesRE and CursedStrikesRE:FindFirstChild("Activated")
+local CursedStrikesEffects = CursedStrikesRE and CursedStrikesRE:FindFirstChild("Effects")
 
 local Knit = require(ReplicatedStorage.Knit.Knit)
 
@@ -225,6 +244,249 @@ task.spawn(function()
     end
 end)
 
+--// Void carry -------------------------------------------------------------------
+-- Cursed Strikes announces itself over CursedStrikesService.RE.Effects. Two of
+-- those keys are useful here:
+--
+--   "Hit"      (victimCharacter, wasHeavy)
+--   "FinalHit" (attackerCharacter, victimCharacter)
+--
+-- FinalHit names both sides, so it is unambiguous. "Hit" only names the victim,
+-- so it is only trusted inside a short window after we fired Activated
+-- ourselves - otherwise every Cursed Strikes landing anywhere on the server
+-- would trigger a carry.
+local lastActivatedAt = 0
+local ACTIVATION_WINDOW = 2.5
+local carryActive = false
+
+local function getOwnCharacter()
+    local char = LocalPlayer.Character
+    if char and char:FindFirstChild("HumanoidRootPart") then return char end
+    local chars = workspace:FindFirstChild("Characters")
+    local folder = chars and chars:FindFirstChild(LocalPlayer.Name)
+    if folder and folder:FindFirstChild("HumanoidRootPart") then return folder end
+    return char or folder
+end
+
+-- The game keeps a character under workspace.Characters as well as the usual
+-- Player.Character, and the Effects remote can hand back either, so identity
+-- is checked against both rather than assuming one.
+local function isOwnCharacter(model)
+    if not model then return false end
+    if model == LocalPlayer.Character then return true end
+    local chars = workspace:FindFirstChild("Characters")
+    if chars and model == chars:FindFirstChild(LocalPlayer.Name) then return true end
+    return model.Name == LocalPlayer.Name
+end
+
+local function getOwnRoot()
+    local char = getOwnCharacter()
+    return char and char:FindFirstChild("HumanoidRootPart")
+end
+
+local function getOwnHumanoid()
+    local char = getOwnCharacter()
+    return char and char:FindFirstChildOfClass("Humanoid")
+end
+
+if CursedStrikesActivated and typeof(hookmetamethod) == "function" and typeof(getnamecallmethod) == "function" then
+    local originalNamecall
+    originalNamecall = hookmetamethod(game, "__namecall", function(self, ...)
+        if self == CursedStrikesActivated and getnamecallmethod() == "FireServer" then
+            lastActivatedAt = tick()
+        end
+        return originalNamecall(self, ...)
+    end)
+end
+
+-- The dump carries no world positions, so the map's extents are measured live
+-- rather than hardcoded - that also means this keeps working if the arena
+-- changes.
+local function getMapBounds()
+    local map = workspace:FindFirstChild("Map")
+    if not map then return nil end
+    local ok, cf, size = pcall(function()
+        local a, b = map:GetBoundingBox()
+        return a, b
+    end)
+    if not ok or not cf or not size then return nil end
+    return cf.Position, size
+end
+
+-- Somewhere past the edge of the arena, at altitude. Height is what keeps this
+-- survivable: we sit above the map rather than dropping to the kill plane, so
+-- the victim is the only one who falls.
+local function computeVoidPoint(fromPosition)
+    local center, size = getMapBounds()
+    if not center then return nil end
+    local half = size / 2
+
+    -- Leave by whichever horizontal axis we are already nearest to, so the
+    -- trip out is as short as possible.
+    local dx = fromPosition.X - center.X
+    local dz = fromPosition.Z - center.Z
+    local outX, outZ
+    if math.abs(dx) / math.max(half.X, 1) >= math.abs(dz) / math.max(half.Z, 1) then
+        outX = center.X + (dx >= 0 and 1 or -1) * (half.X + VoidConfig.VoidMargin)
+        outZ = fromPosition.Z
+    else
+        outX = fromPosition.X
+        outZ = center.Z + (dz >= 0 and 1 or -1) * (half.Z + VoidConfig.VoidMargin)
+    end
+
+    local topY = center.Y + half.Y + VoidConfig.Clearance
+    return Vector3.new(outX, topY, outZ), topY
+end
+
+local moveParams = RaycastParams.new()
+moveParams.FilterType = Enum.RaycastFilterType.Exclude
+moveParams.IgnoreWater = true
+
+-- Incremental, raycast-checked movement. The point of stepping instead of
+-- teleporting is that every step is verified against geometry first, so the
+-- character never passes through a wall - which is the thing most likely to be
+-- noticed, far more than speed is.
+local function flyTo(goal, victimChar, deadline)
+    local root = getOwnRoot()
+    if not root then return false end
+
+    local ignore = { getOwnCharacter() }
+    if victimChar then ignore[#ignore + 1] = victimChar end
+    moveParams.FilterDescendantsInstances = ignore
+
+    while tick() < deadline do
+        root = getOwnRoot()
+        if not root then return false end
+
+        local current = root.Position
+        local delta = goal - current
+        local distance = delta.Magnitude
+        if distance <= 2 then return true end
+
+        local dt = RunService.Heartbeat:Wait()
+        local stepLength = math.min(VoidConfig.FlySpeed * dt, distance)
+        local direction = delta.Unit
+        local nextPos = current + direction * stepLength
+
+        local blocked = workspace:Raycast(current, nextPos - current, moveParams)
+        if blocked then
+            -- Something is in the way: climb over it rather than through it,
+            -- and let the next iteration retry the horizontal leg.
+            local lift = current + Vector3.new(0, VoidConfig.StepBlockedLift, 0)
+            local liftBlocked = workspace:Raycast(current, Vector3.new(0, VoidConfig.StepBlockedLift, 0), moveParams)
+            if liftBlocked then
+                return false
+            end
+            root.CFrame = CFrame.new(lift, lift + Vector3.new(direction.X, 0, direction.Z))
+        else
+            local lookAt = nextPos + Vector3.new(direction.X, 0, direction.Z)
+            if (Vector3.new(direction.X, 0, direction.Z)).Magnitude < 0.01 then
+                lookAt = nextPos + root.CFrame.LookVector
+            end
+            root.CFrame = CFrame.new(nextPos, lookAt)
+        end
+    end
+
+    return false
+end
+
+local function runVoidCarry(victimChar)
+    if carryActive or not VoidConfig.Enabled then return end
+
+    local root = getOwnRoot()
+    if not root then return end
+
+    carryActive = true
+    local origin = root.CFrame
+    VoidConfig.Status = "carrying"
+    VoidConfig.LastFollowGap = -1
+
+    local finished = false
+    local function restore()
+        if finished then return end
+        finished = true
+        local rootNow = getOwnRoot()
+        if rootNow then rootNow.CFrame = origin end
+        carryActive = false
+    end
+
+    task.spawn(function()
+        local ok = pcall(function()
+            local voidPoint, safeY = computeVoidPoint(root.Position)
+            if not voidPoint then
+                VoidConfig.Status = "no Map to measure"
+                return
+            end
+
+            local hardDeadline = tick() + 6
+
+            -- Straight up first: clears whatever is around without touching it.
+            local rise = Vector3.new(root.Position.X, safeY, root.Position.Z)
+            if not flyTo(rise, victimChar, hardDeadline) then
+                VoidConfig.Status = "blocked on ascent"
+                return
+            end
+
+            if not flyTo(voidPoint, victimChar, hardDeadline) then
+                VoidConfig.Status = "blocked crossing out"
+                return
+            end
+
+            VoidConfig.Status = "over the void"
+
+            -- Hold position while the victim is out here with us, and watch
+            -- whether they are actually following. If the server does not keep
+            -- them attached through the combo this gap grows immediately, which
+            -- is the honest signal that the carry did nothing.
+            local holdUntil = tick() + VoidConfig.CarryDuration
+            while tick() < holdUntil do
+                local rootNow = getOwnRoot()
+                local hum = getOwnHumanoid()
+                if not rootNow or not hum or hum.Health <= 0 then break end
+
+                rootNow.CFrame = CFrame.new(voidPoint, voidPoint + rootNow.CFrame.LookVector)
+
+                if victimChar then
+                    local victimRoot = victimChar:FindFirstChild("HumanoidRootPart")
+                    if victimRoot then
+                        VoidConfig.LastFollowGap = (victimRoot.Position - rootNow.Position).Magnitude
+                    end
+                end
+
+                RunService.Heartbeat:Wait()
+            end
+
+            VoidConfig.Status = "returning"
+        end)
+
+        if not ok then
+            VoidConfig.Status = "errored"
+        end
+        restore()
+        if VoidConfig.Status == "returning" or VoidConfig.Status == "over the void" then
+            VoidConfig.Status = "done"
+        end
+    end)
+end
+
+if CursedStrikesEffects then
+    CursedStrikesEffects.OnClientEvent:Connect(function(key, a, b)
+        if not VoidConfig.Enabled or carryActive then return end
+
+        if key == "FinalHit" then
+            -- FinalHit(attacker, victim): unambiguous, no window needed.
+            if isOwnCharacter(a) and b and not isOwnCharacter(b) then
+                runVoidCarry(b)
+            end
+        elseif key == "Hit" then
+            -- Hit(victim, ...): only ours if we just used the move.
+            if tick() - lastActivatedAt <= ACTIVATION_WINDOW and a and not isOwnCharacter(a) then
+                runVoidCarry(a)
+            end
+        end
+    end)
+end
+
 local Centrl = loadstring(game:HttpGet('https://raw.githubusercontent.com/iamdookie1/Rblx2/main/UI/Lib2.lua'))()
 
 local Window = Centrl:Window({
@@ -305,6 +567,131 @@ DashInfo:Paragraph({
     Title = 'front',
     Text = 'Untouched. Front dash is actually a separate chase/lunge ability and keeps its original cooldown and behavior.',
 })
+
+local VoidTab = Window:Tab({ Title = 'void carry', Icon = 'move-down' })
+
+local VoidSection = VoidTab:Section({ Title = 'cursed strikes carry', Side = 'left' })
+
+VoidSection:Toggle({
+    Title = 'enabled',
+    Flag = 'void_enabled',
+    Default = false,
+    Callback = function(state)
+        VoidConfig.Enabled = state
+        if state and not CursedStrikesEffects then
+            Centrl:Notify({
+                Title = 'itadori',
+                Content = 'CursedStrikesService.RE.Effects not found - carry cannot detect hits.',
+                Type = 'error',
+                Duration = 8,
+            })
+        end
+    end,
+})
+
+local VoidStatus = VoidSection:Label({ Title = 'status: idle' })
+local VoidFollow = VoidSection:Label({ Title = 'victim follow gap: --' })
+
+VoidSection:Slider({
+    Title = 'fly speed',
+    Flag = 'void_speed',
+    Min = 60,
+    Max = 800,
+    Increment = 20,
+    Default = 320,
+    Suffix = ' studs/s',
+    Callback = function(v) VoidConfig.FlySpeed = v end,
+})
+
+VoidSection:Slider({
+    Title = 'carry duration',
+    Flag = 'void_duration',
+    Min = 0.2,
+    Max = 5,
+    Increment = 0.1,
+    Default = 1.2,
+    Suffix = 's',
+    Callback = function(v) VoidConfig.CarryDuration = v end,
+})
+
+VoidSection:Button({
+    Title = 'test run (no target)',
+    Callback = function()
+        if carryActive then return end
+        runVoidCarry(nil)
+    end,
+})
+
+local VoidTuning = VoidTab:Section({ Title = 'positioning', Side = 'right' })
+
+VoidTuning:Slider({
+    Title = 'height above map',
+    Flag = 'void_clearance',
+    Min = 20,
+    Max = 400,
+    Increment = 10,
+    Default = 70,
+    Suffix = ' studs',
+    Callback = function(v) VoidConfig.Clearance = v end,
+})
+
+VoidTuning:Slider({
+    Title = 'distance past map edge',
+    Flag = 'void_margin',
+    Min = 50,
+    Max = 1500,
+    Increment = 25,
+    Default = 260,
+    Suffix = ' studs',
+    Callback = function(v) VoidConfig.VoidMargin = v end,
+})
+
+VoidTuning:Slider({
+    Title = 'lift when blocked',
+    Flag = 'void_lift',
+    Min = 5,
+    Max = 100,
+    Increment = 5,
+    Default = 25,
+    Suffix = ' studs',
+    Callback = function(v) VoidConfig.StepBlockedLift = v end,
+})
+
+VoidTuning:Paragraph({
+    Title = 'why it goes up first',
+    Text = 'Every step is raycast against the map before it is taken, and a blocked step climbs over the obstruction instead of moving through it - passing through walls is far more noticeable than moving fast. It rises above the arena before crossing out, so the path is clear air the whole way.',
+})
+
+VoidTuning:Paragraph({
+    Title = 'staying alive',
+    Text = 'The destination sits above the top of the map, not down in the void, so you are never below the kill plane - only whatever is dropped out there falls. Your position is restored the moment the carry ends, and it aborts early if your health hits zero.',
+})
+
+local VoidInfo = VoidTab:Section({ Title = 'detection', Side = 'left' })
+
+VoidInfo:Paragraph({
+    Title = 'how a hit is detected',
+    Text = 'CursedStrikesService.RE.Effects fires "FinalHit"(attacker, victim), which names both sides so it triggers directly. It also fires "Hit"(victim), which does not say who threw it - that one is only trusted within 2.5s of you firing Activated yourself, so other people landing the move nearby cannot set it off.',
+})
+
+VoidInfo:Paragraph({
+    Title = 'read the follow gap',
+    Text = 'The gap above is the distance between you and the victim while you are out over the void. If it stays small the server is keeping them attached through the combo and the carry is working. If it jumps immediately they were never brought along, and no amount of tuning here will change that.',
+})
+
+task.spawn(function()
+    while true do
+        task.wait(0.35)
+        pcall(function()
+            VoidStatus:Set('status: ' .. tostring(VoidConfig.Status))
+            if VoidConfig.LastFollowGap >= 0 then
+                VoidFollow:Set(('victim follow gap: %.1f studs'):format(VoidConfig.LastFollowGap))
+            else
+                VoidFollow:Set('victim follow gap: --')
+            end
+        end)
+    end
+end)
 
 Window:Load()
 
