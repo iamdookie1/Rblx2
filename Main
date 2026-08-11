@@ -8,6 +8,10 @@ local Games = {
     [9391468976] = { Name = 'Jujutsu Shenanigans', Script = 'Games/Jjs' },
     [106920577206536] = { Name = 'A Quiet Place', Script = 'Games/Survival.lua' },
     [155615604] = { Name = 'Prison Life', Script = 'Games/PrisonLife.lua' },
+    -- 3008's testing place, taken from a PlaceId check in the game's own
+    -- source. The public place's id was not recoverable from the dump, so it
+    -- still needs adding here before the hub will auto-detect a normal server.
+    [2788336572] = { Name = '3008 (test place)', Script = 'Games/3008.lua' },
 }
 
 local Centrl = loadstring(game:HttpGet('https://raw.githubusercontent.com/iamdookie1/Ui/main/Lib2.lua'))()
