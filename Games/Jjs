@@ -22,6 +22,14 @@ local VoidConfig = {
     ProbeDepth = 900,
     -- How far out the edge scan is willing to look.
     MaxTravel = 2500,
+    -- "Timed" waits out the combo and teleports straight to the void a moment
+    -- before the victim is released, ignoring anything in between. "Routed"
+    -- is the older behaviour that picks its way out through openings.
+    Mode = "Timed",
+    -- How long before the predicted release to make the jump.
+    Lead = 0.12,
+    -- Overrides the measured duration when non-zero.
+    ManualDuration = 0,
     -- Instant hops when the way is clear; off falls back to stepped flying.
     InstantHops = true,
     -- How far a single escape hop may reach, and how many hops before the
@@ -268,6 +276,40 @@ end)
 local lastActivatedAt = 0
 local ACTIVATION_WINDOW = 2.5
 local carryActive = false
+-- Flipped by the FinalHit handler so a carry in progress knows the victim has
+-- actually been let go, rather than trusting the prediction alone.
+local releaseSeen = false
+
+-- How long Cursed Strikes holds someone before letting go is not in the dump:
+-- it lives in the server script and the animation lengths, neither of which
+-- are readable. So it gets measured instead - the gap between the first hit
+-- landing and FinalHit, averaged over every use, which converges after a
+-- couple of combos and adapts if the move is ever retuned.
+local Timing = {
+    Learned = nil,
+    Samples = 0,
+    Last = nil,
+    ComboStart = nil,
+}
+
+local function predictedHold()
+    if VoidConfig.ManualDuration > 0 then return VoidConfig.ManualDuration end
+    return Timing.Learned
+end
+
+local function recordHold(seconds)
+    -- Anything wildly long is a stray FinalHit from a later combo rather than
+    -- a real measurement, so it does not get to poison the average.
+    if seconds <= 0.05 or seconds > 8 then return end
+    Timing.Last = seconds
+    if Timing.Learned then
+        Timing.Samples = Timing.Samples + 1
+        Timing.Learned = Timing.Learned + (seconds - Timing.Learned) / math.min(Timing.Samples, 8)
+    else
+        Timing.Learned = seconds
+        Timing.Samples = 1
+    end
+end
 
 local function getOwnCharacter()
     local char = LocalPlayer.Character
@@ -565,9 +607,73 @@ local function runVoidCarry(victimChar)
         carryActive = false
     end
 
+    -- releaseSeen is owned by the effect handlers, not reset here: a carry
+    -- started from FinalHit is one where the release has already happened, and
+    -- clearing the flag would make it wait for an event that has been and gone.
+
     task.spawn(function()
         local ok = pcall(function()
             local startPos = root.Position
+
+            if VoidConfig.Mode == "Timed" then
+                -- Nothing is routed and nothing is dodged: the whole point is
+                -- to spend the combo standing exactly where you were, then make
+                -- one jump at the last possible moment.
+                --
+                -- The destination is worked out immediately rather than at the
+                -- jump, so the moment itself costs nothing but a CFrame write.
+                VoidConfig.Status = "waiting out the combo"
+                local probeFrom = startPos + Vector3.new(0, VoidConfig.Clearance, 0)
+                local voidPoint, reason = findVoidTarget(probeFrom)
+                if not voidPoint then
+                    VoidConfig.Status = reason or "no void found"
+                    return
+                end
+
+                local hold = predictedHold()
+                if hold then
+                    local fireAt = (Timing.ComboStart or tick()) + hold - VoidConfig.Lead
+                    while tick() < fireAt and not releaseSeen do
+                        local hum = getOwnHumanoid()
+                        if not hum or hum.Health <= 0 then return end
+                        RunService.Heartbeat:Wait()
+                    end
+                else
+                    -- First combo of the session, so there is nothing learned
+                    -- yet: ride it out and jump the instant FinalHit lands.
+                    -- That measurement is what makes the next one early.
+                    VoidConfig.Status = "learning the timing"
+                    local giveUp = tick() + 8
+                    while not releaseSeen and tick() < giveUp do
+                        local hum = getOwnHumanoid()
+                        if not hum or hum.Health <= 0 then return end
+                        RunService.Heartbeat:Wait()
+                    end
+                end
+
+                local jumpRoot = getOwnRoot()
+                if not jumpRoot then return end
+                jumpRoot.CFrame = CFrame.new(voidPoint, voidPoint + jumpRoot.CFrame.LookVector)
+                VoidConfig.Status = "over the void"
+
+                local holdUntil = tick() + VoidConfig.CarryDuration
+                while tick() < holdUntil do
+                    local rootNow = getOwnRoot()
+                    local hum = getOwnHumanoid()
+                    if not rootNow or not hum or hum.Health <= 0 then break end
+                    rootNow.CFrame = CFrame.new(voidPoint, voidPoint + rootNow.CFrame.LookVector)
+                    if victimChar then
+                        local victimRoot = victimChar:FindFirstChild("HumanoidRootPart")
+                        if victimRoot then
+                            VoidConfig.LastFollowGap = (victimRoot.Position - rootNow.Position).Magnitude
+                        end
+                    end
+                    RunService.Heartbeat:Wait()
+                end
+
+                VoidConfig.Status = "returning"
+                return
+            end
 
             -- Altitude is relative to where you already are, not derived from
             -- the map, so it is always a sane number of studs.
@@ -654,17 +760,31 @@ end
 
 if CursedStrikesEffects then
     CursedStrikesEffects.OnClientEvent:Connect(function(key, a, b)
-        if not VoidConfig.Enabled or carryActive then return end
-
         if key == "FinalHit" then
-            -- FinalHit(attacker, victim): unambiguous, no window needed.
+            -- FinalHit(attacker, victim) is the last hit of the combo, so it
+            -- doubles as the release marker. Timing is recorded even while a
+            -- carry is running - that is precisely the run being measured.
             if isOwnCharacter(a) and b and not isOwnCharacter(b) then
-                runVoidCarry(b)
+                if Timing.ComboStart then
+                    recordHold(tick() - Timing.ComboStart)
+                end
+                releaseSeen = true
+                if VoidConfig.Enabled and not carryActive then
+                    runVoidCarry(b)
+                end
             end
         elseif key == "Hit" then
-            -- Hit(victim, ...): only ours if we just used the move.
+            -- Hit(victim, ...): only ours if we just used the move. The first
+            -- one is where the hold begins, so it is what durations are
+            -- measured from.
             if tick() - lastActivatedAt <= ACTIVATION_WINDOW and a and not isOwnCharacter(a) then
-                runVoidCarry(a)
+                if not carryActive then
+                    Timing.ComboStart = tick()
+                    releaseSeen = false
+                    if VoidConfig.Enabled then
+                        runVoidCarry(a)
+                    end
+                end
             end
         end
     end)
@@ -774,6 +894,46 @@ VoidSection:Toggle({
 
 local VoidStatus = VoidSection:Label({ Title = 'status: idle' })
 local VoidFollow = VoidSection:Label({ Title = 'victim follow gap: --' })
+local VoidTiming = VoidSection:Label({ Title = 'measured hold: not yet seen' })
+
+VoidSection:Dropdown({
+    Title = 'mode',
+    Flag = 'void_mode',
+    Options = { 'Timed', 'Routed' },
+    Default = 'Timed',
+    Callback = function(v) VoidConfig.Mode = v end,
+})
+
+VoidSection:Slider({
+    Title = 'jump this early',
+    Flag = 'void_lead',
+    Min = 0.02,
+    Max = 1,
+    Increment = 0.02,
+    Default = 0.12,
+    Suffix = 's',
+    Callback = function(v) VoidConfig.Lead = v end,
+})
+
+VoidSection:Slider({
+    Title = 'manual hold override',
+    Flag = 'void_manual_hold',
+    Min = 0,
+    Max = 8,
+    Increment = 0.1,
+    Default = 0,
+    Suffix = 's',
+    Callback = function(v) VoidConfig.ManualDuration = v end,
+})
+
+VoidSection:Button({
+    Title = 'forget measured timing',
+    Callback = function()
+        Timing.Learned = nil
+        Timing.Samples = 0
+        Timing.Last = nil
+    end,
+})
 
 VoidSection:Slider({
     Title = 'fly speed',
@@ -934,6 +1094,16 @@ VoidInfo:Paragraph({
     Text = 'The gap above is the distance between you and the victim while you are out over the void. If it stays small the server is keeping them attached through the combo and the carry is working. If it jumps immediately they were never brought along, and no amount of tuning here will change that.',
 })
 
+VoidInfo:Paragraph({
+    Title = 'timed mode',
+    Text = 'How long Cursed Strikes holds someone is not in the game files anywhere the client can read, so it gets measured: the gap between the first hit landing and FinalHit, averaged over every combo. The first use of a session has nothing learned yet, so it rides the combo out and jumps on FinalHit - that run is what teaches it. From the second onward it jumps early, by the lead above.',
+})
+
+VoidInfo:Paragraph({
+    Title = 'timed vs routed',
+    Text = 'Timed spends the whole combo standing exactly where you were, then makes one teleport straight to the void a moment before the release - nothing is dodged and nothing in the way matters, because it is a single instant jump rather than a journey. Routed is the older behaviour that picks its way out through openings and never passes through anything, which is slower and can fail if you are boxed in.',
+})
+
 task.spawn(function()
     while true do
         task.wait(0.35)
@@ -943,6 +1113,15 @@ task.spawn(function()
                 VoidFollow:Set(('victim follow gap: %.1f studs'):format(VoidConfig.LastFollowGap))
             else
                 VoidFollow:Set('victim follow gap: --')
+            end
+
+            if VoidConfig.ManualDuration > 0 then
+                VoidTiming:Set(('measured hold: overridden to %.2fs'):format(VoidConfig.ManualDuration))
+            elseif Timing.Learned then
+                VoidTiming:Set(('measured hold: %.2fs over %d combo(s), last %.2fs')
+                    :format(Timing.Learned, Timing.Samples, Timing.Last or Timing.Learned))
+            else
+                VoidTiming:Set('measured hold: not yet seen')
             end
         end)
     end
