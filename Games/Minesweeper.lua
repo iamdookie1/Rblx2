@@ -1,7 +1,7 @@
 --// Minesweeper -------------------------------------------------------------------
 -- Board:   workspace.Flag.Parts        (one Part per tile)
 -- Number:  part.NumberGui.TextLabel.Text
--- Flag:    a foreign child on the tile (the model is built server side)
+-- Flag:    an object carrying a UserId attribute (names who placed it)
 --
 -- Mine positions are never replicated - the server reveals a tile only once it
 -- is touched - so nothing hidden is being read. Everything below is derived from
@@ -62,6 +62,7 @@ local Stats = {
 
 --// Board -------------------------------------------------------------------------
 local FlagModel, PartsFolder
+local boardPitch = nil
 local tiles = {}          -- [part] = tile
 local tileList = {}
 local dirty, dirtyCount = {}, 0
@@ -95,28 +96,54 @@ end
 -- detection below cannot mistake our own highlights for a flag.
 local OURS = "MSV_"
 
--- The flag model is built server side, so its name is not in any client dump
--- and matching on "flag" was always a guess. Detect it structurally instead:
--- the only things the game ever parents to a tile are the number gui and the
--- flag, so any other foreign child means flagged.
+-- A flag carries a UserId attribute naming whoever placed it. That is the one
+-- unambiguous marker: the name is server-built and varies, and "anything
+-- foreign parented to the tile" catches decor that is not a flag at all.
+local function carriesUserId(inst)
+    local ok, value = pcall(function() return inst:GetAttribute("UserId") end)
+    return ok and value ~= nil
+end
+
+-- Flags placed away from the tile rather than parented to it, mapped onto the
+-- tile beneath them. Rebuilt only when a sweep actually needs it.
+local looseFlags = {}
+
 local function hasFlag(part)
-    for _, child in ipairs(part:GetChildren()) do
-        local name = child.Name
-        if name:sub(1, #OURS) ~= OURS
-            and name ~= "NumberGui"
-            and not child:IsA("ClickDetector")
-            and not child:IsA("Attachment")
-            and not child:IsA("Weld")
-            and not child:IsA("WeldConstraint")
-            and not child:IsA("Motor6D")
-            and not child:IsA("SpecialMesh")
-            and not child:IsA("Decal")
-            and not child:IsA("Texture")
-        then
+    if carriesUserId(part) then return true end
+    for _, d in ipairs(part:GetDescendants()) do
+        if d.Name:sub(1, #OURS) ~= OURS and carriesUserId(d) then
             return true
         end
     end
-    return false
+    return looseFlags[part] == true
+end
+
+-- Sweeps for flag objects that are not inside a tile and pins each to the
+-- nearest one. Only worth doing if the per-tile check is coming up empty, so
+-- the caller decides when.
+local function refreshLooseFlags(tileList, pitch)
+    looseFlags = {}
+    if not pitch then return end
+    local budget = 6000
+    for _, inst in ipairs(Workspace:GetDescendants()) do
+        if budget <= 0 then break end
+        budget = budget - 1
+        if (inst:IsA("BasePart") or inst:IsA("Model")) and carriesUserId(inst) then
+            local ok, pos = pcall(function()
+                if inst:IsA("Model") then return inst:GetPivot().Position end
+                return inst.Position
+            end)
+            if ok and pos then
+                local best, bestGap = nil, pitch * 0.75
+                for _, tile in ipairs(tileList) do
+                    local tp = tile.part.Position
+                    local gap = math.abs(tp.X - pos.X) + math.abs(tp.Z - pos.Z)
+                    if gap < bestGap then bestGap, best = gap, tile end
+                end
+                if best then looseFlags[best.part] = true end
+            end
+        end
+    end
 end
 
 -- "revealed" once a number can be read, "flagged" if a flag sits on it, else
@@ -157,6 +184,7 @@ local function buildBoard()
         end
     end
     if pitch == math.huge then pitch = parts[1].Size.X end
+    boardPitch = pitch
 
     local buckets = {}
     local function keyOf(pos)
@@ -715,6 +743,13 @@ task.spawn(function()
                 -- Backstop only. The events above drive everything in real
                 -- time; this exists purely to catch a change that somehow did
                 -- not raise one, so it runs rarely instead of every tick.
+                -- If no flag has been spotted on any tile but flags clearly
+                -- exist elsewhere, they are parented somewhere other than the
+                -- tile, so pin them by position. Only runs while the cheap
+                -- per-tile check is finding nothing.
+                if Stats.Flagged == 0 then
+                    pcall(refreshLooseFlags, tileList, boardPitch)
+                end
                 for _, t in ipairs(tileList) do
                     if t.state ~= "revealed" then refreshTile(t) end
                 end
