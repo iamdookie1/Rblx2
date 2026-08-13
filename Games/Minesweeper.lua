@@ -1,7 +1,7 @@
 --// Minesweeper -------------------------------------------------------------------
 -- Board:   workspace.Flag.Parts        (one Part per tile)
 -- Number:  part.NumberGui.TextLabel.Text
--- Flag:    a descendant named "flag"
+-- Flag:    a foreign child on the tile (the model is built server side)
 --
 -- Mine positions are never replicated - the server reveals a tile only once it
 -- is touched - so nothing hidden is being read. Everything below is derived from
@@ -91,10 +91,30 @@ local function readNumber(part)
     return tonumber(text)
 end
 
+-- Marker on everything this script parents to a tile, so foreign-child
+-- detection below cannot mistake our own highlights for a flag.
+local OURS = "MSV_"
+
+-- The flag model is built server side, so its name is not in any client dump
+-- and matching on "flag" was always a guess. Detect it structurally instead:
+-- the only things the game ever parents to a tile are the number gui and the
+-- flag, so any other foreign child means flagged.
 local function hasFlag(part)
-    if part:FindFirstChild("flag") then return true end
-    for _, d in ipairs(part:GetDescendants()) do
-        if d.Name:lower():find("flag") then return true end
+    for _, child in ipairs(part:GetChildren()) do
+        local name = child.Name
+        if name:sub(1, #OURS) ~= OURS
+            and name ~= "NumberGui"
+            and not child:IsA("ClickDetector")
+            and not child:IsA("Attachment")
+            and not child:IsA("Weld")
+            and not child:IsA("WeldConstraint")
+            and not child:IsA("Motor6D")
+            and not child:IsA("SpecialMesh")
+            and not child:IsA("Decal")
+            and not child:IsA("Texture")
+        then
+            return true
+        end
     end
     return false
 end
@@ -290,7 +310,13 @@ end
 local function buildVisual(part, method, color)
     local made = {}
 
-    local function add(inst) made[#made + 1] = inst return inst end
+    local function add(inst)
+        -- Tagged so flag detection can tell our own markers apart from a real
+        -- flag the game placed.
+        inst.Name = OURS .. inst.ClassName
+        made[#made + 1] = inst
+        return inst
+    end
 
     if method == "Highlight" then
         local h = add(Instance.new("Highlight"))
@@ -408,6 +434,24 @@ local function applyVisual(part, kind)
 
     clearVisual(part)
     visuals[part] = { Kind = kind, Method = method, Objects = buildVisual(part, method, color) }
+end
+
+-- The game runs a detector once a second that counts tiles whose Color is
+-- exactly Color3.new(0,1,0) or Color3.new(1,0,0) and reports the number to the
+-- server over ReplicatedStorage.Message with the tag "Color". It is aimed
+-- squarely at solver scripts that paint tiles pure green and pure red.
+--
+-- Nothing here writes a tile's own Color, so the detector has nothing to see -
+-- but a colour picked at exactly those two values would still be an odd thing
+-- to be wearing, so both are nudged off the exact match.
+local function safeColor(color)
+    local r = math.floor(color.R * 255 + 0.5)
+    local g = math.floor(color.G * 255 + 0.5)
+    local b = math.floor(color.B * 255 + 0.5)
+    if (r == 0 and g == 255 and b == 0) or (r == 255 and g == 0 and b == 0) then
+        return Color3.fromRGB(math.min(r + 8, 255), math.min(g, 247) + 8, b + 8)
+    end
+    return color
 end
 
 local function wanted(kind)
@@ -731,7 +775,7 @@ SafeSection:Colorpicker({
     Title = 'safe color',
     Flag = 'ms_safe_color',
     Default = Color3.fromRGB(70, 170, 255),
-    Callback = function(v) Config.SafeColor = v refreshVisualsOnly() end,
+    Callback = function(v) Config.SafeColor = safeColor(v) refreshVisualsOnly() end,
 })
 
 local MineSection = MainTab:Section({ Title = 'mines', Side = 'right' })
@@ -755,7 +799,7 @@ MineSection:Colorpicker({
     Title = 'mine color',
     Flag = 'ms_mine_color',
     Default = Color3.fromRGB(255, 60, 60),
-    Callback = function(v) Config.MineColor = v refreshVisualsOnly() end,
+    Callback = function(v) Config.MineColor = safeColor(v) refreshVisualsOnly() end,
 })
 
 local DisplaySection = MainTab:Section({ Title = 'display', Side = 'left' })
@@ -778,6 +822,11 @@ DisplaySection:Slider({
 DisplaySection:Paragraph({
     Title = 'updates are instant',
     Text = 'Solving is driven by the board changing, not by a timer: a reveal or a flag re-solves on the very next frame, and frames where nothing moved cost nothing at all. A tile also loses its marker the moment it stops being unknown, so flagging a bomb clears it immediately rather than on the next pass. The sweep above is only a safety net for a change that somehow raised no event, which is why it can sit at a second or more.',
+})
+
+DisplaySection:Paragraph({
+    Title = 'the game watches for this',
+    Text = 'It counts tiles coloured exactly pure green or pure red once a second and reports the total to the server as a "Color" message - a detector aimed at solver scripts that repaint tiles. Nothing here writes a tile\'s own colour, so it sees nothing, and the pickers refuse those two exact values anyway. Worth knowing before switching to any method that tints the tile itself.',
 })
 
 DisplaySection:Paragraph({
