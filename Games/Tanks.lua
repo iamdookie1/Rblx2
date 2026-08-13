@@ -419,6 +419,96 @@ if Blink and typeof(Blink) == "table" and Blink.Snapshot and Blink.Snapshot.Send
     end
 end
 
+--// Anti rubber-band ---------------------------------------------------------------
+-- The server never moves you. It sends Snapshot.Rejection(x, z, id) and the
+-- CLIENT does this to itself:
+--
+--   root.CFrame = CFrame.new(x, y, z) * rotation
+--   root.AssemblyLinearVelocity = Vector3.zero
+--   linearVelocity.PlaneVelocity = Vector2.zero
+--   forceAccumulator, lastVelocity, lastDirection = zero
+--
+-- So the snap back is bad twice over: it moves you, and it kills every scrap of
+-- momentum you had. Most of those corrections are sub-stud lag noise, and
+-- eating a dead stop for half a stud is what makes normal play feel awful.
+--
+-- Blink's .On assigns a single handler slot rather than appending, so
+-- re-registering replaces the game's handler outright and we decide what a
+-- correction actually does. The acknowledgement is always sent either way, so
+-- from the server's side nothing looks unusual.
+local Rubber = {
+    Enabled = false,
+    Threshold = 6,
+    KeepMomentum = true,
+    Smooth = true,
+    SmoothAlpha = 0.35,
+
+    Seen = 0,
+    Ignored = 0,
+    LastDistance = 0,
+}
+
+local function installRejectionHandler()
+    if not (Blink and Blink.Snapshot and Blink.Snapshot.Rejection) then return false end
+    if typeof(Blink.Snapshot.Rejection.On) ~= "function" then return false end
+
+    Blink.Snapshot.Rejection.On(function(x, z, id)
+        -- Acknowledge first and unconditionally: the server is waiting on this,
+        -- and staying silent is the part that would actually look suspicious.
+        pcall(function()
+            if Blink.Snapshot.AcknowledgeRejection then
+                Blink.Snapshot.AcknowledgeRejection.Fire(id, os.clock())
+            end
+        end)
+
+        local root = getOwnRoot()
+        if not root then return end
+
+        local here = root.Position
+        local target = Vector3.new(x, here.Y, z)
+        local distance = (Vector3.new(here.X, 0, here.Z) - Vector3.new(x, 0, z)).Magnitude
+
+        Rubber.Seen = Rubber.Seen + 1
+        Rubber.LastDistance = distance
+
+        if not Rubber.Enabled then
+            -- Faithful reproduction of the game's own behaviour.
+            root.CFrame = CFrame.new(target) * root.CFrame.Rotation
+            root.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+            return
+        end
+
+        -- Small corrections are lag noise, not the server disagreeing about
+        -- where you are. Riding through them is what removes the twitch.
+        if distance <= Rubber.Threshold then
+            Rubber.Ignored = Rubber.Ignored + 1
+            return
+        end
+
+        local velocity = root.AssemblyLinearVelocity
+        if Rubber.Smooth then
+            -- Ease onto the corrected spot instead of snapping, so a real
+            -- correction reads as being pushed rather than teleported.
+            local blended = here:Lerp(target, math.clamp(Rubber.SmoothAlpha, 0.05, 1))
+            root.CFrame = CFrame.new(blended) * root.CFrame.Rotation
+        else
+            root.CFrame = CFrame.new(target) * root.CFrame.Rotation
+        end
+
+        -- Keeping momentum is the half that matters most: the position is the
+        -- server's call, but being stopped dead is not required by anything.
+        if Rubber.KeepMomentum then
+            root.AssemblyLinearVelocity = velocity
+        else
+            root.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+        end
+    end)
+
+    return true
+end
+
+local rejectionHooked = installRejectionHandler()
+
 --// ESP --------------------------------------------------------------------------
 local espObjects = {}
 
@@ -696,6 +786,67 @@ RangeSection:Slider({
     Callback = function(v) Aim.PredictScale = v end,
 })
 
+local RubberSection = MainTab:Section({ Title = 'anti rubber-band', Side = 'left' })
+
+local rubberLabel = RubberSection:Label({ Title = 'corrections: 0 (0 ignored)' })
+
+RubberSection:Toggle({
+    Title = 'stop the snap back',
+    Flag = 'tk_rubber',
+    Default = false,
+    Callback = function(v)
+        Rubber.Enabled = v
+        if v and not rejectionHooked then
+            notify('Could not take over the rejection handler - the game may have changed.', 'error', 8)
+        end
+    end,
+})
+
+RubberSection:Toggle({
+    Title = 'keep momentum',
+    Flag = 'tk_rubber_momentum',
+    Default = true,
+    Callback = function(v) Rubber.KeepMomentum = v end,
+})
+
+RubberSection:Toggle({
+    Title = 'ease instead of snap',
+    Flag = 'tk_rubber_smooth',
+    Default = true,
+    Callback = function(v) Rubber.Smooth = v end,
+})
+
+RubberSection:Slider({
+    Title = 'ignore corrections under',
+    Flag = 'tk_rubber_threshold',
+    Min = 0,
+    Max = 40,
+    Increment = 0.5,
+    Default = 6,
+    Suffix = ' studs',
+    Callback = function(v) Rubber.Threshold = v end,
+})
+
+RubberSection:Slider({
+    Title = 'ease strength',
+    Flag = 'tk_rubber_alpha',
+    Min = 0.05,
+    Max = 1,
+    Increment = 0.05,
+    Default = 0.35,
+    Callback = function(v) Rubber.SmoothAlpha = v end,
+})
+
+RubberSection:Paragraph({
+    Title = 'what this is doing',
+    Text = 'The server never moves you - it sends a correction and your own client snaps you to it and zeroes every bit of velocity you had, which is why a half stud of lag costs you a dead stop. This takes over that handler: corrections under the threshold are ridden through, larger ones are eased onto instead of snapped, and your momentum is kept either way. The acknowledgement the server waits for is always sent, so nothing looks unusual from its side.',
+})
+
+RubberSection:Paragraph({
+    Title = 'tuning it',
+    Text = 'Watch the ignored count. If it climbs constantly during ordinary driving the threshold is doing its job. Push it too high and you will drift out of step with where the server thinks you are, which costs you hits rather than winning them - around five or six studs covers normal lag without arguing about real disagreements.',
+})
+
 local FovSection = MainTab:Section({ Title = 'fov', Side = 'left' })
 
 FovSection:Toggle({
@@ -824,6 +975,8 @@ spawnLoop(function()
             rangeLabel:Set(('range: %d studs'):format(math.floor(effectiveRange())))
             targetLabel:Set('target: ' .. tostring(Diag.LastTarget))
             recordLabel:Set(('records sent: %d'):format(Diag.RecordsSeen))
+            rubberLabel:Set(('corrections: %d (%d ignored, last %.1f studs)')
+                :format(Rubber.Seen, Rubber.Ignored, Rubber.LastDistance))
         end)
     end
 end)
