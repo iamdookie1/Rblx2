@@ -69,6 +69,8 @@ local Stats = {
     Mines = 0,
     LastSolve = 0,
     Dirty = 0,
+    AvgNeighbours = 0,
+    Pitch = 0,
     Status = "no board found",
 }
 
@@ -82,7 +84,7 @@ local dirty = {}
 local dirtyCount = 0
 local classification = {}   -- [part] = "safe" | "mine"  (what the solver last concluded)
 local visuals = {}          -- [part] = { Highlight=, Box=, Outline= }
-local tileSize, tileY = nil, nil
+local tileSize, tileY, gridPitch = nil, nil, nil
 
 local function markDirty(tile)
     if not dirty[tile] then
@@ -126,10 +128,48 @@ local function readNumber(part)
     return nil
 end
 
+-- Flags are placed as their own objects rather than parented to the tile, so
+-- looking only at a tile's children misses them entirely and every flagged
+-- square keeps counting as unknown. This maps flag objects onto tiles by
+-- position instead, rebuilt each pass since flags come and go constantly.
+local flaggedTiles = {}
+
+local function refreshFlags()
+    flaggedTiles = {}
+    if not gridPitch then return end
+
+    local budget = 4000
+    for _, inst in ipairs(Workspace:GetDescendants()) do
+        if budget <= 0 then break end
+        budget = budget - 1
+        if inst:IsA("BasePart") or inst:IsA("Model") then
+            if inst.Name:lower():find("flag") and not tiles[inst] then
+                local ok, position = pcall(function()
+                    if inst:IsA("Model") then return inst:GetPivot().Position end
+                    return inst.Position
+                end)
+                if ok and position then
+                    -- Nearest tile beneath the flag, within half a cell.
+                    local bestTile, bestGap = nil, gridPitch * 0.75
+                    for _, tile in ipairs(tileList) do
+                        local tp = tile.part.Position
+                        local gap = math.abs(tp.X - position.X) + math.abs(tp.Z - position.Z)
+                        if gap < bestGap then
+                            bestGap = gap
+                            bestTile = tile
+                        end
+                    end
+                    if bestTile then flaggedTiles[bestTile.part] = true end
+                end
+            end
+        end
+    end
+end
+
 local function isFlagged(part)
+    if flaggedTiles[part] then return true end
     for _, child in ipairs(part:GetChildren()) do
-        local name = child.Name:lower()
-        if name:find("flag") then return true end
+        if child.Name:lower():find("flag") then return true end
     end
     local ok, flagged = pcall(function() return part:GetAttribute("Flagged") end)
     if ok and flagged == true then return true end
@@ -204,11 +244,48 @@ local function discoverBoard()
     tileSize = best[1].Size.X
     tileY = domY
 
+    -- Grid pitch is measured, not assumed to equal tile size. If the board
+    -- leaves any gap between tiles then size ~= spacing, and deriving cells
+    -- from size alone puts every tile in its own island with no neighbours -
+    -- which reads as a perfectly healthy board that can never solve anything.
+    local onY = {}
     for _, part in ipairs(best) do
         local y = math.floor(part.Position.Y * 10 + 0.5) / 10
-        if y == domY then
-            local gx = math.floor(part.Position.X / tileSize + 0.5)
-            local gz = math.floor(part.Position.Z / tileSize + 0.5)
+        if y == domY then onY[#onY + 1] = part end
+    end
+
+    local function smallestGap(values)
+        table.sort(values)
+        local gap = nil
+        for i = 2, #values do
+            local d = values[i] - values[i - 1]
+            if d > 0.05 and (not gap or d < gap) then gap = d end
+        end
+        return gap
+    end
+
+    local xsSeen, zsSeen, xs, zs = {}, {}, {}, {}
+    local minX, minZ = math.huge, math.huge
+    for _, part in ipairs(onY) do
+        local x = math.floor(part.Position.X * 100 + 0.5) / 100
+        local z = math.floor(part.Position.Z * 100 + 0.5) / 100
+        if not xsSeen[x] then xsSeen[x] = true xs[#xs + 1] = x end
+        if not zsSeen[z] then zsSeen[z] = true zs[#zs + 1] = z end
+        if x < minX then minX = x end
+        if z < minZ then minZ = z end
+    end
+
+    local pitchX = smallestGap(xs) or tileSize
+    local pitchZ = smallestGap(zs) or tileSize
+    gridPitch = math.min(pitchX, pitchZ)
+
+    for _, part in ipairs(onY) do
+        do
+            -- Anchored to the board's own corner rather than world origin, so
+            -- a board sitting at arbitrary coordinates still lands on whole
+            -- cell indices.
+            local gx = math.floor((part.Position.X - minX) / pitchX + 0.5)
+            local gz = math.floor((part.Position.Z - minZ) / pitchZ + 0.5)
             local tile = {
                 part = part, gx = gx, gz = gz,
                 state = "unknown", number = nil, neighbours = nil,
@@ -235,6 +312,16 @@ local function discoverBoard()
         end
         tile.neighbours = list
     end
+
+    -- A healthy grid averages close to 8 neighbours per tile. Anything near 0
+    -- means the cell derivation is wrong, which is invisible from the revealed
+    -- count alone - so it gets reported rather than left to be guessed at.
+    local totalNeighbours = 0
+    for _, tile in ipairs(tileList) do
+        totalNeighbours = totalNeighbours + #tile.neighbours
+    end
+    Stats.AvgNeighbours = #tileList > 0 and (totalNeighbours / #tileList) or 0
+    Stats.Pitch = gridPitch or 0
 
     Stats.Tiles = #tileList
     return #tileList > 0
@@ -493,14 +580,21 @@ end
 local function scanForChanges()
     local revealed, unknown, flagged = 0, 0, 0
 
+    refreshFlags()
+
     for _, tile in ipairs(tileList) do
-        if tile.state == "unknown" then
+        -- Revealed tiles never revert, so they are skipped. Unknown and flagged
+        -- both still move - a flag can be taken back off - so both are re-read.
+        if tile.state ~= "revealed" then
             if tile.part.Parent then
                 local state, number = readTile(tile.part)
                 if state ~= tile.state or number ~= tile.number then
                     tile.state = state
                     tile.number = number
                     markDirty(tile)
+                    -- A flag change alters every constraint touching this tile,
+                    -- so its neighbours need re-solving too.
+                    for _, n in ipairs(tile.neighbours) do markDirty(n) end
                 end
             end
         end
@@ -683,6 +777,7 @@ local boardLabel = StatusSection:Label({ Title = 'board: scanning...' })
 local countLabel = StatusSection:Label({ Title = 'revealed 0 / unknown 0 / flagged 0' })
 local resultLabel = StatusSection:Label({ Title = 'safe 0 / mines 0' })
 local perfLabel = StatusSection:Label({ Title = 'last solve: --' })
+local gridLabel = StatusSection:Label({ Title = 'grid: --' })
 
 StatusSection:Button({
     Title = 'rescan board',
@@ -698,7 +793,7 @@ StatusSection:Button({
 
 StatusSection:Paragraph({
     Title = 'if nothing ever lights up',
-    Text = 'Check the revealed count above. If it stays at zero while the board clearly has numbers on it, the tiles are drawing their numbers in a form the reader does not recognise yet - tell me how they look and it is a one-line fix. Everything else here is already correct once that reads properly.',
+    Text = 'Read the grid line. Neighbours average should sit near 8 - if it is near 0 the cells were derived wrongly and no tile can see the numbers around it, which looks identical to a healthy board from the counts alone. If neighbours look right but revealed stays at 0, the numbers are drawn in a form the reader does not know yet.',
 })
 
 spawnLoop(function()
@@ -714,6 +809,7 @@ spawnLoop(function()
             else
                 perfLabel:Set('last solve: --')
             end
+            gridLabel:Set(('grid: pitch %.2f, %.1f neighbours avg'):format(Stats.Pitch, Stats.AvgNeighbours))
         end)
     end
 end)
