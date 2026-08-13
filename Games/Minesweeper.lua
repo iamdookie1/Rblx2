@@ -45,7 +45,8 @@ local Config = {
     MineColor = Color3.fromRGB(255, 60, 60),
 
     Transparency = 0.5,
-    Interval = 0.05,
+    -- Solving is event driven, so this is only how often the safety sweep runs.
+    Backstop = 1,
 
     AutoFlag = false,
     FlagRange = 16,
@@ -550,14 +551,30 @@ local function solveIncremental()
 end
 
 --// Change tracking -----------------------------------------------------------------
+-- Set by anything that changes the board; the frame loop below picks it up on
+-- the very next step. Coalescing through a flag means a burst of twenty reveals
+-- costs one solve rather than twenty.
+local solveQueued = false
+local function requestSolve() solveQueued = true end
+
 local function refreshTile(tile)
     if not tile.part.Parent then return end
     local state, number = readTile(tile.part)
     if state ~= tile.state or number ~= tile.number then
         tile.state, tile.number = state, number
+
+        -- A tile that just got flagged or revealed is no longer something to
+        -- point at, so its marker goes immediately rather than surviving until
+        -- the next solve. This is the flag-a-bomb-and-it-vanishes case.
+        if state ~= "unknown" and classification[tile.part] then
+            clearVisual(tile.part)
+            classification[tile.part] = nil
+        end
+
         markDirty(tile)
         -- A reveal or a flag changes every constraint touching this tile.
         for _, n in ipairs(tile.neighbours) do markDirty(n) end
+        requestSolve()
     end
 end
 
@@ -651,19 +668,29 @@ task.spawn(function()
                 classification, flaggedByUs = {}, {}
                 Stats.Status = "board gone, rescanning"
             else
-                -- A light sweep catches anything the events missed; only tiles
-                -- that are not already revealed can change.
+                -- Backstop only. The events above drive everything in real
+                -- time; this exists purely to catch a change that somehow did
+                -- not raise one, so it runs rarely instead of every tick.
                 for _, t in ipairs(tileList) do
                     if t.state ~= "revealed" then refreshTile(t) end
                 end
                 fullRescanCounts()
-                pcall(solveIncremental)
                 if Config.AutoFlag then task.spawn(autoFlagPass) end
             end
         end
-        task.wait(Config.Interval)
+        task.wait(Config.Backstop)
     end
 end)
+
+-- Solving runs on the frame after a change lands, not on a timer. Nothing
+-- happens on frames where the board did not move, so this costs nothing while
+-- idle and updates immediately when it matters.
+track(PostSimulation:Connect(function()
+    if Unloading or not boardReady or not solveQueued then return end
+    solveQueued = false
+    pcall(solveIncremental)
+    fullRescanCounts()
+end))
 
 --// UI ---------------------------------------------------------------------------
 local Centrl = loadstring(game:HttpGet('https://raw.githubusercontent.com/iamdookie1/Rblx2/main/UI/Lib2.lua'))()
@@ -741,11 +768,16 @@ DisplaySection:Slider({
 })
 
 DisplaySection:Slider({
-    Title = 'update interval',
-    Flag = 'ms_interval',
-    Min = 0.03, Max = 0.5, Increment = 0.01, Default = 0.05,
+    Title = 'backstop sweep',
+    Flag = 'ms_backstop',
+    Min = 0.25, Max = 5, Increment = 0.25, Default = 1,
     Suffix = 's',
-    Callback = function(v) Config.Interval = v end,
+    Callback = function(v) Config.Backstop = v end,
+})
+
+DisplaySection:Paragraph({
+    Title = 'updates are instant',
+    Text = 'Solving is driven by the board changing, not by a timer: a reveal or a flag re-solves on the very next frame, and frames where nothing moved cost nothing at all. A tile also loses its marker the moment it stops being unknown, so flagging a bomb clears it immediately rather than on the next pass. The sweep above is only a safety net for a change that somehow raised no event, which is why it can sit at a second or more.',
 })
 
 DisplaySection:Paragraph({
