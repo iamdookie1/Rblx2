@@ -1,416 +1,423 @@
 --// Minesweeper -------------------------------------------------------------------
--- Mine positions are NOT replicated to the client. The server reveals a tile's
--- contents only after it is touched (MiscEvents.PlayEffect -> EffectScript,
--- which spawns the mine model on reveal). So there is nothing hidden to read.
+-- Board:   workspace.Flag.Parts        (one Part per tile)
+-- Number:  part.NumberGui.TextLabel.Text
+-- Flag:    a descendant named "flag"
 --
--- Everything below is therefore derived the legitimate way: from the revealed
--- numbers, which the client necessarily has because it draws them. A tile is
--- only ever marked safe or mined when it is *provably* so - never a guess.
+-- Mine positions are never replicated - the server reveals a tile only once it
+-- is touched - so nothing hidden is being read. Everything below is derived from
+-- the revealed numbers, which the client necessarily has because it draws them,
+-- and a tile is only marked when it is provably safe or provably mined.
 --
--- Two solving passes, both exact:
---   1. Single constraint. For a revealed number N with F flagged neighbours and
---      U unknown neighbours: if N-F == 0 every U is safe; if N-F == #U every U
---      is a mine.
---   2. Subset elimination. For constraints A and B where A's unknowns are a
---      subset of B's, the difference B\A must contain exactly (Nb-Fb)-(Na-Fa)
---      mines among #Ub-#Ua tiles. If that is 0 they are all safe; if the counts
---      match they are all mines. This is what cracks the pairs single-constraint
---      logic cannot.
---
--- Nothing probabilistic is shown. If a position genuinely requires a guess,
--- nothing lights up, which is the honest answer.
+-- On placing flags: the game reads a token out of workspace.Salasana at startup
+-- and then zeroes, renames and destroys it, so a script injected later cannot
+-- read it. Every PlaceFlag:FireServer(part, token, true) needs that value, which
+-- is why blindly firing the remote does nothing. Two routes actually work:
+-- recover the token from the upvalues of the game's own handler, or fire the
+-- ClickDetector the game made and let its handler send the token for us.
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Workspace = workspace
 
 local LocalPlayer = Players.LocalPlayer
 local Camera = Workspace.CurrentCamera
 
-local function resolveEvent(modernName, legacyName)
-    local ok, event = pcall(function() return RunService[modernName] end)
-    if ok and event then return event end
-    return RunService[legacyName]
+local function resolveEvent(modern, legacy)
+    local ok, ev = pcall(function() return RunService[modern] end)
+    if ok and ev then return ev end
+    return RunService[legacy]
 end
-
-local PreRender = resolveEvent("PreRender", "RenderStepped")
 local PostSimulation = resolveEvent("PostSimulation", "Heartbeat")
 
 local Connections = {}
 local Unloading = false
-
 local function track(c) Connections[#Connections + 1] = c return c end
-local function spawnLoop(fn) return task.spawn(fn) end
-
-Workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(function()
-    if Workspace.CurrentCamera then Camera = Workspace.CurrentCamera end
-end)
 
 --// Config ------------------------------------------------------------------------
 local Config = {
     ShowSafe = false,
     SafeMethod = "Highlight",
-    SafeColor = Color3.fromRGB(80, 230, 120),
+    SafeColor = Color3.fromRGB(70, 170, 255),
 
     ShowMines = false,
     MineMethod = "Highlight",
-    MineColor = Color3.fromRGB(240, 70, 70),
+    MineColor = Color3.fromRGB(255, 60, 60),
 
-    Transparency = 0.55,
-    ScanInterval = 0.35,
+    Transparency = 0.5,
+    Interval = 0.05,
+
+    AutoFlag = false,
+    FlagRange = 16,
+    FlagDelay = 0.06,
+    FlagMethod = "Auto",
 }
 
 local Stats = {
-    Tiles = 0,
-    Revealed = 0,
-    Unknown = 0,
-    Flagged = 0,
-    Safe = 0,
-    Mines = 0,
-    LastSolve = 0,
-    Dirty = 0,
-    AvgNeighbours = 0,
-    Pitch = 0,
-    Status = "no board found",
+    Tiles = 0, Revealed = 0, Unknown = 0, Flagged = 0,
+    Safe = 0, Mines = 0, LastSolve = 0, Changed = 0,
+    Neighbours = 0, Token = "not found", Status = "waiting for board",
 }
 
---// Board model -------------------------------------------------------------------
--- tiles[part] = { part, gx, gz, state, number, neighbours }
--- state is "unknown" | "revealed" | "flagged"
-local tiles = {}
-local grid = {}
+--// Board -------------------------------------------------------------------------
+local FlagModel, PartsFolder
+local tiles = {}          -- [part] = tile
 local tileList = {}
-local dirty = {}
-local dirtyCount = 0
-local classification = {}   -- [part] = "safe" | "mine"  (what the solver last concluded)
-local visuals = {}          -- [part] = { Highlight=, Box=, Outline= }
-local tileSize, tileY, gridPitch = nil, nil, nil
+local dirty, dirtyCount = {}, 0
+local classification = {} -- [part] = "safe" | "mine"
+local visuals = {}
+local flaggedByUs = {}
 
 local function markDirty(tile)
-    if not dirty[tile] then
+    if tile and not dirty[tile] then
         dirty[tile] = true
         dirtyCount = dirtyCount + 1
     end
 end
 
---// Reading a tile ------------------------------------------------------------------
--- The dump used to build this was captured in the lobby, so the exact way a
--- revealed number is drawn could not be confirmed. Rather than assume one, every
--- plausible representation is tried in order and the first that yields 0-8 wins.
--- If the board ever reads as all-unknown, this is the function to adjust.
+--// Reading -----------------------------------------------------------------------
 local function readNumber(part)
-    local ok, attrs = pcall(function() return part:GetAttributes() end)
-    if ok and attrs then
-        for _, value in pairs(attrs) do
-            if typeof(value) == "number" and value >= 0 and value <= 8 then
-                return math.floor(value)
-            end
-        end
+    local gui = part:FindFirstChild("NumberGui")
+    if not gui then return nil end
+    local label = gui:FindFirstChild("TextLabel") or gui:FindFirstChildWhichIsA("TextLabel", true)
+    if not label then return nil end
+    local text = label.Text
+    if not text or text == "" then
+        -- An opened tile with no text is a zero: every neighbour is safe, which
+        -- is the single most useful constraint on the board.
+        return 0
     end
-
-    for _, child in ipairs(part:GetChildren()) do
-        if child:IsA("IntValue") or child:IsA("NumberValue") then
-            local v = child.Value
-            if v >= 0 and v <= 8 then return math.floor(v) end
-        elseif child:IsA("StringValue") then
-            local n = tonumber(child.Value)
-            if n and n >= 0 and n <= 8 then return math.floor(n) end
-        elseif child:IsA("SurfaceGui") or child:IsA("BillboardGui") then
-            for _, label in ipairs(child:GetDescendants()) do
-                if label:IsA("TextLabel") or label:IsA("TextButton") then
-                    local n = tonumber((label.Text or ""):match("%d"))
-                    if n and n >= 0 and n <= 8 then return n end
-                end
-            end
-        end
-    end
-
-    return nil
+    return tonumber(text)
 end
 
--- Flags are placed as their own objects rather than parented to the tile, so
--- looking only at a tile's children misses them entirely and every flagged
--- square keeps counting as unknown. This maps flag objects onto tiles by
--- position instead, rebuilt each pass since flags come and go constantly.
-local flaggedTiles = {}
-
-local function refreshFlags()
-    flaggedTiles = {}
-    if not gridPitch then return end
-
-    local budget = 4000
-    for _, inst in ipairs(Workspace:GetDescendants()) do
-        if budget <= 0 then break end
-        budget = budget - 1
-        if inst:IsA("BasePart") or inst:IsA("Model") then
-            if inst.Name:lower():find("flag") and not tiles[inst] then
-                local ok, position = pcall(function()
-                    if inst:IsA("Model") then return inst:GetPivot().Position end
-                    return inst.Position
-                end)
-                if ok and position then
-                    -- Nearest tile beneath the flag, within half a cell.
-                    local bestTile, bestGap = nil, gridPitch * 0.75
-                    for _, tile in ipairs(tileList) do
-                        local tp = tile.part.Position
-                        local gap = math.abs(tp.X - position.X) + math.abs(tp.Z - position.Z)
-                        if gap < bestGap then
-                            bestGap = gap
-                            bestTile = tile
-                        end
-                    end
-                    if bestTile then flaggedTiles[bestTile.part] = true end
-                end
-            end
-        end
+local function hasFlag(part)
+    if part:FindFirstChild("flag") then return true end
+    for _, d in ipairs(part:GetDescendants()) do
+        if d.Name:lower():find("flag") then return true end
     end
-end
-
-local function isFlagged(part)
-    if flaggedTiles[part] then return true end
-    for _, child in ipairs(part:GetChildren()) do
-        if child.Name:lower():find("flag") then return true end
-    end
-    local ok, flagged = pcall(function() return part:GetAttribute("Flagged") end)
-    if ok and flagged == true then return true end
     return false
 end
 
--- Returns state, number. A tile counts as revealed once a number can be read
--- off it; anything else is still unknown and therefore still solvable-for.
+-- "revealed" once a number can be read, "flagged" if a flag sits on it, else
+-- still unknown and therefore still worth solving for.
 local function readTile(part)
-    if isFlagged(part) then return "flagged", nil end
-    local number = readNumber(part)
-    if number then return "revealed", number end
+    if hasFlag(part) then return "flagged", nil end
+    local n = readNumber(part)
+    if n then return "revealed", n end
     return "unknown", nil
 end
 
---// Board discovery ------------------------------------------------------------------
--- The board is found by shape rather than by name: the largest set of
--- identically-sized parts sharing a top surface height is the grid. That
--- survives the tiles being renamed or reparented between rounds.
-local function discoverBoard()
+--// Discovery ---------------------------------------------------------------------
+-- Neighbours are matched by distance rather than by dividing position by tile
+-- size: the board leaves a gap between tiles, so size-based cell maths puts
+-- every tile on its own index with no neighbours at all - which looks identical
+-- to a healthy board from the counts and can never solve anything.
+local function buildBoard()
+    FlagModel = Workspace:FindFirstChild("Flag")
+    PartsFolder = FlagModel and FlagModel:FindFirstChild("Parts")
+    if not PartsFolder then return false end
+
+    tiles, tileList = {}, {}
+    local parts = {}
+    for _, part in ipairs(PartsFolder:GetChildren()) do
+        if part:IsA("BasePart") then parts[#parts + 1] = part end
+    end
+    if #parts == 0 then return false end
+
+    -- Spacing measured off the board itself, then used as the bucket size for a
+    -- spatial hash so neighbour matching stays linear instead of comparing every
+    -- tile against every other one.
+    local pitch = math.huge
+    local sample = math.min(#parts, 200)
+    for i = 1, sample do
+        for j = i + 1, sample do
+            local d = (parts[i].Position - parts[j].Position).Magnitude
+            if d > 0.05 and d < pitch then pitch = d end
+        end
+    end
+    if pitch == math.huge then pitch = parts[1].Size.X end
+
     local buckets = {}
-    local budget = 12000
-
-    local character = LocalPlayer.Character
-
-    for _, inst in ipairs(Workspace:GetDescendants()) do
-        if budget <= 0 then break end
-        budget = budget - 1
-        -- Guarded rather than `LocalPlayer.Character or Workspace`: with no
-        -- character that fallback excludes everything in Workspace and the
-        -- scan silently finds nothing.
-        local mine = character ~= nil and inst:IsDescendantOf(character)
-        if inst:IsA("BasePart") and not mine then
-            local size = inst.Size
-            -- Tiles are flat and square-ish in plan.
-            if math.abs(size.X - size.Z) < 0.05 and size.X >= 1 then
-                local key = ("%.2f_%.2f_%.2f"):format(size.X, size.Y, size.Z)
-                local bucket = buckets[key]
-                if not bucket then
-                    bucket = {}
-                    buckets[key] = bucket
-                end
-                bucket[#bucket + 1] = inst
-            end
-        end
+    local function keyOf(pos)
+        return ("%d_%d"):format(math.floor(pos.X / pitch + 0.5), math.floor(pos.Z / pitch + 0.5))
     end
 
-    local best, bestCount = nil, 0
-    for _, bucket in pairs(buckets) do
-        if #bucket > bestCount then
-            best, bestCount = bucket, #bucket
-        end
+    for _, part in ipairs(parts) do
+        local tile = { part = part, state = "unknown", number = nil, neighbours = {} }
+        tiles[part] = tile
+        tileList[#tileList + 1] = tile
+        local k = keyOf(part.Position)
+        buckets[k] = buckets[k] or {}
+        table.insert(buckets[k], tile)
     end
 
-    if not best or bestCount < 9 then
-        return false
-    end
-
-    -- Keep only the dominant height so a second, unrelated slab of same-sized
-    -- parts elsewhere in the map cannot contaminate the grid.
-    local heights = {}
-    for _, part in ipairs(best) do
-        local y = math.floor(part.Position.Y * 10 + 0.5) / 10
-        heights[y] = (heights[y] or 0) + 1
-    end
-    local domY, domCount = nil, 0
-    for y, count in pairs(heights) do
-        if count > domCount then domY, domCount = y, count end
-    end
-
-    tiles, grid, tileList = {}, {}, {}
-    tileSize = best[1].Size.X
-    tileY = domY
-
-    -- Grid pitch is measured, not assumed to equal tile size. If the board
-    -- leaves any gap between tiles then size ~= spacing, and deriving cells
-    -- from size alone puts every tile in its own island with no neighbours -
-    -- which reads as a perfectly healthy board that can never solve anything.
-    local onY = {}
-    for _, part in ipairs(best) do
-        local y = math.floor(part.Position.Y * 10 + 0.5) / 10
-        if y == domY then onY[#onY + 1] = part end
-    end
-
-    local function smallestGap(values)
-        table.sort(values)
-        local gap = nil
-        for i = 2, #values do
-            local d = values[i] - values[i - 1]
-            if d > 0.05 and (not gap or d < gap) then gap = d end
-        end
-        return gap
-    end
-
-    local xsSeen, zsSeen, xs, zs = {}, {}, {}, {}
-    local minX, minZ = math.huge, math.huge
-    for _, part in ipairs(onY) do
-        local x = math.floor(part.Position.X * 100 + 0.5) / 100
-        local z = math.floor(part.Position.Z * 100 + 0.5) / 100
-        if not xsSeen[x] then xsSeen[x] = true xs[#xs + 1] = x end
-        if not zsSeen[z] then zsSeen[z] = true zs[#zs + 1] = z end
-        if x < minX then minX = x end
-        if z < minZ then minZ = z end
-    end
-
-    local pitchX = smallestGap(xs) or tileSize
-    local pitchZ = smallestGap(zs) or tileSize
-    gridPitch = math.min(pitchX, pitchZ)
-
-    for _, part in ipairs(onY) do
-        do
-            -- Anchored to the board's own corner rather than world origin, so
-            -- a board sitting at arbitrary coordinates still lands on whole
-            -- cell indices.
-            local gx = math.floor((part.Position.X - minX) / pitchX + 0.5)
-            local gz = math.floor((part.Position.Z - minZ) / pitchZ + 0.5)
-            local tile = {
-                part = part, gx = gx, gz = gz,
-                state = "unknown", number = nil, neighbours = nil,
-            }
-            tiles[part] = tile
-            tileList[#tileList + 1] = tile
-            grid[gx] = grid[gx] or {}
-            grid[gx][gz] = tile
-        end
-    end
-
-    -- Neighbour links are built once and reused for the life of the board;
-    -- recomputing them per solve is pure waste.
+    local reach = pitch * 1.6
     for _, tile in ipairs(tileList) do
+        local pos = tile.part.Position
+        local bx = math.floor(pos.X / pitch + 0.5)
+        local bz = math.floor(pos.Z / pitch + 0.5)
         local list = {}
         for dx = -1, 1 do
             for dz = -1, 1 do
-                if not (dx == 0 and dz == 0) then
-                    local column = grid[tile.gx + dx]
-                    local other = column and column[tile.gz + dz]
-                    if other then list[#list + 1] = other end
+                local bucket = buckets[("%d_%d"):format(bx + dx, bz + dz)]
+                if bucket then
+                    for _, other in ipairs(bucket) do
+                        if other ~= tile then
+                            local d = (other.part.Position - pos).Magnitude
+                            if d <= reach then list[#list + 1] = other end
+                        end
+                    end
                 end
             end
         end
         tile.neighbours = list
     end
 
-    -- A healthy grid averages close to 8 neighbours per tile. Anything near 0
-    -- means the cell derivation is wrong, which is invisible from the revealed
-    -- count alone - so it gets reported rather than left to be guessed at.
-    local totalNeighbours = 0
-    for _, tile in ipairs(tileList) do
-        totalNeighbours = totalNeighbours + #tile.neighbours
-    end
-    Stats.AvgNeighbours = #tileList > 0 and (totalNeighbours / #tileList) or 0
-    Stats.Pitch = gridPitch or 0
-
+    local total = 0
+    for _, t in ipairs(tileList) do total = total + #t.neighbours end
+    Stats.Neighbours = #tileList > 0 and total / #tileList or 0
     Stats.Tiles = #tileList
-    return #tileList > 0
+    return true
+end
+
+--// Flag token --------------------------------------------------------------------
+-- workspace.Salasana is destroyed by the game before an injected script can read
+-- it, so the value is recovered from where it still lives: captured as an upvalue
+-- inside the handler the game connected. A closure that holds the PlaceFlag
+-- remote is the one we want, and its numeric upvalue is the token.
+local PlaceFlagRemote
+local flagToken = nil
+
+local function findPlaceFlagRemote()
+    local events = ReplicatedStorage:FindFirstChild("Events")
+    local folder = events and events:FindFirstChild("FlagEvents")
+    return folder and folder:FindFirstChild("PlaceFlag")
+end
+
+local function recoverToken()
+    PlaceFlagRemote = PlaceFlagRemote or findPlaceFlagRemote()
+
+    -- Free if we got in early enough: the value is still sitting there.
+    local salasana = Workspace:FindFirstChild("Salasana")
+    if salasana and salasana:IsA("ValueBase") then
+        local ok, v = pcall(function() return salasana.Value end)
+        if ok and typeof(v) == "number" and v ~= 0 then
+            flagToken = v
+            Stats.Token = "read from Salasana"
+            return true
+        end
+    end
+
+    if not PlaceFlagRemote then return false end
+    if typeof(getgc) ~= "function" or typeof(debug) ~= "table" or typeof(debug.getupvalues) ~= "function" then
+        Stats.Token = "no getgc on this executor"
+        return false
+    end
+
+    local found = nil
+    pcall(function()
+        for _, fn in ipairs(getgc()) do
+            if type(fn) == "function" then
+                local ok, ups = pcall(debug.getupvalues, fn)
+                if ok and type(ups) == "table" then
+                    local holdsRemote, candidate = false, nil
+                    for _, up in pairs(ups) do
+                        if up == PlaceFlagRemote then
+                            holdsRemote = true
+                        elseif typeof(up) == "number" and up ~= 0 then
+                            candidate = up
+                        end
+                    end
+                    -- Some closures capture ReplicatedStorage rather than the
+                    -- remote itself, so a nearby numeric upvalue alone is not
+                    -- enough; the remote has to be in the same closure.
+                    if holdsRemote and candidate then
+                        found = candidate
+                        break
+                    end
+                end
+            end
+        end
+    end)
+
+    if found then
+        flagToken = found
+        Stats.Token = "recovered from handler"
+        return true
+    end
+
+    Stats.Token = "not found"
+    return false
+end
+
+local function placeFlag(part)
+    local method = Config.FlagMethod
+
+    if method == "Auto" or method == "Token" then
+        if not flagToken then recoverToken() end
+        if flagToken and PlaceFlagRemote then
+            local ok = pcall(function()
+                PlaceFlagRemote:FireServer(part, flagToken, true)
+            end)
+            if ok then return true end
+        end
+        if method == "Token" then return false end
+    end
+
+    -- The game only creates ClickDetectors on touch devices, but where one
+    -- exists its handler already holds the token, so firing it is the most
+    -- faithful route available.
+    local detector = part:FindFirstChildOfClass("ClickDetector")
+    if detector and typeof(fireclickdetector) == "function" then
+        local ok = pcall(fireclickdetector, detector)
+        if ok then return true end
+    end
+
+    return false
 end
 
 --// Visuals ----------------------------------------------------------------------
-local function colorFor(kind)
-    return kind == "mine" and Config.MineColor or Config.SafeColor
-end
-
-local function methodFor(kind)
-    return kind == "mine" and Config.MineMethod or Config.SafeMethod
-end
-
 local function clearVisual(part)
     local v = visuals[part]
     if not v then return end
-    if v.Highlight then v.Highlight:Destroy() end
-    if v.Outline then v.Outline:Destroy() end
-    if v.Box then pcall(function() v.Box:Remove() end) end
+    for _, inst in ipairs(v.Objects) do
+        pcall(function() inst:Destroy() end)
+    end
     visuals[part] = nil
 end
 
+local function buildVisual(part, method, color)
+    local made = {}
+
+    local function add(inst) made[#made + 1] = inst return inst end
+
+    if method == "Highlight" then
+        local h = add(Instance.new("Highlight"))
+        h.FillColor, h.OutlineColor = color, color
+        h.FillTransparency = Config.Transparency
+        h.OutlineTransparency = 0
+        h.Adornee = part
+        h.Parent = part
+    elseif method == "SelectionBox" then
+        local b = add(Instance.new("SelectionBox"))
+        b.Color3, b.SurfaceColor3 = color, color
+        b.LineThickness = 0.05
+        b.SurfaceTransparency = Config.Transparency
+        b.Adornee = part
+        b.Parent = part
+    elseif method == "BoxAdornment" then
+        local b = add(Instance.new("BoxHandleAdornment"))
+        b.Size = part.Size * 1.02
+        b.Color3 = color
+        b.Transparency = Config.Transparency
+        b.AlwaysOnTop = true
+        b.ZIndex = 1
+        b.Adornee = part
+        b.Parent = part
+    elseif method == "SphereAdornment" then
+        local s = add(Instance.new("SphereHandleAdornment"))
+        s.Radius = math.max(part.Size.X, part.Size.Z) / 2
+        s.Color3 = color
+        s.Transparency = Config.Transparency
+        s.AlwaysOnTop = true
+        s.Adornee = part
+        s.Parent = part
+    elseif method == "SurfaceGui" then
+        local g = add(Instance.new("SurfaceGui"))
+        g.Face = Enum.NormalId.Top
+        g.AlwaysOnTop = true
+        g.Adornee = part
+        g.Parent = part
+        local f = Instance.new("Frame")
+        f.Size = UDim2.fromScale(1, 1)
+        f.BackgroundColor3 = color
+        f.BackgroundTransparency = Config.Transparency
+        f.BorderSizePixel = 0
+        f.Parent = g
+    elseif method == "Billboard" then
+        local b = add(Instance.new("BillboardGui"))
+        b.Size = UDim2.fromOffset(28, 28)
+        b.AlwaysOnTop = true
+        b.Adornee = part
+        b.Parent = part
+        local f = Instance.new("Frame")
+        f.Size = UDim2.fromScale(1, 1)
+        f.BackgroundColor3 = color
+        f.BackgroundTransparency = Config.Transparency
+        f.BorderSizePixel = 0
+        f.Parent = b
+    elseif method == "PointLight" then
+        local l = add(Instance.new("PointLight"))
+        l.Color = color
+        l.Brightness = 3
+        l.Range = 8
+        l.Parent = part
+    elseif method == "Neon Overlay" then
+        local p = add(Instance.new("Part"))
+        p.Size = part.Size * 1.02
+        p.CFrame = part.CFrame
+        p.Anchored = true
+        p.CanCollide = false
+        p.CanQuery = false
+        p.CanTouch = false
+        p.Material = Enum.Material.Neon
+        p.Color = color
+        p.Transparency = Config.Transparency
+        p.Parent = part
+    end
+
+    return made
+end
+
 local function applyVisual(part, kind)
-    local method = methodFor(kind)
-    local color = colorFor(kind)
+    local method = kind == "mine" and Config.MineMethod or Config.SafeMethod
+    local color = kind == "mine" and Config.MineColor or Config.SafeColor
     local existing = visuals[part]
 
-    -- Same kind and same method: only the cheap properties are touched. This is
-    -- the path taken when a transparency or colour slider moves, so dragging a
-    -- slider never rebuilds a single instance.
+    -- Same kind and method: only cheap properties are touched, so dragging the
+    -- transparency slider never rebuilds a single instance.
     if existing and existing.Kind == kind and existing.Method == method then
-        if existing.Highlight then
-            existing.Highlight.FillColor = color
-            existing.Highlight.OutlineColor = color
-            existing.Highlight.FillTransparency = Config.Transparency
-        elseif existing.Outline then
-            existing.Outline.Color3 = color
-            existing.Outline.SurfaceTransparency = Config.Transparency
-        elseif existing.Box then
-            existing.Box.Color = color
+        for _, inst in ipairs(existing.Objects) do
+            pcall(function()
+                if inst:IsA("Highlight") then
+                    inst.FillColor, inst.OutlineColor = color, color
+                    inst.FillTransparency = Config.Transparency
+                elseif inst:IsA("SelectionBox") then
+                    inst.Color3, inst.SurfaceColor3 = color, color
+                    inst.SurfaceTransparency = Config.Transparency
+                elseif inst:IsA("HandleAdornment") then
+                    inst.Color3 = color
+                    inst.Transparency = Config.Transparency
+                elseif inst:IsA("BasePart") then
+                    inst.Color = color
+                    inst.Transparency = Config.Transparency
+                elseif inst:IsA("PointLight") then
+                    inst.Color = color
+                elseif inst:IsA("SurfaceGui") or inst:IsA("BillboardGui") then
+                    local f = inst:FindFirstChildWhichIsA("Frame")
+                    if f then
+                        f.BackgroundColor3 = color
+                        f.BackgroundTransparency = Config.Transparency
+                    end
+                end
+            end)
         end
         return
     end
 
     clearVisual(part)
-    local v = { Kind = kind, Method = method }
-
-    if method == "Highlight" then
-        local hl = Instance.new("Highlight")
-        hl.FillColor = color
-        hl.OutlineColor = color
-        hl.FillTransparency = Config.Transparency
-        hl.OutlineTransparency = 0
-        hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
-        hl.Adornee = part
-        hl.Parent = part
-        v.Highlight = hl
-    elseif method == "Outline" then
-        local box = Instance.new("SelectionBox")
-        box.Adornee = part
-        box.Color3 = color
-        box.LineThickness = 0.03
-        box.SurfaceColor3 = color
-        box.SurfaceTransparency = Config.Transparency
-        box.Parent = part
-        v.Outline = box
-    elseif method == "Box" and typeof(Drawing) == "table" then
-        pcall(function()
-            local square = Drawing.new("Square")
-            square.Thickness = 1.5
-            square.Filled = false
-            square.Color = color
-            square.Visible = false
-            v.Box = square
-        end)
-    end
-
-    visuals[part] = v
+    visuals[part] = { Kind = kind, Method = method, Objects = buildVisual(part, method, color) }
 end
 
--- Only ever called with the tiles whose conclusion actually changed.
+local function wanted(kind)
+    return (kind == "safe" and Config.ShowSafe) or (kind == "mine" and Config.ShowMines)
+end
+
 local function applyDiff(newClass)
     local safe, mines = 0, 0
-
     for part, kind in pairs(newClass) do
         if kind == "safe" then safe = safe + 1 else mines = mines + 1 end
-        local wanted = (kind == "safe" and Config.ShowSafe) or (kind == "mine" and Config.ShowMines)
-        if wanted then
+        if wanted(kind) then
             if classification[part] ~= kind or not visuals[part] then
                 applyVisual(part, kind)
             end
@@ -418,71 +425,51 @@ local function applyDiff(newClass)
             clearVisual(part)
         end
     end
-
-    -- Anything previously marked that no longer is loses its visual, and only
-    -- those. Nothing else is touched.
+    -- Only tiles that stopped being classified lose their visual. Nothing else
+    -- is touched.
     for part in pairs(classification) do
-        if not newClass[part] then
-            clearVisual(part)
-        end
+        if not newClass[part] then clearVisual(part) end
     end
-
     classification = newClass
-    Stats.Safe = safe
-    Stats.Mines = mines
+    Stats.Safe, Stats.Mines = safe, mines
 end
 
--- Re-applies visuals when a toggle/method/colour changes, without re-solving.
 local function refreshVisualsOnly()
     for part, kind in pairs(classification) do
-        local wanted = (kind == "safe" and Config.ShowSafe) or (kind == "mine" and Config.ShowMines)
-        if wanted then
-            applyVisual(part, kind)
-        else
-            clearVisual(part)
-        end
+        if wanted(kind) then applyVisual(part, kind) else clearVisual(part) end
     end
 end
 
 --// Solver -------------------------------------------------------------------------
--- Builds constraints only around the tiles that changed, then runs exact logic
--- over that local set. A single reveal touches at most a 5x5 neighbourhood, so
--- the work per update is bounded regardless of how large the board is.
 local function buildConstraints(scope)
-    local constraints = {}
+    local out = {}
     for _, tile in ipairs(scope) do
         if tile.state == "revealed" and tile.number then
-            local unknowns, flagged = {}, 0
+            local unknowns, flags = {}, 0
             for _, n in ipairs(tile.neighbours) do
-                if n.state == "unknown" then
-                    unknowns[#unknowns + 1] = n
-                elseif n.state == "flagged" then
-                    flagged = flagged + 1
-                end
+                if n.state == "unknown" then unknowns[#unknowns + 1] = n
+                elseif n.state == "flagged" then flags = flags + 1 end
             end
             if #unknowns > 0 then
-                local remaining = tile.number - flagged
-                -- A negative remainder means the flags around this tile are
-                -- wrong; trusting it would produce confident nonsense, so the
-                -- constraint is dropped instead.
+                local remaining = tile.number - flags
+                -- A negative remainder means the flags nearby are wrong; acting
+                -- on it would produce confident nonsense, so it is dropped.
                 if remaining >= 0 then
-                    constraints[#constraints + 1] = {
-                        tile = tile, unknowns = unknowns,
-                        count = #unknowns, remaining = remaining,
-                    }
+                    out[#out + 1] = { unknowns = unknowns, count = #unknowns, remaining = remaining }
                 end
             end
         end
     end
-    return constraints
+    return out
 end
 
 local function solveScope(scope)
-    local constraints = buildConstraints(scope)
+    local cs = buildConstraints(scope)
     local result = {}
 
-    -- Pass 1: single constraint.
-    for _, c in ipairs(constraints) do
+    -- Pass 1: a number with its mines already flagged frees the rest; a number
+    -- needing as many mines as it has unknowns mines them all.
+    for _, c in ipairs(cs) do
         if c.remaining == 0 then
             for _, u in ipairs(c.unknowns) do result[u.part] = "safe" end
         elseif c.remaining == c.count then
@@ -490,32 +477,28 @@ local function solveScope(scope)
         end
     end
 
-    -- Pass 2: subset elimination between overlapping constraints.
-    for i = 1, #constraints do
-        local a = constraints[i]
-        local setA = {}
-        for _, u in ipairs(a.unknowns) do setA[u] = true end
-
-        for j = 1, #constraints do
-            if i ~= j then
-                local b = constraints[j]
-                if b.count > a.count then
-                    local subset = true
-                    for _, u in ipairs(a.unknowns) do
-                        if not table.find(b.unknowns, u) then
-                            subset = false
-                            break
-                        end
-                    end
-
-                    if subset then
-                        local extraCount = b.count - a.count
-                        local extraMines = b.remaining - a.remaining
-                        if extraMines == 0 or extraMines == extraCount then
-                            local kind = extraMines == 0 and "safe" or "mine"
-                            for _, u in ipairs(b.unknowns) do
-                                if not setA[u] then result[u.part] = kind end
-                            end
+    -- Pass 2: subset elimination. Where A's unknowns sit inside B's, the
+    -- difference holds exactly (Rb - Ra) mines across (Cb - Ca) tiles. This is
+    -- what resolves the pairs pass 1 cannot.
+    local limit = math.min(#cs, 300)
+    for i = 1, limit do
+        local a = cs[i]
+        local inA = {}
+        for _, u in ipairs(a.unknowns) do inA[u] = true end
+        for j = 1, limit do
+            local b = cs[j]
+            if i ~= j and b.count > a.count then
+                local subset = true
+                for _, u in ipairs(a.unknowns) do
+                    if not table.find(b.unknowns, u) then subset = false break end
+                end
+                if subset then
+                    local extra = b.count - a.count
+                    local mines = b.remaining - a.remaining
+                    if mines == 0 or mines == extra then
+                        local kind = mines == 0 and "safe" or "mine"
+                        for _, u in ipairs(b.unknowns) do
+                            if not inA[u] then result[u.part] = kind end
                         end
                     end
                 end
@@ -526,140 +509,161 @@ local function solveScope(scope)
     return result
 end
 
--- Merges a freshly solved local region into the standing conclusions. Tiles
--- outside the region keep whatever was concluded before, so a small change
--- never discards the rest of the board's solution.
 local function solveIncremental()
     if dirtyCount == 0 then return end
 
-    local scope = {}
-    local seen = {}
+    -- Two rings: the changed tile's neighbours are the constraints that moved,
+    -- and their neighbours are the tiles those constraints reach.
+    local scope, seen = {}, {}
+    local function push(t)
+        if not seen[t] then seen[t] = true scope[#scope + 1] = t end
+    end
     for tile in pairs(dirty) do
-        -- Two rings: the changed tile's neighbours are the constraints that
-        -- moved, and their neighbours are the tiles those constraints touch.
+        push(tile)
         for _, n1 in ipairs(tile.neighbours) do
-            if not seen[n1] then seen[n1] = true scope[#scope + 1] = n1 end
-            for _, n2 in ipairs(n1.neighbours) do
-                if not seen[n2] then seen[n2] = true scope[#scope + 1] = n2 end
-            end
+            push(n1)
+            for _, n2 in ipairs(n1.neighbours) do push(n2) end
         end
-        if not seen[tile] then seen[tile] = true scope[#scope + 1] = tile end
     end
 
     local started = os.clock()
     local localResult = solveScope(scope)
 
+    -- Conclusions outside the recomputed region are carried forward, so one
+    -- reveal never discards the rest of the board's solution.
     local merged = {}
     for part, kind in pairs(classification) do
         local tile = tiles[part]
-        -- Drop stale conclusions about tiles that have since been revealed or
-        -- flagged, and about anything inside the region just recomputed.
         if tile and tile.state == "unknown" and not seen[tile] then
             merged[part] = kind
         end
     end
     for part, kind in pairs(localResult) do
         local tile = tiles[part]
-        if tile and tile.state == "unknown" then
-            merged[part] = kind
-        end
+        if tile and tile.state == "unknown" then merged[part] = kind end
     end
 
     applyDiff(merged)
-
     Stats.LastSolve = (os.clock() - started) * 1000
-    Stats.Dirty = dirtyCount
-    dirty = {}
-    dirtyCount = 0
+    Stats.Changed = dirtyCount
+    dirty, dirtyCount = {}, 0
 end
 
---// Change detection ------------------------------------------------------------------
--- Only unknown tiles can change into something interesting, and a revealed tile
--- never goes back. So each pass re-reads just the tiles that are still unknown,
--- which shrinks steadily as the board is cleared.
-local function scanForChanges()
-    local revealed, unknown, flagged = 0, 0, 0
+--// Change tracking -----------------------------------------------------------------
+local function refreshTile(tile)
+    if not tile.part.Parent then return end
+    local state, number = readTile(tile.part)
+    if state ~= tile.state or number ~= tile.number then
+        tile.state, tile.number = state, number
+        markDirty(tile)
+        -- A reveal or a flag changes every constraint touching this tile.
+        for _, n in ipairs(tile.neighbours) do markDirty(n) end
+    end
+end
 
-    refreshFlags()
+local function fullRescanCounts()
+    local r, u, f = 0, 0, 0
+    for _, t in ipairs(tileList) do
+        if t.state == "revealed" then r = r + 1
+        elseif t.state == "flagged" then f = f + 1
+        else u = u + 1 end
+    end
+    Stats.Revealed, Stats.Unknown, Stats.Flagged = r, u, f
+end
 
-    for _, tile in ipairs(tileList) do
-        -- Revealed tiles never revert, so they are skipped. Unknown and flagged
-        -- both still move - a flag can be taken back off - so both are re-read.
-        if tile.state ~= "revealed" then
-            if tile.part.Parent then
-                local state, number = readTile(tile.part)
-                if state ~= tile.state or number ~= tile.number then
-                    tile.state = state
-                    tile.number = number
-                    markDirty(tile)
-                    -- A flag change alters every constraint touching this tile,
-                    -- so its neighbours need re-solving too.
-                    for _, n in ipairs(tile.neighbours) do markDirty(n) end
+--// Auto flag ------------------------------------------------------------------------
+local flagBusy = false
+
+local function autoFlagPass()
+    if flagBusy or not Config.AutoFlag then return end
+    local char = LocalPlayer.Character
+    local root = char and char:FindFirstChild("HumanoidRootPart")
+    if not root then return end
+
+    flagBusy = true
+
+    local queue = {}
+    for part, kind in pairs(classification) do
+        if kind == "mine" and part.Parent and not flaggedByUs[part] then
+            local tile = tiles[part]
+            if tile and tile.state == "unknown" then
+                local d = (part.Position - root.Position).Magnitude
+                if d <= Config.FlagRange then
+                    queue[#queue + 1] = { part = part, d = d }
                 end
             end
         end
-        if tile.state == "revealed" then revealed = revealed + 1
-        elseif tile.state == "flagged" then flagged = flagged + 1
-        else unknown = unknown + 1 end
+    end
+    table.sort(queue, function(a, b) return a.d < b.d end)
+
+    for _, entry in ipairs(queue) do
+        if Unloading or not Config.AutoFlag then break end
+        if entry.part.Parent and not hasFlag(entry.part) then
+            flaggedByUs[entry.part] = true
+            placeFlag(entry.part)
+            task.wait(Config.FlagDelay)
+        end
     end
 
-    Stats.Revealed = revealed
-    Stats.Unknown = unknown
-    Stats.Flagged = flagged
+    flagBusy = false
 end
 
+--// Main loop -------------------------------------------------------------------------
 local boardReady = false
 
-spawnLoop(function()
+task.spawn(function()
     while not Unloading do
         if not boardReady then
-            local ok = pcall(discoverBoard)
+            local ok = pcall(buildBoard)
             if ok and #tileList > 0 then
                 boardReady = true
                 Stats.Status = ("board found: %d tiles"):format(#tileList)
-                for _, tile in ipairs(tileList) do markDirty(tile) end
+                for _, t in ipairs(tileList) do refreshTile(t) markDirty(t) end
+                recoverToken()
+
+                -- Event driven from here: a tile only changes when something is
+                -- added to it, so polling every tile every frame is wasted work.
+                track(PartsFolder.DescendantAdded:Connect(function(d)
+                    local part = d:FindFirstAncestorWhichIsA("BasePart")
+                    if part and tiles[part] then
+                        refreshTile(tiles[part])
+                    end
+                end))
+                track(PartsFolder.DescendantRemoving:Connect(function(d)
+                    local part = d:FindFirstAncestorWhichIsA("BasePart")
+                    if part and tiles[part] then
+                        task.defer(function()
+                            if tiles[part] then refreshTile(tiles[part]) end
+                        end)
+                    end
+                end))
+                track(PartsFolder.ChildRemoved:Connect(function()
+                    boardReady = false
+                end))
             else
-                Stats.Status = "no board found"
-                task.wait(1.5)
+                Stats.Status = "waiting for board"
+                task.wait(1)
             end
         else
-            -- A board that has vanished (round ended) is rediscovered rather
-            -- than left pointing at destroyed parts.
-            if #tileList == 0 or not tileList[1].part.Parent then
+            if not PartsFolder or not PartsFolder.Parent or #tileList == 0 then
                 boardReady = false
                 for part in pairs(visuals) do clearVisual(part) end
-                classification = {}
+                classification, flaggedByUs = {}, {}
                 Stats.Status = "board gone, rescanning"
             else
-                pcall(scanForChanges)
+                -- A light sweep catches anything the events missed; only tiles
+                -- that are not already revealed can change.
+                for _, t in ipairs(tileList) do
+                    if t.state ~= "revealed" then refreshTile(t) end
+                end
+                fullRescanCounts()
                 pcall(solveIncremental)
+                if Config.AutoFlag then task.spawn(autoFlagPass) end
             end
         end
-        task.wait(Config.ScanInterval)
+        task.wait(Config.Interval)
     end
 end)
-
---// Box drawing (only when that method is in use) -----------------------------------
-track(PreRender:Connect(function()
-    if Unloading then return end
-    for part, v in pairs(visuals) do
-        if v.Box then
-            if not part.Parent then
-                clearVisual(part)
-            else
-                local screen, onScreen = Camera:WorldToViewportPoint(part.Position)
-                if onScreen then
-                    local size = math.max(8, 900 / math.max(screen.Z, 1))
-                    v.Box.Visible = true
-                    v.Box.Position = Vector2.new(screen.X - size / 2, screen.Y - size / 2)
-                    v.Box.Size = Vector2.new(size, size)
-                else
-                    v.Box.Visible = false
-                end
-            end
-        end
-    end
-end))
 
 --// UI ---------------------------------------------------------------------------
 local Centrl = loadstring(game:HttpGet('https://raw.githubusercontent.com/iamdookie1/Rblx2/main/UI/Lib2.lua'))()
@@ -669,8 +673,13 @@ local Window = Centrl:Window({
     SubTitle = 'solver',
     Folder = 'MinesweeperSolver',
     ToggleKey = Enum.KeyCode.RightShift,
-    Accent = Color3.fromRGB(90, 220, 140),
+    Accent = Color3.fromRGB(90, 200, 255),
 })
+
+local METHODS = {
+    'Highlight', 'SelectionBox', 'BoxAdornment', 'SphereAdornment',
+    'SurfaceGui', 'Billboard', 'PointLight', 'Neon Overlay',
+}
 
 local MainTab = Window:Tab({ Title = 'main', Icon = 'grid-3x3' })
 
@@ -678,141 +687,146 @@ local SafeSection = MainTab:Section({ Title = 'safe tiles', Side = 'left' })
 
 SafeSection:Toggle({
     Title = 'show safe',
-    Flag = 'ms_show_safe',
+    Flag = 'ms_safe',
     Default = false,
-    Callback = function(v)
-        Config.ShowSafe = v
-        refreshVisualsOnly()
-    end,
+    Callback = function(v) Config.ShowSafe = v refreshVisualsOnly() end,
 })
 
 SafeSection:Dropdown({
     Title = 'show as',
     Flag = 'ms_safe_method',
-    Options = { 'Highlight', 'Outline', 'Box' },
+    Options = METHODS,
     Default = 'Highlight',
-    Callback = function(v)
-        Config.SafeMethod = v
-        refreshVisualsOnly()
-    end,
+    Callback = function(v) Config.SafeMethod = v refreshVisualsOnly() end,
 })
 
 SafeSection:Colorpicker({
     Title = 'safe color',
     Flag = 'ms_safe_color',
-    Default = Color3.fromRGB(80, 230, 120),
-    Callback = function(v)
-        Config.SafeColor = v
-        refreshVisualsOnly()
-    end,
+    Default = Color3.fromRGB(70, 170, 255),
+    Callback = function(v) Config.SafeColor = v refreshVisualsOnly() end,
 })
 
 local MineSection = MainTab:Section({ Title = 'mines', Side = 'right' })
 
 MineSection:Toggle({
     Title = 'show mines',
-    Flag = 'ms_show_mines',
+    Flag = 'ms_mines',
     Default = false,
-    Callback = function(v)
-        Config.ShowMines = v
-        refreshVisualsOnly()
-    end,
+    Callback = function(v) Config.ShowMines = v refreshVisualsOnly() end,
 })
 
 MineSection:Dropdown({
     Title = 'show as',
     Flag = 'ms_mine_method',
-    Options = { 'Highlight', 'Outline', 'Box' },
+    Options = METHODS,
     Default = 'Highlight',
-    Callback = function(v)
-        Config.MineMethod = v
-        refreshVisualsOnly()
-    end,
+    Callback = function(v) Config.MineMethod = v refreshVisualsOnly() end,
 })
 
 MineSection:Colorpicker({
     Title = 'mine color',
     Flag = 'ms_mine_color',
-    Default = Color3.fromRGB(240, 70, 70),
-    Callback = function(v)
-        Config.MineColor = v
-        refreshVisualsOnly()
-    end,
+    Default = Color3.fromRGB(255, 60, 60),
+    Callback = function(v) Config.MineColor = v refreshVisualsOnly() end,
 })
 
-local SharedSection = MainTab:Section({ Title = 'display', Side = 'left' })
+local DisplaySection = MainTab:Section({ Title = 'display', Side = 'left' })
 
-SharedSection:Slider({
+DisplaySection:Slider({
     Title = 'transparency',
     Flag = 'ms_transparency',
-    Min = 0,
-    Max = 1,
-    Increment = 0.05,
-    Default = 0.55,
+    Min = 0, Max = 1, Increment = 0.05, Default = 0.5,
+    Callback = function(v) Config.Transparency = v refreshVisualsOnly() end,
+})
+
+DisplaySection:Slider({
+    Title = 'update interval',
+    Flag = 'ms_interval',
+    Min = 0.03, Max = 0.5, Increment = 0.01, Default = 0.05,
+    Suffix = 's',
+    Callback = function(v) Config.Interval = v end,
+})
+
+DisplaySection:Paragraph({
+    Title = 'only certainties',
+    Text = 'A tile lights up only when the surrounding numbers prove it. Two exact passes run: single constraints first, then subset elimination between overlapping ones, which resolves the pairs simple logic cannot. Positions that genuinely need a guess stay dark rather than showing odds.',
+})
+
+local FlagSection = MainTab:Section({ Title = 'auto flag', Side = 'right' })
+
+FlagSection:Toggle({
+    Title = 'auto flag mines',
+    Flag = 'ms_autoflag',
+    Default = false,
     Callback = function(v)
-        Config.Transparency = v
-        refreshVisualsOnly()
+        Config.AutoFlag = v
+        if v then
+            flaggedByUs = {}
+            recoverToken()
+        end
     end,
 })
 
-SharedSection:Slider({
-    Title = 'update interval',
-    Flag = 'ms_interval',
-    Min = 0.05,
-    Max = 1,
-    Increment = 0.05,
-    Default = 0.35,
+FlagSection:Dropdown({
+    Title = 'method',
+    Flag = 'ms_flag_method',
+    Options = { 'Auto', 'Token', 'ClickDetector' },
+    Default = 'Auto',
+    Callback = function(v) Config.FlagMethod = v end,
+})
+
+FlagSection:Slider({
+    Title = 'flag range',
+    Flag = 'ms_flag_range',
+    Min = 4, Max = 200, Increment = 2, Default = 16,
+    Suffix = ' studs',
+    Callback = function(v) Config.FlagRange = v end,
+})
+
+FlagSection:Slider({
+    Title = 'delay between flags',
+    Flag = 'ms_flag_delay',
+    Min = 0.02, Max = 0.5, Increment = 0.02, Default = 0.06,
     Suffix = 's',
-    Callback = function(v) Config.ScanInterval = v end,
+    Callback = function(v) Config.FlagDelay = v end,
 })
 
-SharedSection:Paragraph({
-    Title = 'only certainties are shown',
-    Text = 'A tile lights up only when the surrounding numbers prove it. Two exact passes run: a number with its mines already flagged makes every remaining neighbour safe, and a number needing exactly as many mines as it has unknowns makes them all mines. Overlapping constraints are then compared against each other, which resolves the pairs the first pass cannot. Positions that genuinely require a guess stay dark rather than showing odds.',
+FlagSection:Button({
+    Title = 'find flag token',
+    Callback = function()
+        recoverToken()
+        Centrl:Notify({
+            Title = 'minesweeper',
+            Content = 'Token: ' .. Stats.Token,
+            Type = flagToken and 'success' or 'warning',
+            Duration = 5,
+        })
+    end,
 })
 
-local StatusSection = MainTab:Section({ Title = 'status', Side = 'right' })
+FlagSection:Paragraph({
+    Title = 'why flags need a token',
+    Text = 'The game reads a value out of workspace.Salasana at startup and then destroys it, and every PlaceFlag call has to include it - which is why firing the remote blind does nothing. If the script loads before that happens the value is read directly; otherwise it is recovered from the upvalues of the handler the game connected. ClickDetector mode instead fires the game\'s own detector and lets its handler supply the token, which only exists on touch devices.',
+})
 
-local boardLabel = StatusSection:Label({ Title = 'board: scanning...' })
+local StatusSection = MainTab:Section({ Title = 'status', Side = 'left' })
+
+local boardLabel = StatusSection:Label({ Title = 'board: --' })
 local countLabel = StatusSection:Label({ Title = 'revealed 0 / unknown 0 / flagged 0' })
 local resultLabel = StatusSection:Label({ Title = 'safe 0 / mines 0' })
-local perfLabel = StatusSection:Label({ Title = 'last solve: --' })
-local gridLabel = StatusSection:Label({ Title = 'grid: --' })
+local perfLabel = StatusSection:Label({ Title = 'solve: --' })
+local tokenLabel = StatusSection:Label({ Title = 'token: --' })
 
 StatusSection:Button({
     Title = 'rescan board',
     Callback = function()
         boardReady = false
         for part in pairs(visuals) do clearVisual(part) end
-        classification = {}
-        dirty = {}
-        dirtyCount = 0
-        Stats.Status = 'rescanning'
+        classification, flaggedByUs = {}, {}
+        dirty, dirtyCount = {}, 0
     end,
 })
-
-StatusSection:Paragraph({
-    Title = 'if nothing ever lights up',
-    Text = 'Read the grid line. Neighbours average should sit near 8 - if it is near 0 the cells were derived wrongly and no tile can see the numbers around it, which looks identical to a healthy board from the counts alone. If neighbours look right but revealed stays at 0, the numbers are drawn in a form the reader does not know yet.',
-})
-
-spawnLoop(function()
-    while not Unloading do
-        task.wait(0.25)
-        pcall(function()
-            boardLabel:Set('board: ' .. tostring(Stats.Status))
-            countLabel:Set(('revealed %d / unknown %d / flagged %d'):format(
-                Stats.Revealed, Stats.Unknown, Stats.Flagged))
-            resultLabel:Set(('safe %d / mines %d'):format(Stats.Safe, Stats.Mines))
-            if Stats.LastSolve > 0 then
-                perfLabel:Set(('last solve: %.2f ms over %d changed'):format(Stats.LastSolve, Stats.Dirty))
-            else
-                perfLabel:Set('last solve: --')
-            end
-            gridLabel:Set(('grid: pitch %.2f, %.1f neighbours avg'):format(Stats.Pitch, Stats.AvgNeighbours))
-        end)
-    end
-end)
 
 StatusSection:Button({
     Title = 'unload',
@@ -823,6 +837,23 @@ StatusSection:Button({
         Centrl:Unload()
     end,
 })
+
+task.spawn(function()
+    while not Unloading do
+        task.wait(0.25)
+        pcall(function()
+            boardLabel:Set(('board: %s (%.1f neighbours avg)'):format(Stats.Status, Stats.Neighbours))
+            countLabel:Set(('revealed %d / unknown %d / flagged %d'):format(Stats.Revealed, Stats.Unknown, Stats.Flagged))
+            resultLabel:Set(('safe %d / mines %d'):format(Stats.Safe, Stats.Mines))
+            if Stats.LastSolve > 0 then
+                perfLabel:Set(('solve: %.2f ms over %d changed'):format(Stats.LastSolve, Stats.Changed))
+            else
+                perfLabel:Set('solve: --')
+            end
+            tokenLabel:Set('token: ' .. tostring(Stats.Token))
+        end)
+    end
+end)
 
 Window:Load()
 
