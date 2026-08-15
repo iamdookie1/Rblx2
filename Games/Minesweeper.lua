@@ -58,12 +58,16 @@ local Config = {
     DeepThink = false,
     DeepLimit = 16,
     DeepSolutionCap = 20000,
+
+    ShowFalseFlags = false,
+    FalseFlagColor = Color3.fromRGB(255, 140, 0),
+    ShowChances = false,
 }
 
 local Stats = {
     Tiles = 0, Revealed = 0, Unknown = 0, Flagged = 0,
     Safe = 0, Mines = 0, LastSolve = 0, Changed = 0,
-    Neighbours = 0, Token = "not found", Status = "waiting for board",
+    Neighbours = 0, FalseFlags = 0, Token = "not found", Status = "waiting for board",
 }
 
 --// Board -------------------------------------------------------------------------
@@ -72,7 +76,9 @@ local boardPitch = nil
 local tiles = {}          -- [part] = tile
 local tileList = {}
 local dirty, dirtyCount = {}, 0
-local classification = {} -- [part] = "safe" | "mine"
+local classification = {} -- [part] = "safe" | "mine" | "falseflag"
+local chanceOf = {}       -- [part] = chance of being a mine, when unproven
+local refreshChanceLabels -- defined once visuals exist
 local visuals = {}
 local flaggedByUs = {}
 
@@ -466,6 +472,10 @@ end
 local function applyVisual(part, kind)
     local method = kind == "mine" and Config.MineMethod or Config.SafeMethod
     local color = kind == "mine" and Config.MineColor or Config.SafeColor
+    if kind == "falseflag" then
+        method = "Highlight"
+        color = Config.FalseFlagColor
+    end
     local existing = visuals[part]
 
     -- Same kind and method: only cheap properties are touched, so dragging the
@@ -521,14 +531,85 @@ local function safeColor(color)
     return color
 end
 
+-- Chance of being a mine for tiles nothing proves, keyed by part. Written by
+-- the solver, read by the labels.
+local chanceLabels = {}
+
+function refreshChanceLabels()
+    if not Config.ShowChances then
+        for part, gui in pairs(chanceLabels) do
+            pcall(function() gui:Destroy() end)
+            chanceLabels[part] = nil
+        end
+        return
+    end
+
+    local seen = {}
+    for part, chance in pairs(chanceOf) do
+        local tile = tiles[part]
+        -- A proven tile already says what it is with colour; a number on top of
+        -- that is noise. Chances are only for the genuinely undecided.
+        if tile and tile.state == "unknown" and not classification[part] then
+            seen[part] = true
+            local gui = chanceLabels[part]
+            if not gui then
+                gui = Instance.new("BillboardGui")
+                gui.Name = OURS .. "Chance"
+                gui.Adornee = part
+                gui.Size = UDim2.fromOffset(46, 20)
+                gui.AlwaysOnTop = true
+                local text = Instance.new("TextLabel")
+                text.Name = "T"
+                text.BackgroundTransparency = 1
+                text.Size = UDim2.fromScale(1, 1)
+                text.Font = Enum.Font.GothamBold
+                text.TextSize = 13
+                text.TextStrokeTransparency = 0.4
+                text.Parent = gui
+                gui.Parent = part
+                chanceLabels[part] = gui
+            end
+            local label = gui:FindFirstChild("T")
+            if label then
+                local pct = math.floor(chance * 100 + 0.5)
+                label.Text = pct .. "%"
+                -- Green through red by risk, so the reading is glanceable
+                -- without doing arithmetic.
+                label.TextColor3 = Color3.fromRGB(
+                    math.floor(60 + 195 * chance),
+                    math.floor(220 - 160 * chance),
+                    80
+                )
+            end
+        end
+    end
+
+    for part, gui in pairs(chanceLabels) do
+        if not seen[part] then
+            pcall(function() gui:Destroy() end)
+            chanceLabels[part] = nil
+        end
+    end
+end
+
 local function wanted(kind)
+    if kind == "falseflag" then return Config.ShowFalseFlags end
     return (kind == "safe" and Config.ShowSafe) or (kind == "mine" and Config.ShowMines)
 end
 
-local function applyDiff(newClass)
+local function applyDiff(newClass, falseFlags)
+    falseFlags = falseFlags or {}
     local safe, mines = 0, 0
-    for part, kind in pairs(newClass) do
-        if kind == "safe" then safe = safe + 1 else mines = mines + 1 end
+
+    -- A wrong flag is drawn even though its tile is not "unknown", because the
+    -- whole point is that it is sitting somewhere it should not be.
+    local combined = {}
+    for part, kind in pairs(newClass) do combined[part] = kind end
+    for part in pairs(falseFlags) do combined[part] = "falseflag" end
+
+    for part, kind in pairs(combined) do
+        if kind == "safe" then safe = safe + 1
+        elseif kind == "mine" then mines = mines + 1 end
         if wanted(kind) then
             if classification[part] ~= kind or not visuals[part] then
                 applyVisual(part, kind)
@@ -537,30 +618,44 @@ local function applyDiff(newClass)
             clearVisual(part)
         end
     end
+
     -- Only tiles that stopped being classified lose their visual. Nothing else
     -- is touched.
     for part in pairs(classification) do
-        if not newClass[part] then clearVisual(part) end
+        if not combined[part] then clearVisual(part) end
     end
-    classification = newClass
+    classification = combined
     Stats.Safe, Stats.Mines = safe, mines
+
+    refreshChanceLabels()
 end
 
 local function refreshVisualsOnly()
     for part, kind in pairs(classification) do
         if wanted(kind) then applyVisual(part, kind) else clearVisual(part) end
     end
+    refreshChanceLabels()
 end
 
 --// Solver -------------------------------------------------------------------------
-local function buildConstraints(scope)
+-- treatFlagsAsUnknown re-opens every flagged tile as a candidate. That is how a
+-- wrong flag gets caught: with the flag taken at face value its tile is simply
+-- excluded and can never be questioned, but treated as unknown the surrounding
+-- numbers can prove it safe, which means the flag on it is wrong.
+local function buildConstraints(scope, treatFlagsAsUnknown)
     local out = {}
     for _, tile in ipairs(scope) do
         if tile.state == "revealed" and tile.number then
             local unknowns, flags = {}, 0
             for _, n in ipairs(tile.neighbours) do
                 if n.state == "unknown" then unknowns[#unknowns + 1] = n
-                elseif n.state == "flagged" then flags = flags + 1 end
+                elseif n.state == "flagged" then
+                    if treatFlagsAsUnknown then
+                        unknowns[#unknowns + 1] = n
+                    else
+                        flags = flags + 1
+                    end
+                end
             end
             if #unknowns > 0 then
                 local remaining = tile.number - flags
@@ -575,9 +670,13 @@ local function buildConstraints(scope)
     return out
 end
 
-local function solveScope(scope)
-    local cs = buildConstraints(scope)
+-- Returns result (proven safe/mine) and probs (chance of being a mine, for the
+-- tiles nothing proves either way). Probabilities only exist when the deep pass
+-- runs, because they come out of counting arrangements.
+local function solveScope(scope, treatFlagsAsUnknown)
+    local cs = buildConstraints(scope, treatFlagsAsUnknown)
     local result = {}
+    local probs = {}
 
     -- Pass 1: a number with its mines already flagged frees the rest; a number
     -- needing as many mines as it has unknowns mines them all.
@@ -642,7 +741,12 @@ local function solveScope(scope)
     -- anything safe in all of them is safe. This finds everything the board
     -- logically proves, including the cases the two passes above cannot reach -
     -- it is just expensive, hence the toggle and the caps.
-    if Config.DeepThink then
+    --
+    -- It also runs when chances are being shown, because a real percentage can
+    -- only come from counting arrangements: how many of the valid layouts put a
+    -- mine on this tile. The two passes above only ever answer yes/no/unknown,
+    -- so without enumeration there is nothing honest to put on the label.
+    if Config.DeepThink or Config.ShowChances then
         local groupOf, groups = {}, {}
         local function unite(a, b)
             local ga, gb = groupOf[a], groupOf[b]
@@ -748,6 +852,11 @@ local function solveScope(scope)
                             result[tile.part] = "mine"
                         elseif mineIn[i] == 0 then
                             result[tile.part] = "safe"
+                        else
+                            -- Neither proven: the share of valid arrangements
+                            -- that put a mine here is a genuine probability,
+                            -- not a heuristic.
+                            probs[tile.part] = mineIn[i] / total
                         end
                     end
                 end
@@ -755,55 +864,81 @@ local function solveScope(scope)
         end
     end
 
-    return result
+    return result, probs
 end
+
+-- Solving the whole board is worth far more than solving a slice of it, but it
+-- is no longer free, so it is not allowed to run flat out on every frame of a
+-- reveal cascade. The gate is the cost of the last solve: a solve that took a
+-- millisecond may run again immediately, one that took twenty has to wait
+-- roughly its own duration first. Cheap boards stay frame-instant, heavy ones
+-- settle at spending about half a frame's worth of time on thinking instead of
+-- all of it, and the request is never dropped - only deferred.
+local lastSolveCost, lastSolveAt = 0, 0
+
+-- Set by anything that changes the board; the frame loop at the bottom picks it
+-- up on the very next step. Coalescing through a flag means a burst of twenty
+-- reveals costs one solve rather than twenty.
+local solveQueued = false
+local function requestSolve() solveQueued = true end
 
 local function solveIncremental()
     if dirtyCount == 0 then return end
-
-    -- Two rings: the changed tile's neighbours are the constraints that moved,
-    -- and their neighbours are the tiles those constraints reach.
-    local scope, seen = {}, {}
-    local function push(t)
-        if not seen[t] then seen[t] = true scope[#scope + 1] = t end
-    end
-    for tile in pairs(dirty) do
-        push(tile)
-        for _, n1 in ipairs(tile.neighbours) do
-            push(n1)
-            for _, n2 in ipairs(n1.neighbours) do push(n2) end
-        end
+    if os.clock() - lastSolveAt < lastSolveCost then
+        requestSolve()
+        return
     end
 
+    -- The whole board, every time. Restricting the solve to two rings around
+    -- whatever changed was the reason it sat idle on positions it could already
+    -- prove: a corner 1 with a single unknown left is solvable the moment it is
+    -- revealed, but if nothing near it changed afterwards it never got looked at
+    -- again. Scoping was a saving on cost that has since been paid for
+    -- elsewhere, and it was quietly costing answers.
     local started = os.clock()
-    local localResult = solveScope(scope)
+    local result, probs = solveScope(tileList, false)
 
-    -- Conclusions outside the recomputed region are carried forward, so one
-    -- reveal never discards the rest of the board's solution.
     local merged = {}
-    for part, kind in pairs(classification) do
-        local tile = tiles[part]
-        if tile and tile.state == "unknown" and not seen[tile] then
-            merged[part] = kind
-        end
-    end
-    for part, kind in pairs(localResult) do
+    for part, kind in pairs(result) do
         local tile = tiles[part]
         if tile and tile.state == "unknown" then merged[part] = kind end
     end
 
-    applyDiff(merged)
-    Stats.LastSolve = (os.clock() - started) * 1000
+    -- False flags: re-run with flagged tiles treated as open. Anything the
+    -- numbers prove safe while a flag sits on it is a flag in the wrong place,
+    -- and it poisons every constraint around it until it is moved.
+    -- Deliberately not gated on better thinking: the two exact passes are quite
+    -- capable of proving a flagged tile safe on their own, and a wrong flag is
+    -- worth catching whether or not the expensive pass is switched on.
+    local falseFlags = {}
+    if Config.ShowFalseFlags then
+        local reopened = solveScope(tileList, true)
+        for part, kind in pairs(reopened) do
+            local tile = tiles[part]
+            if tile and tile.state == "flagged" and kind == "safe" then
+                falseFlags[part] = true
+            end
+        end
+    end
+
+    chanceOf = probs or {}
+    applyDiff(merged, falseFlags)
+
+    local wrong = 0
+    for _ in pairs(falseFlags) do wrong = wrong + 1 end
+    Stats.FalseFlags = wrong
+    local elapsed = os.clock() - started
+    Stats.LastSolve = elapsed * 1000
     Stats.Changed = dirtyCount
+    -- Only a solve that overran a slice of the frame buys itself a cooldown, and
+    -- the cooldown is capped so a single pathological board cannot stall
+    -- updates for a noticeable stretch.
+    lastSolveCost = math.min(math.max(elapsed - 0.004, 0), 0.15)
+    lastSolveAt = os.clock()
     dirty, dirtyCount = {}, 0
 end
 
 --// Change tracking -----------------------------------------------------------------
--- Set by anything that changes the board; the frame loop below picks it up on
--- the very next step. Coalescing through a flag means a burst of twenty reveals
--- costs one solve rather than twenty.
-local solveQueued = false
-local function requestSolve() solveQueued = true end
 
 local function refreshTile(tile)
     if not tile.part.Parent then return end
@@ -1077,14 +1212,57 @@ DisplaySection:Paragraph({
     Text = 'The normal passes look at one number at a time and then at pairs of overlapping numbers. This one takes each connected clump of unknown tiles and works through every mine arrangement the numbers permit: anything that is a mine in all of them is a mine, anything safe in all of them is safe. It finds everything the board actually proves rather than only what pairwise logic reaches. Still no guessing. Depth caps the clump size it will attempt, since the arrangements grow fast - raise it if clumps are being skipped, lower it if solves get heavy.',
 })
 
+DisplaySection:Toggle({
+    Title = 'highlight false flags',
+    Flag = 'ms_falseflags',
+    Default = false,
+    Callback = function(v)
+        Config.ShowFalseFlags = v
+        for _, t in ipairs(tileList) do markDirty(t) end
+        requestSolve()
+    end,
+})
+
+DisplaySection:Colorpicker({
+    Title = 'false flag color',
+    Flag = 'ms_falseflag_color',
+    Default = Color3.fromRGB(255, 140, 0),
+    Callback = function(v) Config.FalseFlagColor = safeColor(v) refreshVisualsOnly() end,
+})
+
+DisplaySection:Paragraph({
+    Title = 'what a false flag is',
+    Text = 'A flag someone put on a tile the numbers can prove is safe. It is worth seeing for its own sake, but the real damage is that every number touching it counts it as a mine, so the whole neighbourhood solves wrong until it comes off - which is how a corner that should be obvious ends up looking undecidable. Detection re-runs the solve with flags treated as open tiles; anything that comes back safe while wearing a flag is marked. Works with better thinking off, finds more with it on.',
+})
+
+DisplaySection:Toggle({
+    Title = 'show chances',
+    Flag = 'ms_chances',
+    Default = false,
+    Callback = function(v)
+        Config.ShowChances = v
+        if v then
+            for _, t in ipairs(tileList) do markDirty(t) end
+            requestSolve()
+        else
+            refreshChanceLabels()
+        end
+    end,
+})
+
+DisplaySection:Paragraph({
+    Title = 'what the percentages are',
+    Text = 'Every tile a number touches but nothing proves gets a real figure: the solver counts every mine arrangement the surrounding numbers permit and shows the share of them that put a mine here. 33% means one arrangement in three, not a guess at one. Proven tiles get no number because their colour already says it. Turning this on runs the counting pass whether or not better thinking is enabled, since nothing cheaper can produce an actual probability.',
+})
+
 DisplaySection:Paragraph({
     Title = 'the game watches for this',
     Text = 'It counts tiles coloured exactly pure green or pure red once a second and reports the total to the server as a "Color" message - a detector aimed at solver scripts that repaint tiles. Nothing here writes a tile\'s own colour, so it sees nothing, and the pickers refuse those two exact values anyway. Worth knowing before switching to any method that tints the tile itself.',
 })
 
 DisplaySection:Paragraph({
-    Title = 'only certainties',
-    Text = 'A tile lights up only when the surrounding numbers prove it. Two exact passes run: single constraints first, then subset elimination between overlapping ones, which resolves the pairs simple logic cannot. Positions that genuinely need a guess stay dark rather than showing odds.',
+    Title = 'colour still means certainty',
+    Text = 'A tile is coloured only when the surrounding numbers prove it. Two exact passes run: single constraints first, then subset elimination between overlapping ones, which resolves the pairs simple logic cannot. Positions that genuinely need a guess are never coloured - if chances are on they carry a percentage instead, which is a different statement and reads as one.',
 })
 
 local FlagSection = MainTab:Section({ Title = 'auto flag', Side = 'right' })
@@ -1149,6 +1327,7 @@ local StatusSection = MainTab:Section({ Title = 'status', Side = 'left' })
 local boardLabel = StatusSection:Label({ Title = 'board: --' })
 local countLabel = StatusSection:Label({ Title = 'revealed 0 / unknown 0 / flagged 0' })
 local resultLabel = StatusSection:Label({ Title = 'safe 0 / mines 0' })
+local wrongLabel = StatusSection:Label({ Title = 'false flags: off' })
 local perfLabel = StatusSection:Label({ Title = 'solve: --' })
 local tokenLabel = StatusSection:Label({ Title = 'token: --' })
 
@@ -1158,6 +1337,8 @@ StatusSection:Button({
         boardReady = false
         for part in pairs(visuals) do clearVisual(part) end
         classification, flaggedByUs = {}, {}
+        chanceOf = {}
+        refreshChanceLabels()
         dirty, dirtyCount = {}, 0
     end,
 })
@@ -1168,6 +1349,8 @@ StatusSection:Button({
         Unloading = true
         for _, c in ipairs(Connections) do pcall(function() c:Disconnect() end) end
         for part in pairs(visuals) do clearVisual(part) end
+        Config.ShowChances = false
+        refreshChanceLabels()
         Centrl:Unload()
     end,
 })
@@ -1179,6 +1362,11 @@ task.spawn(function()
             boardLabel:Set(('board: %s (%.1f neighbours avg)'):format(Stats.Status, Stats.Neighbours))
             countLabel:Set(('revealed %d / unknown %d / flagged %d'):format(Stats.Revealed, Stats.Unknown, Stats.Flagged))
             resultLabel:Set(('safe %d / mines %d'):format(Stats.Safe, Stats.Mines))
+            if Config.ShowFalseFlags then
+                wrongLabel:Set(('false flags: %d'):format(Stats.FalseFlags))
+            else
+                wrongLabel:Set('false flags: off')
+            end
             if Stats.LastSolve > 0 then
                 perfLabel:Set(('solve: %.2f ms over %d changed'):format(Stats.LastSolve, Stats.Changed))
             else
