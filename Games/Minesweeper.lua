@@ -52,6 +52,12 @@ local Config = {
     FlagRange = 16,
     FlagDelay = 0.06,
     FlagMethod = "Auto",
+
+    -- Exhaustive enumeration over connected groups. Finds everything the board
+    -- proves, at a cost, so it is opt in and capped.
+    DeepThink = false,
+    DeepLimit = 16,
+    DeepSolutionCap = 20000,
 }
 
 local Stats = {
@@ -99,51 +105,84 @@ local OURS = "MSV_"
 -- A flag carries a UserId attribute naming whoever placed it. That is the one
 -- unambiguous marker: the name is server-built and varies, and "anything
 -- foreign parented to the tile" catches decor that is not a flag at all.
+-- GetAttribute never throws on an Instance, so the pcall this used to carry was
+-- pure overhead at a few thousand calls a second.
 local function carriesUserId(inst)
-    local ok, value = pcall(function() return inst:GetAttribute("UserId") end)
-    return ok and value ~= nil
+    return inst:GetAttribute("UserId") ~= nil
 end
 
--- Flags placed away from the tile rather than parented to it, mapped onto the
--- tile beneath them. Rebuilt only when a sweep actually needs it.
+-- Flags placed away from the tile rather than parented to it.
 local looseFlags = {}
 
-local function hasFlag(part)
+-- Flag state is cached per tile and only recomputed when something is actually
+-- added to or removed from that tile. Walking GetDescendants on six hundred
+-- tiles every sweep was allocating a table per tile per second for an answer
+-- that almost never changes.
+local flagCache = {}
+
+local function computeFlag(part)
     if carriesUserId(part) then return true end
-    for _, d in ipairs(part:GetDescendants()) do
-        if d.Name:sub(1, #OURS) ~= OURS and carriesUserId(d) then
-            return true
+    for _, child in ipairs(part:GetChildren()) do
+        if child.Name:sub(1, #OURS) ~= OURS then
+            if carriesUserId(child) then return true end
+            -- One level deeper covers a flag model wrapping its own parts,
+            -- without the unbounded walk a full descendant scan does.
+            for _, sub in ipairs(child:GetChildren()) do
+                if carriesUserId(sub) then return true end
+            end
         end
     end
-    return looseFlags[part] == true
+    return false
 end
 
--- Sweeps for flag objects that are not inside a tile and pins each to the
--- nearest one. Only worth doing if the per-tile check is coming up empty, so
--- the caller decides when.
-local function refreshLooseFlags(tileList, pitch)
+local function invalidateFlag(part)
+    flagCache[part] = nil
+end
+
+local function hasFlag(part)
+    local cached = flagCache[part]
+    if cached == nil then
+        cached = computeFlag(part)
+        flagCache[part] = cached
+    end
+    return cached or looseFlags[part] == true
+end
+
+-- Pins flag objects that live outside the tiles onto the tile beneath them.
+-- Buckets by grid cell instead of comparing every flag against every tile, and
+-- runs once per board rather than on repeat - the old version rescanned six
+-- thousand descendants against six hundred tiles every second precisely when
+-- flag detection was failing, which is what made it crawl.
+local looseSweepDone = false
+
+local function refreshLooseFlags(pitch)
     looseFlags = {}
-    if not pitch then return end
+    if not pitch or #tileList == 0 then return end
+
+    local byCell = {}
+    for _, tile in ipairs(tileList) do
+        local p = tile.part.Position
+        local key = ("%d_%d"):format(math.floor(p.X / pitch + 0.5), math.floor(p.Z / pitch + 0.5))
+        byCell[key] = tile
+    end
+
     local budget = 6000
     for _, inst in ipairs(Workspace:GetDescendants()) do
         if budget <= 0 then break end
         budget = budget - 1
-        if (inst:IsA("BasePart") or inst:IsA("Model")) and carriesUserId(inst) then
+        if (inst:IsA("BasePart") or inst:IsA("Model")) and not tiles[inst] and carriesUserId(inst) then
             local ok, pos = pcall(function()
                 if inst:IsA("Model") then return inst:GetPivot().Position end
                 return inst.Position
             end)
             if ok and pos then
-                local best, bestGap = nil, pitch * 0.75
-                for _, tile in ipairs(tileList) do
-                    local tp = tile.part.Position
-                    local gap = math.abs(tp.X - pos.X) + math.abs(tp.Z - pos.Z)
-                    if gap < bestGap then bestGap, best = gap, tile end
-                end
-                if best then looseFlags[best.part] = true end
+                local key = ("%d_%d"):format(math.floor(pos.X / pitch + 0.5), math.floor(pos.Z / pitch + 0.5))
+                local tile = byCell[key]
+                if tile then looseFlags[tile.part] = true end
             end
         end
     end
+    looseSweepDone = true
 end
 
 -- "revealed" once a number can be read, "flagged" if a flag sits on it, else
@@ -550,28 +589,165 @@ local function solveScope(scope)
         end
     end
 
-    -- Pass 2: subset elimination. Where A's unknowns sit inside B's, the
-    -- difference holds exactly (Rb - Ra) mines across (Cb - Ca) tiles. This is
-    -- what resolves the pairs pass 1 cannot.
-    local limit = math.min(#cs, 300)
-    for i = 1, limit do
-        local a = cs[i]
+    -- Pass 2: subset elimination, but only between constraints that actually
+    -- share a tile. Comparing every pair was O(n^2) with a linear search inside
+    -- it; indexing by tile first cuts that to the handful that could ever
+    -- overlap.
+    local byTile = {}
+    for _, c in ipairs(cs) do
+        for _, u in ipairs(c.unknowns) do
+            local list = byTile[u]
+            if not list then list = {} byTile[u] = list end
+            list[#list + 1] = c
+        end
+    end
+
+    for _, a in ipairs(cs) do
         local inA = {}
         for _, u in ipairs(a.unknowns) do inA[u] = true end
-        for j = 1, limit do
-            local b = cs[j]
-            if i ~= j and b.count > a.count then
-                local subset = true
-                for _, u in ipairs(a.unknowns) do
-                    if not table.find(b.unknowns, u) then subset = false break end
+
+        local candidates, seenC = {}, {}
+        for _, u in ipairs(a.unknowns) do
+            for _, c in ipairs(byTile[u] or {}) do
+                if c ~= a and not seenC[c] and c.count > a.count then
+                    seenC[c] = true
+                    candidates[#candidates + 1] = c
                 end
-                if subset then
-                    local extra = b.count - a.count
-                    local mines = b.remaining - a.remaining
-                    if mines == 0 or mines == extra then
-                        local kind = mines == 0 and "safe" or "mine"
-                        for _, u in ipairs(b.unknowns) do
-                            if not inA[u] then result[u.part] = kind end
+            end
+        end
+
+        for _, b in ipairs(candidates) do
+            -- A is inside B exactly when B contains as many of A's tiles as A
+            -- has. Counting that is the whole subset test; no separate pass
+            -- needed.
+            local contained = 0
+            for _, u in ipairs(b.unknowns) do
+                if inA[u] then contained = contained + 1 end
+            end
+            if contained == a.count then
+                local extra = b.count - a.count
+                local mines = b.remaining - a.remaining
+                if mines == 0 or mines == extra then
+                    local kind = mines == 0 and "safe" or "mine"
+                    for _, u in ipairs(b.unknowns) do
+                        if not inA[u] then result[u.part] = kind end
+                    end
+                end
+            end
+        end
+    end
+
+    -- Pass 3, optional: exhaustive enumeration over each connected group of
+    -- unknowns. Anything that is a mine in every valid arrangement is a mine,
+    -- anything safe in all of them is safe. This finds everything the board
+    -- logically proves, including the cases the two passes above cannot reach -
+    -- it is just expensive, hence the toggle and the caps.
+    if Config.DeepThink then
+        local groupOf, groups = {}, {}
+        local function unite(a, b)
+            local ga, gb = groupOf[a], groupOf[b]
+            if ga and gb and ga ~= gb then
+                for _, t in ipairs(gb) do
+                    ga[#ga + 1] = t
+                    groupOf[t] = ga
+                end
+                for i, g in ipairs(groups) do
+                    if g == gb then table.remove(groups, i) break end
+                end
+            elseif ga and not gb then
+                ga[#ga + 1] = b
+                groupOf[b] = ga
+            elseif gb and not ga then
+                gb[#gb + 1] = a
+                groupOf[a] = gb
+            elseif not ga and not gb then
+                local g = { a }
+                groupOf[a] = g
+                if a ~= b then g[#g + 1] = b groupOf[b] = g end
+                groups[#groups + 1] = g
+            end
+        end
+
+        for _, c in ipairs(cs) do
+            local first = c.unknowns[1]
+            if not groupOf[first] then unite(first, first) end
+            for i = 2, #c.unknowns do unite(first, c.unknowns[i]) end
+        end
+
+        for _, group in ipairs(groups) do
+            -- Beyond this size the arrangement count explodes and the two
+            -- passes above have almost certainly already settled it.
+            if #group <= Config.DeepLimit then
+                local index = {}
+                for i, t in ipairs(group) do index[t] = i end
+
+                local local_cs = {}
+                local seen = {}
+                for _, t in ipairs(group) do
+                    for _, c in ipairs(byTile[t] or {}) do
+                        if not seen[c] then
+                            seen[c] = true
+                            local idxs = {}
+                            for _, u in ipairs(c.unknowns) do
+                                local i = index[u]
+                                if i then idxs[#idxs + 1] = i end
+                            end
+                            local_cs[#local_cs + 1] = { idxs = idxs, remaining = c.remaining }
+                        end
+                    end
+                end
+
+                local n = #group
+                local assign = {}
+                local mineIn = {}
+                for i = 1, n do mineIn[i] = 0 end
+                local total = 0
+
+                -- Prunes as soon as a constraint is already over its mine count
+                -- or can no longer reach it, so most branches die early.
+                local function feasible(pos)
+                    for _, c in ipairs(local_cs) do
+                        local mines, open = 0, 0
+                        for _, i in ipairs(c.idxs) do
+                            if i <= pos then
+                                if assign[i] then mines = mines + 1 end
+                            else
+                                open = open + 1
+                            end
+                        end
+                        if mines > c.remaining then return false end
+                        if mines + open < c.remaining then return false end
+                    end
+                    return true
+                end
+
+                local function recurse(pos)
+                    if total > Config.DeepSolutionCap then return end
+                    if pos > n then
+                        total = total + 1
+                        for i = 1, n do
+                            if assign[i] then mineIn[i] = mineIn[i] + 1 end
+                        end
+                        return
+                    end
+                    assign[pos] = false
+                    if feasible(pos) then recurse(pos + 1) end
+                    assign[pos] = true
+                    if feasible(pos) then recurse(pos + 1) end
+                    assign[pos] = nil
+                end
+
+                recurse(1)
+
+                -- Only trustworthy if the search finished rather than hitting
+                -- the cap, otherwise "in every solution" means "in every
+                -- solution we bothered to look at".
+                if total > 0 and total <= Config.DeepSolutionCap then
+                    for i, tile in ipairs(group) do
+                        if mineIn[i] == total then
+                            result[tile.part] = "mine"
+                        elseif mineIn[i] == 0 then
+                            result[tile.part] = "safe"
                         end
                     end
                 end
@@ -712,9 +888,13 @@ task.spawn(function()
 
                 -- Event driven from here: a tile only changes when something is
                 -- added to it, so polling every tile every frame is wasted work.
+                -- The cached flag state is dropped here and nowhere else, so it
+                -- is recomputed exactly when a tile's contents actually change
+                -- rather than on every sweep.
                 track(PartsFolder.DescendantAdded:Connect(function(d)
                     local part = d:FindFirstAncestorWhichIsA("BasePart")
                     if part and tiles[part] then
+                        invalidateFlag(part)
                         refreshTile(tiles[part])
                     end
                 end))
@@ -722,7 +902,10 @@ task.spawn(function()
                     local part = d:FindFirstAncestorWhichIsA("BasePart")
                     if part and tiles[part] then
                         task.defer(function()
-                            if tiles[part] then refreshTile(tiles[part]) end
+                            if tiles[part] then
+                                invalidateFlag(part)
+                                refreshTile(tiles[part])
+                            end
                         end)
                     end
                 end))
@@ -743,21 +926,32 @@ task.spawn(function()
                 -- Backstop only. The events above drive everything in real
                 -- time; this exists purely to catch a change that somehow did
                 -- not raise one, so it runs rarely instead of every tick.
-                -- If no flag has been spotted on any tile but flags clearly
-                -- exist elsewhere, they are parented somewhere other than the
-                -- tile, so pin them by position. Only runs while the cheap
-                -- per-tile check is finding nothing.
-                if Stats.Flagged == 0 then
-                    pcall(refreshLooseFlags, tileList, boardPitch)
+                -- Once per board, and only if no flag has turned up on a tile.
+                -- Repeating this every sweep is what made the whole thing
+                -- crawl, since a failing flag check kept it permanently on.
+                if Stats.Flagged == 0 and not looseSweepDone then
+                    pcall(refreshLooseFlags, boardPitch)
                 end
                 for _, t in ipairs(tileList) do
                     if t.state ~= "revealed" then refreshTile(t) end
                 end
                 fullRescanCounts()
-                if Config.AutoFlag then task.spawn(autoFlagPass) end
             end
         end
         task.wait(Config.Backstop)
+    end
+end)
+
+-- Auto flag gets its own tight loop rather than riding the backstop. Hanging it
+-- off a one second sweep meant flags came out in a burst and then nothing for a
+-- second regardless of what had come into range, which is what made it feel
+-- like it fired whenever it felt like it.
+task.spawn(function()
+    while not Unloading do
+        if Config.AutoFlag and boardReady then
+            pcall(autoFlagPass)
+        end
+        task.wait(0.1)
     end
 end)
 
@@ -857,6 +1051,30 @@ DisplaySection:Slider({
 DisplaySection:Paragraph({
     Title = 'updates are instant',
     Text = 'Solving is driven by the board changing, not by a timer: a reveal or a flag re-solves on the very next frame, and frames where nothing moved cost nothing at all. A tile also loses its marker the moment it stops being unknown, so flagging a bomb clears it immediately rather than on the next pass. The sweep above is only a safety net for a change that somehow raised no event, which is why it can sit at a second or more.',
+})
+
+DisplaySection:Toggle({
+    Title = 'better thinking',
+    Flag = 'ms_deep',
+    Default = false,
+    Callback = function(v)
+        Config.DeepThink = v
+        for _, t in ipairs(tileList) do markDirty(t) end
+        requestSolve()
+    end,
+})
+
+DisplaySection:Slider({
+    Title = 'thinking depth',
+    Flag = 'ms_deep_limit',
+    Min = 8, Max = 22, Increment = 1, Default = 16,
+    Suffix = ' tiles',
+    Callback = function(v) Config.DeepLimit = v end,
+})
+
+DisplaySection:Paragraph({
+    Title = 'what better thinking does',
+    Text = 'The normal passes look at one number at a time and then at pairs of overlapping numbers. This one takes each connected clump of unknown tiles and works through every mine arrangement the numbers permit: anything that is a mine in all of them is a mine, anything safe in all of them is safe. It finds everything the board actually proves rather than only what pairwise logic reaches. Still no guessing. Depth caps the clump size it will attempt, since the arrangements grow fast - raise it if clumps are being skipped, lower it if solves get heavy.',
 })
 
 DisplaySection:Paragraph({
