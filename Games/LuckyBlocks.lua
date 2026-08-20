@@ -81,12 +81,8 @@ local Config = {
     Minutes = 1000,
     TpBase = "Spawn1",
 
-    Watch = "",
-    Keep = "",
+    Wanted = "",
     AutoEquip = true,
-    AutoDrop = false,
-    ForceDrop = false,
-    DropDelay = 0.35,
 
     AntiAfk = true,
     BlockAfkTeleport = true,
@@ -115,7 +111,6 @@ local Stats = {
     Tools = 0,
     LastTool = "-",
     Watch = "-",
-    Dropped = 0,
 }
 
 -- Drawn fresh for every pad rather than once when the slider moves, which is
@@ -257,6 +252,8 @@ local function eachGiver(fn)
 end
 
 --// Collecting --------------------------------------------------------------------
+local LastPad = { kind = nil, at = 0 }
+
 local function rootPart()
     local character = LocalPlayer.Character
     return character and character:FindFirstChild("HumanoidRootPart") or nil
@@ -285,6 +282,11 @@ local function collect(giver, kind)
 
     Stats.Collected = Stats.Collected + 1
     Stats.LastCollected = kind
+    -- Remembered so a tool arriving in the next moment can be attributed to the
+    -- pad that produced it. It is the only way to learn which tier an item
+    -- comes from, since the roll itself is server side and silent.
+    LastPad.kind = kind
+    LastPad.at = os.clock()
     return true
 end
 
@@ -675,8 +677,12 @@ CollectSection:Toggle({
     Callback = function(state) Config.AutoCollect = state end,
 })
 
+-- Handles kept so narrowing the farm can move the switches as well as the
+-- config, rather than leaving the panel claiming something that is no longer
+-- true.
+local wantToggles = {}
 for _, kind in ipairs(BLOCK_TYPES) do
-    CollectSection:Toggle({
+    wantToggles[kind] = CollectSection:Toggle({
         Title = string.lower(kind) .. " blocks",
         Flag = "lb_want_" .. string.lower(kind),
         Default = true,
@@ -866,20 +872,31 @@ MinuteSection:Paragraph({
     Text = "UpdateCameraAngle has nothing to do with a camera. ReplicatedFirst's afk_connection fires it with your Minutes total the moment you arrive back from an AFK server, so the count carries over - the client is simply trusted to state what that number was.\n\nThat is the only place the game ever sends it, so calling it directly is an untested path with a plausible reason to work. Start with a small number and check the leaderboard before reaching for the top of the slider: if it adds rather than sets, a huge value is not something you can take back.",
 })
 
---// Backpack --------------------------------------------------------------------
--- There is no backpack size to raise. Satchel is a skin over Roblox's Backpack,
--- with no slot count and no drop code of its own, and Roblox's Backpack holds as
--- many tools as you put in it. What runs out is the hotbar's ten visible slots -
--- everything past that is in the inventory rather than gone.
+--// Items ------------------------------------------------------------------------
+-- You cannot pick what a block gives. The roll happens on the server against a
+-- table the client never sees, and the gear lands straight in the Backpack -
+-- there is not one Tool loose in the whole workspace, so there is no dropped
+-- item on the floor to walk past and leave behind either. Nothing about which
+-- item arrives is decided anywhere this script can reach.
 --
--- The counters that genuinely are capped are lucky_tag through galaxy_tag, plain
--- NumberValues the server owns; no client script in the game reads or writes
--- them. Writing one here would change the number on screen and nothing the
--- server believes, so they are shown rather than touched.
+-- What is decidable is which pad you pull from. Every tool is stamped with the
+-- tier of the pad touched immediately before it appeared, which over a few
+-- hundred pulls says plainly which tier your item actually comes from - and
+-- that turns "I want this item" into "stop spending pulls on the four tiers
+-- that have never once produced it", which is a real saving even though it is
+-- not a guarantee.
+--
+-- The drop feature that used to live here is gone. Reparenting a tool from the
+-- client is how Roblox's own Backspace drop works, but this game does not
+-- honour it, so it half-worked at best.
 
-local seenTools = {}      -- [name] = how many have arrived this session
+-- A tool that lands more than this long after a pad was touched cannot be
+-- credited to it. Generous, because the server takes its time.
+local ATTRIBUTION_WINDOW = 3
+
+local seenTools = {}      -- [name] = { total = n, tiers = { [tier] = n } }
 local toolLog = {}        -- most recent arrivals, newest first
-local watchHits = 0
+local wantedHits = 0
 
 local function backpack()
     return LocalPlayer:FindFirstChildOfClass("Backpack")
@@ -902,54 +919,53 @@ local function heldTools()
     return out
 end
 
-local function matchesWatch(name)
-    local want = Config.Watch
-    if not want or want == "" then return false end
-    return string.find(string.lower(name), string.lower(want), 1, true) ~= nil
-end
-
-local function keepThis(name)
-    local keep = Config.Keep
-    if not keep or keep == "" then return false end
-    local lowered = string.lower(name)
-    for word in string.gmatch(string.lower(keep), "[^,]+") do
+-- Comma separated, because wanting one specific item is rarer than wanting any
+-- of a handful.
+local function wantedList()
+    local out = {}
+    for word in string.gmatch(string.lower(Config.Wanted or ""), "[^,]+") do
         word = string.gsub(word, "^%s+", "")
         word = string.gsub(word, "%s+$", "")
-        if word ~= "" and string.find(lowered, word, 1, true) then return true end
+        if word ~= "" then out[#out + 1] = word end
+    end
+    return out
+end
+
+local function isWanted(name)
+    local lowered = string.lower(name)
+    for _, word in ipairs(wantedList()) do
+        if string.find(lowered, word, 1, true) then return true end
     end
     return false
 end
 
--- Reparenting an equipped tool to workspace is how Roblox's own Backspace drop
--- works, and it replicates because the client owns its character. Nothing else
--- a client can do to a tool reaches the server.
-local function dropTool(tool)
-    local character = LocalPlayer.Character
-    local human = character and character:FindFirstChildOfClass("Humanoid")
-    if not (character and human) then return false end
-    if not Config.ForceDrop and tool.CanBeDropped == false then return false end
-    local ok = pcall(function()
-        human:EquipTool(tool)
-        tool.Parent = Workspace
-    end)
-    return ok
-end
-
 local function noteArrival(tool)
     local name = tool.Name
-    seenTools[name] = (seenTools[name] or 0) + 1
-    table.insert(toolLog, 1, name)
+    local tier = "unknown"
+    if LastPad.kind and os.clock() - LastPad.at <= ATTRIBUTION_WINDOW then
+        tier = LastPad.kind
+    end
+
+    local entry = seenTools[name]
+    if not entry then
+        entry = { total = 0, tiers = {} }
+        seenTools[name] = entry
+    end
+    entry.total = entry.total + 1
+    entry.tiers[tier] = (entry.tiers[tier] or 0) + 1
+
+    table.insert(toolLog, 1, ("%s  <- %s"):format(name, tier))
     for index = #toolLog, 41, -1 do
         toolLog[index] = nil
     end
-    Stats.LastTool = name
+    Stats.LastTool = ("%s (%s)"):format(name, tier)
 
-    if matchesWatch(name) then
-        watchHits = watchHits + 1
-        Stats.Watch = ("%s x%d"):format(name, watchHits)
+    if isWanted(name) then
+        wantedHits = wantedHits + 1
+        Stats.Watch = ("%s x%d"):format(name, wantedHits)
         Centrl:Notify({
             Title = "lucky blocks",
-            Content = "Got " .. name,
+            Content = ("Got %s from a %s block."):format(name, tier),
             Type = "success",
             Duration = 6,
         })
@@ -958,15 +974,6 @@ local function noteArrival(tool)
             local human = character and character:FindFirstChildOfClass("Humanoid")
             if human then pcall(function() human:EquipTool(tool) end) end
         end
-    elseif Config.AutoDrop and not keepThis(name) then
-        task.spawn(function()
-            task.wait(Config.DropDelay)
-            if tool.Parent and not Unloading and Config.AutoDrop then
-                if dropTool(tool) then
-                    Stats.Dropped = Stats.Dropped + 1
-                end
-            end
-        end)
     end
 end
 
@@ -983,129 +990,171 @@ task.spawn(function()
                     task.defer(noteArrival, child)
                 end
             end))
-            for _, item in ipairs(bag:GetChildren()) do
-                if item:IsA("Tool") then
-                    seenTools[item.Name] = (seenTools[item.Name] or 0) + 1
-                end
-            end
         end
         Stats.Tools = #heldTools()
         task.wait(1)
     end
 end)
 
---// Backpack tab ----------------------------------------------------------------
-local BagTab = Window:Tab({ Title = "backpack", Icon = "backpack" })
+-- Which tiers have ever produced something on the wanted list, and how often.
+local function tiersForWanted()
+    local counts, total = {}, 0
+    for name, entry in pairs(seenTools) do
+        if isWanted(name) then
+            for tier, n in pairs(entry.tiers) do
+                if tier ~= "unknown" then
+                    counts[tier] = (counts[tier] or 0) + n
+                    total = total + n
+                end
+            end
+        end
+    end
+    return counts, total
+end
 
-local WatchSection = BagTab:Section({ Title = "watch for an item", Side = "left" })
+--// Items tab -------------------------------------------------------------------
+local BagTab = Window:Tab({ Title = "items", Icon = "backpack" })
 
-WatchSection:Textbox({
-    Title = "item name",
-    Flag = "lb_watch",
-    Placeholder = "part of the name, e.g. periastron",
+local WantSection = BagTab:Section({ Title = "items you want", Side = "left" })
+
+WantSection:Textbox({
+    Title = "wanted",
+    Flag = "lb_wanted",
+    Placeholder = "comma separated, e.g. periastron, falcon",
     ClearOnFocus = false,
-    Callback = function(text) Config.Watch = tostring(text or "") end,
+    Callback = function(text) Config.Wanted = tostring(text or "") end,
 })
 
-WatchSection:Toggle({
-    Title = "equip it when it lands",
+WantSection:Toggle({
+    Title = "equip it the moment it lands",
     Flag = "lb_autoequip",
     Default = true,
     Callback = function(state) Config.AutoEquip = state end,
 })
 
-WatchSection:Paragraph({
-    Title = "there is no backpack size to raise",
-    Text = "Satchel is a skin over Roblox's Backpack - no slot count, no drop code of its own - and Roblox's Backpack takes as many tools as you put in it. What runs out is the ten visible hotbar slots; everything past those is in the inventory rather than lost, so nothing is being thrown away on the way in.\n\nWhich item a block gives is rolled on the server against a table the client never sees, so it cannot be steered - only rolled again. What this does instead is catch the roll: name part of the item, and it says so the moment one arrives and puts it in your hand.",
+WantSection:Paragraph({
+    Title = "the roll cannot be picked",
+    Text = "Which item a block gives is decided on the server against a table the client never sees, and the gear appears straight in your Backpack. There is not one Tool loose anywhere in the workspace either, so there is no item lying on the floor to walk past and leave behind. Nothing about which item arrives is decided anywhere this script can reach.\n\nWhat is decidable is which pad you pull from, and that is what the rest of this tab is for.",
 })
 
-WatchSection:Paragraph({
-    Title = "the counters that are capped",
-    Text = "lucky_tag through galaxy_tag are plain NumberValues on your player, counting the blocks you have out. The server owns them - not one client script in the whole game reads or writes them - so setting one here would change a number on your screen and nothing the server believes. They are on the farm tab so you can watch which one is actually stuck.",
+WantSection:Paragraph({
+    Title = "so narrow the pulls instead",
+    Text = "Every tool that arrives is stamped with the tier of the pad touched just before it. Over a few hundred pulls that says plainly which tier your item actually comes from - and if four of the six tiers have never once produced it, switching them off means every pull afterwards is spent somewhere it can happen.\n\nThat is not a guarantee of the item. It is the difference between rolling the right table and rolling five wrong ones alongside it, which is the whole of what can honestly be done here.",
 })
 
-local BagSection = BagTab:Section({ Title = "clearing space", Side = "right" })
+local NarrowSection = BagTab:Section({ Title = "narrow the farm", Side = "right" })
 
-BagSection:Textbox({
-    Title = "keep these",
-    Flag = "lb_keep",
-    Placeholder = "comma separated, e.g. periastron, falcon",
-    ClearOnFocus = false,
-    Callback = function(text) Config.Keep = tostring(text or "") end,
-})
+local narrowLabel = NarrowSection:Label({ Title = "no data yet" })
 
-BagSection:Toggle({
-    Title = "drop everything else",
-    Flag = "lb_autodrop",
-    Default = false,
-    Callback = function(state) Config.AutoDrop = state end,
-})
-
-BagSection:Toggle({
-    Title = "drop even if marked undroppable",
-    Flag = "lb_forcedrop",
-    Default = false,
-    Callback = function(state) Config.ForceDrop = state end,
-})
-
-BagSection:Slider({
-    Title = "wait before dropping",
-    Flag = "lb_dropdelay",
-    Min = 0, Max = 3, Increment = 0.05, Default = 0.35,
-    Suffix = "s",
-    Callback = function(value) Config.DropDelay = value end,
-})
-
-BagSection:Button({
-    Title = "drop everything not kept",
+NarrowSection:Button({
+    Title = "where do my items come from",
     Callback = function()
-        task.spawn(function()
-            local dropped = 0
-            for _, tool in ipairs(heldTools()) do
-                if not keepThis(tool.Name) and not matchesWatch(tool.Name) then
-                    if dropTool(tool) then
-                        dropped = dropped + 1
-                        Stats.Dropped = Stats.Dropped + 1
-                    end
-                    task.wait(0.1)
-                end
-            end
+        local counts, total = tiersForWanted()
+        if total == 0 then
+            narrowLabel:Set("nothing on the wanted list has dropped yet")
             Centrl:Notify({
                 Title = "lucky blocks",
-                Content = ("Dropped %d."):format(dropped),
-                Type = dropped > 0 and "success" or "warning",
+                Content = "No wanted item has dropped yet - keep farming and try again.",
+                Type = "warning",
                 Duration = 5,
             })
-        end)
+            return
+        end
+        local rows = {}
+        for tier, n in pairs(counts) do
+            rows[#rows + 1] = { tier = tier, n = n }
+        end
+        table.sort(rows, function(a, b) return a.n > b.n end)
+        local parts = {}
+        for _, row in ipairs(rows) do
+            parts[#parts + 1] = ("%s %d (%.0f%%)"):format(row.tier, row.n, row.n / total * 100)
+        end
+        narrowLabel:Set(table.concat(parts, "   "))
     end,
 })
 
-BagSection:Paragraph({
-    Title = "how a drop actually leaves",
-    Text = "Equip the tool, then reparent it to the workspace - the same two steps Roblox's own Backspace drop takes, and they replicate because the client owns its character. Nothing else a client can do to a tool reaches the server, so a tool the game marked undroppable will usually stay put; the override is there to try anyway rather than to promise.\n\nWorth saying plainly: this frees hotbar space, it does not raise a cap. If blocks have stopped coming, the counters are the thing to look at, not this.",
+NarrowSection:Button({
+    Title = "farm only those tiers",
+    Callback = function()
+        local counts, total = tiersForWanted()
+        if total == 0 then
+            Centrl:Notify({
+                Title = "lucky blocks",
+                Content = "Nothing to narrow to yet - no wanted item has dropped.",
+                Type = "warning",
+                Duration = 5,
+            })
+            return
+        end
+        local kept = {}
+        for _, kind in ipairs(BLOCK_TYPES) do
+            local on = (counts[kind] or 0) > 0
+            Config.Want[kind] = on
+            if wantToggles[kind] then pcall(function() wantToggles[kind]:Set(on) end) end
+            if on then kept[#kept + 1] = kind end
+        end
+        Centrl:Notify({
+            Title = "lucky blocks",
+            Content = "Now farming only: " .. table.concat(kept, ", "),
+            Type = "success",
+            Duration = 6,
+        })
+    end,
+})
+
+NarrowSection:Button({
+    Title = "turn every tier back on",
+    Callback = function()
+        for _, kind in ipairs(BLOCK_TYPES) do
+            Config.Want[kind] = true
+            if wantToggles[kind] then pcall(function() wantToggles[kind]:Set(true) end) end
+        end
+    end,
+})
+
+NarrowSection:Paragraph({
+    Title = "give it a sample first",
+    Text = "One drop is not evidence. Leave the farm running until the wanted item has landed a good few times before narrowing, or you will switch off a tier that simply had not come up yet. The percentages beside each tier are there so you can see how much you are actually going on.",
 })
 
 local LogSection = BagTab:Section({ Title = "what has dropped", Side = "left" })
 
 local toolsLabel = LogSection:Label({ Title = "tools: 0" })
 local lastToolLabel = LogSection:Label({ Title = "last: --" })
-local watchLabel = LogSection:Label({ Title = "watching: --" })
-local logLabel = LogSection:Paragraph({ Title = "recent", Text = "nothing yet" })
+local watchLabel = LogSection:Label({ Title = "wanted: --" })
+local logLabel = LogSection:Paragraph({ Title = "by item", Text = "nothing yet" })
 
 LogSection:Button({
     Title = "count what you have seen",
     Callback = function()
         local rows = {}
-        for name, count in pairs(seenTools) do
-            rows[#rows + 1] = { name = name, count = count }
+        for name, entry in pairs(seenTools) do
+            rows[#rows + 1] = { name = name, entry = entry }
         end
-        table.sort(rows, function(a, b) return a.count > b.count end)
+        table.sort(rows, function(a, b) return a.entry.total > b.entry.total end)
         local lines = {}
-        for index = 1, math.min(#rows, 25) do
-            lines[#lines + 1] = ("%s  x%d"):format(rows[index].name, rows[index].count)
+        for index = 1, math.min(#rows, 20) do
+            local row = rows[index]
+            local tiers = {}
+            for tier, n in pairs(row.entry.tiers) do
+                tiers[#tiers + 1] = ("%s %d"):format(tier, n)
+            end
+            table.sort(tiers)
+            lines[#lines + 1] = ("%s  x%d   [%s]"):format(row.name, row.entry.total, table.concat(tiers, ", "))
         end
         -- Paragraph:Set takes a table, not a string. Handed a string it finds
         -- no Title and no Text on it and quietly does nothing at all.
+        logLabel:Set({ Text = #lines > 0 and table.concat(lines, "\n") or "nothing yet" })
+    end,
+})
+
+LogSection:Button({
+    Title = "recent arrivals",
+    Callback = function()
+        local lines = {}
+        for index = 1, math.min(#toolLog, 20) do
+            lines[#lines + 1] = toolLog[index]
+        end
         logLabel:Set({ Text = #lines > 0 and table.concat(lines, "\n") or "nothing yet" })
     end,
 })
@@ -1287,9 +1336,9 @@ task.spawn(function()
                     string.sub(kind, 1, 3), value and tostring(math.floor(value.Value)) or "?")
             end
             tagLabel:Set("blocks out: " .. table.concat(tags, "  "))
-            toolsLabel:Set(("tools: %d   dropped %d"):format(Stats.Tools, Stats.Dropped))
+            toolsLabel:Set(("tools: %d"):format(Stats.Tools))
             lastToolLabel:Set("last: " .. tostring(Stats.LastTool))
-            watchLabel:Set("watching: " .. (Config.Watch ~= "" and (Config.Watch .. "  -> " .. Stats.Watch) or "nothing"))
+            watchLabel:Set("wanted: " .. (Config.Wanted ~= "" and (Config.Wanted .. "  -> " .. Stats.Watch) or "nothing set"))
             collectLabel:Set(("collected %d   last: %s"):format(Stats.Collected, tostring(Stats.LastCollected)))
             touchLabel:Set("method: " .. Stats.Touch)
             firedLabel:Set(("spawn fired: %d%s"):format(
