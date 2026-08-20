@@ -69,6 +69,15 @@ local Config = {
     RandomAmount = { Min = 0.10, Max = 0.60 },
     RandomChance = 25,
 
+    -- The randomizer's opposite: a burst where the fingers speed up. Amount is
+    -- a divisor, so 2 means that gap takes half as long.
+    SpeedBoost = false,
+    SpeedBoostAmount = { Min = 1.5, Max = 3.0 },
+    SpeedBoostChance = 20,
+
+    BackspaceStart = { Min = 0.15, Max = 0.45 },
+    BackspaceDelay = { Min = 0.05, Max = 0.12 },
+
     PanicOnly = false,
     PanicAt = 4,
 
@@ -539,6 +548,8 @@ end
 
 local lastLetterDelay = nil
 local lastStartDelay = nil
+local lastBackDelay = nil
+local lastBackStart = nil
 
 local function withRandomizer(base)
     if not Config.Randomizer then return base end
@@ -546,6 +557,23 @@ local function withRandomizer(base)
         return base
     end
     return base + nextDelay(Config.RandomAmount, nil)
+end
+
+local function withBoost(base)
+    if not Config.SpeedBoost then return base end
+    if math.random(1, 100) > math.max(1, math.floor(Config.SpeedBoostChance)) then
+        return base
+    end
+    local factor = nextDelay(Config.SpeedBoostAmount, nil)
+    if factor <= 1 then return base end
+    return base / factor
+end
+
+-- Boost first, then the randomizer. They pull opposite ways on purpose - one is
+-- a burst of speed, the other a moment of hesitation - and both firing on the
+-- same gap is rare and reads fine when it happens: sped up, then stumbled.
+local function shapeDelay(base)
+    return withRandomizer(withBoost(base))
 end
 
 --// Typing ----------------------------------------------------------------------
@@ -572,12 +600,14 @@ local function abortedSince(token)
     return Unloading or Round.token ~= token or not Config.AutoType
 end
 
--- What is in flight right now. `sent` is the number of letters this script has
--- actually pushed past the locked prefix, which is what a retry has to undo.
-local Attempt = { word = nil, sent = 0, token = -1, at = 0, tries = 0, awaiting = false }
+-- What is in flight right now. `typed` is the exact run of letters this script
+-- has pushed past the locked prefix - the string, not just a count, because a
+-- retry needs to know what is standing there to work out how little of it has
+-- to go.
+local Attempt = { word = nil, typed = "", token = -1, at = 0, tries = 0, awaiting = false }
 
 local function clearAttempt()
-    Attempt.word, Attempt.sent, Attempt.awaiting = nil, 0, false
+    Attempt.word, Attempt.awaiting = nil, false
 end
 
 local function blacklistWord(word, reason)
@@ -604,12 +634,25 @@ end
 
 local typeWord
 
--- Wipe the letters we typed, then try something else. The game's own input
--- model keeps the rejected word on screen after a strike - AnswerInput clears
--- itself on `correct` and on nothing else - so the server's buffer is still
--- holding it too, and a human would be hitting backspace here. Exactly `sent`
--- of them: the client refuses to send a backspace once the count is back down
--- to the prefix, so it never over-deletes and the server has no reason to clamp.
+-- How much of what is already typed the next word can keep. Both words share
+-- the locked prefix by construction, so this only compares the parts past it:
+-- "ple" standing there and "ply" wanted keeps "pl", meaning one backspace and
+-- one letter rather than three of each.
+local function sharedStem(typed, target)
+    local limit = math.min(#typed, #target)
+    local index = 0
+    while index < limit and string.sub(typed, index + 1, index + 1) == string.sub(target, index + 1, index + 1) do
+        index = index + 1
+    end
+    return index
+end
+
+-- Correct the word in place rather than wiping it. The game's own input model
+-- keeps a refused word on screen - AnswerInput clears itself on `correct` and on
+-- nothing else - so the server's buffer is still holding it and a human would be
+-- backspacing here. Deleting only back to the shared stem is both faster and
+-- more natural than clearing the whole thing: it is what someone fixing a typo
+-- actually does.
 local function retryAfterRejection(token)
     if abortedSince(token) or not Round.isTurn then return end
     if not Config.AutoChange then return end
@@ -618,20 +661,11 @@ local function retryAfterRejection(token)
         return
     end
 
-    local toClear = Attempt.sent
+    local standing = Attempt.typed
     clearAttempt()
     Attempt.tries = Attempt.tries + 1
     Stats.Retries = Stats.Retries + 1
 
-    if Config.ClearBeforeRetry and toClear > 0 then
-        for _ = 1, toClear do
-            if abortedSince(token) then return end
-            sendChar(-1)
-            task.wait(withRandomizer(nextDelay(Config.LetterDelay, lastLetterDelay)))
-        end
-    end
-
-    if abortedSince(token) or not Round.isTurn then return end
     local word, count = chooseWord(string.lower(Round.prefix))
     Stats.Candidates = count
     if not word then
@@ -640,28 +674,73 @@ local function retryAfterRejection(token)
         return
     end
     Stats.Suggestion = word
-    Stats.Status = ("retry %d: %s"):format(Attempt.tries, word)
-    typeWord(word, token, true)
+
+    local target = string.sub(word, #Round.prefix + 1)
+    local keep = 0
+    if Config.ClearBeforeRetry then
+        keep = sharedStem(standing, target)
+        local toDelete = #standing - keep
+
+        if toDelete > 0 then
+            local pause = shapeDelay(nextDelay(Config.BackspaceStart, lastBackStart))
+            lastBackStart = pause
+            Stats.LastDelay = pause
+            task.wait(pause)
+            if abortedSince(token) or not Round.isTurn then return end
+
+            for _ = 1, toDelete do
+                if abortedSince(token) then return end
+                sendChar(-1)
+                Attempt.typed = string.sub(Attempt.typed, 1, #Attempt.typed - 1)
+                local gap = shapeDelay(nextDelay(Config.BackspaceDelay, lastBackDelay))
+                lastBackDelay = gap
+                Stats.LastDelay = gap
+                task.wait(gap)
+            end
+        end
+        Stats.Status = ("retry %d: %s (kept %d, deleted %d)"):format(Attempt.tries, word, keep, toDelete)
+    else
+        -- Told to assume the server clears its own buffer on a strike, so there
+        -- is nothing standing and the whole word gets typed fresh.
+        Attempt.typed = ""
+        Stats.Status = ("retry %d: %s"):format(Attempt.tries, word)
+    end
+
+    if abortedSince(token) or not Round.isTurn then return end
+    typeWord(word, token, true, keep)
 end
 
-function typeWord(word, token, isRetry)
+-- startFrom is how many letters past the prefix are already standing, which a
+-- retry that kept a shared stem has left in place.
+function typeWord(word, token, isRetry, startFrom)
     typing = true
+    startFrom = startFrom or 0
     Attempt.word = word
-    Attempt.sent = 0
     Attempt.token = token
     Attempt.awaiting = false
+    if not isRetry then
+        Attempt.typed = ""
+    end
     Stats.Status = (isRetry and "retyping " or "typing ") .. word
 
-    local rest = string.sub(word, #Round.prefix + 1)
+    local rest = string.sub(word, #Round.prefix + 1 + startFrom)
     if rest == "" then
+        -- The stem that survived is already the whole word: nothing to type,
+        -- just submit it.
         typing = false
+        TriedThisTurn[word] = true
+        Attempt.at = os.clock()
+        Attempt.awaiting = true
+        Stats.LastWord = word
+        Stats.Status = "submitted " .. word
+        submitAnswer()
         return
     end
 
     -- A retry is already mid-turn with the clock running, so it skips straight
     -- to typing rather than sitting through the opening pause again.
     if not isRetry then
-        local start = withRandomizer(nextDelay(Config.StartDelay, lastStartDelay))
+        local start = shapeDelay(nextDelay(Config.StartDelay, lastStartDelay))
         lastStartDelay = start
         Stats.LastDelay = start
         task.wait(start)
@@ -678,11 +757,12 @@ function typeWord(word, token, isRetry)
             Stats.Status = "aborted mid-word"
             return
         end
-        sendChar(string.upper(string.sub(rest, index, index)))
-        Attempt.sent = Attempt.sent + 1
+        local char = string.sub(rest, index, index)
+        sendChar(string.upper(char))
+        Attempt.typed = Attempt.typed .. char
         Stats.Typed = Stats.Typed + 1
         if index < #rest then
-            local gap = withRandomizer(nextDelay(Config.LetterDelay, lastLetterDelay))
+            local gap = shapeDelay(nextDelay(Config.LetterDelay, lastLetterDelay))
             lastLetterDelay = gap
             Stats.LastDelay = gap
             task.wait(gap)
@@ -693,7 +773,7 @@ function typeWord(word, token, isRetry)
         typing = false
         return
     end
-    task.wait(withRandomizer(nextDelay(Config.SubmitDelay, nil)))
+    task.wait(shapeDelay(nextDelay(Config.SubmitDelay, nil)))
     if abortedSince(token) then
         typing = false
         return
@@ -778,6 +858,7 @@ busConnect("updateRound", function(prompt, _, turnPlayer, time, _, strikes)
     -- is untouched; only the per-turn shortlist resets.
     TriedThisTurn = {}
     Attempt.tries = 0
+    Attempt.typed = ""
     clearAttempt()
 
     if Round.isTurn and not Config.PanicOnly then
@@ -865,6 +946,7 @@ busConnect("endGame", function()
     UsedThisMatch = {}
     TriedThisTurn = {}
     Attempt.tries = 0
+    Attempt.typed = ""
     clearAttempt()
     saveLearned()
     saveBlacklist()
@@ -1243,6 +1325,37 @@ RandomSection:Slider({
     Callback = function(value) Config.RandomChance = value end,
 })
 
+RandomSection:Toggle({
+    Title = "speed boost",
+    Flag = "wg_boost_speed",
+    Default = false,
+    Callback = function(state) Config.SpeedBoost = state end,
+})
+
+RandomSection:Slider({
+    Title = "boost chance",
+    Flag = "wg_boost_chance",
+    Min = 1, Max = 100, Increment = 1, Default = 20,
+    Suffix = "%",
+    Callback = function(value) Config.SpeedBoostChance = value end,
+})
+
+RandomSection:RangeSlider({
+    Title = "boost by",
+    Flag = "wg_boost_amount",
+    Min = 1, Max = 10, Increment = 0.1,
+    Default = { 1.5, 3 },
+    Suffix = "x",
+    Callback = function(low, high)
+        Config.SpeedBoostAmount = { Min = low, Max = high }
+    end,
+})
+
+RandomSection:Paragraph({
+    Title = "the randomizer's opposite",
+    Text = "Where the randomizer inserts hesitation, this takes it away: on its share of gaps the delay is divided by a factor from the span, so 2x means that keystroke lands in half the usual time. Per gap rather than per word, which is what makes it read as bursts - a run of letters you know cold going quickly, the rest at your normal pace.\n\nBoth can be on at once. They pull opposite ways on purpose, and the rare gap where both fire reads fine: sped up, then stumbled.",
+})
+
 RandomSection:Paragraph({
     Title = "what the randomizer adds",
     Text = "On top of the delays above, and only on the share of them set by 'how often', an extra pause of a random length from its own span. The delay spans give you a steady typing rhythm; this is the part that breaks it - the mid-word hesitation of someone who had to stop and think. Leaving it off gives clean, even typing inside your chosen spans, which is faster but reads as more machine-like.",
@@ -1276,7 +1389,7 @@ WordSection:Dropdown({
 WordSection:RangeSlider({
     Title = "word length",
     Flag = "wg_length",
-    Min = 3, Max = 14, Increment = 1,
+    Min = 1, Max = 100, Increment = 1,
     Default = { 4, 9 },
     Callback = function(low, high)
         Config.WordLength = { Min = low, Max = high }
@@ -1318,6 +1431,28 @@ RetrySection:Toggle({
     Callback = function(state) Config.ClearBeforeRetry = state end,
 })
 
+RetrySection:RangeSlider({
+    Title = "pause before backspacing",
+    Flag = "wg_back_start",
+    Min = 0, Max = 2, Increment = 0.05,
+    Default = { 0.15, 0.45 },
+    Suffix = "s",
+    Callback = function(low, high)
+        Config.BackspaceStart = { Min = low, Max = high }
+    end,
+})
+
+RetrySection:RangeSlider({
+    Title = "backspace speed",
+    Flag = "wg_back_delay",
+    Min = 0, Max = 1, Increment = 0.01,
+    Default = { 0.05, 0.12 },
+    Suffix = "s",
+    Callback = function(low, high)
+        Config.BackspaceDelay = { Min = low, Max = high }
+    end,
+})
+
 RetrySection:Slider({
     Title = "retries per turn",
     Flag = "wg_retry_limit",
@@ -1339,8 +1474,8 @@ RetrySection:Paragraph({
 })
 
 RetrySection:Paragraph({
-    Title = "why it backspaces first",
-    Text = "The refused word is still sitting in the input. The game's own display clears itself when an answer is accepted and at no other point, so after a strike the letters stay on screen - which means the server is still holding them too, and a human would be reaching for backspace. Exactly as many are sent as this script typed, never more: the game refuses to send a backspace once the count is back down to the locked prefix, so the server was never given a reason to guard against over-deleting and neither is it given one here.\n\nIf a retry ever comes out as two words jammed together, the server does clear on its own and this should be off.",
+    Title = "it only deletes what it has to",
+    Text = "The refused word is still sitting in the input. The game's own display clears itself when an answer is accepted and at no other point, so after a strike the letters stay on screen - which means the server is still holding them too, and a human would be reaching for backspace.\n\nOnly back as far as the two words stop agreeing, though. With APPLE refused and APPLY next, APPL is already correct and standing there: one backspace and one letter, not five of each. It is quicker on the clock and it is also what someone fixing a typo actually does - nobody clears a whole word to change its last letter.\n\nIf a retry ever comes out as two words jammed together, the server clears on its own after a strike and this should be off, which types the replacement fresh instead.",
 })
 
 local StatusSection = MainTab:Section({ Title = "status", Side = "right" })
@@ -1585,7 +1720,7 @@ AddSection:Textbox({
 
 AddSection:Paragraph({
     Title = "where the bank comes from",
-    Text = "The dictionary is 349,766 sorted English words fetched once from the hub repo and cached to disk, so it costs one download ever. It ships sorted because the words sharing a prefix are then one contiguous run - a lower-bound search and a short walk, rather than a scan of the whole list every round.\n\nThe learned half is built from the game itself. Every accepted answer is broadcast to the whole table, so each round teaches the bank a word that is known to pass, whether you played it or somebody else did. Those outrank the dictionary when a prefix comes up again, which is why this gets better the longer it runs.",
+    Text = "The dictionary is 445,955 words - Unknowns-debug/words, a blend of several dictionaries - fetched once from the hub repo and cached to disk, so it costs one download ever. It is stored sorted, which is the only change made to it: the words sharing a prefix are then one contiguous run, so a lookup is a lower-bound search and a short walk rather than a scan of the whole list every round.\n\nThe learned half is built from the game itself. Every accepted answer is broadcast to the whole table, so each round teaches the bank a word that is known to pass, whether you played it or somebody else did. Those outrank the dictionary when a prefix comes up again, which is why this gets better the longer it runs.",
 })
 
 --// Player tab --------------------------------------------------------------------
