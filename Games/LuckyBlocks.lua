@@ -81,6 +81,13 @@ local Config = {
     Minutes = 1000,
     TpBase = "Spawn1",
 
+    Watch = "",
+    Keep = "",
+    AutoEquip = true,
+    AutoDrop = false,
+    ForceDrop = false,
+    DropDelay = 0.35,
+
     AntiAfk = true,
     BlockAfkTeleport = true,
 
@@ -105,6 +112,10 @@ local Stats = {
     MyBase = "-",
     Held = "-",
     Fired = 0,
+    Tools = 0,
+    LastTool = "-",
+    Watch = "-",
+    Dropped = 0,
 }
 
 -- Drawn fresh for every pad rather than once when the slider moves, which is
@@ -762,6 +773,7 @@ local StatusSection = FarmTab:Section({ Title = "status", Side = "left" })
 local baseLabel = StatusSection:Label({ Title = "base: --" })
 local giverLabel = StatusSection:Label({ Title = "givers: --" })
 local heldLabel = StatusSection:Label({ Title = "holding: --" })
+local tagLabel = StatusSection:Label({ Title = "blocks out: --" })
 local collectLabel = StatusSection:Label({ Title = "collected 0" })
 local touchLabel = StatusSection:Label({ Title = "method: --" })
 local firedLabel = StatusSection:Label({ Title = "spawn fired: 0" })
@@ -852,6 +864,250 @@ MinuteSection:Button({
 MinuteSection:Paragraph({
     Title = "the remote is misnamed",
     Text = "UpdateCameraAngle has nothing to do with a camera. ReplicatedFirst's afk_connection fires it with your Minutes total the moment you arrive back from an AFK server, so the count carries over - the client is simply trusted to state what that number was.\n\nThat is the only place the game ever sends it, so calling it directly is an untested path with a plausible reason to work. Start with a small number and check the leaderboard before reaching for the top of the slider: if it adds rather than sets, a huge value is not something you can take back.",
+})
+
+--// Backpack --------------------------------------------------------------------
+-- There is no backpack size to raise. Satchel is a skin over Roblox's Backpack,
+-- with no slot count and no drop code of its own, and Roblox's Backpack holds as
+-- many tools as you put in it. What runs out is the hotbar's ten visible slots -
+-- everything past that is in the inventory rather than gone.
+--
+-- The counters that genuinely are capped are lucky_tag through galaxy_tag, plain
+-- NumberValues the server owns; no client script in the game reads or writes
+-- them. Writing one here would change the number on screen and nothing the
+-- server believes, so they are shown rather than touched.
+
+local seenTools = {}      -- [name] = how many have arrived this session
+local toolLog = {}        -- most recent arrivals, newest first
+local watchHits = 0
+
+local function backpack()
+    return LocalPlayer:FindFirstChildOfClass("Backpack")
+end
+
+local function heldTools()
+    local out = {}
+    local bag = backpack()
+    if bag then
+        for _, item in ipairs(bag:GetChildren()) do
+            if item:IsA("Tool") then out[#out + 1] = item end
+        end
+    end
+    local character = LocalPlayer.Character
+    if character then
+        for _, item in ipairs(character:GetChildren()) do
+            if item:IsA("Tool") then out[#out + 1] = item end
+        end
+    end
+    return out
+end
+
+local function matchesWatch(name)
+    local want = Config.Watch
+    if not want or want == "" then return false end
+    return string.find(string.lower(name), string.lower(want), 1, true) ~= nil
+end
+
+local function keepThis(name)
+    local keep = Config.Keep
+    if not keep or keep == "" then return false end
+    local lowered = string.lower(name)
+    for word in string.gmatch(string.lower(keep), "[^,]+") do
+        word = string.gsub(word, "^%s+", "")
+        word = string.gsub(word, "%s+$", "")
+        if word ~= "" and string.find(lowered, word, 1, true) then return true end
+    end
+    return false
+end
+
+-- Reparenting an equipped tool to workspace is how Roblox's own Backspace drop
+-- works, and it replicates because the client owns its character. Nothing else
+-- a client can do to a tool reaches the server.
+local function dropTool(tool)
+    local character = LocalPlayer.Character
+    local human = character and character:FindFirstChildOfClass("Humanoid")
+    if not (character and human) then return false end
+    if not Config.ForceDrop and tool.CanBeDropped == false then return false end
+    local ok = pcall(function()
+        human:EquipTool(tool)
+        tool.Parent = Workspace
+    end)
+    return ok
+end
+
+local function noteArrival(tool)
+    local name = tool.Name
+    seenTools[name] = (seenTools[name] or 0) + 1
+    table.insert(toolLog, 1, name)
+    for index = #toolLog, 41, -1 do
+        toolLog[index] = nil
+    end
+    Stats.LastTool = name
+
+    if matchesWatch(name) then
+        watchHits = watchHits + 1
+        Stats.Watch = ("%s x%d"):format(name, watchHits)
+        Centrl:Notify({
+            Title = "lucky blocks",
+            Content = "Got " .. name,
+            Type = "success",
+            Duration = 6,
+        })
+        if Config.AutoEquip then
+            local character = LocalPlayer.Character
+            local human = character and character:FindFirstChildOfClass("Humanoid")
+            if human then pcall(function() human:EquipTool(tool) end) end
+        end
+    elseif Config.AutoDrop and not keepThis(name) then
+        task.spawn(function()
+            task.wait(Config.DropDelay)
+            if tool.Parent and not Unloading and Config.AutoDrop then
+                if dropTool(tool) then
+                    Stats.Dropped = Stats.Dropped + 1
+                end
+            end
+        end)
+    end
+end
+
+task.spawn(function()
+    -- Rebound on every respawn, because the Backpack instance is replaced.
+    local hooked = nil
+    while not Unloading do
+        local bag = backpack()
+        if bag and bag ~= hooked then
+            hooked = bag
+            track(bag.ChildAdded:Connect(function(child)
+                if Unloading then return end
+                if child:IsA("Tool") then
+                    task.defer(noteArrival, child)
+                end
+            end))
+            for _, item in ipairs(bag:GetChildren()) do
+                if item:IsA("Tool") then
+                    seenTools[item.Name] = (seenTools[item.Name] or 0) + 1
+                end
+            end
+        end
+        Stats.Tools = #heldTools()
+        task.wait(1)
+    end
+end)
+
+--// Backpack tab ----------------------------------------------------------------
+local BagTab = Window:Tab({ Title = "backpack", Icon = "backpack" })
+
+local WatchSection = BagTab:Section({ Title = "watch for an item", Side = "left" })
+
+WatchSection:Textbox({
+    Title = "item name",
+    Flag = "lb_watch",
+    Placeholder = "part of the name, e.g. periastron",
+    ClearOnFocus = false,
+    Callback = function(text) Config.Watch = tostring(text or "") end,
+})
+
+WatchSection:Toggle({
+    Title = "equip it when it lands",
+    Flag = "lb_autoequip",
+    Default = true,
+    Callback = function(state) Config.AutoEquip = state end,
+})
+
+WatchSection:Paragraph({
+    Title = "there is no backpack size to raise",
+    Text = "Satchel is a skin over Roblox's Backpack - no slot count, no drop code of its own - and Roblox's Backpack takes as many tools as you put in it. What runs out is the ten visible hotbar slots; everything past those is in the inventory rather than lost, so nothing is being thrown away on the way in.\n\nWhich item a block gives is rolled on the server against a table the client never sees, so it cannot be steered - only rolled again. What this does instead is catch the roll: name part of the item, and it says so the moment one arrives and puts it in your hand.",
+})
+
+WatchSection:Paragraph({
+    Title = "the counters that are capped",
+    Text = "lucky_tag through galaxy_tag are plain NumberValues on your player, counting the blocks you have out. The server owns them - not one client script in the whole game reads or writes them - so setting one here would change a number on your screen and nothing the server believes. They are on the farm tab so you can watch which one is actually stuck.",
+})
+
+local BagSection = BagTab:Section({ Title = "clearing space", Side = "right" })
+
+BagSection:Textbox({
+    Title = "keep these",
+    Flag = "lb_keep",
+    Placeholder = "comma separated, e.g. periastron, falcon",
+    ClearOnFocus = false,
+    Callback = function(text) Config.Keep = tostring(text or "") end,
+})
+
+BagSection:Toggle({
+    Title = "drop everything else",
+    Flag = "lb_autodrop",
+    Default = false,
+    Callback = function(state) Config.AutoDrop = state end,
+})
+
+BagSection:Toggle({
+    Title = "drop even if marked undroppable",
+    Flag = "lb_forcedrop",
+    Default = false,
+    Callback = function(state) Config.ForceDrop = state end,
+})
+
+BagSection:Slider({
+    Title = "wait before dropping",
+    Flag = "lb_dropdelay",
+    Min = 0, Max = 3, Increment = 0.05, Default = 0.35,
+    Suffix = "s",
+    Callback = function(value) Config.DropDelay = value end,
+})
+
+BagSection:Button({
+    Title = "drop everything not kept",
+    Callback = function()
+        task.spawn(function()
+            local dropped = 0
+            for _, tool in ipairs(heldTools()) do
+                if not keepThis(tool.Name) and not matchesWatch(tool.Name) then
+                    if dropTool(tool) then
+                        dropped = dropped + 1
+                        Stats.Dropped = Stats.Dropped + 1
+                    end
+                    task.wait(0.1)
+                end
+            end
+            Centrl:Notify({
+                Title = "lucky blocks",
+                Content = ("Dropped %d."):format(dropped),
+                Type = dropped > 0 and "success" or "warning",
+                Duration = 5,
+            })
+        end)
+    end,
+})
+
+BagSection:Paragraph({
+    Title = "how a drop actually leaves",
+    Text = "Equip the tool, then reparent it to the workspace - the same two steps Roblox's own Backspace drop takes, and they replicate because the client owns its character. Nothing else a client can do to a tool reaches the server, so a tool the game marked undroppable will usually stay put; the override is there to try anyway rather than to promise.\n\nWorth saying plainly: this frees hotbar space, it does not raise a cap. If blocks have stopped coming, the counters are the thing to look at, not this.",
+})
+
+local LogSection = BagTab:Section({ Title = "what has dropped", Side = "left" })
+
+local toolsLabel = LogSection:Label({ Title = "tools: 0" })
+local lastToolLabel = LogSection:Label({ Title = "last: --" })
+local watchLabel = LogSection:Label({ Title = "watching: --" })
+local logLabel = LogSection:Paragraph({ Title = "recent", Text = "nothing yet" })
+
+LogSection:Button({
+    Title = "count what you have seen",
+    Callback = function()
+        local rows = {}
+        for name, count in pairs(seenTools) do
+            rows[#rows + 1] = { name = name, count = count }
+        end
+        table.sort(rows, function(a, b) return a.count > b.count end)
+        local lines = {}
+        for index = 1, math.min(#rows, 25) do
+            lines[#lines + 1] = ("%s  x%d"):format(rows[index].name, rows[index].count)
+        end
+        -- Paragraph:Set takes a table, not a string. Handed a string it finds
+        -- no Title and no Text on it and quietly does nothing at all.
+        logLabel:Set({ Text = #lines > 0 and table.concat(lines, "\n") or "nothing yet" })
+    end,
 })
 
 --// Player tab -------------------------------------------------------------------
@@ -1022,6 +1278,18 @@ task.spawn(function()
             baseLabel:Set(("base: %s   (%d bases in range)"):format(Stats.MyBase, Stats.Bases))
             giverLabel:Set(("givers: %d   ready %d"):format(Stats.Givers, Stats.Ready))
             heldLabel:Set("holding: " .. tostring(Stats.Held))
+            -- Every type spelled out rather than only the non-zero ones, so a
+            -- counter sitting at its cap is visible instead of inferred.
+            local tags = {}
+            for _, kind in ipairs({ "lucky", "super", "diamond", "rainbow", "galaxy" }) do
+                local value = LocalPlayer:FindFirstChild(kind .. "_tag")
+                tags[#tags + 1] = ("%s %s"):format(
+                    string.sub(kind, 1, 3), value and tostring(math.floor(value.Value)) or "?")
+            end
+            tagLabel:Set("blocks out: " .. table.concat(tags, "  "))
+            toolsLabel:Set(("tools: %d   dropped %d"):format(Stats.Tools, Stats.Dropped))
+            lastToolLabel:Set("last: " .. tostring(Stats.LastTool))
+            watchLabel:Set("watching: " .. (Config.Watch ~= "" and (Config.Watch .. "  -> " .. Stats.Watch) or "nothing"))
             collectLabel:Set(("collected %d   last: %s"):format(Stats.Collected, tostring(Stats.LastCollected)))
             touchLabel:Set("method: " .. Stats.Touch)
             firedLabel:Set(("spawn fired: %d%s"):format(
