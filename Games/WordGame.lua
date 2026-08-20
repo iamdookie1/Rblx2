@@ -372,20 +372,37 @@ local UsedThisMatch = {}
 -- burns the clock proving it wrong again.
 local TriedThisTurn = {}
 
--- Scoring is tiered rather than blended, so a tier never loses to length: a
--- word the server has already accepted beats any dictionary word, a common word
--- beats any obscure one, and the mode only decides the order inside a tier.
+-- Which key dominates depends on the mode, and getting that backwards was a
+-- real bug: with the tiers always on top, "longest" quietly meant "longest
+-- word that also happens to be common", and since common words are short it
+-- answered `over` with `overnight` while `overintellectualizations` sat in the
+-- pool untouched. Asking for the longest word is an explicit instruction about
+-- length, so in that mode length leads and the tiers only settle ties between
+-- words the same length. Same in reverse for shortest.
+--
+-- `common` is the mode where the tiers do lead, because that is what it is for:
+-- a word the server has already accepted beats any dictionary word, a common
+-- word beats any obscure one, and length is only a nudge toward typing less.
 local VERIFIED_BONUS = 100000
 local COMMON_BONUS = 5000
 
-local function modeScore(word, mode)
+-- Above any word in any dictionary, so `shortest` stays positive whatever the
+-- length cap is set to.
+local LENGTH_CEILING = 128
+
+local function scoreWord(word, verified, mode)
     local length = #word
-    if mode == "shortest" then
-        return (40 - length) * 10
-    elseif mode == "longest" then
-        return length * 10
+    if mode == "longest" or mode == "shortest" then
+        local primary = (mode == "longest") and length or (LENGTH_CEILING - length)
+        local tie = 0
+        if verified then tie = tie + 100 end
+        if CommonSet[word] then tie = tie + 10 end
+        return primary * 1000 + tie
     end
-    return (40 - length) * 3
+    local score = (40 - length) * 3
+    if verified then score = score + VERIFIED_BONUS end
+    if CommonSet[word] then score = score + COMMON_BONUS end
+    return score
 end
 
 -- One pass, whole prefix run, running best. The earlier version collected the
@@ -430,9 +447,7 @@ local function chooseWord(prefix)
             return
         end
 
-        local score = modeScore(word, mode)
-        if verified then score = score + VERIFIED_BONUS end
-        if CommonSet[word] then score = score + COMMON_BONUS end
+        local score = scoreWord(word, verified, mode)
 
         if score > anyScore then
             anyWord, anyScore, anyTies = word, score, 1
@@ -1378,15 +1393,34 @@ RandomSection:Slider({
 
 local WordSection = MainTab:Section({ Title = "word choice", Side = "left" })
 
+local lengthSlider
+
 WordSection:Dropdown({
     Title = "prefer",
     Flag = "wg_pick",
     Options = { "common", "shortest", "longest", "random" },
     Default = "common",
-    Callback = function(value) Config.Pick = value end,
+    Callback = function(value)
+        Config.Pick = value
+        -- The length band silently outranks the mode, so asking for the longest
+        -- word while the band still sits at its default cap of 9 gets you the
+        -- longest word under ten letters and no hint as to why. Open the band
+        -- rather than let the two controls quietly contradict each other - and
+        -- open it by driving the slider, so what it reads is what is in force.
+        if value == "longest" and lengthSlider and Config.WordLength.Max < 15 then
+            lengthSlider:Set(Config.WordLength.Min, 100)
+            Centrl:Notify({
+                Title = "word game",
+                Content = ("Raised the length cap to 100 - it was %d, which would have capped 'longest' there.")
+                    :format(math.floor(Config.WordLength.Max)),
+                Type = "info",
+                Duration = 6,
+            })
+        end
+    end,
 })
 
-WordSection:RangeSlider({
+lengthSlider = WordSection:RangeSlider({
     Title = "word length",
     Flag = "wg_length",
     Min = 1, Max = 100, Increment = 1,
@@ -1405,7 +1439,7 @@ WordSection:Toggle({
 
 WordSection:Paragraph({
     Title = "how a word gets picked",
-    Text = "Words the server has already accepted outrank everything, then words from the common list, then the rest of the dictionary. 'shortest' is the fastest to type and the safest on a low clock; 'longest' exists because several pets pay out on words of ten letters or more; 'common' is the middle road and the default. Length here is a preference rather than a rule - if nothing inside the band starts with the prefix, a word outside it beats no word at all.",
+    Text = "On 'common', words the server has already accepted outrank everything, then words from the common list, then the rest of the dictionary, with length only a nudge toward typing less. It is the safest mode and the default.\n\n'longest' and 'shortest' are explicit instructions about length, so there length leads and the two tiers above only settle ties between words of equal length. Otherwise 'longest' would mean 'longest word that also happens to be common', and since common words are short it would answer a prefix of 'over' with 'overnight' while 'overintellectualizations' sat in the pool. 'longest' is there because several pets pay out on words of ten letters or more.\n\nThe length band still outranks the mode - it is a filter, not a preference - which is why picking 'longest' opens the cap if it was low enough to fight it. If nothing inside the band starts with the prefix at all, a word outside it beats no word.",
 })
 
 local RetrySection = MainTab:Section({ Title = "when a word is refused", Side = "left" })
