@@ -17,6 +17,9 @@
 --   <- client   updateRound(prompt, table, turnPlayer, time, _, strikes, notes)
 --   <- client   updateTyping(word)   whoever is typing, live, letter by letter
 --   <- client   correct(word, ...)   the answer the server just accepted
+--   <- client   strike(userId, kind) an answer was refused; the game hangs its
+--                                    Error sound off this, staying quiet only
+--                                    for kind 5
 --
 -- The word bank itself is server side - the ability that builds hints reaches
 -- for _G.import("bank"), which resolves nowhere on the client - so nothing here
@@ -74,6 +77,12 @@ local Config = {
     AvoidUsed = true,
     Learn = true,
 
+    BlacklistFails = true,
+    AutoChange = true,
+    RetryLimit = 3,
+    RetryAfter = 1.2,
+    ClearBeforeRetry = true,
+
     AutoTimeBoost = false,
     TimeBoostAt = 3,
     AutoSteal = false,
@@ -109,6 +118,9 @@ local Stats = {
     OpponentTyping = "",
     Candidates = 0,
     Suggestion = "-",
+    Blacklisted = 0,
+    LastRejected = "-",
+    Retries = 0,
 }
 
 --// Game bridge -------------------------------------------------------------------
@@ -175,6 +187,7 @@ local FOLDER = "CentrlWordGame"
 local BANK_FILE = FOLDER .. "/WordBank.txt"
 local COMMON_FILE = FOLDER .. "/WordCommon.txt"
 local LEARNED_FILE = FOLDER .. "/learned.json"
+local BLACKLIST_FILE = FOLDER .. "/blacklist.json"
 
 local HAS_FILES = typeof(readfile) == "function"
     and typeof(writefile) == "function"
@@ -184,7 +197,9 @@ local Dictionary = {}     -- sorted array, so a prefix is one binary search away
 local CommonSet = {}      -- [word] = true
 local Learned = {}        -- [promptKey] = { [word] = true }
 local LearnedAll = {}     -- [word] = true, every word the server ever accepted
+local Blacklist = {}      -- [word] = true, submitted and refused by the server
 local learnedDirty = false
+local blacklistDirty = false
 
 local function ensureFolder()
     if not HAS_FILES or typeof(isfolder) ~= "function" then return false end
@@ -254,6 +269,35 @@ local function saveLearned()
     end
 end
 
+local function saveBlacklist()
+    if not HAS_FILES or not blacklistDirty or not ensureFolder() then return end
+    local list = {}
+    for word in pairs(Blacklist) do
+        list[#list + 1] = word
+    end
+    local ok, encoded = pcall(HttpService.JSONEncode, HttpService, list)
+    if ok then
+        pcall(writefile, BLACKLIST_FILE, encoded)
+        blacklistDirty = false
+    end
+end
+
+local function loadBlacklist()
+    if not HAS_FILES or not isfile(BLACKLIST_FILE) then return end
+    local ok, decoded = pcall(function()
+        return HttpService:JSONDecode(readfile(BLACKLIST_FILE))
+    end)
+    if not ok or typeof(decoded) ~= "table" then return end
+    local total = 0
+    for _, word in ipairs(decoded) do
+        if not Blacklist[word] then
+            Blacklist[word] = true
+            total = total + 1
+        end
+    end
+    Stats.Blacklisted = total
+end
+
 local function loadLearned()
     if not HAS_FILES or not isfile(LEARNED_FILE) then return end
     local ok, decoded = pcall(function()
@@ -290,6 +334,7 @@ local function loadWords()
             Stats.Common = splitLines(common, CommonSet, true)
         end
         loadLearned()
+        loadBlacklist()
         Stats.Status = "ready"
     end)
 end
@@ -311,6 +356,12 @@ local function lowerBound(prefix)
 end
 
 local UsedThisMatch = {}
+
+-- Words already attempted on this turn. A word the server refused is off the
+-- table for the retry that follows it, whether or not it is being blacklisted
+-- permanently - otherwise the retry re-picks the same best-scoring word and
+-- burns the clock proving it wrong again.
+local TriedThisTurn = {}
 
 -- Scoring is tiered rather than blended, so a tier never loses to length: a
 -- word the server has already accepted beats any dictionary word, a common word
@@ -349,6 +400,8 @@ local function chooseWord(prefix)
         if seen[word] then return end
         seen[word] = true
         if #word <= plen then return end
+        if Blacklist[word] then return end
+        if TriedThisTurn[word] then return end
         if Config.AvoidUsed and UsedThisMatch[word] then return end
         pool = pool + 1
 
@@ -519,9 +572,85 @@ local function abortedSince(token)
     return Unloading or Round.token ~= token or not Config.AutoType
 end
 
-local function typeWord(word, token)
+-- What is in flight right now. `sent` is the number of letters this script has
+-- actually pushed past the locked prefix, which is what a retry has to undo.
+local Attempt = { word = nil, sent = 0, token = -1, at = 0, tries = 0, awaiting = false }
+
+local function clearAttempt()
+    Attempt.word, Attempt.sent, Attempt.awaiting = nil, 0, false
+end
+
+local function blacklistWord(word, reason)
+    if not word or word == "" then return end
+    TriedThisTurn[word] = true
+    Stats.LastRejected = word .. " (" .. reason .. ")"
+    if not Config.BlacklistFails then return end
+    if not Blacklist[word] then
+        Blacklist[word] = true
+        Stats.Blacklisted = Stats.Blacklisted + 1
+        blacklistDirty = true
+    end
+    -- A word the server refuses is not a word the server accepts, so it has no
+    -- business sitting in the learned bank claiming otherwise.
+    LearnedAll[word] = nil
+    for _, set in pairs(Learned) do
+        if set[word] then
+            set[word] = nil
+            Stats.Learned = math.max(0, Stats.Learned - 1)
+            learnedDirty = true
+        end
+    end
+end
+
+local typeWord
+
+-- Wipe the letters we typed, then try something else. The game's own input
+-- model keeps the rejected word on screen after a strike - AnswerInput clears
+-- itself on `correct` and on nothing else - so the server's buffer is still
+-- holding it too, and a human would be hitting backspace here. Exactly `sent`
+-- of them: the client refuses to send a backspace once the count is back down
+-- to the prefix, so it never over-deletes and the server has no reason to clamp.
+local function retryAfterRejection(token)
+    if abortedSince(token) or not Round.isTurn then return end
+    if not Config.AutoChange then return end
+    if Attempt.tries >= math.floor(Config.RetryLimit) then
+        Stats.Status = "out of retries"
+        return
+    end
+
+    local toClear = Attempt.sent
+    clearAttempt()
+    Attempt.tries = Attempt.tries + 1
+    Stats.Retries = Stats.Retries + 1
+
+    if Config.ClearBeforeRetry and toClear > 0 then
+        for _ = 1, toClear do
+            if abortedSince(token) then return end
+            sendChar(-1)
+            task.wait(withRandomizer(nextDelay(Config.LetterDelay, lastLetterDelay)))
+        end
+    end
+
+    if abortedSince(token) or not Round.isTurn then return end
+    local word, count = chooseWord(string.lower(Round.prefix))
+    Stats.Candidates = count
+    if not word then
+        Stats.Status = "nothing left for '" .. Round.prefix .. "'"
+        Stats.Missed = Stats.Missed + 1
+        return
+    end
+    Stats.Suggestion = word
+    Stats.Status = ("retry %d: %s"):format(Attempt.tries, word)
+    typeWord(word, token, true)
+end
+
+function typeWord(word, token, isRetry)
     typing = true
-    Stats.Status = "typing " .. word
+    Attempt.word = word
+    Attempt.sent = 0
+    Attempt.token = token
+    Attempt.awaiting = false
+    Stats.Status = (isRetry and "retyping " or "typing ") .. word
 
     local rest = string.sub(word, #Round.prefix + 1)
     if rest == "" then
@@ -529,14 +658,18 @@ local function typeWord(word, token)
         return
     end
 
-    local start = withRandomizer(nextDelay(Config.StartDelay, lastStartDelay))
-    lastStartDelay = start
-    Stats.LastDelay = start
-    task.wait(start)
-    if abortedSince(token) or not Round.isTurn then
-        typing = false
-        Stats.Status = "aborted"
-        return
+    -- A retry is already mid-turn with the clock running, so it skips straight
+    -- to typing rather than sitting through the opening pause again.
+    if not isRetry then
+        local start = withRandomizer(nextDelay(Config.StartDelay, lastStartDelay))
+        lastStartDelay = start
+        Stats.LastDelay = start
+        task.wait(start)
+        if abortedSince(token) or not Round.isTurn then
+            typing = false
+            Stats.Status = "aborted"
+            return
+        end
     end
 
     for index = 1, #rest do
@@ -546,6 +679,7 @@ local function typeWord(word, token)
             return
         end
         sendChar(string.upper(string.sub(rest, index, index)))
+        Attempt.sent = Attempt.sent + 1
         Stats.Typed = Stats.Typed + 1
         if index < #rest then
             local gap = withRandomizer(nextDelay(Config.LetterDelay, lastLetterDelay))
@@ -564,11 +698,28 @@ local function typeWord(word, token)
         typing = false
         return
     end
-    submitAnswer()
-    UsedThisMatch[word] = true
+
+    -- Marked pending before the submit, not after: remoteFire is an
+    -- InvokeServer and yields, so a fast `correct` can come back while we are
+    -- still inside it. Setting the flag afterwards would set it on an attempt
+    -- the server had already answered, and the watchdog would retry a word that
+    -- was accepted.
+    TriedThisTurn[word] = true
+    Attempt.at = os.clock()
+    Attempt.awaiting = true
     Stats.LastWord = word
     Stats.Status = "submitted " .. word
+    submitAnswer()
     typing = false
+end
+
+-- Called by the strike handler and by the silence watchdog below.
+local function onRejected(word, reason)
+    local token = Attempt.token
+    blacklistWord(word, reason)
+    task.spawn(function()
+        retryAfterRejection(token)
+    end)
 end
 
 local function solveRound()
@@ -594,7 +745,7 @@ local function solveRound()
 
     local token = Round.token
     task.spawn(function()
-        typeWord(word, token)
+        typeWord(word, token, false)
     end)
 end
 
@@ -622,6 +773,13 @@ busConnect("updateRound", function(prompt, _, turnPlayer, time, _, strikes)
     Stats.Turn = Round.isTurn and "you" or (turnPlayer and tostring(turnPlayer.Name) or "-")
     Stats.Round = Round.choices and "choice round" or ("prefix '" .. Round.prefix .. "'")
 
+    -- A new prompt means a new prefix, so last turn's rejections say nothing
+    -- about this one and the retry budget starts over. The permanent blacklist
+    -- is untouched; only the per-turn shortlist resets.
+    TriedThisTurn = {}
+    Attempt.tries = 0
+    clearAttempt()
+
     if Round.isTurn and not Config.PanicOnly then
         solveRound()
     end
@@ -631,6 +789,18 @@ busConnect("correct", function(word)
     if typeof(word) ~= "string" or word == "" then return end
     local clean = string.lower(string.gsub(word, "[^%a]", ""))
     if clean == "" then return end
+    -- Accepted, so the watchdog has nothing to chase. Scoped to our own word:
+    -- `correct` fires for whoever answered, and an opponent's answer says
+    -- nothing about an attempt of ours that might still be in flight.
+    if clean == Attempt.word then
+        clearAttempt()
+    end
+    -- Proven good, whoever played it, even if an earlier run blacklisted it.
+    if Blacklist[clean] then
+        Blacklist[clean] = nil
+        Stats.Blacklisted = math.max(0, Stats.Blacklisted - 1)
+        blacklistDirty = true
+    end
     UsedThisMatch[clean] = true
     Stats.LastWord = clean
     if Round.isTurn then
@@ -663,6 +833,28 @@ busConnect("takeDamage", function(userId)
     end
 end)
 
+-- The rejection signal. The game connects this to its own Error sound, and
+-- kind 5 is the one case it stays quiet for, so that is the one case treated as
+-- something other than a refused word. A strike can also arrive from an
+-- opponent's pet - Sting and Frenzy both hand out strikes - so it only counts
+-- as a rejection when it lands on us, shortly after our own submit, in the same
+-- round we submitted in.
+local REJECT_WINDOW = 3
+
+busConnect("strike", function(userId, kind)
+    if userId ~= LocalPlayer.UserId then return end
+    if kind == 5 then return end
+    if not Attempt.awaiting or not Attempt.word then return end
+    if Attempt.token ~= Round.token then return end
+    if os.clock() - Attempt.at > REJECT_WINDOW then return end
+
+    local word = Attempt.word
+    Attempt.awaiting = false
+    Stats.Missed = Stats.Missed + 1
+    Stats.Status = "refused: " .. word
+    onRejected(word, "strike")
+end)
+
 busConnect("endGame", function()
     Round.active = false
     Round.isTurn = false
@@ -671,7 +863,11 @@ busConnect("endGame", function()
     Stats.Round = "no round"
     Stats.Turn = "-"
     UsedThisMatch = {}
+    TriedThisTurn = {}
+    Attempt.tries = 0
+    clearAttempt()
     saveLearned()
+    saveBlacklist()
 end)
 
 --// Panic mode + auto time boost --------------------------------------------------
@@ -684,6 +880,25 @@ track(PostSimulation:Connect(function()
     if Round.isTurn and Config.PanicOnly and Config.AutoType and not typing then
         if left > 0 and left <= Config.PanicAt then
             solveRound()
+        end
+    end
+
+    -- Backstop for a refusal the server does not announce: we submitted, no
+    -- `correct` came back, the round never turned over and it is somehow still
+    -- our turn. That is only ever a rejection. It does not blacklist, because
+    -- silence is not proof the word was bad - a dropped packet looks identical -
+    -- so it retries and leaves the word for the strike handler to condemn.
+    if Attempt.awaiting and Round.isTurn and Config.AutoType and Config.AutoChange then
+        if Attempt.token == Round.token and os.clock() - Attempt.at > Config.RetryAfter then
+            local word = Attempt.word
+            Attempt.awaiting = false
+            Stats.Status = "no answer for " .. tostring(word)
+            TriedThisTurn[word] = true
+            Stats.LastRejected = tostring(word) .. " (no reply)"
+            local token = Attempt.token
+            task.spawn(function()
+                retryAfterRejection(token)
+            end)
         end
     end
 
@@ -921,6 +1136,7 @@ task.spawn(function()
     while not Unloading do
         task.wait(20)
         pcall(saveLearned)
+        pcall(saveBlacklist)
     end
 end)
 
@@ -1079,6 +1295,54 @@ WordSection:Paragraph({
     Text = "Words the server has already accepted outrank everything, then words from the common list, then the rest of the dictionary. 'shortest' is the fastest to type and the safest on a low clock; 'longest' exists because several pets pay out on words of ten letters or more; 'common' is the middle road and the default. Length here is a preference rather than a rule - if nothing inside the band starts with the prefix, a word outside it beats no word at all.",
 })
 
+local RetrySection = MainTab:Section({ Title = "when a word is refused", Side = "left" })
+
+RetrySection:Toggle({
+    Title = "try a different word",
+    Flag = "wg_autochange",
+    Default = true,
+    Callback = function(state) Config.AutoChange = state end,
+})
+
+RetrySection:Toggle({
+    Title = "blacklist words that fail",
+    Flag = "wg_blacklist",
+    Default = true,
+    Callback = function(state) Config.BlacklistFails = state end,
+})
+
+RetrySection:Toggle({
+    Title = "backspace before retrying",
+    Flag = "wg_clear_retry",
+    Default = true,
+    Callback = function(state) Config.ClearBeforeRetry = state end,
+})
+
+RetrySection:Slider({
+    Title = "retries per turn",
+    Flag = "wg_retry_limit",
+    Min = 1, Max = 8, Increment = 1, Default = 3,
+    Callback = function(value) Config.RetryLimit = value end,
+})
+
+RetrySection:Slider({
+    Title = "give up waiting after",
+    Flag = "wg_retry_after",
+    Min = 0.4, Max = 4, Increment = 0.1, Default = 1.2,
+    Suffix = "s",
+    Callback = function(value) Config.RetryAfter = value end,
+})
+
+RetrySection:Paragraph({
+    Title = "how a refusal is spotted",
+    Text = "The server announces one: it sends a strike, which is what makes the game play its error sound. That only counts as your word being refused when it lands on you, within three seconds of your own submit, in the round you submitted in - pets hand out strikes too, and being stung by someone else's Sting is not evidence against the word you just typed.\n\nA second check covers a refusal that arrives silently. If nothing came back, the round never turned over and it is somehow still your turn, the word did not land. That one only retries and never blacklists, because silence is not proof - a dropped packet looks exactly the same.",
+})
+
+RetrySection:Paragraph({
+    Title = "why it backspaces first",
+    Text = "The refused word is still sitting in the input. The game's own display clears itself when an answer is accepted and at no other point, so after a strike the letters stay on screen - which means the server is still holding them too, and a human would be reaching for backspace. Exactly as many are sent as this script typed, never more: the game refuses to send a backspace once the count is back down to the locked prefix, so the server was never given a reason to guard against over-deleting and neither is it given one here.\n\nIf a retry ever comes out as two words jammed together, the server does clear on its own and this should be off.",
+})
+
 local StatusSection = MainTab:Section({ Title = "status", Side = "right" })
 
 local busLabel = StatusSection:Label({ Title = "bus: --" })
@@ -1088,6 +1352,7 @@ local turnLabel = StatusSection:Label({ Title = "turn: --" })
 local suggestLabel = StatusSection:Label({ Title = "word: --" })
 local statusLabel = StatusSection:Label({ Title = "status: --" })
 local countLabel = StatusSection:Label({ Title = "answered 0 / missed 0" })
+local rejectLabel = StatusSection:Label({ Title = "refused: --" })
 
 --// Match tab ---------------------------------------------------------------------
 local MatchTab = Window:Tab({ Title = "match", Icon = "swords" })
@@ -1217,6 +1482,80 @@ BankSection:Button({
     end,
 })
 
+local BlacklistSection = BankTab:Section({ Title = "blacklist", Side = "left" })
+
+local blacklistLabel = BlacklistSection:Label({ Title = "blacklisted: --" })
+
+BlacklistSection:Textbox({
+    Title = "blacklist a word",
+    Flag = "wg_bl_add",
+    Placeholder = "word the server keeps refusing",
+    ClearOnFocus = true,
+    Callback = function(text)
+        local clean = string.lower(string.gsub(tostring(text or ""), "[^%a]", ""))
+        if clean == "" then return end
+        if not Blacklist[clean] then
+            Blacklist[clean] = true
+            Stats.Blacklisted = Stats.Blacklisted + 1
+            blacklistDirty = true
+        end
+        LearnedAll[clean] = nil
+        for _, set in pairs(Learned) do
+            if set[clean] then
+                set[clean] = nil
+                Stats.Learned = math.max(0, Stats.Learned - 1)
+                learnedDirty = true
+            end
+        end
+        saveBlacklist()
+        Centrl:Notify({
+            Title = "word game",
+            Content = "Blacklisted '" .. clean .. "'",
+            Type = "success",
+            Duration = 4,
+        })
+    end,
+})
+
+BlacklistSection:Textbox({
+    Title = "un-blacklist a word",
+    Flag = "wg_bl_remove",
+    Placeholder = "put a word back in play",
+    ClearOnFocus = true,
+    Callback = function(text)
+        local clean = string.lower(string.gsub(tostring(text or ""), "[^%a]", ""))
+        if clean == "" then return end
+        local had = Blacklist[clean] ~= nil
+        Blacklist[clean] = nil
+        if had then
+            Stats.Blacklisted = math.max(0, Stats.Blacklisted - 1)
+            blacklistDirty = true
+            saveBlacklist()
+        end
+        Centrl:Notify({
+            Title = "word game",
+            Content = had and ("Removed '" .. clean .. "'") or ("'" .. clean .. "' was not blacklisted"),
+            Type = had and "success" or "info",
+            Duration = 4,
+        })
+    end,
+})
+
+BlacklistSection:Button({
+    Title = "clear the blacklist",
+    Callback = function()
+        Blacklist = {}
+        Stats.Blacklisted = 0
+        blacklistDirty = true
+        saveBlacklist()
+    end,
+})
+
+BlacklistSection:Paragraph({
+    Title = "what ends up in here",
+    Text = "Words this script typed and the server refused. They are dropped from the candidate pool for good and stripped out of the learned bank at the same time, since a word the server refuses has no business sitting there claiming it was accepted.\n\nIt is not one-way: if a blacklisted word is ever accepted afterwards - by you or by anyone at the table - it comes straight back out. That matters because a refusal is not always about the word. Some rounds refuse a word only because it has already been used, and blacklisting it there would be throwing away a perfectly good answer over one bad round.\n\nThe list is saved to disk, so it carries between sessions and only ever gets sharper.",
+})
+
 local AddSection = BankTab:Section({ Title = "add a word", Side = "right" })
 
 AddSection:Textbox({
@@ -1330,6 +1669,7 @@ VisualSection:Button({
     Callback = function()
         Unloading = true
         saveLearned()
+        saveBlacklist()
         for _, connection in ipairs(Connections) do
             pcall(function() connection:Disconnect() end)
         end
@@ -1363,6 +1703,8 @@ task.spawn(function()
             suggestLabel:Set("word: " .. tostring(Stats.Suggestion))
             statusLabel:Set("status: " .. Stats.Status)
             countLabel:Set(("answered %d / missed %d / keys %d"):format(Stats.Answered, Stats.Missed, Stats.Typed))
+            rejectLabel:Set(("refused: %s   (%d retries, %d blacklisted)"):format(
+                tostring(Stats.LastRejected), Stats.Retries, Stats.Blacklisted))
 
             questionLabel:Set("question: " .. (Stats.Question ~= "" and Stats.Question or "--"))
             prefixLabel:Set("prefix: " .. (Stats.Prefix ~= "" and Stats.Prefix or "--"))
@@ -1373,6 +1715,7 @@ task.spawn(function()
             dictLabel:Set(("dictionary: %d   common: %d"):format(Stats.Dictionary, Stats.Common))
             learnLabel:Set(("learned: %d   last accepted: %s"):format(Stats.Learned, tostring(Stats.LastWord)))
             keyLabel:Set("prompt key: " .. tostring(Stats.PromptKey or "--"))
+            blacklistLabel:Set(("blacklisted: %d   last: %s"):format(Stats.Blacklisted, tostring(Stats.LastRejected)))
         end)
     end
 end)
