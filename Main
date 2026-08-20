@@ -11,7 +11,6 @@ local Games = {
     [2768379856] = { Name = '3008', Script = 'Games/3008.lua' },
     [119789365111500] = { Name = 'Tanks', Script = 'Games/Tanks.lua' },
     [7871169780] = { Name = 'Minesweeper', Script = 'Games/Minesweeper.lua' },
-    [91704854174760] = { Name = 'Word Game', Script = 'Games/WordGame.lua' },
     -- 3008's testing place, from a PlaceId check in the game's own source.
     -- Kept alongside the public place so the hub works on both.
     [2788336572] = { Name = '3008 (test place)', Script = 'Games/3008.lua' },
