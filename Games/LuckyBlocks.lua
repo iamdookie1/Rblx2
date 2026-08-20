@@ -76,6 +76,8 @@ local Config = {
     SweepDelay = 1,
     ReadyCheck = true,
     SpawnLoop = false,
+    SpawnRate = 50,
+    SpawnKinds = { Lucky = true, Super = true, Diamond = true, Rainbow = true, Galaxy = true },
     Minutes = 1000,
     TpBase = "Spawn1",
 
@@ -102,6 +104,7 @@ local Stats = {
     Touch = "checking",
     MyBase = "-",
     Held = "-",
+    Fired = 0,
 }
 
 -- Drawn fresh for every pad rather than once when the slider moves, which is
@@ -309,16 +312,77 @@ local SPAWN_REMOTES = {
     Galaxy = "SpawnGalaxyBlock",
 }
 
+local SPAWN_ORDER = { "Lucky", "Super", "Diamond", "Rainbow", "Galaxy" }
+
+-- Looked up once and kept. At fifty calls a second a FindFirstChild per fire is
+-- fifty pointless tree walks a second, and the remotes never move.
+local spawnRemoteCache = {}
+
+local function spawnRemote(kind)
+    local cached = spawnRemoteCache[kind]
+    if cached and cached.Parent then return cached end
+    local name = SPAWN_REMOTES[kind]
+    if not name then return nil end
+    local remote = ReplicatedStorage:FindFirstChild(name)
+    spawnRemoteCache[kind] = remote
+    return remote
+end
+
 local function fireSpawn(kind)
     local name = SPAWN_REMOTES[kind]
     if not name then return false, "no remote for " .. tostring(kind) end
-    local remote = ReplicatedStorage:FindFirstChild(name)
+    local remote = spawnRemote(kind)
     if not remote then return false, name .. " missing" end
     local ok, err = pcall(function()
         remote:FireServer()
     end)
+    if ok then Stats.Fired = Stats.Fired + 1 end
     return ok, ok and "fired" or tostring(err)
 end
+
+-- Rate driven off the frame delta rather than a task.wait per call, because
+-- task.wait cannot go below a frame: a wait of 0.02 still costs a whole one, so
+-- the old loop's ceiling was the refresh rate no matter what number went in.
+-- Carrying the fractional remainder between frames keeps the rate honest at any
+-- framerate, and firing several in one frame is what gets past sixty a second.
+--
+-- The per-frame cap is the important half. After a hitch the accumulator is
+-- holding a second's worth of calls, and dumping four hundred remotes into one
+-- frame is how a client freezes itself or trips a rate limit.
+local SPAWN_BURST_CAP = 25
+local spawnCarry, spawnCursor = 0, 0
+
+track(PostSimulation:Connect(function(delta)
+    if Unloading or not Config.SpawnLoop then
+        spawnCarry = 0
+        return
+    end
+
+    local kinds = {}
+    for _, kind in ipairs(SPAWN_ORDER) do
+        if Config.SpawnKinds[kind] then kinds[#kinds + 1] = kind end
+    end
+    if #kinds == 0 then
+        spawnCarry = 0
+        return
+    end
+
+    spawnCarry = spawnCarry + (delta or 0) * Config.SpawnRate
+    local count = math.floor(spawnCarry)
+    if count <= 0 then return end
+    spawnCarry = spawnCarry - count
+    if count > SPAWN_BURST_CAP then
+        count = SPAWN_BURST_CAP
+        spawnCarry = 0
+    end
+
+    -- Round robin rather than a block of one kind then a block of the next, so
+    -- every selected type gets an even share of the rate even at low counts.
+    for _ = 1, count do
+        spawnCursor = spawnCursor % #kinds + 1
+        fireSpawn(kinds[spawnCursor])
+    end
+end))
 
 --// AFK --------------------------------------------------------------------------
 -- Two layers, because the timer lives in a ReplicatedFirst upvalue we would
@@ -700,6 +764,7 @@ local giverLabel = StatusSection:Label({ Title = "givers: --" })
 local heldLabel = StatusSection:Label({ Title = "holding: --" })
 local collectLabel = StatusSection:Label({ Title = "collected 0" })
 local touchLabel = StatusSection:Label({ Title = "method: --" })
+local firedLabel = StatusSection:Label({ Title = "spawn fired: 0" })
 local statusLabel = StatusSection:Label({ Title = "status: --" })
 
 --// Remotes tab ------------------------------------------------------------------
@@ -731,20 +796,35 @@ SpawnSection:Toggle({
     Title = "keep firing them",
     Flag = "lb_spawn_loop",
     Default = false,
-    Callback = function(state)
-        Config.SpawnLoop = state
-        if not state then return end
-        task.spawn(function()
-            while Config.SpawnLoop and not Unloading do
-                for _, kind in ipairs({ "Lucky", "Super", "Diamond", "Rainbow", "Galaxy" }) do
-                    if not Config.SpawnLoop or Unloading then break end
-                    fireSpawn(kind)
-                    task.wait(0.2)
-                end
-                task.wait(1)
-            end
-        end)
+    Callback = function(state) Config.SpawnLoop = state end,
+})
+
+SpawnSection:Slider({
+    Title = "fire rate",
+    Flag = "lb_spawn_rate",
+    Min = 1, Max = 200, Increment = 1, Default = 50,
+    Suffix = "/s",
+    Callback = function(value) Config.SpawnRate = value end,
+})
+
+SpawnSection:Dropdown({
+    Title = "which to fire",
+    Flag = "lb_spawn_kinds",
+    Options = { "Lucky", "Super", "Diamond", "Rainbow", "Galaxy" },
+    Multi = true,
+    Default = { "Lucky", "Super", "Diamond", "Rainbow", "Galaxy" },
+    Callback = function(value)
+        local picked = {}
+        for _, kind in ipairs(typeof(value) == "table" and value or { value }) do
+            picked[kind] = true
+        end
+        Config.SpawnKinds = picked
     end,
+})
+
+SpawnSection:Paragraph({
+    Title = "the rate is a real rate",
+    Text = "Fifty a second means fifty, not fifty attempts. Driving this off task.wait cannot get there - a wait of 0.02 still costs a whole frame, so the old loop was capped at the refresh rate however small the number went. This one takes the frame delta, works out how many calls that slice of a second is owed and fires them all, carrying the fraction over so the rate holds at any framerate.\n\nA cap of twenty-five per frame sits on top. After a hitch the accumulator is holding a second's worth of calls, and dumping several hundred remotes into one frame is how a client freezes itself.\n\nPick only the block you actually want. Firing all five splits the rate five ways, so fifty a second across the lot is ten a second of the one that matters.",
 })
 
 local MinuteSection = RemoteTab:Section({ Title = "minutes", Side = "right" })
@@ -944,6 +1024,8 @@ task.spawn(function()
             heldLabel:Set("holding: " .. tostring(Stats.Held))
             collectLabel:Set(("collected %d   last: %s"):format(Stats.Collected, tostring(Stats.LastCollected)))
             touchLabel:Set("method: " .. Stats.Touch)
+            firedLabel:Set(("spawn fired: %d%s"):format(
+                Stats.Fired, Config.SpawnLoop and ("  (" .. math.floor(Config.SpawnRate) .. "/s)") or ""))
             statusLabel:Set("status: " .. Stats.Status)
         end)
     end
