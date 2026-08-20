@@ -82,7 +82,7 @@ local Config = {
     PanicAt = 4,
 
     Pick = "common",
-    WordLength = { Min = 4, Max = 9 },
+    WordLength = { Min = 4, Max = 100 },
     AvoidUsed = true,
     Learn = true,
 
@@ -1393,38 +1393,34 @@ RandomSection:Slider({
 
 local WordSection = MainTab:Section({ Title = "word choice", Side = "left" })
 
-local lengthSlider
-
 WordSection:Dropdown({
     Title = "prefer",
     Flag = "wg_pick",
     Options = { "common", "shortest", "longest", "random" },
     Default = "common",
-    Callback = function(value)
-        Config.Pick = value
-        -- The length band silently outranks the mode, so asking for the longest
-        -- word while the band still sits at its default cap of 9 gets you the
-        -- longest word under ten letters and no hint as to why. Open the band
-        -- rather than let the two controls quietly contradict each other - and
-        -- open it by driving the slider, so what it reads is what is in force.
-        if value == "longest" and lengthSlider and Config.WordLength.Max < 15 then
-            lengthSlider:Set(Config.WordLength.Min, 100)
-            Centrl:Notify({
-                Title = "word game",
-                Content = ("Raised the length cap to 100 - it was %d, which would have capped 'longest' there.")
-                    :format(math.floor(Config.WordLength.Max)),
-                Type = "info",
-                Duration = 6,
-            })
-        end
-    end,
+    Callback = function(value) Config.Pick = value end,
 })
 
-lengthSlider = WordSection:RangeSlider({
+-- Wide by default, and deliberately so. The band is a hard filter that outranks
+-- the mode, so a narrow default quietly caps 'longest' - which is exactly what
+-- the old default of 4-9 did, answering with the longest word under ten letters
+-- and giving no sign why. The previous attempt at this had the dropdown open the
+-- band on demand, which failed in the one case that mattered: a saved config
+-- restoring 'longest' at load fires the dropdown's callback before the slider it
+-- reaches for has been created, so the cap stayed at 9 and stayed silent.
+--
+-- Nothing needs the narrow default anyway. 'common' already prefers short words
+-- through its own scoring, so lifting the cap costs it nothing, and the floor
+-- stays at 4 so nothing else about it moves.
+-- New flag name on purpose. The old one has 4-9 saved against it in every
+-- config written so far, and that value is precisely the one that caps
+-- 'longest' - restoring it would put the bug straight back for anyone who has
+-- used the script before. One slider position is worth losing to avoid that.
+WordSection:RangeSlider({
     Title = "word length",
-    Flag = "wg_length",
+    Flag = "wg_word_length",
     Min = 1, Max = 100, Increment = 1,
-    Default = { 4, 9 },
+    Default = { 4, 100 },
     Callback = function(low, high)
         Config.WordLength = { Min = low, Max = high }
     end,
@@ -1439,7 +1435,7 @@ WordSection:Toggle({
 
 WordSection:Paragraph({
     Title = "how a word gets picked",
-    Text = "On 'common', words the server has already accepted outrank everything, then words from the common list, then the rest of the dictionary, with length only a nudge toward typing less. It is the safest mode and the default.\n\n'longest' and 'shortest' are explicit instructions about length, so there length leads and the two tiers above only settle ties between words of equal length. Otherwise 'longest' would mean 'longest word that also happens to be common', and since common words are short it would answer a prefix of 'over' with 'overnight' while 'overintellectualizations' sat in the pool. 'longest' is there because several pets pay out on words of ten letters or more.\n\nThe length band still outranks the mode - it is a filter, not a preference - which is why picking 'longest' opens the cap if it was low enough to fight it. If nothing inside the band starts with the prefix at all, a word outside it beats no word.",
+    Text = "On 'common', words the server has already accepted outrank everything, then words from the common list, then the rest of the dictionary, with length only a nudge toward typing less. It is the safest mode and the default.\n\n'longest' and 'shortest' are explicit instructions about length, so there length leads and the two tiers above only settle ties between words of equal length. Otherwise 'longest' would mean 'longest word that also happens to be common', and since common words are short it would answer a prefix of 'over' with 'overnight' while 'overintellectualizations' sat in the pool. 'longest' is there because several pets pay out on words of ten letters or more.\n\nThe length band is a hard filter and it outranks the mode, so narrowing it caps whatever the mode would otherwise reach for - it starts wide for exactly that reason. If nothing inside the band starts with the prefix at all, a word outside it beats no word.",
 })
 
 local RetrySection = MainTab:Section({ Title = "when a word is refused", Side = "left" })
@@ -1519,6 +1515,7 @@ local bankLabel = StatusSection:Label({ Title = "bank: --" })
 local roundLabel = StatusSection:Label({ Title = "round: --" })
 local turnLabel = StatusSection:Label({ Title = "turn: --" })
 local suggestLabel = StatusSection:Label({ Title = "word: --" })
+local modeLabel = StatusSection:Label({ Title = "mode: --" })
 local statusLabel = StatusSection:Label({ Title = "status: --" })
 local countLabel = StatusSection:Label({ Title = "answered 0 / missed 0" })
 local rejectLabel = StatusSection:Label({ Title = "refused: --" })
@@ -1870,6 +1867,15 @@ task.spawn(function()
             roundLabel:Set("round: " .. Stats.Round)
             turnLabel:Set(("turn: %s   (%d candidates)"):format(Stats.Turn, Stats.Candidates))
             suggestLabel:Set("word: " .. tostring(Stats.Suggestion))
+            -- Mode and band together, because they interact: the band is the
+            -- filter that decides what the mode is allowed to reach for, and
+            -- reading one without the other is how a capped 'longest' looks
+            -- like a broken 'longest'.
+            modeLabel:Set(("mode: %s   length %d-%d%s"):format(
+                tostring(Config.Pick),
+                math.floor(Config.WordLength.Min),
+                math.floor(Config.WordLength.Max),
+                (Config.Pick == "longest" and Config.WordLength.Max < 15) and "  <- capping longest" or ""))
             statusLabel:Set("status: " .. Stats.Status)
             countLabel:Set(("answered %d / missed %d / keys %d"):format(Stats.Answered, Stats.Missed, Stats.Typed))
             rejectLabel:Set(("refused: %s   (%d retries, %d blacklisted)"):format(
