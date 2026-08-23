@@ -12,6 +12,9 @@ local Games = {
     [119789365111500] = { Name = 'Tanks', Script = 'Games/Tanks.lua' },
     [7871169780] = { Name = 'Minesweeper', Script = 'Games/Minesweeper.lua' },
     [662417684] = { Name = 'Lucky Blocks', Script = 'Games/LuckyBlocks.lua' },
+    -- Doodle Drop's level creator, from UGC_PLACE_ID in the game's own Config.
+    -- The main place id is not in the dump, so only this one is mapped so far.
+    [107331150688830] = { Name = 'Doodle Drop (create)', Script = 'Games/DoodleDrop.lua' },
     -- Lucky Blocks boots you here after 19 idle minutes, from the place id in
     -- its own afk_connection script. The hub loads on both so a session that
     -- gets sent over keeps its menu.
