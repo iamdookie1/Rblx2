@@ -79,13 +79,15 @@ local Config = {
 
     Points = 7,
     Sigma = 6,
-    Budget = 6,          -- ms of simulation per frame
+    Budget = 12,         -- ms of simulation per frame
     Anneal = 0.93,
 
     ShowPath = true,
     ShowTrack = true,
+    ShowBarriers = true,
     TrackColor = Color3.fromRGB(120, 220, 130),
     PathColor = Color3.fromRGB(120, 200, 255),
+    BarrierColor = Color3.fromRGB(255, 110, 110),
 }
 
 local Stats = {
@@ -98,6 +100,7 @@ local Stats = {
     Reached = false,
     Attempts = 0,
     Stage = "-",
+    Barriers = 0,
 }
 
 --// Level model -------------------------------------------------------------------
@@ -135,23 +138,59 @@ local function noDrawSpec(level)
     }
 end
 
+--// Level geometry ---------------------------------------------------------------
+-- Every straight line the marble can hit that is not the drawn track: the
+-- level's own barriers. simSegs appends these to the track segments, so the
+-- simulation already accounts for them - but the search has to know where they
+-- are to have any chance of routing around one deliberately rather than by luck.
+local function barrierBoxes(level)
+    local out = {}
+    for _, b in ipairs(level.barriers or {}) do
+        out[#out + 1] = {
+            minX = math.min(b[1], b[3]), maxX = math.max(b[1], b[3]),
+            minY = math.min(b[2], b[4]), maxY = math.max(b[2], b[4]),
+        }
+    end
+    return out
+end
+
+-- Only the barriers standing between the drop and the goal matter. One off to
+-- the side of the route is not an obstacle, and seeding around it would send
+-- the search somewhere pointless.
+local function blockingBoxes(level)
+    local goalBox = level.goalBox
+    local lo = math.min(level.start.X, goalBox.minX)
+    local hi = math.max(level.start.X, goalBox.maxX)
+    local out = {}
+    for _, box in ipairs(barrierBoxes(level)) do
+        if box.maxX >= lo and box.minX <= hi then
+            out[#out + 1] = box
+        end
+    end
+    return out
+end
+
 --// Candidate tracks --------------------------------------------------------------
--- A candidate is a column of heights. The x positions are fixed, spread from
--- just clear of the drop to the middle of the goal box, and only the y values
--- are searched - which turns a free-form drawing into a handful of numbers and
--- is what makes a few thousand attempts a minute possible at all.
+-- A candidate is a column of heights at fixed x positions, so a free-form
+-- drawing collapses to a handful of numbers.
+--
+-- The first point sits slightly *behind* the drop rather than ahead of it, and
+-- that detail is the whole thing working or not. Gravity is straight down, so a
+-- marble released at startX falls at startX: a track whose first point is off to
+-- one side is a track the marble sails straight past, and every candidate then
+-- scores on where a free-falling marble happened to land rather than on the
+-- shape at all. Setting back means the marble lands in the middle of the first
+-- segment instead of on its tip, which is also steadier than an endpoint hit.
+local BACKSET = 3
+
 local function xColumn(level, n)
     local startX = level.start.X
     local goalBox = level.goalBox
     local goalX = (goalBox.minX + goalBox.maxX) * 0.5
     local bounds = Game.Config.drawBounds
-
-    -- The first control point clears the no-draw circle around the drop, or the
-    -- whole track is rejected before it is ever simulated.
-    local clearance = Game.Config.noDrawRadius + Game.Config.marble.radius + 0.6
     local dir = goalX >= startX and 1 or -1
-    local firstX = startX + dir * clearance
 
+    local firstX = math.clamp(startX - dir * BACKSET, bounds.minX, bounds.maxX)
     local xs = {}
     for i = 1, n do
         local a = (i - 1) / (n - 1)
@@ -163,6 +202,18 @@ end
 local function clampY(y)
     local bounds = Game.Config.drawBounds
     return math.clamp(y, bounds.minY, bounds.maxY)
+end
+
+-- noDrawViolation counts points inside a box of half-width noDrawRadius around
+-- the drop and only trips at three, so one point under the marble is fine - but
+-- it has to be far enough down that the marble is clear of it when it starts
+-- falling, or the drop begins already touching the track.
+local function headroom(level)
+    return Game.Config.noDrawRadius + Game.Config.marble.radius + 0.8
+end
+
+local function ceilingY(level)
+    return level.start.Y - headroom(level)
 end
 
 local function buildStrokes(xs, ys)
@@ -218,95 +269,127 @@ local function score(level, xs, ys)
 end
 
 --// Seeds -------------------------------------------------------------------------
--- Sensible starting shapes rather than pure noise. A steep drop that flattens
--- late is the fast answer to most of these - height first buys speed, and the
--- flat run spends it - so the search is handed that idea instead of having to
--- rediscover it from a straight line every restart.
+-- Sensible starting shapes rather than noise. A steep drop that flattens late is
+-- the fast answer to most of these - height first buys speed, the flat run
+-- spends it - so the search is handed that idea instead of rediscovering it from
+-- a straight line every restart.
+--
+-- The last group is generated from the level's own barriers: for each one
+-- standing between the drop and the goal, a shape that passes over its top and
+-- one that passes under its bottom. A level with something in the way has a best
+-- answer no amount of nudging a straight line ever reaches, and this is what
+-- makes finding it a first guess rather than a lucky accident.
 local function seedShapes(level, xs)
     local n = #xs
-    local y0 = level.start.Y - 2
+    local top = ceilingY(level)
+    local y0 = math.min(level.start.Y - 2, top)
     local goalBox = level.goalBox
     local y1 = (goalBox.minY + goalBox.maxY) * 0.5
 
     local shapes = {}
-
-    local straight = {}
-    for i = 1, n do
-        straight[i] = clampY(y0 + (y1 - y0) * ((i - 1) / (n - 1)))
+    local function add(fn)
+        local shape = {}
+        for i = 1, n do
+            shape[i] = clampY(fn((i - 1) / (n - 1), i))
+        end
+        shape[1] = math.min(shape[1], top)
+        shapes[#shapes + 1] = shape
     end
-    shapes[#shapes + 1] = straight
 
-    -- Drop hard, then run flat.
-    local steep = {}
-    for i = 1, n do
-        local a = (i - 1) / (n - 1)
-        steep[i] = clampY(y0 + (y1 - y0) * (a ^ 0.45))
-    end
-    shapes[#shapes + 1] = steep
+    add(function(a) return y0 + (y1 - y0) * a end)              -- straight
+    add(function(a) return y0 + (y1 - y0) * (a ^ 0.45) end)     -- steep, then flat
+    add(function(a) return y0 + (y1 - y0) * (a ^ 2.0) end)      -- gentle, then steep
+    add(function(a) return y0 + (y1 - y0) * a - math.sin(a * math.pi) * 8 end)
 
-    -- Ease out gently, for levels where speed into the box overshoots it.
-    local shallow = {}
-    for i = 1, n do
-        local a = (i - 1) / (n - 1)
-        shallow[i] = clampY(y0 + (y1 - y0) * (a ^ 2.0))
+    for _, box in ipairs(blockingBoxes(level)) do
+        local clearance = Game.Config.marble.radius * 2 + 1.5
+        -- Over the top: hold high until past the obstacle, then drop away.
+        add(function(_, i)
+            local x = xs[i]
+            if x >= box.minX - 4 and x <= box.maxX + 4 then
+                return box.maxY + clearance
+            end
+            local a = (i - 1) / (n - 1)
+            return math.max(y0 + (y1 - y0) * a, box.maxY + clearance - 14 * a)
+        end)
+        -- Under the bottom, for a barrier hanging from above.
+        add(function(_, i)
+            local x = xs[i]
+            if x >= box.minX - 4 and x <= box.maxX + 4 then
+                return box.minY - clearance
+            end
+            local a = (i - 1) / (n - 1)
+            return y0 + (y1 - y0) * a
+        end)
     end
-    shapes[#shapes + 1] = shallow
-
-    -- A dip below the goal line and back up, which beats everything on levels
-    -- where a barrier sits across the direct route.
-    local dip = {}
-    for i = 1, n do
-        local a = (i - 1) / (n - 1)
-        dip[i] = clampY(y0 + (y1 - y0) * a - math.sin(a * math.pi) * 8)
-    end
-    shapes[#shapes + 1] = dip
 
     return shapes
 end
 
 --// Search ------------------------------------------------------------------------
--- A restarted hill climb. Each pass perturbs every height by a shrinking
--- gaussian and keeps the result only if it is quicker, so it walks downhill
--- from wherever the seed put it; when the step size collapses the run is spent
--- and the next seed starts fresh somewhere else. Restarts are what stop a level
--- with a barrier in the way from settling into the best of the wrong shapes.
+-- Two moves, alternating. A sweep walks the control points one at a time and
+-- tries a few heights for each, keeping any that arrives quicker; a jitter
+-- nudges every point at once. The sweep is what actually converges - it changes
+-- one number and sees the result, so every sim is informative - while the jitter
+-- exists to escape the places a one-at-a-time search cannot leave, where two
+-- points have to move together to improve at all.
+--
+-- Both shrink their step as they stop finding anything, and when the step
+-- collapses the seed is spent and the next shape starts fresh.
 local Search = {
     running = false,
     level = nil,
     xs = nil,
     seeds = nil,
     seedIndex = 0,
+    mode = "seed",
     current = nil,
     currentScore = math.huge,
-    sigma = 0,
+    step = 0,
+    pointIndex = 1,
+    offsetIndex = 1,
+    sweepImproved = false,
+    jitterLeft = 0,
     best = nil,
     bestScore = math.huge,
     bestResult = nil,
-    sinceImprove = 0,
 }
+
+local SWEEP_OFFSETS = { 1, -1, 0.35, -0.35, 2.5, -2.5 }
+
+local function copyList(list)
+    local out = table.create(#list)
+    for i = 1, #list do out[i] = list[i] end
+    return out
+end
 
 local function resetSearch(level)
     Search.level = level
     Search.xs = xColumn(level, math.floor(Config.Points))
     Search.seeds = seedShapes(level, Search.xs)
     Search.seedIndex = 0
+    Search.mode = "seed"
     Search.current = nil
     Search.currentScore = math.huge
     Search.best = nil
     Search.bestScore = math.huge
     Search.bestResult = nil
-    Search.sinceImprove = 0
     Stats.Sims = 0
     Stats.Attempts = 0
     Stats.Best = "none"
     Stats.BestTicks = math.huge
     Stats.Reached = false
+    Stats.Barriers = #blockingBoxes(level)
 end
 
-local function copyList(list)
-    local out = table.create(#list)
-    for i = 1, #list do out[i] = list[i] end
-    return out
+local function noteBest(s, ys, result)
+    if s >= Search.bestScore then return end
+    Search.bestScore = s
+    Search.best = copyList(ys)
+    Search.bestResult = result
+    Stats.Reached = s < FAIL_BASE
+    Stats.BestTicks = s < FAIL_BASE and s or math.huge
+    Stats.Best = s < FAIL_BASE and ("%.4fs"):format(s / 10000) or "no route yet"
 end
 
 local function beginSeed()
@@ -317,8 +400,8 @@ local function beginSeed()
         seed = copyList(seeds[Search.seedIndex])
         Stats.Stage = ("seed %d of %d"):format(Search.seedIndex, #seeds)
     else
-        -- Out of shapes, so restart from the best found so far with a wide
-        -- kick. Random noise from scratch almost never clears a barrier.
+        -- Out of shapes: restart from the best found so far with a wide kick.
+        -- Noise from scratch almost never clears an obstacle.
         local base = Search.best or seeds[1]
         seed = copyList(base)
         for i = 1, #seed do
@@ -326,59 +409,97 @@ local function beginSeed()
         end
         Stats.Stage = ("restart %d"):format(Search.seedIndex - #seeds)
     end
+    seed[1] = math.min(seed[1], ceilingY(Search.level))
     Search.current = seed
     Search.currentScore = math.huge
-    Search.sigma = Config.Sigma
-    Search.sinceImprove = 0
+    Search.step = Config.Sigma
+    Search.mode = "seed"
+    Search.pointIndex = 1
+    Search.offsetIndex = 1
+    Search.sweepImproved = false
 end
 
 local function step()
     if not Search.current then
         beginSeed()
     end
-
     local xs, level = Search.xs, Search.level
 
-    if Search.currentScore == math.huge then
+    if Search.mode == "seed" then
         local s, result = score(level, xs, Search.current)
-        Search.currentScore = s
         Stats.Attempts = Stats.Attempts + 1
-        if s < Search.bestScore then
-            Search.bestScore = s
-            Search.best = copyList(Search.current)
-            Search.bestResult = result
+        Search.currentScore = s
+        noteBest(s, Search.current, result)
+        Search.mode = "sweep"
+        Search.pointIndex = 1
+        Search.offsetIndex = 1
+        Search.sweepImproved = false
+        return
+    end
+
+    if Search.mode == "sweep" then
+        local trial = copyList(Search.current)
+        local i = Search.pointIndex
+        local delta = SWEEP_OFFSETS[Search.offsetIndex] * Search.step
+        trial[i] = clampY(trial[i] + delta)
+        if i == 1 then
+            trial[1] = math.min(trial[1], ceilingY(level))
+        end
+
+        local s, result = score(level, xs, trial)
+        Stats.Attempts = Stats.Attempts + 1
+        if s < Search.currentScore then
+            Search.current = trial
+            Search.currentScore = s
+            Search.sweepImproved = true
+            noteBest(s, trial, result)
+        end
+
+        Search.offsetIndex = Search.offsetIndex + 1
+        if Search.offsetIndex > #SWEEP_OFFSETS then
+            Search.offsetIndex = 1
+            Search.pointIndex = Search.pointIndex + 1
+            if Search.pointIndex > #xs then
+                -- A pass that improved nothing means the step is too coarse;
+                -- shrink it and try again, or hand over to the jitter.
+                if Search.sweepImproved then
+                    Search.pointIndex = 1
+                    Search.sweepImproved = false
+                else
+                    Search.step = Search.step * 0.55
+                    if Search.step < 0.08 then
+                        Search.current = nil
+                    else
+                        Search.mode = "jitter"
+                        Search.jitterLeft = 12
+                    end
+                end
+            end
         end
         return
     end
 
+    -- jitter
     local trial = copyList(Search.current)
     for i = 1, #trial do
-        trial[i] = clampY(trial[i] + (math.random() - 0.5) * 2 * Search.sigma)
+        trial[i] = clampY(trial[i] + (math.random() - 0.5) * 2 * Search.step)
     end
+    trial[1] = math.min(trial[1], ceilingY(level))
 
     local s, result = score(level, xs, trial)
     Stats.Attempts = Stats.Attempts + 1
-
     if s < Search.currentScore then
         Search.current = trial
         Search.currentScore = s
-        Search.sinceImprove = 0
-        if s < Search.bestScore then
-            Search.bestScore = s
-            Search.best = copyList(trial)
-            Search.bestResult = result
-            Stats.Reached = s < FAIL_BASE
-            Stats.BestTicks = s < FAIL_BASE and s or math.huge
-            Stats.Best = s < FAIL_BASE and ("%.4fs"):format(s / 10000) or "no route yet"
-        end
-    else
-        Search.sinceImprove = Search.sinceImprove + 1
-        Search.sigma = Search.sigma * Config.Anneal
-        -- Spent: the steps are too small to find anything and nothing has moved
-        -- in a while. Take the next seed rather than grinding.
-        if Search.sigma < 0.05 or Search.sinceImprove > 60 then
-            Search.current = nil
-        end
+        noteBest(s, trial, result)
+    end
+
+    Search.jitterLeft = Search.jitterLeft - 1
+    if Search.jitterLeft <= 0 then
+        Search.mode = "sweep"
+        Search.pointIndex = 1
+        Search.offsetIndex = 1
+        Search.sweepImproved = false
     end
 end
 
@@ -433,6 +554,20 @@ end
 
 local function drawBest()
     clearVisual()
+
+    -- The level's own barriers, drawn whether or not anything is solved yet.
+    -- If the search says a level has nothing in the way and the map plainly
+    -- does, this is where that shows up.
+    if Config.ShowBarriers and Search.level then
+        for _, b in ipairs(Search.level.barriers or {}) do
+            drawLine(
+                Vector3.new(b[1], b[2], 0),
+                Vector3.new(b[3], b[4], 0),
+                Config.BarrierColor, 0.4
+            )
+        end
+    end
+
     if not Search.best or not Search.xs then return end
     local xs, ys = Search.xs, Search.best
 
@@ -614,9 +749,14 @@ TuneSection:Slider({
 TuneSection:Slider({
     Title = "simulation per frame",
     Flag = "dd_budget",
-    Min = 1, Max = 12, Increment = 0.5, Default = 6,
+    Min = 1, Max = 120, Increment = 1, Default = 12,
     Suffix = "ms",
     Callback = function(value) Config.Budget = value end,
+})
+
+TuneSection:Paragraph({
+    Title = "how far to push that",
+    Text = "This is how much of each frame the search is allowed to eat. A frame at 60fps is 16.7ms, so anything up to about 10 leaves the game running normally and anything past 30 will visibly stutter - the slider goes to 120 because a stuttering menu is a fine trade when you are staring at it waiting for an answer anyway. Turn it down before going back to playing.\n\nIt does not change what the search finds, only how quickly it gets there."
 })
 
 TuneSection:Paragraph({
@@ -641,6 +781,7 @@ local levelLabel = StatusSection:Label({ Title = "level: --" })
 local bestLabel = StatusSection:Label({ Title = "best: --" })
 local simLabel = StatusSection:Label({ Title = "sims: 0" })
 local stageLabel = StatusSection:Label({ Title = "stage: --" })
+local blockLabel = StatusSection:Label({ Title = "in the way: --" })
 
 StatusSection:Paragraph({
     Title = "the time is reported by the client",
@@ -661,6 +802,13 @@ VisualSection:Toggle({
     Flag = "dd_show_path",
     Default = true,
     Callback = function(state) Config.ShowPath = state drawBest() end,
+})
+
+VisualSection:Toggle({
+    Title = "show what's in the way",
+    Flag = "dd_show_barriers",
+    Default = true,
+    Callback = function(state) Config.ShowBarriers = state drawBest() end,
 })
 
 VisualSection:Colorpicker({
@@ -704,6 +852,8 @@ task.spawn(function()
             bestLabel:Set(("best: %s%s"):format(Stats.Best, Stats.Reached and "" or "  (not arriving yet)"))
             simLabel:Set(("sims: %d   %.0f/s   tried %d"):format(Stats.Sims, Stats.Rate, Stats.Attempts))
             stageLabel:Set("stage: " .. Stats.Stage)
+            blockLabel:Set(("in the way: %d barrier%s")
+                :format(Stats.Barriers, Stats.Barriers == 1 and "" or "s"))
         end)
         -- Redrawn on a timer rather than on every improvement: early on the best
         -- changes several times a second and rebuilding the parts that often
