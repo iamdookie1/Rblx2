@@ -26,6 +26,87 @@ local DashConfig = {
     Cooldown = 0.5,
 }
 
+-- Dash manipulation.
+--
+-- MovementController:Dash builds the movement itself, on the client, out of a
+-- BodyVelocity named MovementForce parented into the Torso for 0.4 seconds.
+-- Its speed is `direction * (200 * multiplier)`, and the multiplier is read
+-- straight off `character.Info.DashMultiplier` - a Value instance the game
+-- looks up every single dash:
+--
+--     local v41 = Info:FindFirstChild("DashMultiplier")
+--     local v42 = v41 and v41.Value or 1
+--     local v43 = DIRECTIONS[dir] * (200 * v42)
+--
+-- So there is nothing to hook. Putting our own DashMultiplier in Info makes
+-- the game's own dash code go further, using its own animation, dust trail and
+-- decay curve. We own our character's physics, so the movement replicates.
+--
+-- Front is the exception: DashRequest routes it to UseSetService("Chase"),
+-- a server-side lunge that never touches this code and cannot be scaled from
+-- here. What it can do instead is take the movement-dash path - the direction
+-- table has a Front entry and the game ships a DashFront animation - which is
+-- a real front dash rather than a chase, and that one does scale.
+local DashMod = {
+    Enabled = false,
+    Multiplier = 1.6,
+    FrontAsDash = false,
+    FrontMultiplier = 1.6,
+    Applied = nil,
+}
+
+local function dashMultiplierValue(character)
+    local info = character and character:FindFirstChild("Info")
+    if not info then return nil end
+
+    local existing = info:FindFirstChild("DashMultiplier")
+    if existing then
+        -- Some movesets ship their own. Remember what it was so turning this
+        -- off gives that moveset its dash back rather than leaving ours on it.
+        if DashMod.Applied ~= existing then
+            DashMod.Applied = existing
+            DashMod.Borrowed = true
+            DashMod.Original = existing.Value
+        end
+        return existing
+    end
+
+    if not DashMod.Enabled then return nil end
+    local value = Instance.new("NumberValue")
+    value.Name = "DashMultiplier"
+    value.Value = 1
+    value.Parent = info
+    DashMod.Applied = value
+    DashMod.Borrowed = false
+    DashMod.Original = nil
+    return value
+end
+
+-- Created on the first dash and then left in place, tracking the slider, until
+-- the feature is switched off. Nothing else in the game reads DashMultiplier,
+-- so there is no reason to keep adding and removing it around every dash.
+local function applyDashMultiplier(character, multiplier)
+    local value = dashMultiplierValue(character)
+    if value then
+        value.Value = multiplier
+    end
+end
+
+local function clearDashMultiplier()
+    local value = DashMod.Applied
+    if not value then return end
+    pcall(function()
+        if DashMod.Borrowed then
+            value.Value = DashMod.Original or 1
+        else
+            value:Destroy()
+        end
+    end)
+    DashMod.Applied = nil
+    DashMod.Borrowed = false
+    DashMod.Original = nil
+end
+
 local AnimVariants = ReplicatedStorage.Animations.Itadori.Variants
 
 local DIVERGENT_IDS = {
@@ -71,7 +152,7 @@ local function hookDashRequest()
     OriginalDashRequest = Controller.DashRequest
 
     Controller.DashRequest = function(self, ...)
-        if not DashConfig.Enabled then
+        if not DashConfig.Enabled and not DashMod.Enabled then
             return OriginalDashRequest(self, ...)
         end
 
@@ -91,7 +172,27 @@ local function hookDashRequest()
         end
 
         local direction = getDashDirection(humanoid, hrp)
-        if direction == "Front" then
+        local rerouteFront = DashMod.Enabled and DashMod.FrontAsDash
+
+        -- With only the multiplier on, the game keeps its own cooldown and its
+        -- own dash call; all we do is set the value it is about to read.
+        if not DashConfig.Enabled then
+            if DashMod.Enabled and not (direction == "Front" and not rerouteFront) then
+                applyDashMultiplier(character,
+                    direction == "Front" and DashMod.FrontMultiplier or DashMod.Multiplier)
+            end
+            if direction == "Front" and rerouteFront then
+                if info:FindFirstChild("NoDash") then return end
+                if info:FindFirstChild("Stun") then return end
+                if character:GetAttribute("Ragdoll") > 0 then return end
+                DashRemote:FireServer(direction)
+                self:Dash(LocalPlayer, character, direction)
+                return
+            end
+            return OriginalDashRequest(self, ...)
+        end
+
+        if direction == "Front" and not rerouteFront then
             return OriginalDashRequest(self, ...)
         end
 
@@ -107,6 +208,11 @@ local function hookDashRequest()
 
         if tick() - LastCustomDash < DashConfig.Cooldown then return end
         LastCustomDash = tick()
+
+        if DashMod.Enabled then
+            applyDashMultiplier(character,
+                direction == "Front" and DashMod.FrontMultiplier or DashMod.Multiplier)
+        end
 
         DashRemote:FireServer(direction)
         self:Dash(LocalPlayer, character, direction)
@@ -258,6 +364,10 @@ end)
 -- *whether* a move can be blocked, it learns *how long you have to react*, and
 -- everything defensive here gates on that instead.
 
+-- Set once ManjiConfig exists further down; only used as a fallback when a
+-- counter goes out against a move whose lead has never been measured.
+local ManjiConfig_AssumeLead = 0.35
+
 local Intel = {
     -- Rolling feed of move announcements, newest last.
     Feed = {},
@@ -278,15 +388,34 @@ local IntelConfig = {
     LogFeed = true,
 }
 
--- Effect names that fire on impact rather than on startup. Reacting to these
--- is pointless - the hit has already happened - so they are excluded from the
--- attack feed and from every defensive trigger.
+-- Effects that fire on impact rather than on startup. Reacting to them is
+-- pointless - the hit has already landed - but the bigger reason to drop them
+-- is blame: the timing table credits a stun to the most recent announcement,
+-- so an impact event arriving at the same moment as the stun would take the
+-- credit from the startup that actually gave warning, and the move would learn
+-- a lead of roughly zero forever after.
+--
+-- Being slightly over-inclusive here is the safe direction. Filtering a real
+-- startup costs one move's reactability; letting one impact event through
+-- corrupts that move's timing permanently.
 local IMPACT_EFFECTS = {
-    Hit = true, FinalHit = true, Hurt = true, Impact = true, Land = true,
-    Explode = true, Explosion = true, Blocked = true, Kill = true,
-    Death = true, End = true, Finish = true, Cancel = true, Stop = true,
-    Deactivate = true, Slam = true, Burst = true, TrueRagdoll = true,
+    Hurt = true, Impact = true, Land = true, Explode = true, Explosion = true,
+    Blocked = true, Kill = true, Death = true, End = true, Finish = true,
+    Cancel = true, Stop = true, Deactivate = true, Slam = true, Burst = true,
+    TrueRagdoll = true, Shatter = true, Grab = true, Crush = true,
+    -- Voice lines, not attacks.
+    Chat = true, Chat2 = true, Voice = true, Emote = true,
 }
+
+-- Named variants are far too many to list: across the dump there is Hit, Hit2,
+-- Hit3, ChaseHit, FinalHit, BlackFlashHit, AerialHit, DismantleHit, CleaveHit,
+-- ThrowableHit and more. Every one of them is impact-time, so match the shape.
+local function is_impact_effect(name)
+    if IMPACT_EFFECTS[name] then
+        return true
+    end
+    return string.find(name, 'Hit', 1, true) ~= nil
+end
 
 local function serverNow()
     local ok, value = pcall(function()
@@ -566,6 +695,23 @@ end
 local feedSink = nil        -- set by the UI once it exists
 local statusSink = nil
 
+-- The M1 loop fires every 0.025s while the button is held, and a chain lands
+-- several swings a second. Detection wants every one of them; the log does
+-- not, so repeats of the same move by the same player collapse.
+local lastLogged = {}
+local FEED_REPEAT_GAP = 0.45
+
+local function shouldLog(actor, key)
+    local stamp = tostring(actor) .. '|' .. key
+    local now = tick()
+    local previous = lastLogged[stamp]
+    if previous and now - previous < FEED_REPEAT_GAP then
+        return false
+    end
+    lastLogged[stamp] = now
+    return true
+end
+
 local function pushFeed(text, kind)
     table.insert(Intel.Feed, { text = text, kind = kind, at = tick() })
     while #Intel.Feed > Intel.FeedLimit do
@@ -579,6 +725,19 @@ end
 -- The Effects payload is (effectName, ...) and the controllers all treat the
 -- first model in the varargs as the actor. Rather than hardcoding which
 -- position that is for 226 different services, find it.
+-- Swing2 is fired as (character, comboIndex, "Up"/"Down"), so an M1 chain
+-- carries which hit of the string it is on. Worth surfacing: hit four is when
+-- the finisher or launch comes.
+local function comboIndexFrom(...)
+    for index = 1, select('#', ...) do
+        local value = select(index, ...)
+        if type(value) == 'number' and value >= 1 and value <= 8 then
+            return math.floor(value)
+        end
+    end
+    return nil
+end
+
 local function actorFrom(...)
     for index = 1, select('#', ...) do
         local value = select(index, ...)
@@ -598,13 +757,18 @@ local function distanceTo(char)
     return (a.Position - b.Position).Magnitude
 end
 
-local function noteAnnouncement(service, effect, actor)
+-- `mine` marks our own moves. They are still recorded, because attributing a
+-- stun needs to know what caused it and half the stuns worth timing are ones
+-- we inflicted - without them the countdown could never work on someone we
+-- just hit. Everything defensive filters them back out.
+local function noteAnnouncement(service, effect, actor, mine)
     local now = tick()
     table.insert(Intel.Recent, {
         key = timingKey(service, effect),
         service = service,
         effect = effect,
         actor = actor,
+        mine = mine and true or false,
         at = now,
         distance = distanceTo(actor),
     })
@@ -631,27 +795,30 @@ local function blameFor(victim, at)
     return best
 end
 
--- What we are currently blocking / the counter we most recently threw, so the
--- outcome events below have something to attribute themselves to.
-local activeBlock = nil
 local pendingThrow = nil
 
+-- Outcomes are attributed when they *resolve*, by asking which announcement
+-- was most recently responsible - not when the script decides to act.
+--
+-- That distinction is the whole thing. Keying off our own tryBlock/tryManji
+-- meant the tally only ever saw what the script did, so a session spent
+-- blocking and countering by hand recorded nothing at all. Blaming at
+-- resolution counts every block and every counter, whoever pressed it.
 local function resolveBlock(perfect)
-    if not activeBlock or activeBlock.resolved then return end
-    activeBlock.resolved = true
-    local entry = outcomeFor(activeBlock.key)
+    local blame = blameFor(ownCharacter(), tick())
+    if not blame then return end
+    local entry = outcomeFor(blame.key)
     entry.blocked = entry.blocked + 1
-    pushFeed(('%s blocked%s'):format(activeBlock.key, perfect and ' (perfect)' or ''), 'success')
+    pushFeed(('%s blocked%s'):format(blame.key, perfect and ' (perfect)' or ''), 'success')
 end
 
--- Called when a stun lands on us: if a block was up and nothing ever confirmed
--- it absorbed anything, the attack went through it.
+-- A stun landing on us while a guard was up means the attack beat it.
 local function failBlock()
-    if not activeBlock or activeBlock.resolved then return end
-    activeBlock.resolved = true
-    local entry = outcomeFor(activeBlock.key)
+    local blame = blameFor(ownCharacter(), tick())
+    if not blame then return end
+    local entry = outcomeFor(blame.key)
     entry.pierced = entry.pierced + 1
-    pushFeed(('%s went through the block'):format(activeBlock.key), 'warn')
+    pushFeed(('%s went through the block'):format(blame.key), 'warn')
 end
 
 local function resolveThrow(hit)
@@ -664,6 +831,27 @@ local function resolveThrow(hit)
     else
         entry.whiffed = entry.whiffed + 1
     end
+end
+
+-- Every Manji Kick announces its own startup, ours included, so this fires
+-- whether the script threw it or we did.
+local function noteThrow()
+    local blame = blameFor(ownCharacter(), tick())
+    local timeLeft = 0
+    local key = 'unprovoked'
+    if blame then
+        local lead = predictedLead(blame.key) or ManjiConfig_AssumeLead or 0.35
+        timeLeft = (blame.at + lead) - tick()
+        key = blame.key
+    end
+    pendingThrow = recordThrow(timeLeft)
+    pendingThrow.key = key
+    local throw = pendingThrow
+    task.delay(1.2, function()
+        if throw and not throw.done then
+            resolveThrow(false)
+        end
+    end)
 end
 
 -- Assigned by the overlay further down, which cannot be defined before this
@@ -710,33 +898,48 @@ local function hookService(serviceFolder)
         -- unambiguous "the counter caught something". Checked before the
         -- impact-effect filter below, which exists to keep hit-time events out
         -- of the *threat* feed and would otherwise drop this too.
-        if Outcomes.Enabled and serviceName == 'ManjiKick' and effectName == 'Hit' then
-            local attacker = ...
-            if typeof(attacker) == 'Instance' and isOwn(attacker) then
-                resolveThrow(true)
+        if Outcomes.Enabled and serviceName == 'ManjiKick' then
+            local first = ...
+            if typeof(first) == 'Instance' and isOwn(first) then
+                if effectName == 'Startup' then
+                    noteThrow()
+                elseif effectName == 'Hit' or effectName == 'Fade' then
+                    -- Hit is the counter's kick connecting, Fade the dodge
+                    -- afterimage; either means it caught something.
+                    resolveThrow(true)
+                end
             end
         end
 
         local actor = actorFrom(...)
-        if not actor or isOwn(actor) then return end
-        if IMPACT_EFFECTS[effectName] then return end
+        if not actor then return end
+        if is_impact_effect(effectName) then return end
 
         local distance = distanceTo(actor)
         if distance > IntelConfig.Range then return end
 
-        noteAnnouncement(serviceName, effectName, actor)
+        local mine = isOwn(actor)
+        noteAnnouncement(serviceName, effectName, actor, mine)
+        -- Recorded above so a stun we cause can be attributed, but our own
+        -- moves are not threats and do not belong in the feed or on a tag.
+        if mine then return end
+
         if noteEspMove then
             noteEspMove(actor, serviceName, effectName)
         end
 
         local key = timingKey(serviceName, effectName)
+        if not shouldLog(actor, key) then return end
+
         local lead, samples = predictedLead(key)
+        local combo = comboIndexFrom(...)
+        local label = combo and ('%s m%d'):format(serviceName, combo) or serviceName
         local text
         if lead then
             text = ('%s  %s  %.0fst  ~%.2fs lead (n=%d)')
-                :format(actor.Name, serviceName, distance, lead, samples)
+                :format(actor.Name, label, distance, lead, samples)
         else
-            text = ('%s  %s  %.0fst  lead unknown'):format(actor.Name, serviceName, distance)
+            text = ('%s  %s  %.0fst  lead unknown'):format(actor.Name, label, distance)
         end
         pushFeed(text, lead and 'info' or nil)
     end)
@@ -753,6 +956,56 @@ local function hookAllServices()
 end
 
 
+--// Stun clock ---------------------------------------------------------------
+-- The server never sends how long a stun lasts, so this pairs the two things
+-- that are knowable: the moment it started, which is visible, and the learned
+-- duration for whatever caused it. Elapsed against that gives a countdown.
+--
+-- It is a prediction and is labelled as one. With no measurement for the move
+-- it shows how long the stun has been running instead, which is at least a
+-- fact.
+
+local stunClock = setmetatable({}, { __mode = 'k' })   -- character -> clock
+
+local function beginStun(char, key)
+    local predicted = key and predictedStun(key) or nil
+    stunClock[char] = {
+        start = tick(),
+        key = key,
+        predicted = predicted,
+    }
+end
+
+local function endStun(char)
+    stunClock[char] = nil
+end
+
+-- Returns remaining seconds and whether that is a prediction or just elapsed
+-- time. nil when the character is not stunned at all.
+local function stunRemaining(char)
+    local clock = stunClock[char]
+    if not clock then
+        -- Ragdoll has no clock of its own; the attribute is all there is.
+        if isRagdolled(char) then
+            return nil, 'ragdoll'
+        end
+        return nil, nil
+    end
+    local elapsed = tick() - clock.start
+    if not clock.predicted then
+        return nil, ('%.1fs so far'):format(elapsed)
+    end
+    return math.max(0, clock.predicted - elapsed), nil
+end
+
+local function stunText(char)
+    local remaining, note = stunRemaining(char)
+    if remaining then
+        return ('%.1fs left'):format(remaining)
+    end
+    return note
+end
+
 --// Overlay -----------------------------------------------------------------
 -- The feed answers "what is happening" but only if you are looking at the
 -- menu. This puts the same state over the player it belongs to: what they are
@@ -766,6 +1019,7 @@ local EspConfig = {
     ShowEvade = true,
     ShowBurst = true,
     ShowDistance = false,
+    ShowStunClock = true,
     TextSize = 14,
 }
 
@@ -873,6 +1127,10 @@ local function paintEsp(char, entry)
 
     if EspConfig.ShowState then
         local burst = EspConfig.ShowBurst and canBurst(char)
+        local clock = EspConfig.ShowStunClock and stunText(char)
+        if clock then
+            label = label .. '  ' .. clock
+        end
         entry.state.Text = burst and (label .. '  |  burst') or label
         entry.state.TextColor3 = ESP_STATE_COLOR[label] or Color3.fromRGB(190, 190, 190)
         entry.state.Visible = true
@@ -963,14 +1221,18 @@ local function watchInfo(char)
 
     info.ChildAdded:Connect(function(state)
         if state.Name ~= 'Stun' then return end
-        -- A stun landing on us while a block was up and unconfirmed means the
-        -- attack beat the guard.
-        if isOwn(char) and Outcomes.Enabled then
+        -- Only counts as pierced if a guard was actually up when it landed.
+        if isOwn(char) and Outcomes.Enabled and hasState(char, 'Block') then
             failBlock()
         end
-        if not Intel.Learning then return end
         local startedAt = tick()
         local blame = blameFor(char, startedAt)
+        beginStun(char, blame and blame.key or nil)
+        state.Destroying:Connect(function()
+            endStun(char)
+        end)
+
+        if not Intel.Learning then return end
         if not blame then return end
         local ragdolled = isRagdolled(char)
         -- Destroying rather than ChildRemoved: Debris destroys the instance,
@@ -1099,7 +1361,7 @@ local function pendingThreat(cfg)
             -- Everything below this point in the list is older still.
             break
         end
-        if actor and actor.Parent and not isOwn(actor) then
+        if actor and actor.Parent and not event.mine then
             local distance = distanceTo(actor)
             if distance <= cfg.Range then
                 local lead, samples = predictedLead(event.key)
@@ -1236,16 +1498,8 @@ local function tryManji()
     if fireMove(move) then
         ManjiConfig.Attempts = ManjiConfig.Attempts + 1
         manjiBusyUntil = now + 0.35
-        -- Recorded as a miss and upgraded if a Hit arrives; a throw nothing
-        -- ever confirms is exactly the wasted one we want counted.
-        pendingThrow = recordThrow(threat.timeLeft)
-        pendingThrow.key = threat.event.key
-        local throw = pendingThrow
-        task.delay(1.2, function()
-            if throw and not throw.done then
-                resolveThrow(false)
-            end
-        end)
+        -- Not recorded here: the throw's own Startup broadcast does that, so
+        -- one code path covers this and a manual counter alike.
         setStatus(ManjiConfig, ('countered %s (%.2fs)')
             :format(threat.event.service, threat.timeLeft))
         pushFeed(('manji -> %s in %.2fs'):format(threat.event.service, threat.timeLeft), 'success')
@@ -1359,7 +1613,6 @@ local function tryBlock()
     end
 
     BlockConfig.Attempts = BlockConfig.Attempts + 1
-    activeBlock = { key = threat.event.key, at = now, resolved = false }
     blockHeldUntil = now + BlockConfig.Hold
     blockReleaseToken = blockReleaseToken + 1
     local token = blockReleaseToken
@@ -1466,6 +1719,11 @@ IntelSection:Toggle({
     Flag = 'intel_learn',
     Default = true,
     Callback = function(state) Intel.Learning = state end,
+})
+
+IntelSection:Paragraph({
+    Title = 'm1s',
+    Text = 'Basic attacks are detected. They go out as <Moveset>Service.Activated and come back as that service\'s Effects "Swing" / "Swing2" - the fist whoosh and arm flash that play as the swing starts, before contact - so they show as Itadori, Gojo and so on. Swing2 carries which hit of the chain it is, shown as m1 to m4, and hit four is usually the finisher or launch. A chain collapses to one log line but every swing still counts as a threat.',
 })
 
 IntelSection:Slider({
@@ -1618,6 +1876,13 @@ OverlaySection:Toggle({
 })
 
 OverlaySection:Toggle({
+    Title = 'stun countdown',
+    Flag = 'esp_stunclock',
+    Default = true,
+    Callback = function(state) EspConfig.ShowStunClock = state end,
+})
+
+OverlaySection:Toggle({
     Title = 'distance',
     Flag = 'esp_distance',
     Default = false,
@@ -1629,6 +1894,11 @@ local OverlayNotes = OverlayTab:Section({ Title = 'reading it', Side = 'right' }
 OverlayNotes:Paragraph({
     Title = 'what is on the tag',
     Text = 'Name, then state, then whatever move that player just started, then the evade bar. The move line comes off the same announcement feed the counter tab reacts to, so if a name appears there it means the script saw the move start - it is not reading an animation.',
+})
+
+OverlayNotes:Paragraph({
+    Title = 'stun countdown',
+    Text = 'How long until they can act again. The server never sends a stun length, so this is the learned duration for whatever hit them, counted down from when the stun appeared - a prediction, and only as good as the sample count on the intel tab. With no measurement for that move it shows how long the stun has run instead, which at least is a fact. Ragdoll has no clock of its own and just reads ragdoll.',
 })
 
 OverlayNotes:Paragraph({
@@ -1649,6 +1919,7 @@ local TName = TargetSection:Stat({ Title = 'target', Value = '-' })
 local TDist = TargetSection:Stat({ Title = 'distance', Value = '-' })
 local TState = TargetSection:Stat({ Title = 'state', Value = '-' })
 local TBurst = TargetSection:Stat({ Title = 'burst', Value = '-' })
+local TStun = TargetSection:Stat({ Title = 'stun left', Value = '-' })
 local TEvade = TargetSection:Progress({
     Title = 'evade meter',
     Min = 0,
@@ -2001,6 +2272,71 @@ DashSection:Slider({
     Callback = function(v) DashConfig.Cooldown = v end,
 })
 
+local DashModSection = DashTab:Section({ Title = 'dash manipulation', Side = 'left' })
+
+DashModSection:Toggle({
+    Title = 'enabled',
+    Flag = 'dashmod_enabled',
+    Default = false,
+    Callback = function(state)
+        DashMod.Enabled = state
+        if state then
+            hookDashRequest()
+        else
+            clearDashMultiplier()
+        end
+    end,
+})
+
+DashModSection:Slider({
+    Title = 'side / back distance',
+    Flag = 'dashmod_mult',
+    Min = 0.25,
+    Max = 5,
+    Increment = 0.05,
+    Default = 1.6,
+    Suffix = 'x',
+    Callback = function(v) DashMod.Multiplier = v end,
+})
+
+DashModSection:Toggle({
+    Title = 'front dash instead of chase',
+    Flag = 'dashmod_front',
+    Default = false,
+    Callback = function(state)
+        DashMod.FrontAsDash = state
+        if state then hookDashRequest() end
+    end,
+})
+
+DashModSection:Slider({
+    Title = 'front distance',
+    Flag = 'dashmod_frontmult',
+    Min = 0.25,
+    Max = 5,
+    Increment = 0.05,
+    Default = 1.6,
+    Suffix = 'x',
+    Callback = function(v) DashMod.FrontMultiplier = v end,
+})
+
+local DashModNotes = DashTab:Section({ Title = 'how it works', Side = 'right' })
+
+DashModNotes:Paragraph({
+    Title = 'distance',
+    Text = 'The dash is built on the client: a BodyVelocity in your Torso for 0.4s at 200 studs/s times a multiplier, which the game reads off Info.DashMultiplier every dash. Setting that value is the whole trick - no hooking, and the game keeps its own animation, dust trail and decay curve. It applies to back, left and right.',
+})
+
+DashModNotes:Paragraph({
+    Title = 'front dash',
+    Text = 'Front is normally not a dash at all. It routes to a Chase - a server-side lunge toward your target - which never touches the movement code and cannot be scaled from here. The toggle makes front take the movement path instead, which is a real dash in the direction you are facing and does scale. It stops being a gap-closer onto a target, so it is off by default.',
+})
+
+DashModNotes:Paragraph({
+    Title = 'limits',
+    Text = 'Multiplier scales speed, not duration - the 0.4s window is fixed by a Debris timer, so very high values travel far in the same time rather than for longer. Server-side movement validation is not something the dump shows, so treat large numbers as untested.',
+})
+
 local DashInfo = DashTab:Section({ Title = 'behavior', Side = 'right' })
 
 DashInfo:Paragraph({
@@ -2058,12 +2394,19 @@ task.spawn(function()
             TEvade:Set(evadeMeter(target))
             TBurst:Set(canBurst(target) and 'ready' or 'spent',
                 canBurst(target) and COLOR_BAD or COLOR_GOOD)
+            local left, note = stunRemaining(target)
+            if left then
+                TStun:Set(('%.1fs'):format(left), left > 0.4 and COLOR_GOOD or COLOR_WARN)
+            else
+                TStun:Set(note or '-')
+            end
         else
             TName:Set('-')
             TDist:Set('-')
             TState:Set('-')
             TEvade:Set(0)
             TBurst:Set('-')
+            TStun:Set('-')
         end
 
         pcall(refreshEsp)
