@@ -736,10 +736,12 @@ local function timingKey(service, effect)
     return service .. '.' .. effect
 end
 
+local REACH_SAMPLES = 24
+
 local function timingFor(key)
     local entry = Intel.Timing[key]
     if not entry then
-        entry = { n = 0, lead = 0, dur = 0, ragdoll = 0, reach = 0, last = 0 }
+        entry = { n = 0, lead = 0, dur = 0, ragdoll = 0, dists = {}, last = 0 }
         Intel.Timing[key] = entry
     end
     return entry
@@ -760,11 +762,11 @@ local function recordSample(key, lead, duration, wasRagdoll, distance)
     blendInto(entry, 'lead', lead)
     blendInto(entry, 'dur', duration)
     blendInto(entry, 'ragdoll', wasRagdoll and 1 or 0)
-    -- Reach is the furthest this move has ever actually connected from, not an
-    -- average: one hit at 80 studs proves it can cross 80 studs, and a hundred
-    -- point-blank ones do not disprove it.
-    if distance and distance > (entry.reach or 0) and distance < 1e6 then
-        entry.reach = distance
+    if distance and distance < 1e6 then
+        table.insert(entry.dists, distance)
+        while #entry.dists > REACH_SAMPLES do
+            table.remove(entry.dists, 1)
+        end
     end
     entry.last = tick()
     Intel.Samples = Intel.Samples + 1
@@ -784,11 +786,32 @@ local function predictedStun(key)
     return entry.dur, entry.n
 end
 
--- How far this move has been seen to reach. nil until it has connected once.
+-- How far this move has been seen to reach.
+--
+-- This used to be the single furthest distance ever recorded, which was wrong
+-- in the worst way: attribution is a heuristic, so one mis-blamed sample set
+-- the reach forever and nothing could bring it back down. Basic attacks fire
+-- constantly and so win attribution races constantly, which is exactly why
+-- they were the ones that ended up looking like they reached across the map.
+--
+-- Second-largest instead, and only once there are enough samples for a
+-- second-largest to mean anything. One bad blame no longer decides anything:
+-- it takes two independent hits from that far out.
+local REACH_MIN_SAMPLES = 4
+
 local function learnedReach(key)
     local entry = Intel.Timing[key]
-    if not entry or entry.n < 1 or (entry.reach or 0) <= 0 then return nil end
-    return entry.reach
+    if not entry or #entry.dists < REACH_MIN_SAMPLES then return nil end
+    local top, second = -1, -1
+    for _, d in ipairs(entry.dists) do
+        if d > top then
+            top, second = d, top
+        elseif d > second then
+            second = d
+        end
+    end
+    if second <= 0 then return nil end
+    return second
 end
 
 
@@ -966,15 +989,55 @@ local function noteAnnouncement(service, effect, actor, mine)
     end
 end
 
--- The most recent thing that could plausibly have caused a hit on `victim`.
+-- Which announcement caused this hit.
+--
+-- Taking the most recent one inside a 2.5s window was far too crude. Basic
+-- attacks fire several times a second, so whatever else was happening, an M1
+-- was almost always the newest thing in the list - and it collected the blame
+-- for hits it had nothing to do with. Every wrong blame then poisoned that
+-- move's learned lead, stun and reach.
+--
+-- Three things narrow it down, none of which need to know what the move is:
+--
+--   Time. Nothing older than BLAME_WINDOW is considered. Kept generous enough
+--   for a slow wind-up to still be learnable - tightening this was tempting
+--   but it throws away the slow moves along with the noise, and the other two
+--   filters are the ones doing the real work.
+--
+--   Distance, checked against the move's own history rather than a blanket
+--   number. A move known to land at six studs did not cause a hit from forty.
+--   Until it has a history, a deliberately tight default applies - assume
+--   short and let evidence extend it, never the other way round.
+--
+--   Fit. A move with a known lead of 0.22s explains a 0.21s gap far better
+--   than it explains a 1.4s one. Candidates are scored on how well the
+--   observed gap matches what that move has done before, and the best fit
+--   wins rather than the newest.
+local BLAME_WINDOW = 1.6
+local BLAME_DEFAULT_REACH = 28
+local REACH_MARGIN = 1.25
+
 local function blameFor(victim, at)
-    local best = nil
+    local best, bestScore = nil, -math.huge
     for index = #Intel.Recent, 1, -1 do
         local event = Intel.Recent[index]
-        if event.at <= at and at - event.at <= Intel.RecentWindow then
-            if event.actor ~= victim and event.distance <= IntelConfig.Range then
-                best = event
-                break
+        local gap = at - event.at
+        if gap > BLAME_WINDOW then
+            break
+        end
+        if gap >= 0 and event.actor and event.actor ~= victim and event.actor.Parent then
+            local reach = learnedReach(event.key)
+            local limit = reach and (reach * REACH_MARGIN) or BLAME_DEFAULT_REACH
+            if (event.distance or math.huge) <= limit then
+                -- Recency and closeness break ties; fit dominates when known.
+                local score = -gap * 0.5 - (event.distance or 0) / 200
+                local lead = predictedLead(event.key)
+                if lead then
+                    score = score + 2 - math.min(2, math.abs(gap - lead) / 0.15)
+                end
+                if score > bestScore then
+                    best, bestScore = event, score
+                end
             end
         end
     end
@@ -1494,15 +1557,18 @@ local ManjiConfig = {
     AutoWindow = true,
     -- Below this the input would land after the hit does.
     Reaction = 0.08,
-    Range = 60,
+    -- Only used until a move has enough history to say how far it reaches.
+    -- Deliberately short: assume melee and let evidence extend it.
+    Range = 30,
     AssumeLead = 0.35,
     -- Was false, which meant that until a move had been measured - and on a
     -- fresh session that is every move - there was never anything to counter.
     -- The window check is what stops a wasted throw; refusing to look was not.
     UseUnmeasured = true,
-    -- Past AimFrom studs an attacker has to actually be pointed at us for the
-    -- attack to count as incoming.
+    -- The attacker has to be pointed at us. Wide cone up close where swings
+    -- turn into you, tight at range where they cannot.
     AimFrom = 25,
+    AimConeNear = 105,
     AimCone = 50,
     Attempts = 0,
     Skipped = 0,
@@ -1521,8 +1587,10 @@ local BlockConfig = {
     -- How long after an attack was announced the guard is still worth having
     -- up, since the next hit of the chain is coming.
     Sustain = 1.2,
-    Range = 70,
+    -- As above: what stands in until reach is known, biased short.
+    Range = 32,
     AimFrom = 25,
+    AimConeNear = 110,
     AimCone = 55,
     -- Refuse to block moves that have been measured going through guards.
     SkipUnblockable = true,
@@ -1563,12 +1631,17 @@ end
 --   Is it pointed here? A projectile fired at somebody else is not a threat.
 --   Only asked past AimFrom, because close-up swings have wide hitboxes and
 --   track, so facing means much less than it does at range.
-local REACH_MARGIN = 1.25
-
+-- Is the attacker pointed at us?
+--
+-- This used to be skipped outright below AimFrom studs, on the reasoning that
+-- close-range swings track and have wide hitboxes. That is true of a glancing
+-- angle and completely false of someone facing the other way, which is how it
+-- ended up blocking an M1 from a player with their back turned.
+--
+-- So the cone is never off, it just widens up close: generous enough that a
+-- swing which might plausibly turn into us still counts, tight enough that
+-- somebody facing away does not.
 local function aimedHere(actor, distance, cfg)
-    if distance <= cfg.AimFrom then
-        return true
-    end
     local mine = ownCharacter()
     local ours = mine and mine:FindFirstChild('HumanoidRootPart')
     local theirs = actor:FindFirstChild('HumanoidRootPart')
@@ -1578,7 +1651,9 @@ local function aimedHere(actor, distance, cfg)
     local look = theirs.CFrame.LookVector * Vector3.new(1, 0, 1)
     if look.Magnitude < 0.01 then return true end
     local dot = math.clamp(look.Unit:Dot(toward.Unit), -1, 1)
-    return math.deg(math.acos(dot)) <= cfg.AimCone
+    local angle = math.deg(math.acos(dot))
+    local cone = distance <= cfg.AimFrom and cfg.AimConeNear or cfg.AimCone
+    return angle <= cone
 end
 
 local function inReach(event, actor, distance, cfg)
@@ -2081,7 +2156,8 @@ local function refreshTimings()
     for _, row in ipairs(rows) do
         local e = row.entry
         local tag = e.ragdoll > 0.5 and ' rag' or ''
-        local reach = (e.reach or 0) > 0 and ('%4.0fst'):format(e.reach) or '   -  '
+        local known = learnedReach(row.key)
+        local reach = known and ('%4.0fst'):format(known) or '   -  '
         TimingLog:Add(('%-24s %5.2fs %5.2fs %s (%d)%s')
             :format(row.key:sub(1, 24), e.lead, e.dur, reach, e.n, tag))
     end
@@ -2353,7 +2429,7 @@ ManjiSection:Slider({
 })
 
 ManjiSection:Slider({
-    Title = 'ignore aim under',
+    Title = 'wide cone under',
     Flag = 'manji_aimfrom',
     Min = 0,
     Max = 60,
@@ -2361,6 +2437,17 @@ ManjiSection:Slider({
     Default = 25,
     Suffix = 'st',
     Callback = function(v) ManjiConfig.AimFrom = v end,
+})
+
+ManjiSection:Slider({
+    Title = 'close aim cone',
+    Flag = 'manji_aimconenear',
+    Min = 30,
+    Max = 180,
+    Increment = 5,
+    Default = 105,
+    Suffix = ' deg',
+    Callback = function(v) ManjiConfig.AimConeNear = v end,
 })
 
 ManjiSection:Slider({
@@ -2469,7 +2556,7 @@ BlockSection:Slider({
 })
 
 BlockSection:Slider({
-    Title = 'ignore aim under',
+    Title = 'wide cone under',
     Flag = 'block_aimfrom',
     Min = 0,
     Max = 60,
@@ -2477,6 +2564,17 @@ BlockSection:Slider({
     Default = 25,
     Suffix = 'st',
     Callback = function(v) BlockConfig.AimFrom = v end,
+})
+
+BlockSection:Slider({
+    Title = 'close aim cone',
+    Flag = 'block_aimconenear',
+    Min = 30,
+    Max = 180,
+    Increment = 5,
+    Default = 110,
+    Suffix = ' deg',
+    Callback = function(v) BlockConfig.AimConeNear = v end,
 })
 
 BlockSection:Toggle({
@@ -2580,7 +2678,12 @@ CounterNotes:Paragraph({
 
 CounterNotes:Paragraph({
     Title = 'ranged attacks',
-    Text = 'There is no range setting doing the work once a move has been seen land. Every sample records how far away the attacker was, and the furthest a move has ever connected from is taken as its reach - so anything that hits from across a room is treated as ranged whatever it is called, and a swing that only ever lands at six studs stops counting as a threat from thirty. The slider is only what stands in until a move has connected once. Past the aim distance the attacker also has to be pointed roughly at us, so a projectile thrown at somebody else is not reacted to; up close that test is skipped, since swings there have wide hitboxes and track.',
+    Text = 'Reach is measured, not set. Every sample records how far away the attacker was, and a move\'s reach is the second furthest it has connected from over its last two dozen samples - second, not furthest, so one mis-blamed sample cannot decide it. Until a move has four samples the slider stands in, and it is set short on purpose: assume melee and let evidence extend it, never the other way round.',
+})
+
+CounterNotes:Paragraph({
+    Title = 'facing',
+    Text = 'The attacker always has to be pointed roughly this way - the cone just widens up close, where a swing can still turn into you, and tightens at range where it cannot. Somebody with their back to you fails at any distance.',
 })
 
 CounterNotes:Paragraph({
