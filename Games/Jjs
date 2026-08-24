@@ -363,6 +363,31 @@ local function canBurst(char)
         and not (info and info:GetAttribute("Burst"))
 end
 
+local COLOR_GOOD = Color3.fromRGB(126, 217, 87)
+local COLOR_WARN = Color3.fromRGB(255, 196, 87)
+local COLOR_BAD = Color3.fromRGB(255, 96, 106)
+
+-- `openness` is how good the state is *for whoever is attacking this
+-- character*: 1 wide open, -1 untouchable, 0 neither. The caller flips it for
+-- our own row, so a stun on us reads red and a stun on them reads green
+-- without needing two copies of the same list.
+local function describeState(char)
+    if not char then return 'none', 0 end
+    if char:GetAttribute('Dead') then return 'dead', 0 end
+    if isRagdolled(char) then return 'ragdolled', 1 end
+    if hasState(char, 'Stun') then return 'stunned', 1 end
+    if hasState(char, 'IFrame') then return 'i-frames', -1 end
+    if hasState(char, 'Block') then return 'blocking', -1 end
+    if hasState(char, 'InSkill') then return 'in a skill', -1 end
+    return 'free', 0
+end
+
+local function openColor(openness)
+    if openness > 0 then return COLOR_GOOD end
+    if openness < 0 then return COLOR_BAD end
+    return nil
+end
+
 -- Cooldowns. `ReadyAt` is an absolute server timestamp on the move instance;
 -- `Info.CD` is a blanket lock over every move at once.
 local function movesetFolder(char)
@@ -451,6 +476,91 @@ local function predictedStun(key)
     return entry.dur, entry.n
 end
 
+
+--// Learning from outcomes ---------------------------------------------------
+-- The timing table above learns *when* a move lands. This learns whether doing
+-- something about it actually worked, which is the part that otherwise has to
+-- be configured by hand.
+--
+-- Two outcome signals exist, both broadcast to every client:
+--
+--   BlockService.RE.Effects (character, wasPerfect)
+--       Fires when a block actually absorbs a hit - the game uses it to play
+--       the block clink, or the "Perfect" sting on a parry. So if we were
+--       blocking and this names us, the attack was blockable from where we
+--       stood. If we were blocking and got stunned with no such event, it was
+--       not - either genuinely unblockable, or it broke through our guard.
+--
+--   ManjiKickService.RE.Effects "Hit" (attacker, victim)
+--       Fires when the counter's kick connects, and names both sides, so a
+--       Hit naming us as attacker is an unambiguous "the counter caught
+--       something". No Hit inside the follow-up window means the throw was
+--       wasted.
+--
+-- Neither tells us whether a move is blockable in the abstract - that lives in
+-- a server script and always will. What they give is a record of what happened
+-- the last N times we tried, per move, which is the thing worth acting on.
+
+local Outcomes = {
+    -- key -> { blocked, pierced, countered, whiffed }
+    Moves = {},
+    -- Manji throws recorded as { timeLeft = , hit = }, used to find the window.
+    Throws = {},
+    ThrowLimit = 40,
+    Enabled = true,
+}
+
+local function outcomeFor(key)
+    local entry = Outcomes.Moves[key]
+    if not entry then
+        entry = { blocked = 0, pierced = 0, countered = 0, whiffed = 0 }
+        Outcomes.Moves[key] = entry
+    end
+    return entry
+end
+
+-- How often blocking this move has actually worked. nil until it has been
+-- tried, so callers can tell "never tested" from "tested and it fails".
+local function blockability(key)
+    local entry = Outcomes.Moves[key]
+    if not entry then return nil, 0 end
+    local tried = entry.blocked + entry.pierced
+    if tried == 0 then return nil, 0 end
+    return entry.blocked / tried, tried
+end
+
+-- The measured counter window: the largest timeLeft that has ever actually
+-- produced a hit, shrunk slightly for margin. Falls back to nil while there is
+-- nothing to go on, which is what makes the manual slider still matter on a
+-- fresh session.
+local MIN_THROWS_FOR_WINDOW = 4
+
+local function learnedWindow()
+    local hits, misses = {}, {}
+    for _, throw in ipairs(Outcomes.Throws) do
+        table.insert(throw.hit and hits or misses, throw.timeLeft)
+    end
+    if #hits < MIN_THROWS_FOR_WINDOW then
+        return nil, #hits, #misses
+    end
+    local widest = 0
+    for _, value in ipairs(hits) do
+        if value > widest then widest = value end
+    end
+    -- Every miss further out than the widest hit is evidence the window ends
+    -- between them; sit just inside the hit rather than splitting the gap,
+    -- because throwing early is the expensive mistake.
+    return widest * 0.9, #hits, #misses
+end
+
+local function recordThrow(timeLeft)
+    table.insert(Outcomes.Throws, { timeLeft = timeLeft, hit = false, at = tick() })
+    while #Outcomes.Throws > Outcomes.ThrowLimit do
+        table.remove(Outcomes.Throws, 1)
+    end
+    return Outcomes.Throws[#Outcomes.Throws]
+end
+
 --// Announcement feed --------------------------------------------------------
 
 local feedSink = nil        -- set by the UI once it exists
@@ -521,6 +631,46 @@ local function blameFor(victim, at)
     return best
 end
 
+-- What we are currently blocking / the counter we most recently threw, so the
+-- outcome events below have something to attribute themselves to.
+local activeBlock = nil
+local pendingThrow = nil
+
+local function resolveBlock(perfect)
+    if not activeBlock or activeBlock.resolved then return end
+    activeBlock.resolved = true
+    local entry = outcomeFor(activeBlock.key)
+    entry.blocked = entry.blocked + 1
+    pushFeed(('%s blocked%s'):format(activeBlock.key, perfect and ' (perfect)' or ''), 'success')
+end
+
+-- Called when a stun lands on us: if a block was up and nothing ever confirmed
+-- it absorbed anything, the attack went through it.
+local function failBlock()
+    if not activeBlock or activeBlock.resolved then return end
+    activeBlock.resolved = true
+    local entry = outcomeFor(activeBlock.key)
+    entry.pierced = entry.pierced + 1
+    pushFeed(('%s went through the block'):format(activeBlock.key), 'warn')
+end
+
+local function resolveThrow(hit)
+    if not pendingThrow or pendingThrow.done then return end
+    pendingThrow.done = true
+    pendingThrow.hit = hit
+    local entry = outcomeFor(pendingThrow.key)
+    if hit then
+        entry.countered = entry.countered + 1
+    else
+        entry.whiffed = entry.whiffed + 1
+    end
+end
+
+-- Assigned by the overlay further down, which cannot be defined before this
+-- point because it needs distanceTo. Declared here so the Effects hook binds
+-- to this local rather than compiling into a nil global lookup.
+local noteEspMove
+
 local hookedServices = {}
 
 local function hookService(serviceFolder)
@@ -540,7 +690,33 @@ local function hookService(serviceFolder)
     local serviceName = serviceFolder.Name:gsub('Service$', '')
     effects.OnClientEvent:Connect(function(effectName, ...)
         if not IntelConfig.Enabled then return end
+
+        -- BlockService is the one service whose Effects payload is not
+        -- (effectName, ...) but (character, wasPerfect) - the game uses it to
+        -- play the block clink. Naming us means a block of ours just absorbed
+        -- a hit, which is the only positive proof that what we blocked was
+        -- blockable from where we were standing.
+        if serviceName == 'Block' then
+            if Outcomes.Enabled and typeof(effectName) == 'Instance' and isOwn(effectName) then
+                local perfect = ...
+                resolveBlock(perfect and true or false)
+            end
+            return
+        end
+
         if type(effectName) ~= 'string' then return end
+
+        -- ManjiKick's Hit names attacker and victim, so a Hit naming us is an
+        -- unambiguous "the counter caught something". Checked before the
+        -- impact-effect filter below, which exists to keep hit-time events out
+        -- of the *threat* feed and would otherwise drop this too.
+        if Outcomes.Enabled and serviceName == 'ManjiKick' and effectName == 'Hit' then
+            local attacker = ...
+            if typeof(attacker) == 'Instance' and isOwn(attacker) then
+                resolveThrow(true)
+            end
+        end
+
         local actor = actorFrom(...)
         if not actor or isOwn(actor) then return end
         if IMPACT_EFFECTS[effectName] then return end
@@ -549,6 +725,9 @@ local function hookService(serviceFolder)
         if distance > IntelConfig.Range then return end
 
         noteAnnouncement(serviceName, effectName, actor)
+        if noteEspMove then
+            noteEspMove(actor, serviceName, effectName)
+        end
 
         local key = timingKey(serviceName, effectName)
         local lead, samples = predictedLead(key)
@@ -573,6 +752,202 @@ local function hookAllServices()
     end)
 end
 
+
+--// Overlay -----------------------------------------------------------------
+-- The feed answers "what is happening" but only if you are looking at the
+-- menu. This puts the same state over the player it belongs to: what they are
+-- doing right now, whether they are open, and how close they are to escaping.
+
+local EspConfig = {
+    Enabled = false,
+    Range = 250,
+    ShowState = true,
+    ShowMove = true,
+    ShowEvade = true,
+    ShowBurst = true,
+    ShowDistance = false,
+    TextSize = 14,
+}
+
+local esp = {}          -- character -> { gui, ... }
+local espMoveUntil = {} -- character -> { text, until }
+
+local ESP_STATE_COLOR = {
+    stunned = Color3.fromRGB(126, 217, 87),
+    ragdolled = Color3.fromRGB(126, 217, 87),
+    ['i-frames'] = Color3.fromRGB(255, 96, 106),
+    blocking = Color3.fromRGB(255, 196, 87),
+    ['in a skill'] = Color3.fromRGB(255, 196, 87),
+}
+
+local function destroyEsp(char)
+    local entry = esp[char]
+    if not entry then return end
+    pcall(function()
+        entry.gui:Destroy()
+    end)
+    esp[char] = nil
+end
+
+local function clearEsp()
+    for char in pairs(esp) do
+        destroyEsp(char)
+    end
+    table.clear(espMoveUntil)
+end
+
+local function buildEsp(char)
+    local head = char:FindFirstChild('Head') or char:FindFirstChild('HumanoidRootPart')
+    if not head then return nil end
+
+    -- Parented to the character rather than to a ScreenGui, so it follows the
+    -- model and dies with it if the script is ever torn down mid-round.
+    local gui = Instance.new('BillboardGui')
+    gui.Name = 'centrl_esp'
+    gui.Adornee = head
+    gui.AlwaysOnTop = true
+    gui.Size = UDim2.new(0, 220, 0, 66)
+    gui.StudsOffset = Vector3.new(0, 3.2, 0)
+    gui.MaxDistance = EspConfig.Range
+    gui.ResetOnSpawn = false
+
+    local layout = Instance.new('UIListLayout', gui)
+    layout.FillDirection = Enum.FillDirection.Vertical
+    layout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+    layout.SortOrder = Enum.SortOrder.LayoutOrder
+    layout.Padding = UDim.new(0, 1)
+
+    local function line(order, size, color)
+        local label = Instance.new('TextLabel', gui)
+        label.BackgroundTransparency = 1
+        label.Size = UDim2.new(1, 0, 0, size + 3)
+        label.Font = Enum.Font.GothamBold
+        label.TextSize = size
+        label.TextColor3 = color
+        label.TextStrokeTransparency = 0.4
+        label.TextStrokeColor3 = Color3.new(0, 0, 0)
+        label.LayoutOrder = order
+        label.Text = ''
+        return label
+    end
+
+    local entry = {
+        gui = gui,
+        name = line(0, EspConfig.TextSize, Color3.new(1, 1, 1)),
+        state = line(1, EspConfig.TextSize - 2, Color3.new(1, 1, 1)),
+        move = line(2, EspConfig.TextSize - 2, Color3.fromRGB(180, 160, 255)),
+    }
+
+    -- A bar rather than a number: the evade meter matters as "how full", and
+    -- a filling bar reads at a glance in a fight where a number does not.
+    local track = Instance.new('Frame', gui)
+    track.Name = 'evade'
+    track.Size = UDim2.new(0, 90, 0, 4)
+    track.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+    track.BorderSizePixel = 0
+    track.LayoutOrder = 3
+    local trackCorner = Instance.new('UICorner', track)
+    trackCorner.CornerRadius = UDim.new(0, 2)
+    local fill = Instance.new('Frame', track)
+    fill.Size = UDim2.new(0, 0, 1, 0)
+    fill.BackgroundColor3 = Color3.fromRGB(120, 180, 255)
+    fill.BorderSizePixel = 0
+    local fillCorner = Instance.new('UICorner', fill)
+    fillCorner.CornerRadius = UDim.new(0, 2)
+    entry.evadeTrack = track
+    entry.evadeFill = fill
+
+    gui.Parent = char
+    esp[char] = entry
+    return entry
+end
+
+local function paintEsp(char, entry)
+    local label, openness = describeState(char)
+    entry.name.Text = char.Name
+    entry.name.Visible = true
+
+    if EspConfig.ShowDistance then
+        entry.name.Text = ('%s  %.0fst'):format(char.Name, distanceTo(char))
+    end
+
+    if EspConfig.ShowState then
+        local burst = EspConfig.ShowBurst and canBurst(char)
+        entry.state.Text = burst and (label .. '  |  burst') or label
+        entry.state.TextColor3 = ESP_STATE_COLOR[label] or Color3.fromRGB(190, 190, 190)
+        entry.state.Visible = true
+    else
+        entry.state.Visible = false
+    end
+
+    if EspConfig.ShowMove then
+        local pending = espMoveUntil[char]
+        if pending and tick() < pending.stop then
+            entry.move.Text = pending.text
+            entry.move.Visible = true
+        else
+            entry.move.Visible = false
+            entry.move.Text = ''
+        end
+    else
+        entry.move.Visible = false
+    end
+
+    if EspConfig.ShowEvade then
+        local meter = math.clamp(evadeMeter(char) / 50, 0, 1)
+        entry.evadeFill.Size = UDim2.new(meter, 0, 1, 0)
+        -- Full means they can dash straight out of a ragdoll, which is the one
+        -- value worth a colour change.
+        entry.evadeFill.BackgroundColor3 = meter >= 1
+            and Color3.fromRGB(255, 96, 106)
+            or Color3.fromRGB(120, 180, 255)
+        entry.evadeTrack.Visible = true
+    else
+        entry.evadeTrack.Visible = false
+    end
+end
+
+-- Called from the Effects hook so the overlay names the move as it starts.
+function noteEspMove(char, service, effect)
+    if not EspConfig.Enabled or not EspConfig.ShowMove then return end
+    local lead = predictedLead(timingKey(service, effect))
+    espMoveUntil[char] = {
+        text = service,
+        stop = tick() + math.max(0.6, (lead or 0.4) + 0.5),
+    }
+end
+
+local function refreshEsp()
+    if not EspConfig.Enabled then
+        if next(esp) then clearEsp() end
+        return
+    end
+    local folder = charactersFolder()
+    if not folder then return end
+
+    local live = {}
+    for _, char in ipairs(folder:GetChildren()) do
+        if not isOwn(char) and char:FindFirstChild('HumanoidRootPart') then
+            if distanceTo(char) <= EspConfig.Range then
+                live[char] = true
+                local entry = esp[char]
+                if not entry or not entry.gui.Parent then
+                    entry = buildEsp(char)
+                end
+                if entry then
+                    entry.gui.MaxDistance = EspConfig.Range
+                    paintEsp(char, entry)
+                end
+            end
+        end
+    end
+    for char in pairs(esp) do
+        if not live[char] then
+            destroyEsp(char)
+        end
+    end
+end
+
 --// Measuring what we get hit by ---------------------------------------------
 -- Watch Info on every character. When a Stun appears, blame the most recent
 -- nearby announcement and start a clock; when it is destroyed, close the
@@ -587,8 +962,13 @@ local function watchInfo(char)
     watchedInfo[info] = true
 
     info.ChildAdded:Connect(function(state)
-        if not Intel.Learning then return end
         if state.Name ~= 'Stun' then return end
+        -- A stun landing on us while a block was up and unconfirmed means the
+        -- attack beat the guard.
+        if isOwn(char) and Outcomes.Enabled then
+            failBlock()
+        end
+        if not Intel.Learning then return end
         local startedAt = tick()
         local blame = blameFor(char, startedAt)
         if not blame then return end
@@ -661,6 +1041,9 @@ local ManjiConfig = {
     -- TIME field, which lives server-side for the built-in movesets, so it is
     -- a setting rather than a reading. Everything else on this panel is real.
     Window = 0.5,
+    -- Once enough throws have actually connected, the measured window replaces
+    -- the setting above and the slider stops mattering.
+    AutoWindow = true,
     -- Below this the input would land after the hit does.
     Reaction = 0.08,
     Range = 60,
@@ -682,6 +1065,13 @@ local BlockConfig = {
     Reaction = 0.06,
     LookAhead = 0.9,
     Range = 70,
+    -- Refuse to block moves that have been measured going through guards.
+    SkipUnblockable = true,
+    MinSamples = 3,
+    MinSuccess = 0.34,
+    -- How often to re-test a move already written off, so a wrong verdict can
+    -- correct itself instead of being permanent.
+    RetryChance = 0.15,
     AssumeLead = 0.35,
     UseUnmeasured = true,
     Attempts = 0,
@@ -816,21 +1206,46 @@ local function tryManji()
     -- arrives and eats its cooldown for nothing; thrown too late it does not
     -- come out in time at all. Only the band between the two is worth spending
     -- the move on.
+    --
+    -- The width of that band is the one number the dump cannot give us, so it
+    -- is measured: every throw records how far out the hit was, and whether a
+    -- ManjiKick Hit followed. Once enough throws have connected, the widest
+    -- one that worked defines the window and the slider stops being used.
+    local window = ManjiConfig.Window
+    local source = 'set'
+    if ManjiConfig.AutoWindow then
+        local learned = learnedWindow()
+        if learned then
+            window = learned
+            source = 'learned'
+        end
+    end
+
     if threat.timeLeft < ManjiConfig.Reaction then
         ManjiConfig.Skipped = ManjiConfig.Skipped + 1
         setStatus(ManjiConfig, ('too late (%.2fs)'):format(threat.timeLeft))
         return
     end
-    if threat.timeLeft > ManjiConfig.Window then
+    if threat.timeLeft > window then
         ManjiConfig.Skipped = ManjiConfig.Skipped + 1
-        setStatus(ManjiConfig, ('too early (%.2fs > %.2fs window)')
-            :format(threat.timeLeft, ManjiConfig.Window))
+        setStatus(ManjiConfig, ('too early (%.2fs > %.2fs %s)')
+            :format(threat.timeLeft, window, source))
         return
     end
 
     if fireMove(move) then
         ManjiConfig.Attempts = ManjiConfig.Attempts + 1
         manjiBusyUntil = now + 0.35
+        -- Recorded as a miss and upgraded if a Hit arrives; a throw nothing
+        -- ever confirms is exactly the wasted one we want counted.
+        pendingThrow = recordThrow(threat.timeLeft)
+        pendingThrow.key = threat.event.key
+        local throw = pendingThrow
+        task.delay(1.2, function()
+            if throw and not throw.done then
+                resolveThrow(false)
+            end
+        end)
         setStatus(ManjiConfig, ('countered %s (%.2fs)')
             :format(threat.event.service, threat.timeLeft))
         pushFeed(('manji -> %s in %.2fs'):format(threat.event.service, threat.timeLeft), 'success')
@@ -904,6 +1319,25 @@ local function tryBlock()
         return
     end
 
+    -- Learned refusal: if blocking this move has been tried and mostly failed,
+    -- putting a guard up again just holds us still for it. Unknown moves are
+    -- still worth a try, since a block that works is how they become known.
+    if BlockConfig.SkipUnblockable then
+        local rate, tried = blockability(threat.event.key)
+        if rate and tried >= BlockConfig.MinSamples and rate < BlockConfig.MinSuccess then
+            -- Never retrying would lock in the verdict: a move written off
+            -- after three unlucky samples could never earn its way back,
+            -- because refusing to block it is also refusing to gather any
+            -- more evidence. So a fraction of the time, try it anyway.
+            if math.random() >= BlockConfig.RetryChance then
+                BlockConfig.Skipped = BlockConfig.Skipped + 1
+                setStatus(BlockConfig, ('%s beats blocks (%d%%, n=%d)')
+                    :format(threat.event.service, math.floor(rate * 100), tried))
+                return
+            end
+        end
+    end
+
     local angle = angleToward(char, threat.actor)
     if angle > BlockConfig.MaxAngle then
         BlockConfig.Skipped = BlockConfig.Skipped + 1
@@ -925,6 +1359,7 @@ local function tryBlock()
     end
 
     BlockConfig.Attempts = BlockConfig.Attempts + 1
+    activeBlock = { key = threat.event.key, at = now, resolved = false }
     blockHeldUntil = now + BlockConfig.Hold
     blockReleaseToken = blockReleaseToken + 1
     local token = blockReleaseToken
@@ -965,6 +1400,7 @@ local MainTab = Window:Tab({ Title = 'Main', Icon = 'zap' })
 
 local FlashTab = MainTab:Tab({ Title = 'black flash', Icon = 'zap' })
 local IntelTab = MainTab:Tab({ Title = 'intel', Icon = 'radar' })
+local OverlayTab = MainTab:Tab({ Title = 'overlay', Icon = 'eye' })
 local TargetTab = MainTab:Tab({ Title = 'target', Icon = 'crosshair' })
 
 --// Main > black flash -------------------------------------------------------
@@ -1053,6 +1489,8 @@ local FeedLog = IntelSection:Console({
 feedSink = function(text, kind)
     if kind == 'success' then
         FeedLog:Success(text)
+    elseif kind == 'warn' then
+        FeedLog:Warn(text)
     elseif kind == 'info' then
         FeedLog:Info(text)
     else
@@ -1118,6 +1556,91 @@ TimingSection:Paragraph({
     Text = 'lead is how long between a move announcing itself and a stun actually landing - the reaction budget. stun is how long that stun lasted. Neither is sent by the server; both are measured here, so a row with n=2 is a guess and a row with n=40 is not. Attribution blames the nearest recent announcement, so a crowded fight adds noise.',
 })
 
+--// Main > overlay -----------------------------------------------------------
+
+local OverlaySection = OverlayTab:Section({ Title = 'above players', Side = 'left' })
+
+OverlaySection:Toggle({
+    Title = 'enabled',
+    Flag = 'esp_enabled',
+    Default = false,
+    Callback = function(state)
+        EspConfig.Enabled = state
+        if not state then
+            clearEsp()
+        elseif not IntelConfig.Enabled then
+            IntelConfig.Enabled = true
+            if Intel.Hooked == 0 then
+                hookAllServices()
+                watchCharacters()
+            end
+        end
+    end,
+})
+
+OverlaySection:Slider({
+    Title = 'range',
+    Flag = 'esp_range',
+    Min = 30,
+    Max = 600,
+    Increment = 10,
+    Default = 250,
+    Suffix = 'st',
+    Callback = function(v) EspConfig.Range = v end,
+})
+
+OverlaySection:Toggle({
+    Title = 'state',
+    Flag = 'esp_state',
+    Default = true,
+    Callback = function(state) EspConfig.ShowState = state end,
+})
+
+OverlaySection:Toggle({
+    Title = 'current move',
+    Flag = 'esp_move',
+    Default = true,
+    Callback = function(state) EspConfig.ShowMove = state end,
+})
+
+OverlaySection:Toggle({
+    Title = 'evade bar',
+    Flag = 'esp_evade',
+    Default = true,
+    Callback = function(state) EspConfig.ShowEvade = state end,
+})
+
+OverlaySection:Toggle({
+    Title = 'burst',
+    Flag = 'esp_burst',
+    Default = true,
+    Callback = function(state) EspConfig.ShowBurst = state end,
+})
+
+OverlaySection:Toggle({
+    Title = 'distance',
+    Flag = 'esp_distance',
+    Default = false,
+    Callback = function(state) EspConfig.ShowDistance = state end,
+})
+
+local OverlayNotes = OverlayTab:Section({ Title = 'reading it', Side = 'right' })
+
+OverlayNotes:Paragraph({
+    Title = 'what is on the tag',
+    Text = 'Name, then state, then whatever move that player just started, then the evade bar. The move line comes off the same announcement feed the counter tab reacts to, so if a name appears there it means the script saw the move start - it is not reading an animation.',
+})
+
+OverlayNotes:Paragraph({
+    Title = 'colours',
+    Text = 'Green state means they are open - stunned or ragdolled. Red means do not bother - i-frames. Amber is blocking or mid-skill. The evade bar turns red at full, which is the point they can dash straight out of a ragdoll.',
+})
+
+OverlayNotes:Paragraph({
+    Title = 'needs the feed',
+    Text = 'Turning this on turns the move feed on too, since the move line has nothing to show otherwise. State and evade are live attribute reads and work either way.',
+})
+
 --// Main > target ------------------------------------------------------------
 
 local TargetSection = TargetTab:Section({ Title = 'punish window', Side = 'left' })
@@ -1151,31 +1674,6 @@ local SEvade = SelfSection:Progress({
 })
 local SManji = SelfSection:Stat({ Title = 'manji kick', Value = '-' })
 local SBurst = SelfSection:Stat({ Title = 'burst', Value = '-' })
-
-local COLOR_GOOD = Color3.fromRGB(126, 217, 87)
-local COLOR_WARN = Color3.fromRGB(255, 196, 87)
-local COLOR_BAD = Color3.fromRGB(255, 96, 106)
-
--- `openness` is how good the state is *for whoever is attacking this
--- character*: 1 wide open, -1 untouchable, 0 neither. The caller flips it for
--- our own row, so a stun on us reads red and a stun on them reads green
--- without needing two copies of the same list.
-local function describeState(char)
-    if not char then return 'none', 0 end
-    if char:GetAttribute('Dead') then return 'dead', 0 end
-    if isRagdolled(char) then return 'ragdolled', 1 end
-    if hasState(char, 'Stun') then return 'stunned', 1 end
-    if hasState(char, 'IFrame') then return 'i-frames', -1 end
-    if hasState(char, 'Block') then return 'blocking', -1 end
-    if hasState(char, 'InSkill') then return 'in a skill', -1 end
-    return 'free', 0
-end
-
-local function openColor(openness)
-    if openness > 0 then return COLOR_GOOD end
-    if openness < 0 then return COLOR_BAD end
-    return nil
-end
 
 local function currentTarget()
     local controller = toolController()
@@ -1231,8 +1729,15 @@ ManjiSection:Toggle({
     end,
 })
 
+ManjiSection:Toggle({
+    Title = 'learn the window',
+    Flag = 'manji_autowindow',
+    Default = true,
+    Callback = function(state) ManjiConfig.AutoWindow = state end,
+})
+
 ManjiSection:Slider({
-    Title = 'counter window',
+    Title = 'counter window (until learned)',
     Flag = 'manji_window',
     Min = 0.1,
     Max = 1.5,
@@ -1284,6 +1789,7 @@ ManjiSection:Slider({
 
 local ManjiStatus = ManjiSection:Stat({ Title = 'status', Value = 'idle' })
 local ManjiCount = ManjiSection:Stat({ Title = 'thrown / skipped', Value = '0 / 0' })
+local ManjiWindow = ManjiSection:Stat({ Title = 'window in use', Value = 'set' })
 
 local BlockSection = CounterTab:Section({ Title = 'auto block', Side = 'right' })
 
@@ -1365,6 +1871,13 @@ BlockSection:Slider({
 })
 
 BlockSection:Toggle({
+    Title = 'skip moves that beat blocks',
+    Flag = 'block_skipunblockable',
+    Default = true,
+    Callback = function(state) BlockConfig.SkipUnblockable = state end,
+})
+
+BlockSection:Toggle({
     Title = 'act on unmeasured moves',
     Flag = 'block_unmeasured',
     Default = true,
@@ -1384,6 +1897,65 @@ BlockSection:Slider({
 
 local BlockStatus = BlockSection:Stat({ Title = 'status', Value = 'idle' })
 local BlockCount = BlockSection:Stat({ Title = 'blocked / skipped', Value = '0 / 0' })
+
+local OutcomeSection = CounterTab:Section({ Title = 'what actually worked', Side = 'right' })
+
+local OutcomeLog = OutcomeSection:Console({
+    Title = 'move  /  blocked  /  pierced  /  countered',
+    Height = 150,
+    MaxLines = 80,
+})
+
+local function refreshOutcomes()
+    local rows = {}
+    for key, entry in pairs(Outcomes.Moves) do
+        local total = entry.blocked + entry.pierced + entry.countered + entry.whiffed
+        if total > 0 then
+            table.insert(rows, { key = key, entry = entry, total = total })
+        end
+    end
+    table.sort(rows, function(a, b) return a.total > b.total end)
+    OutcomeLog:Clear()
+    if #rows == 0 then
+        OutcomeLog:Add('nothing tried yet - block or counter something')
+    end
+    for _, row in ipairs(rows) do
+        local e = row.entry
+        local rate, tried = blockability(row.key)
+        local verdict = ''
+        if rate then
+            -- Same threshold auto block gates on, so the label always
+            -- describes what the script will actually do.
+            if tried >= BlockConfig.MinSamples and rate < BlockConfig.MinSuccess then
+                verdict = '  beats blocks'
+            elseif rate >= 0.67 then
+                verdict = '  blockable'
+            else
+                verdict = '  mixed'
+            end
+        end
+        OutcomeLog:Add(('%-24s %d/%d  %d/%d%s'):format(
+            row.key:sub(1, 24), e.blocked, e.blocked + e.pierced,
+            e.countered, e.countered + e.whiffed, verdict))
+    end
+end
+
+OutcomeSection:Buttons({
+    { Title = 'refresh', Callback = refreshOutcomes },
+    {
+        Title = 'reset',
+        Callback = function()
+            Outcomes.Moves = {}
+            table.clear(Outcomes.Throws)
+            refreshOutcomes()
+        end,
+    },
+})
+
+OutcomeSection:Paragraph({
+    Title = 'where these come from',
+    Text = 'blocked counts every time BlockService announced one of our blocks absorbing a hit; pierced counts a stun landing on us while a block was up and nothing confirmed it. countered counts a ManjiKick Hit naming us as the attacker after a throw. All three are broadcast by the server, so they are observations rather than guesses - but they describe what happened to us at that angle and range, not a property of the move.',
+})
 
 local CounterNotes = CounterTab:Section({ Title = 'what this can and cannot know', Side = 'left' })
 
@@ -1494,9 +2066,23 @@ task.spawn(function()
             TBurst:Set('-')
         end
 
+        pcall(refreshEsp)
+
+        if ManjiConfig.AutoWindow then
+            local learned, hits, misses = learnedWindow()
+            if learned then
+                ManjiWindow:Set(('%.2fs learned (%d/%d)'):format(learned, hits, hits + misses), COLOR_GOOD)
+            else
+                ManjiWindow:Set(('%.2fs set (%d hits so far)'):format(ManjiConfig.Window, hits or 0))
+            end
+        else
+            ManjiWindow:Set(('%.2fs set'):format(ManjiConfig.Window))
+        end
+
         if tick() - lastTimingRefresh > 4 then
             lastTimingRefresh = tick()
             pcall(refreshTimings)
+            pcall(refreshOutcomes)
         end
     end
 end)

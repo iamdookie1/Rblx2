@@ -234,6 +234,23 @@ local function disconnect_all()
     table.clear(Library._connections)
 end
 
+-- Anything the library puts *outside* its own ScreenGui has to clean itself up
+-- explicitly, because destroying ScreenGui will not touch it. The unibar icon
+-- lives in CoreGui.TopBarApp, so it registers here.
+Library._teardowns = {}
+
+local function on_unload(fn)
+    table.insert(Library._teardowns, fn)
+    return fn
+end
+
+local function run_teardowns()
+    for _, fn in pairs(Library._teardowns) do
+        pcall(fn)
+    end
+    table.clear(Library._teardowns)
+end
+
 --// Accent + scale registries ----------------------------------------------
 
 local function accent(object, properties)
@@ -1738,6 +1755,7 @@ end
 function Library:Unload()
     Library._unloaded = true
     disconnect_all()
+    run_teardowns()
     pcall(function()
         ScreenGui:Destroy()
     end)
@@ -5014,11 +5032,27 @@ end
 -- always shows the icon - it's the library's one and only show/hide entry
 -- point now, replacing the floating MobileButton entirely (forced off
 -- below) rather than sitting alongside it.
+-- Marks our icon so every copy of this closure can recognise every other
+-- copy's, not just its own. Two windows in one session (the hub unloading and
+-- handing off to a game script) each run this whole function, and without a
+-- shared marker each one measures the other's icon as native topbar content
+-- and widens the bar to clear it - which the other then measures in turn. That
+-- feedback loop is what made the topbar crawl wider every two seconds.
+local UNIBAR_TAG = 'centrl_unibar_icon'
+
+local function is_our_icon(instance)
+    return instance:GetAttribute(UNIBAR_TAG) == true
+end
+
 local function add_unibar_icon(win)
     local ok = pcall(function()
         local ICON_MARGIN = 4
 
         local icon, icon_row
+        local dead = false
+        -- Original size per ancestor we widen, so unloading can put the
+        -- topbar back the way we found it instead of leaving it stretched.
+        local widened = {}
 
         local function find_icon_row()
             local app = CoreGui:FindFirstChild('TopBarApp')
@@ -5035,7 +5069,7 @@ local function add_unibar_icon(win)
             local edge = 0
             local row_left = row.AbsolutePosition.X
             for _, child in row:GetChildren() do
-                if child ~= icon and child:IsA('GuiObject') and child.Visible and child.AbsoluteSize.X > 0 then
+                if not is_our_icon(child) and child:IsA('GuiObject') and child.Visible and child.AbsoluteSize.X > 0 then
                     local right = (child.AbsolutePosition.X - row_left) + child.AbsoluteSize.X
                     if right > edge then edge = right end
                 end
@@ -5050,11 +5084,27 @@ local function add_unibar_icon(win)
             end
             local size = frame.Size
             if size.X.Offset == target_width then return end
+            -- Recorded before the first change only, so a later pass never
+            -- captures our own widened value as the original.
+            if widened[frame] == nil then
+                widened[frame] = size
+            end
             frame.Size = UDim2.new(size.X.Scale, target_width, size.Y.Scale, size.Y.Offset)
         end
 
+        local function restore_widths()
+            for frame, size in pairs(widened) do
+                pcall(function()
+                    if frame.Parent then
+                        frame.Size = size
+                    end
+                end)
+            end
+            table.clear(widened)
+        end
+
         local function fit_icon(row, sibling, left_frame)
-            if not icon then return end
+            if dead or not icon then return end
             local native_width = native_content_width(row)
             icon.Size = sibling.Size
             icon.Position = UDim2.new(0, math.floor(native_width + 0.5), sibling.Position.Y.Scale, sibling.Position.Y.Offset)
@@ -5086,6 +5136,9 @@ local function add_unibar_icon(win)
             icon.ZIndex = sibling.ZIndex
             pcall(function() icon.AnchorPoint = sibling.AnchorPoint end)
             pcall(function() icon.AutoLocalize = false end)
+            -- Set before parenting, so no sweep or measurement can ever see
+            -- this icon in the row untagged.
+            icon:SetAttribute(UNIBAR_TAG, true)
             icon.Parent = row
 
             track(icon.MouseButton1Click:Connect(function()
@@ -5108,7 +5161,21 @@ local function add_unibar_icon(win)
             icon.TextTransparency = win.Visible and 0 or 0.45
         end
 
+        -- Anything of ours already sitting in the row belongs to a previous
+        -- window that went away without unloading cleanly. There can only be
+        -- one, so clear the rest before adding this one.
+        local function sweep_stale(row)
+            for _, child in pairs(row:GetChildren()) do
+                if child ~= icon and is_our_icon(child) then
+                    pcall(function()
+                        child:Destroy()
+                    end)
+                end
+            end
+        end
+
         local function refresh_icon()
+            if dead then return end
             local row, sibling, left_frame = find_icon_row()
             if not row then return end
             if icon and not icon:IsDescendantOf(game) then
@@ -5120,14 +5187,35 @@ local function add_unibar_icon(win)
             elseif icon.Parent ~= row then
                 icon.Parent = row
             end
+            sweep_stale(row)
             icon_row = row
             fit_icon(row, sibling, left_frame)
         end
 
+        on_unload(function()
+            -- Order matters: stop the loop, drop the icon, then hand the
+            -- topbar its original widths back. Restoring first would just be
+            -- undone by a refresh already in flight.
+            dead = true
+            if icon then
+                pcall(function()
+                    icon:Destroy()
+                end)
+                icon = nil
+            end
+            restore_widths()
+        end)
+
         refresh_icon()
         task.spawn(function()
-            while icon and icon:IsDescendantOf(game) do
+            -- `dead` rather than the icon's ancestry: an unloaded library
+            -- leaves nothing to test, and the old check kept this running
+            -- forever against a topbar it no longer owned.
+            while not dead and not Library._unloaded do
                 task.wait(2)
+                if dead or Library._unloaded then
+                    return
+                end
                 pcall(refresh_icon)
             end
         end)
