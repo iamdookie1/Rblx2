@@ -1116,6 +1116,12 @@ Tab.__index = Tab
 local Section = {}
 Section.__index = Section
 
+-- Sub-tabs are tabs that live inside another tab rather than on the rail.
+-- They share Tab's section builder but need their own Select, because Tab's
+-- iterates window.Tabs and a sub-tab is deliberately not in that list.
+local SubTab = {}
+SubTab.__index = SubTab
+
 function Library:Window(options)
     options = options or {}
 
@@ -1695,6 +1701,26 @@ function Window:Load()
     return self
 end
 
+-- Looks a rail tab up by title so a script can jump the menu to a page
+-- without keeping a reference to every handle it ever made. Titles are
+-- matched exactly; nested pages are reached with tab:GetTab(...).
+function Window:GetTab(title)
+    for _, tab in pairs(self.Tabs) do
+        if tab.Title == title then
+            return tab
+        end
+    end
+    return nil
+end
+
+function Window:SelectTab(title)
+    local tab = self:GetTab(title)
+    if tab then
+        tab:Select()
+    end
+    return tab
+end
+
 function Window:SetToggleKey(key)
     if typeof(key) == 'EnumItem' then
         self.ToggleKey = key
@@ -1820,6 +1846,28 @@ function Window:Tab(options)
     title_label.Position = UDim2.new(0, icon and 32 or 12, 0.5, 0)
     title_label.Size = UDim2.new(1, -40, 1, 0)
 
+    -- Hidden until something calls Tab:SetBadge. It sits in the gap the title
+    -- label already leaves on the right, so a badge never pushes text around.
+    local badge = accent(create('Frame', {
+        Name = 'badge',
+        Parent = button,
+        BackgroundColor3 = Library.Accent,
+        AnchorPoint = Vector2.new(1, 0.5),
+        Position = UDim2.new(1, -8, 0.5, 0),
+        Size = UDim2.new(0, 0, 0, 15),
+        AutomaticSize = Enum.AutomaticSize.X,
+        Visible = false,
+        ZIndex = 2,
+    }), { 'BackgroundColor3' })
+    corner(badge, 8)
+    padding(badge, 0, 0, 5, 5)
+    local badge_label = label(badge, '', 10, 'bold', Theme.Background)
+    badge_label.Name = 'count'
+    badge_label.Size = UDim2.new(0, 0, 1, 0)
+    badge_label.AutomaticSize = Enum.AutomaticSize.X
+    badge_label.TextXAlignment = Enum.TextXAlignment.Center
+    badge_label.ZIndex = 2
+
     local page = create('Frame', {
         Name = 'page',
         Parent = self.Pages,
@@ -1842,6 +1890,8 @@ function Window:Tab(options)
     tab.Indicator = indicator
     tab.TitleLabel = title_label
     tab.IconImage = icon_image
+    tab.Badge = badge
+    tab.BadgeLabel = badge_label
     tab.Page = page
     tab.Left = left
     tab.Right = right or left
@@ -1884,10 +1934,348 @@ end
 
 Tab.select = Tab.Select
 
+--// Sub-tabs (tabs inside tabs) ---------------------------------------------
+
+-- A rail entry can host its own row of tabs instead of one long wall of
+-- sections. `tab:Tab({ Title = 'melee' })` puts a horizontal strip at the top
+-- of that tab's page and gives each entry a real page underneath, two columns
+-- and all, so "combat" can hold melee / ranged / misc without spending three
+-- slots on the rail.
+
+local SUB_STRIP_HEIGHT = 30
+local TOUCH_SUB_STRIP_HEIGHT = 34
+
+local function sub_strip_height()
+    return is_touch() and TOUCH_SUB_STRIP_HEIGHT or SUB_STRIP_HEIGHT
+end
+
+-- Built the first time a tab is asked for a sub-tab. Until then a tab looks
+-- and behaves exactly as it always has, so nothing already written against
+-- the library changes shape.
+function Tab:_ensure_sub_host()
+    if self.SubHost then
+        return
+    end
+
+    local strip_height = sub_strip_height()
+
+    local strip = create('ScrollingFrame', {
+        Name = 'substrip',
+        Parent = self.Page,
+        BackgroundTransparency = 1,
+        BorderSizePixel = 0,
+        Position = UDim2.new(0, 0, 0, 0),
+        Size = UDim2.new(1, 0, 0, strip_height),
+        CanvasSize = UDim2.new(0, 0, 0, 0),
+        AutomaticCanvasSize = Enum.AutomaticSize.X,
+        ScrollingDirection = Enum.ScrollingDirection.X,
+        ScrollBarThickness = 0,
+        ElasticBehavior = Enum.ElasticBehavior.WhenScrollable,
+        ZIndex = 2,
+    })
+    list(strip, 6, Enum.FillDirection.Horizontal)
+    sink_scroll(strip)
+
+    -- A hairline under the strip so the row reads as a tab bar and not a
+    -- loose cluster of buttons floating above the content.
+    create('Frame', {
+        Name = 'subline',
+        Parent = self.Page,
+        BackgroundColor3 = Theme.Stroke,
+        BorderSizePixel = 0,
+        Position = UDim2.new(0, 0, 0, strip_height),
+        Size = UDim2.new(1, 0, 0, 1),
+    })
+
+    local host = create('Frame', {
+        Name = 'subpages',
+        Parent = self.Page,
+        BackgroundTransparency = 1,
+        Position = UDim2.new(0, 0, 0, strip_height + 7),
+        Size = UDim2.new(1, 0, 1, -(strip_height + 7)),
+    })
+
+    -- The tab's own columns stop being used the moment it hosts sub-tabs.
+    -- Hiding them matters beyond tidiness: sink_scroll marks them Active, and
+    -- an active scrolling frame sitting under the sub-pages would eat touch
+    -- drags meant for the content on top of it.
+    self.Left.Visible = false
+    if self.Right and self.Right ~= self.Left then
+        self.Right.Visible = false
+    end
+
+    self.SubStrip = strip
+    self.SubHost = host
+    self.SubTabs = {}
+end
+
+function Tab:Tab(options)
+    options = options or {}
+    local title = pick(options, 'Tab', 'Title', 'title', 'Name')
+    local icon = pick(options, nil, 'Icon', 'icon', 'Image')
+
+    self:_ensure_sub_host()
+
+    local sub = setmetatable({}, SubTab)
+    sub.Window = self.Window
+    sub.Parent = self
+    sub.ParentTab = self
+    sub.Title = title
+    sub.Sections = {}
+
+    local strip_height = sub_strip_height()
+
+    -- Each entry is only as wide as its own label, so a strip of short names
+    -- doesn't waste half the row. AutomaticSize.X on the button follows
+    -- AutomaticSize.X on `content`, which in turn follows its list layout --
+    -- the indicator stays a direct child of the button precisely so the
+    -- layout never sees it and never reserves a slot for it.
+    local button = create('TextButton', {
+        Name = 'stb',
+        Parent = self.SubStrip,
+        BackgroundColor3 = Theme.Element,
+        BackgroundTransparency = 1,
+        Size = UDim2.new(0, 0, 0, strip_height - 6),
+        AutomaticSize = Enum.AutomaticSize.X,
+        Text = '',
+        AutoButtonColor = false,
+        LayoutOrder = #self.SubTabs + 1,
+    })
+    corner(button, 5)
+    padding(button, 0, 0, 12, 12)
+
+    local content = create('Frame', {
+        Name = 'content',
+        Parent = button,
+        BackgroundTransparency = 1,
+        Size = UDim2.new(0, 0, 1, 0),
+        AutomaticSize = Enum.AutomaticSize.X,
+    })
+    local content_layout = list(content, 6, Enum.FillDirection.Horizontal)
+    content_layout.VerticalAlignment = Enum.VerticalAlignment.Center
+
+    local icon_image
+    if icon then
+        icon_image = create('ImageLabel', {
+            Name = 'icon',
+            Parent = content,
+            BackgroundTransparency = 1,
+            Size = UDim2.fromOffset(16, 16),
+            ImageColor3 = Theme.SubText,
+            LayoutOrder = 0,
+        })
+        Library:ApplyIcon(icon_image, icon, ui_icon_options(16))
+    end
+
+    local title_label = label(content, title, 12, 'semi', Theme.SubText)
+    title_label.Name = 'title'
+    title_label.Size = UDim2.new(0, 0, 1, 0)
+    title_label.AutomaticSize = Enum.AutomaticSize.X
+    title_label.TextXAlignment = Enum.TextXAlignment.Center
+    title_label.LayoutOrder = 1
+
+    local badge = accent(create('Frame', {
+        Name = 'badge',
+        Parent = content,
+        BackgroundColor3 = Library.Accent,
+        Size = UDim2.new(0, 0, 0, 15),
+        AutomaticSize = Enum.AutomaticSize.X,
+        Visible = false,
+        LayoutOrder = 2,
+    }), { 'BackgroundColor3' })
+    corner(badge, 8)
+    padding(badge, 0, 0, 5, 5)
+    local badge_label = label(badge, '', 10, 'bold', Theme.Background)
+    badge_label.Name = 'count'
+    badge_label.Size = UDim2.new(0, 0, 1, 0)
+    badge_label.AutomaticSize = Enum.AutomaticSize.X
+    badge_label.TextXAlignment = Enum.TextXAlignment.Center
+
+    local indicator = accent(create('Frame', {
+        Name = 'indi',
+        Parent = button,
+        AnchorPoint = Vector2.new(0.5, 1),
+        Position = UDim2.new(0.5, 0, 1, 0),
+        Size = UDim2.new(0, 0, 0, 2),
+        BorderSizePixel = 0,
+    }), { 'BackgroundColor3' })
+    corner(indicator, 1)
+
+    local page = create('Frame', {
+        Name = 'subpage',
+        Parent = self.SubHost,
+        BackgroundTransparency = 1,
+        Size = UDim2.new(1, 0, 1, 0),
+        Visible = false,
+    })
+
+    local single_column = is_touch()
+    local left = make_column(page, 'L', single_column and 1 or 0.5, 0, 0)
+    local right
+    if single_column then
+        left.Size = UDim2.new(1, -6, 1, 0)
+    else
+        right = make_column(page, 'R', 0.5, 0.5, 6)
+    end
+
+    sub.Button = button
+    sub.Indicator = indicator
+    sub.TitleLabel = title_label
+    sub.IconImage = icon_image
+    sub.Badge = badge
+    sub.BadgeLabel = badge_label
+    sub.Page = page
+    sub.Left = left
+    sub.Right = right or left
+    sub.SingleColumn = single_column
+
+    track(button.MouseButton1Click:Connect(function()
+        sub:Select()
+    end))
+    hover(button, Theme.Element, Theme.ElementHover)
+
+    table.insert(self.SubTabs, sub)
+
+    if #self.SubTabs == 1 then
+        -- Sections added before the first sub-tab existed migrate into it, so
+        -- `tab:Section(...)` followed later by `tab:Tab(...)` yields one
+        -- coherent page instead of content stranded on the hidden layer.
+        if #self.Sections > 0 then
+            local has_right = self.Right ~= self.Left
+            for _, section in pairs(self.Sections) do
+                local on_right = has_right and section.Card.Parent == self.Right
+                section.Card.Parent = on_right and sub.Right or sub.Left
+                section.Card.LayoutOrder = #sub.Sections + 1
+                section.Tab = sub
+                table.insert(sub.Sections, section)
+            end
+            table.clear(self.Sections)
+        end
+        sub:Select()
+    end
+
+    return sub
+end
+
+Tab.SubTab = Tab.Tab
+Tab.create_tab = Tab.Tab
+Tab.AddTab = Tab.Tab
+
+function SubTab:Select()
+    local parent = self.Parent
+    for _, other in pairs(parent.SubTabs) do
+        if other ~= self then
+            other.Page.Visible = false
+            tween(other.Button, QUAD, { BackgroundTransparency = 1 })
+            tween(other.TitleLabel, QUAD, { TextColor3 = Theme.SubText })
+            tween(other.Indicator, QUART, { Size = UDim2.new(0, 0, 0, 2) })
+            if other.IconImage then
+                tween(other.IconImage, QUAD, { ImageColor3 = Theme.SubText })
+            end
+        end
+    end
+    self.Page.Visible = true
+    parent.ActiveSubTab = self
+    tween(self.Button, QUAD, { BackgroundTransparency = 0 })
+    tween(self.TitleLabel, QUAD, { TextColor3 = Theme.Text })
+    tween(self.Indicator, QUART, { Size = UDim2.new(0.62, 0, 0, 2) })
+    if self.IconImage then
+        tween(self.IconImage, QUAD, { ImageColor3 = Library.Accent })
+    end
+end
+
+-- Select() only swaps the sub-page; Focus() also brings the parent tab
+-- forward, which is what a caller jumping here from elsewhere in the menu
+-- actually wants.
+function SubTab:Focus()
+    self.Parent:Select()
+    self:Select()
+end
+
+function SubTab:SetTitle(text)
+    self.Title = tostring(text)
+    self.TitleLabel.Text = self.Title
+end
+
+function SubTab:SetIcon(icon)
+    if not self.IconImage or icon == nil then
+        return
+    end
+    Library:ApplyIcon(self.IconImage, icon, ui_icon_options(16))
+end
+
+SubTab.select = SubTab.Select
+SubTab.focus = SubTab.Focus
+SubTab.set_title = SubTab.SetTitle
+SubTab.set_icon = SubTab.SetIcon
+
+-- Finds a sub-tab by title, so scripts can jump to one without holding a
+-- reference to every handle they ever made.
+function Tab:GetTab(title)
+    if not self.SubTabs then
+        return nil
+    end
+    for _, sub in pairs(self.SubTabs) do
+        if sub.Title == title then
+            return sub
+        end
+    end
+    return nil
+end
+
+function Tab:SelectTab(title)
+    local sub = self:GetTab(title)
+    if sub then
+        sub:Select()
+    end
+    return sub
+end
+
+--// Tab decoration ----------------------------------------------------------
+
+function Tab:SetTitle(text)
+    self.Title = tostring(text)
+    self.TitleLabel.Text = self.Title
+end
+
+function Tab:SetIcon(icon)
+    if not self.IconImage or icon == nil then
+        return
+    end
+    Library:ApplyIcon(self.IconImage, icon, ui_icon_options(16))
+end
+
+-- A short accent pill on the tab button: an unread count, a live "3 on", a
+-- warning dot. Passing nil or '' hides it again. Rail tabs and sub-tabs both
+-- carry one, so this is written once and shared below.
+function Tab:SetBadge(text)
+    if not self.Badge then
+        return
+    end
+    if text == nil or text == '' or text == false then
+        self.Badge.Visible = false
+        return
+    end
+    self.BadgeLabel.Text = tostring(text)
+    self.Badge.Visible = true
+end
+
+Tab.set_title = Tab.SetTitle
+Tab.set_icon = Tab.SetIcon
+Tab.set_badge = Tab.SetBadge
+
+
 --// Sections ---------------------------------------------------------------
 
 function Tab:Section(options)
     options = options or {}
+    -- Once a tab hosts sub-tabs its own columns are hidden, so a section asked
+    -- for on the parent belongs on whichever sub-page is showing. SubTab has
+    -- no .SubTabs field, so reusing this same function for sub-tabs can't
+    -- recurse.
+    if self.SubTabs and self.SubTabs[1] then
+        return (self.ActiveSubTab or self.SubTabs[1]):Section(options)
+    end
     local title = pick(options, 'Section', 'Title', 'title', 'Name')
     local side = tostring(pick(options, 'left', 'Side', 'side', 'section')):lower()
     local parent = (side == 'right' or side == 'r') and self.Right or self.Left
@@ -1947,6 +2335,14 @@ end
 
 Tab.create_section = Tab.Section
 Tab.Groupbox = Tab.Section
+
+-- Identical builder: a sub-tab exposes Left/Right/Sections/SingleColumn under
+-- the same names a tab does, so nothing in here has to know the difference.
+SubTab.Section = Tab.Section
+SubTab.create_section = Tab.Section
+SubTab.Groupbox = Tab.Section
+SubTab.SetBadge = Tab.SetBadge
+SubTab.set_badge = Tab.SetBadge
 
 function Section:_next()
     self.Order = self.Order + 1
@@ -2414,6 +2810,302 @@ function Section:Slider(options)
     paint()
     task.spawn(function()
         pcall(callback, value)
+    end)
+    return api
+end
+
+--// Element: range slider --------------------------------------------------
+
+-- Two knobs on one track, for settings that are a span rather than a point:
+-- a delay picked randomly between 0.5s and 0.7s, a distance band an ESP should
+-- draw inside, a damage roll. The value is a table, `{ Min = , Max = }`, which
+-- survives the config round trip as-is because encode_flags copies tables
+-- through untouched.
+function Section:RangeSlider(options)
+    options = options or {}
+    local title = pick(options, 'Range', 'Title', 'title', 'Text')
+    local flag = pick(options, nil, 'Flag', 'flag')
+    local minimum = tonumber(pick(options, 0, 'Min', 'min', 'minimum_value', 'Minimum')) or 0
+    local maximum = tonumber(pick(options, 100, 'Max', 'max', 'maximum_value', 'Maximum')) or 100
+    local increment = tonumber(pick(options, 1, 'Increment', 'increment', 'round_number', 'Step')) or 1
+    local suffix = tostring(pick(options, '', 'Suffix', 'suffix', 'Unit'))
+    local separator = tostring(pick(options, ' - ', 'Separator', 'separator'))
+    local callback = pick(options, function() end, 'Callback', 'callback')
+    local ignore_saved = pick(options, false, 'IgnoreSaved', 'ignoresaved')
+
+    -- Defaults arrive either as two keys or as one table/pair, since
+    -- `Default = { 0.5, 0.7 }` is the shape people reach for first.
+    local default_low = pick(options, nil, 'DefaultMin', 'defaultmin', 'LowDefault', 'ValueMin')
+    local default_high = pick(options, nil, 'DefaultMax', 'defaultmax', 'HighDefault', 'ValueMax')
+    local default_pair = pick(options, nil, 'Default', 'default', 'Value', 'value')
+    if typeof(default_pair) == 'table' then
+        default_low = default_low or default_pair.Min or default_pair.min or default_pair[1]
+        default_high = default_high or default_pair.Max or default_pair.max or default_pair[2]
+    end
+    default_low = tonumber(default_low) or minimum
+    default_high = tonumber(default_high) or maximum
+
+    local bar_height = is_touch() and 8 or 6
+    local holder = create('Frame', {
+        Name = 'rangeframe',
+        Parent = self.Container,
+        BackgroundTransparency = 1,
+        Size = UDim2.new(1, 0, 0, (is_touch() and 44 or 38)),
+        LayoutOrder = self:_next(),
+    })
+
+    local title_label = label(holder, title, 12, nil, Theme.SubText)
+    title_label.Name = 'title'
+    title_label.Size = UDim2.new(1, -110, 0, 16)
+
+    -- Wider than the plain slider's readout: this one holds two numbers.
+    local value_label = label(holder, '', 12, 'semi', Theme.Text)
+    value_label.Name = 'value'
+    value_label.AnchorPoint = Vector2.new(1, 0)
+    value_label.Position = UDim2.new(1, 0, 0, 0)
+    value_label.Size = UDim2.new(0, 110, 0, 16)
+    value_label.TextXAlignment = Enum.TextXAlignment.Right
+
+    local track_hitbox = create('TextButton', {
+        Name = 'hitbox',
+        Parent = holder,
+        BackgroundTransparency = 1,
+        AnchorPoint = Vector2.new(0, 1),
+        Position = UDim2.new(0, 0, 1, 0),
+        Size = UDim2.new(1, 0, 0, is_touch() and 22 or 16),
+        Text = '',
+        AutoButtonColor = false,
+    })
+
+    local bar = create('Frame', {
+        Name = 'bar',
+        Parent = track_hitbox,
+        BackgroundColor3 = Theme.Element,
+        AnchorPoint = Vector2.new(0, 0.5),
+        Position = UDim2.new(0, 0, 0.5, 0),
+        Size = UDim2.new(1, 0, 0, bar_height),
+    })
+    corner(bar, 3)
+    stroke(bar, Theme.Stroke)
+
+    -- The accent sits between the two knobs rather than running from the left
+    -- edge, so the bar reads as "this span is selected".
+    local fill = accent(create('Frame', {
+        Name = 'slide',
+        Parent = bar,
+        BackgroundColor3 = Library.Accent,
+        Size = UDim2.new(0, 0, 1, 0),
+    }), { 'BackgroundColor3' })
+    corner(fill, 3)
+
+    local function make_knob(name)
+        local knob = create('Frame', {
+            Name = name,
+            Parent = bar,
+            BackgroundColor3 = Theme.Text,
+            AnchorPoint = Vector2.new(0.5, 0.5),
+            Position = UDim2.new(0, 0, 0.5, 0),
+            Size = UDim2.fromOffset(is_touch() and 14 or 10, is_touch() and 14 or 10),
+            ZIndex = 2,
+        })
+        corner(knob, 20)
+        return knob
+    end
+
+    local low_knob = make_knob('knob_min')
+    local high_knob = make_knob('knob_max')
+
+    local api = {}
+
+    local function round(number)
+        if increment <= 0 then
+            return number
+        end
+        local rounded = math.floor((number - minimum) / increment + 0.5) * increment + minimum
+        return tonumber(string.format('%.6f', rounded))
+    end
+
+    local low = math.clamp(round(default_low), minimum, maximum)
+    local high = math.clamp(round(default_high), minimum, maximum)
+    if low > high then
+        low, high = high, low
+    end
+
+    local function alpha_of(number)
+        if maximum == minimum then
+            return 0
+        end
+        return (number - minimum) / (maximum - minimum)
+    end
+
+    local function shown(number)
+        if increment >= 1 then
+            return math.round(number)
+        end
+        return number
+    end
+
+    local function paint()
+        local low_alpha = alpha_of(low)
+        local high_alpha = alpha_of(high)
+        tween(fill, QUAD, {
+            Position = UDim2.new(low_alpha, 0, 0, 0),
+            Size = UDim2.new(high_alpha - low_alpha, 0, 1, 0),
+        })
+        tween(low_knob, QUAD, { Position = UDim2.new(low_alpha, 0, 0.5, 0) })
+        tween(high_knob, QUAD, { Position = UDim2.new(high_alpha, 0, 0.5, 0) })
+        value_label.Text = tostring(shown(low)) .. separator .. tostring(shown(high)) .. suffix
+    end
+
+    function api:Set(new_low, new_high, silent)
+        -- Also accepts a single table, so :Set(Flags.foo) round-trips.
+        if typeof(new_low) == 'table' then
+            silent = new_high
+            local pair = new_low
+            new_low = pair.Min or pair.min or pair[1]
+            new_high = pair.Max or pair.max or pair[2]
+        end
+        local a = math.clamp(round(tonumber(new_low) or minimum), minimum, maximum)
+        local b = math.clamp(round(tonumber(new_high) or maximum), minimum, maximum)
+        if a > b then
+            a, b = b, a
+        end
+        low, high = a, b
+        paint()
+        if flag then
+            Library.Flags[flag] = { Min = low, Max = high }
+        end
+        if not silent then
+            task.spawn(function()
+                local ok, err = pcall(callback, low, high)
+                if not ok then
+                    warn('[centrl] range slider callback error: ' .. tostring(err))
+                end
+            end)
+            if not ignore_saved then
+                autosave()
+            end
+        end
+    end
+
+    function api:SetMin(value, silent)
+        api:Set(value, high, silent)
+    end
+
+    function api:SetMax(value, silent)
+        api:Set(low, value, silent)
+    end
+
+    function api:Get()
+        return low, high
+    end
+
+    function api:GetRange()
+        return { Min = low, Max = high }
+    end
+
+    -- The reason a range control usually exists: pick a value inside it.
+    function api:Random()
+        if low == high then
+            return low
+        end
+        return low + math.random() * (high - low)
+    end
+
+    api.SetValue, api.set_value = api.Set, api.Set
+
+    local dragging = nil
+
+    local function alpha_from(input)
+        local absolute = bar.AbsolutePosition.X
+        local width = math.max(bar.AbsoluteSize.X, 1)
+        return math.clamp((input_position(input).X - absolute) / width, 0, 1)
+    end
+
+    local function update_from(input)
+        local value = minimum + alpha_from(input) * (maximum - minimum)
+        if dragging == 'low' then
+            api:Set(math.min(value, high), high)
+        else
+            api:Set(low, math.max(value, low))
+        end
+    end
+
+    -- Which knob the press belongs to. Outside the span the answer is the side
+    -- you pressed on; inside it, the nearer knob. Both stacked on one spot is
+    -- the case that needs the explicit test, otherwise the pair would be stuck
+    -- there forever with no way to pull them apart.
+    local function pick_knob(input)
+        local alpha = alpha_from(input)
+        local low_alpha, high_alpha = alpha_of(low), alpha_of(high)
+        if alpha < low_alpha then
+            return 'low'
+        elseif alpha > high_alpha then
+            return 'high'
+        elseif math.abs(alpha - low_alpha) <= math.abs(alpha - high_alpha) then
+            return 'low'
+        end
+        return 'high'
+    end
+
+    local function grow(knob)
+        tween(knob, QUAD, { Size = UDim2.fromOffset(is_touch() and 18 or 13, is_touch() and 18 or 13) })
+    end
+
+    local function shrink(knob)
+        tween(knob, QUAD, { Size = UDim2.fromOffset(is_touch() and 14 or 10, is_touch() and 14 or 10) })
+    end
+
+    track(track_hitbox.InputBegan:Connect(function(input)
+        if not is_press(input) then
+            return
+        end
+        if not claim_drag(api) then
+            return
+        end
+        dragging = pick_knob(input)
+        grow(dragging == 'low' and low_knob or high_knob)
+        update_from(input)
+    end))
+
+    track(UserInputService.InputChanged:Connect(function(input)
+        if dragging and is_move(input) then
+            update_from(input)
+        end
+    end))
+
+    track(UserInputService.InputEnded:Connect(function(input)
+        if dragging and is_press(input) then
+            dragging = nil
+            release_drag(api)
+            shrink(low_knob)
+            shrink(high_knob)
+        end
+    end))
+
+    if flag and not ignore_saved then
+        register_flag(flag, { Min = low, Max = high }, function(value)
+            api:Set(value, nil, false)
+        end)
+        local saved = Library.Flags[flag]
+        if typeof(saved) == 'table' then
+            local a = tonumber(saved.Min or saved.min or saved[1])
+            local b = tonumber(saved.Max or saved.max or saved[2])
+            if a and b then
+                low = math.clamp(round(a), minimum, maximum)
+                high = math.clamp(round(b), minimum, maximum)
+                if low > high then
+                    low, high = high, low
+                end
+            end
+        end
+    elseif flag then
+        Library.Flags[flag] = { Min = low, Max = high }
+    end
+
+    paint()
+    task.spawn(function()
+        pcall(callback, low, high)
     end)
     return api
 end
@@ -3376,6 +4068,9 @@ Section.Color = Section.Colorpicker
 Section.create_toggle = Section.Toggle
 Section.create_checkbox = Section.Toggle
 Section.create_slider = Section.Slider
+Section.create_rangeslider = Section.RangeSlider
+Section.create_range_slider = Section.RangeSlider
+Section.Range = Section.RangeSlider
 Section.create_dropdown = Section.Dropdown
 Section.create_textbox = Section.Textbox
 Section.create_button = Section.Button
@@ -3384,6 +4079,565 @@ Section.create_colorpicker = Section.Colorpicker
 Section.create_label = Section.Label
 Section.create_paragraph = Section.Paragraph
 Section.create_divider = Section.Divider
+
+--// Element: progress meter -------------------------------------------------
+
+-- A read-only bar for things the script measures rather than things the user
+-- sets: blocks farmed this minute, ammo left, how far a solver has walked its
+-- search. It carries no flag because there is nothing to save.
+function Section:Progress(options)
+    options = options or {}
+    local title = pick(options, 'Progress', 'Title', 'title', 'Text')
+    local minimum = tonumber(pick(options, 0, 'Min', 'min', 'Minimum')) or 0
+    local maximum = tonumber(pick(options, 100, 'Max', 'max', 'Maximum')) or 100
+    local default = tonumber(pick(options, minimum, 'Default', 'default', 'Value', 'value')) or minimum
+    local suffix = tostring(pick(options, '', 'Suffix', 'suffix', 'Unit'))
+    local as_percent = pick(options, false, 'Percent', 'percent', 'ShowPercent')
+    local show_max = pick(options, false, 'ShowMax', 'show_max', 'OutOf')
+    local bar_color = pick(options, nil, 'Color', 'color', 'BarColor')
+    local formatter = pick(options, nil, 'Format', 'format', 'Formatter')
+
+    local holder = create('Frame', {
+        Name = 'progress',
+        Parent = self.Container,
+        BackgroundTransparency = 1,
+        Size = UDim2.new(1, 0, 0, is_touch() and 40 or 34),
+        LayoutOrder = self:_next(),
+    })
+
+    local title_label = label(holder, title, 12, nil, Theme.SubText)
+    title_label.Name = 'title'
+    title_label.Size = UDim2.new(1, -120, 0, 16)
+
+    local value_label = label(holder, '', 12, 'semi', Theme.Text)
+    value_label.Name = 'value'
+    value_label.AnchorPoint = Vector2.new(1, 0)
+    value_label.Position = UDim2.new(1, 0, 0, 0)
+    value_label.Size = UDim2.new(0, 120, 0, 16)
+    value_label.TextXAlignment = Enum.TextXAlignment.Right
+
+    local bar = create('Frame', {
+        Name = 'bar',
+        Parent = holder,
+        BackgroundColor3 = Theme.Element,
+        AnchorPoint = Vector2.new(0, 1),
+        Position = UDim2.new(0, 0, 1, 0),
+        Size = UDim2.new(1, 0, 0, is_touch() and 10 or 8),
+    })
+    corner(bar, 4)
+    stroke(bar, Theme.Stroke)
+
+    local fill = create('Frame', {
+        Name = 'fill',
+        Parent = bar,
+        BackgroundColor3 = bar_color or Library.Accent,
+        Size = UDim2.new(0, 0, 1, 0),
+        BorderSizePixel = 0,
+    })
+    corner(fill, 4)
+    -- Only follow the theme accent when the caller didn't name a colour: a bar
+    -- deliberately painted red shouldn't turn blue because the menu did.
+    if not bar_color then
+        accent(fill, { 'BackgroundColor3' })
+    end
+
+    local value = math.clamp(default, math.min(minimum, maximum), math.max(minimum, maximum))
+    local override_text = nil
+
+    local function alpha_of(number)
+        if maximum == minimum then
+            return 0
+        end
+        return math.clamp((number - minimum) / (maximum - minimum), 0, 1)
+    end
+
+    local function readout()
+        if override_text then
+            return override_text
+        end
+        if formatter then
+            local ok, text = pcall(formatter, value, minimum, maximum)
+            if ok and text ~= nil then
+                return tostring(text)
+            end
+        end
+        if as_percent then
+            return tostring(math.round(alpha_of(value) * 100)) .. '%'
+        end
+        local shown = math.abs(value - math.round(value)) < 1e-6 and math.round(value) or value
+        if show_max then
+            local cap = math.abs(maximum - math.round(maximum)) < 1e-6 and math.round(maximum) or maximum
+            return tostring(shown) .. ' / ' .. tostring(cap) .. suffix
+        end
+        return tostring(shown) .. suffix
+    end
+
+    local function paint(animate)
+        local target = UDim2.new(alpha_of(value), 0, 1, 0)
+        if animate == false then
+            fill.Size = target
+        else
+            tween(fill, QUAD, { Size = target })
+        end
+        value_label.Text = readout()
+    end
+
+    local api = {}
+
+    function api:Set(new_value, animate)
+        value = math.clamp(tonumber(new_value) or minimum, math.min(minimum, maximum), math.max(minimum, maximum))
+        paint(animate)
+    end
+
+    function api:SetMax(new_max)
+        maximum = tonumber(new_max) or maximum
+        api:Set(value)
+    end
+
+    function api:SetMin(new_min)
+        minimum = tonumber(new_min) or minimum
+        api:Set(value)
+    end
+
+    -- Pins the readout to arbitrary text ('idle', 'searching...') without
+    -- touching the bar. Pass nil to hand it back to the number.
+    function api:SetText(text)
+        override_text = text ~= nil and tostring(text) or nil
+        value_label.Text = readout()
+    end
+
+    function api:SetTitle(text)
+        title_label.Text = tostring(text)
+    end
+
+    function api:SetColor(color)
+        if typeof(color) ~= 'Color3' then
+            return
+        end
+        bar_color = color
+        Library._accent_objects[fill] = nil
+        tween(fill, QUAD, { BackgroundColor3 = color })
+    end
+
+    function api:Get()
+        return value
+    end
+
+    api.SetValue, api.set_value, api.set = api.Set, api.Set, api.Set
+    api.set_text, api.set_title, api.set_color = api.SetText, api.SetTitle, api.SetColor
+
+    paint(false)
+    return api
+end
+
+--// Element: button row ------------------------------------------------------
+
+-- Two or three related actions that would each waste a full row on their own:
+-- `Section:Buttons({ { Title = 'start', Callback = a }, { Title = 'stop',
+-- Callback = b } })`. Returns the list of button handles in the order given.
+function Section:Buttons(options)
+    options = options or {}
+    local entries = pick(options, nil, 'Buttons', 'buttons', 'Items', 'items', 'Options')
+    if entries == nil then
+        -- A bare array in the options table is the shape people reach for
+        -- first, so accept that too.
+        entries = {}
+        for index = 1, #options do
+            entries[index] = options[index]
+        end
+    end
+    if #entries == 0 then
+        return {}
+    end
+
+    local gap = 6
+    local count = #entries
+    local row = create('Frame', {
+        Name = 'buttonrow',
+        Parent = self.Container,
+        BackgroundTransparency = 1,
+        Size = UDim2.new(1, 0, 0, row_height()),
+        LayoutOrder = self:_next(),
+    })
+    list(row, gap, Enum.FillDirection.Horizontal)
+
+    local width = 1 / count
+    local trim = gap * (count - 1) / count
+    local apis = {}
+
+    for index = 1, count do
+        local entry = entries[index]
+        if typeof(entry) == 'string' then
+            entry = { Title = entry }
+        end
+        entry = entry or {}
+        local title = pick(entry, 'Button', 'Title', 'title', 'Text')
+        local callback = pick(entry, function() end, 'Callback', 'callback', 'Func')
+
+        local button = create('TextButton', {
+            Name = 'button',
+            Parent = row,
+            BackgroundColor3 = Theme.Element,
+            Size = UDim2.new(width, -trim, 1, 0),
+            Text = '',
+            AutoButtonColor = false,
+            LayoutOrder = index,
+        })
+        corner(button, 5)
+        stroke(button, Theme.Stroke)
+        hover(button, Theme.Element, Theme.ElementHover)
+
+        local title_label = label(button, title, 12, 'semi', Theme.Text)
+        title_label.Size = UDim2.new(1, -8, 1, 0)
+        title_label.Position = UDim2.new(0, 4, 0, 0)
+        title_label.TextXAlignment = Enum.TextXAlignment.Center
+        title_label.TextTruncate = Enum.TextTruncate.AtEnd
+
+        track(button.MouseButton1Click:Connect(function()
+            tween(button, TweenInfo.new(0.08), { BackgroundColor3 = Library.Accent })
+            tween(title_label, TweenInfo.new(0.08), { TextColor3 = Theme.Background })
+            task.delay(0.12, function()
+                tween(button, QUAD, { BackgroundColor3 = Theme.Element })
+                tween(title_label, QUAD, { TextColor3 = Theme.Text })
+            end)
+            task.spawn(function()
+                local ok, err = pcall(callback)
+                if not ok then
+                    warn('[centrl] button callback error: ' .. tostring(err))
+                end
+            end)
+        end))
+
+        local api = {}
+        function api:SetTitle(text)
+            title_label.Text = tostring(text)
+        end
+        function api:SetVisible(state)
+            button.Visible = state and true or false
+        end
+        api.set_title, api.set_visible = api.SetTitle, api.SetVisible
+        apis[index] = api
+    end
+
+    return apis
+end
+
+--// Element: stat readout ---------------------------------------------------
+
+-- Name on the left, live value on the right, no chrome. What a Label with a
+-- manually concatenated string was always trying to be.
+function Section:Stat(options)
+    options = options or {}
+    if typeof(options) == 'string' then
+        options = { Title = options }
+    end
+    local title = pick(options, 'Stat', 'Title', 'title', 'Name')
+    local value = pick(options, '-', 'Value', 'value', 'Default', 'Text')
+    local value_color = pick(options, Theme.Text, 'Color', 'color', 'ValueColor')
+
+    local row = create('Frame', {
+        Name = 'stat',
+        Parent = self.Container,
+        BackgroundTransparency = 1,
+        Size = UDim2.new(1, 0, 0, 18),
+        LayoutOrder = self:_next(),
+    })
+
+    local title_label = label(row, title, 12, nil, Theme.SubText)
+    title_label.Name = 'title'
+    title_label.Size = UDim2.new(0.5, -4, 1, 0)
+
+    local value_label = label(row, tostring(value), 12, 'semi', value_color)
+    value_label.Name = 'value'
+    value_label.AnchorPoint = Vector2.new(1, 0)
+    value_label.Position = UDim2.new(1, 0, 0, 0)
+    value_label.Size = UDim2.new(0.5, -4, 1, 0)
+    value_label.TextXAlignment = Enum.TextXAlignment.Right
+    value_label.TextTruncate = Enum.TextTruncate.AtEnd
+
+    local api = {}
+    function api:Set(new_value, color)
+        value_label.Text = tostring(new_value)
+        if typeof(color) == 'Color3' then
+            value_label.TextColor3 = color
+        end
+    end
+    function api:SetTitle(text)
+        title_label.Text = tostring(text)
+    end
+    function api:SetColor(color)
+        if typeof(color) == 'Color3' then
+            value_label.TextColor3 = color
+        end
+    end
+    function api:Get()
+        return value_label.Text
+    end
+    api.SetValue, api.set_value, api.set = api.Set, api.Set, api.Set
+    api.set_title, api.set_color = api.SetTitle, api.SetColor
+    return api
+end
+
+--// Element: console log -----------------------------------------------------
+
+-- A scrolling line buffer. Scripts that were faking one by rewriting a
+-- Paragraph with table.concat get real per-line colouring, a hard cap on how
+-- many lines exist as instances, and scrolling that doesn't reflow the page.
+function Section:Console(options)
+    options = options or {}
+    local title = pick(options, nil, 'Title', 'title')
+    local height = tonumber(pick(options, 120, 'Height', 'height', 'Lines')) or 120
+    local max_lines = math.max(1, tonumber(pick(options, 150, 'MaxLines', 'max_lines', 'Limit')) or 150)
+    local monospace = pick(options, true, 'Monospace', 'monospace', 'Code')
+    local auto_scroll = pick(options, true, 'AutoScroll', 'auto_scroll', 'Follow')
+    local timestamps = pick(options, false, 'Timestamps', 'timestamps', 'Time')
+    local text_size = tonumber(pick(options, 11, 'TextSize', 'text_size')) or 11
+
+    -- 12px of padding, plus the 14px title and the 4px list gap when there is
+    -- a title, so `Height` means the height of the log itself rather than of
+    -- the box that happens to contain it.
+    local holder = create('Frame', {
+        Name = 'console',
+        Parent = self.Container,
+        BackgroundColor3 = Theme.Element,
+        Size = UDim2.new(1, 0, 0, height + 12 + (title and 18 or 0)),
+        LayoutOrder = self:_next(),
+    })
+    corner(holder, 5)
+    stroke(holder, Theme.Stroke)
+    padding(holder, 6, 6, 8, 6)
+    list(holder, 4)
+
+    if title then
+        local title_label = label(holder, title, 11, 'bold', Theme.SubText)
+        title_label.Size = UDim2.new(1, 0, 0, 14)
+        title_label.LayoutOrder = 0
+    end
+
+    local view = create('ScrollingFrame', {
+        Name = 'view',
+        Parent = holder,
+        BackgroundTransparency = 1,
+        BorderSizePixel = 0,
+        Size = UDim2.new(1, 0, 0, height),
+        CanvasSize = UDim2.new(0, 0, 0, 0),
+        AutomaticCanvasSize = Enum.AutomaticSize.Y,
+        ScrollingDirection = Enum.ScrollingDirection.Y,
+        ScrollBarThickness = 2,
+        ScrollBarImageColor3 = Theme.Stroke,
+        ElasticBehavior = Enum.ElasticBehavior.WhenScrollable,
+        ClipsDescendants = true,
+        LayoutOrder = 1,
+    })
+    list(view, 2)
+    sink_scroll(view)
+
+    local lines = {}
+    local counter = 0
+
+    local function scroll_to_end()
+        if not auto_scroll then
+            return
+        end
+        -- AutomaticCanvasSize only reports the new height after a layout pass,
+        -- so the jump has to wait a frame or it lands on the previous bottom.
+        task.defer(function()
+            if view.Parent then
+                view.CanvasPosition = Vector2.new(0, math.max(0, view.AbsoluteCanvasSize.Y - view.AbsoluteWindowSize.Y))
+            end
+        end)
+    end
+
+    local api = {}
+
+    function api:Add(text, color)
+        if text == nil then
+            return
+        end
+        local body = tostring(text)
+        if timestamps then
+            body = os.date('[%H:%M:%S] ') .. body
+        end
+
+        counter = counter + 1
+        local props = text_props(text_size, nil, color or Theme.SubText)
+        if monospace then
+            props.FontFace = nil
+            props.Font = Enum.Font.Code
+        end
+        props.Name = 'line'
+        props.Parent = view
+        props.Text = body
+        props.Size = UDim2.new(1, -4, 0, 0)
+        props.AutomaticSize = Enum.AutomaticSize.Y
+        props.TextWrapped = true
+        props.LayoutOrder = counter
+        local line = create('TextLabel', props)
+
+        table.insert(lines, line)
+        -- Trimming by destroying the oldest keeps the instance count flat on a
+        -- log that runs for an hour, which a plain text buffer would not.
+        while #lines > max_lines do
+            local oldest = table.remove(lines, 1)
+            if oldest then
+                oldest:Destroy()
+            end
+        end
+
+        scroll_to_end()
+        return line
+    end
+
+    function api:Clear()
+        for _, line in pairs(lines) do
+            line:Destroy()
+        end
+        table.clear(lines)
+        counter = 0
+        view.CanvasPosition = Vector2.new(0, 0)
+    end
+
+    function api:Set(list_of_lines)
+        api:Clear()
+        if typeof(list_of_lines) == 'table' then
+            for _, entry in ipairs(list_of_lines) do
+                api:Add(entry)
+            end
+        elseif list_of_lines ~= nil then
+            api:Add(list_of_lines)
+        end
+    end
+
+    function api:Get()
+        local out = {}
+        for index, line in ipairs(lines) do
+            out[index] = line.Text
+        end
+        return out
+    end
+
+    function api:Count()
+        return #lines
+    end
+
+    function api:SetAutoScroll(state)
+        auto_scroll = state and true or false
+    end
+
+    -- Convenience colours so callers don't have to reach into Theme.
+    function api:Success(text)
+        return api:Add(text, Theme.Success)
+    end
+
+    function api:Warn(text)
+        return api:Add(text, Theme.Warning)
+    end
+
+    function api:Error(text)
+        return api:Add(text, Theme.Error)
+    end
+
+    function api:Info(text)
+        return api:Add(text, Theme.Info)
+    end
+
+    api.AddLine, api.Push, api.Print, api.add = api.Add, api.Add, api.Add, api.Add
+    api.clear, api.set, api.get = api.Clear, api.Set, api.Get
+    return api
+end
+
+Section.Log = Section.Console
+Section.Logbox = Section.Console
+
+--// Element: image -----------------------------------------------------------
+
+function Section:Image(options)
+    options = options or {}
+    if typeof(options) == 'string' then
+        options = { Image = options }
+    end
+    local image = pick(options, '', 'Image', 'image', 'Icon', 'Asset', 'Id')
+    local height = tonumber(pick(options, 120, 'Height', 'height')) or 120
+    local rounded = tonumber(pick(options, 5, 'Corner', 'corner', 'Radius')) or 5
+    local transparency = tonumber(pick(options, 0, 'Transparency', 'transparency')) or 0
+    local scale_type = pick(options, Enum.ScaleType.Fit, 'ScaleType', 'scale_type')
+
+    local holder = create('Frame', {
+        Name = 'image',
+        Parent = self.Container,
+        BackgroundColor3 = Theme.Element,
+        Size = UDim2.new(1, 0, 0, height),
+        ClipsDescendants = true,
+        LayoutOrder = self:_next(),
+    })
+    corner(holder, rounded)
+    stroke(holder, Theme.Stroke)
+
+    local picture = create('ImageLabel', {
+        Name = 'picture',
+        Parent = holder,
+        BackgroundTransparency = 1,
+        Size = UDim2.new(1, 0, 1, 0),
+        ImageTransparency = transparency,
+        ScaleType = scale_type,
+    })
+    -- Routed through ApplyIcon so a Lucide name works here as well as an
+    -- asset id, and neither ever yields the caller.
+    Library:ApplyIcon(picture, image, ui_icon_options(math.min(height, 128)))
+
+    local api = {}
+    function api:Set(new_image)
+        Library:ApplyIcon(picture, new_image, ui_icon_options(math.min(height, 128)))
+    end
+    function api:SetHeight(new_height)
+        height = tonumber(new_height) or height
+        holder.Size = UDim2.new(1, 0, 0, height)
+    end
+    function api:SetTransparency(value)
+        picture.ImageTransparency = tonumber(value) or 0
+    end
+    function api:SetColor(color)
+        if typeof(color) == 'Color3' then
+            picture.ImageColor3 = color
+        end
+    end
+    api.set, api.set_height = api.Set, api.SetHeight
+    return api
+end
+
+--// Section housekeeping -----------------------------------------------------
+
+function Section:SetVisible(state)
+    self.Card.Visible = state and true or false
+end
+
+function Section:Destroy()
+    local tab = self.Tab
+    if tab and tab.Sections then
+        for index, other in ipairs(tab.Sections) do
+            if other == self then
+                table.remove(tab.Sections, index)
+                break
+            end
+        end
+    end
+    self.Card:Destroy()
+end
+
+-- Wipes every element out of a section without losing the section itself, for
+-- panels that rebuild their contents from live game state.
+function Section:Clear()
+    for _, child in pairs(self.Container:GetChildren()) do
+        if not child:IsA('UIListLayout') then
+            child:Destroy()
+        end
+    end
+    self.Order = 0
+end
+
+Section.set_visible = Section.SetVisible
+Section.destroy = Section.Destroy
+Section.clear = Section.Clear
 
 --// Built-in settings tab ---------------------------------------------------
 
@@ -3549,6 +4803,8 @@ end
 
 Window.create_tab = Window.Tab
 Window.AddTab = Window.Tab
+Window.get_tab = Window.GetTab
+Window.select_tab = Window.SelectTab
 Window.set_toggle_key = Window.SetToggleKey
 Window.set_scale = function(a, b)
     Library:SetScale(tonumber(b) or tonumber(a) or 1)
@@ -3588,12 +4844,15 @@ Library.Version = '2.0.0'
 -- Merged in from https://raw.githubusercontent.com/iamdookie1/inf/refs/heads/main/source.txt
 -- (a build of Infinite Yield that reflows Centrl's own left tab rail into a
 -- horizontal strip across the top of the window instead of building a
--- parallel one) plus a hand-built 3-line menu icon in the topbar. These are
--- the only two changes; everything above this point is Lib2 exactly as
--- published. Both patches use the library's own real internals (create,
--- corner, stroke, accent, hover, Theme, Window, Tab, TOPBAR_HEIGHT, ...)
--- rather than reimplementing them, since this code lives inside the same
--- closure as the rest of the library.
+-- parallel one) plus a hand-built 3-line menu icon in the topbar. Both
+-- patches use the library's own real internals (create, corner, stroke,
+-- accent, hover, Theme, Window, Tab, TOPBAR_HEIGHT, ...) rather than
+-- reimplementing them, since this code lives inside the same closure as the
+-- rest of the library.
+--
+-- This has to stay at the very bottom: it wraps Window.Tab and
+-- Library.Window, so everything it wraps must already be defined. Sub-tabs
+-- (Tab:Tab) are unaffected -- their strip is horizontal to begin with.
 
 local TOP_TAB_STRIP_HEIGHT = 40
 local TOP_TAB_BUTTON_WIDTH = 100
@@ -3617,6 +4876,15 @@ local function restyle_tab_for_top(tab)
     -- button, since the title color change alone already shows which tab
     -- is active.
     tab.Indicator.Visible = false
+
+    -- The badge normally sits in the gutter the left-aligned title label
+    -- leaves on its right. A centred title has no such gutter, so up here it
+    -- becomes a corner marker instead of a trailing pill.
+    if tab.Badge then
+        tab.Badge.AnchorPoint = Vector2.new(1, 0)
+        tab.Badge.Position = UDim2.new(1, -3, 0, 3)
+        tab.Badge.Size = UDim2.new(0, 0, 0, 13)
+    end
 end
 
 -- Patched once on the shared class table, so it covers every tab on every
