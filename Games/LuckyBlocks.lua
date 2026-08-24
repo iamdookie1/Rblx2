@@ -655,7 +655,7 @@ local function teleportTo(cframe)
 end
 
 --// UI ---------------------------------------------------------------------------
-local Centrl = loadstring(game:HttpGet("https://raw.githubusercontent.com/iamdookie1/Ui/main/Lib2.lua"))()
+local Centrl = loadstring(game:HttpGet('https://raw.githubusercontent.com/iamdookie1/Rblx2/main/UI/Lib2.lua'))()
 
 local Window = Centrl:Window({
     Title = "lucky blocks",

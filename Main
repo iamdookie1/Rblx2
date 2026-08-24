@@ -1,4 +1,5 @@
 local RunService = game:GetService("RunService")
+local Players = game:GetService("Players")
 
 local REPO_RAW_BASE = 'https://raw.githubusercontent.com/iamdookie1/Rblx2/main/'
 local WATCH_DURATION = 5
@@ -25,7 +26,10 @@ local Games = {
     [2788336572] = { Name = '3008 (test place)', Script = 'Games/3008.lua' },
 }
 
-local Centrl = loadstring(game:HttpGet('https://raw.githubusercontent.com/iamdookie1/Ui/main/Lib2.lua'))()
+-- The UI ships in this repo now, so the hub and everything it loads are
+-- versioned together: a change to the library lands with the scripts written
+-- against it instead of drifting in a second repo.
+local Centrl = loadstring(game:HttpGet(REPO_RAW_BASE .. 'UI/Lib2.lua'))()
 
 local Window = Centrl:Window({
     Title = 'hub',
@@ -35,36 +39,197 @@ local Window = Centrl:Window({
     Accent = Color3.fromRGB(60, 140, 255),
 })
 
-local MainTab = Window:Tab({ Title = 'load', Icon = 'gamepad-2' })
+-- One rail entry holding three real pages, rather than three rail entries for
+-- what is one screen's worth of loader.
+local HubTab = Window:Tab({ Title = 'hub', Icon = 'gamepad-2' })
 
-local Status = MainTab:Section({ Title = 'status', Side = 'left' })
-local Load = MainTab:Section({ Title = 'load', Side = 'right' })
+local LoadPage = HubTab:Tab({ Title = 'load', Icon = 'play' })
+local GamesPage = HubTab:Tab({ Title = 'games', Icon = 'list' })
+local SessionPage = HubTab:Tab({ Title = 'session', Icon = 'info' })
 
-local StatusLabel = Status:Label({ Title = 'Watching for supported game...' })
+--// load ---------------------------------------------------------------------
+
+local Status = LoadPage:Section({ Title = 'status', Side = 'left' })
+local Load = LoadPage:Section({ Title = 'load', Side = 'right' })
+
+local PlaceStat = Status:Stat({ Title = 'place id', Value = tostring(game.PlaceId) })
+local DetectedStat = Status:Stat({ Title = 'detected', Value = 'searching...' })
+local ScriptStat = Status:Stat({ Title = 'script', Value = '-' })
+
+local Log = Status:Console({ Title = 'log', Height = 110, MaxLines = 60, Timestamps = true })
+Log:Add('watching for a supported game...')
 
 local MatchedGame = nil
+local Loaded = false
 
-local LoadButton = Load:Button({
-    Title = 'load game',
+local function runMatched()
+    if not MatchedGame then
+        Log:Warn('nothing to load')
+        return
+    end
+    if Loaded then
+        Log:Warn('already loaded — rejoin to load again')
+        return
+    end
+
+    local url = REPO_RAW_BASE .. MatchedGame.Script
+    Log:Add('fetching ' .. MatchedGame.Script)
+
+    local ok, source = pcall(game.HttpGet, game, url)
+    if not ok then
+        Log:Error('fetch failed: ' .. tostring(source))
+        return
+    end
+
+    local loader, compileError = loadstring(source)
+    if not loader then
+        -- Compiling before unloading the menu, so a broken script leaves the
+        -- hub on screen with the reason instead of taking it down with it.
+        Log:Error('compile failed: ' .. tostring(compileError))
+        return
+    end
+
+    Loaded = true
+    Log:Success('running ' .. MatchedGame.Name)
+    Centrl:Unload()
+    loader()
+end
+
+Load:Buttons({
+    { Title = 'load game', Callback = runMatched },
+    {
+        Title = 'copy place id',
+        Callback = function()
+            if setclipboard then
+                setclipboard(tostring(game.PlaceId))
+                Log:Add('place id copied')
+            else
+                Log:Warn('no setclipboard in this executor')
+            end
+        end,
+    },
+})
+
+Load:Button({
+    Title = 'unload hub',
     Callback = function()
-        if not MatchedGame then return end
-        local scriptUrl = REPO_RAW_BASE .. MatchedGame.Script
-        local loader = loadstring(game:HttpGet(scriptUrl))
         Centrl:Unload()
-        loader()
+    end,
+})
+
+--// games --------------------------------------------------------------------
+
+local Supported = GamesPage:Section({ Title = 'supported games', Side = 'left' })
+
+-- Sorted by name so the list is stable between sessions; pairs over a table
+-- keyed by PlaceId would shuffle it every run.
+local ordered = {}
+for placeId, entry in pairs(Games) do
+    table.insert(ordered, { PlaceId = placeId, Name = entry.Name, Script = entry.Script })
+end
+table.sort(ordered, function(a, b)
+    return a.Name:lower() < b.Name:lower()
+end)
+
+for _, entry in ipairs(ordered) do
+    local here = entry.PlaceId == game.PlaceId
+    Supported:Stat({
+        Title = entry.Name,
+        Value = tostring(entry.PlaceId),
+        Color = here and Color3.fromRGB(126, 217, 87) or nil,
+    })
+end
+
+GamesPage:SetBadge(tostring(#ordered))
+
+local Jump = GamesPage:Section({ Title = 'open', Side = 'right' })
+
+local jumpChoice = ordered[1] and ordered[1].Name or nil
+local jumpNames = {}
+for index, entry in ipairs(ordered) do
+    jumpNames[index] = entry.Name
+end
+
+Jump:Dropdown({
+    Title = 'game',
+    Values = jumpNames,
+    Default = jumpChoice,
+    Callback = function(value)
+        jumpChoice = value
+    end,
+})
+
+Jump:Button({
+    Title = 'copy loadstring',
+    Callback = function()
+        for _, entry in ipairs(ordered) do
+            if entry.Name == jumpChoice then
+                if not setclipboard then
+                    Log:Warn('no setclipboard in this executor')
+                    return
+                end
+                setclipboard(("loadstring(game:HttpGet('%s%s'))()"):format(REPO_RAW_BASE, entry.Script))
+                Log:Add('loadstring for ' .. entry.Name .. ' copied')
+                return
+            end
+        end
+    end,
+})
+
+Jump:Label({
+    Text = 'The hub only runs a script when you are already in its place. Copy a loadstring here to run one by hand.',
+})
+
+--// session ------------------------------------------------------------------
+
+local Session = SessionPage:Section({ Title = 'session', Side = 'left' })
+
+local executor = 'unknown'
+if identifyexecutor then
+    local ok, name = pcall(identifyexecutor)
+    if ok and name then
+        executor = tostring(name)
+    end
+end
+
+Session:Stat({ Title = 'executor', Value = executor })
+Session:Stat({ Title = 'player', Value = Players.LocalPlayer and Players.LocalPlayer.Name or '-' })
+Session:Stat({ Title = 'place id', Value = tostring(game.PlaceId) })
+Session:Stat({ Title = 'job id', Value = game.JobId ~= '' and game.JobId or 'studio' })
+
+local Menu = SessionPage:Section({ Title = 'menu', Side = 'right' })
+
+Menu:Label({ Text = 'Right Shift toggles the menu. Everything under settings — accent, scale, configs — is saved per folder.' })
+
+Menu:Button({
+    Title = 'copy job id',
+    Callback = function()
+        if setclipboard then
+            setclipboard(tostring(game.JobId))
+            Log:Add('job id copied')
+        else
+            Log:Warn('no setclipboard in this executor')
+        end
     end,
 })
 
 Window:Load()
 
--- Watch for a supported game for up to WATCH_DURATION seconds after load, then stop.
+-- Watch for a supported game for up to WATCH_DURATION seconds after load, then
+-- stop. PlaceId is set before this ever runs in practice, but a slow join can
+-- still be mid-swap when the hub is executed.
 task.spawn(function()
     local start = os.clock()
     while os.clock() - start < WATCH_DURATION do
         local match = Games[game.PlaceId]
         if match then
             MatchedGame = match
-            StatusLabel:Set('Detected: ' .. match.Name)
+            PlaceStat:Set(tostring(game.PlaceId))
+            DetectedStat:Set(match.Name, Color3.fromRGB(126, 217, 87))
+            ScriptStat:Set(match.Script)
+            HubTab:SetBadge('1')
+            LoadPage:SetBadge('!')
+            Log:Success(match.Name .. ' detected')
             Centrl:Notify({
                 Title = 'hub',
                 Content = match.Name .. ' detected. Press "load game" to run it.',
@@ -76,7 +241,6 @@ task.spawn(function()
         RunService.Heartbeat:Wait()
     end
 
-    if not MatchedGame then
-        StatusLabel:Set('No supported game detected')
-    end
+    DetectedStat:Set('unsupported', Color3.fromRGB(255, 96, 106))
+    Log:Warn('no supported game for place ' .. tostring(game.PlaceId))
 end)
