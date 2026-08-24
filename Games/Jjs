@@ -13,6 +13,83 @@ local Config = {
 local BLACKFLASH_DELAY = 0.212
 local VARIANT4_DELAY = 0.4
 
+-- Black flash timing under lag.
+--
+-- The old version slept for a fixed 0.212s with task.delay and fired. Two
+-- things break that when the connection is poor:
+--
+--   task.delay counts wall-clock seconds, but the swing it is trying to hit
+--   is an animation. A frame hitch delays the animation without delaying the
+--   timer, so the fire lands at the wrong point of a swing that has not got
+--   there yet.
+--
+--   Even with perfect local timing, the remote still has to travel. The server
+--   judges the window against when it *receives* the fire, so a 90ms ping puts
+--   every attempt 90ms late no matter how well the client timed it.
+--
+-- So the trigger reads the animation's own clock instead of sleeping, and
+-- fires early by the measured ping. What is left after that is whatever the
+-- ping figure gets wrong, which is what the tuner below is for.
+local FlashTune = {
+    PingComp = true,
+    AutoTune = true,
+    -- Extra lead tried on top of ping compensation, in seconds. Kept small:
+    -- this is correcting the error in a latency estimate, not the delay.
+    Candidates = { -0.06, -0.04, -0.02, 0, 0.02, 0.04, 0.06 },
+    Stats = {},          -- offset -> { n, hit }
+    Current = 0,
+    Attempts = 0,
+    Hits = 0,
+    Pending = nil,
+    MinSamples = 4,
+    ExploreChance = 0.25,
+}
+
+local function flashStat(offset)
+    local entry = FlashTune.Stats[offset]
+    if not entry then
+        entry = { n = 0, hit = 0 }
+        FlashTune.Stats[offset] = entry
+    end
+    return entry
+end
+
+-- Mostly use the best offset seen so far, but keep sampling the others: a
+-- candidate that lost its first two coin flips would otherwise never be tried
+-- again, and ping drifts over a session anyway.
+local function pickOffset()
+    if not FlashTune.AutoTune then
+        return 0
+    end
+    if math.random() < FlashTune.ExploreChance then
+        return FlashTune.Candidates[math.random(1, #FlashTune.Candidates)]
+    end
+    local best, bestRate = nil, -1
+    for _, offset in ipairs(FlashTune.Candidates) do
+        local entry = FlashTune.Stats[offset]
+        if entry and entry.n >= FlashTune.MinSamples then
+            local rate = entry.hit / entry.n
+            if rate > bestRate then
+                best, bestRate = offset, rate
+            end
+        end
+    end
+    return best or 0
+end
+
+local function currentPing()
+    if not FlashTune.PingComp then return 0 end
+    local ok, ping = pcall(function()
+        return LocalPlayer:GetNetworkPing()
+    end)
+    if ok and type(ping) == 'number' and ping >= 0 then
+        -- GetNetworkPing reports seconds. Capped so a spike cannot pull the
+        -- fire back before the swing has started.
+        return math.clamp(ping, 0, BLACKFLASH_DELAY * 0.75)
+    end
+    return 0
+end
+
 local Services = ReplicatedStorage.Knit.Knit.Services
 local Activated = Services.DivergentFistService.RE.Activated
 local RightActivated = Services.ItadoriService.RE.RightActivated
@@ -235,14 +312,37 @@ local function getDivergentFistArg()
     return moveset:FindFirstChild("Divergent Fist")
 end
 
+-- Fires when the animation itself reaches `at`, rather than when a timer says
+-- that much time has passed. A dropped frame moves both together.
+local function atAnimationTime(track, at, run)
+    local connection
+    local started = tick()
+    connection = RunService.Heartbeat:Connect(function()
+        local ok, isPlaying, timePosition = pcall(function()
+            return track.IsPlaying, track.TimePosition
+        end)
+        if not ok or not isPlaying then
+            connection:Disconnect()
+            return
+        end
+        if timePosition >= at then
+            connection:Disconnect()
+            run()
+        elseif tick() - started > 3 then
+            -- The track should never run this long; never leak the connection.
+            connection:Disconnect()
+        end
+    end)
+    return connection
+end
+
 local function hookTrack(track, id)
     local variant = DIVERGENT_IDS[id]
     if not variant then return end
 
     if variant == 4 then
-        task.delay(VARIANT4_DELAY, function()
+        atAnimationTime(track, VARIANT4_DELAY, function()
             if not Config.Enabled then return end
-            if not track.IsPlaying then return end
             RightActivated:FireServer()
         end)
         return
@@ -251,14 +351,69 @@ local function hookTrack(track, id)
     local shouldFire = math.random(1, 100) <= Config.Chance
     if not shouldFire then return end
 
-    task.delay(BLACKFLASH_DELAY, function()
+    local offset = pickOffset()
+    local lead = currentPing() + offset
+    -- Clamped so a large lead cannot ask for a negative animation time, which
+    -- would fire on the very first frame of the swing.
+    local at = math.clamp(BLACKFLASH_DELAY - lead, 0.02, BLACKFLASH_DELAY)
+
+    atAnimationTime(track, at, function()
         if not Config.Enabled then return end
-        if not track.IsPlaying then return end
         local arg = getDivergentFistArg()
-        if arg then
-            Activated:FireServer(arg)
-        end
+        if not arg then return end
+        Activated:FireServer(arg)
+
+        FlashTune.Current = offset
+        FlashTune.Attempts = FlashTune.Attempts + 1
+        -- Resolved by the ItadoriService broadcast: BlackFlashHit means the
+        -- window was hit, a plain Hit means we connected without it, and
+        -- nothing at all means the punch missed and says nothing about timing.
+        local attempt = { offset = offset, at = tick(), done = false }
+        FlashTune.Pending = attempt
+        task.delay(1.2, function()
+            if not attempt.done then
+                attempt.done = true
+                FlashTune.Pending = nil
+            end
+        end)
     end)
+end
+
+-- Its own listener rather than a branch inside the generic Effects hook: the
+-- black flash has nothing to do with the intel feed and should tune itself
+-- whether or not that is switched on.
+do
+    local itadoriRE = Services:FindFirstChild("ItadoriService")
+    itadoriRE = itadoriRE and itadoriRE:FindFirstChild("RE")
+    local effects = itadoriRE and itadoriRE:FindFirstChild("Effects")
+    if effects then
+        effects.OnClientEvent:Connect(function(effectName, attacker)
+            if not FlashTune.AutoTune then return end
+            local attempt = FlashTune.Pending
+            if not attempt or attempt.done then return end
+            if typeof(attacker) ~= 'Instance' then return end
+            if attacker.Name ~= LocalPlayer.Name and attacker ~= LocalPlayer.Character then
+                return
+            end
+            -- BlackFlashHit means the window was hit. A plain Hit means we
+            -- connected without it, which is the case that says the timing was
+            -- off. A whiff produces neither and is left out of the tally,
+            -- since it says nothing about when we fired.
+            if effectName == 'BlackFlashHit' then
+                attempt.done = true
+                FlashTune.Pending = nil
+                local entry = flashStat(attempt.offset)
+                entry.n = entry.n + 1
+                entry.hit = entry.hit + 1
+                FlashTune.Hits = FlashTune.Hits + 1
+            elseif effectName == 'Hit' then
+                attempt.done = true
+                FlashTune.Pending = nil
+                local entry = flashStat(attempt.offset)
+                entry.n = entry.n + 1
+            end
+        end)
+    end
 end
 
 local function connectHumanoid(hum)
@@ -467,14 +622,32 @@ local function isRagdolled(char)
     return (char:GetAttribute("Ragdoll") or 0) > 0
 end
 
--- The one question that decides whether any of the automation may act.
+-- The one question that decides whether any of the automation may act, copied
+-- from the game's own gate in DashRequest rather than invented:
+--
+--     if Info:FindFirstChild("Block") then return end
+--     if Info:FindFirstChild("Stun") then return end
+--     if char:GetAttribute("Ragdoll") > 0 then return end
+--     local v132 = Info:FindFirstChild("InSkill")
+--     if v132 and v132.Value == false then return end
+--
+-- Note the difference in how InSkill is treated. Block, Stun and Ragdoll are
+-- presence checks, but InSkill only locks you out when its Value is false -
+-- present-and-true means "in a skill and still allowed to act". Testing it by
+-- presence, which is what this used to do, refused to block or counter through
+-- any skill at all and was stricter than the game itself.
+local function valueLocked(char, name)
+    local info = infoOf(char)
+    local state = info and info:FindFirstChild(name)
+    return state ~= nil and state.Value == false
+end
+
 local function canAct(char)
     if not char then return false, 'no character' end
     if char:GetAttribute("Dead") then return false, 'dead' end
     if isRagdolled(char) then return false, 'ragdolled' end
     if hasState(char, 'Stun') then return false, 'stunned' end
-    if hasState(char, 'InSkill') then return false, 'in a skill' end
-    if hasState(char, 'Cancel') then return false, 'cancelled' end
+    if valueLocked(char, 'InSkill') then return false, 'locked in a skill' end
     return true, 'ready'
 end
 
@@ -1324,8 +1497,10 @@ local BlockConfig = {
     -- the same way.
     MaxAngle = 75,
     Hold = 0.45,
-    Reaction = 0.06,
     LookAhead = 0.9,
+    -- How long after an attack was announced the guard is still worth having
+    -- up, since the next hit of the chain is coming.
+    Sustain = 1.2,
     Range = 70,
     -- Refuse to block moves that have been measured going through guards.
     SkipUnblockable = true,
@@ -1563,13 +1738,17 @@ local function tryBlock()
         return
     end
 
-    if threat.timeLeft < BlockConfig.Reaction then
-        BlockConfig.Skipped = BlockConfig.Skipped + 1
-        setStatus(BlockConfig, ('too late (%.2fs)'):format(threat.timeLeft))
-        return
-    end
+    -- Deliberately not a narrow timing band. Attacks here come in chains, and
+    -- a guard that goes up "too late" for the first hit still stops the next
+    -- three - so missing the window is not a reason to stand there unguarded.
+    -- What matters is that someone nearby is actively swinging.
     if threat.timeLeft > BlockConfig.LookAhead then
         setStatus(BlockConfig, ('waiting (%.2fs out)'):format(threat.timeLeft))
+        return
+    end
+    local age = tick() - threat.event.at
+    if age > BlockConfig.Sustain then
+        setStatus(BlockConfig, 'nothing recent')
         return
     end
 
@@ -1678,6 +1857,26 @@ Flash:Slider({
     Callback = function(v) Config.Chance = v end,
 })
 
+local FlashSection_Tune = FlashTab:Section({ Title = 'timing under lag', Side = 'left' })
+
+FlashSection_Tune:Toggle({
+    Title = 'ping compensation',
+    Flag = 'bf_pingcomp',
+    Default = true,
+    Callback = function(state) FlashTune.PingComp = state end,
+})
+
+FlashSection_Tune:Toggle({
+    Title = 'auto tune',
+    Flag = 'bf_autotune',
+    Default = true,
+    Callback = function(state) FlashTune.AutoTune = state end,
+})
+
+local FlashPing = FlashSection_Tune:Stat({ Title = 'ping', Value = '-' })
+local FlashRate = FlashSection_Tune:Stat({ Title = 'landed', Value = '0 / 0' })
+local FlashOffset = FlashSection_Tune:Stat({ Title = 'best lead', Value = 'learning' })
+
 local FlashInfo = FlashTab:Section({ Title = 'timing', Side = 'right' })
 
 FlashInfo:Paragraph({
@@ -1687,7 +1886,17 @@ FlashInfo:Paragraph({
 
 FlashInfo:Paragraph({
     Title = 'fist 4',
-    Text = 'No black flash. Fires ItadoriService.RightActivated 0.4s after the animation starts, every time.',
+    Text = 'No black flash. Fires ItadoriService.RightActivated 0.4s into the animation, every time.',
+})
+
+FlashInfo:Paragraph({
+    Title = 'why it drifts when you lag',
+    Text = 'Two reasons. A timer counts wall-clock seconds but the swing is an animation, so a dropped frame delays the swing without delaying the timer and the fire lands somewhere the punch has not reached. And the server judges the window against when it receives the fire, so ping puts every attempt late by that much however well the client timed it.',
+})
+
+FlashInfo:Paragraph({
+    Title = 'what it does about it',
+    Text = 'The trigger watches the animation\'s own clock instead of sleeping, so a hitch moves both together, and fires early by your measured ping. Auto tune handles the rest: it tries small leads either side of that and keeps whichever lands most often, judged by ItadoriService announcing BlackFlashHit rather than a plain Hit. A punch that misses entirely is left out of the tally, since it says nothing about timing.',
 })
 
 --// Main > intel -------------------------------------------------------------
@@ -2120,14 +2329,14 @@ BlockSection:Slider({
 })
 
 BlockSection:Slider({
-    Title = 'min reaction',
-    Flag = 'block_reaction',
-    Min = 0,
-    Max = 0.4,
-    Increment = 0.01,
-    Default = 0.06,
+    Title = 'hold through',
+    Flag = 'block_sustain',
+    Min = 0.2,
+    Max = 3,
+    Increment = 0.05,
+    Default = 1.2,
     Suffix = 's',
-    Callback = function(v) BlockConfig.Reaction = v end,
+    Callback = function(v) BlockConfig.Sustain = v end,
 })
 
 BlockSection:Slider({
@@ -2237,7 +2446,7 @@ CounterNotes:Paragraph({
 
 CounterNotes:Paragraph({
     Title = 'what it gates on instead',
-    Text = 'Timing. Manji only goes out when the hit is due inside the counter window, so it is not spent on something that lands after the counter expires. Block only goes up when the attack is already inside your facing cone, because a block facing the wrong way gets broken anyway - and a block that snaps to a hit coming from behind is the obvious tell.',
+    Text = 'Manji gates on timing: it only goes out when the hit is due inside the counter window, so it is not spent on something landing after the counter expires. Block deliberately does not - attacks come in chains, and a guard that goes up late for the first hit still stops the next three, so missing a window is no reason to stand there unguarded. It gates on the attack being inside your facing cone instead, because a block facing the wrong way gets broken anyway and one that snaps to a hit from behind is the obvious tell.',
 })
 
 CounterNotes:Paragraph({
@@ -2410,6 +2619,29 @@ task.spawn(function()
         end
 
         pcall(refreshEsp)
+
+        do
+            local ok, ping = pcall(function() return LocalPlayer:GetNetworkPing() end)
+            FlashPing:Set(ok and type(ping) == 'number'
+                and ('%d ms'):format(math.floor(ping * 1000 + 0.5)) or '-')
+            FlashRate:Set(('%d / %d'):format(FlashTune.Hits, FlashTune.Attempts))
+            local best, bestRate, bestN = nil, -1, 0
+            for _, offset in ipairs(FlashTune.Candidates) do
+                local entry = FlashTune.Stats[offset]
+                if entry and entry.n >= FlashTune.MinSamples then
+                    local rate = entry.hit / entry.n
+                    if rate > bestRate then
+                        best, bestRate, bestN = offset, rate, entry.n
+                    end
+                end
+            end
+            if best then
+                FlashOffset:Set(('%+.0f ms  %d%% (n=%d)')
+                    :format(best * 1000, math.floor(bestRate * 100), bestN), COLOR_GOOD)
+            else
+                FlashOffset:Set('learning')
+            end
+        end
 
         if ManjiConfig.AutoWindow then
             local learned, hits, misses = learnedWindow()
