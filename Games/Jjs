@@ -608,6 +608,11 @@ end
 
 -- State reads. All of these work on any character, not just ours.
 
+local function positionOf(char)
+    local hrp = char and char:FindFirstChild('HumanoidRootPart')
+    return hrp and hrp.Position or nil
+end
+
 local function infoOf(char)
     return char and char:FindFirstChild("Info") or nil
 end
@@ -867,6 +872,27 @@ local function blockability(key)
     return entry.blocked / tried, tried
 end
 
+-- One verdict, used by the automation and by everything that displays it, so
+-- the panel can never describe a move differently from how the script treats
+-- it. Thresholds live here rather than being restated at each call site.
+local BLOCK_MIN_SAMPLES = 3
+local BLOCK_FAIL_BELOW = 0.34
+local BLOCK_PASS_ABOVE = 0.67
+
+local function blockVerdict(key)
+    local rate, tried = blockability(key)
+    if not rate or tried < BLOCK_MIN_SAMPLES then
+        return 'unknown', rate, tried or 0
+    end
+    if rate < BLOCK_FAIL_BELOW then
+        return 'unblockable', rate, tried
+    end
+    if rate >= BLOCK_PASS_ABOVE then
+        return 'blockable', rate, tried
+    end
+    return 'mixed', rate, tried
+end
+
 -- The measured counter window: the largest timeLeft that has ever actually
 -- produced a hit, shrunk slightly for margin. Falls back to nil while there is
 -- nothing to go on, which is what makes the manual slider still matter on a
@@ -979,6 +1005,10 @@ local function noteAnnouncement(service, effect, actor, mine)
         actor = actor,
         mine = mine and true or false,
         at = now,
+        -- Where the attacker stood when they announced. Distance then becomes
+        -- a question about a specific victim rather than always about us,
+        -- which is what lets somebody else's fight teach us anything.
+        origin = positionOf(actor),
         distance = distanceTo(actor),
     })
     -- Trim by age rather than count so a quiet minute doesn't keep stale
@@ -1018,7 +1048,8 @@ local BLAME_DEFAULT_REACH = 28
 local REACH_MARGIN = 1.25
 
 local function blameFor(victim, at)
-    local best, bestScore = nil, -math.huge
+    local best, bestScore, bestReach = nil, -math.huge, nil
+    local target = positionOf(victim)
     for index = #Intel.Recent, 1, -1 do
         local event = Intel.Recent[index]
         local gap = at - event.at
@@ -1026,22 +1057,29 @@ local function blameFor(victim, at)
             break
         end
         if gap >= 0 and event.actor and event.actor ~= victim and event.actor.Parent then
+            -- Measured from where the attacker stood to whoever got hit. Using
+            -- our own distance would make every judgement about somebody
+            -- else's fight meaningless, and those are most of the samples.
+            local reachedFor = math.huge
+            if event.origin and target then
+                reachedFor = (event.origin - target).Magnitude
+            end
             local reach = learnedReach(event.key)
             local limit = reach and (reach * REACH_MARGIN) or BLAME_DEFAULT_REACH
-            if (event.distance or math.huge) <= limit then
+            if reachedFor <= limit then
                 -- Recency and closeness break ties; fit dominates when known.
-                local score = -gap * 0.5 - (event.distance or 0) / 200
+                local score = -gap * 0.5 - reachedFor / 200
                 local lead = predictedLead(event.key)
                 if lead then
                     score = score + 2 - math.min(2, math.abs(gap - lead) / 0.15)
                 end
                 if score > bestScore then
-                    best, bestScore = event, score
+                    best, bestScore, bestReach = event, score, reachedFor
                 end
             end
         end
     end
-    return best
+    return best, bestReach
 end
 
 local pendingThrow = nil
@@ -1053,21 +1091,47 @@ local pendingThrow = nil
 -- meant the tally only ever saw what the script did, so a session spent
 -- blocking and countering by hand recorded nothing at all. Blaming at
 -- resolution counts every block and every counter, whoever pressed it.
-local function resolveBlock(perfect)
-    local blame = blameFor(ownCharacter(), tick())
+-- Whether a move can be blocked is learned by watching guards succeed and
+-- fail. The mistake before was only ever watching our own: a move we had
+-- never personally blocked could never be classified, and auto block skipping
+-- the ones it had written off meant it stopped gathering evidence about
+-- exactly the moves it was least sure of.
+--
+-- Both of the signals involved are broadcast for every player, not just us -
+-- BlockService.Effects plays the block clink at whoever blocked, and Info is
+-- readable on everyone. So every guard anyone on the server puts up is a
+-- sample. A move nobody has ever blocked stays unknown, which is the honest
+-- answer, but it stops being the common case.
+local lastBlockConfirm = setmetatable({}, { __mode = 'k' })
+local BLOCK_FLINCH_GAP = 0.35
+
+local function resolveBlock(char, perfect)
+    lastBlockConfirm[char] = tick()
+    local blame = blameFor(char, tick())
     if not blame then return end
     local entry = outcomeFor(blame.key)
     entry.blocked = entry.blocked + 1
-    pushFeed(('%s blocked%s'):format(blame.key, perfect and ' (perfect)' or ''), 'success')
+    if isOwn(char) then
+        pushFeed(('%s blocked%s'):format(blame.key, perfect and ' (perfect)' or ''), 'success')
+    end
 end
 
--- A stun landing on us while a guard was up means the attack beat it.
-local function failBlock()
-    local blame = blameFor(ownCharacter(), tick())
+-- A stun landing on someone whose guard was up means the attack beat it.
+local function failBlock(char)
+    -- Unless their guard had just been confirmed absorbing something: a
+    -- successful block still flinches, and counting that flinch as a failure
+    -- would mark every blockable move unblockable.
+    local confirmed = lastBlockConfirm[char]
+    if confirmed and tick() - confirmed < BLOCK_FLINCH_GAP then
+        return
+    end
+    local blame = blameFor(char, tick())
     if not blame then return end
     local entry = outcomeFor(blame.key)
     entry.pierced = entry.pierced + 1
-    pushFeed(('%s went through the block'):format(blame.key), 'warn')
+    if isOwn(char) then
+        pushFeed(('%s went through the block'):format(blame.key), 'warn')
+    end
 end
 
 local function resolveThrow(hit)
@@ -1134,9 +1198,9 @@ local function hookService(serviceFolder)
         -- a hit, which is the only positive proof that what we blocked was
         -- blockable from where we were standing.
         if serviceName == 'Block' then
-            if Outcomes.Enabled and typeof(effectName) == 'Instance' and isOwn(effectName) then
+            if Outcomes.Enabled and typeof(effectName) == 'Instance' then
                 local perfect = ...
-                resolveBlock(perfect and true or false)
+                resolveBlock(effectName, perfect and true or false)
             end
             return
         end
@@ -1183,14 +1247,17 @@ local function hookService(serviceFolder)
         local lead, samples = predictedLead(key)
         local combo = comboIndexFrom(...)
         local label = combo and ('%s m%d'):format(serviceName, combo) or serviceName
+        local verdict = blockVerdict(key)
+        local mark = verdict == 'unblockable' and '  UNBLOCKABLE'
+            or (verdict == 'blockable' and '  blockable' or '')
         local text
         if lead then
-            text = ('%s  %s  %.0fst  ~%.2fs lead (n=%d)')
-                :format(actor.Name, label, distance, lead, samples)
+            text = ('%s  %s  %.0fst  ~%.2fs lead (n=%d)%s')
+                :format(actor.Name, label, distance, lead, samples, mark)
         else
-            text = ('%s  %s  %.0fst  lead unknown'):format(actor.Name, label, distance)
+            text = ('%s  %s  %.0fst  lead unknown%s'):format(actor.Name, label, distance, mark)
         end
-        pushFeed(text, lead and 'info' or nil)
+        pushFeed(text, verdict == 'unblockable' and 'warn' or (lead and 'info' or nil))
     end)
 end
 
@@ -1391,6 +1458,9 @@ local function paintEsp(char, entry)
         local pending = espMoveUntil[char]
         if pending and tick() < pending.stop then
             entry.move.Text = pending.text
+            entry.move.TextColor3 = pending.unblockable
+                and Color3.fromRGB(255, 96, 106)
+                or Color3.fromRGB(180, 160, 255)
             entry.move.Visible = true
         else
             entry.move.Visible = false
@@ -1417,9 +1487,12 @@ end
 -- Called from the Effects hook so the overlay names the move as it starts.
 function noteEspMove(char, service, effect)
     if not EspConfig.Enabled or not EspConfig.ShowMove then return end
-    local lead = predictedLead(timingKey(service, effect))
+    local key = timingKey(service, effect)
+    local lead = predictedLead(key)
+    local verdict = blockVerdict(key)
     espMoveUntil[char] = {
-        text = service,
+        text = verdict == 'unblockable' and (service .. '  UNBLOCKABLE') or service,
+        unblockable = verdict == 'unblockable',
         stop = tick() + math.max(0.6, (lead or 0.4) + 0.5),
     }
 end
@@ -1470,12 +1543,12 @@ local function watchInfo(char)
 
     info.ChildAdded:Connect(function(state)
         if state.Name ~= 'Stun' then return end
-        -- Only counts as pierced if a guard was actually up when it landed.
-        if isOwn(char) and Outcomes.Enabled and hasState(char, 'Block') then
-            failBlock()
+        -- Anyone's broken guard is worth knowing about, not only ours.
+        if Outcomes.Enabled and hasState(char, 'Block') then
+            failBlock(char)
         end
         local startedAt = tick()
-        local blame = blameFor(char, startedAt)
+        local blame, reached = blameFor(char, startedAt)
         beginStun(char, blame and blame.key or nil)
         state.Destroying:Connect(function()
             endStun(char)
@@ -1492,7 +1565,7 @@ local function watchInfo(char)
             -- A stun that outlives the attribution window is almost certainly
             -- a chain of several moves, not one long one.
             if duration > 12 then return end
-            recordSample(blame.key, startedAt - blame.at, duration, ragdolled, blame.distance)
+            recordSample(blame.key, startedAt - blame.at, duration, ragdolled, reached)
         end)
     end)
 end
@@ -1915,15 +1988,15 @@ local function tryBlock()
     -- putting a guard up again just holds us still for it. Unknown moves are
     -- still worth a try, since a block that works is how they become known.
     if BlockConfig.SkipUnblockable then
-        local rate, tried = blockability(threat.event.key)
-        if rate and tried >= BlockConfig.MinSamples and rate < BlockConfig.MinSuccess then
+        local verdict, rate, tried = blockVerdict(threat.event.key)
+        if verdict == 'unblockable' then
             -- Never retrying would lock in the verdict: a move written off
             -- after three unlucky samples could never earn its way back,
             -- because refusing to block it is also refusing to gather any
             -- more evidence. So a fraction of the time, try it anyway.
             if math.random() >= BlockConfig.RetryChance then
                 BlockConfig.Skipped = BlockConfig.Skipped + 1
-                setStatus(BlockConfig, ('%s beats blocks (%d%%, n=%d)')
+                setStatus(BlockConfig, ('%s unblockable (%d%%, n=%d)')
                     :format(threat.event.service, math.floor(rate * 100), tried))
                 return
             end
@@ -2264,6 +2337,11 @@ local OverlayNotes = OverlayTab:Section({ Title = 'reading it', Side = 'right' }
 OverlayNotes:Paragraph({
     Title = 'what is on the tag',
     Text = 'Name, then state, then whatever move that player just started, then the evade bar. The move line comes off the same announcement feed the counter tab reacts to, so if a name appears there it means the script saw the move start - it is not reading an animation.',
+})
+
+OverlayNotes:Paragraph({
+    Title = 'unblockable moves',
+    Text = 'A move the tally has marked unblockable is named in red on the tag and in the feed as it starts. That verdict comes from watching guards across the whole server, so it usually arrives before you have personally been caught by it.',
 })
 
 OverlayNotes:Paragraph({
@@ -2628,19 +2706,8 @@ local function refreshOutcomes()
     end
     for _, row in ipairs(rows) do
         local e = row.entry
-        local rate, tried = blockability(row.key)
-        local verdict = ''
-        if rate then
-            -- Same threshold auto block gates on, so the label always
-            -- describes what the script will actually do.
-            if tried >= BlockConfig.MinSamples and rate < BlockConfig.MinSuccess then
-                verdict = '  beats blocks'
-            elseif rate >= 0.67 then
-                verdict = '  blockable'
-            else
-                verdict = '  mixed'
-            end
-        end
+        local named = blockVerdict(row.key)
+        local verdict = named == 'unknown' and '' or ('  ' .. named)
         OutcomeLog:Add(('%-24s %d/%d  %d/%d%s'):format(
             row.key:sub(1, 24), e.blocked, e.blocked + e.pierced,
             e.countered, e.countered + e.whiffed, verdict))
@@ -2661,7 +2728,12 @@ OutcomeSection:Buttons({
 
 OutcomeSection:Paragraph({
     Title = 'where these come from',
-    Text = 'blocked counts every time BlockService announced one of our blocks absorbing a hit; pierced counts a stun landing on us while a block was up and nothing confirmed it. countered counts a ManjiKick Hit naming us as the attacker after a throw. All three are broadcast by the server, so they are observations rather than guesses - but they describe what happened to us at that angle and range, not a property of the move.',
+    Text = 'Every guard anyone on the server puts up is a sample, not just ours. BlockService announces a block absorbing a hit for whoever blocked it, and Info is readable on everyone, so blocked and pierced are counted across the whole lobby. That is the difference between classifying a move the first time somebody else eats it and never classifying it until we personally tried. countered still comes from a ManjiKick Hit naming us. All of it is server broadcast, so these are observations - but they describe what happened at that angle and range, not a property of the move.',
+})
+
+OutcomeSection:Paragraph({
+    Title = 'the verdicts',
+    Text = 'unknown means fewer than three attempts have been seen and it will not refuse to block on that basis. unblockable means under a third of guards survived it, and auto block stops offering itself up - though it still tries occasionally, so a wrong call can correct itself. blockable means over two thirds held. The same function decides the label and the behaviour, so they cannot disagree.',
 })
 
 local CounterNotes = CounterTab:Section({ Title = 'what this can and cannot know', Side = 'left' })
