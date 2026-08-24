@@ -9,36 +9,6 @@ local Config = {
     Chance = 100,
 }
 
--- Void carry: when Cursed Strikes connects, ride the combo out past the edge
--- of the map so the victim is dropped over nothing, then return.
-local VoidConfig = {
-    Enabled = false,
-    FlySpeed = 320,
-    Clearance = 70,
-    VoidMargin = 120,
-    CarryDuration = 1.2,
-    StepBlockedLift = 25,
-    -- How far down a spot has to be clear before it counts as void.
-    ProbeDepth = 900,
-    -- How far out the edge scan is willing to look.
-    MaxTravel = 2500,
-    -- "Timed" waits out the combo and teleports straight to the void a moment
-    -- before the victim is released, ignoring anything in between. "Routed"
-    -- is the older behaviour that picks its way out through openings.
-    Mode = "Timed",
-    -- How long before the predicted release to make the jump.
-    Lead = 0.12,
-    -- Overrides the measured duration when non-zero.
-    ManualDuration = 0,
-    -- Instant hops when the way is clear; off falls back to stepped flying.
-    InstantHops = true,
-    -- How far a single escape hop may reach, and how many hops before the
-    -- router gives up rather than pinballing around a room forever.
-    HopRange = 400,
-    MaxHops = 12,
-    Status = "idle",
-    LastFollowGap = -1,
-}
 
 local BLACKFLASH_DELAY = 0.212
 local VARIANT4_DELAY = 0.4
@@ -48,10 +18,6 @@ local Activated = Services.DivergentFistService.RE.Activated
 local RightActivated = Services.ItadoriService.RE.RightActivated
 local DashRemote = Services.MovementService.RE.Dash
 
-local CursedStrikesRE = Services:FindFirstChild("CursedStrikesService")
-CursedStrikesRE = CursedStrikesRE and CursedStrikesRE:FindFirstChild("RE")
-local CursedStrikesActivated = CursedStrikesRE and CursedStrikesRE:FindFirstChild("Activated")
-local CursedStrikesEffects = CursedStrikesRE and CursedStrikesRE:FindFirstChild("Effects")
 
 local Knit = require(ReplicatedStorage.Knit.Knit)
 
@@ -262,545 +228,746 @@ task.spawn(function()
     end
 end)
 
---// Void carry -------------------------------------------------------------------
--- Cursed Strikes announces itself over CursedStrikesService.RE.Effects. Two of
--- those keys are useful here:
---
---   "Hit"      (victimCharacter, wasHeavy)
---   "FinalHit" (attackerCharacter, victimCharacter)
---
--- FinalHit names both sides, so it is unambiguous. "Hit" only names the victim,
--- so it is only trusted inside a short window after we fired Activated
--- ourselves - otherwise every Cursed Strikes landing anywhere on the server
--- would trigger a carry.
-local lastActivatedAt = 0
-local ACTIVATION_WINDOW = 2.5
-local carryActive = false
--- Flipped by the FinalHit handler so a carry in progress knows the victim has
--- actually been let go, rather than trusting the prediction alone.
-local releaseSeen = false
 
--- How long Cursed Strikes holds someone before letting go is not in the dump:
--- it lives in the server script and the animation lengths, neither of which
--- are readable. So it gets measured instead - the gap between the first hit
--- landing and FinalHit, averaged over every use, which converges after a
--- couple of combos and adapts if the move is ever retuned.
-local Timing = {
-    Learned = nil,
+--// Combat intel ------------------------------------------------------------
+-- Everything below reads state the server already replicates. Nothing here is
+-- a guess about server internals except where it says so.
+--
+-- Three facts make it work, all confirmed against the dump:
+--
+--   1. Every move is a Knit service with an `RE.Effects` RemoteEvent that the
+--      server broadcasts to *all* clients as (effectName, ...). The controllers
+--      use it purely for VFX, and the first argument is the acting character.
+--      That is the only announcement of "someone started doing something" that
+--      reaches us, and it reaches us for everyone on the server.
+--
+--   2. Character state is instances in `character.Info` - Stun, Block, IFrame,
+--      InSkill, NoBlock, Wakeup - created by the server and deleted by a
+--      server-side Debris timer. So we can see that someone is stunned and
+--      when it ends, but the *length* never crosses the wire. It has to be
+--      measured.
+--
+--   3. Each move under `character.Moveset` carries a `ReadyAt` attribute, an
+--      absolute time compared against workspace:GetServerTimeNow(). Cooldowns
+--      are readable, exactly, for our own moves.
+--
+-- What is NOT readable, and no amount of client code changes this: whether a
+-- given attack is blockable, whether it is 360-blockable, and what attack type
+-- it is (which is what decides whether a counter catches it). Those live in
+-- server scripts. The timing table below is the workaround - it does not learn
+-- *whether* a move can be blocked, it learns *how long you have to react*, and
+-- everything defensive here gates on that instead.
+
+local Intel = {
+    -- Rolling feed of move announcements, newest last.
+    Feed = {},
+    FeedLimit = 60,
+    -- key -> { n, lead, dur, ragdoll } running means, keyed "Service.Effect".
+    Timing = {},
+    -- Events seen recently, used to attribute a stun to whatever caused it.
+    Recent = {},
+    RecentWindow = 2.5,
+    Learning = true,
     Samples = 0,
-    Last = nil,
-    ComboStart = nil,
+    Hooked = 0,
 }
 
-local function predictedHold()
-    if VoidConfig.ManualDuration > 0 then return VoidConfig.ManualDuration end
-    return Timing.Learned
-end
+local IntelConfig = {
+    Enabled = false,
+    Range = 90,
+    LogFeed = true,
+}
 
-local function recordHold(seconds)
-    -- Anything wildly long is a stray FinalHit from a later combo rather than
-    -- a real measurement, so it does not get to poison the average.
-    if seconds <= 0.05 or seconds > 8 then return end
-    Timing.Last = seconds
-    if Timing.Learned then
-        Timing.Samples = Timing.Samples + 1
-        Timing.Learned = Timing.Learned + (seconds - Timing.Learned) / math.min(Timing.Samples, 8)
-    else
-        Timing.Learned = seconds
-        Timing.Samples = 1
+-- Effect names that fire on impact rather than on startup. Reacting to these
+-- is pointless - the hit has already happened - so they are excluded from the
+-- attack feed and from every defensive trigger.
+local IMPACT_EFFECTS = {
+    Hit = true, FinalHit = true, Hurt = true, Impact = true, Land = true,
+    Explode = true, Explosion = true, Blocked = true, Kill = true,
+    Death = true, End = true, Finish = true, Cancel = true, Stop = true,
+    Deactivate = true, Slam = true, Burst = true, TrueRagdoll = true,
+}
+
+local function serverNow()
+    local ok, value = pcall(function()
+        return workspace:GetServerTimeNow()
+    end)
+    if ok and type(value) == 'number' then
+        return value
     end
+    return tick()
 end
 
-local function getOwnCharacter()
-    local char = LocalPlayer.Character
-    if char and char:FindFirstChild("HumanoidRootPart") then return char end
-    local chars = workspace:FindFirstChild("Characters")
-    local folder = chars and chars:FindFirstChild(LocalPlayer.Name)
-    if folder and folder:FindFirstChild("HumanoidRootPart") then return folder end
-    return char or folder
+local function charactersFolder()
+    return workspace:FindFirstChild("Characters")
 end
 
--- The game keeps a character under workspace.Characters as well as the usual
--- Player.Character, and the Effects remote can hand back either, so identity
--- is checked against both rather than assuming one.
-local function isOwnCharacter(model)
+local function ownCharacter()
+    local folder = charactersFolder()
+    local mine = folder and folder:FindFirstChild(LocalPlayer.Name)
+    if mine and mine:FindFirstChild("HumanoidRootPart") then
+        return mine
+    end
+    -- The game keeps a copy under Player.Character too, and which one is live
+    -- depends on how far into a respawn we are.
+    local fallback = LocalPlayer.Character
+    if fallback and fallback:FindFirstChild("HumanoidRootPart") then
+        return fallback
+    end
+    return nil
+end
+
+local function isOwn(model)
     if not model then return false end
-    if model == LocalPlayer.Character then return true end
-    local chars = workspace:FindFirstChild("Characters")
-    if chars and model == chars:FindFirstChild(LocalPlayer.Name) then return true end
-    return model.Name == LocalPlayer.Name
+    return model.Name == LocalPlayer.Name or model == LocalPlayer.Character
 end
 
-local function getOwnRoot()
-    local char = getOwnCharacter()
-    return char and char:FindFirstChild("HumanoidRootPart")
+-- State reads. All of these work on any character, not just ours.
+
+local function infoOf(char)
+    return char and char:FindFirstChild("Info") or nil
 end
 
-local function getOwnHumanoid()
-    local char = getOwnCharacter()
-    return char and char:FindFirstChildOfClass("Humanoid")
+local function hasState(char, name)
+    local info = infoOf(char)
+    return info ~= nil and info:FindFirstChild(name) ~= nil
 end
 
-if CursedStrikesActivated and typeof(hookmetamethod) == "function" and typeof(getnamecallmethod) == "function" then
-    local originalNamecall
-    originalNamecall = hookmetamethod(game, "__namecall", function(self, ...)
-        if self == CursedStrikesActivated and getnamecallmethod() == "FireServer" then
-            lastActivatedAt = tick()
+local function isRagdolled(char)
+    if not char then return false end
+    return (char:GetAttribute("Ragdoll") or 0) > 0
+end
+
+-- The one question that decides whether any of the automation may act.
+local function canAct(char)
+    if not char then return false, 'no character' end
+    if char:GetAttribute("Dead") then return false, 'dead' end
+    if isRagdolled(char) then return false, 'ragdolled' end
+    if hasState(char, 'Stun') then return false, 'stunned' end
+    if hasState(char, 'InSkill') then return false, 'in a skill' end
+    if hasState(char, 'Cancel') then return false, 'cancelled' end
+    return true, 'ready'
+end
+
+local function evadeMeter(char)
+    if not char then return 0 end
+    return char:GetAttribute("Evade") or 0
+end
+
+-- The game treats "can burst" as the character attribute being set while the
+-- Info-folder one is not - the second is the spent/cooldown marker.
+local function canBurst(char)
+    if not char then return false end
+    local info = infoOf(char)
+    return (char:GetAttribute("Burst") and true or false)
+        and not (info and info:GetAttribute("Burst"))
+end
+
+-- Cooldowns. `ReadyAt` is an absolute server timestamp on the move instance;
+-- `Info.CD` is a blanket lock over every move at once.
+local function movesetFolder(char)
+    return char and char:FindFirstChild("Moveset") or nil
+end
+
+local function findMove(char, serviceName)
+    local moveset = movesetFolder(char)
+    if not moveset then return nil end
+    for _, move in ipairs(moveset:GetChildren()) do
+        if move:GetAttribute("Service") == serviceName then
+            return move
         end
-        return originalNamecall(self, ...)
-    end)
+    end
+    return nil
 end
 
--- Deliberately NOT Map:GetBoundingBox(). The game's debris PartCache parks
--- 2000 spare parts at CFrame.new(0, 10000000, 0) inside workspace.Map.Data, so
--- the map's bounding box is about five million studs tall - aiming at the top
--- of it just flies straight up forever, which is exactly what this used to do.
+local function cooldownLeft(move)
+    if not move then return math.huge end
+    local readyAt = move:GetAttribute("ReadyAt")
+    if not readyAt then return 0 end
+    return math.max(0, readyAt - serverNow())
+end
+
+local function globallyLocked(char)
+    local info = infoOf(char)
+    return info ~= nil and info:GetAttribute("CD") and true or false
+end
+
+--// The timing table ---------------------------------------------------------
+-- Two numbers per move, both measured, neither readable:
 --
--- Instead the void is found the way it is actually defined: a spot where a ray
--- pointed straight down hits nothing. The filter mirrors the game's own ground
--- checks (Map + Domains), minus the Data folder holding the parked cache.
-local voidParams = RaycastParams.new()
-voidParams.FilterType = Enum.RaycastFilterType.Include
-voidParams.IgnoreWater = true
+--   lead   how long between the announcement and the stun actually landing.
+--          This is the reaction budget, and it is what auto block and auto
+--          manji gate on.
+--   dur    how long the stun lasted once it landed.
+--
+-- Attribution is "the most recent announcement from someone else, within
+-- range, inside RecentWindow". That is a heuristic and it will mis-attribute
+-- in a crowded fight. The sample count is shown in the UI so a number backed
+-- by two samples is visibly not a number backed by forty.
 
-local function refreshVoidFilter()
-    local include = {}
-    local map = workspace:FindFirstChild("Map")
-    if map then
-        for _, child in ipairs(map:GetChildren()) do
-            if child.Name ~= "Data" then
-                include[#include + 1] = child
-            end
+local function timingKey(service, effect)
+    return service .. '.' .. effect
+end
+
+local function timingFor(key)
+    local entry = Intel.Timing[key]
+    if not entry then
+        entry = { n = 0, lead = 0, dur = 0, ragdoll = 0, last = 0 }
+        Intel.Timing[key] = entry
+    end
+    return entry
+end
+
+local function blendInto(entry, field, value)
+    local n = entry.n
+    if n <= 1 then
+        entry[field] = value
+    else
+        entry[field] = entry[field] + (value - entry[field]) / n
+    end
+end
+
+local function recordSample(key, lead, duration, wasRagdoll)
+    local entry = timingFor(key)
+    entry.n = entry.n + 1
+    blendInto(entry, 'lead', lead)
+    blendInto(entry, 'dur', duration)
+    blendInto(entry, 'ragdoll', wasRagdoll and 1 or 0)
+    entry.last = tick()
+    Intel.Samples = Intel.Samples + 1
+end
+
+-- Best guess at how much warning a move gives, or nil when it has never been
+-- measured. Callers must treat nil as "unknown", never as zero.
+local function predictedLead(key)
+    local entry = Intel.Timing[key]
+    if not entry or entry.n < 1 then return nil end
+    return entry.lead, entry.n
+end
+
+local function predictedStun(key)
+    local entry = Intel.Timing[key]
+    if not entry or entry.n < 1 then return nil end
+    return entry.dur, entry.n
+end
+
+--// Announcement feed --------------------------------------------------------
+
+local feedSink = nil        -- set by the UI once it exists
+local statusSink = nil
+
+local function pushFeed(text, kind)
+    table.insert(Intel.Feed, { text = text, kind = kind, at = tick() })
+    while #Intel.Feed > Intel.FeedLimit do
+        table.remove(Intel.Feed, 1)
+    end
+    if feedSink and IntelConfig.LogFeed then
+        feedSink(text, kind)
+    end
+end
+
+-- The Effects payload is (effectName, ...) and the controllers all treat the
+-- first model in the varargs as the actor. Rather than hardcoding which
+-- position that is for 226 different services, find it.
+local function actorFrom(...)
+    for index = 1, select('#', ...) do
+        local value = select(index, ...)
+        if typeof(value) == 'Instance' and value:IsA('Model') and value:FindFirstChild('HumanoidRootPart') then
+            return value
         end
     end
-    local domains = workspace:FindFirstChild("Domains")
-    if domains then include[#include + 1] = domains end
-    voidParams.FilterDescendantsInstances = include
-    return #include > 0
+    return nil
 end
 
-local function isOverVoid(position)
-    local hit = workspace:Raycast(position, Vector3.new(0, -VoidConfig.ProbeDepth, 0), voidParams)
-    return hit == nil
+local function distanceTo(char)
+    local mine = ownCharacter()
+    if not mine or not char then return math.huge end
+    local a = mine:FindFirstChild('HumanoidRootPart')
+    local b = char:FindFirstChild('HumanoidRootPart')
+    if not a or not b then return math.huge end
+    return (a.Position - b.Position).Magnitude
 end
 
--- Scans outward by increasing radius so the first hit is the nearest edge,
--- which keeps the trip short. Pure raycasting, no movement - the character
--- does not budge until a destination is already known to be over nothing.
-local COMPASS = {
-    Vector3.new(1, 0, 0), Vector3.new(-1, 0, 0),
-    Vector3.new(0, 0, 1), Vector3.new(0, 0, -1),
-    Vector3.new(0.707, 0, 0.707), Vector3.new(-0.707, 0, 0.707),
-    Vector3.new(0.707, 0, -0.707), Vector3.new(-0.707, 0, -0.707),
-}
-
-local function findVoidTarget(fromPosition)
-    if not refreshVoidFilter() then return nil, "no Map to scan" end
-
-    -- Bias the search toward where the camera is already pointing, so when
-    -- several edges are equally close it picks the one in front of you.
-    local look = workspace.CurrentCamera and workspace.CurrentCamera.CFrame.LookVector
-    local ordered = {}
-    if look then
-        local flat = Vector3.new(look.X, 0, look.Z)
-        if flat.Magnitude > 0.01 then ordered[1] = flat.Unit end
+local function noteAnnouncement(service, effect, actor)
+    local now = tick()
+    table.insert(Intel.Recent, {
+        key = timingKey(service, effect),
+        service = service,
+        effect = effect,
+        actor = actor,
+        at = now,
+        distance = distanceTo(actor),
+    })
+    -- Trim by age rather than count so a quiet minute doesn't keep stale
+    -- events around to be attributed to a fresh stun.
+    local cutoff = now - Intel.RecentWindow
+    while Intel.Recent[1] and Intel.Recent[1].at < cutoff do
+        table.remove(Intel.Recent, 1)
     end
-    for _, dir in ipairs(COMPASS) do ordered[#ordered + 1] = dir end
-
-    local step = 40
-    for distance = step, VoidConfig.MaxTravel, step do
-        for _, dir in ipairs(ordered) do
-            local candidate = fromPosition + dir * distance
-            if isOverVoid(candidate) then
-                -- Push a little further past the lip so the victim is clearly
-                -- out over nothing rather than teetering on the edge.
-                local final = fromPosition + dir * (distance + VoidConfig.VoidMargin)
-                if isOverVoid(final) then return final end
-                return candidate
-            end
-        end
-    end
-
-    return nil, "no void found within range"
 end
 
-local moveParams = RaycastParams.new()
-moveParams.FilterType = Enum.RaycastFilterType.Exclude
-moveParams.IgnoreWater = true
-
-local function setMoveFilter(victimChar)
-    local ignore = { getOwnCharacter() }
-    if victimChar then ignore[#ignore + 1] = victimChar end
-    moveParams.FilterDescendantsInstances = ignore
-end
-
--- Roughly the volume a character occupies. Sweeping this instead of a bare
--- line stops the router calling a doorframe-width gap "clear" and then
--- shoving a body through the wall next to it.
-local HULL = Vector3.new(4, 6, 4)
-
-local function pathClear(from, to)
-    local delta = to - from
-    if delta.Magnitude < 0.1 then return true end
-
-    local ok, result = pcall(function()
-        return workspace:Blockcast(CFrame.new(from), HULL, delta, moveParams)
-    end)
-    if ok then return result == nil end
-
-    -- Blockcast is not on every client; four parallel rays offset around the
-    -- travel axis approximate the same thing.
-    if workspace:Raycast(from, delta, moveParams) then return false end
-    local axis = delta.Unit
-    local side = axis:Cross(Vector3.new(0, 1, 0))
-    if side.Magnitude < 0.01 then side = axis:Cross(Vector3.new(1, 0, 0)) end
-    side = side.Unit * 2
-    local up = Vector3.new(0, 3, 0)
-    local offsets = { side, -side, up, -up }
-    for _, offset in ipairs(offsets) do
-        if workspace:Raycast(from + offset, delta, moveParams) then return false end
-    end
-    return true
-end
-
--- How far we can get along a direction before something blocks it. This is
--- what turns "there is a wall in the way" into "there is a gap over there".
-local function furthestClearAlong(from, direction, maxDistance)
+-- The most recent thing that could plausibly have caused a hit on `victim`.
+local function blameFor(victim, at)
     local best = nil
-    local step = 15
-    local distance = step
-    while distance <= maxDistance do
-        local candidate = from + direction * distance
-        if pathClear(from, candidate) then
-            best = candidate
-        else
-            break
+    for index = #Intel.Recent, 1, -1 do
+        local event = Intel.Recent[index]
+        if event.at <= at and at - event.at <= Intel.RecentWindow then
+            if event.actor ~= victim and event.distance <= IntelConfig.Range then
+                best = event
+                break
+            end
         end
-        distance = distance + step
     end
     return best
 end
 
--- Directions worth probing for a way out: the compass at eye level, the same
--- angled upward (windows, balconies, open roofs), and straight up.
-local ESCAPE_DIRECTIONS = {}
-do
-    for _, dir in ipairs(COMPASS) do
-        ESCAPE_DIRECTIONS[#ESCAPE_DIRECTIONS + 1] = dir
-        ESCAPE_DIRECTIONS[#ESCAPE_DIRECTIONS + 1] = (dir + Vector3.new(0, 0.85, 0)).Unit
-    end
-    ESCAPE_DIRECTIONS[#ESCAPE_DIRECTIONS + 1] = Vector3.new(0, 1, 0)
-end
+local hookedServices = {}
 
--- Greedy line-of-sight routing. If the destination is already in the clear it
--- is taken in one hop; otherwise it looks for the reachable spot that gets
--- closest to the goal - an opening, a rooftop, a doorway - hops there and
--- tries again. Every hop is hull-swept first, so nothing is ever moved
--- through geometry even though the hops themselves are instant.
-local function travelTo(goal, victimChar, deadline)
-    setMoveFilter(victimChar)
-
-    for _ = 1, VoidConfig.MaxHops do
-        if tick() > deadline then return false, "timed out" end
-
-        local root = getOwnRoot()
-        if not root then return false, "no character" end
-        local current = root.Position
-
-        if (goal - current).Magnitude <= 3 then return true end
-
-        if pathClear(current, goal) then
-            root.CFrame = CFrame.new(goal, goal + root.CFrame.LookVector)
-            return true
-        end
-
-        -- Blocked: find the reachable waypoint that improves things most.
-        local currentGap = (goal - current).Magnitude
-        local bestPoint, bestGap = nil, currentGap
-        for _, direction in ipairs(ESCAPE_DIRECTIONS) do
-            local reach = furthestClearAlong(current, direction, VoidConfig.HopRange)
-            if reach then
-                local gap = (goal - reach).Magnitude
-                if gap < bestGap - 5 then
-                    bestGap = gap
-                    bestPoint = reach
-                end
-            end
-        end
-
-        if not bestPoint then
-            return false, "boxed in"
-        end
-
-        root.CFrame = CFrame.new(bestPoint, bestPoint + root.CFrame.LookVector)
-        if not VoidConfig.InstantHops then
-            task.wait(math.min(0.12, (bestPoint - current).Magnitude / math.max(VoidConfig.FlySpeed, 1)))
+local function hookService(serviceFolder)
+    if hookedServices[serviceFolder] then return end
+    local re = serviceFolder:FindFirstChild('RE')
+    local effects = re and re:FindFirstChild('Effects')
+    if not effects or not effects:IsA('RemoteEvent') then
+        -- Some services use UnreliableRemoteEvent for Effects; both fire
+        -- OnClientEvent, so only the class check needs widening.
+        if not (effects and effects:IsA('UnreliableRemoteEvent')) then
+            return
         end
     end
+    hookedServices[serviceFolder] = true
+    Intel.Hooked = Intel.Hooked + 1
 
-    return false, "no route out"
-end
+    local serviceName = serviceFolder.Name:gsub('Service$', '')
+    effects.OnClientEvent:Connect(function(effectName, ...)
+        if not IntelConfig.Enabled then return end
+        if type(effectName) ~= 'string' then return end
+        local actor = actorFrom(...)
+        if not actor or isOwn(actor) then return end
+        if IMPACT_EFFECTS[effectName] then return end
 
--- Kept for when instant hops are switched off: same raycast-checked stepping
--- as before, just slower and less conspicuous.
-local function flyTo(goal, victimChar, deadline)
-    local root = getOwnRoot()
-    if not root then return false end
+        local distance = distanceTo(actor)
+        if distance > IntelConfig.Range then return end
 
-    local ignore = { getOwnCharacter() }
-    if victimChar then ignore[#ignore + 1] = victimChar end
-    moveParams.FilterDescendantsInstances = ignore
+        noteAnnouncement(serviceName, effectName, actor)
 
-    while tick() < deadline do
-        root = getOwnRoot()
-        if not root then return false end
-
-        local current = root.Position
-        local delta = goal - current
-        local distance = delta.Magnitude
-        if distance <= 2 then return true end
-
-        local dt = RunService.Heartbeat:Wait()
-        local stepLength = math.min(VoidConfig.FlySpeed * dt, distance)
-        local direction = delta.Unit
-        local nextPos = current + direction * stepLength
-
-        local blocked = workspace:Raycast(current, nextPos - current, moveParams)
-        if blocked then
-            -- Something is in the way: climb over it rather than through it,
-            -- and let the next iteration retry the horizontal leg.
-            local lift = current + Vector3.new(0, VoidConfig.StepBlockedLift, 0)
-            local liftBlocked = workspace:Raycast(current, Vector3.new(0, VoidConfig.StepBlockedLift, 0), moveParams)
-            if liftBlocked then
-                return false
-            end
-            root.CFrame = CFrame.new(lift, lift + Vector3.new(direction.X, 0, direction.Z))
+        local key = timingKey(serviceName, effectName)
+        local lead, samples = predictedLead(key)
+        local text
+        if lead then
+            text = ('%s  %s  %.0fst  ~%.2fs lead (n=%d)')
+                :format(actor.Name, serviceName, distance, lead, samples)
         else
-            local lookAt = nextPos + Vector3.new(direction.X, 0, direction.Z)
-            if (Vector3.new(direction.X, 0, direction.Z)).Magnitude < 0.01 then
-                lookAt = nextPos + root.CFrame.LookVector
+            text = ('%s  %s  %.0fst  lead unknown'):format(actor.Name, serviceName, distance)
+        end
+        pushFeed(text, lead and 'info' or nil)
+    end)
+end
+
+local function hookAllServices()
+    for _, folder in ipairs(Services:GetChildren()) do
+        pcall(hookService, folder)
+    end
+    Services.ChildAdded:Connect(function(folder)
+        task.wait(0.1)
+        pcall(hookService, folder)
+    end)
+end
+
+--// Measuring what we get hit by ---------------------------------------------
+-- Watch Info on every character. When a Stun appears, blame the most recent
+-- nearby announcement and start a clock; when it is destroyed, close the
+-- sample. Watching everyone rather than only ourselves fills the table far
+-- faster, at the cost of noisier attribution in a group fight.
+
+local watchedInfo = setmetatable({}, { __mode = 'k' })
+
+local function watchInfo(char)
+    local info = infoOf(char)
+    if not info or watchedInfo[info] then return end
+    watchedInfo[info] = true
+
+    info.ChildAdded:Connect(function(state)
+        if not Intel.Learning then return end
+        if state.Name ~= 'Stun' then return end
+        local startedAt = tick()
+        local blame = blameFor(char, startedAt)
+        if not blame then return end
+        local ragdolled = isRagdolled(char)
+        -- Destroying rather than ChildRemoved: Debris destroys the instance,
+        -- and Destroying fires for that while ChildRemoved would also fire if
+        -- the whole character were being torn down.
+        state.Destroying:Connect(function()
+            local duration = tick() - startedAt
+            -- A stun that outlives the attribution window is almost certainly
+            -- a chain of several moves, not one long one.
+            if duration > 12 then return end
+            recordSample(blame.key, startedAt - blame.at, duration, ragdolled)
+        end)
+    end)
+end
+
+local function watchCharacters()
+    local folder = charactersFolder()
+    if not folder then
+        workspace.ChildAdded:Connect(function(child)
+            if child.Name == 'Characters' then
+                task.wait(0.2)
+                watchCharacters()
             end
-            root.CFrame = CFrame.new(nextPos, lookAt)
+        end)
+        return
+    end
+    for _, char in ipairs(folder:GetChildren()) do
+        pcall(watchInfo, char)
+    end
+    folder.ChildAdded:Connect(function(char)
+        -- Info is parented in a moment after the model itself.
+        for _ = 1, 20 do
+            if infoOf(char) then break end
+            task.wait(0.1)
+        end
+        pcall(watchInfo, char)
+    end)
+end
+
+--// Counter automation -------------------------------------------------------
+-- Both of these drive the game's own ToolController rather than firing remotes
+-- by hand. Block() and UseTool() are exactly what a keypress calls, so what
+-- reaches the server is shaped like a real input instead of a reconstruction
+-- of one.
+
+local ToolController = nil
+
+local function toolController()
+    if ToolController then return ToolController end
+    local ok, controller = pcall(function()
+        return Knit.GetController("ToolController")
+    end)
+    if ok and controller then
+        ToolController = controller
+    end
+    return ToolController
+end
+
+local BlockDeactivated do
+    local folder = Services:FindFirstChild("BlockService")
+    local re = folder and folder:FindFirstChild("RE")
+    BlockDeactivated = re and re:FindFirstChild("Deactivated") or nil
+end
+
+local ManjiConfig = {
+    Enabled = false,
+    -- How long the counter stays active once thrown. This is a COUNTER node's
+    -- TIME field, which lives server-side for the built-in movesets, so it is
+    -- a setting rather than a reading. Everything else on this panel is real.
+    Window = 0.5,
+    -- Below this the input would land after the hit does.
+    Reaction = 0.08,
+    Range = 60,
+    AssumeLead = 0.35,
+    UseUnmeasured = false,
+    Attempts = 0,
+    Skipped = 0,
+    Last = 'idle',
+}
+
+local BlockConfig = {
+    Enabled = false,
+    -- Only block attacks arriving from inside this cone. The game breaks a
+    -- block that is not facing the attack, and blocking a hit coming from
+    -- behind is the tell that gives an auto block away, so both reasons point
+    -- the same way.
+    MaxAngle = 75,
+    Hold = 0.45,
+    Reaction = 0.06,
+    LookAhead = 0.9,
+    Range = 70,
+    AssumeLead = 0.35,
+    UseUnmeasured = true,
+    Attempts = 0,
+    Skipped = 0,
+    Last = 'idle',
+}
+
+-- Called from the Heartbeat loop, so it repaints only on an actual change
+-- rather than rewriting four labels sixty times a second.
+local function setStatus(which, text)
+    if which.Last == text then return end
+    which.Last = text
+    if statusSink then statusSink() end
+end
+
+-- The freshest announcement we could still do something about, plus how long
+-- until it lands. Returns nil when nothing is pending or the timing is unknown
+-- and the caller does not want to guess.
+local function pendingThreat(cfg)
+    local now = tick()
+    for index = #Intel.Recent, 1, -1 do
+        local event = Intel.Recent[index]
+        local actor = event.actor
+        if now - event.at > Intel.RecentWindow then
+            -- Everything below this point in the list is older still.
+            break
+        end
+        if actor and actor.Parent and not isOwn(actor) then
+            local distance = distanceTo(actor)
+            if distance <= cfg.Range then
+                local lead, samples = predictedLead(event.key)
+                local measured = lead ~= nil
+                if not measured then
+                    if not cfg.UseUnmeasured then
+                        return nil, 'unmeasured: ' .. event.key
+                    end
+                    lead = cfg.AssumeLead
+                    samples = 0
+                end
+                local impactAt = event.at + lead
+                return {
+                    event = event,
+                    actor = actor,
+                    distance = distance,
+                    measured = measured,
+                    samples = samples or 0,
+                    timeLeft = impactAt - now,
+                }
+            end
         end
     end
+    return nil, 'nothing incoming'
+end
 
+--// Auto manji kick ----------------------------------------------------------
+
+local manjiBusyUntil = 0
+
+local function manjiMove()
+    local char = ownCharacter()
+    if not char then return nil end
+    local move = findMove(char, "ManjiKickService")
+    if move then return move end
+    -- Fall back to the display name in case the Service attribute is ever
+    -- renamed; the move instance is what UseTool needs either way.
+    local moveset = movesetFolder(char)
+    return moveset and moveset:FindFirstChild("Manji Kick") or nil
+end
+
+local function fireMove(move)
+    local controller = toolController()
+    if controller then
+        local ok = pcall(function()
+            controller:UseTool(move, "Activated")
+        end)
+        if ok then return true end
+        local key = move:GetAttribute("Key")
+        if key then
+            ok = pcall(function()
+                controller:UseKey(key, "Activated")
+            end)
+            if ok then return true end
+        end
+    end
+    -- Last resort: the raw remote, with the move instance the server expects.
+    local folder = Services:FindFirstChild("ManjiKickService")
+    local re = folder and folder:FindFirstChild("RE")
+    local activated = re and re:FindFirstChild("Activated")
+    if activated then
+        local ok = pcall(function()
+            activated:FireServer(move)
+        end)
+        return ok
+    end
     return false
 end
 
-local function runVoidCarry(victimChar)
-    if carryActive or not VoidConfig.Enabled then return end
+local function tryManji()
+    if not ManjiConfig.Enabled then return end
+    local now = tick()
+    if now < manjiBusyUntil then return end
 
-    local root = getOwnRoot()
-    if not root then return end
-
-    carryActive = true
-    local origin = root.CFrame
-    VoidConfig.Status = "carrying"
-    VoidConfig.LastFollowGap = -1
-
-    local finished = false
-    local function restore()
-        if finished then return end
-        finished = true
-        local rootNow = getOwnRoot()
-        if rootNow then rootNow.CFrame = origin end
-        carryActive = false
+    local char = ownCharacter()
+    local able, why = canAct(char)
+    if not able then
+        setStatus(ManjiConfig, why)
+        return
+    end
+    if globallyLocked(char) then
+        setStatus(ManjiConfig, 'global cooldown')
+        return
     end
 
-    -- releaseSeen is owned by the effect handlers, not reset here: a carry
-    -- started from FinalHit is one where the release has already happened, and
-    -- clearing the flag would make it wait for an event that has been and gone.
+    local move = manjiMove()
+    if not move then
+        setStatus(ManjiConfig, 'no manji kick on this moveset')
+        return
+    end
+    local left = cooldownLeft(move)
+    if left > 0 then
+        setStatus(ManjiConfig, ('cooldown %.1fs'):format(left))
+        return
+    end
 
-    task.spawn(function()
-        local ok = pcall(function()
-            local startPos = root.Position
+    local threat, reason = pendingThreat(ManjiConfig)
+    if not threat then
+        setStatus(ManjiConfig, reason or 'nothing incoming')
+        return
+    end
 
-            if VoidConfig.Mode == "Timed" then
-                -- Nothing is routed and nothing is dodged: the whole point is
-                -- to spend the combo standing exactly where you were, then make
-                -- one jump at the last possible moment.
-                --
-                -- The destination is worked out immediately rather than at the
-                -- jump, so the moment itself costs nothing but a CFrame write.
-                VoidConfig.Status = "waiting out the combo"
-                local probeFrom = startPos + Vector3.new(0, VoidConfig.Clearance, 0)
-                local voidPoint, reason = findVoidTarget(probeFrom)
-                if not voidPoint then
-                    VoidConfig.Status = reason or "no void found"
-                    return
-                end
+    -- The waste test. A counter thrown too early expires before the hit
+    -- arrives and eats its cooldown for nothing; thrown too late it does not
+    -- come out in time at all. Only the band between the two is worth spending
+    -- the move on.
+    if threat.timeLeft < ManjiConfig.Reaction then
+        ManjiConfig.Skipped = ManjiConfig.Skipped + 1
+        setStatus(ManjiConfig, ('too late (%.2fs)'):format(threat.timeLeft))
+        return
+    end
+    if threat.timeLeft > ManjiConfig.Window then
+        ManjiConfig.Skipped = ManjiConfig.Skipped + 1
+        setStatus(ManjiConfig, ('too early (%.2fs > %.2fs window)')
+            :format(threat.timeLeft, ManjiConfig.Window))
+        return
+    end
 
-                local hold = predictedHold()
-                if hold then
-                    local fireAt = (Timing.ComboStart or tick()) + hold - VoidConfig.Lead
-                    while tick() < fireAt and not releaseSeen do
-                        local hum = getOwnHumanoid()
-                        if not hum or hum.Health <= 0 then return end
-                        RunService.Heartbeat:Wait()
-                    end
-                else
-                    -- First combo of the session, so there is nothing learned
-                    -- yet: ride it out and jump the instant FinalHit lands.
-                    -- That measurement is what makes the next one early.
-                    VoidConfig.Status = "learning the timing"
-                    local giveUp = tick() + 8
-                    while not releaseSeen and tick() < giveUp do
-                        local hum = getOwnHumanoid()
-                        if not hum or hum.Health <= 0 then return end
-                        RunService.Heartbeat:Wait()
-                    end
-                end
+    if fireMove(move) then
+        ManjiConfig.Attempts = ManjiConfig.Attempts + 1
+        manjiBusyUntil = now + 0.35
+        setStatus(ManjiConfig, ('countered %s (%.2fs)')
+            :format(threat.event.service, threat.timeLeft))
+        pushFeed(('manji -> %s in %.2fs'):format(threat.event.service, threat.timeLeft), 'success')
+    else
+        setStatus(ManjiConfig, 'activation failed')
+    end
+end
 
-                local jumpRoot = getOwnRoot()
-                if not jumpRoot then return end
-                jumpRoot.CFrame = CFrame.new(voidPoint, voidPoint + jumpRoot.CFrame.LookVector)
-                VoidConfig.Status = "over the void"
+--// Auto block ---------------------------------------------------------------
 
-                local holdUntil = tick() + VoidConfig.CarryDuration
-                while tick() < holdUntil do
-                    local rootNow = getOwnRoot()
-                    local hum = getOwnHumanoid()
-                    if not rootNow or not hum or hum.Health <= 0 then break end
-                    rootNow.CFrame = CFrame.new(voidPoint, voidPoint + rootNow.CFrame.LookVector)
-                    if victimChar then
-                        local victimRoot = victimChar:FindFirstChild("HumanoidRootPart")
-                        if victimRoot then
-                            VoidConfig.LastFollowGap = (victimRoot.Position - rootNow.Position).Magnitude
-                        end
-                    end
-                    RunService.Heartbeat:Wait()
-                end
+local blockHeldUntil = 0
+local blockReleaseToken = 0
 
-                VoidConfig.Status = "returning"
-                return
-            end
-
-            -- Altitude is relative to where you already are, not derived from
-            -- the map, so it is always a sane number of studs.
-            local cruiseY = startPos.Y + VoidConfig.Clearance
-            local rise = Vector3.new(startPos.X, cruiseY, startPos.Z)
-
-            -- Deadlines scale with the distance actually being covered rather
-            -- than a flat guess, so a long crossing is not cut off halfway.
-            local function deadlineFor(from, to)
-                return tick() + 1.5 + (to - from).Magnitude / math.max(VoidConfig.FlySpeed, 1)
-            end
-
-            local function goTo(destination, from, label)
-                local deadline = deadlineFor(from, destination)
-                if VoidConfig.InstantHops then
-                    -- Routing is instant, but a room with no way out still has
-                    -- to be given time to be searched.
-                    deadline = tick() + 4
-                    local reached, why = travelTo(destination, victimChar, deadline)
-                    if not reached then
-                        VoidConfig.Status = label .. ": " .. tostring(why)
-                    end
-                    return reached
-                end
-                if not flyTo(destination, victimChar, deadline) then
-                    VoidConfig.Status = label .. ": blocked"
-                    return false
-                end
-                return true
-            end
-
-            VoidConfig.Status = "ascending"
-            if not goTo(rise, startPos, "ascent") then return end
-
-            local currentRoot = getOwnRoot()
-            local cruisePos = currentRoot and currentRoot.Position or rise
-
-            VoidConfig.Status = "looking for an edge"
-            local voidPoint, reason = findVoidTarget(cruisePos)
-            if not voidPoint then
-                VoidConfig.Status = reason or "no void found"
-                return
-            end
-
-            VoidConfig.Status = "crossing out"
-            if not goTo(voidPoint, cruisePos, "crossing") then return end
-
-            VoidConfig.Status = "over the void"
-
-            -- Hold position while the victim is out here with us, and watch
-            -- whether they are actually following. If the server does not keep
-            -- them attached through the combo this gap grows immediately, which
-            -- is the honest signal that the carry did nothing.
-            local holdUntil = tick() + VoidConfig.CarryDuration
-            while tick() < holdUntil do
-                local rootNow = getOwnRoot()
-                local hum = getOwnHumanoid()
-                if not rootNow or not hum or hum.Health <= 0 then break end
-
-                rootNow.CFrame = CFrame.new(voidPoint, voidPoint + rootNow.CFrame.LookVector)
-
-                if victimChar then
-                    local victimRoot = victimChar:FindFirstChild("HumanoidRootPart")
-                    if victimRoot then
-                        VoidConfig.LastFollowGap = (victimRoot.Position - rootNow.Position).Magnitude
-                    end
-                end
-
-                RunService.Heartbeat:Wait()
-            end
-
-            VoidConfig.Status = "returning"
+local function releaseBlock()
+    if BlockDeactivated then
+        pcall(function()
+            BlockDeactivated:FireServer()
         end)
-
-        if not ok then
-            VoidConfig.Status = "errored"
-        end
-        restore()
-        if VoidConfig.Status == "returning" or VoidConfig.Status == "over the void" then
-            VoidConfig.Status = "done"
-        end
-    end)
+    end
+    blockHeldUntil = 0
 end
 
-if CursedStrikesEffects then
-    CursedStrikesEffects.OnClientEvent:Connect(function(key, a, b)
-        if key == "FinalHit" then
-            -- FinalHit(attacker, victim) is the last hit of the combo, so it
-            -- doubles as the release marker. Timing is recorded even while a
-            -- carry is running - that is precisely the run being measured.
-            if isOwnCharacter(a) and b and not isOwnCharacter(b) then
-                if Timing.ComboStart then
-                    recordHold(tick() - Timing.ComboStart)
-                end
-                releaseSeen = true
-                if VoidConfig.Enabled and not carryActive then
-                    runVoidCarry(b)
-                end
-            end
-        elseif key == "Hit" then
-            -- Hit(victim, ...): only ours if we just used the move. The first
-            -- one is where the hold begins, so it is what durations are
-            -- measured from.
-            if tick() - lastActivatedAt <= ACTIVATION_WINDOW and a and not isOwnCharacter(a) then
-                if not carryActive then
-                    Timing.ComboStart = tick()
-                    releaseSeen = false
-                    if VoidConfig.Enabled then
-                        runVoidCarry(a)
-                    end
-                end
-            end
+-- How far off our facing the attacker is, in degrees. The game breaks a block
+-- that is not oriented into the attack, so this is both the "will it even
+-- work" test and the "will this look like a 360 block" test.
+local function angleToward(char, actor)
+    local mine = char and char:FindFirstChild('HumanoidRootPart')
+    local theirs = actor and actor:FindFirstChild('HumanoidRootPart')
+    if not mine or not theirs then return 180 end
+    local toward = (theirs.Position - mine.Position) * Vector3.new(1, 0, 1)
+    if toward.Magnitude < 0.01 then return 0 end
+    local look = mine.CFrame.LookVector * Vector3.new(1, 0, 1)
+    if look.Magnitude < 0.01 then return 180 end
+    local dot = math.clamp(look.Unit:Dot(toward.Unit), -1, 1)
+    return math.deg(math.acos(dot))
+end
+
+local function tryBlock()
+    if not BlockConfig.Enabled then return end
+    local now = tick()
+    if now < blockHeldUntil then return end
+
+    local char = ownCharacter()
+    local able, why = canAct(char)
+    if not able then
+        setStatus(BlockConfig, why)
+        return
+    end
+    if hasState(char, 'NoBlock') then
+        setStatus(BlockConfig, 'blocking disabled on us')
+        return
+    end
+    if hasState(char, 'Block') then
+        setStatus(BlockConfig, 'already blocking')
+        return
+    end
+
+    local threat, reason = pendingThreat(BlockConfig)
+    if not threat then
+        setStatus(BlockConfig, reason or 'nothing incoming')
+        return
+    end
+
+    if threat.timeLeft < BlockConfig.Reaction then
+        BlockConfig.Skipped = BlockConfig.Skipped + 1
+        setStatus(BlockConfig, ('too late (%.2fs)'):format(threat.timeLeft))
+        return
+    end
+    if threat.timeLeft > BlockConfig.LookAhead then
+        setStatus(BlockConfig, ('waiting (%.2fs out)'):format(threat.timeLeft))
+        return
+    end
+
+    local angle = angleToward(char, threat.actor)
+    if angle > BlockConfig.MaxAngle then
+        BlockConfig.Skipped = BlockConfig.Skipped + 1
+        setStatus(BlockConfig, ('%.0f deg off - not facing it'):format(angle))
+        return
+    end
+
+    local controller = toolController()
+    if not controller then
+        setStatus(BlockConfig, 'no ToolController')
+        return
+    end
+    local ok = pcall(function()
+        controller:Block()
+    end)
+    if not ok then
+        setStatus(BlockConfig, 'block call failed')
+        return
+    end
+
+    BlockConfig.Attempts = BlockConfig.Attempts + 1
+    blockHeldUntil = now + BlockConfig.Hold
+    blockReleaseToken = blockReleaseToken + 1
+    local token = blockReleaseToken
+    task.delay(BlockConfig.Hold, function()
+        -- A newer block may have taken over in the meantime; only the most
+        -- recent hold is allowed to release.
+        if token == blockReleaseToken then
+            releaseBlock()
         end
     end)
+    setStatus(BlockConfig, ('blocked %s at %.0f deg'):format(threat.event.service, angle))
+    pushFeed(('block -> %s (%.0f deg, %.2fs)'):format(threat.event.service, angle, threat.timeLeft), 'success')
 end
+
+task.spawn(function()
+    while true do
+        RunService.Heartbeat:Wait()
+        if IntelConfig.Enabled then
+            pcall(tryManji)
+            pcall(tryBlock)
+        end
+    end
+end)
+
+--// UI -----------------------------------------------------------------------
 
 local Centrl = loadstring(game:HttpGet('https://raw.githubusercontent.com/iamdookie1/Rblx2/main/UI/Lib2.lua'))()
 
 local Window = Centrl:Window({
     Title = 'itadori',
-    SubTitle = 'black flash',
+    SubTitle = 'combat',
     Folder = 'AutoBlackFlash',
     ToggleKey = Enum.KeyCode.RightShift,
     Accent = Color3.fromRGB(180, 60, 255),
 })
 
-local FlashTab = Window:Tab({ Title = 'black flash', Icon = 'zap' })
+local MainTab = Window:Tab({ Title = 'Main', Icon = 'zap' })
+
+local FlashTab = MainTab:Tab({ Title = 'black flash', Icon = 'zap' })
+local IntelTab = MainTab:Tab({ Title = 'intel', Icon = 'radar' })
+local TargetTab = MainTab:Tab({ Title = 'target', Icon = 'crosshair' })
+
+--// Main > black flash -------------------------------------------------------
 
 local Flash = FlashTab:Section({ Title = 'auto black flash', Side = 'left' })
 
@@ -833,6 +1000,409 @@ FlashInfo:Paragraph({
     Title = 'fist 4',
     Text = 'No black flash. Fires ItadoriService.RightActivated 0.4s after the animation starts, every time.',
 })
+
+--// Main > intel -------------------------------------------------------------
+
+local IntelSection = IntelTab:Section({ Title = 'move feed', Side = 'left' })
+
+IntelSection:Toggle({
+    Title = 'enabled',
+    Flag = 'intel_enabled',
+    Default = false,
+    Callback = function(state)
+        IntelConfig.Enabled = state
+        if state and Intel.Hooked == 0 then
+            hookAllServices()
+            watchCharacters()
+        end
+    end,
+})
+
+IntelSection:Toggle({
+    Title = 'log to feed',
+    Flag = 'intel_log',
+    Default = true,
+    Callback = function(state) IntelConfig.LogFeed = state end,
+})
+
+IntelSection:Toggle({
+    Title = 'learn timings',
+    Flag = 'intel_learn',
+    Default = true,
+    Callback = function(state) Intel.Learning = state end,
+})
+
+IntelSection:Slider({
+    Title = 'range',
+    Flag = 'intel_range',
+    Min = 20,
+    Max = 300,
+    Increment = 5,
+    Default = 90,
+    Suffix = 'st',
+    Callback = function(v) IntelConfig.Range = v end,
+})
+
+local FeedLog = IntelSection:Console({
+    Title = 'announcements',
+    Height = 150,
+    MaxLines = 80,
+    Timestamps = true,
+})
+
+feedSink = function(text, kind)
+    if kind == 'success' then
+        FeedLog:Success(text)
+    elseif kind == 'info' then
+        FeedLog:Info(text)
+    else
+        FeedLog:Add(text)
+    end
+end
+
+local TimingSection = IntelTab:Section({ Title = 'learned timings', Side = 'right' })
+
+local HookedStat = TimingSection:Stat({ Title = 'services hooked', Value = '0' })
+local SampleStat = TimingSection:Stat({ Title = 'samples', Value = '0' })
+local MoveStat = TimingSection:Stat({ Title = 'moves measured', Value = '0' })
+
+local TimingLog = TimingSection:Console({
+    Title = 'move  /  lead  /  stun  (n)',
+    Height = 170,
+    MaxLines = 120,
+})
+
+local function refreshTimings()
+    local rows = {}
+    for key, entry in pairs(Intel.Timing) do
+        if entry.n > 0 then
+            table.insert(rows, { key = key, entry = entry })
+        end
+    end
+    table.sort(rows, function(a, b)
+        if a.entry.n ~= b.entry.n then
+            return a.entry.n > b.entry.n
+        end
+        return a.key < b.key
+    end)
+    TimingLog:Clear()
+    if #rows == 0 then
+        TimingLog:Add('nothing measured yet - take a few hits')
+    end
+    for _, row in ipairs(rows) do
+        local e = row.entry
+        local tag = e.ragdoll > 0.5 and ' rag' or ''
+        TimingLog:Add(('%-28s %5.2fs %5.2fs (%d)%s')
+            :format(row.key:sub(1, 28), e.lead, e.dur, e.n, tag))
+    end
+    MoveStat:Set(tostring(#rows))
+    SampleStat:Set(tostring(Intel.Samples))
+    HookedStat:Set(tostring(Intel.Hooked))
+end
+
+TimingSection:Buttons({
+    { Title = 'refresh', Callback = refreshTimings },
+    { Title = 'clear feed', Callback = function() FeedLog:Clear() end },
+    {
+        Title = 'reset table',
+        Callback = function()
+            Intel.Timing = {}
+            Intel.Samples = 0
+            refreshTimings()
+        end,
+    },
+})
+
+TimingSection:Paragraph({
+    Title = 'what these numbers are',
+    Text = 'lead is how long between a move announcing itself and a stun actually landing - the reaction budget. stun is how long that stun lasted. Neither is sent by the server; both are measured here, so a row with n=2 is a guess and a row with n=40 is not. Attribution blames the nearest recent announcement, so a crowded fight adds noise.',
+})
+
+--// Main > target ------------------------------------------------------------
+
+local TargetSection = TargetTab:Section({ Title = 'punish window', Side = 'left' })
+
+local TName = TargetSection:Stat({ Title = 'target', Value = '-' })
+local TDist = TargetSection:Stat({ Title = 'distance', Value = '-' })
+local TState = TargetSection:Stat({ Title = 'state', Value = '-' })
+local TBurst = TargetSection:Stat({ Title = 'burst', Value = '-' })
+local TEvade = TargetSection:Progress({
+    Title = 'evade meter',
+    Min = 0,
+    Max = 50,
+    Default = 0,
+    ShowMax = true,
+})
+
+TargetSection:Paragraph({
+    Title = 'reading it',
+    Text = 'Evade fills to 50; at full the target can dash straight out of a ragdoll. burst ready means they can break your combo and get i-frames on the way out. Both are replicated attributes, so these are live reads rather than estimates.',
+})
+
+local SelfSection = TargetTab:Section({ Title = 'self', Side = 'right' })
+
+local SState = SelfSection:Stat({ Title = 'state', Value = '-' })
+local SEvade = SelfSection:Progress({
+    Title = 'evade meter',
+    Min = 0,
+    Max = 50,
+    Default = 0,
+    ShowMax = true,
+})
+local SManji = SelfSection:Stat({ Title = 'manji kick', Value = '-' })
+local SBurst = SelfSection:Stat({ Title = 'burst', Value = '-' })
+
+local COLOR_GOOD = Color3.fromRGB(126, 217, 87)
+local COLOR_WARN = Color3.fromRGB(255, 196, 87)
+local COLOR_BAD = Color3.fromRGB(255, 96, 106)
+
+-- `openness` is how good the state is *for whoever is attacking this
+-- character*: 1 wide open, -1 untouchable, 0 neither. The caller flips it for
+-- our own row, so a stun on us reads red and a stun on them reads green
+-- without needing two copies of the same list.
+local function describeState(char)
+    if not char then return 'none', 0 end
+    if char:GetAttribute('Dead') then return 'dead', 0 end
+    if isRagdolled(char) then return 'ragdolled', 1 end
+    if hasState(char, 'Stun') then return 'stunned', 1 end
+    if hasState(char, 'IFrame') then return 'i-frames', -1 end
+    if hasState(char, 'Block') then return 'blocking', -1 end
+    if hasState(char, 'InSkill') then return 'in a skill', -1 end
+    return 'free', 0
+end
+
+local function openColor(openness)
+    if openness > 0 then return COLOR_GOOD end
+    if openness < 0 then return COLOR_BAD end
+    return nil
+end
+
+local function currentTarget()
+    local controller = toolController()
+    if controller then
+        local ok, target = pcall(function()
+            return controller:GetTarget()
+        end)
+        if ok and typeof(target) == 'Instance' and target:IsA('Model') then
+            return target
+        end
+    end
+    -- No lock-on, so fall back to the nearest other character in range.
+    local folder = charactersFolder()
+    local mine = ownCharacter()
+    if not folder or not mine then return nil end
+    local best, bestDistance = nil, IntelConfig.Range
+    for _, char in ipairs(folder:GetChildren()) do
+        if not isOwn(char) and char:FindFirstChild('HumanoidRootPart') then
+            local distance = distanceTo(char)
+            if distance < bestDistance then
+                best, bestDistance = char, distance
+            end
+        end
+    end
+    return best
+end
+
+--// Counter ------------------------------------------------------------------
+
+local CounterTab = Window:Tab({ Title = 'counter', Icon = 'shield' })
+
+local ManjiSection = CounterTab:Section({ Title = 'auto manji kick', Side = 'left' })
+
+ManjiSection:Toggle({
+    Title = 'enabled',
+    Flag = 'manji_enabled',
+    Default = false,
+    Callback = function(state)
+        ManjiConfig.Enabled = state
+        if state and not IntelConfig.Enabled then
+            IntelConfig.Enabled = true
+            if Intel.Hooked == 0 then
+                hookAllServices()
+                watchCharacters()
+            end
+            Centrl:Notify({
+                Title = 'counter',
+                Content = 'Move feed turned on - auto manji has nothing to react to without it.',
+                Type = 'info',
+                Duration = 5,
+            })
+        end
+    end,
+})
+
+ManjiSection:Slider({
+    Title = 'counter window',
+    Flag = 'manji_window',
+    Min = 0.1,
+    Max = 1.5,
+    Increment = 0.05,
+    Default = 0.5,
+    Suffix = 's',
+    Callback = function(v) ManjiConfig.Window = v end,
+})
+
+ManjiSection:Slider({
+    Title = 'min reaction',
+    Flag = 'manji_reaction',
+    Min = 0,
+    Max = 0.4,
+    Increment = 0.01,
+    Default = 0.08,
+    Suffix = 's',
+    Callback = function(v) ManjiConfig.Reaction = v end,
+})
+
+ManjiSection:Slider({
+    Title = 'range',
+    Flag = 'manji_range',
+    Min = 10,
+    Max = 150,
+    Increment = 5,
+    Default = 60,
+    Suffix = 'st',
+    Callback = function(v) ManjiConfig.Range = v end,
+})
+
+ManjiSection:Toggle({
+    Title = 'act on unmeasured moves',
+    Flag = 'manji_unmeasured',
+    Default = false,
+    Callback = function(state) ManjiConfig.UseUnmeasured = state end,
+})
+
+ManjiSection:Slider({
+    Title = 'assumed lead (unmeasured)',
+    Flag = 'manji_assume',
+    Min = 0.05,
+    Max = 1,
+    Increment = 0.05,
+    Default = 0.35,
+    Suffix = 's',
+    Callback = function(v) ManjiConfig.AssumeLead = v end,
+})
+
+local ManjiStatus = ManjiSection:Stat({ Title = 'status', Value = 'idle' })
+local ManjiCount = ManjiSection:Stat({ Title = 'thrown / skipped', Value = '0 / 0' })
+
+local BlockSection = CounterTab:Section({ Title = 'auto block', Side = 'right' })
+
+BlockSection:Toggle({
+    Title = 'enabled',
+    Flag = 'block_enabled',
+    Default = false,
+    Callback = function(state)
+        BlockConfig.Enabled = state
+        if state and not IntelConfig.Enabled then
+            IntelConfig.Enabled = true
+            if Intel.Hooked == 0 then
+                hookAllServices()
+                watchCharacters()
+            end
+            Centrl:Notify({
+                Title = 'counter',
+                Content = 'Move feed turned on - auto block has nothing to react to without it.',
+                Type = 'info',
+                Duration = 5,
+            })
+        end
+    end,
+})
+
+BlockSection:Slider({
+    Title = 'max angle',
+    Flag = 'block_angle',
+    Min = 15,
+    Max = 180,
+    Increment = 5,
+    Default = 75,
+    Suffix = ' deg',
+    Callback = function(v) BlockConfig.MaxAngle = v end,
+})
+
+BlockSection:Slider({
+    Title = 'hold',
+    Flag = 'block_hold',
+    Min = 0.1,
+    Max = 2,
+    Increment = 0.05,
+    Default = 0.45,
+    Suffix = 's',
+    Callback = function(v) BlockConfig.Hold = v end,
+})
+
+BlockSection:Slider({
+    Title = 'look ahead',
+    Flag = 'block_lookahead',
+    Min = 0.1,
+    Max = 2,
+    Increment = 0.05,
+    Default = 0.9,
+    Suffix = 's',
+    Callback = function(v) BlockConfig.LookAhead = v end,
+})
+
+BlockSection:Slider({
+    Title = 'min reaction',
+    Flag = 'block_reaction',
+    Min = 0,
+    Max = 0.4,
+    Increment = 0.01,
+    Default = 0.06,
+    Suffix = 's',
+    Callback = function(v) BlockConfig.Reaction = v end,
+})
+
+BlockSection:Slider({
+    Title = 'range',
+    Flag = 'block_range',
+    Min = 10,
+    Max = 200,
+    Increment = 5,
+    Default = 70,
+    Suffix = 'st',
+    Callback = function(v) BlockConfig.Range = v end,
+})
+
+BlockSection:Toggle({
+    Title = 'act on unmeasured moves',
+    Flag = 'block_unmeasured',
+    Default = true,
+    Callback = function(state) BlockConfig.UseUnmeasured = state end,
+})
+
+BlockSection:Slider({
+    Title = 'assumed lead (unmeasured)',
+    Flag = 'block_assume',
+    Min = 0.05,
+    Max = 1,
+    Increment = 0.05,
+    Default = 0.35,
+    Suffix = 's',
+    Callback = function(v) BlockConfig.AssumeLead = v end,
+})
+
+local BlockStatus = BlockSection:Stat({ Title = 'status', Value = 'idle' })
+local BlockCount = BlockSection:Stat({ Title = 'blocked / skipped', Value = '0 / 0' })
+
+local CounterNotes = CounterTab:Section({ Title = 'what this can and cannot know', Side = 'left' })
+
+CounterNotes:Paragraph({
+    Title = 'not readable',
+    Text = 'Whether an attack is blockable, whether it is 360-blockable, and its attack type - which is what decides whether a counter catches it - all live in server scripts. No client can read them. So neither toggle knows whether a given attack is actually counterable or blockable.',
+})
+
+CounterNotes:Paragraph({
+    Title = 'what it gates on instead',
+    Text = 'Timing. Manji only goes out when the hit is due inside the counter window, so it is not spent on something that lands after the counter expires. Block only goes up when the attack is already inside your facing cone, because a block facing the wrong way gets broken anyway - and a block that snaps to a hit coming from behind is the obvious tell.',
+})
+
+CounterNotes:Paragraph({
+    Title = 'untested',
+    Text = 'None of this has been run in-game yet. The remotes and attributes are read straight from the dump, but the reaction and window defaults are starting points, not measurements.',
+})
+
+--// Dash ---------------------------------------------------------------------
 
 local DashTab = Window:Tab({ Title = 'dash', Icon = 'wind' })
 
@@ -871,267 +1441,62 @@ DashInfo:Paragraph({
     Text = 'Untouched. Front dash is actually a separate chase/lunge ability and keeps its original cooldown and behavior.',
 })
 
-local VoidTab = Window:Tab({ Title = 'void carry', Icon = 'move-down' })
+--// Live readouts ------------------------------------------------------------
 
-local VoidSection = VoidTab:Section({ Title = 'cursed strikes carry', Side = 'left' })
-
-VoidSection:Toggle({
-    Title = 'enabled',
-    Flag = 'void_enabled',
-    Default = false,
-    Callback = function(state)
-        VoidConfig.Enabled = state
-        if state and not CursedStrikesEffects then
-            Centrl:Notify({
-                Title = 'itadori',
-                Content = 'CursedStrikesService.RE.Effects not found - carry cannot detect hits.',
-                Type = 'error',
-                Duration = 8,
-            })
-        end
-    end,
-})
-
-local VoidStatus = VoidSection:Label({ Title = 'status: idle' })
-local VoidFollow = VoidSection:Label({ Title = 'victim follow gap: --' })
-local VoidTiming = VoidSection:Label({ Title = 'measured hold: not yet seen' })
-
-VoidSection:Dropdown({
-    Title = 'mode',
-    Flag = 'void_mode',
-    Options = { 'Timed', 'Routed' },
-    Default = 'Timed',
-    Callback = function(v) VoidConfig.Mode = v end,
-})
-
-VoidSection:Slider({
-    Title = 'jump this early',
-    Flag = 'void_lead',
-    Min = 0.02,
-    Max = 1,
-    Increment = 0.02,
-    Default = 0.12,
-    Suffix = 's',
-    Callback = function(v) VoidConfig.Lead = v end,
-})
-
-VoidSection:Slider({
-    Title = 'manual hold override',
-    Flag = 'void_manual_hold',
-    Min = 0,
-    Max = 8,
-    Increment = 0.1,
-    Default = 0,
-    Suffix = 's',
-    Callback = function(v) VoidConfig.ManualDuration = v end,
-})
-
-VoidSection:Button({
-    Title = 'forget measured timing',
-    Callback = function()
-        Timing.Learned = nil
-        Timing.Samples = 0
-        Timing.Last = nil
-    end,
-})
-
-VoidSection:Slider({
-    Title = 'fly speed',
-    Flag = 'void_speed',
-    Min = 60,
-    Max = 800,
-    Increment = 20,
-    Default = 320,
-    Suffix = ' studs/s',
-    Callback = function(v) VoidConfig.FlySpeed = v end,
-})
-
-VoidSection:Slider({
-    Title = 'carry duration',
-    Flag = 'void_duration',
-    Min = 0.2,
-    Max = 5,
-    Increment = 0.1,
-    Default = 1.2,
-    Suffix = 's',
-    Callback = function(v) VoidConfig.CarryDuration = v end,
-})
-
-VoidSection:Button({
-    Title = 'test run (no target)',
-    Callback = function()
-        if carryActive then return end
-        runVoidCarry(nil)
-    end,
-})
-
-local VoidTuning = VoidTab:Section({ Title = 'positioning', Side = 'right' })
-
-VoidTuning:Slider({
-    Title = 'climb height',
-    Flag = 'void_clearance',
-    Min = 20,
-    Max = 400,
-    Increment = 10,
-    Default = 70,
-    Suffix = ' studs',
-    Callback = function(v) VoidConfig.Clearance = v end,
-})
-
-VoidTuning:Slider({
-    Title = 'push past the edge',
-    Flag = 'void_margin',
-    Min = 0,
-    Max = 600,
-    Increment = 20,
-    Default = 120,
-    Suffix = ' studs',
-    Callback = function(v) VoidConfig.VoidMargin = v end,
-})
-
-VoidTuning:Slider({
-    Title = 'edge scan range',
-    Flag = 'void_max_travel',
-    Min = 500,
-    Max = 8000,
-    Increment = 250,
-    Default = 2500,
-    Suffix = ' studs',
-    Callback = function(v) VoidConfig.MaxTravel = v end,
-})
-
-VoidTuning:Slider({
-    Title = 'void probe depth',
-    Flag = 'void_probe_depth',
-    Min = 200,
-    Max = 3000,
-    Increment = 100,
-    Default = 900,
-    Suffix = ' studs',
-    Callback = function(v) VoidConfig.ProbeDepth = v end,
-})
-
-local VoidRouting = VoidTab:Section({ Title = 'routing', Side = 'right' })
-
-VoidRouting:Toggle({
-    Title = 'instant hops',
-    Flag = 'void_instant',
-    Default = true,
-    Callback = function(v) VoidConfig.InstantHops = v end,
-})
-
-VoidRouting:Slider({
-    Title = 'hop range',
-    Flag = 'void_hop_range',
-    Min = 50,
-    Max = 1500,
-    Increment = 50,
-    Default = 400,
-    Suffix = ' studs',
-    Callback = function(v) VoidConfig.HopRange = v end,
-})
-
-VoidRouting:Slider({
-    Title = 'max hops',
-    Flag = 'void_max_hops',
-    Min = 2,
-    Max = 40,
-    Increment = 1,
-    Default = 12,
-    Callback = function(v) VoidConfig.MaxHops = v end,
-})
-
-VoidRouting:Paragraph({
-    Title = 'how it moves',
-    Text = 'If the destination is already in open air it is taken in a single instant hop. If something is in the way it looks for the reachable spot that gets closest to the goal - a doorway, a window, a rooftop, the gap above a wall - hops there, and tries again from the new position. Every hop is swept with a character-sized box first, so nothing is ever moved through geometry even though the hops are instant.',
-})
-
-VoidRouting:Paragraph({
-    Title = 'if it trips something',
-    Text = 'Turn instant hops off and it reverts to the old stepped flight at the fly speed above, which is slower but reads as ordinary movement. The routing logic is identical either way, only the pace changes.',
-})
-
-VoidTuning:Slider({
-    Title = 'lift when blocked',
-    Flag = 'void_lift',
-    Min = 5,
-    Max = 100,
-    Increment = 5,
-    Default = 25,
-    Suffix = ' studs',
-    Callback = function(v) VoidConfig.StepBlockedLift = v end,
-})
-
-VoidTuning:Paragraph({
-    Title = 'how the edge is found',
-    Text = 'It climbs, then raycasts straight down from candidate spots in eight directions at growing range, and the first one that hits nothing is the void. Scanning outward means it picks the nearest edge, so the trip is short. The camera direction is checked first, so when several edges are equally close it leaves the way you are facing.',
-})
-
-VoidTuning:Paragraph({
-    Title = 'if it cannot get out',
-    Text = 'A status of "boxed in" means there was no reachable opening from where you were standing - fully enclosed, with no gap wide enough for a character. Raising hop range lets it consider openings further away, and raising max hops lets it work through more rooms before giving up.',
-})
-
-VoidTuning:Paragraph({
-    Title = 'why not the map bounds',
-    Text = 'The game parks 2000 spare debris parts at Y = 10,000,000 inside workspace.Map.Data, so the map bounding box is about five million studs tall. Aiming at the top of it just flew straight up until the timer ran out, which is what this used to do. Probing for a hole in the floor avoids the whole problem.',
-})
-
-VoidTuning:Paragraph({
-    Title = 'staying alive',
-    Text = 'Cruise altitude is your own height plus the climb above, never anything derived from the map, so you stay well above the kill plane while only what gets dropped falls. Position is restored the moment the carry ends, and it aborts early on death.',
-})
-
-local VoidInfo = VoidTab:Section({ Title = 'detection', Side = 'left' })
-
-VoidInfo:Paragraph({
-    Title = 'how a hit is detected',
-    Text = 'CursedStrikesService.RE.Effects fires "FinalHit"(attacker, victim), which names both sides so it triggers directly. It also fires "Hit"(victim), which does not say who threw it - that one is only trusted within 2.5s of you firing Activated yourself, so other people landing the move nearby cannot set it off.',
-})
-
-VoidInfo:Paragraph({
-    Title = 'read the follow gap',
-    Text = 'The gap above is the distance between you and the victim while you are out over the void. If it stays small the server is keeping them attached through the combo and the carry is working. If it jumps immediately they were never brought along, and no amount of tuning here will change that.',
-})
-
-VoidInfo:Paragraph({
-    Title = 'timed mode',
-    Text = 'How long Cursed Strikes holds someone is not in the game files anywhere the client can read, so it gets measured: the gap between the first hit landing and FinalHit, averaged over every combo. The first use of a session has nothing learned yet, so it rides the combo out and jumps on FinalHit - that run is what teaches it. From the second onward it jumps early, by the lead above.',
-})
-
-VoidInfo:Paragraph({
-    Title = 'timed vs routed',
-    Text = 'Timed spends the whole combo standing exactly where you were, then makes one teleport straight to the void a moment before the release - nothing is dodged and nothing in the way matters, because it is a single instant jump rather than a journey. Routed is the older behaviour that picks its way out through openings and never passes through anything, which is slower and can fail if you are boxed in.',
-})
-
-task.spawn(function()
-    while true do
-        task.wait(0.35)
-        pcall(function()
-            VoidStatus:Set('status: ' .. tostring(VoidConfig.Status))
-            if VoidConfig.LastFollowGap >= 0 then
-                VoidFollow:Set(('victim follow gap: %.1f studs'):format(VoidConfig.LastFollowGap))
-            else
-                VoidFollow:Set('victim follow gap: --')
-            end
-
-            if VoidConfig.ManualDuration > 0 then
-                VoidTiming:Set(('measured hold: overridden to %.2fs'):format(VoidConfig.ManualDuration))
-            elseif Timing.Learned then
-                VoidTiming:Set(('measured hold: %.2fs over %d combo(s), last %.2fs')
-                    :format(Timing.Learned, Timing.Samples, Timing.Last or Timing.Learned))
-            else
-                VoidTiming:Set('measured hold: not yet seen')
-            end
-        end)
-    end
-end)
+statusSink = function()
+    ManjiStatus:Set(ManjiConfig.Last)
+    ManjiCount:Set(ManjiConfig.Attempts .. ' / ' .. ManjiConfig.Skipped)
+    BlockStatus:Set(BlockConfig.Last)
+    BlockCount:Set(BlockConfig.Attempts .. ' / ' .. BlockConfig.Skipped)
+end
 
 Window:Load()
 
-Centrl:Notify({
-    Title = 'itadori',
-    Content = 'Loaded. RightShift toggles the menu.',
-    Type = 'success',
-    Duration = 5,
-})
+task.spawn(function()
+    local lastTimingRefresh = 0
+    while true do
+        task.wait(0.2)
+
+        local mine = ownCharacter()
+        local label, openness = describeState(mine)
+        -- Negated: a state that leaves us open is bad news on our own row.
+        SState:Set(label, openColor(-openness))
+        SEvade:Set(evadeMeter(mine))
+        SBurst:Set(canBurst(mine) and 'ready' or 'spent',
+            canBurst(mine) and COLOR_GOOD or nil)
+
+        local move = manjiMove()
+        if not move then
+            SManji:Set('not equipped', COLOR_BAD)
+        else
+            local left = cooldownLeft(move)
+            if left > 0 then
+                SManji:Set(('%.1fs'):format(left), COLOR_WARN)
+            else
+                SManji:Set('ready', COLOR_GOOD)
+            end
+        end
+
+        local target = currentTarget()
+        if target then
+            local tLabel, tOpenness = describeState(target)
+            TName:Set(target.Name)
+            TDist:Set(('%.0f st'):format(distanceTo(target)))
+            TState:Set(tLabel, openColor(tOpenness))
+            TEvade:Set(evadeMeter(target))
+            TBurst:Set(canBurst(target) and 'ready' or 'spent',
+                canBurst(target) and COLOR_BAD or COLOR_GOOD)
+        else
+            TName:Set('-')
+            TDist:Set('-')
+            TState:Set('-')
+            TEvade:Set(0)
+            TBurst:Set('-')
+        end
+
+        if tick() - lastTimingRefresh > 4 then
+            lastTimingRefresh = tick()
+            pcall(refreshTimings)
+        end
+    end
+end)
