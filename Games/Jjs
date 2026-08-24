@@ -278,15 +278,34 @@ local IntelConfig = {
     LogFeed = true,
 }
 
--- Effect names that fire on impact rather than on startup. Reacting to these
--- is pointless - the hit has already happened - so they are excluded from the
--- attack feed and from every defensive trigger.
+-- Effects that fire on impact rather than on startup. Reacting to them is
+-- pointless - the hit has already landed - but the bigger reason to drop them
+-- is blame: the timing table credits a stun to the most recent announcement,
+-- so an impact event arriving at the same moment as the stun would take the
+-- credit from the startup that actually gave warning, and the move would learn
+-- a lead of roughly zero forever after.
+--
+-- Being slightly over-inclusive here is the safe direction. Filtering a real
+-- startup costs one move's reactability; letting one impact event through
+-- corrupts that move's timing permanently.
 local IMPACT_EFFECTS = {
-    Hit = true, FinalHit = true, Hurt = true, Impact = true, Land = true,
-    Explode = true, Explosion = true, Blocked = true, Kill = true,
-    Death = true, End = true, Finish = true, Cancel = true, Stop = true,
-    Deactivate = true, Slam = true, Burst = true, TrueRagdoll = true,
+    Hurt = true, Impact = true, Land = true, Explode = true, Explosion = true,
+    Blocked = true, Kill = true, Death = true, End = true, Finish = true,
+    Cancel = true, Stop = true, Deactivate = true, Slam = true, Burst = true,
+    TrueRagdoll = true, Shatter = true, Grab = true, Crush = true,
+    -- Voice lines, not attacks.
+    Chat = true, Chat2 = true, Voice = true, Emote = true,
 }
+
+-- Named variants are far too many to list: across the dump there is Hit, Hit2,
+-- Hit3, ChaseHit, FinalHit, BlackFlashHit, AerialHit, DismantleHit, CleaveHit,
+-- ThrowableHit and more. Every one of them is impact-time, so match the shape.
+local function is_impact_effect(name)
+    if IMPACT_EFFECTS[name] then
+        return true
+    end
+    return string.find(name, 'Hit', 1, true) ~= nil
+end
 
 local function serverNow()
     local ok, value = pcall(function()
@@ -566,6 +585,23 @@ end
 local feedSink = nil        -- set by the UI once it exists
 local statusSink = nil
 
+-- The M1 loop fires every 0.025s while the button is held, and a chain lands
+-- several swings a second. Detection wants every one of them; the log does
+-- not, so repeats of the same move by the same player collapse.
+local lastLogged = {}
+local FEED_REPEAT_GAP = 0.45
+
+local function shouldLog(actor, key)
+    local stamp = tostring(actor) .. '|' .. key
+    local now = tick()
+    local previous = lastLogged[stamp]
+    if previous and now - previous < FEED_REPEAT_GAP then
+        return false
+    end
+    lastLogged[stamp] = now
+    return true
+end
+
 local function pushFeed(text, kind)
     table.insert(Intel.Feed, { text = text, kind = kind, at = tick() })
     while #Intel.Feed > Intel.FeedLimit do
@@ -579,6 +615,19 @@ end
 -- The Effects payload is (effectName, ...) and the controllers all treat the
 -- first model in the varargs as the actor. Rather than hardcoding which
 -- position that is for 226 different services, find it.
+-- Swing2 is fired as (character, comboIndex, "Up"/"Down"), so an M1 chain
+-- carries which hit of the string it is on. Worth surfacing: hit four is when
+-- the finisher or launch comes.
+local function comboIndexFrom(...)
+    for index = 1, select('#', ...) do
+        local value = select(index, ...)
+        if type(value) == 'number' and value >= 1 and value <= 8 then
+            return math.floor(value)
+        end
+    end
+    return nil
+end
+
 local function actorFrom(...)
     for index = 1, select('#', ...) do
         local value = select(index, ...)
@@ -719,7 +768,7 @@ local function hookService(serviceFolder)
 
         local actor = actorFrom(...)
         if not actor or isOwn(actor) then return end
-        if IMPACT_EFFECTS[effectName] then return end
+        if is_impact_effect(effectName) then return end
 
         local distance = distanceTo(actor)
         if distance > IntelConfig.Range then return end
@@ -730,13 +779,17 @@ local function hookService(serviceFolder)
         end
 
         local key = timingKey(serviceName, effectName)
+        if not shouldLog(actor, key) then return end
+
         local lead, samples = predictedLead(key)
+        local combo = comboIndexFrom(...)
+        local label = combo and ('%s m%d'):format(serviceName, combo) or serviceName
         local text
         if lead then
             text = ('%s  %s  %.0fst  ~%.2fs lead (n=%d)')
-                :format(actor.Name, serviceName, distance, lead, samples)
+                :format(actor.Name, label, distance, lead, samples)
         else
-            text = ('%s  %s  %.0fst  lead unknown'):format(actor.Name, serviceName, distance)
+            text = ('%s  %s  %.0fst  lead unknown'):format(actor.Name, label, distance)
         end
         pushFeed(text, lead and 'info' or nil)
     end)
@@ -1466,6 +1519,11 @@ IntelSection:Toggle({
     Flag = 'intel_learn',
     Default = true,
     Callback = function(state) Intel.Learning = state end,
+})
+
+IntelSection:Paragraph({
+    Title = 'm1s',
+    Text = 'Basic attacks are detected. They go out as <Moveset>Service.Activated and come back as that service\'s Effects "Swing" / "Swing2" - the fist whoosh and arm flash that play as the swing starts, before contact - so they show as Itadori, Gojo and so on. Swing2 carries which hit of the chain it is, shown as m1 to m4, and hit four is usually the finisher or launch. A chain collapses to one log line but every swing still counts as a threat.',
 })
 
 IntelSection:Slider({
