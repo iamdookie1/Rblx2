@@ -739,7 +739,7 @@ end
 local function timingFor(key)
     local entry = Intel.Timing[key]
     if not entry then
-        entry = { n = 0, lead = 0, dur = 0, ragdoll = 0, last = 0 }
+        entry = { n = 0, lead = 0, dur = 0, ragdoll = 0, reach = 0, last = 0 }
         Intel.Timing[key] = entry
     end
     return entry
@@ -754,12 +754,18 @@ local function blendInto(entry, field, value)
     end
 end
 
-local function recordSample(key, lead, duration, wasRagdoll)
+local function recordSample(key, lead, duration, wasRagdoll, distance)
     local entry = timingFor(key)
     entry.n = entry.n + 1
     blendInto(entry, 'lead', lead)
     blendInto(entry, 'dur', duration)
     blendInto(entry, 'ragdoll', wasRagdoll and 1 or 0)
+    -- Reach is the furthest this move has ever actually connected from, not an
+    -- average: one hit at 80 studs proves it can cross 80 studs, and a hundred
+    -- point-blank ones do not disprove it.
+    if distance and distance > (entry.reach or 0) and distance < 1e6 then
+        entry.reach = distance
+    end
     entry.last = tick()
     Intel.Samples = Intel.Samples + 1
 end
@@ -776,6 +782,13 @@ local function predictedStun(key)
     local entry = Intel.Timing[key]
     if not entry or entry.n < 1 then return nil end
     return entry.dur, entry.n
+end
+
+-- How far this move has been seen to reach. nil until it has connected once.
+local function learnedReach(key)
+    local entry = Intel.Timing[key]
+    if not entry or entry.n < 1 or (entry.reach or 0) <= 0 then return nil end
+    return entry.reach
 end
 
 
@@ -1416,7 +1429,7 @@ local function watchInfo(char)
             -- A stun that outlives the attribution window is almost certainly
             -- a chain of several moves, not one long one.
             if duration > 12 then return end
-            recordSample(blame.key, startedAt - blame.at, duration, ragdolled)
+            recordSample(blame.key, startedAt - blame.at, duration, ragdolled, blame.distance)
         end)
     end)
 end
@@ -1483,7 +1496,14 @@ local ManjiConfig = {
     Reaction = 0.08,
     Range = 60,
     AssumeLead = 0.35,
-    UseUnmeasured = false,
+    -- Was false, which meant that until a move had been measured - and on a
+    -- fresh session that is every move - there was never anything to counter.
+    -- The window check is what stops a wasted throw; refusing to look was not.
+    UseUnmeasured = true,
+    -- Past AimFrom studs an attacker has to actually be pointed at us for the
+    -- attack to count as incoming.
+    AimFrom = 25,
+    AimCone = 50,
     Attempts = 0,
     Skipped = 0,
     Last = 'idle',
@@ -1502,6 +1522,8 @@ local BlockConfig = {
     -- up, since the next hit of the chain is coming.
     Sustain = 1.2,
     Range = 70,
+    AimFrom = 25,
+    AimCone = 55,
     -- Refuse to block moves that have been measured going through guards.
     SkipUnblockable = true,
     MinSamples = 3,
@@ -1527,40 +1549,102 @@ end
 -- The freshest announcement we could still do something about, plus how long
 -- until it lands. Returns nil when nothing is pending or the timing is unknown
 -- and the caller does not want to guess.
+-- Whether an attack can actually arrive here, rather than whether the attacker
+-- is inside some number we picked.
+--
+-- Two questions, and neither needs the attack type - which is just as well,
+-- since that is server-side:
+--
+--   Can it cross the distance? Answered by what the move has already done. Any
+--   move that has connected from 80 studs is a ranged one whatever it is
+--   called, and one that has only ever landed at 6 is not going to reach
+--   across a room. That number is already being measured on every sample.
+--
+--   Is it pointed here? A projectile fired at somebody else is not a threat.
+--   Only asked past AimFrom, because close-up swings have wide hitboxes and
+--   track, so facing means much less than it does at range.
+local REACH_MARGIN = 1.25
+
+local function aimedHere(actor, distance, cfg)
+    if distance <= cfg.AimFrom then
+        return true
+    end
+    local mine = ownCharacter()
+    local ours = mine and mine:FindFirstChild('HumanoidRootPart')
+    local theirs = actor:FindFirstChild('HumanoidRootPart')
+    if not ours or not theirs then return true end
+    local toward = (ours.Position - theirs.Position) * Vector3.new(1, 0, 1)
+    if toward.Magnitude < 0.01 then return true end
+    local look = theirs.CFrame.LookVector * Vector3.new(1, 0, 1)
+    if look.Magnitude < 0.01 then return true end
+    local dot = math.clamp(look.Unit:Dot(toward.Unit), -1, 1)
+    return math.deg(math.acos(dot)) <= cfg.AimCone
+end
+
+local function inReach(event, actor, distance, cfg)
+    local reach = learnedReach(event.key)
+    -- Until it has connected once there is nothing to go on, so the slider
+    -- stands in. After that the slider is not consulted at all.
+    local limit = reach and (reach * REACH_MARGIN) or cfg.Range
+    if distance > limit then
+        return false, 'out of reach'
+    end
+    if not aimedHere(actor, distance, cfg) then
+        return false, 'aimed elsewhere'
+    end
+    return true
+end
+
 local function pendingThreat(cfg)
     local now = tick()
+    -- Kept so the status can say why everything was passed over, rather than
+    -- reporting "nothing incoming" while an attack is plainly in progress.
+    local skipped = nil
     for index = #Intel.Recent, 1, -1 do
         local event = Intel.Recent[index]
-        local actor = event.actor
         if now - event.at > Intel.RecentWindow then
             -- Everything below this point in the list is older still.
             break
         end
+        local actor = event.actor
         if actor and actor.Parent and not event.mine then
             local distance = distanceTo(actor)
-            if distance <= cfg.Range then
-                local lead, samples = predictedLead(event.key)
-                local measured = lead ~= nil
+            local lead, samples = predictedLead(event.key)
+            local measured = lead ~= nil
+            local usable = true
+
+            if not measured and not cfg.UseUnmeasured then
+                skipped = skipped or ('unmeasured: ' .. event.service)
+                usable = false
+            end
+            if usable then
+                local reaches, why = inReach(event, actor, distance, cfg)
+                if not reaches then
+                    skipped = skipped or (why .. ': ' .. event.service)
+                    usable = false
+                end
+            end
+
+            -- Skipping rather than giving up here is the difference between
+            -- reacting to the newest *usable* threat and refusing to act at
+            -- all because the newest one happened to be unreadable.
+            if usable then
                 if not measured then
-                    if not cfg.UseUnmeasured then
-                        return nil, 'unmeasured: ' .. event.key
-                    end
                     lead = cfg.AssumeLead
                     samples = 0
                 end
-                local impactAt = event.at + lead
                 return {
                     event = event,
                     actor = actor,
                     distance = distance,
                     measured = measured,
                     samples = samples or 0,
-                    timeLeft = impactAt - now,
+                    timeLeft = (event.at + lead) - now,
                 }
             end
         end
     end
-    return nil, 'nothing incoming'
+    return nil, skipped or 'nothing incoming'
 end
 
 --// Auto manji kick ----------------------------------------------------------
@@ -1972,7 +2056,7 @@ local SampleStat = TimingSection:Stat({ Title = 'samples', Value = '0' })
 local MoveStat = TimingSection:Stat({ Title = 'moves measured', Value = '0' })
 
 local TimingLog = TimingSection:Console({
-    Title = 'move  /  lead  /  stun  (n)',
+    Title = 'move  /  lead  /  stun  /  reach  (n)',
     Height = 170,
     MaxLines = 120,
 })
@@ -1997,8 +2081,9 @@ local function refreshTimings()
     for _, row in ipairs(rows) do
         local e = row.entry
         local tag = e.ragdoll > 0.5 and ' rag' or ''
-        TimingLog:Add(('%-28s %5.2fs %5.2fs (%d)%s')
-            :format(row.key:sub(1, 28), e.lead, e.dur, e.n, tag))
+        local reach = (e.reach or 0) > 0 and ('%4.0fst'):format(e.reach) or '   -  '
+        TimingLog:Add(('%-24s %5.2fs %5.2fs %s (%d)%s')
+            :format(row.key:sub(1, 24), e.lead, e.dur, reach, e.n, tag))
     end
     MoveStat:Set(tostring(#rows))
     SampleStat:Set(tostring(Intel.Samples))
@@ -2020,7 +2105,7 @@ TimingSection:Buttons({
 
 TimingSection:Paragraph({
     Title = 'what these numbers are',
-    Text = 'lead is how long between a move announcing itself and a stun actually landing - the reaction budget. stun is how long that stun lasted. Neither is sent by the server; both are measured here, so a row with n=2 is a guess and a row with n=40 is not. Attribution blames the nearest recent announcement, so a crowded fight adds noise.',
+    Text = 'lead is how long between a move announcing itself and a stun actually landing - the reaction budget. stun is how long that stun lasted. reach is the furthest that move has ever connected from, which is how a ranged attack gets recognised as one without ever being told. None of the three is sent by the server; all are measured here, so a row with n=2 is a guess and a row with n=40 is not. Attribution blames the nearest recent announcement, so a crowded fight adds noise.',
 })
 
 --// Main > overlay -----------------------------------------------------------
@@ -2239,7 +2324,7 @@ ManjiSection:Slider({
 })
 
 ManjiSection:Slider({
-    Title = 'range',
+    Title = 'range (until reach is learned)',
     Flag = 'manji_range',
     Min = 10,
     Max = 150,
@@ -2251,9 +2336,31 @@ ManjiSection:Slider({
 
 ManjiSection:Toggle({
     Title = 'act on unmeasured moves',
-    Flag = 'manji_unmeasured',
-    Default = false,
+    Flag = 'manji_unmeasured2',
+    Default = true,
     Callback = function(state) ManjiConfig.UseUnmeasured = state end,
+})
+
+ManjiSection:Slider({
+    Title = 'aim cone',
+    Flag = 'manji_aimcone',
+    Min = 15,
+    Max = 180,
+    Increment = 5,
+    Default = 50,
+    Suffix = ' deg',
+    Callback = function(v) ManjiConfig.AimCone = v end,
+})
+
+ManjiSection:Slider({
+    Title = 'ignore aim under',
+    Flag = 'manji_aimfrom',
+    Min = 0,
+    Max = 60,
+    Increment = 5,
+    Default = 25,
+    Suffix = 'st',
+    Callback = function(v) ManjiConfig.AimFrom = v end,
 })
 
 ManjiSection:Slider({
@@ -2340,7 +2447,7 @@ BlockSection:Slider({
 })
 
 BlockSection:Slider({
-    Title = 'range',
+    Title = 'range (until reach is learned)',
     Flag = 'block_range',
     Min = 10,
     Max = 200,
@@ -2348,6 +2455,28 @@ BlockSection:Slider({
     Default = 70,
     Suffix = 'st',
     Callback = function(v) BlockConfig.Range = v end,
+})
+
+BlockSection:Slider({
+    Title = 'aim cone',
+    Flag = 'block_aimcone',
+    Min = 15,
+    Max = 180,
+    Increment = 5,
+    Default = 55,
+    Suffix = ' deg',
+    Callback = function(v) BlockConfig.AimCone = v end,
+})
+
+BlockSection:Slider({
+    Title = 'ignore aim under',
+    Flag = 'block_aimfrom',
+    Min = 0,
+    Max = 60,
+    Increment = 5,
+    Default = 25,
+    Suffix = 'st',
+    Callback = function(v) BlockConfig.AimFrom = v end,
 })
 
 BlockSection:Toggle({
@@ -2447,6 +2576,11 @@ CounterNotes:Paragraph({
 CounterNotes:Paragraph({
     Title = 'what it gates on instead',
     Text = 'Manji gates on timing: it only goes out when the hit is due inside the counter window, so it is not spent on something landing after the counter expires. Block deliberately does not - attacks come in chains, and a guard that goes up late for the first hit still stops the next three, so missing a window is no reason to stand there unguarded. It gates on the attack being inside your facing cone instead, because a block facing the wrong way gets broken anyway and one that snaps to a hit from behind is the obvious tell.',
+})
+
+CounterNotes:Paragraph({
+    Title = 'ranged attacks',
+    Text = 'There is no range setting doing the work once a move has been seen land. Every sample records how far away the attacker was, and the furthest a move has ever connected from is taken as its reach - so anything that hits from across a room is treated as ranged whatever it is called, and a swing that only ever lands at six studs stops counting as a threat from thirty. The slider is only what stands in until a move has connected once. Past the aim distance the attacker also has to be pointed roughly at us, so a projectile thrown at somebody else is not reacted to; up close that test is skipped, since swings there have wide hitboxes and track.',
 })
 
 CounterNotes:Paragraph({
