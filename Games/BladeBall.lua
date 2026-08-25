@@ -46,6 +46,7 @@
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Workspace = workspace
 
@@ -307,6 +308,15 @@ if KeybindM2 then
     end))
 end
 
+-- A phone reports TouchEnabled true and MouseEnabled false. Sending a mouse
+-- click on one is the single most obvious thing this script was doing wrong.
+local function isTouchDevice()
+    local ok, touch = pcall(function()
+        return UserInputService.TouchEnabled and not UserInputService.MouseEnabled
+    end)
+    return ok and touch == true
+end
+
 local Pressers = {
     -- Fires the same RemoteEvent the game fires. The arguments the real client
     -- sends were never read, because the module that sends them is obfuscated,
@@ -325,15 +335,36 @@ local Pressers = {
         return pcall(function() ParryButtonPress:Fire() end)
     end,
 
-    -- Synthesised click at the centre of the screen, not at the ball: the
-    -- handler reads the input type, not where it landed, and clicking wherever
+    -- Synthesised input at the centre of the screen, not at the ball: the
+    -- handler reads the input type, not where it landed, and tapping wherever
     -- the ball happens to be can hit the Roblox menu button on a phone.
-    -- VirtualInputManager is itself a known exploit tool, so this is not free.
+    --
+    -- The DEVICE decides which kind of input. The build that got somebody
+    -- kicked always sent a mouse click, and it was sent from a phone. A
+    -- MouseButton1 event on a device with no mouse is not a subtle tell -
+    -- UserInputService reports TouchEnabled true and MouseEnabled false, and
+    -- anything watching can read those two properties as easily as we can. On
+    -- touch this now sends a touch, which is the input the game expects there.
+    --
+    -- That removes an obvious tell. It does not make VirtualInputManager itself
+    -- invisible: it is a known exploit tool and a client-side anti-cheat can
+    -- look for it directly.
     Input = function()
         local vim = game:GetService("VirtualInputManager")
         if typeof(vim) ~= "Instance" then return false, "no VirtualInputManager" end
+
         local viewport = Camera and Camera.ViewportSize or Vector2.new(1280, 720)
         local x, y = viewport.X * 0.5, viewport.Y * 0.5
+
+        if isTouchDevice() then
+            -- SendTouchEvent(touchId, state, x, y). State 0 begins the touch,
+            -- 2 ends it, which is a tap.
+            return pcall(function()
+                vim:SendTouchEvent(1, 0, x, y)
+                vim:SendTouchEvent(1, 2, x, y)
+            end)
+        end
+
         local button = parryInputType == Enum.UserInputType.MouseButton2 and 1 or 0
         return pcall(function()
             vim:SendMouseButtonEvent(x, y, button, true, game, 1)
@@ -573,6 +604,7 @@ local pingStat = BallSection:Stat({ Title = 'ping', Value = '-' })
 local cueStat = BallSection:Stat({ Title = 'cues shown', Value = '0' })
 budgetLabel = BallSection:Stat({ Title = 'presses left', Value = '-' })
 local hitStat = BallSection:Stat({ Title = 'parried', Value = '0 / 0' })
+local verdictStat = BallSection:Stat({ Title = 'verdict', Value = '-' })
 
 task.spawn(function()
     while not Unloading do
@@ -614,6 +646,24 @@ task.spawn(function()
         pcall(function()
             hitStat:Set(('%d / %d'):format(Stats.Successes, Stats.Presses))
         end)
+
+        -- "It did not get me kicked" and "it did not do anything" look the
+        -- same from the outside. ParrySuccess is the only thing that tells
+        -- them apart, so it gets said out loud rather than left to inference.
+        pcall(function()
+            local score = MethodScores[Config.Mode]
+            if Config.Mode == 'Indicator' then
+                verdictStat:Set('reading only', Color3.fromRGB(126, 217, 87))
+            elseif not score or score.presses == 0 then
+                verdictStat:Set('untested')
+            elseif score.successes > 0 then
+                verdictStat:Set(('WORKS - %d confirmed'):format(score.successes),
+                    Color3.fromRGB(126, 217, 87))
+            else
+                verdictStat:Set(('no effect in %d presses'):format(score.presses),
+                    Color3.fromRGB(255, 180, 70))
+            end
+        end)
     end
 end)
 
@@ -637,8 +687,18 @@ RiskSection:Paragraph({
 })
 
 RiskSection:Paragraph({
-    Title = 'Input',
-    Text = 'Synthesises a click through VirtualInputManager. It produces the most genuine-looking parry of the three because the game\'s own code runs end to end. VirtualInputManager is also a well known exploit tool that a client-side anti-cheat can look for directly, so "most genuine looking" is not the same as safe.',
+    Title = 'Input - this is the one that got somebody kicked',
+    Text = 'It sent a MouseButton1 click, from a phone. UserInputService on that device reports TouchEnabled true and MouseEnabled false, so a mouse click there is a tell anything can read in two lines. It now sends a touch on touch devices and a click on desktop. That removes an obvious mistake rather than making the method safe: VirtualInputManager is a known exploit tool in its own right and a client-side anti-cheat can look for it directly. It is still the method whose parry looks most genuine, because the game\'s own code runs end to end.',
+})
+
+RiskSection:Paragraph({
+    Title = 'why nothing here can make a call look legitimate',
+    Text = 'Firing ParryAttempt with the right arguments would need the arguments, and the only code that knows them is SwordsController.PRY, which is a Luraph VM. Reading them off the wire while you parry by hand means hooking a metamethod - and that module already checks whether debug.info has been hooked, so the capture is more detectable than the thing it is trying to make safe. If your executor has a built-in remote spy, that runs below the game and is the one route that does not put a hook in this script.',
+})
+
+RiskSection:Paragraph({
+    Title = 'can the anti-cheat just be turned off',
+    Text = 'It runs on your client, so in principle yes. In practice it is a Luraph VM that is already required and running before this script loads, and it sets BAC_HASH plus two decoy globals specifically so tampering shows. The bigger problem is that this game routes 1232 of its remotes through hashed names - the anti-cheat almost certainly reports over one of them and cannot be picked out by name. Silencing a client that the server expects to hear from usually ends the same way as being caught by it, except the kick becomes something that does not expire.',
 })
 
 local DiagSection = SettingsTab:Section({ Title = 'diagnostics', Side = 'right' })
