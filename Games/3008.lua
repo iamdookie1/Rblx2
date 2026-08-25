@@ -19,6 +19,24 @@
 --   Event :FireServer  ("FallDamage",        data)
 --   Event :FireServer  ("DecreaseStat",      {Stats = {Energy = n}})
 --
+-- Three shared sources decide what this script believes about the world, and
+-- reading them beats any table we could hardcode:
+--
+--   ReplicatedStorage.Modules.Item      : get(name) -> item definition, so
+--                                         food, healing and harmful items are
+--                                         the game's own classification
+--   ReplicatedStorage.Remotes.Communication
+--                                       : OnClientEvent("ShowWhistle",
+--                                         {Player, Position}) - every whistle
+--                                         in the server, with its exact spot
+--   CollectionService tags              : "Item" makes a model grabbable,
+--                                         "Storable" and "Interactable" decide
+--                                         which action E runs on it
+--
+-- Player attributes the client reads and we can therefore change:
+--   LocalPlayer:GetAttribute("ScrollDistance")     - carry/place range clamp
+--   Humanoid   :GetAttribute("Hunger")             - read only, server owned
+--
 -- Where the server is authoritative, the UI says so instead of shipping a
 -- toggle that only lies to your own HUD.
 
@@ -28,6 +46,7 @@ local UserInputService = game:GetService("UserInputService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local VirtualUser = game:GetService("VirtualUser")
 local Lighting = game:GetService("Lighting")
+local CollectionService = game:GetService("CollectionService")
 local Workspace = workspace
 
 local LocalPlayer = Players.LocalPlayer
@@ -46,6 +65,10 @@ local PostSimulation = resolveEvent("PostSimulation", "Heartbeat")
 --// Lifecycle -------------------------------------------------------------------
 local Connections = {}
 local Unloading = false
+
+-- Declared up here because the systems below want to talk long before the UI
+-- that owns the notifier is built.
+local notify
 
 local function track(connection)
     Connections[#Connections + 1] = connection
@@ -76,13 +99,36 @@ local Main = {
     RemoteShove = false,
     ShoveRadius = 40,
     ShoveDelay = 1.2,
+
+    AutoWhistle = false,
+    WhistleInterval = 16,
+}
+
+-- Another player's whistle is broadcast to every client as
+-- Remotes.Communication:FireClient("ShowWhistle", { Player = plr, Position = v3 })
+-- so the exact spot they whistled from arrives here for free - no guessing,
+-- no config, and it works even while they are streamed out.
+local Whistle = {
+    Follow = false,
+    Target = 'anyone',
+    WaitSeconds = 60,
+    ExpiresAt = 0,
+    Offset = 6,
+    Last = nil,
 }
 
 local Finder = {
     Altitude = 400,
     RingStep = 350,
     MaxRings = 14,
-    Dwell = 0.45,
+    Dwell = 0.35,
+    -- How long to give a chunk to actually stream in before writing the point
+    -- off. A fixed dwell was the old behaviour and it was the bug: on a slow
+    -- connection every ring expired before the map arrived.
+    LoadTimeout = 8,
+    -- Map geometry lands before character models do, so once the ground is
+    -- there we still wait this long for players to follow it down.
+    Settle = 0.7,
     ReturnAfter = true,
     UseCache = true,
     Searching = false,
@@ -104,6 +150,9 @@ local Player = {
     ReachEnabled = false,
     Reach = 30,
     AntiAFK = true,
+
+    MobileFly = true,
+    GrabKey = Enum.KeyCode.V,
 }
 
 local Visual = {
@@ -116,6 +165,10 @@ local Visual = {
     ShowDistance = true,
     ItemFilter = "Food",
     MaxEspDistance = 1500,
+    -- 0 means no cap at all. The old build had no visible count limit but the
+    -- Highlight method silently hit the engine's ~31-instance ceiling, which
+    -- is what made item ESP look broken in a shop full of pizza.
+    MaxEspCount = 150,
 
     Fullbright = false,
     NoFog = false,
@@ -138,11 +191,85 @@ local SpecialEmployees = {
     ["Snowball"] = true, ["Abomination Employee"] = true, ["EnergyOrb"] = true,
 }
 
-local FoodNames = {
+-- Only used if ReplicatedStorage.Modules.Item cannot be reached. The real
+-- classification comes from the game's own item definitions below, which is
+-- why this list no longer decides anything on its own.
+local FallbackFood = {
     Pizza = true, Burger = true, Cookie = true, Hotdog = true, Chips = true,
     Lemon = true, ["Lemon Slice"] = true, Banana = true, Water = true,
     ["Ice Cream"] = true, ["Bloxy Soda"] = true, Medkit = true,
 }
+
+--// Item definitions --------------------------------------------------------------
+-- ReplicatedStorage.Modules.Item is the game's own item registry:
+--
+--   Item.get(nameOrInstance) -> { Name, PickupTime, Properties = {
+--       Inventory, Consumable, Restocks, RegenStats = { Health, Energy, Hunger },
+--       ValuedStat } }
+--
+-- Reading it instead of hardcoding names means the filters below track the game
+-- exactly - including the fact that a Glass Shard lives in _EDIBLE and carries a
+-- NEGATIVE Health regen, so "food" that would hurt you is something we can
+-- actually recognise rather than eat by accident.
+local ItemModule
+do
+    local ok, module = pcall(function()
+        local modules = ReplicatedStorage:WaitForChild("Modules", 15)
+        return modules and modules:WaitForChild("Item", 15)
+    end)
+    if ok and module then
+        local loaded, api = pcall(require, module)
+        if loaded and typeof(api) == "table" and typeof(api.get) == "function" then
+            ItemModule = api
+        end
+    end
+end
+
+local defCache = {}
+
+local function itemProps(name)
+    if not ItemModule then return nil end
+    local cached = defCache[name]
+    if cached == nil then
+        local ok, def = pcall(ItemModule.get, name)
+        cached = (ok and typeof(def) == "table" and def.Properties) or false
+        defCache[name] = cached
+    end
+    return cached or nil
+end
+
+local function regenOf(name, stat)
+    local props = itemProps(name)
+    local stats = props and props.RegenStats
+    if not stats then return 0 end
+    return tonumber(stats[stat]) or 0
+end
+
+-- Consumable in the game's sense: something the client will let you eat/drink.
+local function isConsumable(name)
+    local props = itemProps(name)
+    if props then return props.Consumable == true end
+    return FallbackFood[name] == true
+end
+
+-- Anything whose Health regen is negative. The game itself special-cases this
+-- with a confirmation prompt before you eat it.
+local function isHarmful(name)
+    return regenOf(name, "Health") < 0
+end
+
+local function isHealing(name)
+    return regenOf(name, "Health") > 0
+end
+
+--// Tags --------------------------------------------------------------------------
+-- The client decides what E does purely from these tags: "Interactable" runs
+-- Interact, "Storable" runs Store, and "Item" is what makes a model grabbable
+-- at all. Matching them beats any name list we could keep up to date.
+local function hasTag(instance, tag)
+    local ok, tagged = pcall(function() return CollectionService:HasTag(instance, tag) end)
+    return ok and tagged == true
+end
 
 --// Character helpers ------------------------------------------------------------
 local function getCharacter() return LocalPlayer.Character end
@@ -306,6 +433,92 @@ local function requestStreamAround(position)
     end)
 end
 
+--// Holding position ---------------------------------------------------------------
+-- Writing CFrame once and then waiting is what made the old sweep fall out of
+-- the sky: gravity had the whole dwell to work on you, and on a slow chunk that
+-- dwell turned into seconds. Anchoring the root and re-asserting it every step
+-- keeps you exactly where you were put, however long the load takes.
+local holdConnection
+local holdTarget
+
+local function releaseHold()
+    if holdConnection then
+        holdConnection:Disconnect()
+        holdConnection = nil
+    end
+    holdTarget = nil
+    local root = getRoot()
+    if root then
+        pcall(function()
+            root.Anchored = false
+            root.AssemblyLinearVelocity = Vector3.new()
+        end)
+    end
+    local hum = getHumanoid()
+    if hum then pcall(function() hum.PlatformStand = false end) end
+end
+
+local function holdAt(cframe)
+    local root = getRoot()
+    if not root then return false end
+    holdTarget = cframe
+    root.CFrame = cframe
+    pcall(function()
+        root.AssemblyLinearVelocity = Vector3.new()
+        root.AssemblyAngularVelocity = Vector3.new()
+        root.Anchored = true
+    end)
+    local hum = getHumanoid()
+    -- PlatformStand stops the Humanoid trying to walk or ragdoll against an
+    -- anchored root, which otherwise fights us for the whole hold.
+    if hum then pcall(function() hum.PlatformStand = true end) end
+    if not holdConnection then
+        holdConnection = PostSimulation:Connect(function()
+            if Unloading or not holdTarget then return end
+            local current = getRoot()
+            if not current then return end
+            if not current.Anchored then current.Anchored = true end
+            if (current.Position - holdTarget.Position).Magnitude > 1 then
+                current.CFrame = holdTarget
+            end
+        end)
+    end
+    return true
+end
+
+-- A chunk has arrived when something solid exists under the probe point. That
+-- is a real answer, unlike a fixed wait that is either wasted time or too short.
+local downRayParams = RaycastParams.new()
+downRayParams.FilterType = Enum.RaycastFilterType.Exclude
+
+local function regionLoaded(point)
+    local char = getCharacter()
+    downRayParams.FilterDescendantsInstances = char and { char } or {}
+    local ok, hit = pcall(function()
+        return Workspace:Raycast(point, Vector3.new(0, -(math.abs(point.Y) + 2000), 0), downRayParams)
+    end)
+    return ok and hit ~= nil
+end
+
+-- Returns once the target is visible, or once the ground below has loaded and
+-- had a moment for character models to follow it in, or once we give up.
+local function waitForRegion(point, target)
+    local deadline = os.clock() + math.max(1, Finder.LoadTimeout)
+    local groundAt = nil
+    while os.clock() < deadline do
+        if Unloading or not Finder.Searching then return false end
+        if target and isStreamedIn(target) then return true end
+        if regionLoaded(point) then
+            groundAt = groundAt or os.clock()
+            if os.clock() - groundAt >= Finder.Settle then return true end
+        else
+            groundAt = nil
+        end
+        task.wait(0.1)
+    end
+    return regionLoaded(point)
+end
+
 -- Rings outward from wherever you are, at altitude. Height is the point: high
 -- enough that you are not standing in someone's aisle while the chunk loads,
 -- and the stream radius is spherical so altitude costs very little coverage.
@@ -328,6 +541,7 @@ local function searchForPlayer(plr, onUpdate)
             local rootNow = getRoot()
             if rootNow then rootNow.CFrame = origin end
         end
+        releaseHold()
         return found, reason
     end
 
@@ -366,8 +580,20 @@ local function searchForPlayer(plr, onUpdate)
             if onUpdate then onUpdate(Finder.Status) end
 
             requestStreamAround(point)
-            teleportTo(CFrame.new(point))
-            task.wait(Finder.Dwell)
+            holdAt(CFrame.new(point))
+
+            -- Sit still up there until the chunk is genuinely in, instead of
+            -- moving on after a fixed fraction of a second and calling an
+            -- unloaded region empty.
+            local loaded = waitForRegion(point, plr)
+            if Unloading or not Finder.Searching then
+                return finish(false, "cancelled")
+            end
+            if loaded then
+                Finder.Status = ("ring %d, point %d/%d (loaded)"):format(ring, index, #points)
+                if onUpdate then onUpdate(Finder.Status) end
+            end
+            if Finder.Dwell > 0 then task.wait(Finder.Dwell) end
 
             if isStreamedIn(plr) then
                 local target = plr.Character:FindFirstChild("HumanoidRootPart")
@@ -375,6 +601,7 @@ local function searchForPlayer(plr, onUpdate)
                     -- Found: drop next to them rather than inside them.
                     Finder.Searching = false
                     Finder.Status = "found " .. plr.Name
+                    releaseHold()
                     local rootNow = getRoot()
                     if rootNow then
                         rootNow.CFrame = target.CFrame * CFrame.new(0, 0, 4)
@@ -402,9 +629,13 @@ local function gotoPlayer(plr, onUpdate)
     if Finder.UseCache then
         local cached = lastSeen[plr]
         if cached then
+            local probe = cached.Position + Vector3.new(0, 6, 0)
+            Finder.Searching = true
             requestStreamAround(cached.Position)
-            teleportTo(CFrame.new(cached.Position + Vector3.new(0, 6, 0)))
-            task.wait(Finder.Dwell)
+            holdAt(CFrame.new(probe))
+            waitForRegion(probe, plr)
+            Finder.Searching = false
+            releaseHold()
             if isStreamedIn(plr) then
                 local target = plr.Character:FindFirstChild("HumanoidRootPart")
                 if target then
@@ -419,27 +650,131 @@ local function gotoPlayer(plr, onUpdate)
     return searchForPlayer(plr, onUpdate)
 end
 
+--// Whistle ---------------------------------------------------------------------------
+-- Your own whistle is a plain Action call. The client wraps it in a 15 second
+-- cooldown held in a local upvalue, so calling the remote directly is not gated
+-- by it - the server still is, hence the interval defaulting to 16.
+local function sendWhistle()
+    return invokeAction("Whistle")
+end
+
+spawnLoop(function()
+    while not Unloading do
+        task.wait(0.5)
+        if Main.AutoWhistle and isAlive() then
+            sendWhistle()
+            local waited = 0
+            local interval = math.max(1, Main.WhistleInterval)
+            while waited < interval and not Unloading and Main.AutoWhistle do
+                task.wait(0.5)
+                waited = waited + 0.5
+            end
+        end
+    end
+end)
+
+-- Everyone else's whistle arrives on Remotes.Communication as
+-- ("ShowWhistle", { Player = plr, Position = Vector3 }). The game only uses it
+-- to draw a marker; the position in it is the exact spot they whistled from,
+-- which is all a teleport needs. It fires even while they are streamed out, so
+-- this reaches people the sweep would have to hunt for.
+local CommunicationRemote
+pcall(function()
+    local remotes = ReplicatedStorage:WaitForChild("Remotes", 15)
+    CommunicationRemote = remotes and remotes:WaitForChild("Communication", 15)
+end)
+
+local function onWhistleHeard(who, position)
+    local name = (typeof(who) == "Instance" and who:IsA("Player")) and who.Name or "someone"
+    local root = getRoot()
+    local distance = root and (position - root.Position).Magnitude or nil
+    Whistle.Last = {
+        Name = name,
+        Position = position,
+        At = os.clock(),
+        Distance = distance,
+    }
+
+    if not Whistle.Follow then return end
+    if Whistle.Target ~= 'anyone' and name ~= Whistle.Target then return end
+    if Whistle.WaitSeconds > 0 and os.clock() > Whistle.ExpiresAt then
+        Whistle.Follow = false
+        notify('Whistle listen window expired.', 'warning')
+        return
+    end
+
+    releaseHold()
+    -- Land slightly above and behind the whistle point rather than inside
+    -- whatever they were standing on when it went off.
+    local landed = teleportTo(CFrame.new(position + Vector3.new(0, Whistle.Offset, 0)))
+    if landed then
+        requestStreamAround(position)
+        notify(('Teleported to %s\'s whistle (%d studs away).'):format(name, math.floor(distance or 0)))
+    else
+        notify('Heard a whistle but there was no character to move.', 'error')
+    end
+end
+
+if CommunicationRemote then
+    track(CommunicationRemote.OnClientEvent:Connect(function(name, payload)
+        if Unloading then return end
+        if name ~= "ShowWhistle" or typeof(payload) ~= "table" then return end
+        local position = payload.Position
+        if typeof(position) ~= "Vector3" then return end
+        onWhistleHeard(payload.Player, position)
+    end))
+end
+
 --// Items ---------------------------------------------------------------------------
-local function itemMatchesFilter(model)
-    if Visual.ItemFilter == "All" then return true end
-    if Visual.ItemFilter == "Food" then return FoodNames[model.Name] == true end
+local ItemFilters = { 'All', 'Food', 'Healing', 'Storable', 'Interactable', 'Non-food' }
+
+local function itemMatchesFilter(model, filter)
+    filter = filter or Visual.ItemFilter
+    if filter == "All" then return true end
+    if filter == "Food" then return isConsumable(model.Name) and not isHarmful(model.Name) end
+    if filter == "Healing" then return isHealing(model.Name) end
+    if filter == "Storable" then return hasTag(model, "Storable") end
+    if filter == "Interactable" then return hasTag(model, "Interactable") end
+    if filter == "Non-food" then return not isConsumable(model.Name) end
     return true
 end
 
-local function collectibleItems(radius, foodOnly)
+-- Streamed-out item models still exist as instances, they just carry no
+-- BaseParts. GetPivot still reports where the model is, so distance work stays
+-- valid for items you cannot see yet.
+local function modelPosition(model)
+    local part = model.PrimaryPart
+        or model:FindFirstChildWhichIsA("BasePart")
+        or model:FindFirstChildWhichIsA("BasePart", true)
+    if part then return part.Position end
+    local ok, pivot = pcall(function() return model:GetPivot().Position end)
+    if ok and typeof(pivot) == "Vector3" and pivot.Magnitude > 0.01 then return pivot end
+    return nil
+end
+
+-- Mirrors PickupSystem.ReturnModel: the client will only offer a model that is
+-- tagged Item, has a PrimaryPart and is not already Busy in someone else's
+-- hands. Asking for anything else is a guaranteed refusal.
+local function canPickup(model)
+    if not model.Parent then return false end
+    if not model.PrimaryPart then return false end
+    if model:GetAttribute("Busy") == true then return false end
+    return true
+end
+
+local function collectibleItems(radius, filter)
     local root = getRoot()
     local list = {}
     if not root or not ItemsFolder then return list end
     for _, model in ipairs(ItemsFolder:GetChildren()) do
-        if model:IsA("Model") then
-            if not foodOnly or FoodNames[model.Name] then
-                local ok, pivot = pcall(function() return model:GetPivot().Position end)
-                if ok and (pivot - root.Position).Magnitude <= radius then
-                    list[#list + 1] = model
-                end
+        if model:IsA("Model") and canPickup(model) and itemMatchesFilter(model, filter) then
+            local position = modelPosition(model)
+            if position and (position - root.Position).Magnitude <= radius then
+                list[#list + 1] = { Model = model, Distance = (position - root.Position).Magnitude }
             end
         end
     end
+    table.sort(list, function(a, b) return a.Distance < b.Distance end)
     return list
 end
 
@@ -470,10 +805,15 @@ spawnLoop(function()
     while not Unloading do
         task.wait(Main.CollectDelay)
         if Main.AutoCollect and isAlive() then
-            local items = collectibleItems(Main.CollectRadius, not Main.CollectAll and Main.CollectFood)
-            for _, model in ipairs(items) do
+            local filter = 'All'
+            if not Main.CollectAll and Main.CollectFood then filter = 'Food' end
+            local items = collectibleItems(Main.CollectRadius, filter)
+            for _, entry in ipairs(items) do
                 if Unloading or not Main.AutoCollect then break end
-                if model.Parent then
+                local model = entry.Model
+                -- Glass Shard is registered as edible and takes health off you.
+                -- Never sweep it up unless you asked for literally everything.
+                if canPickup(model) and (Main.CollectAll or not isHarmful(model.Name)) then
                     local ok = pickupModel(model)
                     if ok then
                         -- Straight into the bag; holding it would block the
@@ -520,21 +860,26 @@ spawnLoop(function()
             if Main.AutoEat then
                 local hunger = hum:GetAttribute("Hunger")
                 if hunger and hunger <= Main.HungerThreshold then
+                    -- Pick the biggest hunger restore we are carrying rather
+                    -- than the first thing in the bag, and never something the
+                    -- game registers as edible but health-negative.
+                    local best, bestValue = nil, 0
                     for _, name in ipairs(inventoryToolNames()) do
-                        if FoodNames[name] and name ~= "Medkit" then
-                            consume(name)
-                            break
+                        if isConsumable(name) and not isHarmful(name) then
+                            local value = regenOf(name, "Hunger")
+                            if value > bestValue then best, bestValue = name, value end
                         end
                     end
+                    if best then consume(best) end
                 end
             end
             if Main.AutoHeal and hum.Health <= (hum.MaxHealth * (Main.HealthThreshold / 100)) then
+                local best, bestValue = nil, 0
                 for _, name in ipairs(inventoryToolNames()) do
-                    if name == "Medkit" then
-                        consume("Medkit")
-                        break
-                    end
+                    local value = regenOf(name, "Health")
+                    if value > bestValue then best, bestValue = name, value end
                 end
+                if best then consume(best) end
             end
         end
     end
@@ -607,9 +952,65 @@ local function setNoclip(state)
     end)
 end
 
+--// Reach --------------------------------------------------------------------------
+-- PickupSystem clamps how far you can hold and place an item with
+--   math.clamp(distance, 2.1, LocalPlayer:GetAttribute("ScrollDistance"))
+-- The attribute is read off the PLAYER. The previous build wrote it to the
+-- Humanoid instead, which nothing ever reads - that is why reach did nothing.
+-- The server rewrites the attribute on respawn and on rank changes, so it gets
+-- re-asserted every step rather than set once.
+local baseScrollDistance = nil
+
+local function applyReach()
+    if baseScrollDistance == nil then
+        baseScrollDistance = LocalPlayer:GetAttribute("ScrollDistance") or 15
+    end
+    if LocalPlayer:GetAttribute("ScrollDistance") ~= Player.Reach then
+        pcall(function() LocalPlayer:SetAttribute("ScrollDistance", Player.Reach) end)
+    end
+end
+
+local function restoreReach()
+    if baseScrollDistance ~= nil then
+        pcall(function() LocalPlayer:SetAttribute("ScrollDistance", baseScrollDistance) end)
+    end
+end
+
+-- Holding further away is only half of it. The grab itself is a 10 stud
+-- raycast from the crosshair inside GetModelAtCrosshair, and that number is
+-- baked into the game's own code - so instead of fighting it, this casts the
+-- same ray ourselves at whatever range you asked for and calls Pickup on what
+-- it finds. Same remote, same payload, just aimed further.
+local grabParams = RaycastParams.new()
+grabParams.FilterType = Enum.RaycastFilterType.Exclude
+
+local function grabAtCrosshair()
+    local char = getCharacter()
+    if not char then return false, "no character" end
+    grabParams.FilterDescendantsInstances = { char }
+
+    local viewport = Camera.ViewportSize
+    local ray = Camera:ScreenPointToRay(viewport.X / 2, viewport.Y / 2)
+    local hit = Workspace:Raycast(ray.Origin, ray.Direction * Player.Reach, grabParams)
+    if not hit then return false, "nothing in the way" end
+
+    local model = hit.Instance:FindFirstAncestorOfClass("Model")
+    while model and not hasTag(model, "Item") do
+        model = model:FindFirstAncestorOfClass("Model")
+    end
+    if not model then return false, "that is not an item" end
+    if not canPickup(model) then return false, model.Name .. " is busy or not loaded" end
+
+    local ok = pickupModel(model)
+    return ok == true, ok and model.Name or "server refused"
+end
+
+--// Fly ----------------------------------------------------------------------------
 local function stopFly()
     if flyVelocity then flyVelocity:Destroy() flyVelocity = nil end
     if flyGyro then flyGyro:Destroy() flyGyro = nil end
+    local hum = getHumanoid()
+    if hum then pcall(function() hum.PlatformStand = false end) end
 end
 
 local function startFly()
@@ -627,14 +1028,55 @@ local function startFly()
     flyGyro.Parent = root
 end
 
+-- Touch with no keyboard means the default joystick is the only steering the
+-- player has, so fly reads it instead of demanding WASD that does not exist.
+local function touchOnly()
+    return UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled
+end
+
+local mobileRiseUntil = 0
+
+-- On mobile the joystick gives a flat world direction and the camera gives
+-- pitch. Splitting the stick into forward/right amounts and replaying them
+-- along the camera's real LookVector means aiming the camera up and pushing
+-- forward climbs - vertical control with no extra buttons drawn on screen.
+local function mobileFlyDirection(camCF)
+    local hum = getHumanoid()
+    local move = hum and hum.MoveDirection or Vector3.new()
+    local direction = Vector3.new()
+
+    if move.Magnitude > 0.05 then
+        local flatForward = Vector3.new(camCF.LookVector.X, 0, camCF.LookVector.Z)
+        flatForward = flatForward.Magnitude > 0.001 and flatForward.Unit or camCF.LookVector
+        local flatRight = Vector3.new(camCF.RightVector.X, 0, camCF.RightVector.Z)
+        flatRight = flatRight.Magnitude > 0.001 and flatRight.Unit or camCF.RightVector
+
+        direction = camCF.LookVector * move:Dot(flatForward) + camCF.RightVector * move:Dot(flatRight)
+    end
+
+    if os.clock() < mobileRiseUntil then
+        direction = direction + Vector3.new(0, 1, 0)
+    end
+
+    return direction
+end
+
 track(PostSimulation:Connect(function()
     if Unloading or not Player.Fly then return end
     if not flyVelocity or not flyGyro then return end
     local direction = Vector3.new()
     local camCF = Camera.CFrame
-    if flyDirection.Z ~= 0 then direction = direction + camCF.LookVector * -flyDirection.Z end
+
+    -- W maps to +Z here, so this must NOT be negated: with the minus in place
+    -- W flew you backwards and S flew you forwards.
+    if flyDirection.Z ~= 0 then direction = direction + camCF.LookVector * flyDirection.Z end
     if flyDirection.X ~= 0 then direction = direction + camCF.RightVector * flyDirection.X end
     if flyDirection.Y ~= 0 then direction = direction + Vector3.new(0, flyDirection.Y, 0) end
+
+    if Player.MobileFly and touchOnly() then
+        direction = direction + mobileFlyDirection(camCF)
+    end
+
     if direction.Magnitude > 0 then
         flyVelocity.Velocity = direction.Unit * Player.FlySpeed
     else
@@ -665,7 +1107,13 @@ track(UserInputService.InputEnded:Connect(function(input)
 end))
 
 track(UserInputService.JumpRequest:Connect(function()
-    if Unloading or not Player.InfiniteJump then return end
+    if Unloading then return end
+    -- While flying the jump button is a straight climb, not a jump.
+    if Player.Fly and Player.MobileFly and touchOnly() then
+        mobileRiseUntil = os.clock() + 0.3
+        return
+    end
+    if not Player.InfiniteJump then return end
     local hum = getHumanoid()
     if hum then pcall(function() hum:ChangeState(Enum.HumanoidStateType.Jumping) end) end
 end))
@@ -676,12 +1124,7 @@ track(PostSimulation:Connect(function()
     if not hum then return end
     if Player.SpeedEnabled then hum.WalkSpeed = Player.WalkSpeed end
     if Player.JumpEnabled then hum.JumpPower = Player.JumpPower end
-    -- ScrollDistance is the clamp on how far you can hold and place an item.
-    -- It is a plain attribute the client reads, so raising it extends your
-    -- legitimate placement reach without touching a remote.
-    if Player.ReachEnabled then
-        pcall(function() hum:SetAttribute("ScrollDistance", Player.Reach) end)
-    end
+    if Player.ReachEnabled then applyReach() end
 end))
 
 track(LocalPlayer.Idled:Connect(function()
@@ -699,7 +1142,20 @@ track(LocalPlayer.CharacterAdded:Connect(function(char)
 end))
 
 --// ESP ---------------------------------------------------------------------------------
+-- Everything lives in a folder under the Camera rather than inside the models
+-- themselves. Item models stream in and out constantly, and anything parented
+-- to one dies with it - so adornees point at the model while the instances
+-- themselves stay put.
 local espObjects = {}
+local EspHolder = Instance.new("Folder")
+EspHolder.Name = "Esp3008"
+EspHolder.Parent = Camera
+
+-- Roblox stops rendering Highlights past roughly 31 live instances and gives
+-- no error when it does. That ceiling is the real reason item ESP looked dead
+-- in a shop holding a hundred pizzas, so it is enforced here on purpose and
+-- everything past it falls back to a marker, which has no such limit.
+local HIGHLIGHT_BUDGET = 30
 
 local function espColor(kind, name)
     if kind == "Employee" then
@@ -711,11 +1167,12 @@ local function espColor(kind, name)
     return Color3.fromRGB(80, 180, 255)
 end
 
-local function espAnchor(model)
+local function espPart(model)
     return model:FindFirstChild("HumanoidRootPart")
         or model:FindFirstChild("Head")
         or model.PrimaryPart
         or model:FindFirstChildWhichIsA("BasePart")
+        or model:FindFirstChildWhichIsA("BasePart", true)
 end
 
 local function destroyEsp(key)
@@ -723,25 +1180,45 @@ local function destroyEsp(key)
     if not objs then return end
     if objs.Highlight then objs.Highlight:Destroy() end
     if objs.Billboard then objs.Billboard:Destroy() end
+    if objs.Proxy then objs.Proxy:Destroy() end
     if objs.Box then pcall(function() objs.Box:Remove() end) end
     espObjects[key] = nil
 end
 
-local function buildEsp(model, label, kind)
+-- A streamed-out model has no part to adorn to, but GetPivot still knows where
+-- it is. A tiny invisible anchor driven from the pivot gives the billboard
+-- something to hang on so distant items still draw.
+local function ensureProxy(objs)
+    if objs.Proxy and objs.Proxy.Parent then return objs.Proxy end
+    local part = Instance.new("Part")
+    part.Name = "anchor"
+    part.Anchored = true
+    part.CanCollide = false
+    part.CanQuery = false
+    part.CanTouch = false
+    part.Transparency = 1
+    part.Size = Vector3.new(0.2, 0.2, 0.2)
+    part.Parent = EspHolder
+    objs.Proxy = part
+    return part
+end
+
+local function buildEsp(model, label, kind, method)
     destroyEsp(model)
     local color = espColor(kind, model.Name)
-    local objs = { Kind = kind, Method = Visual.Method, ShowNames = Visual.ShowNames }
+    local objs = { Kind = kind, Method = method, ShowNames = Visual.ShowNames }
     espObjects[model] = objs
 
-    if Visual.Method == "Highlight" then
+    if method == "Highlight" then
         local hl = Instance.new("Highlight")
         hl.FillColor = color
         hl.OutlineColor = color
         hl.OutlineTransparency = 0
         hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
-        hl.Parent = model
+        hl.Adornee = model
+        hl.Parent = EspHolder
         objs.Highlight = hl
-    elseif typeof(Drawing) == "table" and Visual.Method == "Box" then
+    elseif method == "Box" then
         pcall(function()
             local box = Drawing.new("Square")
             box.Thickness = 1.5
@@ -752,68 +1229,82 @@ local function buildEsp(model, label, kind)
         end)
     end
 
-    if Visual.ShowNames then
-        local anchor = espAnchor(model)
-        if anchor then
-            local billboard = Instance.new("BillboardGui")
-            billboard.Name = "Esp3008"
-            billboard.Adornee = anchor
-            billboard.Size = UDim2.fromOffset(200, 34)
-            billboard.StudsOffset = Vector3.new(0, 2, 0)
-            billboard.AlwaysOnTop = true
-            local text = Instance.new("TextLabel")
-            text.BackgroundTransparency = 1
-            text.Size = UDim2.fromScale(1, 1)
-            text.Font = Enum.Font.GothamBold
-            text.TextSize = 13
-            text.TextColor3 = color
-            text.TextStrokeTransparency = 0.4
-            text.Text = label
-            text.Parent = billboard
-            billboard.Parent = model
-            objs.Billboard = billboard
-            objs.NameLabel = text
+    -- The marker method is the dot itself, so it needs the billboard whether or
+    -- not names are on. Highlight and Box only need one for the label.
+    if method == "Marker" or Visual.ShowNames then
+        local billboard = Instance.new("BillboardGui")
+        billboard.Name = "tag"
+        billboard.Size = UDim2.fromOffset(200, 40)
+        billboard.StudsOffset = Vector3.new(0, 2, 0)
+        billboard.AlwaysOnTop = true
+        billboard.LightInfluence = 0
+        billboard.Parent = EspHolder
+
+        if method == "Marker" then
+            local dot = Instance.new("Frame")
+            dot.Name = "dot"
+            dot.AnchorPoint = Vector2.new(0.5, 0.5)
+            dot.Position = UDim2.fromScale(0.5, 0.78)
+            dot.Size = UDim2.fromOffset(7, 7)
+            dot.BackgroundColor3 = color
+            dot.BorderSizePixel = 0
+            dot.Parent = billboard
+            local corner = Instance.new("UICorner")
+            corner.CornerRadius = UDim.new(1, 0)
+            corner.Parent = dot
+            objs.Dot = dot
         end
+
+        local text = Instance.new("TextLabel")
+        text.Name = "name"
+        text.BackgroundTransparency = 1
+        text.Size = UDim2.new(1, 0, 0, 24)
+        text.Font = Enum.Font.GothamBold
+        text.TextSize = 13
+        text.TextColor3 = color
+        text.TextStrokeTransparency = 0.4
+        text.Text = label
+        text.Visible = Visual.ShowNames
+        text.Parent = billboard
+
+        objs.Billboard = billboard
+        objs.NameLabel = text
     end
+
+    return objs
 end
+
+local espShown, espTotal = 0, 0
 
 spawnLoop(function()
     while not Unloading do
         task.wait(0.4)
         local root = getRoot()
         local seen = {}
+        local candidates = {}
 
         if root then
-            local function consider(model, kind, label)
-                local anchor = espAnchor(model)
-                if not anchor then return end
-                local dist = (anchor.Position - root.Position).Magnitude
-                if dist > Visual.MaxEspDistance then return end
-                seen[model] = true
-                local objs = espObjects[model]
-                if not objs or objs.Method ~= Visual.Method or objs.ShowNames ~= Visual.ShowNames then
-                    buildEsp(model, label, kind)
-                    objs = espObjects[model]
-                end
-                if objs then
-                    if objs.Highlight then
-                        objs.Highlight.FillTransparency = Visual.Transparency
-                    end
-                    if objs.NameLabel then
-                        if Visual.ShowDistance then
-                            objs.NameLabel.Text = ("%s [%d]"):format(label, math.floor(dist))
-                        else
-                            objs.NameLabel.Text = label
-                        end
-                    end
-                end
+            local origin = root.Position
+
+            local function offer(model, kind, label)
+                local position = modelPosition(model)
+                if not position then return end
+                local distance = (position - origin).Magnitude
+                if distance > Visual.MaxEspDistance then return end
+                candidates[#candidates + 1] = {
+                    Model = model,
+                    Kind = kind,
+                    Label = label,
+                    Distance = distance,
+                    Position = position,
+                }
             end
 
             if Visual.Employees and EmployeesFolder then
                 for _, model in ipairs(EmployeesFolder:GetChildren()) do
                     local hum = model:FindFirstChildOfClass("Humanoid")
                     if hum and hum.Health > 0 then
-                        consider(model, "Employee", model.Name)
+                        offer(model, "Employee", model.Name)
                     end
                 end
             end
@@ -821,7 +1312,7 @@ spawnLoop(function()
             if Visual.Items and ItemsFolder then
                 for _, model in ipairs(ItemsFolder:GetChildren()) do
                     if model:IsA("Model") and itemMatchesFilter(model) then
-                        consider(model, "Item", model.Name)
+                        offer(model, "Item", model.Name)
                     end
                 end
             end
@@ -829,10 +1320,85 @@ spawnLoop(function()
             if Visual.PlayersEsp then
                 for _, plr in ipairs(Players:GetPlayers()) do
                     if plr ~= LocalPlayer and plr.Character then
-                        consider(plr.Character, "Player", plr.Name)
+                        offer(plr.Character, "Player", plr.Name)
                     end
                 end
             end
+
+            -- Nearest first, so whatever the count limit cuts off is always the
+            -- stuff furthest away rather than whatever happened to be enumerated
+            -- last.
+            table.sort(candidates, function(a, b) return a.Distance < b.Distance end)
+
+            espTotal = #candidates
+            local limit = Visual.MaxEspCount
+            if limit > 0 and #candidates > limit then
+                for index = #candidates, limit + 1, -1 do
+                    candidates[index] = nil
+                end
+            end
+            espShown = #candidates
+
+            local highlightsUsed = 0
+
+            for _, entry in ipairs(candidates) do
+                local model = entry.Model
+                seen[model] = true
+
+                local method = Visual.Method
+                if method == "Highlight" then
+                    if highlightsUsed < HIGHLIGHT_BUDGET then
+                        highlightsUsed = highlightsUsed + 1
+                    else
+                        method = "Marker"
+                    end
+                elseif method == "Box" and typeof(Drawing) ~= "table" then
+                    method = "Marker"
+                end
+
+                local objs = espObjects[model]
+                if not objs or objs.Method ~= method or objs.ShowNames ~= Visual.ShowNames then
+                    objs = buildEsp(model, entry.Label, entry.Kind, method)
+                end
+
+                if objs then
+                    objs.Position = entry.Position
+                    local part = espPart(model)
+
+                    if objs.Highlight then
+                        objs.Highlight.FillTransparency = Visual.Transparency
+                    end
+
+                    if objs.Billboard then
+                        local adornee = part
+                        if not adornee then
+                            local proxy = ensureProxy(objs)
+                            proxy.CFrame = CFrame.new(entry.Position)
+                            adornee = proxy
+                        elseif objs.Proxy then
+                            objs.Proxy:Destroy()
+                            objs.Proxy = nil
+                        end
+                        objs.Billboard.Adornee = adornee
+                        objs.Billboard.MaxDistance = Visual.MaxEspDistance
+                    end
+
+                    if objs.Dot then
+                        objs.Dot.BackgroundTransparency = Visual.Transparency * 0.6
+                    end
+
+                    if objs.NameLabel then
+                        objs.NameLabel.Visible = Visual.ShowNames
+                        if Visual.ShowDistance then
+                            objs.NameLabel.Text = ("%s [%d]"):format(entry.Label, math.floor(entry.Distance))
+                        else
+                            objs.NameLabel.Text = entry.Label
+                        end
+                    end
+                end
+            end
+        else
+            espShown, espTotal = 0, 0
         end
 
         for key in pairs(espObjects) do
@@ -848,10 +1414,10 @@ track(PreRender:Connect(function()
             if not model.Parent then
                 destroyEsp(model)
             else
-                local anchor = espAnchor(model)
+                local anchor = objs.Position or (espPart(model) and espPart(model).Position)
                 if anchor then
-                    local top, onScreen = Camera:WorldToViewportPoint(anchor.Position + Vector3.new(0, 3, 0))
-                    local bottom = Camera:WorldToViewportPoint(anchor.Position - Vector3.new(0, 3, 0))
+                    local top, onScreen = Camera:WorldToViewportPoint(anchor + Vector3.new(0, 3, 0))
+                    local bottom = Camera:WorldToViewportPoint(anchor - Vector3.new(0, 3, 0))
                     if onScreen then
                         local height = bottom.Y - top.Y
                         local width = height * 0.6
@@ -932,7 +1498,7 @@ local Window = Centrl:Window({
     Accent = Color3.fromRGB(255, 190, 60),
 })
 
-local function notify(content, kind, duration)
+function notify(content, kind, duration)
     Centrl:Notify({
         Title = '3008',
         Content = content,
@@ -1053,12 +1619,34 @@ SweepSection:Slider({
 })
 
 SweepSection:Slider({
-    Title = 'dwell per point',
+    Title = 'max wait for chunk load',
+    Flag = 'tv_load_timeout',
+    Min = 1,
+    Max = 20,
+    Increment = 0.5,
+    Default = 8,
+    Suffix = 's',
+    Callback = function(v) Finder.LoadTimeout = v end,
+})
+
+SweepSection:Slider({
+    Title = 'settle after ground loads',
+    Flag = 'tv_settle',
+    Min = 0,
+    Max = 3,
+    Increment = 0.1,
+    Default = 0.7,
+    Suffix = 's',
+    Callback = function(v) Finder.Settle = v end,
+})
+
+SweepSection:Slider({
+    Title = 'extra dwell per point',
     Flag = 'tv_dwell',
-    Min = 0.15,
+    Min = 0,
     Max = 2,
     Increment = 0.05,
-    Default = 0.45,
+    Default = 0.35,
     Suffix = 's',
     Callback = function(v) Finder.Dwell = v end,
 })
@@ -1071,6 +1659,11 @@ SweepSection:Toggle({
 })
 
 local radiusLabel = SweepSection:Label({ Title = 'measured stream radius: --' })
+
+SweepSection:Paragraph({
+    Title = 'how a point is judged',
+    Text = 'Each probe now holds you anchored at altitude and raycasts straight down until something solid answers, which is the real signal that the chunk arrived. Only then does it wait out the settle time for character models to follow the ground in. A point is written off after the max wait, not after a fixed dwell that used to expire before the map had loaded at all.',
+})
 
 SweepSection:Paragraph({
     Title = 'tuning the spacing',
@@ -1107,14 +1700,21 @@ LootSection:Slider({
 LootSection:Button({
     Title = 'collect nearest item now',
     Callback = function()
-        local items = collectibleItems(Main.CollectRadius, not Main.CollectAll)
+        local filter = Main.CollectAll and 'All' or 'Food'
+        local items = collectibleItems(Main.CollectRadius, filter)
         if #items == 0 then
-            notify('Nothing in range.', 'warning')
+            notify('Nothing matching in range.', 'warning')
             return
         end
-        local ok = pickupModel(items[1])
-        notify(ok and ('Picked up ' .. items[1].Name) or 'Server refused the pickup.', ok and 'success' or 'warning')
+        local model = items[1].Model
+        local ok = pickupModel(model)
+        notify(ok and ('Picked up ' .. model.Name) or 'Server refused the pickup.', ok and 'success' or 'warning')
     end,
+})
+
+LootSection:Paragraph({
+    Title = 'what counts as food',
+    Text = 'Read straight out of ReplicatedStorage.Modules.Item rather than a name list, so it follows the game exactly. That includes knowing Glass Shard is filed as edible with a negative health regen - auto collect skips it unless you asked for everything, and auto eat will never touch it.',
 })
 
 LootSection:Paragraph({
@@ -1142,7 +1742,7 @@ ActionSection:Slider({
 })
 
 ActionSection:Toggle({
-    Title = 'auto medkit',
+    Title = 'auto heal when hurt',
     Flag = 'tv_auto_heal',
     Default = false,
     Callback = function(v) Main.AutoHeal = v end,
@@ -1177,14 +1777,6 @@ ActionSection:Slider({
 })
 
 ActionSection:Button({
-    Title = 'whistle',
-    Callback = function()
-        local ok = invokeAction("Whistle")
-        notify(ok and 'Whistled.' or 'Whistle refused (15s cooldown).', ok and 'success' or 'warning')
-    end,
-})
-
-ActionSection:Button({
     Title = 'drop held item here',
     Callback = function()
         local root = getRoot()
@@ -1197,6 +1789,144 @@ ActionSection:Button({
 ActionSection:Paragraph({
     Title = 'why health and hunger have no toggle',
     Text = 'Both are server-owned in this game: the client only ever reads them to draw the bars. Pinning them would make your HUD lie while you still starve, so eating and medkits are automated instead. Energy is different - the client decides whether you can sprint, which is why infinite energy is real.',
+})
+
+--// Whistle section
+local WhistleSection = MainTab:Section({ Title = 'whistle', Side = 'right' })
+
+WhistleSection:Button({
+    Title = 'whistle now',
+    Callback = function()
+        local ok = sendWhistle()
+        notify(ok and 'Whistled.' or 'Whistle refused (server cooldown).', ok and 'success' or 'warning')
+    end,
+})
+
+WhistleSection:Toggle({
+    Title = 'auto whistle',
+    Flag = 'tv_auto_whistle',
+    Default = false,
+    Callback = function(v) Main.AutoWhistle = v end,
+})
+
+WhistleSection:Slider({
+    Title = 'whistle every',
+    Flag = 'tv_whistle_interval',
+    Min = 5,
+    Max = 120,
+    Increment = 1,
+    Default = 16,
+    Suffix = 's',
+    Callback = function(v) Main.WhistleInterval = v end,
+})
+
+local whistleHeard = WhistleSection:Stat({ Title = 'last whistle', Value = 'none yet' })
+
+local whistleDropdown = WhistleSection:Dropdown({
+    Title = 'teleport when this player whistles',
+    Flag = 'tv_whistle_target',
+    Options = { 'anyone' },
+    Default = 'anyone',
+    Callback = function(v) Whistle.Target = v end,
+})
+
+WhistleSection:Button({
+    Title = 'refresh whistle list',
+    Callback = function()
+        local names = { 'anyone' }
+        for _, plr in ipairs(Players:GetPlayers()) do
+            if plr ~= LocalPlayer then names[#names + 1] = plr.Name end
+        end
+        pcall(function() whistleDropdown:SetOptions(names) end)
+    end,
+})
+
+WhistleSection:Input({
+    Title = 'listen for (seconds, 0 = forever)',
+    Flag = 'tv_whistle_wait',
+    Default = '60',
+    Placeholder = '60',
+    Callback = function(text)
+        local seconds = tonumber(text)
+        if not seconds or seconds < 0 then
+            notify('Listen time needs to be a number of seconds.', 'warning')
+            return
+        end
+        Whistle.WaitSeconds = seconds
+        if Whistle.Follow then
+            Whistle.ExpiresAt = seconds > 0 and (os.clock() + seconds) or math.huge
+        end
+    end,
+})
+
+local whistleToggle = WhistleSection:Toggle({
+    Title = 'teleport to whistle',
+    Flag = 'tv_whistle_follow',
+    Default = false,
+    Callback = function(v)
+        Whistle.Follow = v
+        if v then
+            Whistle.ExpiresAt = Whistle.WaitSeconds > 0 and (os.clock() + Whistle.WaitSeconds) or math.huge
+            if not CommunicationRemote then
+                notify('Remotes.Communication was not found - whistles cannot be heard.', 'error', 8)
+            end
+        end
+    end,
+})
+
+local whistleWindow = WhistleSection:Stat({ Title = 'listening', Value = 'off' })
+
+-- Expiry has to be watched here rather than only at whistle time, so the
+-- toggle actually turns itself off when nobody whistles at all.
+spawnLoop(function()
+    while not Unloading do
+        task.wait(0.5)
+
+        if Whistle.Follow and Whistle.WaitSeconds > 0 and os.clock() > Whistle.ExpiresAt then
+            Whistle.Follow = false
+            pcall(function() whistleToggle:Set(false) end)
+            notify('Stopped listening for whistles - nothing heard in time.', 'warning')
+        end
+
+        local windowText = 'off'
+        if Whistle.Follow then
+            if Whistle.WaitSeconds > 0 then
+                windowText = ('%ds left'):format(math.max(0, math.floor(Whistle.ExpiresAt - os.clock())))
+            else
+                windowText = 'no time limit'
+            end
+        end
+        pcall(function() whistleWindow:Set(windowText) end)
+
+        local heardText = 'none yet'
+        if Whistle.Last then
+            local ago = os.clock() - Whistle.Last.At
+            if Whistle.Last.Distance then
+                heardText = ('%s, %ds ago, %d studs'):format(Whistle.Last.Name, math.floor(ago), math.floor(Whistle.Last.Distance))
+            else
+                heardText = ('%s, %ds ago'):format(Whistle.Last.Name, math.floor(ago))
+            end
+        end
+        pcall(function() whistleHeard:Set(heardText) end)
+    end
+end)
+
+WhistleSection:Button({
+    Title = 'go to last whistle',
+    Callback = function()
+        if not Whistle.Last then
+            notify('No whistle heard yet.', 'warning')
+            return
+        end
+        releaseHold()
+        local ok = teleportTo(CFrame.new(Whistle.Last.Position + Vector3.new(0, Whistle.Offset, 0)))
+        notify(ok and ('Moved to ' .. Whistle.Last.Name .. "'s whistle.") or 'No character to move.', ok and 'success' or 'error')
+    end,
+})
+
+WhistleSection:Paragraph({
+    Title = 'how this hears them',
+    Text = 'Every whistle is broadcast to all clients on Remotes.Communication as ShowWhistle with the whistler and the exact world position it came from - the game only uses it to draw the marker on your screen. Reading that same event means no guessing and no configuration, and it reaches people who are streamed out, which is exactly who the sweep struggles with.',
 })
 
 --// Player tab
@@ -1317,13 +2047,28 @@ MoveSection:Slider({
     Callback = function(v) Player.FlySpeed = v end,
 })
 
+MoveSection:Toggle({
+    Title = 'mobile fly uses the joystick',
+    Flag = 'tv_mobile_fly',
+    Default = true,
+    Callback = function(v) Player.MobileFly = v end,
+})
+
+MoveSection:Paragraph({
+    Title = 'flying on a phone',
+    Text = 'No extra buttons get drawn - the normal joystick steers and the camera decides height. Push forward with the camera tilted up and you climb, tilt down and you dive, exactly like walking does. The jump button becomes a straight climb while fly is on. Keyboards are untouched: WASD, space and shift work as they always did.',
+})
+
 local ReachSection = PlayerTab:Section({ Title = 'reach', Side = 'left' })
 
 ReachSection:Toggle({
     Title = 'extended item reach',
     Flag = 'tv_reach_enabled',
     Default = false,
-    Callback = function(v) Player.ReachEnabled = v end,
+    Callback = function(v)
+        Player.ReachEnabled = v
+        if v then applyReach() else restoreReach() end
+    end,
 })
 
 ReachSection:Slider({
@@ -1334,7 +2079,38 @@ ReachSection:Slider({
     Increment = 5,
     Default = 30,
     Suffix = ' studs',
-    Callback = function(v) Player.Reach = v end,
+    Callback = function(v)
+        Player.Reach = v
+        if Player.ReachEnabled then applyReach() end
+    end,
+})
+
+local reachStat = ReachSection:Stat({ Title = 'ScrollDistance now', Value = '-' })
+
+spawnLoop(function()
+    while not Unloading do
+        task.wait(1)
+        local current = LocalPlayer:GetAttribute("ScrollDistance")
+        pcall(function() reachStat:Set(current and tostring(current) or 'unset') end)
+    end
+end)
+
+ReachSection:Button({
+    Title = 'grab item at crosshair',
+    Callback = function()
+        local ok, detail = grabAtCrosshair()
+        notify(ok and ('Grabbed ' .. tostring(detail)) or ('No grab: ' .. tostring(detail)), ok and 'success' or 'warning')
+    end,
+})
+
+ReachSection:Keybind({
+    Title = 'grab key',
+    Flag = 'tv_grab_key',
+    Default = Enum.KeyCode.V,
+    Callback = function()
+        local ok, detail = grabAtCrosshair()
+        if not ok then notify('No grab: ' .. tostring(detail), 'warning', 3) end
+    end,
 })
 
 ReachSection:Toggle({
@@ -1345,8 +2121,13 @@ ReachSection:Toggle({
 })
 
 ReachSection:Paragraph({
-    Title = 'reach',
-    Text = 'ScrollDistance is the attribute clamping how far you can hold and place an item. It is read on the client, so raising it extends how far out you can carry and position things without touching a remote at all.',
+    Title = 'why it works now',
+    Text = 'PickupSystem clamps carry distance with math.clamp(distance, 2.1, LocalPlayer:GetAttribute("ScrollDistance")). The attribute is read off the Player. The old build wrote it to the Humanoid, which nothing reads - so the toggle did nothing at all. It now goes on the Player and is re-asserted every step, because the server overwrites it on respawn.',
+})
+
+ReachSection:Paragraph({
+    Title = 'grabbing further away',
+    Text = 'Carry range and grab range are two different numbers. The grab itself is a fixed 10 stud raycast baked into GetModelAtCrosshair, so raising ScrollDistance alone still leaves you reaching over the shelf and picking up nothing. The grab key casts that same ray yourself at the reach distance above and calls the same Pickup remote with whatever it hits.',
 })
 
 --// Visual tab
@@ -1377,7 +2158,7 @@ EspSection:Toggle({
 EspSection:Dropdown({
     Title = 'item filter',
     Flag = 'tv_item_filter',
-    Options = { 'Food', 'All' },
+    Options = ItemFilters,
     Default = 'Food',
     Callback = function(v) Visual.ItemFilter = v end,
 })
@@ -1385,10 +2166,25 @@ EspSection:Dropdown({
 EspSection:Dropdown({
     Title = 'method',
     Flag = 'tv_esp_method',
-    Options = { 'Highlight', 'Box' },
-    Default = 'Highlight',
+    Options = { 'Marker', 'Highlight', 'Box' },
+    Default = 'Marker',
     Callback = function(v) Visual.Method = v end,
 })
+
+local espCountStat = EspSection:Stat({ Title = 'drawn', Value = '0' })
+
+spawnLoop(function()
+    while not Unloading do
+        task.wait(0.5)
+        local text
+        if espTotal > espShown then
+            text = ('%d of %d in range'):format(espShown, espTotal)
+        else
+            text = ('%d'):format(espShown)
+        end
+        pcall(function() espCountStat:Set(text) end)
+    end
+end)
 
 local EspConfigSection = VisualTab:Section({ Title = 'esp config', Side = 'right' })
 
@@ -1425,6 +2221,34 @@ EspConfigSection:Slider({
     Default = 1500,
     Suffix = ' studs',
     Callback = function(v) Visual.MaxEspDistance = v end,
+})
+
+EspConfigSection:Input({
+    Title = 'max esp count (0 = no limit)',
+    Flag = 'tv_esp_max_count',
+    Default = '150',
+    Placeholder = '150',
+    Callback = function(text)
+        local count = tonumber(text)
+        if not count or count < 0 then
+            notify('ESP count needs to be a whole number, or 0 for no limit.', 'warning')
+            return
+        end
+        Visual.MaxEspCount = math.floor(count)
+        if Visual.MaxEspCount == 0 then
+            notify('ESP count limit removed. Marker draws thousands fine; Highlight still caps at 30 by engine.', 'warning', 7)
+        end
+    end,
+})
+
+EspConfigSection:Paragraph({
+    Title = 'why item esp was empty',
+    Text = 'Highlight is the default in most hubs and Roblox quietly stops rendering past about 31 live Highlight instances - in a shop holding a hundred pizzas the item highlights simply never drew. Marker is the new default: a dot and a label per entry with no engine ceiling. Highlight still works and is capped at the nearest 30 on purpose; anything past that falls back to a marker instead of vanishing.',
+})
+
+EspConfigSection:Paragraph({
+    Title = 'streamed out items',
+    Text = 'A distant item model still exists but carries no parts at all, so there is nothing to adorn to. Those entries get an invisible anchor driven from the model pivot, which is why items now show up well before you can see them. Adornees point at the model while the instances themselves live under the camera, so nothing dies when a chunk streams out.',
 })
 
 EspConfigSection:Paragraph({
@@ -1504,6 +2328,27 @@ spawnLoop(function()
     end
 end)
 
+local invStat = DiagSection:Stat({ Title = 'inventory', Value = '-' })
+local itemModuleStat = DiagSection:Stat({ Title = 'item definitions', Value = ItemModule and 'loaded' or 'unavailable' })
+local whistleRemoteStat = DiagSection:Stat({ Title = 'whistle broadcast', Value = CommunicationRemote and 'connected' or 'not found' })
+
+spawnLoop(function()
+    while not Unloading do
+        task.wait(1)
+        local max = LocalPlayer:GetAttribute("MaxInventorySpace")
+        local used = 0
+        for _, name in ipairs(inventoryToolNames()) do
+            if name then used = used + 1 end
+        end
+        pcall(function() invStat:Set(('%d / %s'):format(used, max and tostring(max) or '?')) end)
+    end
+end)
+
+DiagSection:Paragraph({
+    Title = 'infinite inventory space',
+    Text = 'Not possible from here, and shipping a toggle for it would only make your own HUD lie. MaxInventorySpace is a Player attribute the client reads once, to draw the "3/8 items" text - nothing else. The refusal comes from the server, which returns the message containing "Inventory" that Store shows you. The only in-game route that raises it is the admin panel, which fires Remotes.Vip with a rank check behind it.',
+})
+
 DiagSection:Paragraph({
     Title = 'stream radius',
     Text = 'Measured live by sampling how far the furthest loaded map part sits from you, because the real streaming radius is not readable as a property from the client. Use it to set the ring spacing on the main tab rather than guessing.',
@@ -1530,8 +2375,13 @@ ControlSection:Button({
         end
 
         for key in pairs(espObjects) do destroyEsp(key) end
+        if EspHolder then EspHolder:Destroy() end
         setNoclip(false)
         stopFly()
+        releaseHold()
+        restoreReach()
+        Whistle.Follow = false
+        Main.AutoWhistle = false
         applyFullbright(false)
         applyNoFog(false)
         setCeilingHidden(false)
