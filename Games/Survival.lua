@@ -10,21 +10,13 @@ Workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(function()
     Camera = Workspace.CurrentCamera
 end)
 
--- The fire remote takes an action name ("UseItem", "DropItem", ...) and,
--- for weapons, a MousePosition the server trusts as the aim point - not a
--- 2D screen coordinate, but the world hit of a Raycast straight out of the
--- camera's LookVector (see Player.Utilities' GetMouseHit: it ignores the
--- actual mouse cursor entirely). That's what makes both aim techniques
--- below work: camera-lock because turning the camera IS turning the aim
--- ray, and the silent remote hook because replacing MousePosition replaces
--- exactly what the server already trusts.
 local Events = ReplicatedStorage:WaitForChild("Events", 10)
 local Remotes = Events and Events:WaitForChild("Remotes", 10)
 local RequestCharacterAction = Remotes and Remotes:WaitForChild("RequestCharacterAction", 10)
 
 local Config = {
     SilentAim = false,
-    AimMode = "Camera", -- "Camera" (visible, always works) or "Silent" (invisible, needs namecall hooking)
+    AimMode = "Camera",
     AimPart = "Head",
     TargetPlayers = true,
     TargetMonsters = true,
@@ -51,7 +43,6 @@ local ESPConfig = {
     Items = false,
 }
 
---// Targeting --------------------------------------------------------------------
 local function getAimPart(model)
     return model:FindFirstChild(Config.AimPart) or model:FindFirstChild("HumanoidRootPart") or model:FindFirstChild("Head")
 end
@@ -68,9 +59,6 @@ local function hasLineOfSight(fromPos, toPos, ignoreInstances)
     return (result.Position - fromPos).Magnitude >= dir.Magnitude - 1.5
 end
 
--- Monsters live under a flat Workspace._Monsters folder, each entry a Model
--- with its own Humanoid - same shape as a player's character, so targeting
--- treats both the same way once collected.
 local function collectCandidates()
     local list = {}
     if Config.TargetPlayers then
@@ -131,7 +119,6 @@ local function getBestTarget()
     return best
 end
 
---// Silent aim (remote hook) -----------------------------------------------------
 local HAS_NAMECALL_HOOK = typeof(hookmetamethod) == "function" and typeof(getnamecallmethod) == "function"
 local originalNamecall
 
@@ -153,7 +140,6 @@ if HAS_NAMECALL_HOOK and RequestCharacterAction then
     end)
 end
 
---// Camera-lock aim (always works, visibly turns the camera) --------------------
 local function applyCameraLock()
     if not (Config.SilentAim and Config.AimMode == "Camera") then return end
     local aimPart = getBestTarget()
@@ -165,7 +151,6 @@ pcall(function()
     RunService:BindToRenderStep("SurvivalAimLock", Enum.RenderPriority.Camera.Value + 1, applyCameraLock)
 end)
 
---// FOV circle --------------------------------------------------------------------
 local fovCircle
 if typeof(Drawing) == "table" then
     pcall(function()
@@ -180,27 +165,18 @@ end
 
 RunService.RenderStepped:Connect(function()
     if not fovCircle then return end
-    -- Only gated on the fov toggle itself, not on silent aim also being on -
-    -- tying it to SilentAim meant the circle never appeared unless aim
-    -- assist was already engaged, which read as "fov isn't drawn at all".
+
     local show = Config.FOVEnabled
     fovCircle.Visible = show
     if show then
         fovCircle.Radius = Config.FOVRadius
-        -- Drawing's Transparency is opacity-flavored (1 = fully opaque), the
-        -- opposite of Roblox's own convention, so the slider (Roblox-style,
-        -- higher = more see-through) gets inverted here.
+
         fovCircle.Transparency = 1 - Config.FOVTransparency
         fovCircle.Position = Vector2.new(Camera.ViewportSize.X / 2, Camera.ViewportSize.Y / 2)
     end
 end)
 
---// ESP ------------------------------------------------------------------------
--- "Kind" instead of a plain isMonster boolean, since world items (Workspace.
--- _Items - loose pickups like guns/food lying around, each a Model with a
--- Handle part) get ESP'd too now, and they don't have a Humanoid or a
--- Head/HumanoidRootPart rig the way players/monsters do.
-local espObjects = {} -- [model] = objs
+local espObjects = {}
 
 local function espColorFor(kind)
     if kind == "Monster" then return Color3.fromRGB(255, 170, 60) end
@@ -208,8 +184,6 @@ local function espColorFor(kind)
     return Color3.fromRGB(230, 60, 60)
 end
 
--- Player/monster models use HumanoidRootPart (falling back to Head); items
--- only ever have a Handle.
 local function espAnchor(model, kind)
     if kind == "Item" then
         return model:FindFirstChild("Handle") or model.PrimaryPart
@@ -283,10 +257,6 @@ local function buildEsp(model, name, kind)
     end
 end
 
--- Highlight color/transparency and the name+distance text only need to
--- track loosely, not every frame - bundled into one roster-refresh poll so
--- RenderStepped below stays limited to what actually needs per-frame
--- smoothness (Box/Tracer screen positions, which move with the camera).
 task.spawn(function()
     while true do
         task.wait(0.5)
@@ -405,9 +375,7 @@ RunService.RenderStepped:Connect(function()
             local color = espColorFor(objs.Kind)
 
             if objs.Box and anchor then
-                -- Players/monsters get a head-to-knee box off their rig;
-                -- items have no rig at all, so just a small fixed box around
-                -- the Handle.
+
                 local topPos, bottomPos
                 if objs.Kind == "Item" then
                     topPos = anchor.Position + Vector3.new(0, 0.75, 0)
@@ -452,22 +420,6 @@ Players.PlayerRemoving:Connect(function(plr)
     if char then destroyEsp(char) end
 end)
 
---// Player: speed ------------------------------------------------------------------
--- Plain WalkSpeed overriding alone is what's getting reverted: this game's
--- own Controller LocalScript recalculates and reassigns Humanoid.WalkSpeed
--- itself on movement-state changes (sprint/crouch/weight), and depending on
--- event order it can win that race - and if a Running-state connection
--- fires the instant WalkSpeed changes, no per-frame reassertion beats that,
--- because the correction happens inside the same tick as our write.
--- "extra boost" sidesteps the property entirely: it nudges the
--- HumanoidRootPart directly along whatever direction Humanoid.MoveDirection
--- already says you're heading, stacked on top of normal movement, so
--- there's no WalkSpeed change for anything watching that property to react
--- to. If this game instead validates raw position deltas server-side
--- (a proper anti-speed check, not just a property watchdog), no purely
--- client-side technique reliably beats that without knowing its tolerance -
--- start the boost slider low and raise it until movement stops
--- rubber-banding back.
 local originalWalkSpeed = nil
 
 RunService.Heartbeat:Connect(function(dt)
@@ -494,12 +446,6 @@ RunService.Heartbeat:Connect(function(dt)
     end
 end)
 
---// Player: infinite stats (best effort) --------------------------------------
--- Stamina/Hydration/Satiation are ordinary NumberValues that deplete and
--- replicate down over time, which looks server-driven - forcing them here
--- can't guarantee the server agrees your stats are actually full, but
--- reasserting every frame keeps the client-side value (and whatever HUD
--- reads it) pinned at max even if a server tick knocks it down in between.
 local MAX_STAT = 100
 
 RunService.Heartbeat:Connect(function()
@@ -515,7 +461,6 @@ RunService.Heartbeat:Connect(function()
     end
 end)
 
---// UI -----------------------------------------------------------------------------
 local Centrl = loadstring(game:HttpGet('https://raw.githubusercontent.com/iamdookie1/Rblx2/main/UI/Lib2.lua'))()
 
 local Window = Centrl:Window({
@@ -634,11 +579,6 @@ FovSection:Slider({
     Callback = function(v) Config.FOVTransparency = v end,
 })
 
-FovSection:Paragraph({
-    Title = 'how aiming works here',
-    Text = 'This game aims from the center of your screen (a straight ray out of the camera), not your mouse cursor - so the FOV circle is centered on screen, and "Camera" mode works by turning your view onto the target, same as aiming normally. "Silent" mode instead rewrites the aim point sent to the server without moving your camera, but needs namecall hooking support.',
-})
-
 local VisualTab = Window:Tab({ Title = 'visual', Icon = 'eye' })
 local EspSection = VisualTab:Section({ Title = 'esp', Side = 'left' })
 
@@ -728,11 +668,6 @@ SpeedSection:Slider({
     Callback = function(v) Config.SpeedBoost = v end,
 })
 
-SpeedSection:Paragraph({
-    Title = 'about the anti-speed',
-    Text = 'Plain walkspeed alone gets fought/reverted by this game\'s own movement script. "Extra boost" moves you directly instead of touching walkspeed, which routes around a walkspeed-property watchdog - but if the server is actually checking raw movement distance, nothing purely client-side beats that outright. Start low and raise it until you stop getting snapped back.',
-})
-
 local StatsSection = PlayerTab:Section({ Title = 'stats', Side = 'right' })
 
 StatsSection:Toggle({
@@ -740,11 +675,6 @@ StatsSection:Toggle({
     Flag = 'sv_infinite_stats',
     Default = false,
     Callback = function(v) Config.InfiniteStats = v end,
-})
-
-StatsSection:Paragraph({
-    Title = 'heads up',
-    Text = 'These look server-driven (depleted and synced down over time), so this forces the client-side value back to full every frame rather than guaranteeing the server agrees - it should keep your HUD pinned at max, but treat it as best-effort.',
 })
 
 Window:Load()
