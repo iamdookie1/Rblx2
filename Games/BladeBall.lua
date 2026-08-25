@@ -65,6 +65,10 @@ local PostSimulation = resolveEvent("PostSimulation", "Heartbeat")
 local Connections = {}
 local Unloading = false
 local notify
+-- Set once the UI builds the toggle. Budget exhaustion disables Config.Enabled
+-- from inside press(), and without also repainting this the switch on screen
+-- would still show ON while auto parry is actually off.
+local EnabledToggle
 
 local function track(connection)
     Connections[#Connections + 1] = connection
@@ -89,10 +93,12 @@ local Config = {
     MaxDistance = 140,
     UseClosingSpeed = true,
 
-    -- A press mode disables itself after this many presses. If a method is
-    -- detected, that costs one kick rather than a session of them, and the log
-    -- says which method was live when it happened.
-    PressBudget = 5,
+    -- A press mode disables itself after this many presses. Input has now
+    -- produced a real kick in testing - one successful parry, then kicked - so
+    -- this assumes a fast synchronous check rather than a slow statistical one
+    -- and keeps the budget tight enough that a bad method costs one kick, not
+    -- several.
+    PressBudget = 2,
 
     Sound = true,
     Logging = true,
@@ -381,6 +387,9 @@ local function press()
 
     if Stats.Budget <= 0 then
         Config.Enabled = false
+        -- Silent: this is not the user flipping the switch, and a Set() with
+        -- its callback firing would immediately refill the budget it just spent.
+        if EnabledToggle then EnabledToggle:Set(false, true) end
         log(("BUDGET SPENT on %s - auto parry disabled"):format(Config.Mode))
         notify('Press budget spent. Auto parry turned itself off.', 'warning', 8)
         return
@@ -510,7 +519,7 @@ ModeSection:Dropdown({
     end,
 })
 
-ModeSection:Toggle({
+EnabledToggle = ModeSection:Toggle({
     Title = 'enabled',
     Flag = 'bb_enabled',
     Default = false,
@@ -527,7 +536,7 @@ ModeSection:Slider({
     Min = 1,
     Max = 50,
     Increment = 1,
-    Default = 5,
+    Default = 2,
     Callback = function(value)
         Config.PressBudget = value
         Stats.Budget = value
@@ -687,13 +696,18 @@ RiskSection:Paragraph({
 })
 
 RiskSection:Paragraph({
-    Title = 'Input - this is the one that got somebody kicked',
-    Text = 'It sent a MouseButton1 click, from a phone. UserInputService on that device reports TouchEnabled true and MouseEnabled false, so a mouse click there is a tell anything can read in two lines. It now sends a touch on touch devices and a click on desktop. That removes an obvious mistake rather than making the method safe: VirtualInputManager is a known exploit tool in its own right and a client-side anti-cheat can look for it directly. It is still the method whose parry looks most genuine, because the game\'s own code runs end to end.',
+    Title = 'Input - kicked twice now, for two different reasons',
+    Text = 'First on a phone sending a MouseButton1 click while UserInputService reported TouchEnabled true, MouseEnabled false - a tell anything can read in two lines. Fixed: it now sends a touch on touch devices and a click on desktop. Tested again after the fix - the touch itself landed a real parry and was kicked anyway, fast. One success then an immediate kick is not what a slow statistical check looks like; it reads as a direct, synchronous signature check, most likely on VirtualInputManager use itself rather than anything about the click. There is no known way to make this method safe from inside this script.',
 })
 
 RiskSection:Paragraph({
     Title = 'why nothing here can make a call look legitimate',
     Text = 'Firing ParryAttempt with the right arguments would need the arguments, and the only code that knows them is SwordsController.PRY, which is a Luraph VM. Reading them off the wire while you parry by hand means hooking a metamethod - and that module already checks whether debug.info has been hooked, so the capture is more detectable than the thing it is trying to make safe. If your executor has a built-in remote spy, that runs below the game and is the one route that does not put a hook in this script.',
+})
+
+RiskSection:Paragraph({
+    Title = 'there is no window to beat the kick in',
+    Text = 'The server decides before the client ever sees anything - by the time a kick message renders, the check that produced it already ran and already finished. There is no intermediate signal to react to, because for one to exist, detection and enforcement would have to be two separate steps with something crossing back to the client in between. What actually happened - one parry, then an immediate kick - looks like a single synchronous check with no such gap. And even where anti-cheats do delay enforcement, the delay is often deliberately randomised so it cannot be timed against. Racing this is not a code problem with a code answer.',
 })
 
 RiskSection:Paragraph({
