@@ -97,6 +97,43 @@ local function clickAt(x, y)
     return ok
 end
 
+-- Somewhere a synthesized tap cannot cause trouble.
+--
+-- The minigame's press handler reads only the input type - it ignores the
+-- position entirely, and discards gameProcessedEvent - so the tap can land
+-- anywhere. Aiming it at the marker was pointless, and on a phone the marker
+-- sits near the top of the screen, which is exactly where the Roblox menu
+-- button is. Tapping there opens the Roblox menu instead.
+--
+-- So: below the topbar inset, above the on-screen controls, centred away from
+-- the jump button and the thumbstick.
+local GuiService = game:GetService("GuiService")
+
+local function safeClickPoint()
+    local viewport = Vector2.new(1280, 720)
+    local camera = workspace.CurrentCamera
+    if camera then viewport = camera.ViewportSize end
+
+    local topInset = 0
+    local ok, inset = pcall(function()
+        return GuiService:GetGuiInset()
+    end)
+    if ok and inset then topInset = inset.Y end
+
+    -- A generous margin under the inset rather than a tight one: the Roblox
+    -- topbar grows on some devices, and being 40px lower costs nothing.
+    local top = topInset + 40
+    local bottom = viewport.Y * 0.72   -- clear of the jump button and stick
+    local y = top + (bottom - top) * 0.5
+    if y <= top then y = top + 1 end
+    return viewport.X * 0.5, y
+end
+
+local function safeClick()
+    local x, y = safeClickPoint()
+    return clickAt(x, y)
+end
+
 local function clickCentre(guiObject)
     if not guiObject then return false end
     local position = guiObject.AbsolutePosition
@@ -125,6 +162,10 @@ local Hack = {
     SolveMinigame = false,
     PerfectOnly = true,
     AutoDefend = false,
+    -- Off by default: tapping presses the real circle but a circle under the
+    -- Roblox menu button turns a synthesized tap into an open menu.
+    DefendByTap = false,
+    Defended = 0,
     Rounds = nil,
     Active = false,
     Solved = 0,
@@ -217,7 +258,10 @@ local function solveRound(round, index)
         if not marker.Parent then return end
         local offset = math.abs(marker.Position.X.Scale - round.center)
         if offset <= band then
-            if clickCentre(marker) then
+            -- Deliberately not aimed at the marker: the handler does not read
+            -- the position, and aiming there is what was hitting the Roblox
+            -- menu button on mobile.
+            if safeClick() then
                 Hack.Solved = Hack.Solved + 1
                 Hack.Status = ('round %d hit (%.3f off)'):format(index, offset)
             else
@@ -304,19 +348,57 @@ local function defenceScreen()
     return nil
 end
 
+-- Two ways to answer a firewall, and on a phone the difference matters.
+--
+-- Tapping is the faithful one: it presses the actual circle, so the client's
+-- own counter and the server's agree. But a circle can spawn anywhere on
+-- screen, including under the Roblox menu button, and a synthesized tap there
+-- opens the Roblox menu instead of hitting the circle.
+--
+-- Firing the remote is what the tap would have caused anyway - the client's
+-- handler does nothing else with it - and touches no coordinates at all. It is
+-- paced by the game's own hitMinInterval and only runs while a firewall is
+-- actually on screen, so the server sees the same rate a fast player produces.
+-- That is the default, because a defence that occasionally yanks you into the
+-- Roblox menu is worse than useless.
+local function circlesOnScreen(screen)
+    local n = 0
+    for _, descendant in ipairs(screen:GetDescendants()) do
+        if descendant:IsA("TextButton") and descendant.Visible
+            and descendant.AbsoluteSize.X > 12 then
+            n = n + 1
+        end
+    end
+    return n
+end
+
 task.spawn(function()
     while true do
         RunService.Heartbeat:Wait()
-        if Hack.AutoDefend and canSynthesizeInput() then
+        if Hack.AutoDefend then
             local screen = defenceScreen()
             if screen and os.clock() - lastDefendTap >= DEFEND_MIN_GAP then
-                for _, descendant in ipairs(screen:GetDescendants()) do
-                    if descendant:IsA("TextButton") and descendant.Visible
-                        and descendant.AbsoluteSize.X > 12 then
-                        if clickCentre(descendant) then
-                            lastDefendTap = os.clock()
+                if Hack.DefendByTap then
+                    if canSynthesizeInput() then
+                        for _, descendant in ipairs(screen:GetDescendants()) do
+                            if descendant:IsA("TextButton") and descendant.Visible
+                                and descendant.AbsoluteSize.X > 12 then
+                                if clickCentre(descendant) then
+                                    lastDefendTap = os.clock()
+                                end
+                                break
+                            end
                         end
-                        break
+                    else
+                        Hack.Status = 'tap mode needs VirtualInputManager'
+                    end
+                elseif HackDefend and circlesOnScreen(screen) > 0 then
+                    -- Only while a circle is actually up, so this never sends
+                    -- a hit there was nothing to hit.
+                    local ok = pcall(function() HackDefend:FireServer("hit") end)
+                    if ok then
+                        lastDefendTap = os.clock()
+                        Hack.Defended = Hack.Defended + 1
                     end
                 end
             end
@@ -760,8 +842,13 @@ MiniSection:Paragraph({
 })
 
 MiniSection:Paragraph({
+    Title = 'where it taps',
+    Text = 'The minigame\'s handler reads only the input type - it never looks at where the tap landed. So the tap goes to a point below the Roblox topbar and above the on-screen controls rather than at the marker. Aiming at the marker was pointless and, on a phone, the marker sits right under the Roblox menu button.',
+})
+
+MiniSection:Paragraph({
     Title = 'needs an executor with VirtualInputManager',
-    Text = 'The minigame listens for a real click on UserInputService, and the firewall circles are TextButtons waiting on Activated. Neither can be raised from a script, so the press goes through VirtualInputManager. If your executor does not expose it, the status will say so and nothing else here is affected.',
+    Text = 'The minigame listens for a real press on UserInputService, which a script cannot raise directly, so it goes through VirtualInputManager. If your executor does not expose it the status says so, and nothing else here depends on it - the firewall defence, the economy tools and the overlay all work without it.',
 })
 
 local DefendSection = HackTab:Section({ Title = 'firewall defence', Side = 'right' })
@@ -771,6 +858,20 @@ DefendSection:Toggle({
     Flag = 'bai_defend',
     Default = false,
     Callback = function(state) Hack.AutoDefend = state end,
+})
+
+DefendSection:Toggle({
+    Title = 'tap the circles instead',
+    Flag = 'bai_defend_tap',
+    Default = false,
+    Callback = function(state) Hack.DefendByTap = state end,
+})
+
+local DefendCount = DefendSection:Stat({ Title = 'blocks sent', Value = '0' })
+
+DefendSection:Paragraph({
+    Title = 'mobile',
+    Text = 'By default this answers the firewall through its remote rather than by tapping, because a circle can spawn under the Roblox menu button and a synthesized tap there opens the Roblox menu instead. It only fires while a circle is actually on screen and it is paced by the game\'s own minimum interval, so the server sees the rate a fast player produces. Turn tapping on if you would rather press the real buttons.',
 })
 
 DefendSection:Paragraph({
@@ -1248,6 +1349,7 @@ task.spawn(function()
         task.wait(0.25)
 
         MiniStatus:Set(Hack.Status)
+        DefendCount:Set(tostring(Hack.Defended))
         MiniHits:Set(('%d / %d'):format(Hack.Solved, Hack.Missed))
         if Hack.LastChance > 0 then
             ChanceStat:Set(('%.0f%%'):format(Hack.LastChance * 100))
