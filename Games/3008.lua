@@ -33,9 +33,24 @@
 --                                         "Storable" and "Interactable" decide
 --                                         which action E runs on it
 --
--- Player attributes the client reads and we can therefore change:
---   LocalPlayer:GetAttribute("ScrollDistance")     - carry/place range clamp
---   Humanoid   :GetAttribute("Hunger")             - read only, server owned
+-- The client's own PickupSystem lives at
+--   Players.LocalPlayer.PlayerScripts.source.client.Building (ModuleScript)
+-- and require is cached per instance, so requiring it returns the same table
+-- the game is using. That is where the LIVE carry distance lives.
+--
+-- Player attributes:
+--   LocalPlayer:GetAttribute("ScrollDistance")   - CEILING for carry distance,
+--                                                  not the distance itself
+--   LocalPlayer:GetAttribute("IsHolding")        - server owned, the honest
+--                                                  answer to "am I holding
+--                                                  something right now"
+--   LocalPlayer:GetAttribute("MaxInventorySpace")- server owned, read for the
+--                                                  "n/m items" text
+--   Humanoid   :GetAttribute("Hunger")           - read only, server owned
+--
+-- The moderator panel's one lever, aimed at ourselves in the server tab:
+--   Remotes.Vip:FireServer("UpdatePlayerProperties",
+--       {Properties = {...}, ToPlayer = player})
 --
 -- Where the server is authoritative, the UI says so instead of shipping a
 -- toggle that only lies to your own HUD.
@@ -102,6 +117,9 @@ local Main = {
 
     AutoWhistle = false,
     WhistleInterval = 16,
+
+    AutoUnstick = false,
+    UnstickAfter = 3,
 }
 
 -- Another player's whistle is broadcast to every client as
@@ -115,24 +133,6 @@ local Whistle = {
     ExpiresAt = 0,
     Offset = 6,
     Last = nil,
-}
-
-local Finder = {
-    Altitude = 400,
-    RingStep = 350,
-    MaxRings = 14,
-    Dwell = 0.35,
-    -- How long to give a chunk to actually stream in before writing the point
-    -- off. A fixed dwell was the old behaviour and it was the bug: on a slow
-    -- connection every ring expired before the map arrived.
-    LoadTimeout = 8,
-    -- Map geometry lands before character models do, so once the ground is
-    -- there we still wait this long for players to follow it down.
-    Settle = 0.7,
-    ReturnAfter = true,
-    UseCache = true,
-    Searching = false,
-    Status = "idle",
 }
 
 local Player = {
@@ -348,82 +348,155 @@ track(PostSimulation:Connect(function()
     end
 end))
 
---// Last-known position cache -----------------------------------------------------
--- This game streams player characters out: a distant player's model still
--- replicates (Humanoid, scripts, clothing) but carries no BaseParts at all,
--- so there is no position to read. Recording positions while they ARE loaded
--- is the only way to teleport to someone instantly, and it costs nothing.
-local lastSeen = {}
-
-spawnLoop(function()
-    while not Unloading do
-        task.wait(0.25)
-        for _, plr in ipairs(Players:GetPlayers()) do
-            if plr ~= LocalPlayer then
-                local char = plr.Character
-                local root = char and char:FindFirstChild("HumanoidRootPart")
-                if root then
-                    lastSeen[plr] = { Position = root.Position, At = os.clock() }
-                end
-            end
-        end
+--// Reach --------------------------------------------------------------------------
+-- Two separate numbers control carry distance, and only fixing one of them is
+-- why this kept looking broken.
+--
+--   1. Building (the client's own PickupSystem module) keeps the LIVE carry
+--      distance in a module upvalue that starts at 8. PickupRenderLoop reads it
+--      every frame to decide where the held item floats:
+--        raycast(cursorRay.Origin, cursorRay.Direction * GetScrollDistance())
+--
+--   2. LocalPlayer:GetAttribute("ScrollDistance") is only a CEILING. It is read
+--      by AdjustDistance (mouse wheel) and the gamepad bumpers:
+--        SetScrollDistance(math.clamp(current + delta, 2.1, attribute))
+--
+-- So raising the attribute alone changes nothing until you physically scroll -
+-- and on a phone there is no scroll wheel at all, so it could never take
+-- effect. The module is a plain ModuleScript under PlayerScripts, and require
+-- is cached per instance, so requiring it here hands back the exact same table
+-- the game is using. Setting the live value directly is the actual fix; the
+-- attribute still gets raised so scrolling cannot clamp it back down.
+local PickupSystem
+pcall(function()
+    local scripts = LocalPlayer:WaitForChild("PlayerScripts", 20)
+    local source = scripts and scripts:WaitForChild("source", 20)
+    local client = source and source:WaitForChild("client", 20)
+    local module = client and client:WaitForChild("Building", 20)
+    if module then
+        local ok, api = pcall(require, module)
+        if ok and typeof(api) == "table" and api.SetScrollDistance then PickupSystem = api end
     end
 end)
 
-track(Players.PlayerRemoving:Connect(function(plr)
-    lastSeen[plr] = nil
-end))
+local DEFAULT_SCROLL_DISTANCE = 8
+local baseScrollDistance = nil
 
-local function isStreamedIn(plr)
-    local char = plr.Character
-    return (char and char:FindFirstChild("HumanoidRootPart")) ~= nil
+local function liveScrollDistance()
+    if not PickupSystem then return nil end
+    local ok, value = pcall(function() return PickupSystem:GetScrollDistance() end)
+    if ok then return value end
+    return nil
 end
 
---// Streaming radius probe ---------------------------------------------------------
--- The effective streaming radius is not readable as a property from the
--- client, and it decides how far apart the search rings can be. So measure it
--- instead of guessing: sample streamed-in map parts and report the furthest.
--- Sampled and capped, because Map can hold thousands of parts.
-local measuredRadius = 0
-
-spawnLoop(function()
-    while not Unloading do
-        task.wait(2)
-        local root = getRoot()
-        if root and MapFolder then
-            local furthest = 0
-            local budget = 400
-            local origin = root.Position
-            for _, folder in ipairs(MapFolder:GetChildren()) do
-                if budget <= 0 then break end
-                local children = folder:GetChildren()
-                -- Stride through rather than walking every part: a sample is
-                -- plenty to find the outer edge, and this keeps the probe off
-                -- the frame budget entirely.
-                local stride = math.max(1, math.floor(#children / 60))
-                for i = 1, #children, stride do
-                    if budget <= 0 then break end
-                    local part = children[i]
-                    local pivotOk, pivot = pcall(function() return part:GetPivot().Position end)
-                    if pivotOk then
-                        local d = (pivot - origin).Magnitude
-                        if d > furthest then furthest = d end
-                    end
-                    budget = budget - 1
-                end
-            end
-            if furthest > 0 then
-                measuredRadius = furthest
-            end
-        end
+local function applyReach()
+    if baseScrollDistance == nil then
+        baseScrollDistance = LocalPlayer:GetAttribute("ScrollDistance") or 15
     end
+    -- Raise the ceiling first, or the next scroll tick clamps us straight back.
+    if LocalPlayer:GetAttribute("ScrollDistance") ~= Player.Reach then
+        pcall(function() LocalPlayer:SetAttribute("ScrollDistance", Player.Reach) end)
+    end
+    if PickupSystem and liveScrollDistance() ~= Player.Reach then
+        pcall(function() PickupSystem:SetScrollDistance(Player.Reach) end)
+    end
+end
+
+local function restoreReach()
+    if baseScrollDistance ~= nil then
+        pcall(function() LocalPlayer:SetAttribute("ScrollDistance", baseScrollDistance) end)
+    end
+    if PickupSystem then
+        pcall(function() PickupSystem:SetScrollDistance(DEFAULT_SCROLL_DISTANCE) end)
+    end
+end
+
+--// Holding ------------------------------------------------------------------------
+-- IsHolding is a server-set Player attribute. It is the honest answer to
+-- "does the server think I have something in my hands right now", which is
+-- exactly what a desynced hold needs.
+local function isHolding()
+    return LocalPlayer:GetAttribute("IsHolding") == true
+end
+
+--// Player properties (Remotes.Vip) ------------------------------------------------
+-- The in-game moderator panel changes another player's stats by firing one
+-- remote:
+--
+--   Remotes.Vip:FireServer("UpdatePlayerProperties", {
+--       Properties = { Health = n, MaxHealth = n, MaxInventorySpace = n, ... },
+--       ToPlayer   = player,
+--   })
+--
+-- Its God button is literally SetStat(stat, 1/0), which writes infinity into
+-- both the stat and its Max - that is why god mode makes the health bar render
+-- strangely, the bar is drawing a fraction with an infinite denominator.
+--
+-- Whether the server checks your rank before applying this is its business,
+-- not something the client can see. So rather than promise anything, every
+-- write below is followed by a read of the attribute it was supposed to
+-- change, and the UI reports what actually happened.
+local VipRemote
+pcall(function()
+    local remotes = ReplicatedStorage:WaitForChild("Remotes", 15)
+    VipRemote = remotes and remotes:WaitForChild("Vip", 15)
 end)
 
---// Player finder ------------------------------------------------------------------
+local Admin = {
+    LastResult = 'not tried',
+    LastAt = 0,
+}
+
+local function setProperties(properties, toPlayer)
+    if not VipRemote then return false end
+    local target = toPlayer or LocalPlayer
+    local ok = pcall(function()
+        VipRemote:FireServer("UpdatePlayerProperties", {
+            Properties = properties,
+            ToPlayer = target,
+        })
+    end)
+    return ok
+end
+
+-- Fires the write, then waits for the value it was meant to produce to show up.
+-- A remote the server ignores is silent, so the only honest test is whether the
+-- thing changed.
+local function setPropertiesAndVerify(properties, check, label)
+    if not VipRemote then
+        Admin.LastResult = 'Remotes.Vip not found'
+        Admin.LastAt = os.clock()
+        return false, Admin.LastResult
+    end
+
+    setProperties(properties)
+
+    local deadline = os.clock() + 1.5
+    while os.clock() < deadline do
+        if check() then
+            Admin.LastResult = label .. ': applied'
+            Admin.LastAt = os.clock()
+            return true, Admin.LastResult
+        end
+        task.wait(0.1)
+    end
+
+    Admin.LastResult = label .. ': server refused'
+    Admin.LastAt = os.clock()
+    return false, Admin.LastResult
+end
+
+--// Teleporting -------------------------------------------------------------------
+-- Whatever moves you, land stopped. Carrying velocity into a teleport is what
+-- flings you back out of where you just arrived.
 local function teleportTo(cframe)
     local root = getRoot()
     if not root or not cframe then return false end
     root.CFrame = cframe
+    pcall(function()
+        root.AssemblyLinearVelocity = Vector3.new()
+        root.AssemblyAngularVelocity = Vector3.new()
+    end)
     return true
 end
 
@@ -431,223 +504,6 @@ local function requestStreamAround(position)
     pcall(function()
         LocalPlayer:RequestStreamAroundAsync(position)
     end)
-end
-
---// Holding position ---------------------------------------------------------------
--- Writing CFrame once and then waiting is what made the old sweep fall out of
--- the sky: gravity had the whole dwell to work on you, and on a slow chunk that
--- dwell turned into seconds. Anchoring the root and re-asserting it every step
--- keeps you exactly where you were put, however long the load takes.
-local holdConnection
-local holdTarget
-
-local function releaseHold()
-    if holdConnection then
-        holdConnection:Disconnect()
-        holdConnection = nil
-    end
-    holdTarget = nil
-    local root = getRoot()
-    if root then
-        pcall(function()
-            root.Anchored = false
-            root.AssemblyLinearVelocity = Vector3.new()
-        end)
-    end
-    local hum = getHumanoid()
-    if hum then pcall(function() hum.PlatformStand = false end) end
-end
-
-local function holdAt(cframe)
-    local root = getRoot()
-    if not root then return false end
-    holdTarget = cframe
-    root.CFrame = cframe
-    pcall(function()
-        root.AssemblyLinearVelocity = Vector3.new()
-        root.AssemblyAngularVelocity = Vector3.new()
-        root.Anchored = true
-    end)
-    local hum = getHumanoid()
-    -- PlatformStand stops the Humanoid trying to walk or ragdoll against an
-    -- anchored root, which otherwise fights us for the whole hold.
-    if hum then pcall(function() hum.PlatformStand = true end) end
-    if not holdConnection then
-        holdConnection = PostSimulation:Connect(function()
-            if Unloading or not holdTarget then return end
-            local current = getRoot()
-            if not current then return end
-            if not current.Anchored then current.Anchored = true end
-            if (current.Position - holdTarget.Position).Magnitude > 1 then
-                current.CFrame = holdTarget
-            end
-        end)
-    end
-    return true
-end
-
--- A chunk has arrived when something solid exists under the probe point. That
--- is a real answer, unlike a fixed wait that is either wasted time or too short.
-local downRayParams = RaycastParams.new()
-downRayParams.FilterType = Enum.RaycastFilterType.Exclude
-
-local function regionLoaded(point)
-    local char = getCharacter()
-    downRayParams.FilterDescendantsInstances = char and { char } or {}
-    local ok, hit = pcall(function()
-        return Workspace:Raycast(point, Vector3.new(0, -(math.abs(point.Y) + 2000), 0), downRayParams)
-    end)
-    return ok and hit ~= nil
-end
-
--- Returns once the target is visible, or once the ground below has loaded and
--- had a moment for character models to follow it in, or once we give up.
-local function waitForRegion(point, target)
-    local deadline = os.clock() + math.max(1, Finder.LoadTimeout)
-    local groundAt = nil
-    while os.clock() < deadline do
-        if Unloading or not Finder.Searching then return false end
-        if target and isStreamedIn(target) then return true end
-        if regionLoaded(point) then
-            groundAt = groundAt or os.clock()
-            if os.clock() - groundAt >= Finder.Settle then return true end
-        else
-            groundAt = nil
-        end
-        task.wait(0.1)
-    end
-    return regionLoaded(point)
-end
-
--- Rings outward from wherever you are, at altitude. Height is the point: high
--- enough that you are not standing in someone's aisle while the chunk loads,
--- and the stream radius is spherical so altitude costs very little coverage.
---
--- Note this genuinely moves your character. RequestStreamAroundAsync alone is
--- best-effort and the server can stream the region straight back out, because
--- your ReplicationFocus stays on your character - so the character has to
--- actually go there for the chunk to hold.
-local function searchForPlayer(plr, onUpdate)
-    local root = getRoot()
-    if not root then return false, "no character" end
-
-    local origin = root.CFrame
-    Finder.Searching = true
-
-    local function finish(found, reason)
-        Finder.Searching = false
-        Finder.Status = reason
-        if Finder.ReturnAfter then
-            local rootNow = getRoot()
-            if rootNow then rootNow.CFrame = origin end
-        end
-        releaseHold()
-        return found, reason
-    end
-
-    local start = origin.Position
-    local step = math.max(50, Finder.RingStep)
-
-    for ring = 0, math.max(0, Finder.MaxRings) do
-        if Unloading or not Finder.Searching then
-            return finish(false, "cancelled")
-        end
-
-        -- Ring 0 is a single probe straight up from where you stand; each
-        -- ring after that is a square perimeter, so nothing already covered
-        -- gets revisited.
-        local points = {}
-        if ring == 0 then
-            points[1] = Vector3.new(start.X, Finder.Altitude, start.Z)
-        else
-            local span = ring * step
-            local count = math.max(1, ring * 2)
-            for i = -count, count do
-                local offset = (i / count) * span
-                points[#points + 1] = Vector3.new(start.X + offset, Finder.Altitude, start.Z - span)
-                points[#points + 1] = Vector3.new(start.X + offset, Finder.Altitude, start.Z + span)
-                points[#points + 1] = Vector3.new(start.X - span, Finder.Altitude, start.Z + offset)
-                points[#points + 1] = Vector3.new(start.X + span, Finder.Altitude, start.Z + offset)
-            end
-        end
-
-        for index, point in ipairs(points) do
-            if Unloading or not Finder.Searching then
-                return finish(false, "cancelled")
-            end
-
-            Finder.Status = ("ring %d, point %d/%d"):format(ring, index, #points)
-            if onUpdate then onUpdate(Finder.Status) end
-
-            requestStreamAround(point)
-            holdAt(CFrame.new(point))
-
-            -- Sit still up there until the chunk is genuinely in, instead of
-            -- moving on after a fixed fraction of a second and calling an
-            -- unloaded region empty.
-            local loaded = waitForRegion(point, plr)
-            if Unloading or not Finder.Searching then
-                return finish(false, "cancelled")
-            end
-            if loaded then
-                Finder.Status = ("ring %d, point %d/%d (loaded)"):format(ring, index, #points)
-                if onUpdate then onUpdate(Finder.Status) end
-            end
-            if Finder.Dwell > 0 then task.wait(Finder.Dwell) end
-
-            if isStreamedIn(plr) then
-                local target = plr.Character:FindFirstChild("HumanoidRootPart")
-                if target then
-                    -- Found: drop next to them rather than inside them.
-                    Finder.Searching = false
-                    Finder.Status = "found " .. plr.Name
-                    releaseHold()
-                    local rootNow = getRoot()
-                    if rootNow then
-                        rootNow.CFrame = target.CFrame * CFrame.new(0, 0, 4)
-                    end
-                    return true, "found"
-                end
-            end
-        end
-    end
-
-    return finish(false, "not found")
-end
-
-local function gotoPlayer(plr, onUpdate)
-    if not plr then return false, "no target" end
-
-    if isStreamedIn(plr) then
-        local target = plr.Character:FindFirstChild("HumanoidRootPart")
-        if target then
-            teleportTo(target.CFrame * CFrame.new(0, 0, 4))
-            return true, "already loaded"
-        end
-    end
-
-    if Finder.UseCache then
-        local cached = lastSeen[plr]
-        if cached then
-            local probe = cached.Position + Vector3.new(0, 6, 0)
-            Finder.Searching = true
-            requestStreamAround(cached.Position)
-            holdAt(CFrame.new(probe))
-            waitForRegion(probe, plr)
-            Finder.Searching = false
-            releaseHold()
-            if isStreamedIn(plr) then
-                local target = plr.Character:FindFirstChild("HumanoidRootPart")
-                if target then
-                    teleportTo(target.CFrame * CFrame.new(0, 0, 4))
-                    return true, "from last known position"
-                end
-            end
-            -- Cache was stale; fall through to the sweep.
-        end
-    end
-
-    return searchForPlayer(plr, onUpdate)
 end
 
 --// Whistle ---------------------------------------------------------------------------
@@ -703,9 +559,8 @@ local function onWhistleHeard(who, position)
         return
     end
 
-    releaseHold()
-    -- Land slightly above and behind the whistle point rather than inside
-    -- whatever they were standing on when it went off.
+    -- Land slightly above the whistle point rather than inside whatever they
+    -- were standing on when it went off.
     local landed = teleportTo(CFrame.new(position + Vector3.new(0, Whistle.Offset, 0)))
     if landed then
         requestStreamAround(position)
@@ -752,6 +607,19 @@ local function modelPosition(model)
     return nil
 end
 
+-- Storable is the tag SecondInteract checks before it fires Store, and it
+-- lines up with Properties.Inventory in the item registry - so an item with no
+-- tags replicated yet is still recognised by its definition.
+local function isStorable(model)
+    if hasTag(model, "Storable") then return true end
+    local props = itemProps(model.Name)
+    return props ~= nil and props.Inventory == true
+end
+
+local function isInteractable(model)
+    return hasTag(model, "Interactable")
+end
+
 -- Mirrors PickupSystem.ReturnModel: the client will only offer a model that is
 -- tagged Item, has a PrimaryPart and is not already Busy in someone else's
 -- hands. Asking for anything else is a guaranteed refusal.
@@ -778,16 +646,34 @@ local function collectibleItems(radius, filter)
     return list
 end
 
--- Pickup takes a model reference and the range check lives on the client
--- (GetModelAtCrosshair), so this asks for items you are not looking at. If the
--- server re-validates distance it simply refuses - hence the radius slider,
--- so you can find where that limit actually is.
-local function pickupModel(model)
-    return invokeAction("Pickup", { Model = model })
-end
-
+-- Store and Pickup are two different things and confusing them is what got a
+-- medkit welded to somebody.
+--
+-- Store is what E does on a Storable item: SecondInteract calls
+-- Action:InvokeServer("Store", {Model = model}) on whatever is under the
+-- crosshair, with no pickup involved at all. It goes straight into the bag.
+--
+-- Pickup puts the item in your HANDS. The server attaches the real model to
+-- you, and the client's own Pickup() then sets up everything that makes that
+-- state survivable: SetHoldingModel, a ghost clone under the camera, the
+-- Heartbeat render loop that positions it, and the raycast filter that stops
+-- you shooting rays at your own item. Calling the remote directly does the
+-- first half and none of the second, so the server thinks you are holding
+-- something the client has never heard of: the real parts ride along colliding
+-- with you, and the game's Drop reads GetHoldingModel(), finds nil, and
+-- refuses. That is a stuck item you cannot walk away from or put down.
+--
+-- So: automation uses Store and never Pickup.
 local function storeModel(model)
     return invokeAction("Store", { Model = model })
+end
+
+local function interactModel(model)
+    return invokeAction("Interact", { Model = model })
+end
+
+local function pickupModel(model)
+    return invokeAction("Pickup", { Model = model })
 end
 
 -- Drop carries a client-supplied EndCFrame: the client decides where the held
@@ -799,6 +685,18 @@ local function dropAt(cframe, throwPower)
         CameraCFrame = Camera.CFrame.LookVector,
         ThrowPower = throwPower or 0,
     })
+end
+
+-- Puts whatever we are holding down in front of us. This is also the way out
+-- of a hold the client never set up, because the server only needs the remote
+-- call - it does not care that our client has no ghost model to tidy away.
+local function dropHeld()
+    local root = getRoot()
+    if not root then return false end
+    -- Slightly ahead and below eye level, so it lands on the floor rather than
+    -- inside your own collision box, which is what makes Drop refuse.
+    local target = root.CFrame * CFrame.new(0, -1.5, -5)
+    return dropAt(target) == true
 end
 
 spawnLoop(function()
@@ -813,16 +711,34 @@ spawnLoop(function()
                 local model = entry.Model
                 -- Glass Shard is registered as edible and takes health off you.
                 -- Never sweep it up unless you asked for literally everything.
-                if canPickup(model) and (Main.CollectAll or not isHarmful(model.Name)) then
-                    local ok = pickupModel(model)
-                    if ok then
-                        -- Straight into the bag; holding it would block the
-                        -- next pickup.
-                        storeModel(model)
-                    end
+                local safe = Main.CollectAll or not isHarmful(model.Name)
+                if canPickup(model) and safe and isStorable(model) then
+                    storeModel(model)
                     task.wait(0.15)
                 end
             end
+        end
+    end
+end)
+
+-- A hold the client does not know about can only have come from a remote call,
+-- so this watches for exactly that and puts the item down before it can pin
+-- you in place. Off by default, because holding things on purpose is normal.
+spawnLoop(function()
+    local heldSince = nil
+    while not Unloading do
+        task.wait(0.5)
+        if isHolding() then
+            heldSince = heldSince or os.clock()
+            local desynced = PickupSystem == nil or PickupSystem:GetHoldingModel() == nil
+            if Main.AutoUnstick and desynced and (os.clock() - heldSince) >= Main.UnstickAfter then
+                if dropHeld() then
+                    notify('Dropped an item the client was not tracking.', 'warning')
+                end
+                heldSince = nil
+            end
+        else
+            heldSince = nil
         end
     end
 end)
@@ -952,57 +868,54 @@ local function setNoclip(state)
     end)
 end
 
---// Reach --------------------------------------------------------------------------
--- PickupSystem clamps how far you can hold and place an item with
---   math.clamp(distance, 2.1, LocalPlayer:GetAttribute("ScrollDistance"))
--- The attribute is read off the PLAYER. The previous build wrote it to the
--- Humanoid instead, which nothing ever reads - that is why reach did nothing.
--- The server rewrites the attribute on respawn and on rank changes, so it gets
--- re-asserted every step rather than set once.
-local baseScrollDistance = nil
-
-local function applyReach()
-    if baseScrollDistance == nil then
-        baseScrollDistance = LocalPlayer:GetAttribute("ScrollDistance") or 15
-    end
-    if LocalPlayer:GetAttribute("ScrollDistance") ~= Player.Reach then
-        pcall(function() LocalPlayer:SetAttribute("ScrollDistance", Player.Reach) end)
-    end
-end
-
-local function restoreReach()
-    if baseScrollDistance ~= nil then
-        pcall(function() LocalPlayer:SetAttribute("ScrollDistance", baseScrollDistance) end)
-    end
-end
-
--- Holding further away is only half of it. The grab itself is a 10 stud
--- raycast from the crosshair inside GetModelAtCrosshair, and that number is
--- baked into the game's own code - so instead of fighting it, this casts the
--- same ray ourselves at whatever range you asked for and calls Pickup on what
--- it finds. Same remote, same payload, just aimed further.
+-- Range grab. The game's own reach for this is a 10 stud raycast baked into
+-- GetModelAtCrosshair, so this casts the same ray at whatever distance you set
+-- and acts on what it hits.
+--
+-- It calls Store, not Pickup. Store drops the item into your bag with no hold
+-- state involved, which is the same thing E does on a Storable item and cannot
+-- leave anything attached to you. Pickup would put it in your hands without the
+-- client-side setup that makes a hold work - see the note above storeModel.
 local grabParams = RaycastParams.new()
 grabParams.FilterType = Enum.RaycastFilterType.Exclude
 
-local function grabAtCrosshair()
+local function modelAtCrosshair()
     local char = getCharacter()
-    if not char then return false, "no character" end
-    grabParams.FilterDescendantsInstances = { char }
+    if not char then return nil, "no character" end
+    grabParams.FilterDescendantsInstances = { char, Camera }
 
     local viewport = Camera.ViewportSize
     local ray = Camera:ScreenPointToRay(viewport.X / 2, viewport.Y / 2)
     local hit = Workspace:Raycast(ray.Origin, ray.Direction * Player.Reach, grabParams)
-    if not hit then return false, "nothing in the way" end
+    if not hit then return nil, "nothing in the way" end
 
     local model = hit.Instance:FindFirstAncestorOfClass("Model")
     while model and not hasTag(model, "Item") do
         model = model:FindFirstAncestorOfClass("Model")
     end
-    if not model then return false, "that is not an item" end
+    if not model then return nil, "that is not an item" end
+    return model
+end
+
+local function grabAtCrosshair()
+    local model, why = modelAtCrosshair()
+    if not model then return false, why end
     if not canPickup(model) then return false, model.Name .. " is busy or not loaded" end
 
-    local ok = pickupModel(model)
-    return ok == true, ok and model.Name or "server refused"
+    if isStorable(model) then
+        local ok = storeModel(model)
+        return ok == true, ok and ("stored " .. model.Name) or "server refused, bag may be full"
+    end
+
+    if isInteractable(model) then
+        local ok = interactModel(model)
+        return ok == true, ok and ("used " .. model.Name) or "server refused"
+    end
+
+    -- Not storable and not interactable means the only way to move it is to
+    -- hold it, and a remote-only hold is the thing that gets people stuck. Say
+    -- so instead of doing it quietly.
+    return false, model.Name .. " can only be carried by hand - use the game's own grab"
 end
 
 --// Fly ----------------------------------------------------------------------------
@@ -1514,162 +1427,6 @@ end
 --// Main tab
 local MainTab = Window:Tab({ Title = 'main', Icon = 'crosshair' })
 
-local FindSection = MainTab:Section({ Title = 'find player', Side = 'left' })
-local FindStatus = FindSection:Label({ Title = 'status: idle' })
-
-local selectedPlayer = nil
-local playerDropdown = FindSection:Dropdown({
-    Title = 'player',
-    Flag = 'tv_find_target',
-    Options = { 'none' },
-    Default = 'none',
-    Callback = function(v) selectedPlayer = v end,
-})
-
-FindSection:Button({
-    Title = 'refresh players',
-    Callback = function()
-        local names = {}
-        for _, plr in ipairs(Players:GetPlayers()) do
-            if plr ~= LocalPlayer then
-                local mark = isStreamedIn(plr) and ' (loaded)' or (lastSeen[plr] and ' (cached)' or '')
-                names[#names + 1] = plr.Name .. mark
-            end
-        end
-        if #names == 0 then names = { 'none' } end
-        pcall(function() playerDropdown:SetOptions(names) end)
-    end,
-})
-
-local function resolveSelected()
-    if not selectedPlayer or selectedPlayer == 'none' then return nil end
-    local clean = selectedPlayer:gsub(" %(loaded%)", ""):gsub(" %(cached%)", "")
-    return Players:FindFirstChild(clean)
-end
-
-FindSection:Button({
-    Title = 'go to player',
-    Callback = function()
-        local target = resolveSelected()
-        if not target then
-            notify('Pick a player first (refresh the list).', 'warning')
-            return
-        end
-        spawnLoop(function()
-            local ok, reason = gotoPlayer(target, function(status)
-                pcall(function() FindStatus:Set('status: ' .. status) end)
-            end)
-            pcall(function() FindStatus:Set('status: ' .. tostring(reason)) end)
-            if ok then
-                notify(('Reached %s (%s).'):format(target.Name, tostring(reason)))
-            else
-                notify(('Could not reach %s: %s'):format(target.Name, tostring(reason)), 'error', 6)
-            end
-        end)
-    end,
-})
-
-FindSection:Button({
-    Title = 'stop search',
-    Callback = function()
-        Finder.Searching = false
-        pcall(function() FindStatus:Set('status: cancelled') end)
-    end,
-})
-
-local SweepSection = MainTab:Section({ Title = 'sweep settings', Side = 'right' })
-
-SweepSection:Toggle({
-    Title = 'use last known position first',
-    Flag = 'tv_use_cache',
-    Default = true,
-    Callback = function(v) Finder.UseCache = v end,
-})
-
-SweepSection:Slider({
-    Title = 'search altitude',
-    Flag = 'tv_altitude',
-    Min = 100,
-    Max = 2000,
-    Increment = 50,
-    Default = 400,
-    Suffix = ' studs',
-    Callback = function(v) Finder.Altitude = v end,
-})
-
-SweepSection:Slider({
-    Title = 'ring spacing',
-    Flag = 'tv_ring_step',
-    Min = 100,
-    Max = 1000,
-    Increment = 50,
-    Default = 350,
-    Suffix = ' studs',
-    Callback = function(v) Finder.RingStep = v end,
-})
-
-SweepSection:Slider({
-    Title = 'max rings',
-    Flag = 'tv_max_rings',
-    Min = 1,
-    Max = 30,
-    Increment = 1,
-    Default = 14,
-    Callback = function(v) Finder.MaxRings = v end,
-})
-
-SweepSection:Slider({
-    Title = 'max wait for chunk load',
-    Flag = 'tv_load_timeout',
-    Min = 1,
-    Max = 20,
-    Increment = 0.5,
-    Default = 8,
-    Suffix = 's',
-    Callback = function(v) Finder.LoadTimeout = v end,
-})
-
-SweepSection:Slider({
-    Title = 'settle after ground loads',
-    Flag = 'tv_settle',
-    Min = 0,
-    Max = 3,
-    Increment = 0.1,
-    Default = 0.7,
-    Suffix = 's',
-    Callback = function(v) Finder.Settle = v end,
-})
-
-SweepSection:Slider({
-    Title = 'extra dwell per point',
-    Flag = 'tv_dwell',
-    Min = 0,
-    Max = 2,
-    Increment = 0.05,
-    Default = 0.35,
-    Suffix = 's',
-    Callback = function(v) Finder.Dwell = v end,
-})
-
-SweepSection:Toggle({
-    Title = 'return to start after',
-    Flag = 'tv_return',
-    Default = true,
-    Callback = function(v) Finder.ReturnAfter = v end,
-})
-
-local radiusLabel = SweepSection:Label({ Title = 'measured stream radius: --' })
-
-SweepSection:Paragraph({
-    Title = 'how a point is judged',
-    Text = 'Each probe now holds you anchored at altitude and raycasts straight down until something solid answers, which is the real signal that the chunk arrived. Only then does it wait out the settle time for character models to follow the ground in. A point is written off after the max wait, not after a fixed dwell that used to expire before the map had loaded at all.',
-})
-
-SweepSection:Paragraph({
-    Title = 'tuning the spacing',
-    Text = 'Set ring spacing to roughly the measured stream radius above, or a little under it so rings overlap. Too wide and the sweep skips over people; too narrow and it just takes longer. The sweep genuinely moves you - a stream request alone gets undone because the server keeps your replication focus on your character.',
-})
-
 local LootSection = MainTab:Section({ Title = 'looting', Side = 'left' })
 
 LootSection:Toggle({
@@ -1702,14 +1459,20 @@ LootSection:Button({
     Callback = function()
         local filter = Main.CollectAll and 'All' or 'Food'
         local items = collectibleItems(Main.CollectRadius, filter)
-        if #items == 0 then
-            notify('Nothing matching in range.', 'warning')
-            return
+        for _, entry in ipairs(items) do
+            if isStorable(entry.Model) then
+                local ok = storeModel(entry.Model)
+                notify(ok and ('Stored ' .. entry.Model.Name) or 'Server refused - bag may be full.', ok and 'success' or 'warning')
+                return
+            end
         end
-        local model = items[1].Model
-        local ok = pickupModel(model)
-        notify(ok and ('Picked up ' .. model.Name) or 'Server refused the pickup.', ok and 'success' or 'warning')
+        notify('Nothing storable matching in range.', 'warning')
     end,
+})
+
+LootSection:Paragraph({
+    Title = 'store, not pickup',
+    Text = 'Collecting fires Store, which is what E does on a Storable item and puts it straight in the bag. It never fires Pickup, which puts the item in your hands - a hold created by a remote alone leaves the client with no idea it happened, and that is what welded a medkit to somebody. There is a force drop button on the player tab if anything ever does get stuck.',
 })
 
 LootSection:Paragraph({
@@ -1719,7 +1482,7 @@ LootSection:Paragraph({
 
 LootSection:Paragraph({
     Title = 'range is the experiment',
-    Text = 'Pickup takes a model reference and the range check is client side, so this asks for items you are not looking at. If the server checks distance it just refuses - raise the radius until pickups start failing and you have found the real limit.',
+    Text = 'Store takes a model reference and the range check is client side, so this asks for items you are not looking at. If the server checks distance it simply refuses - raise the radius until it starts failing and you have found the real limit.',
 })
 
 local ActionSection = MainTab:Section({ Title = 'actions', Side = 'right' })
@@ -1918,7 +1681,6 @@ WhistleSection:Button({
             notify('No whistle heard yet.', 'warning')
             return
         end
-        releaseHold()
         local ok = teleportTo(CFrame.new(Whistle.Last.Position + Vector3.new(0, Whistle.Offset, 0)))
         notify(ok and ('Moved to ' .. Whistle.Last.Name .. "'s whistle.") or 'No character to move.', ok and 'success' or 'error')
     end,
@@ -2085,31 +1847,42 @@ ReachSection:Slider({
     end,
 })
 
-local reachStat = ReachSection:Stat({ Title = 'ScrollDistance now', Value = '-' })
+local reachLive = ReachSection:Stat({ Title = 'carry distance now', Value = '-' })
+local reachCeiling = ReachSection:Stat({ Title = 'ceiling (attribute)', Value = '-' })
+local reachModule = ReachSection:Stat({
+    Title = 'PickupSystem',
+    Value = PickupSystem and 'hooked' or 'not found',
+})
 
 spawnLoop(function()
     while not Unloading do
-        task.wait(1)
-        local current = LocalPlayer:GetAttribute("ScrollDistance")
-        pcall(function() reachStat:Set(current and tostring(current) or 'unset') end)
+        task.wait(0.5)
+        local live = liveScrollDistance()
+        local ceiling = LocalPlayer:GetAttribute("ScrollDistance")
+        pcall(function()
+            reachLive:Set(live and ('%.1f studs'):format(live) or 'module not hooked')
+        end)
+        pcall(function()
+            reachCeiling:Set(ceiling and tostring(ceiling) or 'unset')
+        end)
     end
 end)
 
 ReachSection:Button({
-    Title = 'grab item at crosshair',
+    Title = 'take item at crosshair',
     Callback = function()
         local ok, detail = grabAtCrosshair()
-        notify(ok and ('Grabbed ' .. tostring(detail)) or ('No grab: ' .. tostring(detail)), ok and 'success' or 'warning')
+        notify(ok and tostring(detail) or ('No take: ' .. tostring(detail)), ok and 'success' or 'warning')
     end,
 })
 
 ReachSection:Keybind({
-    Title = 'grab key',
+    Title = 'take key',
     Flag = 'tv_grab_key',
     Default = Enum.KeyCode.V,
     Callback = function()
         local ok, detail = grabAtCrosshair()
-        if not ok then notify('No grab: ' .. tostring(detail), 'warning', 3) end
+        if not ok then notify('No take: ' .. tostring(detail), 'warning', 3) end
     end,
 })
 
@@ -2121,13 +1894,76 @@ ReachSection:Toggle({
 })
 
 ReachSection:Paragraph({
-    Title = 'why it works now',
-    Text = 'PickupSystem clamps carry distance with math.clamp(distance, 2.1, LocalPlayer:GetAttribute("ScrollDistance")). The attribute is read off the Player. The old build wrote it to the Humanoid, which nothing reads - so the toggle did nothing at all. It now goes on the Player and is re-asserted every step, because the server overwrites it on respawn.',
+    Title = 'why the attribute alone did nothing',
+    Text = 'There are two numbers. The live carry distance is a module upvalue inside the client\'s Building module that starts at 8, and the render loop reads it every frame to place the held item. The ScrollDistance attribute is only the CEILING that the mouse wheel clamps against. Raising the ceiling changes nothing until you physically scroll - and on a phone there is no wheel, so it could never take effect. Building is a plain ModuleScript and require is cached per instance, so this now sets the live value on the same table the game is using. The carry distance stat above is read straight back out of it.',
 })
 
 ReachSection:Paragraph({
-    Title = 'grabbing further away',
-    Text = 'Carry range and grab range are two different numbers. The grab itself is a fixed 10 stud raycast baked into GetModelAtCrosshair, so raising ScrollDistance alone still leaves you reaching over the shelf and picking up nothing. The grab key casts that same ray yourself at the reach distance above and calls the same Pickup remote with whatever it hits.',
+    Title = 'taking things at range',
+    Text = 'Carry range and take range are different numbers. Taking is a fixed 10 stud raycast baked into GetModelAtCrosshair, so this casts the same ray at your reach distance and fires Store or Interact on what it hits - the same calls E makes. It deliberately never fires Pickup: a hold set up by a remote alone is the thing that welds an item to you.',
+})
+
+local HoldSection = PlayerTab:Section({ Title = 'holding', Side = 'right' })
+
+local holdStat = HoldSection:Stat({ Title = 'server says holding', Value = 'no' })
+local holdSync = HoldSection:Stat({ Title = 'client tracking it', Value = '-' })
+
+spawnLoop(function()
+    while not Unloading do
+        task.wait(0.4)
+        local held = isHolding()
+        pcall(function() holdStat:Set(held and 'yes' or 'no') end)
+
+        local text
+        if not PickupSystem then
+            text = 'module not hooked'
+        elseif not held then
+            text = '-'
+        else
+            local ok, model = pcall(function() return PickupSystem:GetHoldingModel() end)
+            if ok and model then
+                text = 'yes (' .. tostring(model.Name) .. ')'
+            else
+                text = 'NO - stuck'
+            end
+        end
+        pcall(function() holdSync:Set(text) end)
+    end
+end)
+
+HoldSection:Button({
+    Title = 'force drop held item',
+    Callback = function()
+        if not isHolding() then
+            notify('The server does not think you are holding anything.', 'warning')
+            return
+        end
+        local ok = dropHeld()
+        notify(ok and 'Dropped it.' or 'Server refused - try moving somewhere clearer first.', ok and 'success' or 'error')
+    end,
+})
+
+HoldSection:Toggle({
+    Title = 'auto drop untracked holds',
+    Flag = 'tv_auto_unstick',
+    Default = false,
+    Callback = function(v) Main.AutoUnstick = v end,
+})
+
+HoldSection:Slider({
+    Title = 'drop after',
+    Flag = 'tv_unstick_after',
+    Min = 1,
+    Max = 15,
+    Increment = 1,
+    Default = 3,
+    Suffix = 's',
+    Callback = function(v) Main.UnstickAfter = v end,
+})
+
+HoldSection:Paragraph({
+    Title = 'what got the medkit stuck',
+    Text = 'Auto collect used to fire Pickup and then Store. Pickup puts the item in your hands, and the game\'s own Pickup function is what makes that survivable - it records the held model, spawns the ghost you actually see, starts the render loop and fixes the raycast filter. Firing the remote alone did none of that, so the server had you holding something the client had never heard of: the real parts rode along colliding with you, and Drop refused because it looks up a held model that was never set. Auto collect now fires Store only, which is what E does and involves no hold at all. The button above is the way out if anything else leaves you stuck.',
 })
 
 --// Visual tab
@@ -2298,13 +2134,10 @@ local SettingsTab = Window:Tab({ Title = 'settings', Icon = 'settings' })
 local DiagSection = SettingsTab:Section({ Title = 'diagnostics', Side = 'left' })
 
 local systemLabel = DiagSection:Label({ Title = 'System remotes: checking' })
-local streamLabel = DiagSection:Label({ Title = 'stream radius: --' })
-local cacheLabel = DiagSection:Label({ Title = 'cached players: 0' })
 
 spawnLoop(function()
     while not Unloading do
         task.wait(1)
-
         local action, event = getSystem()
         local systemText
         if action and event then
@@ -2315,16 +2148,6 @@ spawnLoop(function()
             systemText = 'System remotes: missing'
         end
         pcall(function() systemLabel:Set(systemText) end)
-
-        local radiusText = measuredRadius > 0
-            and ('stream radius: ~%d studs'):format(math.floor(measuredRadius))
-            or 'stream radius: measuring...'
-        pcall(function() streamLabel:Set(radiusText) end)
-        pcall(function() radiusLabel:Set('measured stream radius: ' .. (measuredRadius > 0 and (math.floor(measuredRadius) .. ' studs') or '--')) end)
-
-        local count = 0
-        for _ in pairs(lastSeen) do count = count + 1 end
-        pcall(function() cacheLabel:Set(('cached players: %d'):format(count)) end)
     end
 end)
 
@@ -2344,31 +2167,163 @@ spawnLoop(function()
     end
 end)
 
-DiagSection:Paragraph({
-    Title = 'infinite inventory space',
-    Text = 'Not possible from here, and shipping a toggle for it would only make your own HUD lie. MaxInventorySpace is a Player attribute the client reads once, to draw the "3/8 items" text - nothing else. The refusal comes from the server, which returns the message containing "Inventory" that Store shows you. The only in-game route that raises it is the admin panel, which fires Remotes.Vip with a rank check behind it.',
+--// Server properties tab
+local AdminTab = Window:Tab({ Title = 'server', Icon = 'shield' })
+local PropSection = AdminTab:Section({ Title = 'player properties', Side = 'left' })
+
+local adminStat = PropSection:Stat({
+    Title = 'Remotes.Vip',
+    Value = VipRemote and 'found' or 'not found',
+})
+local adminResult = PropSection:Stat({ Title = 'last write', Value = 'not tried' })
+
+spawnLoop(function()
+    while not Unloading do
+        task.wait(0.5)
+        pcall(function() adminResult:Set(Admin.LastResult) end)
+    end
+end)
+
+local function humanoidMaxHealth()
+    local hum = getHumanoid()
+    return hum and hum.MaxHealth or 0
+end
+
+PropSection:Button({
+    Title = 'god mode (infinite health)',
+    Callback = function()
+        spawnLoop(function()
+            local ok, detail = setPropertiesAndVerify(
+                { Health = math.huge, MaxHealth = math.huge },
+                function() return humanoidMaxHealth() == math.huge end,
+                'god'
+            )
+            notify(detail, ok and 'success' or 'error', 7)
+            if ok then
+                notify('Health bar will render oddly - it is drawing a fraction over infinity.', 'warning', 7)
+            end
+        end)
+    end,
 })
 
-DiagSection:Paragraph({
-    Title = 'stream radius',
-    Text = 'Measured live by sampling how far the furthest loaded map part sits from you, because the real streaming radius is not readable as a property from the client. Use it to set the ring spacing on the main tab rather than guessing.',
+PropSection:Button({
+    Title = 'restore health to 100',
+    Callback = function()
+        spawnLoop(function()
+            local ok, detail = setPropertiesAndVerify(
+                { Health = 100, MaxHealth = 100 },
+                function() return humanoidMaxHealth() == 100 end,
+                'health reset'
+            )
+            notify(detail, ok and 'success' or 'error', 6)
+        end)
+    end,
+})
+
+PropSection:Button({
+    Title = 'infinite hunger + energy',
+    Callback = function()
+        spawnLoop(function()
+            local ok, detail = setPropertiesAndVerify(
+                {
+                    Hunger = math.huge, MaxHunger = math.huge,
+                    Energy = math.huge, MaxEnergy = math.huge,
+                },
+                function()
+                    local hum = getHumanoid()
+                    return hum ~= nil and hum:GetAttribute("MaxHunger") == math.huge
+                end,
+                'hunger + energy'
+            )
+            notify(detail, ok and 'success' or 'error', 6)
+        end)
+    end,
+})
+
+PropSection:Input({
+    Title = 'max inventory space',
+    Flag = 'tv_inv_space',
+    Default = '100',
+    Placeholder = '100',
+    Callback = function(text)
+        local wanted = tonumber(text)
+        if not wanted or wanted < 1 then
+            notify('Inventory space needs to be a number of slots.', 'warning')
+            return
+        end
+        wanted = math.floor(wanted)
+        spawnLoop(function()
+            local ok, detail = setPropertiesAndVerify(
+                { MaxInventorySpace = wanted },
+                function() return LocalPlayer:GetAttribute("MaxInventorySpace") == wanted end,
+                'inventory space'
+            )
+            notify(detail, ok and 'success' or 'error', 6)
+        end)
+    end,
+})
+
+PropSection:Input({
+    Title = 'carry distance (server side)',
+    Flag = 'tv_server_scroll',
+    Default = '100',
+    Placeholder = '100',
+    Callback = function(text)
+        local wanted = tonumber(text)
+        if not wanted or wanted < 2 then
+            notify('Carry distance needs to be a number of studs.', 'warning')
+            return
+        end
+        spawnLoop(function()
+            local ok, detail = setPropertiesAndVerify(
+                { ScrollDistance = wanted },
+                function() return LocalPlayer:GetAttribute("ScrollDistance") == wanted end,
+                'carry distance'
+            )
+            notify(detail, ok and 'success' or 'error', 6)
+        end)
+    end,
+})
+
+local TogglesSection = AdminTab:Section({ Title = 'flags', Side = 'right' })
+
+local function propertyToggle(title, flag, attribute)
+    TogglesSection:Button({
+        Title = title,
+        Callback = function()
+            spawnLoop(function()
+                local wanted = not (LocalPlayer:GetAttribute(attribute) == true)
+                local ok, detail = setPropertiesAndVerify(
+                    { [attribute] = wanted },
+                    function() return LocalPlayer:GetAttribute(attribute) == wanted end,
+                    attribute
+                )
+                notify(detail .. (ok and (' -> ' .. tostring(wanted)) or ''), ok and 'success' or 'error', 6)
+            end)
+        end,
+    })
+end
+
+propertyToggle('toggle CanPickUp', 'tv_can_pickup', 'CanPickUp')
+propertyToggle('toggle CanInteract', 'tv_can_interact', 'CanInteract')
+propertyToggle('toggle AlwaysAnchor', 'tv_always_anchor', 'AlwaysAnchor')
+
+TogglesSection:Paragraph({
+    Title = 'how this works',
+    Text = 'The in-game moderator panel changes a player by firing one remote: Remotes.Vip UpdatePlayerProperties with a Properties table and a ToPlayer. Its God button is literally SetStat(stat, 1/0), writing infinity into the stat and its Max, which is exactly why god mode makes the health bar draw strangely. These buttons send the same payload aimed at you.',
+})
+
+TogglesSection:Paragraph({
+    Title = 'whether it lands is the server\'s call',
+    Text = 'Nothing here can promise a result. If the server checks your rank first, the remote is simply ignored and you get no error - so every button reads back the attribute it was supposed to change and the last write line above says applied or server refused. That is the real answer, not a toggle flipping green.',
 })
 
 local ControlSection = SettingsTab:Section({ Title = 'control', Side = 'right' })
 
 ControlSection:Button({
-    Title = 'clear position cache',
-    Callback = function()
-        for key in pairs(lastSeen) do lastSeen[key] = nil end
-        notify('Position cache cleared.')
-    end,
-})
-
-ControlSection:Button({
     Title = 'unload',
     Callback = function()
         Unloading = true
-        Finder.Searching = false
 
         for _, connection in ipairs(Connections) do
             pcall(function() connection:Disconnect() end)
@@ -2378,7 +2333,6 @@ ControlSection:Button({
         if EspHolder then EspHolder:Destroy() end
         setNoclip(false)
         stopFly()
-        releaseHold()
         restoreReach()
         Whistle.Follow = false
         Main.AutoWhistle = false
