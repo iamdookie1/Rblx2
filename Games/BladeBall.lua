@@ -441,9 +441,13 @@ end
 local function findControllerModule(namePart)
     local controllers = ReplicatedStorage:FindFirstChild("Controllers")
     if not controllers then return nil end
-    for _, child in ipairs(controllers:GetChildren()) do
-        if child:IsA("ModuleScript") and child.Name:lower():find(namePart, 1, true) then
-            return child
+    local wanted = namePart:lower():gsub("%s+", "")
+    for _, descendant in ipairs(controllers:GetDescendants()) do
+        if descendant:IsA("ModuleScript") then
+            local cleaned = descendant.Name:lower():gsub("%c", ""):gsub("%s+", "")
+            if cleaned:find(wanted, 1, true) then
+                return descendant
+            end
         end
     end
     return nil
@@ -861,11 +865,28 @@ InspectSection:Button({
     end,
 })
 
+local moduleQuery = "InputController"
+
+InspectSection:Textbox({
+    Title = 'controller name',
+    Flag = 'bb_module_query',
+    Default = 'InputController',
+    Placeholder = 'InputController',
+    Callback = function(value)
+        moduleQuery = value
+    end,
+})
+
 InspectSection:Button({
-    Title = 'dump SwordsController',
+    Title = 'dump that controller',
     Callback = function()
         task.spawn(function()
-            dumpModule(findControllerModule("swordscontroller"), "SwordsController")
+            local query = (moduleQuery or ""):lower():gsub("%s+", "")
+            if query == "" then
+                say("type a controller name first", Color3.fromRGB(255, 120, 120))
+                return
+            end
+            dumpModule(findControllerModule(query), moduleQuery)
         end)
     end,
 })
