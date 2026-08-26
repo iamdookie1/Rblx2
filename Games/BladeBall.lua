@@ -67,6 +67,7 @@ local MethodScores = {
     UIBlock = { presses = 0, successes = 0 },
     UIButton = { presses = 0, successes = 0 },
     ReplayInput = { presses = 0, successes = 0 },
+    Animation = { presses = 0, successes = 0 },
     Bindable = { presses = 0, successes = 0 },
     Input = { presses = 0, successes = 0 },
     Capture = { presses = 0, successes = 0 },
@@ -577,6 +578,27 @@ local function clickButtonDirectly(guiButton)
     end)
 end
 
+local GrabParryAnim = Instance.new("Animation")
+GrabParryAnim.AnimationId = "rbxassetid://13772445960"
+
+local grabParryTracks = setmetatable({}, { __mode = "k" })
+
+local function getGrabParryTrack()
+    local char = LocalPlayer.Character
+    local humanoid = char and char:FindFirstChildOfClass("Humanoid")
+    local animator = humanoid and humanoid:FindFirstChildOfClass("Animator")
+    if not animator then return nil end
+
+    local existing = grabParryTracks[animator]
+    if existing then return existing end
+
+    local ok, animTrack = pcall(function() return animator:LoadAnimation(GrabParryAnim) end)
+    if not ok then return nil end
+
+    grabParryTracks[animator] = animTrack
+    return animTrack
+end
+
 local animWatching = false
 
 local function watchAnimations(duration)
@@ -686,6 +708,12 @@ local Pressers = {
     end,
 
     ReplayInput = replayCapturedInput,
+
+    Animation = function()
+        local animTrack = getGrabParryTrack()
+        if not animTrack then return false, "could not load GrabParry animation track" end
+        return pcall(function() animTrack:Play(0) end)
+    end,
 
     Bindable = function()
         if not ParryButtonPress then return false, "ParryButtonPress missing" end
@@ -896,7 +924,7 @@ local ModeSection = MainTab:Section({ Title = 'mode', Side = 'left' })
 ModeSection:Dropdown({
     Title = 'mode',
     Flag = 'bb_mode',
-    Options = { 'Indicator', 'Remote', 'UIBlock', 'UIButton', 'ReplayInput', 'Bindable', 'Input', 'Capture' },
+    Options = { 'Indicator', 'Remote', 'UIBlock', 'UIButton', 'ReplayInput', 'Animation', 'Bindable', 'Input', 'Capture' },
     Default = 'Indicator',
     Callback = function(value)
         Config.Mode = value
@@ -1098,6 +1126,11 @@ RiskSection:Paragraph({
 RiskSection:Paragraph({
     Title = 'UIBlock - probably telemetry, not the real action',
     Text = 'Replicates the exact UIInteraction call captured alongside a real parry - same shape as the UIInteraction/JumpButton call seen earlier, which is a UI click log, not what makes the character jump. This is very likely the same: a report that the Hotbar Block button was clicked, not the thing that actually resolves a hit. The real decision most likely still goes through the separate hashed RemoteFunction seen firing in the same window, which cannot be hardcoded because its name is salted fresh per lobby. Cheap to test, low expectation it does anything.',
+})
+
+RiskSection:Paragraph({
+    Title = 'Animation - plays GrabParry directly, no remote at all',
+    Text = 'Loads and plays rbxassetid://13772445960 (GrabParry) on the current Animator - the exact animation confirmed to play on every real block press. Animation state replicates to the server automatically the same way a real press would, with no remote call from this script at all - the lowest-footprint method tried yet if the theory holds that blocking is resolved from replicated pose rather than an explicit attempt message. Unconfirmed: whether the server can tell a programmatically-played animation apart from one driven by real input.',
 })
 
 RiskSection:Paragraph({
