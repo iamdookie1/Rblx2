@@ -42,6 +42,7 @@ local Config = {
 
     PressBudget = 2,
     CaptureWindow = 2.0,
+    ObserveWindow = 10,
 
     Sound = true,
     Logging = true,
@@ -71,6 +72,7 @@ local MethodScores = {
     Bindable = { presses = 0, successes = 0 },
     Input = { presses = 0, successes = 0 },
     Capture = { presses = 0, successes = 0 },
+    Observe = { presses = 0, successes = 0 },
 }
 
 local function findChildCI(parent, name)
@@ -686,6 +688,87 @@ local function replayCapturedInput()
     return false, "no non-locked connections to fire"
 end
 
+local function runCaptureWindow(duration, pressFirst)
+    if not HAS_NAMECALL then return false, "no hookmetamethod on this executor" end
+    if capturing then return false, "already capturing" end
+    capturing = true
+
+    local count = 0
+    local ignoredCount = 0
+    local summaries = {}
+    local originalNamecall
+    local hookOk = pcall(function()
+        originalNamecall = hookmetamethod(game, "__namecall", function(self, ...)
+            if count < CAPTURE_LIMIT and typeof(self) == "Instance" then
+                local okMethod, method = pcall(getnamecallmethod)
+                if okMethod and (method == "FireServer" or method == "Fire" or method == "InvokeServer") then
+                    local okName, name = pcall(function() return self.Name end)
+                    local firstArg = select(1, ...)
+                    local ignored = (okName and CAPTURE_IGNORE[name] == true) or CAPTURE_IGNORE_TAGS[firstArg] == true
+
+                    if ignored then
+                        ignoredCount = ignoredCount + 1
+                    else
+                        count = count + 1
+                        local args = { ... }
+
+                        task.spawn(function()
+                            local summary = describeCall(self, method, args)
+                            summaries[#summaries + 1] = summary
+
+                            log("capture #" .. count .. " -> " .. summary)
+                        end)
+                    end
+                end
+            end
+            return originalNamecall(self, ...)
+        end)
+    end)
+
+    if not hookOk or not originalNamecall then
+        capturing = false
+        return false, "hook install failed"
+    end
+
+    local pressOk = true
+    if pressFirst then
+        pressOk = pressInput()
+    end
+
+    task.spawn(function()
+
+        local deadline = os.clock() + duration
+        while os.clock() < deadline do
+            task.wait()
+        end
+        pcall(function() hookmetamethod(game, "__namecall", originalNamecall) end)
+        capturing = false
+
+        if count == 0 then
+            log(("capture: nothing new within %.1fs (%d filtered)"):format(duration, ignoredCount))
+            if ignoredCount > 0 then
+                notify(('Hook saw %d already-known call(s) (Ping, MenuState, etc) but nothing new.'):format(ignoredCount), 'warning', 8)
+            else
+                notify('Hook saw zero remote calls of any kind during the window.', 'warning', 7)
+            end
+            return
+        end
+
+        log(("capture: %d call(s) observed (%d filtered), see the lines above"):format(count, ignoredCount))
+        if typeof(setclipboard) == "function" then
+            local copied = pcall(setclipboard, table.concat(summaries, "\n"))
+            notify(copied
+                and ('Captured %d call(s). All copied to your clipboard.'):format(count)
+                or ('Captured %d call(s), but copying failed - see %s'):format(count, LOG_PATH),
+                copied and 'success' or 'warning', 8)
+        else
+            notify(('Captured %d call(s), but this executor has no setclipboard - see %s'):format(count, LOG_PATH), 'warning', 8)
+        end
+    end)
+
+    return (not pressFirst) or pressOk, "armed"
+end
+
 local Pressers = {
 
     Remote = function()
@@ -723,81 +806,11 @@ local Pressers = {
     Input = pressInput,
 
     Capture = function()
-        if not HAS_NAMECALL then return false, "no hookmetamethod on this executor" end
-        if capturing then return false, "already capturing" end
-        capturing = true
+        return runCaptureWindow(Config.CaptureWindow, true)
+    end,
 
-        local count = 0
-        local ignoredCount = 0
-        local summaries = {}
-        local originalNamecall
-        local hookOk = pcall(function()
-            originalNamecall = hookmetamethod(game, "__namecall", function(self, ...)
-                if count < CAPTURE_LIMIT and typeof(self) == "Instance" then
-                    local okMethod, method = pcall(getnamecallmethod)
-                    if okMethod and (method == "FireServer" or method == "Fire" or method == "InvokeServer") then
-                        local okName, name = pcall(function() return self.Name end)
-                        local firstArg = select(1, ...)
-                        local ignored = (okName and CAPTURE_IGNORE[name] == true) or CAPTURE_IGNORE_TAGS[firstArg] == true
-
-                        if ignored then
-                            ignoredCount = ignoredCount + 1
-                        else
-                            count = count + 1
-                            local args = { ... }
-
-                            task.spawn(function()
-                                local summary = describeCall(self, method, args)
-                                summaries[#summaries + 1] = summary
-
-                                log("capture #" .. count .. " -> " .. summary)
-                            end)
-                        end
-                    end
-                end
-                return originalNamecall(self, ...)
-            end)
-        end)
-
-        if not hookOk or not originalNamecall then
-            capturing = false
-            return false, "hook install failed"
-        end
-
-        local pressOk = pressInput()
-
-        task.spawn(function()
-
-            local deadline = os.clock() + Config.CaptureWindow
-            while os.clock() < deadline do
-                task.wait()
-            end
-            pcall(function() hookmetamethod(game, "__namecall", originalNamecall) end)
-            capturing = false
-
-            if count == 0 then
-                log(("capture: nothing new within %.1fs (%d filtered)"):format(Config.CaptureWindow, ignoredCount))
-                if ignoredCount > 0 then
-                    notify(('Hook saw %d already-known call(s) (Ping, MenuState, etc) but nothing new. The parry likely did not fire a FireServer/Fire/InvokeServer call at all.'):format(ignoredCount), 'warning', 8)
-                else
-                    notify('Hook saw zero remote calls of any kind - the touch may not have reached the server.', 'warning', 7)
-                end
-                return
-            end
-
-            log(("capture: %d call(s) observed (%d filtered), see the lines above"):format(count, ignoredCount))
-            if typeof(setclipboard) == "function" then
-                local copied = pcall(setclipboard, table.concat(summaries, "\n"))
-                notify(copied
-                    and ('Captured %d call(s). All copied to your clipboard.'):format(count)
-                    or ('Captured %d call(s), but copying failed - see %s'):format(count, LOG_PATH),
-                    copied and 'success' or 'warning', 8)
-            else
-                notify(('Captured %d call(s), but this executor has no setclipboard - see %s'):format(count, LOG_PATH), 'warning', 8)
-            end
-        end)
-
-        return pressOk, "armed"
+    Observe = function()
+        return runCaptureWindow(Config.ObserveWindow, false)
     end,
 }
 
@@ -924,7 +937,7 @@ local ModeSection = MainTab:Section({ Title = 'mode', Side = 'left' })
 ModeSection:Dropdown({
     Title = 'mode',
     Flag = 'bb_mode',
-    Options = { 'Indicator', 'Remote', 'UIBlock', 'UIButton', 'ReplayInput', 'Animation', 'Bindable', 'Input', 'Capture' },
+    Options = { 'Indicator', 'Remote', 'UIBlock', 'UIButton', 'ReplayInput', 'Animation', 'Bindable', 'Input', 'Capture', 'Observe' },
     Default = 'Indicator',
     Callback = function(value)
         Config.Mode = value
@@ -936,6 +949,12 @@ ModeSection:Dropdown({
                 notify('This executor has no hookmetamethod/getnamecallmethod - Capture cannot run here.', 'error', 8)
             else
                 notify('Capture fires a real touch and records EVERY remote call seen for 0.5s, not just parry-shaped ones - written to file as each is seen. One attempt is enough - lower the press budget below.', 'warning', 10)
+            end
+        elseif value == 'Observe' then
+            if not HAS_NAMECALL then
+                notify('This executor has no hookmetamethod/getnamecallmethod - Observe cannot run here.', 'error', 8)
+            else
+                notify('Observe hooks the same as Capture but presses nothing itself - use it while another script (or your own real presses) does the real work, and it records every remote call seen during the window.', 'warning', 10)
             end
         else
             notify(('%s mode: %d presses then it turns itself off. This is the part that gets people kicked.')
@@ -978,6 +997,17 @@ ModeSection:Slider({
     Default = 2.0,
     Suffix = 's',
     Callback = function(value) Config.CaptureWindow = value end,
+})
+
+ModeSection:Slider({
+    Title = 'observe window',
+    Flag = 'bb_observe_window',
+    Min = 3,
+    Max = 30,
+    Increment = 1,
+    Default = 10,
+    Suffix = 's',
+    Callback = function(value) Config.ObserveWindow = value end,
 })
 
 ModeSection:Toggle({
@@ -1156,6 +1186,11 @@ RiskSection:Paragraph({
 RiskSection:Paragraph({
     Title = 'Capture - grabs the real arguments instead of guessing them',
     Text = 'Fires the same real touch or click Input does, with a __namecall hook armed for the 0.5s around it. It no longer filters by name - a real test filtered for "parry" in the remote name, found nothing, and still got kicked, faster than previous kicks though not instantly. Most likely the real call has a different name entirely, so now every FireServer, Fire and InvokeServer seen in that window gets written to BladeBallParry.txt the instant it happens, not batched at the end. If the kick lands mid-window, whatever was already seen is already on disk.',
+})
+
+RiskSection:Paragraph({
+    Title = 'Observe - same hook, but presses nothing itself',
+    Text = 'For watching a known-working script instead of guessing blindly: run it alongside this one, arm Observe right before it would act, and everything it fires through FireServer/Fire/InvokeServer gets caught by the same hook Capture uses - just without this script adding its own synthetic press into the mix. Same __namecall exposure as Capture, held open longer (default 10s instead of 2s) since there is no single press to time it around.',
 })
 
 RiskSection:Paragraph({
