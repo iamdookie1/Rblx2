@@ -253,6 +253,7 @@ local capturing = false
 
 local CAPTURE_LIMIT = 60
 local CAPTURE_IGNORE = { SetPointer = true, SetLook = true, Ping = true, Fps = true }
+local CAPTURE_IGNORE_TAGS = { Activity = true, Snapshot = true }
 
 local function describeCall(self, method, args)
     local fullName = "?"
@@ -331,6 +332,8 @@ local Pressers = {
                     local okName, name = pcall(function() return self.Name end)
                     local ignored = okName and CAPTURE_IGNORE[name] == true
                     local okMethod, method = pcall(getnamecallmethod)
+                    local firstArg = select(1, ...)
+                    if CAPTURE_IGNORE_TAGS[firstArg] then ignored = true end
                     if not ignored and okMethod and (method == "FireServer" or method == "Fire" or method == "InvokeServer") then
                         count = count + 1
                         local args = { ... }
