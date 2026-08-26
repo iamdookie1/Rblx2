@@ -480,11 +480,25 @@ local function pressInput()
     end)
 end
 
+local BUTTON_SIGNAL_NAMES = { "Activated", "MouseButton1Click", "MouseButton1Down" }
+
+local function fireButtonSignal(guiButton)
+    if typeof(firesignal) ~= "function" then return false, "no firesignal on this executor" end
+
+    for _, signalName in ipairs(BUTTON_SIGNAL_NAMES) do
+        local okSignal, signal = pcall(function() return guiButton[signalName] end)
+        if okSignal and signal then
+            if pcall(firesignal, signal) then return true end
+        end
+    end
+
+    return false, "firesignal failed on every signal tried"
+end
+
 local function fireButtonConnections(guiButton)
     if typeof(getconnections) ~= "function" then return false, "no getconnections on this executor" end
 
-    local signalNames = { "Activated", "MouseButton1Click", "MouseButton1Down" }
-    for _, signalName in ipairs(signalNames) do
+    for _, signalName in ipairs(BUTTON_SIGNAL_NAMES) do
         local okSignal, signal = pcall(function() return guiButton[signalName] end)
         if okSignal and signal then
             local okConn, connections = pcall(getconnections, signal)
@@ -499,6 +513,33 @@ local function fireButtonConnections(guiButton)
     end
 
     return false, "no working connections found"
+end
+
+local function describeButtonConnections(guiButton)
+    local lines = {}
+    if typeof(getconnections) ~= "function" then return lines end
+
+    for _, signalName in ipairs(BUTTON_SIGNAL_NAMES) do
+        local okSignal, signal = pcall(function() return guiButton[signalName] end)
+        if okSignal and signal then
+            local okConn, connections = pcall(getconnections, signal)
+            if okConn and typeof(connections) == "table" then
+                for index, connection in ipairs(connections) do
+                    local line = ("%s #%d: "):format(signalName, index)
+                    local okFn, fn = pcall(function() return connection.Function end)
+                    if okFn and typeof(fn) == "function" then
+                        local okInfo, info = pcall(debug.info, fn, "s")
+                        line = line .. (okInfo and tostring(info) or "<no debug.info>")
+                    else
+                        line = line .. "<no Function field / locked>"
+                    end
+                    lines[#lines + 1] = line
+                end
+            end
+        end
+    end
+
+    return lines
 end
 
 local function clickButtonDirectly(guiButton)
@@ -541,8 +582,8 @@ local Pressers = {
 
     UIButton = function()
         if not BlockButton then return false, "PlayerGui.Hotbar.Block missing" end
-        local ok, err = fireButtonConnections(BlockButton)
-        if ok then return true, "fired via connection" end
+        if fireButtonSignal(BlockButton) then return true, "fired via firesignal" end
+        if fireButtonConnections(BlockButton) then return true, "fired via connection" end
         return clickButtonDirectly(BlockButton)
     end,
 
@@ -1046,6 +1087,28 @@ DiagSection:Button({
         else
             notify(tostring(err), 'error', 6)
         end
+    end,
+})
+
+DiagSection:Button({
+    Title = 'copy Block button connections',
+    Callback = function()
+        if not BlockButton then
+            notify('PlayerGui.Hotbar.Block missing.', 'error', 6)
+            return
+        end
+        local lines = describeButtonConnections(BlockButton)
+        if #lines == 0 then
+            notify('No connections found (or no getconnections on this executor).', 'warning', 7)
+            return
+        end
+        local text = table.concat(lines, "\n")
+        log("connections -> " .. text)
+        local copied = typeof(setclipboard) == "function" and pcall(setclipboard, text)
+        notify(copied
+            and ('%d connection(s) copied to clipboard.'):format(#lines)
+            or ('%d connection(s) - see %s'):format(#lines, LOG_PATH),
+            'success', 7)
     end,
 })
 
