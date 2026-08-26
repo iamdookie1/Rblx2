@@ -64,7 +64,6 @@ local Stats = {
 
 local MethodScores = {
     Remote = { presses = 0, successes = 0 },
-    Block = { presses = 0, successes = 0 },
     Bindable = { presses = 0, successes = 0 },
     Input = { presses = 0, successes = 0 },
     Capture = { presses = 0, successes = 0 },
@@ -91,14 +90,6 @@ local ParryButtonPress = Remotes and Remotes:FindFirstChild("ParryButtonPress")
 local ParrySuccessRemote = Remotes and Remotes:FindFirstChild("ParrySuccess")
 local VisualCD = Remotes and Remotes:FindFirstChild("VisualCD")
 local KeybindM2 = Remotes and Remotes:FindFirstChild("KeybindM2")
-
-local PackagesFolder = ReplicatedStorage:WaitForChild("Packages", 10)
-local NetModule = PackagesFolder and PackagesFolder:FindFirstChild("_Index")
-NetModule = NetModule and NetModule:FindFirstChild("sleitnick_net@0.1.0")
-NetModule = NetModule and NetModule:FindFirstChild("net")
-
-local BlockRemote = NetModule and NetModule:FindFirstChild(
-    "RF/856d88c6dde58c52702c6940c7c9e5a2833aa7fe5002b15a58a24ae396861abc")
 
 local PingModule = ReplicatedStorage:FindFirstChild("Shared")
 PingModule = PingModule and PingModule:FindFirstChild("Ping")
@@ -347,11 +338,6 @@ local Pressers = {
         return pcall(function() ParryAttempt:FireServer() end)
     end,
 
-    Block = function()
-        if not BlockRemote then return false, "hashed Block remote missing" end
-        return pcall(function() BlockRemote:InvokeServer() end)
-    end,
-
     Bindable = function()
         if not ParryButtonPress then return false, "ParryButtonPress missing" end
         return pcall(function() ParryButtonPress:Fire() end)
@@ -561,7 +547,7 @@ local ModeSection = MainTab:Section({ Title = 'mode', Side = 'left' })
 ModeSection:Dropdown({
     Title = 'mode',
     Flag = 'bb_mode',
-    Options = { 'Indicator', 'Remote', 'Block', 'Bindable', 'Input', 'Capture' },
+    Options = { 'Indicator', 'Remote', 'Bindable', 'Input', 'Capture' },
     Default = 'Indicator',
     Callback = function(value)
         Config.Mode = value
@@ -761,11 +747,6 @@ RiskSection:Paragraph({
 })
 
 RiskSection:Paragraph({
-    Title = 'Block - a different remote than Remote mode uses',
-    Text = 'Invokes a hashed RemoteFunction under sleitnick_net, seen fire with zero arguments in a real match right around the UIInteraction telemetry for the Hotbar Block control. Not the same remote ParryAttempt is - untested and unconfirmed, same risk profile as Remote mode: a bare call with no matching input.',
-})
-
-RiskSection:Paragraph({
     Title = 'Bindable',
     Text = 'Fires the ParryButtonPress BindableEvent, which should run the game\'s own parry path including its cooldown. That is the appeal. The risk is that BAC runs on this client too and can compare a parry against whether any real input happened.',
 })
@@ -783,6 +764,11 @@ RiskSection:Paragraph({
 RiskSection:Paragraph({
     Title = 'this is a wider hook than it used to be',
     Text = 'Watching everything instead of one name means the hook can no longer stop the moment it sees a match - there might be more after it - so the full 0.5s is paid every time now, not just on a miss. That is more of the game\'s own traffic passing through code this script wrote, for longer, on every attempt. It is not a smaller risk than before; treat one capture as the whole budget for this mode.',
+})
+
+RiskSection:Paragraph({
+    Title = 'the actual parry remote renames itself every call',
+    Text = 'Two real-match captures around the same Block control produced two different hashed RemoteFunction names, both invoked with zero arguments. A stable hash from sleitnick_net would repeat every time for the same name - it did not, which means the name is being regenerated per call on purpose. There is nothing to hardcode here; any saved hash is already wrong by the next press. Capture is the only mode that can ever reach this one, because it reads whatever the game itself just called instead of guessing a name in advance.',
 })
 
 RiskSection:Paragraph({
