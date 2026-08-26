@@ -406,6 +406,74 @@ local function inspectInputHandlers()
     deliverDump(lines, "input handlers")
 end
 
+local function dumpTable(value, lines, prefix, depth, seen)
+    if depth > 2 then return end
+    seen = seen or {}
+    if seen[value] then
+        lines[#lines + 1] = prefix .. "(already shown)"
+        return
+    end
+    seen[value] = true
+
+    local keys = {}
+    pcall(function()
+        for key in pairs(value) do keys[#keys + 1] = key end
+    end)
+    table.sort(keys, function(a, b) return tostring(a) < tostring(b) end)
+
+    for _, key in ipairs(keys) do
+        local ok, entry = pcall(function() return value[key] end)
+        if ok then
+            lines[#lines + 1] = ("%s%s = %s"):format(prefix, tostring(key), shortValue(entry))
+            if typeof(entry) == "table" and depth < 2 then
+                dumpTable(entry, lines, prefix .. "  ", depth + 1, seen)
+            end
+        end
+    end
+
+    local okMeta, meta = pcall(getmetatable, value)
+    if okMeta and typeof(meta) == "table" and depth < 2 then
+        lines[#lines + 1] = prefix .. "-- metatable --"
+        dumpTable(meta, lines, prefix .. "  ", depth + 1, seen)
+    end
+end
+
+local function findControllerModule(namePart)
+    local controllers = ReplicatedStorage:FindFirstChild("Controllers")
+    if not controllers then return nil end
+    for _, child in ipairs(controllers:GetChildren()) do
+        if child:IsA("ModuleScript") and child.Name:lower():find(namePart, 1, true) then
+            return child
+        end
+    end
+    return nil
+end
+
+local function dumpModule(module, label)
+    if not module then
+        say(label .. ": not found", Color3.fromRGB(255, 120, 120))
+        return
+    end
+
+    local ok, result = pcall(require, module)
+    if not ok then
+        say(label .. ": require failed - " .. tostring(result), Color3.fromRGB(255, 120, 120))
+        return
+    end
+
+    local lines = {}
+    lines[#lines + 1] = label .. " -> " .. module:GetFullName()
+    lines[#lines + 1] = "returned " .. typeof(result)
+
+    if typeof(result) == "table" then
+        dumpTable(result, lines, "  ", 0, nil)
+    else
+        lines[#lines + 1] = "  " .. shortValue(result)
+    end
+
+    deliverDump(lines, label)
+end
+
 local function scanGarbageCollector()
     if not getGc then
         say("no getgc on this executor", Color3.fromRGB(255, 120, 120))
@@ -781,6 +849,44 @@ InspectSection:Button({
     Title = 'inspect InputBegan handlers',
     Callback = function()
         task.spawn(inspectInputHandlers)
+    end,
+})
+
+InspectSection:Button({
+    Title = 'dump custom UserInputService',
+    Callback = function()
+        task.spawn(function()
+            dumpModule(ReplicatedStorage:FindFirstChild("UserInputService"), "custom UIS")
+        end)
+    end,
+})
+
+InspectSection:Button({
+    Title = 'dump SwordsController',
+    Callback = function()
+        task.spawn(function()
+            dumpModule(findControllerModule("swordscontroller"), "SwordsController")
+        end)
+    end,
+})
+
+InspectSection:Button({
+    Title = 'list Controllers',
+    Callback = function()
+        local controllers = ReplicatedStorage:FindFirstChild("Controllers")
+        if not controllers then
+            say("no Controllers folder", Color3.fromRGB(255, 120, 120))
+            return
+        end
+        local lines = { "Controllers children" }
+        for _, child in ipairs(controllers:GetChildren()) do
+            local raw = child.Name
+            local cleaned = raw:gsub("%c", function(c)
+                return ("\\%d"):format(c:byte())
+            end)
+            lines[#lines + 1] = ("%s | %q"):format(child.ClassName, cleaned)
+        end
+        deliverDump(lines, "controllers")
     end,
 })
 
