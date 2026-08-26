@@ -193,6 +193,7 @@ local function startLearning()
     table.clear(learnQueue)
 
     learnInputConnection = track(UserInputService.InputBegan:Connect(function(input, processed)
+        if processed then return end
         if not isPressLikeInput(input.UserInputType) then return end
         lastPressAt = os.clock()
     end))
@@ -342,6 +343,16 @@ EnabledToggle = MainSection:Toggle({
 })
 
 local ControlSection = MainTab:Section({ Title = 'control', Side = 'right' })
+
+ControlSection:Button({
+    Title = 'forget learned remote',
+    Callback = function()
+        LockedRemote = nil
+        LockedClass = nil
+        log("forgot learned remote")
+        notify('Forgot the learned remote. Toggle auto parry off then on to learn again.', 'warning', 7)
+    end,
+})
 
 ControlSection:Button({
     Title = 'unload',
