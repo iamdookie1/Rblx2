@@ -537,6 +537,92 @@ local function scanBySource(sourceQuery)
     end)
 end
 
+local FoundRemotes = {}
+
+local function isRemoteInstance(value)
+    if typeof(value) ~= "Instance" then return false end
+    local ok, result = pcall(function()
+        return value:IsA("RemoteEvent") or value:IsA("RemoteFunction")
+            or value:IsA("UnreliableRemoteEvent") or value:IsA("BindableEvent")
+    end)
+    return ok and result
+end
+
+local function noteFoundRemote(instance, where, lines, seen)
+    if seen[instance] then return end
+    seen[instance] = true
+
+    local okName, fullName = pcall(function() return instance:GetFullName() end)
+    if not okName then return end
+
+    FoundRemotes[#FoundRemotes + 1] = {
+        instance = instance,
+        className = instance.ClassName,
+        fullName = fullName,
+    }
+    lines[#lines + 1] = ("[%d] %s %s"):format(#FoundRemotes, instance.ClassName, fullName)
+    lines[#lines + 1] = ("      held by %s"):format(where)
+end
+
+local function huntRemotesInMemory()
+    if not getGc then
+        say("no getgc on this executor", Color3.fromRGB(255, 120, 120))
+        return
+    end
+
+    say("hunting for remotes held in memory...", Color3.fromRGB(255, 180, 70))
+
+    task.spawn(function()
+        table.clear(FoundRemotes)
+
+        local lines = { "remotes found held by live code" }
+        local seen = {}
+
+        local ok, objects = pcall(getGc, true)
+        if not ok or typeof(objects) ~= "table" then
+            say("getgc failed", Color3.fromRGB(255, 120, 120))
+            return
+        end
+
+        local scanned = 0
+
+        for _, object in pairs(objects) do
+            scanned = scanned + 1
+            if scanned % 1500 == 0 then task.wait() end
+            if #FoundRemotes >= 80 then break end
+
+            local kind = typeof(object)
+
+            if kind == "function" and getUpvalues then
+                pcall(function()
+                    local okUp, ups = pcall(getUpvalues, object)
+                    if okUp and typeof(ups) == "table" then
+                        for _, value in pairs(ups) do
+                            if isRemoteInstance(value) then
+                                local okSrc, source = pcall(debug.info, object, "s")
+                                noteFoundRemote(value,
+                                    "upvalue of function in " .. (okSrc and tostring(source) or "?"),
+                                    lines, seen)
+                            end
+                        end
+                    end
+                end)
+            elseif kind == "table" then
+                pcall(function()
+                    for key, value in pairs(object) do
+                        if isRemoteInstance(value) then
+                            noteFoundRemote(value, "table field " .. tostring(key), lines, seen)
+                        end
+                    end
+                end)
+            end
+        end
+
+        lines[#lines + 1] = ("scanned %d objects, found %d remote(s)"):format(scanned, #FoundRemotes)
+        deliverDump(lines, "remote hunt")
+    end)
+end
+
 local function scanGarbageCollector()
     if not getGc then
         say("no getgc on this executor", Color3.fromRGB(255, 120, 120))
@@ -979,6 +1065,48 @@ InspectSection:Button({
             return
         end
         scanBySource(query)
+    end,
+})
+
+InspectSection:Button({
+    Title = 'hunt remotes in memory',
+    Callback = huntRemotesInMemory,
+})
+
+local remoteIndex = 1
+
+InspectSection:Textbox({
+    Title = 'found remote number',
+    Flag = 'bb_remote_index',
+    Default = '1',
+    Placeholder = '1',
+    Callback = function(value)
+        remoteIndex = tonumber(value) or 1
+    end,
+})
+
+InspectSection:Button({
+    Title = 'fire that found remote',
+    Callback = function()
+        local entry = FoundRemotes[remoteIndex]
+        if not entry then
+            say(("no remote #%d - run the hunt first"):format(remoteIndex), Color3.fromRGB(255, 120, 120))
+            return
+        end
+
+        task.spawn(function()
+            local ok = pcall(function()
+                if entry.className == "RemoteFunction" then
+                    entry.instance:InvokeServer()
+                elseif entry.className == "BindableEvent" then
+                    entry.instance:Fire()
+                else
+                    entry.instance:FireServer()
+                end
+            end)
+            say(("[%d] %s -> %s"):format(remoteIndex, entry.fullName, ok and "fired" or "failed"),
+                ok and Color3.fromRGB(126, 217, 87) or Color3.fromRGB(255, 120, 120))
+        end)
     end,
 })
 
