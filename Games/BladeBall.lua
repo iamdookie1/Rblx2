@@ -654,81 +654,141 @@ local function installCaptureHook()
     return true
 end
 
-local function watchEverything(duration)
+local watchRecords = {}
+local watchStarted = 0
+local apiCalls = {}
+local apiWrapped = false
+
+local EXECUTOR_API = {
+    "getgc", "hookmetamethod", "hookfunction", "replaceclosure",
+    "getconnections", "firesignal", "getupvalues", "setupvalue",
+    "getrawmetatable", "setreadonly", "newcclosure", "getsenv",
+    "getrenv", "checkcaller", "getcallingscript", "getnamecallmethod",
+    "getconstants", "getprotos", "getloadedmodules", "fireclickdetector",
+}
+
+local function wrapExecutorApi()
+    if apiWrapped then return true end
+    if typeof(getgenv) ~= "function" then return false end
+
+    local ok = pcall(function()
+        local env = getgenv()
+        for _, name in ipairs(EXECUTOR_API) do
+            local original = env[name]
+            if typeof(original) == "function" then
+                env[name] = function(...)
+                    if watching then
+                        local caller = "?"
+                        pcall(function() caller = tostring(debug.info(2, "s")) end)
+                        local key = name .. " <- " .. caller
+                        apiCalls[key] = (apiCalls[key] or 0) + 1
+                    end
+                    return original(...)
+                end
+            end
+        end
+    end)
+
+    if ok then apiWrapped = true end
+    return ok
+end
+
+local function startWatching()
     if watching or capturing then
         say("already running", Color3.fromRGB(255, 180, 70))
-        return
+        return false
     end
 
     if not installCaptureHook() then
         say("could not install hook", Color3.fromRGB(255, 120, 120))
-        return
+        return false
     end
 
+    wrapExecutorApi()
+
     table.clear(captureQueue)
+    table.clear(watchRecords)
+    table.clear(apiCalls)
     table.clear(FoundRemotes)
+
+    watchStarted = os.clock()
     watching = true
 
-    say(("watching everything for %ds - let the paid script parry NOW"):format(duration),
+    say("watching - load and run the paid script now, then turn this off",
         Color3.fromRGB(255, 210, 80))
 
     task.spawn(function()
-        local started = os.clock()
-        local lines = { "everything called during the window" }
-        local records = {}
-
-        while os.clock() - started < duration do
+        while watching do
             while #captureQueue > 0 do
                 local item = table.remove(captureQueue, 1)
                 local okName, fullName = pcall(function() return item.instance:GetFullName() end)
-                records[#records + 1] = {
+                watchRecords[#watchRecords + 1] = {
                     method = item.method,
                     fullName = okName and fullName or "?",
                     className = item.instance.ClassName,
                     caller = item.caller,
-                    offset = item.at - started,
+                    offset = item.at - watchStarted,
                     instance = item.instance,
                 }
             end
             task.wait(0.03)
         end
-
-        watching = false
-
-        local byCaller = {}
-        for _, record in ipairs(records) do
-            byCaller[record.caller] = (byCaller[record.caller] or 0) + 1
-        end
-
-        lines[#lines + 1] = "-- callers seen --"
-        for caller, count in pairs(byCaller) do
-            lines[#lines + 1] = ("  %d call(s) from %s"):format(count, caller)
-        end
-
-        lines[#lines + 1] = "-- calls in order --"
-        local seen = {}
-        for _, record in ipairs(records) do
-            lines[#lines + 1] = ("+%.3fs %s %s %s")
-                :format(record.offset, record.method, record.className, record.fullName)
-            lines[#lines + 1] = ("        from %s"):format(record.caller)
-
-            if isRemoteInstance(record.instance) and not seen[record.instance] then
-                seen[record.instance] = true
-                FoundRemotes[#FoundRemotes + 1] = {
-                    instance = record.instance,
-                    className = record.className,
-                    fullName = record.fullName,
-                    method = record.method,
-                }
-            end
-        end
-
-        lines[#lines + 1] = ("%d call(s) total, %d distinct remote(s) kept")
-            :format(#records, #FoundRemotes)
-        deliverDump(lines, "watch")
-        say(("watched %d call(s), kept %d remote(s)"):format(#records, #FoundRemotes),
-            Color3.fromRGB(255, 210, 80))
     end)
+
+    return true
+end
+
+local function stopWatching()
+    if not watching then return end
+    watching = false
+
+    task.wait(0.1)
+
+    local lines = { ("watch results - %.1fs"):format(os.clock() - watchStarted) }
+
+    local anyApi = false
+    lines[#lines + 1] = "-- executor functions called --"
+    for key, count in pairs(apiCalls) do
+        anyApi = true
+        lines[#lines + 1] = ("  %d x %s"):format(count, key)
+    end
+    if not anyApi then
+        lines[#lines + 1] = "  (none seen - it may capture them before this started)"
+    end
+
+    local byCaller = {}
+    for _, record in ipairs(watchRecords) do
+        byCaller[record.caller] = (byCaller[record.caller] or 0) + 1
+    end
+
+    lines[#lines + 1] = "-- callers seen --"
+    for caller, count in pairs(byCaller) do
+        lines[#lines + 1] = ("  %d call(s) from %s"):format(count, caller)
+    end
+
+    lines[#lines + 1] = "-- calls in order --"
+    local seen = {}
+    for _, record in ipairs(watchRecords) do
+        lines[#lines + 1] = ("+%.3fs %s %s %s")
+            :format(record.offset, record.method, record.className, record.fullName)
+        lines[#lines + 1] = ("        from %s"):format(record.caller)
+
+        if isRemoteInstance(record.instance) and not seen[record.instance] then
+            seen[record.instance] = true
+            FoundRemotes[#FoundRemotes + 1] = {
+                instance = record.instance,
+                className = record.className,
+                fullName = record.fullName,
+                method = record.method,
+            }
+        end
+    end
+
+    lines[#lines + 1] = ("%d call(s) total, %d distinct remote(s) kept")
+        :format(#watchRecords, #FoundRemotes)
+    deliverDump(lines, "watch")
+    say(("stopped - %d call(s), %d remote(s) kept"):format(#watchRecords, #FoundRemotes),
+        Color3.fromRGB(255, 210, 80))
 end
 
 local function captureDuringParry(duration)
@@ -1282,16 +1342,22 @@ InspectSection:Button({
     end,
 })
 
-InspectSection:Button({
-    Title = 'watch paid script (6s)',
-    Callback = function()
-        watchEverything(6)
+InspectSection:Toggle({
+    Title = 'watch everything',
+    Flag = 'bb_watch',
+    Default = false,
+    Callback = function(value)
+        if value then
+            if not startWatching() then return end
+        else
+            task.spawn(stopWatching)
+        end
     end,
 })
 
 InspectSection:Paragraph({
     Title = 'copying what the paid script does',
-    Text = 'Run the paid script with its auto parry on, press this, and let it parry. It records every remote fire, bindable fire, synthetic input, animation play and action bind seen in the window, and tags each one with the chunk that called it - so its calls are separated from the game\'s own. Whatever it does that a manual parry does not is the mechanism. Any remotes seen are kept in the numbered list so they can be fired straight afterwards.',
+    Text = 'Turn this on BEFORE loading the paid script so its setup is caught too, then load it, let it parry, and turn this off to get the dump. It runs until you stop it rather than on a timer. It records every remote fire, bindable fire, synthetic input, animation play and action bind, tagging each with the chunk that called it so its calls are separated from the game\'s own. It also wraps the executor API - getgc, hookfunction, hookmetamethod, getconnections, firesignal and the rest - and counts who calls what, so its technique shows up even when its remotes do not. Any remotes seen are kept in the numbered list to fire afterwards.',
 })
 
 InspectSection:Button({
