@@ -738,6 +738,61 @@ local function replayCapturedInput()
     return false, "no non-locked connections to fire"
 end
 
+local liveLogging = false
+local liveOriginalNamecall = nil
+
+local function setLiveRemoteLogging(enabled)
+    if enabled == liveLogging then return end
+
+    if not enabled then
+        if liveOriginalNamecall then
+            pcall(function() hookmetamethod(game, "__namecall", liveOriginalNamecall) end)
+            liveOriginalNamecall = nil
+        end
+        liveLogging = false
+        log("live remote logging: off")
+        return
+    end
+
+    if not HAS_NAMECALL then
+        notify('This executor has no hookmetamethod/getnamecallmethod - cannot log remotes live.', 'error', 7)
+        return
+    end
+
+    local hookOk = pcall(function()
+        liveOriginalNamecall = hookmetamethod(game, "__namecall", function(self, ...)
+            if typeof(self) == "Instance" then
+                local okMethod, method = pcall(getnamecallmethod)
+                if okMethod and (method == "FireServer" or method == "Fire" or method == "InvokeServer") then
+                    local okName, name = pcall(function() return self.Name end)
+                    local firstArg = select(1, ...)
+                    local ignored = (okName and CAPTURE_IGNORE[name] == true) or CAPTURE_IGNORE_TAGS[firstArg] == true
+
+                    if not ignored then
+                        local args = { ... }
+                        task.spawn(function()
+                            local summary = describeCall(self, method, args)
+                            log("live -> " .. summary)
+
+                            local okFullName, fullName = pcall(function() return self:GetFullName() end)
+                            if okFullName then recordCaptured(self, fullName) end
+                        end)
+                    end
+                end
+            end
+            return liveOriginalNamecall(self, ...)
+        end)
+    end)
+
+    if not hookOk or not liveOriginalNamecall then
+        notify('Failed to install live hook.', 'error', 6)
+        return
+    end
+
+    liveLogging = true
+    log("live remote logging: on")
+end
+
 local function runCaptureWindow(duration, pressFirst)
     if not HAS_NAMECALL then return false, "no hookmetamethod on this executor" end
     if capturing then return false, "already capturing" end
@@ -1596,12 +1651,37 @@ ControlSection:Button({
     Callback = function()
         Unloading = true
         Config.Enabled = false
+        setLiveRemoteLogging(false)
         for _, connection in ipairs(Connections) do
             pcall(function() connection:Disconnect() end)
         end
         pcall(function() IndicatorGui:Destroy() end)
         Centrl:Unload()
     end,
+})
+
+local RemoteTab = Window:Tab({ Title = 'remotes', Icon = 'radio' })
+local LiveSection = RemoteTab:Section({ Title = 'live capture', Side = 'left' })
+
+local function randomFlag(prefix)
+    local ok, guid = pcall(function()
+        return game:GetService("HttpService"):GenerateGUID(false)
+    end)
+    return prefix .. "_" .. (ok and guid or tostring(math.random(1, 2 ^ 31)))
+end
+
+LiveSection:Toggle({
+    Title = 'log remotes live',
+    Flag = randomFlag('bb_live_remote'),
+    Default = false,
+    Callback = function(value)
+        setLiveRemoteLogging(value)
+    end,
+})
+
+LiveSection:Paragraph({
+    Title = 'always on, never remembered',
+    Text = 'Hooks __namecall for as long as this stays on, logging every FireServer/Fire/InvokeServer call seen to file and into the same capture list FireCaptured reads from - no fixed window, so it can be left running while your paid script (or your own real presses) does the real work. Its Flag is a fresh random UUID every time this loads, so this toggle never restores a saved state across reloads - if leaving it on ever caused a kick, it will not silently turn itself back on next time.',
 })
 
 Window:Load()
