@@ -418,11 +418,24 @@ local CAPTURE_IGNORE = { SetPointer = true, SetLook = true, Ping = true, Fps = t
 local CAPTURE_IGNORE_TAGS = { Activity = true, Snapshot = true, ["5455ef47-de02-4074-808c-8d82c2cd12ec"] = true }
 
 local LastCaptured = {}
+local CapturedTargetIndex = nil
 
 local function recordCaptured(instance, fullName)
     local hash = fullName:match("/(%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x+)$")
     LastCaptured[#LastCaptured + 1] = { instance = instance, hash = hash, fullName = fullName }
-    if #LastCaptured > 20 then table.remove(LastCaptured, 1) end
+    if #LastCaptured > 20 then
+        table.remove(LastCaptured, 1)
+        if CapturedTargetIndex then
+            CapturedTargetIndex = math.max(1, CapturedTargetIndex - 1)
+        end
+    end
+end
+
+local function currentCapturedEntry()
+    if #LastCaptured == 0 then return nil, 0 end
+    local index = CapturedTargetIndex or #LastCaptured
+    index = math.max(1, math.min(index, #LastCaptured))
+    return LastCaptured[index], index
 end
 
 local function searchGameForValue(target)
@@ -826,8 +839,8 @@ local Pressers = {
     ReplayInput = replayCapturedInput,
 
     FireCaptured = function()
-        if #LastCaptured == 0 then return false, "nothing captured yet" end
-        local entry = LastCaptured[#LastCaptured]
+        local entry = currentCapturedEntry()
+        if not entry then return false, "nothing captured yet" end
 
         local okClass, className = pcall(function() return entry.instance.ClassName end)
         if not okClass then return false, "captured instance is gone" end
@@ -1213,7 +1226,7 @@ RiskSection:Paragraph({
 })
 
 RiskSection:Paragraph({
-    Title = 'FireCaptured - calls the exact instance Capture or Observe last saw',
+    Title = 'FireCaptured - calls the exact instance last targeted',
     Text = 'Uses the literal Instance reference from the most recent Capture/Observe hit, not its name - so it works even though names rotate, as long as you are still in the lobby that instance came from. Strongest candidate yet if that last capture came from watching a script confirmed to actually work: calling the same real remote it used, timed against a real ball the same way every other mode is. Only as good as whatever was last captured - re-run Capture or Observe first if you switch targets.',
 })
 
@@ -1453,19 +1466,74 @@ DiagSection:Button({
 })
 
 DiagSection:Paragraph({
+    Title = 'picking which capture FireCaptured targets',
+    Text = 'A single Capture/Observe window can catch more than one call - FireCaptured only ever used the very last one, with no way to check whether that was actually the right one. List shows every recent capture with its index; the target buttons move which one FireCaptured will call, defaulting to the newest.',
+})
+
+DiagSection:Button({
+    Title = 'list recent captures',
+    Callback = function()
+        if #LastCaptured == 0 then
+            notify('Nothing captured yet.', 'warning', 6)
+            return
+        end
+
+        local lines = {}
+        for index, entry in ipairs(LastCaptured) do
+            local marker = (index == select(2, currentCapturedEntry())) and " <- target" or ""
+            lines[#lines + 1] = ("#%d: %s%s"):format(index, entry.fullName, marker)
+        end
+
+        local text = table.concat(lines, "\n")
+        log("recent captures ->\n" .. text)
+        local copied = typeof(setclipboard) == "function" and pcall(setclipboard, text)
+        notify(copied
+            and ('%d capture(s) copied to clipboard.'):format(#LastCaptured)
+            or ('%d capture(s) - see %s'):format(#LastCaptured, LOG_PATH),
+            'success', 7)
+    end,
+})
+
+DiagSection:Button({
+    Title = 'target previous capture',
+    Callback = function()
+        if #LastCaptured == 0 then
+            notify('Nothing captured yet.', 'warning', 6)
+            return
+        end
+        local _, index = currentCapturedEntry()
+        CapturedTargetIndex = math.max(1, index - 1)
+        local entry = LastCaptured[CapturedTargetIndex]
+        notify(('Targeting #%d: %s'):format(CapturedTargetIndex, entry.fullName), 'success', 6)
+    end,
+})
+
+DiagSection:Button({
+    Title = 'target latest capture',
+    Callback = function()
+        CapturedTargetIndex = nil
+        local entry, index = currentCapturedEntry()
+        if entry then
+            notify(('Targeting #%d (latest): %s'):format(index, entry.fullName), 'success', 6)
+        else
+            notify('Nothing captured yet.', 'warning', 6)
+        end
+    end,
+})
+
+DiagSection:Paragraph({
     Title = 'where does the hash come from',
     Text = 'The hash is not necessarily pure noise - it could be derived from something else in the game (a JobId, a GUID stored as an attribute, anything). Searches every attribute on every instance in the game for an exact match to the most recently captured hash, plus a direct check against game.JobId. A match would reveal where the value actually comes from instead of treating it as unrecoverable.',
 })
 
 DiagSection:Button({
-    Title = 'search game for last captured hash',
+    Title = 'search game for targeted capture hash',
     Callback = function()
-        if #LastCaptured == 0 then
+        local entry = currentCapturedEntry()
+        if not entry then
             notify('Nothing captured yet - run Capture or Observe first.', 'warning', 6)
             return
         end
-
-        local entry = LastCaptured[#LastCaptured]
         if not entry.hash then
             notify('Last captured call had no hash-shaped name to search for.', 'warning', 6)
             return
