@@ -580,13 +580,19 @@ end
 local CapturedInput = nil
 local capturingInput = false
 
+local function isPressLikeInput(inputType)
+    return inputType == Enum.UserInputType.MouseButton1
+        or inputType == Enum.UserInputType.MouseButton2
+        or inputType == Enum.UserInputType.Touch
+end
+
 local function armInputCapture()
     if capturingInput then return false, "already capturing" end
     capturingInput = true
 
     local connection
     connection = track(UserInputService.InputBegan:Connect(function(input, processed)
-        if input.UserInputType ~= parryInputType then return end
+        if not isPressLikeInput(input.UserInputType) then return end
         CapturedInput = input
         capturingInput = false
         if connection then connection:Disconnect() end
