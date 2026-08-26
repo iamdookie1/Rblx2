@@ -478,6 +478,65 @@ local function dumpModule(module, label)
     deliverDump(lines, label)
 end
 
+local function scanBySource(sourceQuery)
+    if not getGc then
+        say("no getgc on this executor", Color3.fromRGB(255, 120, 120))
+        return
+    end
+
+    local wanted = sourceQuery:lower():gsub("%s+", "")
+    say("looking for functions from " .. sourceQuery .. "...", Color3.fromRGB(255, 180, 70))
+
+    task.spawn(function()
+        local lines = {}
+        lines[#lines + 1] = "functions whose chunk matches " .. sourceQuery
+
+        local ok, objects = pcall(getGc, true)
+        if not ok or typeof(objects) ~= "table" then
+            say("getgc failed", Color3.fromRGB(255, 120, 120))
+            return
+        end
+
+        local scanned, found = 0, 0
+        local seenUpvalues = {}
+
+        for _, object in pairs(objects) do
+            scanned = scanned + 1
+            if scanned % 2000 == 0 then task.wait() end
+            if found >= 25 then break end
+
+            if typeof(object) == "function" then
+                local okSrc, source = pcall(debug.info, object, "s")
+                if okSrc and typeof(source) == "string" then
+                    local cleaned = source:lower():gsub("%c", ""):gsub("%s+", "")
+                    if cleaned:find(wanted, 1, true) then
+                        found = found + 1
+                        local okLine, line = pcall(debug.info, object, "l")
+                        lines[#lines + 1] = ("== %s line %s =="):format(source, okLine and tostring(line) or "?")
+
+                        if getUpvalues then
+                            local okUp, ups = pcall(getUpvalues, object)
+                            if okUp and typeof(ups) == "table" then
+                                for index, value in pairs(ups) do
+                                    local rendered = shortValue(value)
+                                    local key = tostring(index) .. rendered
+                                    if not seenUpvalues[key] then
+                                        seenUpvalues[key] = true
+                                        lines[#lines + 1] = ("    up[%s] %s"):format(tostring(index), rendered)
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+
+        lines[#lines + 1] = ("scanned %d objects, %d matching function(s)"):format(scanned, found)
+        deliverDump(lines, "source scan")
+    end)
+end
+
 local function scanGarbageCollector()
     if not getGc then
         say("no getgc on this executor", Color3.fromRGB(255, 120, 120))
@@ -908,6 +967,18 @@ InspectSection:Button({
             lines[#lines + 1] = ("%s | %q"):format(child.ClassName, cleaned)
         end
         deliverDump(lines, "controllers")
+    end,
+})
+
+InspectSection:Button({
+    Title = 'find functions from that script',
+    Callback = function()
+        local query = moduleQuery or ""
+        if query:gsub("%s+", "") == "" then
+            say("type a script name first", Color3.fromRGB(255, 120, 120))
+            return
+        end
+        scanBySource(query)
     end,
 })
 
