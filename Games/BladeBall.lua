@@ -408,11 +408,8 @@ local Pressers = {
                     local okMethod, method = pcall(getnamecallmethod)
                     if okMethod and (method == "FireServer" or method == "Fire" or method == "InvokeServer") then
                         local okName, name = pcall(function() return self.Name end)
-                        local okFullName, fullName = pcall(function() return self:GetFullName() end)
                         local firstArg = select(1, ...)
-                        local ignored = (okName and CAPTURE_IGNORE[name] == true)
-                            or CAPTURE_IGNORE_TAGS[firstArg] == true
-                            or (okFullName and fullName:find("ClientKit", 1, true) ~= nil)
+                        local ignored = (okName and CAPTURE_IGNORE[name] == true) or CAPTURE_IGNORE_TAGS[firstArg] == true
 
                         if ignored then
                             ignoredCount = ignoredCount + 1
