@@ -64,6 +64,7 @@ local Stats = {
 
 local MethodScores = {
     Remote = { presses = 0, successes = 0 },
+    Block = { presses = 0, successes = 0 },
     Bindable = { presses = 0, successes = 0 },
     Input = { presses = 0, successes = 0 },
     Capture = { presses = 0, successes = 0 },
@@ -90,6 +91,14 @@ local ParryButtonPress = Remotes and Remotes:FindFirstChild("ParryButtonPress")
 local ParrySuccessRemote = Remotes and Remotes:FindFirstChild("ParrySuccess")
 local VisualCD = Remotes and Remotes:FindFirstChild("VisualCD")
 local KeybindM2 = Remotes and Remotes:FindFirstChild("KeybindM2")
+
+local PackagesFolder = ReplicatedStorage:WaitForChild("Packages", 10)
+local NetModule = PackagesFolder and PackagesFolder:FindFirstChild("_Index")
+NetModule = NetModule and NetModule:FindFirstChild("sleitnick_net@0.1.0")
+NetModule = NetModule and NetModule:FindFirstChild("net")
+
+local BlockRemote = NetModule and NetModule:FindFirstChild(
+    "RF/856d88c6dde58c52702c6940c7c9e5a2833aa7fe5002b15a58a24ae396861abc")
 
 local PingModule = ReplicatedStorage:FindFirstChild("Shared")
 PingModule = PingModule and PingModule:FindFirstChild("Ping")
@@ -338,6 +347,11 @@ local Pressers = {
         return pcall(function() ParryAttempt:FireServer() end)
     end,
 
+    Block = function()
+        if not BlockRemote then return false, "hashed Block remote missing" end
+        return pcall(function() BlockRemote:InvokeServer() end)
+    end,
+
     Bindable = function()
         if not ParryButtonPress then return false, "ParryButtonPress missing" end
         return pcall(function() ParryButtonPress:Fire() end)
@@ -547,7 +561,7 @@ local ModeSection = MainTab:Section({ Title = 'mode', Side = 'left' })
 ModeSection:Dropdown({
     Title = 'mode',
     Flag = 'bb_mode',
-    Options = { 'Indicator', 'Remote', 'Bindable', 'Input', 'Capture' },
+    Options = { 'Indicator', 'Remote', 'Block', 'Bindable', 'Input', 'Capture' },
     Default = 'Indicator',
     Callback = function(value)
         Config.Mode = value
@@ -744,6 +758,11 @@ RiskSection:Paragraph({
 RiskSection:Paragraph({
     Title = 'Remote - most likely to be the one that answered',
     Text = 'Fires ReplicatedStorage.Remotes.ParryAttempt. The arguments the real client sends were never read, because SwordsController.PRY is obfuscated, so this sends none at all. A server receiving that remote with no arguments, from a client whose parry did not come from input, is about as clear a signature as exploiting produces. If you only test one thing, do not make it this one.',
+})
+
+RiskSection:Paragraph({
+    Title = 'Block - a different remote than Remote mode uses',
+    Text = 'Invokes a hashed RemoteFunction under sleitnick_net, seen fire with zero arguments in a real match right around the UIInteraction telemetry for the Hotbar Block control. Not the same remote ParryAttempt is - untested and unconfirmed, same risk profile as Remote mode: a bare call with no matching input.',
 })
 
 RiskSection:Paragraph({
