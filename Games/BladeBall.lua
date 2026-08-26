@@ -173,6 +173,7 @@ local function lockRemote(instance)
 
     LockedRemote = instance
     LockedClass = className
+    CooldownUntil = os.clock() + 2
     stopLearning()
 
     local okFullName, fullName = pcall(function() return instance:GetFullName() end)
