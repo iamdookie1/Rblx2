@@ -91,6 +91,11 @@ local ParrySuccessRemote = Remotes and Remotes:FindFirstChild("ParrySuccess")
 local VisualCD = Remotes and Remotes:FindFirstChild("VisualCD")
 local KeybindM2 = Remotes and Remotes:FindFirstChild("KeybindM2")
 
+local PackagesFolder = ReplicatedStorage:WaitForChild("Packages", 10)
+local NetModule = PackagesFolder and PackagesFolder:FindFirstChild("_Index")
+NetModule = NetModule and NetModule:FindFirstChild("sleitnick_net@0.1.0")
+NetModule = NetModule and NetModule:FindFirstChild("net")
+
 local PingModule = ReplicatedStorage:FindFirstChild("Shared")
 PingModule = PingModule and PingModule:FindFirstChild("Ping")
 
@@ -273,6 +278,49 @@ local function isTouchDevice()
         return UserInputService.TouchEnabled and not UserInputService.MouseEnabled
     end)
     return ok and touch == true
+end
+
+local netWatching = false
+
+local function startNetWatch(duration)
+    if not NetModule then return false, "net module missing" end
+    if netWatching then return false, "already watching" end
+    netWatching = true
+
+    local known = {}
+    for _, child in ipairs(NetModule:GetChildren()) do
+        known[child] = true
+    end
+
+    task.spawn(function()
+        local deadline = os.clock() + duration
+        local found = {}
+        while os.clock() < deadline and netWatching do
+            for _, child in ipairs(NetModule:GetChildren()) do
+                if not known[child] then
+                    known[child] = true
+                    local line = child.ClassName .. " | " .. child.Name
+                    found[#found + 1] = line
+                    log("watch: new remote appeared -> " .. line)
+                end
+            end
+            task.wait(0.05)
+        end
+        netWatching = false
+
+        if #found == 0 then
+            notify('No new remotes appeared under net during the window. No hook was used either way - this was pure GetChildren polling.', 'warning', 8)
+        else
+            local text = table.concat(found, "\n")
+            local copied = typeof(setclipboard) == "function" and pcall(setclipboard, text)
+            notify(copied
+                and ('%d new remote(s) appeared - copied to clipboard.'):format(#found)
+                or ('%d new remote(s) appeared - see %s'):format(#found, LOG_PATH),
+                'success', 8)
+        end
+    end)
+
+    return true
 end
 
 local HAS_NAMECALL = typeof(hookmetamethod) == "function" and typeof(getnamecallmethod) == "function"
@@ -813,6 +861,22 @@ DiagSection:Toggle({
 DiagSection:Paragraph({
     Title = 'how to find the culprit',
     Text = 'Presses are written to BladeBallParry.txt and flushed before the call goes out, so the file survives a kick and the last line names the mode that was live. Test one mode at a time with a small budget. A mode that gets you kicked will have exactly one press logged after the last mode change; a mode that works will start logging SUCCESS lines instead.',
+})
+
+DiagSection:Button({
+    Title = 'watch for new remotes (10s, no hook)',
+    Callback = function()
+        if not NetModule then
+            notify('sleitnick_net module not found.', 'error', 6)
+            return
+        end
+        local ok, err = startNetWatch(10)
+        if ok then
+            notify('Watching net for 10s. Press the real parry key yourself right now - no synthetic input, no hook, just reading GetChildren.', 'warning', 8)
+        else
+            notify(tostring(err), 'error', 6)
+        end
+    end,
 })
 
 DiagSection:Button({
