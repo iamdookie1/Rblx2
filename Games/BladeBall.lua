@@ -403,9 +403,28 @@ local CAPTURE_LIMIT = 60
 local CAPTURE_IGNORE = { SetPointer = true, SetLook = true, Ping = true, Fps = true, MenuState = true, OnDeath = true }
 local CAPTURE_IGNORE_TAGS = { Activity = true, Snapshot = true, ["5455ef47-de02-4074-808c-8d82c2cd12ec"] = true }
 
+local function findPlacement(self)
+    local okParent, parent = pcall(function() return self.Parent end)
+    if not okParent or not parent then return nil end
+    local okChildren, children = pcall(function() return parent:GetChildren() end)
+    if not okChildren then return nil end
+    for index, child in ipairs(children) do
+        if child == self then
+            return index, #children
+        end
+    end
+    return nil
+end
+
 local function describeCall(self, method, args)
     local fullName = "?"
     pcall(function() fullName = self:GetFullName() end)
+
+    local placementText = ""
+    local index, total = findPlacement(self)
+    if index then
+        placementText = ("[placement %d/%d] "):format(index, total)
+    end
 
     local parts = {}
     for index, value in ipairs(args) do
@@ -427,7 +446,7 @@ local function describeCall(self, method, args)
     end
 
     local tag = fullName:find("sleitnick_net", 1, true) and "[NET] " or ""
-    return ("%s%s : %s(%s)"):format(tag, fullName, method, table.concat(parts, ", "))
+    return ("%s%s%s : %s(%s)"):format(tag, placementText, fullName, method, table.concat(parts, ", "))
 end
 
 local function pressInput()
