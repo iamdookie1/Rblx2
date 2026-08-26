@@ -573,8 +573,14 @@ local function describeSignalConnections(signal, label)
             local line = ("%s #%d: "):format(label, index)
             local okFn, fn = pcall(function() return connection.Function end)
             if okFn and typeof(fn) == "function" then
-                local okInfo, info = pcall(debug.info, fn, "s")
-                line = line .. (okInfo and tostring(info) or "<no debug.info>")
+                local results = { pcall(debug.info, fn, "slna") }
+                if results[1] then
+                    local source, currentLine, name, numParams, isVararg = results[2], results[3], results[4], results[5], results[6]
+                    line = line .. ("source=%s line=%s name=%s params=%s vararg=%s"):format(
+                        tostring(source), tostring(currentLine), tostring(name), tostring(numParams), tostring(isVararg))
+                else
+                    line = line .. "<no debug.info>"
+                end
             else
                 line = line .. "<no Function field / locked>"
             end
