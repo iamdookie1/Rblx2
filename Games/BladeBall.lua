@@ -580,6 +580,94 @@ local function noteFoundRemote(instance, where, lines, seen)
     lines[#lines + 1] = ("      held by %s"):format(where)
 end
 
+local captureHookInstalled = false
+local captureOriginal = nil
+local capturing = false
+local captureQueue = {}
+local CAPTURE_QUEUE_LIMIT = 200
+
+local function installCaptureHook()
+    if captureHookInstalled then return true end
+
+    local hookMeta = pickFunction("hookmetamethod")
+    local getNamecall = pickFunction("getnamecallmethod")
+    if not hookMeta or not getNamecall then return false end
+
+    local ok = pcall(function()
+        local body = function(self, ...)
+            if capturing and typeof(self) == "Instance" and #captureQueue < CAPTURE_QUEUE_LIMIT then
+                local okMethod, method = pcall(getNamecall)
+                if okMethod and (method == "FireServer" or method == "InvokeServer") then
+                    captureQueue[#captureQueue + 1] = {
+                        instance = self,
+                        method = method,
+                        at = os.clock(),
+                    }
+                end
+            end
+            return captureOriginal(self, ...)
+        end
+
+        local newC = pickFunction("newcclosure")
+        captureOriginal = hookMeta(game, "__namecall", newC and newC(body) or body)
+    end)
+
+    if not ok or not captureOriginal then
+        captureOriginal = nil
+        return false
+    end
+
+    captureHookInstalled = true
+    return true
+end
+
+local function captureDuringParry(duration)
+    if capturing then
+        say("already capturing", Color3.fromRGB(255, 180, 70))
+        return
+    end
+
+    if not installCaptureHook() then
+        say("could not install capture hook", Color3.fromRGB(255, 120, 120))
+        return
+    end
+
+    table.clear(captureQueue)
+    table.clear(FoundRemotes)
+    capturing = true
+
+    say(("capturing for %ds - PARRY NOW"):format(duration), Color3.fromRGB(255, 210, 80))
+
+    task.spawn(function()
+        local started = os.clock()
+        local seen = {}
+        local lines = { "captured during a real parry" }
+
+        while os.clock() - started < duration do
+            while #captureQueue > 0 do
+                local item = table.remove(captureQueue, 1)
+                local before = #FoundRemotes
+                noteFoundRemote(item.instance, ("%s at +%.2fs"):format(item.method, item.at - started),
+                    lines, seen)
+                if #FoundRemotes > before then
+                    local entry = FoundRemotes[#FoundRemotes]
+                    entry.method = item.method
+                    say(("[%d] %s %s (+%.2fs)"):format(#FoundRemotes, item.method,
+                        entry.fullName:match("[^%.]+$") or entry.fullName, item.at - started),
+                        Color3.fromRGB(126, 217, 87))
+                end
+            end
+            task.wait(0.05)
+        end
+
+        capturing = false
+        lines[#lines + 1] = ("%d distinct remote(s) captured"):format(#FoundRemotes)
+        deliverDump(lines, "parry capture")
+        say(("done - %d captured. Pick a number and fire it at a real ball."):format(#FoundRemotes),
+            Color3.fromRGB(255, 210, 80))
+    end)
+end
+
 local function huntRemotesInMemory()
     if not getGc then
         say("no getgc on this executor", Color3.fromRGB(255, 120, 120))
@@ -1085,6 +1173,18 @@ InspectSection:Button({
 })
 
 InspectSection:Button({
+    Title = 'capture during real parry (4s)',
+    Callback = function()
+        captureDuringParry(4)
+    end,
+})
+
+InspectSection:Paragraph({
+    Title = 'the one test that never got a clean run',
+    Text = 'Press capture, then parry for real within four seconds. Every FireServer and InvokeServer seen in that window is numbered, so the block call is in there even if the success report is too. Then stay in the same lobby, pick a number and fire it while a ball is coming at you. Names re-salt per lobby, so a captured remote is only valid until you leave. Nothing auto-selects and nothing fires on its own - the earlier attempts at this were ruined by a crash from restoring the hook, by auto-picking the success report, and by our own UI clicks counting as parries, all of which are gone.',
+})
+
+InspectSection:Button({
     Title = 'hunt remotes in memory',
     Callback = huntRemotesInMemory,
 })
@@ -1112,7 +1212,7 @@ InspectSection:Button({
 
         task.spawn(function()
             local ok = pcall(function()
-                if entry.className == "RemoteFunction" then
+                if entry.method == "InvokeServer" or entry.className == "RemoteFunction" then
                     entry.instance:InvokeServer()
                 elseif entry.className == "BindableEvent" then
                     entry.instance:Fire()
