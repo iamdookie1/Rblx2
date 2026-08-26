@@ -1,49 +1,3 @@
---// Blade Ball ---------------------------------------------------------------------
--- Built from a decompile of the live client plus a logged round of real play.
---
--- READ THIS FIRST. An earlier build of this script got its author kicked:
---     BAC | Kicked for exploiting! [BAC 45X24fgg88]
--- That build had an "Auto" mode which rotated through three different ways of
--- triggering a parry to find out which one worked. Rotating meant it fired all
--- three within a few seconds, so it hit every detection this game has at once
--- and there was no way to tell which one answered. Auto is gone. Nothing here
--- fires anything unless you pick that method by name.
---
--- The default mode now writes NOTHING. It reads the ball and shows you when to
--- press. That is not a compromise for its own sake - reading attributes and
--- positions is genuinely invisible, and every part of this script that got
--- somebody kicked was on the writing side.
---
--- What the recon settled, and why the timing is shaped the way it is:
---
---   * The ball is a real Part in workspace.Balls: Shape Ball, Size 3, and
---     Transparency 1. What you SEE is a second, anchored clone the client makes
---     and tags realBall = false. Read the wrong one and you get a ball that
---     never moves, so every lookup here filters on that attribute.
---
---   * The ball says who it is flying at:  ball:GetAttribute("target")
---     No prediction needed. It also carries "from", "minHeight",
---     "IsInTimeHoleAOE" and "lastUpdateRecieveTick".
---
---   * AssemblyLinearVelocity is clean and never went stale across 842 logged
---     samples. Differentiating position looks noisy only because snapshots
---     arrive at ~20Hz over an UnreliableRemoteEvent while sampling runs at 60;
---     smoothed over 7 frames the two agree to about 5%.
---
---   * Every successful parry in the logged round was pressed between 0.217s and
---     0.514s before impact, at distances from 13 to 88 studs. Time is the
---     invariant, distance is not: at the 216 studs/s the ball reached inside 90
---     seconds, fifty studs is 0.23s away.
---
---   * The parry cooldown is broadcast to you on VisualCD, and it grew from
---     0.195 to 0.325 across one round, so it is read live.
---
--- What is still unknown is the exact call the game makes to parry. The module
--- that owns it, SwordsController.PRY, is Luraph-obfuscated anti-cheat rather
--- than parry logic - it sets BAC_HASH plus two decoy globals and checks whether
--- debug.info has been hooked. The three candidates are still here, one at a
--- time, capped, and logged, so a test costs one kick and names its cause.
-
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
@@ -61,13 +15,10 @@ end
 
 local PostSimulation = resolveEvent("PostSimulation", "Heartbeat")
 
---// Lifecycle -------------------------------------------------------------------
 local Connections = {}
 local Unloading = false
 local notify
--- Set once the UI builds the toggle. Budget exhaustion disables Config.Enabled
--- from inside press(), and without also repainting this the switch on screen
--- would still show ON while auto parry is actually off.
+
 local EnabledToggle
 
 local function track(connection)
@@ -79,27 +30,16 @@ Workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(function()
     if Workspace.CurrentCamera then Camera = Workspace.CurrentCamera end
 end)
 
---// Config ----------------------------------------------------------------------
 local Config = {
     Enabled = false,
 
-    -- Indicator writes nothing at all. The other three each fire one specific
-    -- thing and are chosen by name - there is no mode that tries several.
     Mode = "Indicator",
 
-    -- Seconds before impact. Every logged success sat between 0.217 and 0.514.
-    -- Nudged a bit above the midpoint of that range on request - it was pressing
-    -- a little too close for comfort, so this fires a little farther out.
     Lead = 0.40,
     PingFactor = 1.0,
     MaxDistance = 140,
     UseClosingSpeed = true,
 
-    -- A press mode disables itself after this many presses. Input has now
-    -- produced a real kick in testing - one successful parry, then kicked - so
-    -- this assumes a fast synchronous check rather than a slow statistical one
-    -- and keeps the budget tight enough that a bad method costs one kick, not
-    -- several.
     PressBudget = 2,
 
     Sound = true,
@@ -128,7 +68,6 @@ local MethodScores = {
     Capture = { presses = 0, successes = 0 },
 }
 
---// Paths -----------------------------------------------------------------------
 local BallsFolder = Workspace:WaitForChild("Balls", 20)
 local AliveFolder = Workspace:WaitForChild("Alive", 20)
 local Remotes = ReplicatedStorage:WaitForChild("Remotes", 20)
@@ -142,9 +81,6 @@ local KeybindM2 = Remotes and Remotes:FindFirstChild("KeybindM2")
 local PingModule = ReplicatedStorage:FindFirstChild("Shared")
 PingModule = PingModule and PingModule:FindFirstChild("Ping")
 
---// Logging ---------------------------------------------------------------------
--- Presses are flushed the instant they happen rather than batched, because the
--- whole point of the log is to survive a kick and name what was live.
 local LOG_PATH = "BladeBallParry.txt"
 local canWrite = typeof(writefile) == "function"
 local canAppend = typeof(appendfile) == "function"
@@ -168,14 +104,11 @@ local function log(text)
     appendToFile(("[%s] %s\n"):format(os.date("%H:%M:%S"), text))
 end
 
---// Character helpers ------------------------------------------------------------
 local function getRoot()
     local char = LocalPlayer.Character
     return char and char:FindFirstChild("HumanoidRootPart")
 end
 
--- Alive and Dead are separate Workspace folders here, so being in the round is
--- a parent check rather than a health check.
 local function isPlaying()
     local char = LocalPlayer.Character
     if not char then return false end
@@ -184,7 +117,6 @@ local function isPlaying()
     return humanoid ~= nil and humanoid.Health > 0
 end
 
---// Ball ------------------------------------------------------------------------
 local function realBall()
     if not BallsFolder then return nil end
     for _, part in ipairs(BallsFolder:GetChildren()) do
@@ -195,9 +127,6 @@ local function realBall()
     return nil
 end
 
--- Raw speed answers "how fast is it moving", which is not the question. The
--- question is how fast the gap is closing, and on a curve or a fakeout those
--- differ enough to fire early.
 local function closingSpeed(ball, root)
     local velocity = ball.AssemblyLinearVelocity
     if not Config.UseClosingSpeed then return velocity.Magnitude end
@@ -208,7 +137,6 @@ local function closingSpeed(ball, root)
     return closing
 end
 
---// Cooldown --------------------------------------------------------------------
 if VisualCD then
     track(VisualCD.OnClientEvent:Connect(function(a, _, duration)
         if Unloading then return end
@@ -234,9 +162,6 @@ if ParrySuccessRemote then
     end))
 end
 
---// Indicator -------------------------------------------------------------------
--- The safe mode. It reads the same numbers the press modes use and paints them,
--- and that is all it does - no remote, no bindable, no synthesised input.
 local IndicatorGui = Instance.new("ScreenGui")
 IndicatorGui.Name = "BBParryCue"
 IndicatorGui.ResetOnSpawn = false
@@ -306,8 +231,6 @@ local function fireCue()
     end
 end
 
---// Pressing --------------------------------------------------------------------
--- One method, chosen by name, never rotated. Each one fires exactly one thing.
 local parryInputType = Enum.UserInputType.MouseButton1
 
 if KeybindM2 then
@@ -317,8 +240,6 @@ if KeybindM2 then
     end))
 end
 
--- A phone reports TouchEnabled true and MouseEnabled false. Sending a mouse
--- click on one is the single most obvious thing this script was doing wrong.
 local function isTouchDevice()
     local ok, touch = pcall(function()
         return UserInputService.TouchEnabled and not UserInputService.MouseEnabled
@@ -326,36 +247,9 @@ local function isTouchDevice()
     return ok and touch == true
 end
 
---// Capture -----------------------------------------------------------------------
--- Remote mode fires ParryAttempt with no arguments, because SwordsController.PRY
--- is a Luraph VM and its real arguments were never read. Capture does not guess
--- them: it arms a __namecall hook, fires the SAME real touch/click Input already
--- uses, and grabs whatever the game's own code sends to the server as a result.
--- That is the real call with real arguments, straight from the source.
---
--- Originally filtered to remotes with "parry" in the name. A real test found
--- nothing that way and still got kicked - faster than previous kicks, though
--- not instantly - which most likely means the real call has some other name
--- entirely (this game hashes a lot of its remotes) and the earlier version was
--- watching for the wrong thing while still paying the exposure cost of
--- watching. So the filter is gone: this now records every FireServer, Fire and
--- InvokeServer call observed while armed, not just ones that look parry-shaped,
--- and writes each one to file the moment it happens rather than waiting for
--- the window to close - if BladeBallParry.txt exists at all after a capture,
--- something was seen even if the script never got to say so out loud.
---
--- The hook is live for as short a time as this can manage: installed
--- immediately before the touch fires, torn down at 0.5s. It can no longer stop
--- early on a first match, because a real match might not be the first thing
--- seen - so the full window is now always paid, not just on a miss. This does
--- not make the hook invisible - a __namecall hook is exactly what a
--- debug.info(fn, "s") ~= "[C]" check catches, which is the same technique
--- SwordsController.PRY already uses on debug.info itself.
 local HAS_NAMECALL = typeof(hookmetamethod) == "function" and typeof(getnamecallmethod) == "function"
 local capturing = false
--- Hard ceiling on how many individual calls get written out per capture, so a
--- window that happens to land during heavy remote traffic cannot turn into an
--- unbounded write storm. Well above what one parry press should ever produce.
+
 local CAPTURE_LIMIT = 25
 
 local function describeCall(self, method, args)
@@ -369,8 +263,7 @@ local function describeCall(self, method, args)
                 return "Instance(" .. value:GetFullName() .. ")"
             end
             if typeof(value) == "table" then
-                -- Shallow on purpose: enough to see the shape without risking
-                -- an error recursing into something unexpected.
+
                 local pairsText = {}
                 for key, inner in pairs(value) do
                     pairsText[#pairsText + 1] = tostring(key) .. "=" .. tostring(inner)
@@ -385,24 +278,6 @@ local function describeCall(self, method, args)
     return ("%s : %s(%s)"):format(fullName, method, table.concat(parts, ", "))
 end
 
--- Synthesised input at the centre of the screen, not at the ball: the handler
--- reads the input type, not where it landed, and tapping wherever the ball
--- happens to be can hit the Roblox menu button on a phone.
---
--- The DEVICE decides which kind of input. The build that got somebody kicked
--- always sent a mouse click, and it was sent from a phone. A MouseButton1
--- event on a device with no mouse is not a subtle tell - UserInputService
--- reports TouchEnabled true and MouseEnabled false, and anything watching can
--- read those two properties as easily as we can. On touch this now sends a
--- touch, which is the input the game expects there.
---
--- That removes an obvious tell. It does not make VirtualInputManager itself
--- invisible: it is a known exploit tool and a client-side anti-cheat can look
--- for it directly.
---
--- Named separately, rather than only living inside the Pressers table, because
--- Capture needs to call the exact same real touch/click - a table cannot
--- reference its own not-yet-finished self from inside one of its own fields.
 local function pressInput()
     local vim = game:GetService("VirtualInputManager")
     if typeof(vim) ~= "Instance" then return false, "no VirtualInputManager" end
@@ -411,8 +286,7 @@ local function pressInput()
     local x, y = viewport.X * 0.5, viewport.Y * 0.5
 
     if isTouchDevice() then
-        -- SendTouchEvent(touchId, state, x, y). State 0 begins the touch, 2
-        -- ends it, which is a tap.
+
         return pcall(function()
             vim:SendTouchEvent(1, 0, x, y)
             vim:SendTouchEvent(1, 2, x, y)
@@ -427,18 +301,12 @@ local function pressInput()
 end
 
 local Pressers = {
-    -- Fires the same RemoteEvent the game fires. The arguments the real client
-    -- sends were never read, because the module that sends them is obfuscated,
-    -- so this sends none - which is exactly the kind of thing a server can spot.
-    -- Treat it as the most likely of the three to be the one that answered.
+
     Remote = function()
         if not ParryAttempt then return false, "ParryAttempt missing" end
         return pcall(function() ParryAttempt:FireServer() end)
     end,
 
-    -- A client-internal BindableEvent. Firing it should run the game's own parry
-    -- path, cooldown and all, but anything listening can tell it came from
-    -- nowhere.
     Bindable = function()
         if not ParryButtonPress then return false, "ParryButtonPress missing" end
         return pcall(function() ParryButtonPress:Fire() end)
@@ -446,7 +314,6 @@ local Pressers = {
 
     Input = pressInput,
 
-    -- Arms, fires the real Input touch/click, and disarms - all in one call.
     Capture = function()
         if not HAS_NAMECALL then return false, "no hookmetamethod on this executor" end
         if capturing then return false, "already capturing" end
@@ -462,16 +329,11 @@ local Pressers = {
                     if okMethod and (method == "FireServer" or method == "Fire" or method == "InvokeServer") then
                         count = count + 1
                         local args = { ... }
-                        -- Kept out of the hook body itself: this call is on the
-                        -- hot path for every namecall in the game while armed,
-                        -- so the hook stays as close to a single branch as
-                        -- possible and the actual work happens off to the side.
+
                         task.spawn(function()
                             local summary = describeCall(self, method, args)
                             summaries[#summaries + 1] = summary
-                            -- Written the instant it is seen, not batched for
-                            -- the window's end - if the kick lands mid-window
-                            -- this line already made it to disk.
+
                             log("capture #" .. count .. " -> " .. summary)
                         end)
                     end
@@ -485,14 +347,10 @@ local Pressers = {
             return false, "hook install failed"
         end
 
-        -- The hook is live now. Fire immediately - every frame it stays armed
-        -- for no reason is exposure with no benefit.
         local pressOk = pressInput()
 
         task.spawn(function()
-            -- No early exit on a first match anymore: a real hit might not be
-            -- the first thing seen, so the whole window is paid every time,
-            -- not only on a miss.
+
             local deadline = os.clock() + 0.5
             while os.clock() < deadline do
                 task.wait()
@@ -530,8 +388,7 @@ local function press()
 
     if Stats.Budget <= 0 then
         Config.Enabled = false
-        -- Silent: this is not the user flipping the switch, and a Set() with
-        -- its callback firing would immediately refill the budget it just spent.
+
         if EnabledToggle then EnabledToggle:Set(false, true) end
         log(("BUDGET SPENT on %s - auto parry disabled"):format(Config.Mode))
         notify('Press budget spent. Auto parry turned itself off.', 'warning', 8)
@@ -545,8 +402,6 @@ local function press()
     local score = MethodScores[Config.Mode]
     if score then score.presses = score.presses + 1 end
 
-    -- Logged and flushed BEFORE the call, so if this is the one that gets you
-    -- kicked the file already names it.
     log(("press %d/%d via %s | eta=%.3f dist=%.1f speed=%.1f ping=%.0fms")
         :format(Stats.Presses, Config.PressBudget, Config.Mode,
             Stats.LastEta, Stats.LastDistance, Stats.LastSpeed, Stats.Ping * 1000))
@@ -561,7 +416,6 @@ local function press()
     end
 end
 
---// The loop --------------------------------------------------------------------
 track(PostSimulation:Connect(function()
     if Unloading then return end
 
@@ -601,9 +455,6 @@ track(PostSimulation:Connect(function()
     if os.clock() < Stats.CooldownUntil then return end
     if distance > Config.MaxDistance then return end
 
-    -- Half the round trip has to elapse before the server sees a press, so a
-    -- laggy connection needs to act proportionally earlier. The cue leads by the
-    -- same amount, because a human also has to react.
     local lead = Config.Lead + (Stats.Ping * 0.5 * Config.PingFactor)
     if eta > lead then return end
 
@@ -616,7 +467,6 @@ track(PostSimulation:Connect(function()
     end
 end))
 
---// UI --------------------------------------------------------------------------
 local Centrl = loadstring(game:HttpGet(
     'https://raw.githubusercontent.com/iamdookie1/Rblx2/main/UI/Lib2.lua'))()
 
@@ -805,9 +655,6 @@ task.spawn(function()
             hitStat:Set(('%d / %d'):format(Stats.Successes, Stats.Presses))
         end)
 
-        -- "It did not get me kicked" and "it did not do anything" look the
-        -- same from the outside. ParrySuccess is the only thing that tells
-        -- them apart, so it gets said out loud rather than left to inference.
         pcall(function()
             local score = MethodScores[Config.Mode]
             if Config.Mode == 'Indicator' then
@@ -825,7 +672,6 @@ task.spawn(function()
     end
 end)
 
---// Settings ---------------------------------------------------------------------
 local SettingsTab = Window:Tab({ Title = 'settings', Icon = 'settings' })
 local RiskSection = SettingsTab:Section({ Title = 'what is safe and what is not', Side = 'left' })
 
