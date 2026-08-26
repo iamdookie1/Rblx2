@@ -64,7 +64,6 @@ local Stats = {
 
 local MethodScores = {
     Remote = { presses = 0, successes = 0 },
-    Block = { presses = 0, successes = 0 },
     Bindable = { presses = 0, successes = 0 },
     Input = { presses = 0, successes = 0 },
     Capture = { presses = 0, successes = 0 },
@@ -96,9 +95,6 @@ local PackagesFolder = ReplicatedStorage:WaitForChild("Packages", 10)
 local NetModule = PackagesFolder and PackagesFolder:FindFirstChild("_Index")
 NetModule = NetModule and NetModule:FindFirstChild("sleitnick_net@0.1.0")
 NetModule = NetModule and NetModule:FindFirstChild("net")
-
-local BlockRemote = NetModule and NetModule:FindFirstChild(
-    "RF/856d88c6dde58c52702c6940c7c9e5a2833aa7fe5002b15a58a24ae396861abc")
 
 local PingModule = ReplicatedStorage:FindFirstChild("Shared")
 PingModule = PingModule and PingModule:FindFirstChild("Ping")
@@ -284,6 +280,49 @@ local function isTouchDevice()
     return ok and touch == true
 end
 
+local netWatching = false
+
+local function startNetWatch(duration)
+    if not NetModule then return false, "net module missing" end
+    if netWatching then return false, "already watching" end
+    netWatching = true
+
+    local known = {}
+    for _, child in ipairs(NetModule:GetChildren()) do
+        known[child] = true
+    end
+
+    task.spawn(function()
+        local deadline = os.clock() + duration
+        local found = {}
+        while os.clock() < deadline and netWatching do
+            for _, child in ipairs(NetModule:GetChildren()) do
+                if not known[child] then
+                    known[child] = true
+                    local line = child.ClassName .. " | " .. child.Name
+                    found[#found + 1] = line
+                    log("watch: new remote appeared -> " .. line)
+                end
+            end
+            task.wait(0.05)
+        end
+        netWatching = false
+
+        if #found == 0 then
+            notify('No new remotes appeared under net during the window. No hook was used either way - this was pure GetChildren polling.', 'warning', 8)
+        else
+            local text = table.concat(found, "\n")
+            local copied = typeof(setclipboard) == "function" and pcall(setclipboard, text)
+            notify(copied
+                and ('%d new remote(s) appeared - copied to clipboard.'):format(#found)
+                or ('%d new remote(s) appeared - see %s'):format(#found, LOG_PATH),
+                'success', 8)
+        end
+    end)
+
+    return true
+end
+
 local HAS_NAMECALL = typeof(hookmetamethod) == "function" and typeof(getnamecallmethod) == "function"
 local capturing = false
 
@@ -345,11 +384,6 @@ local Pressers = {
     Remote = function()
         if not ParryAttempt then return false, "ParryAttempt missing" end
         return pcall(function() ParryAttempt:FireServer() end)
-    end,
-
-    Block = function()
-        if not BlockRemote then return false, "hashed Block remote missing" end
-        return pcall(function() BlockRemote:InvokeServer() end)
     end,
 
     Bindable = function()
@@ -564,7 +598,7 @@ local ModeSection = MainTab:Section({ Title = 'mode', Side = 'left' })
 ModeSection:Dropdown({
     Title = 'mode',
     Flag = 'bb_mode',
-    Options = { 'Indicator', 'Remote', 'Block', 'Bindable', 'Input', 'Capture' },
+    Options = { 'Indicator', 'Remote', 'Bindable', 'Input', 'Capture' },
     Default = 'Indicator',
     Callback = function(value)
         Config.Mode = value
@@ -764,11 +798,6 @@ RiskSection:Paragraph({
 })
 
 RiskSection:Paragraph({
-    Title = 'Block - a different remote than Remote mode uses',
-    Text = 'Invokes a hashed RemoteFunction under sleitnick_net, seen fire with zero arguments in a real match right around the UIInteraction telemetry for the Hotbar Block control. Not the same remote ParryAttempt is - untested and unconfirmed, same risk profile as Remote mode: a bare call with no matching input.',
-})
-
-RiskSection:Paragraph({
     Title = 'Bindable',
     Text = 'Fires the ParryButtonPress BindableEvent, which should run the game\'s own parry path including its cooldown. That is the appeal. The risk is that BAC runs on this client too and can compare a parry against whether any real input happened.',
 })
@@ -786,6 +815,11 @@ RiskSection:Paragraph({
 RiskSection:Paragraph({
     Title = 'this is a wider hook than it used to be',
     Text = 'Watching everything instead of one name means the hook can no longer stop the moment it sees a match - there might be more after it - so the full 0.5s is paid every time now, not just on a miss. That is more of the game\'s own traffic passing through code this script wrote, for longer, on every attempt. It is not a smaller risk than before; treat one capture as the whole budget for this mode.',
+})
+
+RiskSection:Paragraph({
+    Title = 'the actual parry remote renames itself every call',
+    Text = 'Two real-match captures around the same Block control produced two different hashed RemoteFunction names, both invoked with zero arguments. A stable hash from sleitnick_net would repeat every time for the same name - it did not, which means the name is being regenerated per call on purpose. There is nothing to hardcode here; any saved hash is already wrong by the next press. Capture is the only mode that can ever reach this one, because it reads whatever the game itself just called instead of guessing a name in advance.',
 })
 
 RiskSection:Paragraph({
@@ -830,6 +864,22 @@ DiagSection:Toggle({
 DiagSection:Paragraph({
     Title = 'how to find the culprit',
     Text = 'Presses are written to BladeBallParry.txt and flushed before the call goes out, so the file survives a kick and the last line names the mode that was live. Test one mode at a time with a small budget. A mode that gets you kicked will have exactly one press logged after the last mode change; a mode that works will start logging SUCCESS lines instead.',
+})
+
+DiagSection:Button({
+    Title = 'watch for new remotes (10s, no hook)',
+    Callback = function()
+        if not NetModule then
+            notify('sleitnick_net module not found.', 'error', 6)
+            return
+        end
+        local ok, err = startNetWatch(10)
+        if ok then
+            notify('Watching net for 10s. Press the real parry key yourself right now - no synthetic input, no hook, just reading GetChildren.', 'warning', 8)
+        else
+            notify(tostring(err), 'error', 6)
+        end
+    end,
 })
 
 DiagSection:Button({
