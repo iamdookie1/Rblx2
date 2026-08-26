@@ -88,7 +88,9 @@ local Config = {
     Mode = "Indicator",
 
     -- Seconds before impact. Every logged success sat between 0.217 and 0.514.
-    Lead = 0.35,
+    -- Nudged a bit above the midpoint of that range on request - it was pressing
+    -- a little too close for comfort, so this fires a little farther out.
+    Lead = 0.40,
     PingFactor = 1.0,
     MaxDistance = 140,
     UseClosingSpeed = true,
@@ -123,6 +125,7 @@ local MethodScores = {
     Remote = { presses = 0, successes = 0 },
     Bindable = { presses = 0, successes = 0 },
     Input = { presses = 0, successes = 0 },
+    Capture = { presses = 0, successes = 0 },
 }
 
 --// Paths -----------------------------------------------------------------------
@@ -323,6 +326,99 @@ local function isTouchDevice()
     return ok and touch == true
 end
 
+--// Capture -----------------------------------------------------------------------
+-- Remote mode fires ParryAttempt with no arguments, because SwordsController.PRY
+-- is a Luraph VM and its real arguments were never read. Capture does not guess
+-- them: it arms a __namecall hook, fires the SAME real touch/click Input already
+-- uses, and grabs whatever the game's own code sends to the server as a result.
+-- That is the real call with real arguments, straight from the source.
+--
+-- The hook is live for as short a time as this can manage: installed
+-- immediately before the touch fires, torn down the moment a match is seen or
+-- after 0.5s, whichever comes first. This does not make it invisible - a
+-- __namecall hook is exactly what a debug.info(fn, "s") ~= "[C]" check catches,
+-- which is the same technique SwordsController.PRY already uses on debug.info
+-- itself. It only makes the window as small as possible.
+local HAS_NAMECALL = typeof(hookmetamethod) == "function" and typeof(getnamecallmethod) == "function"
+local capturing = false
+
+local function reportCapture(self, method, args)
+    local fullName = "?"
+    pcall(function() fullName = self:GetFullName() end)
+
+    local parts = {}
+    for index, value in ipairs(args) do
+        local ok, text = pcall(function()
+            if typeof(value) == "Instance" then
+                return "Instance(" .. value:GetFullName() .. ")"
+            end
+            if typeof(value) == "table" then
+                -- Shallow on purpose: enough to see the shape without risking
+                -- an error recursing into something unexpected.
+                local pairsText = {}
+                for key, inner in pairs(value) do
+                    pairsText[#pairsText + 1] = tostring(key) .. "=" .. tostring(inner)
+                end
+                return "{" .. table.concat(pairsText, ", ") .. "}"
+            end
+            return tostring(value)
+        end)
+        parts[index] = ok and text or "<unreadable>"
+    end
+
+    local summary = ("%s : %s(%s)"):format(fullName, method, table.concat(parts, ", "))
+    log("CAPTURED real parry call -> " .. summary)
+
+    if typeof(setclipboard) == "function" then
+        local copied = pcall(setclipboard, summary)
+        notify(copied and 'Captured the real parry call. Copied to your clipboard.'
+            or ('Captured it, but copying failed - see ' .. LOG_PATH), copied and 'success' or 'warning', 8)
+    else
+        notify('Captured it, but this executor has no setclipboard - see ' .. LOG_PATH, 'warning', 8)
+    end
+end
+
+-- Synthesised input at the centre of the screen, not at the ball: the handler
+-- reads the input type, not where it landed, and tapping wherever the ball
+-- happens to be can hit the Roblox menu button on a phone.
+--
+-- The DEVICE decides which kind of input. The build that got somebody kicked
+-- always sent a mouse click, and it was sent from a phone. A MouseButton1
+-- event on a device with no mouse is not a subtle tell - UserInputService
+-- reports TouchEnabled true and MouseEnabled false, and anything watching can
+-- read those two properties as easily as we can. On touch this now sends a
+-- touch, which is the input the game expects there.
+--
+-- That removes an obvious tell. It does not make VirtualInputManager itself
+-- invisible: it is a known exploit tool and a client-side anti-cheat can look
+-- for it directly.
+--
+-- Named separately, rather than only living inside the Pressers table, because
+-- Capture needs to call the exact same real touch/click - a table cannot
+-- reference its own not-yet-finished self from inside one of its own fields.
+local function pressInput()
+    local vim = game:GetService("VirtualInputManager")
+    if typeof(vim) ~= "Instance" then return false, "no VirtualInputManager" end
+
+    local viewport = Camera and Camera.ViewportSize or Vector2.new(1280, 720)
+    local x, y = viewport.X * 0.5, viewport.Y * 0.5
+
+    if isTouchDevice() then
+        -- SendTouchEvent(touchId, state, x, y). State 0 begins the touch, 2
+        -- ends it, which is a tap.
+        return pcall(function()
+            vim:SendTouchEvent(1, 0, x, y)
+            vim:SendTouchEvent(1, 2, x, y)
+        end)
+    end
+
+    local button = parryInputType == Enum.UserInputType.MouseButton2 and 1 or 0
+    return pcall(function()
+        vim:SendMouseButtonEvent(x, y, button, true, game, 1)
+        vim:SendMouseButtonEvent(x, y, button, false, game, 1)
+    end)
+end
+
 local Pressers = {
     -- Fires the same RemoteEvent the game fires. The arguments the real client
     -- sends were never read, because the module that sends them is obfuscated,
@@ -341,41 +437,56 @@ local Pressers = {
         return pcall(function() ParryButtonPress:Fire() end)
     end,
 
-    -- Synthesised input at the centre of the screen, not at the ball: the
-    -- handler reads the input type, not where it landed, and tapping wherever
-    -- the ball happens to be can hit the Roblox menu button on a phone.
-    --
-    -- The DEVICE decides which kind of input. The build that got somebody
-    -- kicked always sent a mouse click, and it was sent from a phone. A
-    -- MouseButton1 event on a device with no mouse is not a subtle tell -
-    -- UserInputService reports TouchEnabled true and MouseEnabled false, and
-    -- anything watching can read those two properties as easily as we can. On
-    -- touch this now sends a touch, which is the input the game expects there.
-    --
-    -- That removes an obvious tell. It does not make VirtualInputManager itself
-    -- invisible: it is a known exploit tool and a client-side anti-cheat can
-    -- look for it directly.
-    Input = function()
-        local vim = game:GetService("VirtualInputManager")
-        if typeof(vim) ~= "Instance" then return false, "no VirtualInputManager" end
+    Input = pressInput,
 
-        local viewport = Camera and Camera.ViewportSize or Vector2.new(1280, 720)
-        local x, y = viewport.X * 0.5, viewport.Y * 0.5
+    -- Arms, fires the real Input touch/click, and disarms - all in one call.
+    Capture = function()
+        if not HAS_NAMECALL then return false, "no hookmetamethod on this executor" end
+        if capturing then return false, "already capturing" end
+        capturing = true
 
-        if isTouchDevice() then
-            -- SendTouchEvent(touchId, state, x, y). State 0 begins the touch,
-            -- 2 ends it, which is a tap.
-            return pcall(function()
-                vim:SendTouchEvent(1, 0, x, y)
-                vim:SendTouchEvent(1, 2, x, y)
+        local seen = false
+        local originalNamecall
+        local hookOk = pcall(function()
+            originalNamecall = hookmetamethod(game, "__namecall", function(self, ...)
+                if not seen and typeof(self) == "Instance" then
+                    local okMethod, method = pcall(getnamecallmethod)
+                    if okMethod and (method == "FireServer" or method == "Fire") then
+                        local okName, name = pcall(function() return self.Name end)
+                        if okName and typeof(name) == "string" and name:lower():find("parry") then
+                            seen = true
+                            local args = { ... }
+                            task.spawn(reportCapture, self, method, args)
+                        end
+                    end
+                end
+                return originalNamecall(self, ...)
             end)
+        end)
+
+        if not hookOk or not originalNamecall then
+            capturing = false
+            return false, "hook install failed"
         end
 
-        local button = parryInputType == Enum.UserInputType.MouseButton2 and 1 or 0
-        return pcall(function()
-            vim:SendMouseButtonEvent(x, y, button, true, game, 1)
-            vim:SendMouseButtonEvent(x, y, button, false, game, 1)
+        -- The hook is live now. Fire immediately - every frame it stays armed
+        -- for no reason is exposure with no benefit.
+        local pressOk = pressInput()
+
+        task.spawn(function()
+            local deadline = os.clock() + 0.5
+            while not seen and os.clock() < deadline do
+                task.wait()
+            end
+            pcall(function() hookmetamethod(game, "__namecall", originalNamecall) end)
+            capturing = false
+            if not seen then
+                log("capture: no parry-shaped remote observed within 0.5s")
+                notify('No matching remote observed - the touch may not have registered as a parry.', 'warning', 6)
+            end
         end)
+
+        return pressOk, seen and "captured" or "armed"
     end,
 }
 
@@ -504,13 +615,19 @@ local ModeSection = MainTab:Section({ Title = 'mode', Side = 'left' })
 ModeSection:Dropdown({
     Title = 'mode',
     Flag = 'bb_mode',
-    Options = { 'Indicator', 'Remote', 'Bindable', 'Input' },
+    Options = { 'Indicator', 'Remote', 'Bindable', 'Input', 'Capture' },
     Default = 'Indicator',
     Callback = function(value)
         Config.Mode = value
         Stats.Budget = Config.PressBudget
         if value == 'Indicator' then
             notify('Indicator only. Nothing is sent to the server.', 'success', 5)
+        elseif value == 'Capture' then
+            if not HAS_NAMECALL then
+                notify('This executor has no hookmetamethod/getnamecallmethod - Capture cannot run here.', 'error', 8)
+            else
+                notify('Capture fires a real touch and briefly hooks __namecall to grab what it sends. One or two attempts is enough - lower the press budget below.', 'warning', 10)
+            end
         else
             notify(('%s mode: %d presses then it turns itself off. This is the part that gets people kicked.')
                 :format(value, Config.PressBudget), 'warning', 10)
@@ -563,7 +680,7 @@ TimingSection:Slider({
     Min = 0.1,
     Max = 0.8,
     Increment = 0.01,
-    Default = 0.35,
+    Default = 0.40,
     Suffix = 's',
     Callback = function(value) Config.Lead = value end,
 })
@@ -701,8 +818,13 @@ RiskSection:Paragraph({
 })
 
 RiskSection:Paragraph({
-    Title = 'why nothing here can make a call look legitimate',
-    Text = 'Firing ParryAttempt with the right arguments would need the arguments, and the only code that knows them is SwordsController.PRY, which is a Luraph VM. Reading them off the wire while you parry by hand means hooking a metamethod - and that module already checks whether debug.info has been hooked, so the capture is more detectable than the thing it is trying to make safe. If your executor has a built-in remote spy, that runs below the game and is the one route that does not put a hook in this script.',
+    Title = 'Capture - grabs the real arguments instead of guessing them',
+    Text = 'Fires the same real touch or click Input does, but arms a __namecall hook a moment before and tears it down a moment after - long enough to see whatever remote the game\'s own code sends as a result, with its real arguments, and copy that to your clipboard. It is not the same as having no hook: a hook is briefly live either way, and the window being short reduces exposure, it does not remove it. Use it once or twice, not as a standing mode - lower the press budget below before trying it.',
+})
+
+RiskSection:Paragraph({
+    Title = 'why nothing here can make a call look legitimate on its own',
+    Text = 'Firing ParryAttempt with the right arguments needs the arguments, and the only code that ever knew them was SwordsController.PRY, a Luraph VM. Capture is the compromise: instead of reading the VM, it reads what the VM itself sends over the wire when a real touch triggers it - but getting there means hooking a metamethod, and that module already checks whether debug.info has been hooked, which is exactly the technique used to detect a hook like this one. If your executor has a built-in remote spy, that runs below the game and is the one route that puts no hook in this script at all - prefer it over Capture if you have it.',
 })
 
 RiskSection:Paragraph({
@@ -716,6 +838,11 @@ RiskSection:Paragraph({
 })
 
 local DiagSection = SettingsTab:Section({ Title = 'diagnostics', Side = 'right' })
+
+DiagSection:Stat({
+    Title = 'Capture support',
+    Value = HAS_NAMECALL and 'hookmetamethod found' or 'not available on this executor',
+})
 
 DiagSection:Toggle({
     Title = 'log to file',
