@@ -343,7 +343,11 @@ local function looksInteresting(text)
 end
 
 local function deliverDump(lines, label)
+    if #lines == 0 then
+        lines = { label .. ": nothing recorded" }
+    end
     local text = table.concat(lines, "\n")
+    if text == "" then text = label .. ": empty" end
     if canWrite then pcall(writefile, INSPECT_PATH, text) end
     local copied = typeof(setclipboard) == "function" and pcall(setclipboard, text)
     say(("%s: %d lines%s"):format(label, #lines,
@@ -657,6 +661,7 @@ end
 local watchRecords = {}
 local watchStarted = 0
 local apiCalls = {}
+local apiOrder = {}
 local apiWrapped = false
 
 local EXECUTOR_API = {
@@ -666,6 +671,47 @@ local EXECUTOR_API = {
     "getrenv", "checkcaller", "getcallingscript", "getnamecallmethod",
     "getconstants", "getprotos", "getloadedmodules", "fireclickdetector",
 }
+
+local function describeFunctionTarget(fn)
+    if typeof(fn) ~= "function" then return tostring(fn) end
+    local source, line, name = "?", "?", "?"
+    pcall(function() source = tostring(debug.info(fn, "s")) end)
+    pcall(function() line = tostring(debug.info(fn, "l")) end)
+    pcall(function() name = tostring(debug.info(fn, "n")) end)
+    return ("fn %s:%s name=%s"):format(source, line, name)
+end
+
+local function describeApiCall(name, a1, a2, a3)
+    if name == "hookmetamethod" then
+        return ("HOOKED %s metamethod %s"):format(tostring(a1), tostring(a2))
+    end
+
+    if name == "hookfunction" or name == "replaceclosure" then
+        return ("HOOKED %s"):format(describeFunctionTarget(a1))
+    end
+
+    if name == "setupvalue" then
+        return ("SET upvalue %s on %s"):format(tostring(a2), describeFunctionTarget(a1))
+    end
+
+    if name == "getconnections" or name == "firesignal" then
+        local target = "?"
+        pcall(function() target = tostring(a1) end)
+        return ("signal %s"):format(target)
+    end
+
+    if name == "getupvalues" or name == "getconstants" or name == "getprotos" then
+        return describeFunctionTarget(a1)
+    end
+
+    if name == "getsenv" then
+        local target = "?"
+        pcall(function() target = a1:GetFullName() end)
+        return ("script %s"):format(target)
+    end
+
+    return ""
+end
 
 local function wrapExecutorApi()
     if apiWrapped then return true end
@@ -678,10 +724,23 @@ local function wrapExecutorApi()
             if typeof(original) == "function" then
                 env[name] = function(...)
                     if watching then
-                        local caller = "?"
-                        pcall(function() caller = tostring(debug.info(2, "s")) end)
-                        local key = name .. " <- " .. caller
-                        apiCalls[key] = (apiCalls[key] or 0) + 1
+                        local a1, a2, a3 = ...
+                        pcall(function()
+                            local caller = "?"
+                            pcall(function() caller = tostring(debug.info(2, "s")) end)
+
+                            local detail = ""
+                            pcall(function() detail = describeApiCall(name, a1, a2, a3) end)
+
+                            local key = detail ~= ""
+                                and ("%s | %s | from %s"):format(name, detail, caller)
+                                or ("%s | from %s"):format(name, caller)
+
+                            if not apiCalls[key] then
+                                apiOrder[#apiOrder + 1] = key
+                            end
+                            apiCalls[key] = (apiCalls[key] or 0) + 1
+                        end)
                     end
                     return original(...)
                 end
@@ -709,6 +768,7 @@ local function startWatching()
     table.clear(captureQueue)
     table.clear(watchRecords)
     table.clear(apiCalls)
+    table.clear(apiOrder)
     table.clear(FoundRemotes)
 
     watchStarted = os.clock()
@@ -742,18 +802,31 @@ local function stopWatching()
     if not watching then return end
     watching = false
 
-    task.wait(0.1)
+    task.wait(0.15)
+
+    while #captureQueue > 0 do
+        local item = table.remove(captureQueue, 1)
+        local okName, fullName = pcall(function() return item.instance:GetFullName() end)
+        watchRecords[#watchRecords + 1] = {
+            method = item.method,
+            fullName = okName and fullName or "?",
+            className = item.instance.ClassName,
+            caller = item.caller,
+            offset = item.at - watchStarted,
+            instance = item.instance,
+        }
+    end
 
     local lines = { ("watch results - %.1fs"):format(os.clock() - watchStarted) }
+    lines[#lines + 1] = ("api wrapped=%s, records=%d"):format(tostring(apiWrapped), #watchRecords)
 
-    local anyApi = false
     lines[#lines + 1] = "-- executor functions called --"
-    for key, count in pairs(apiCalls) do
-        anyApi = true
-        lines[#lines + 1] = ("  %d x %s"):format(count, key)
-    end
-    if not anyApi then
-        lines[#lines + 1] = "  (none seen - it may capture them before this started)"
+    if #apiOrder == 0 then
+        lines[#lines + 1] = "  (none seen - it may grab them into locals before this started)"
+    else
+        for _, key in ipairs(apiOrder) do
+            lines[#lines + 1] = ("  %d x %s"):format(apiCalls[key] or 0, key)
+        end
     end
 
     local byCaller = {}
