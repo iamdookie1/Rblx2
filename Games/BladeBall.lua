@@ -741,6 +741,9 @@ end
 
 local liveLogging = false
 local liveOriginalNamecall = nil
+local liveQueue = {}
+local LIVE_QUEUE_LIMIT = 300
+local LIVE_DRAIN_PER_TICK = 10
 
 local function setLiveRemoteLogging(enabled)
     if enabled == liveLogging then return end
@@ -751,6 +754,7 @@ local function setLiveRemoteLogging(enabled)
             liveOriginalNamecall = nil
         end
         liveLogging = false
+        table.clear(liveQueue)
         log("live remote logging: off")
         return
     end
@@ -769,16 +773,8 @@ local function setLiveRemoteLogging(enabled)
                     local firstArg = select(1, ...)
                     local ignored = (okName and CAPTURE_IGNORE[name] == true) or CAPTURE_IGNORE_TAGS[firstArg] == true
 
-                    if not ignored then
-                        local args = { ... }
-                        task.spawn(function()
-                            local summary = describeCall(self, method, args)
-                            log("live -> " .. summary)
-                            if remoteConsole then remoteConsole:Add(summary) end
-
-                            local okFullName, fullName = pcall(function() return self:GetFullName() end)
-                            if okFullName then recordCaptured(self, fullName) end
-                        end)
+                    if not ignored and #liveQueue < LIVE_QUEUE_LIMIT then
+                        liveQueue[#liveQueue + 1] = { self = self, method = method, args = { ... } }
                     end
                 end
             end
@@ -793,6 +789,31 @@ local function setLiveRemoteLogging(enabled)
 
     liveLogging = true
     log("live remote logging: on")
+
+    task.spawn(function()
+        while liveLogging do
+            local drained = 0
+            while drained < LIVE_DRAIN_PER_TICK and #liveQueue > 0 do
+                local item = table.remove(liveQueue, 1)
+                drained = drained + 1
+
+                local summary = describeCall(item.self, item.method, item.args)
+                log("live -> " .. summary)
+                if remoteConsole then remoteConsole:Add(summary) end
+
+                local okFullName, fullName = pcall(function() return item.self:GetFullName() end)
+                if okFullName then recordCaptured(item.self, fullName) end
+            end
+
+            if #liveQueue >= LIVE_QUEUE_LIMIT then
+                notify('Live log overwhelmed by traffic volume - turning itself off.', 'warning', 8)
+                setLiveRemoteLogging(false)
+                break
+            end
+
+            task.wait(0.1)
+        end
+    end)
 end
 
 local function runCaptureWindow(duration, pressFirst)
