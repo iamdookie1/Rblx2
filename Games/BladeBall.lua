@@ -71,6 +71,15 @@ local SeenPresses = 0
 
 local ParryButton = nil
 local FireMethod = "none"
+local CapturedInput = nil
+
+local GameUIS = nil
+pcall(function()
+    local module = ReplicatedStorage:FindFirstChild("UserInputService")
+    if module and module:IsA("ModuleScript") then
+        GameUIS = require(module)
+    end
+end)
 
 local hookInstalled = false
 local originalNamecall = nil
@@ -317,9 +326,15 @@ local function markPress(source)
 end
 
 track(UserInputService.InputBegan:Connect(function(input, processed)
+    if isPressLikeInput(input.UserInputType) or input.KeyCode == Enum.KeyCode.F then
+        CapturedInput = input
+    end
     if processed then return end
-    if not isPressLikeInput(input.UserInputType) then return end
-    markPress("input")
+    if isPressLikeInput(input.UserInputType) then
+        markPress("input")
+    elseif input.KeyCode == Enum.KeyCode.F then
+        markPress("key F")
+    end
 end))
 
 local PARRY_BUTTON_NAMES = { block = true, parry = true }
@@ -398,6 +413,37 @@ local function fireButton()
     return false
 end
 
+local GAME_UIS_SIGNALS = { "InputBegan", "InputEnded" }
+
+local function fireGameUIS()
+    if not GameUIS or not CapturedInput then return false end
+
+    for _, signalName in ipairs(GAME_UIS_SIGNALS) do
+        local okSignal, signal = pcall(function() return GameUIS[signalName] end)
+        if okSignal and signal then
+            local fired = pcall(function() signal:Fire(CapturedInput, false) end)
+            if fired then return true, "gameUIS:" .. signalName end
+
+            if typeof(firesignal) == "function" and pcall(firesignal, signal, CapturedInput, false) then
+                return true, "gameUIS-firesignal:" .. signalName
+            end
+
+            if typeof(getconnections) == "function" then
+                local okConn, connections = pcall(getconnections, signal)
+                if okConn and typeof(connections) == "table" and #connections > 0 then
+                    local any = false
+                    for _, connection in ipairs(connections) do
+                        if pcall(function() connection:Fire(CapturedInput, false) end) then any = true end
+                    end
+                    if any then return true, "gameUIS-conn:" .. signalName end
+                end
+            end
+        end
+    end
+
+    return false
+end
+
 local function fireRemote()
     local remote = LockedRemote
     local method = LockedMethod
@@ -417,12 +463,15 @@ local function fireRemote()
 end
 
 local function fireLocked()
-    if not ParryButton and not LockedRemote then return end
+    if not ParryButton and not LockedRemote and not GameUIS then return end
 
     CooldownUntil = os.clock() + Config.Cooldown
 
     task.spawn(function()
-        local ok, how = fireButton()
+        local ok, how = fireGameUIS()
+        if not ok then
+            ok, how = fireButton()
+        end
         if not ok then
             ok, how = fireRemote()
         end
@@ -441,7 +490,10 @@ track(PreSimulation:Connect(function()
     if Unloading then return end
 
     if not Config.Enabled then Blocked = "off" return end
-    if not ParryButton and not LockedRemote then Blocked = "no parry button or remote" return end
+    if not ParryButton and not LockedRemote and not GameUIS then
+        Blocked = "no button, remote or game UIS"
+        return
+    end
 
     local ball, isTraining = realBall()
     if not ball then
@@ -737,7 +789,8 @@ task.spawn(function()
                 and ('[%d/%d] %s'):format(CandidateIndex, #Candidates, LockedFullName)
                 or ('none yet (%d candidates)'):format(#Candidates))
             callStat:Set(FireMethod ~= "none" and FireMethod
-                or (ParryButton and 'button ready' or 'nothing yet'))
+                or (GameUIS and (CapturedInput and 'game UIS ready' or 'press once to arm')
+                    or (ParryButton and 'button ready' or 'nothing yet')))
 
             hookStat:Set(('%d calls / %d presses'):format(SeenCalls, SeenPresses),
                 (SeenCalls > 0 and SeenPresses > 0) and Color3.fromRGB(126, 217, 87)
