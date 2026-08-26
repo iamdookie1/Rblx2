@@ -12,14 +12,15 @@ local function resolveEvent(modernName, legacyName)
     return RunService[legacyName]
 end
 
-local PostSimulation = resolveEvent("PostSimulation", "Heartbeat")
+local PreSimulation = resolveEvent("PreSimulation", "Stepped")
 
 local Connections = {}
 local Unloading = false
-local notify
 
-local EnabledToggle
+local notify
 local statusStat
+local lockedStat
+local EnabledToggle
 
 local function track(connection)
     Connections[#Connections + 1] = connection
@@ -28,15 +29,27 @@ end
 
 local Config = {
     Enabled = false,
-    Lead = 0.40,
+    Lead = 0.38,
+    SpeedLead = 0.12,
     PingFactor = 1.0,
-    MaxDistance = 140,
-    UseClosingSpeed = true,
-    Cooldown = 0.195,
+    MaxDistance = 160,
+    Cooldown = 0.2,
 }
 
 local Fires = 0
 local CooldownUntil = 0
+
+local LockedRemote = nil
+local LockedClass = nil
+local LockedFullName = nil
+
+local learning = false
+local lastPressAt = 0
+local learnQueue = {}
+local LEARN_QUEUE_LIMIT = 200
+
+local hookInstalled = false
+local originalNamecall = nil
 
 local function findChildCI(parent, name)
     if not parent then return nil end
@@ -83,19 +96,18 @@ local function getRoot()
     return char and char:FindFirstChild("HumanoidRootPart")
 end
 
-local function isPlaying()
-    local char = LocalPlayer.Character
-    if not char then return false end
-    if AliveFolder and char.Parent ~= AliveFolder then return false end
-    local humanoid = char:FindFirstChildOfClass("Humanoid")
-    return humanoid ~= nil and humanoid.Health > 0
-end
-
 local function isAlive()
     local char = LocalPlayer.Character
     if not char then return false end
     local humanoid = char:FindFirstChildOfClass("Humanoid")
     return humanoid ~= nil and humanoid.Health > 0
+end
+
+local function isPlaying()
+    local char = LocalPlayer.Character
+    if not char then return false end
+    if AliveFolder and char.Parent ~= AliveFolder then return false end
+    return isAlive()
 end
 
 local function realBall()
@@ -116,19 +128,18 @@ local function realBall()
     return nil, false
 end
 
-local function closingSpeed(ball, root)
-    local velocity = ball.AssemblyLinearVelocity
-    if not Config.UseClosingSpeed then return velocity.Magnitude end
-    local toMe = root.Position - ball.Position
-    if toMe.Magnitude < 0.01 then return velocity.Magnitude end
-    local closing = velocity:Dot(toMe.Unit)
-    if closing <= 0 then return 0 end
-    return closing
-end
-
 local HAS_NAMECALL = typeof(hookmetamethod) == "function" and typeof(getnamecallmethod) == "function"
-local CAPTURE_IGNORE = { SetPointer = true, SetLook = true, Ping = true, Fps = true, MenuState = true, OnDeath = true }
-local CAPTURE_IGNORE_TAGS = {
+
+local IGNORE_NAMES = {
+    SetPointer = true,
+    SetLook = true,
+    Ping = true,
+    Fps = true,
+    MenuState = true,
+    OnDeath = true,
+}
+
+local IGNORE_TAGS = {
     Activity = true,
     Snapshot = true,
     UIInteraction = true,
@@ -138,105 +149,96 @@ local CAPTURE_IGNORE_TAGS = {
     ["5455ef47-de02-4074-808c-8d82c2cd12ec"] = true,
 }
 
-local function isPressLikeInput(inputType)
-    return inputType == Enum.UserInputType.MouseButton1
-        or inputType == Enum.UserInputType.MouseButton2
-        or inputType == Enum.UserInputType.Touch
-end
+local function installHook()
+    if hookInstalled or not HAS_NAMECALL then return hookInstalled end
 
-local LockedRemote = nil
-local LockedClass = nil
-local LockedFullName = nil
-local learning = false
-local lastPressAt = 0
-local learnOriginalNamecall = nil
-local learnInputConnection = nil
-local learnQueue = {}
-local LEARN_QUEUE_LIMIT = 300
-
-local function stopLearning()
-    learning = false
-    table.clear(learnQueue)
-    if learnOriginalNamecall then
-        pcall(function() hookmetamethod(game, "__namecall", learnOriginalNamecall) end)
-        learnOriginalNamecall = nil
-    end
-    if learnInputConnection then
-        learnInputConnection:Disconnect()
-        learnInputConnection = nil
-    end
-end
-
-local function lockRemote(instance)
-    local okClass, className = pcall(function() return instance.ClassName end)
-    if not okClass then return end
-
-    LockedRemote = instance
-    LockedClass = className
-    CooldownUntil = os.clock() + 2
-    stopLearning()
-
-    local okFullName, fullName = pcall(function() return instance:GetFullName() end)
-    LockedFullName = okFullName and fullName or "?"
-    log("locked remote: " .. LockedFullName)
-    notify('Learned the real parry remote from your press - auto parry is armed.', 'success', 8)
-end
-
-local function startLearning()
-    if learning or LockedRemote then return end
-    if not HAS_NAMECALL then
-        notify('This executor has no hookmetamethod/getnamecallmethod - cannot learn the remote.', 'error', 8)
-        if EnabledToggle then EnabledToggle:Set(false, true) end
-        Config.Enabled = false
-        return
-    end
-
-    learning = true
-    lastPressAt = 0
-    table.clear(learnQueue)
-
-    learnInputConnection = track(UserInputService.InputBegan:Connect(function(input, processed)
-        if processed then return end
-        if not isPressLikeInput(input.UserInputType) then return end
-        lastPressAt = os.clock()
-    end))
-
-    local hookOk = pcall(function()
-        learnOriginalNamecall = hookmetamethod(game, "__namecall", function(self, ...)
-            if typeof(self) == "Instance" and #learnQueue < LEARN_QUEUE_LIMIT then
+    local ok = pcall(function()
+        local hook = function(self, ...)
+            if learning and not Unloading and #learnQueue < LEARN_QUEUE_LIMIT and typeof(self) == "Instance" then
                 local okMethod, method = pcall(getnamecallmethod)
-                if okMethod and (method == "FireServer" or method == "Fire" or method == "InvokeServer") then
+                if okMethod and (method == "FireServer" or method == "InvokeServer") then
                     local okName, name = pcall(function() return self.Name end)
                     local firstArg = select(1, ...)
-                    local ignored = (okName and CAPTURE_IGNORE[name] == true) or CAPTURE_IGNORE_TAGS[firstArg] == true
-
-                    if not ignored then
+                    if not ((okName and IGNORE_NAMES[name]) or IGNORE_TAGS[firstArg]) then
                         learnQueue[#learnQueue + 1] = { instance = self, at = os.clock() }
                     end
                 end
             end
-            return learnOriginalNamecall(self, ...)
-        end)
+            return originalNamecall(self, ...)
+        end
+
+        if typeof(newcclosure) == "function" then
+            local wrapped = newcclosure(hook)
+            originalNamecall = hookmetamethod(game, "__namecall", wrapped)
+        else
+            originalNamecall = hookmetamethod(game, "__namecall", hook)
+        end
     end)
 
-    if not hookOk or not learnOriginalNamecall then
-        learning = false
-        if learnInputConnection then
-            learnInputConnection:Disconnect()
-            learnInputConnection = nil
-        end
-        notify('Failed to install the learning hook.', 'error', 6)
+    if not ok or not originalNamecall then
+        originalNamecall = nil
+        return false
+    end
+
+    hookInstalled = true
+    log("namecall hook installed (permanent, gated)")
+    return true
+end
+
+local function stopLearning()
+    learning = false
+    table.clear(learnQueue)
+end
+
+local function lockRemote(instance)
+    local okClass, className = pcall(function() return instance.ClassName end)
+    if not okClass then return false end
+
+    local okFullName, fullName = pcall(function() return instance:GetFullName() end)
+    if not okFullName then return false end
+
+    LockedRemote = instance
+    LockedClass = className
+    LockedFullName = fullName
+    CooldownUntil = os.clock() + 2
+
+    stopLearning()
+
+    log("locked remote: " .. fullName .. " (" .. className .. ")")
+    notify('Learned: ' .. fullName, 'success', 10)
+    return true
+end
+
+local function startLearning()
+    if learning or LockedRemote then return end
+
+    if not HAS_NAMECALL then
+        notify('This executor has no hookmetamethod/getnamecallmethod.', 'error', 8)
+        Config.Enabled = false
+        if EnabledToggle then EnabledToggle:Set(false, true) end
         return
     end
 
+    if not installHook() then
+        notify('Failed to install the hook.', 'error', 7)
+        Config.Enabled = false
+        if EnabledToggle then EnabledToggle:Set(false, true) end
+        return
+    end
+
+    table.clear(learnQueue)
+    lastPressAt = 0
+    learning = true
+
     task.spawn(function()
-        while learning do
+        while learning and not Unloading do
             if #learnQueue > 0 then
                 local item = table.remove(learnQueue, 1)
                 local delta = item.at - lastPressAt
-                if lastPressAt > 0 and delta >= 0 and delta <= 0.5 then
-                    lockRemote(item.instance)
-                    break
+                if lastPressAt > 0 and delta >= 0 and delta <= 0.4 then
+                    if lockRemote(item.instance) then
+                        break
+                    end
                 end
             else
                 task.wait(0.05)
@@ -245,39 +247,52 @@ local function startLearning()
     end)
 end
 
+local function isPressLikeInput(inputType)
+    return inputType == Enum.UserInputType.MouseButton1
+        or inputType == Enum.UserInputType.MouseButton2
+        or inputType == Enum.UserInputType.Touch
+end
+
+track(UserInputService.InputBegan:Connect(function(input, processed)
+    if Unloading or not learning then return end
+    if processed then return end
+    if not isPressLikeInput(input.UserInputType) then return end
+    lastPressAt = os.clock()
+end))
+
 local function fireLocked()
-    if not LockedRemote then return end
+    local remote = LockedRemote
+    local className = LockedClass
+    if not remote then return end
+
     CooldownUntil = os.clock() + Config.Cooldown
 
     task.spawn(function()
-        local okClass, className = pcall(function() return LockedRemote.ClassName end)
-        if not okClass then return end
-
         local ok = pcall(function()
             if className == "RemoteFunction" then
-                LockedRemote:InvokeServer()
-            elseif className == "BindableEvent" then
-                LockedRemote:Fire()
+                remote:InvokeServer()
             else
-                LockedRemote:FireServer()
+                remote:FireServer()
             end
         end)
 
         if ok then
             Fires = Fires + 1
-            log(("fired locked remote (#%d)"):format(Fires))
         else
-            log("fired locked remote FAILED")
+            log("fire failed")
         end
     end)
 end
 
-track(PostSimulation:Connect(function()
+track(PreSimulation:Connect(function()
     if Unloading or not Config.Enabled or not LockedRemote then return end
+    if os.clock() < CooldownUntil then return end
 
     local ball, isTraining = realBall()
+    if not ball then return end
+
     local root = getRoot()
-    if not ball or not root then return end
+    if not root then return end
 
     if isTraining then
         if not isAlive() then return end
@@ -286,17 +301,27 @@ track(PostSimulation:Connect(function()
         if ball:GetAttribute("target") ~= LocalPlayer.Name then return end
     end
 
-    if os.clock() < CooldownUntil then return end
-
-    local distance = (ball.Position - root.Position).Magnitude
+    local offset = root.Position - ball.Position
+    local distance = offset.Magnitude
     if distance > Config.MaxDistance then return end
 
-    local speed = closingSpeed(ball, root)
-    if speed <= 1 then return end
+    local velocity = ball.AssemblyLinearVelocity
+    if distance < 0.01 then return end
 
-    local eta = distance / speed
-    local ping = PingModule and (PingModule:GetAttribute("LocalPlayerPing") or 0) or 0
-    local lead = Config.Lead + (ping * 0.5 * Config.PingFactor)
+    local closing = velocity:Dot(offset.Unit)
+    if closing <= 1 then return end
+
+    local eta = distance / closing
+
+    local ping = 0
+    if PingModule then
+        ping = PingModule:GetAttribute("LocalPlayerPing") or 0
+    end
+
+    local lead = Config.Lead
+        + (ping * 0.5 * Config.PingFactor)
+        + math.clamp(closing / 1000, 0, 1) * Config.SpeedLead
+
     if eta > lead then return end
 
     fireLocked()
@@ -326,7 +351,7 @@ local MainTab = Window:Tab({ Title = 'main', Icon = 'crosshair' })
 local MainSection = MainTab:Section({ Title = 'auto parry', Side = 'left' })
 
 statusStat = MainSection:Stat({ Title = 'status', Value = 'off' })
-local lockedStat = MainSection:Stat({ Title = 'learned remote', Value = 'none yet' })
+lockedStat = MainSection:Stat({ Title = 'learned remote', Value = 'none yet' })
 
 EnabledToggle = MainSection:Toggle({
     Title = 'auto parry',
@@ -337,13 +362,47 @@ EnabledToggle = MainSection:Toggle({
         if value then
             if not LockedRemote then
                 startLearning()
-                notify('Waiting for your next real parry press to learn the remote...', 'warning', 8)
+                notify('Parry once yourself - it will learn from that press.', 'warning', 9)
             end
         else
             stopLearning()
         end
-        log(value and "auto parry ON" or "auto parry OFF")
     end,
+})
+
+local TuningSection = MainTab:Section({ Title = 'timing', Side = 'left' })
+
+TuningSection:Slider({
+    Title = 'lead',
+    Flag = 'bb_lead',
+    Min = 0.1,
+    Max = 0.8,
+    Increment = 0.01,
+    Default = 0.38,
+    Suffix = 's',
+    Callback = function(value) Config.Lead = value end,
+})
+
+TuningSection:Slider({
+    Title = 'speed lead',
+    Flag = 'bb_speed_lead',
+    Min = 0,
+    Max = 0.4,
+    Increment = 0.01,
+    Default = 0.12,
+    Suffix = 's',
+    Callback = function(value) Config.SpeedLead = value end,
+})
+
+TuningSection:Slider({
+    Title = 'ping compensation',
+    Flag = 'bb_ping',
+    Min = 0,
+    Max = 2,
+    Increment = 0.1,
+    Default = 1,
+    Suffix = 'x',
+    Callback = function(value) Config.PingFactor = value end,
 })
 
 local ControlSection = MainTab:Section({ Title = 'control', Side = 'right' })
@@ -354,8 +413,9 @@ ControlSection:Button({
         LockedRemote = nil
         LockedClass = nil
         LockedFullName = nil
+        stopLearning()
         log("forgot learned remote")
-        notify('Forgot the learned remote. Toggle auto parry off then on to learn again.', 'warning', 7)
+        notify('Forgotten. Turn auto parry off and on to learn again.', 'warning', 7)
     end,
 })
 
@@ -372,18 +432,23 @@ ControlSection:Button({
     end,
 })
 
+ControlSection:Paragraph({
+    Title = 'how it learns',
+    Text = 'Turn auto parry on, then parry once yourself the normal way. Whatever remote your own press fires within 0.4s gets locked in and reused for every parry after that. The hook is installed once and stays installed as a plain passthrough - it is never uninstalled, because hookmetamethod does not restore, it replaces, and re-installing what it returned makes it call itself until the client dies.',
+})
+
 task.spawn(function()
     while not Unloading do
-        task.wait(0.2)
+        task.wait(0.25)
         pcall(function()
             if not Config.Enabled then
                 statusStat:Set('off')
             elseif LockedRemote then
                 statusStat:Set(('armed - %d fired'):format(Fires), Color3.fromRGB(126, 217, 87))
             elseif learning then
-                statusStat:Set('waiting for your real parry...', Color3.fromRGB(255, 180, 70))
+                statusStat:Set('parry once yourself...', Color3.fromRGB(255, 180, 70))
             else
-                statusStat:Set('starting...')
+                statusStat:Set('idle')
             end
             lockedStat:Set(LockedFullName or 'none yet')
         end)
