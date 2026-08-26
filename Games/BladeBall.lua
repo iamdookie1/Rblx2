@@ -225,24 +225,29 @@ end
 
 local function fireLocked()
     if not LockedRemote then return end
-    local okClass, className = pcall(function() return LockedRemote.ClassName end)
-    if not okClass then return end
+    CooldownUntil = os.clock() + Config.Cooldown
 
-    local ok = pcall(function()
-        if className == "RemoteFunction" then
-            LockedRemote:InvokeServer()
-        elseif className == "BindableEvent" then
-            LockedRemote:Fire()
+    task.spawn(function()
+        local okClass, className = pcall(function() return LockedRemote.ClassName end)
+        if not okClass then return end
+
+        local ok = pcall(function()
+            if className == "RemoteFunction" then
+                LockedRemote:InvokeServer()
+            elseif className == "BindableEvent" then
+                LockedRemote:Fire()
+            else
+                LockedRemote:FireServer()
+            end
+        end)
+
+        if ok then
+            Fires = Fires + 1
+            log(("fired locked remote (#%d)"):format(Fires))
         else
-            LockedRemote:FireServer()
+            log("fired locked remote FAILED")
         end
     end)
-
-    if ok then
-        Fires = Fires + 1
-        CooldownUntil = os.clock() + Config.Cooldown
-        log(("fired locked remote (#%d)"):format(Fires))
-    end
 end
 
 track(PostSimulation:Connect(function()
