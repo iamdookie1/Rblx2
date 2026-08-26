@@ -36,8 +36,9 @@ local Config = {
     PingFactor = 1.0,
     MaxDistance = 160,
     Cooldown = 0.2,
-    PreWindow = 0.25,
-    PostWindow = 0.4,
+    PreWindow = 0.6,
+    PostWindow = 0.6,
+    Strict = false,
 }
 
 local Fires = 0
@@ -52,6 +53,7 @@ local LiveLead = 0
 
 local LockedRemote = nil
 local LockedClass = nil
+local LockedMethod = nil
 local LockedFullName = nil
 
 local learning = false
@@ -171,11 +173,15 @@ local function installHook()
         local hook = function(self, ...)
             if learning and not Unloading and #learnQueue < LEARN_QUEUE_LIMIT and typeof(self) == "Instance" then
                 local okMethod, method = pcall(getnamecallmethod)
-                if okMethod and (method == "FireServer" or method == "InvokeServer") then
-                    local okName, name = pcall(function() return self.Name end)
-                    local firstArg = select(1, ...)
-                    if not ((okName and IGNORE_NAMES[name]) or IGNORE_TAGS[firstArg]) then
-                        learnQueue[#learnQueue + 1] = { instance = self, at = os.clock() }
+                if okMethod and (method == "FireServer" or method == "InvokeServer" or method == "Fire") then
+                    local ignored = false
+                    if Config.Strict then
+                        local okName, name = pcall(function() return self.Name end)
+                        local firstArg = select(1, ...)
+                        ignored = (okName and IGNORE_NAMES[name] == true) or IGNORE_TAGS[firstArg] == true
+                    end
+                    if not ignored then
+                        learnQueue[#learnQueue + 1] = { instance = self, at = os.clock(), method = method }
                     end
                 end
             end
@@ -212,10 +218,11 @@ local function lockCandidate(index)
     CandidateIndex = index
     LockedRemote = entry.instance
     LockedClass = entry.className
+    LockedMethod = entry.method
     LockedFullName = entry.fullName
     CooldownUntil = os.clock() + 2
 
-    local call = (entry.className == "RemoteFunction") and "InvokeServer()" or "FireServer()"
+    local call = entry.method .. "()"
     log(("locked candidate %d/%d: %s -> %s"):format(index, #Candidates, entry.fullName, call))
     if learnConsole then
         learnConsole:Add(("USING [%d] %s"):format(index, entry.fullName), Color3.fromRGB(126, 217, 87))
@@ -265,11 +272,12 @@ local function startLearning()
                         className = okClass and className or "?",
                         fullName = fullName,
                         delta = delta,
+                        method = item.method,
                     }
 
                     if learnConsole then
                         learnConsole:Add(("[%d] %s %s  (%+.3fs)"):format(
-                            #Candidates, okClass and className or "?", shortName, delta),
+                            #Candidates, item.method, shortName, delta),
                             Color3.fromRGB(126, 217, 87))
                     end
 
@@ -335,15 +343,17 @@ end)
 
 local function fireLocked()
     local remote = LockedRemote
-    local className = LockedClass
+    local method = LockedMethod
     if not remote then return end
 
     CooldownUntil = os.clock() + Config.Cooldown
 
     task.spawn(function()
         local ok = pcall(function()
-            if className == "RemoteFunction" then
+            if method == "InvokeServer" then
                 remote:InvokeServer()
+            elseif method == "Fire" then
+                remote:Fire()
             else
                 remote:FireServer()
             end
@@ -500,6 +510,45 @@ TuningSection:Slider({
     Callback = function(value) Config.PingFactor = value end,
 })
 
+local FilterSection = MainTab:Section({ Title = 'learning filter', Side = 'left' })
+
+FilterSection:Toggle({
+    Title = 'strict filter',
+    Flag = 'bb_strict',
+    Default = false,
+    Callback = function(value)
+        Config.Strict = value
+        log("strict filter: " .. tostring(value))
+    end,
+})
+
+FilterSection:Slider({
+    Title = 'window before press',
+    Flag = 'bb_pre_window',
+    Min = 0,
+    Max = 2,
+    Increment = 0.05,
+    Default = 0.6,
+    Suffix = 's',
+    Callback = function(value) Config.PreWindow = value end,
+})
+
+FilterSection:Slider({
+    Title = 'window after press',
+    Flag = 'bb_post_window',
+    Min = 0,
+    Max = 2,
+    Increment = 0.05,
+    Default = 0.6,
+    Suffix = 's',
+    Callback = function(value) Config.PostWindow = value end,
+})
+
+FilterSection:Paragraph({
+    Title = 'if it is not finding it',
+    Text = 'Strict filter off means nothing is excluded by name or first argument - every FireServer, InvokeServer and Fire seen inside the window becomes a numbered candidate, telemetry included. Widen the windows if the call still is not showing up; the game may send it well before your press registers. Then cycle with try next candidate.',
+})
+
 local LearnSection = MainTab:Section({ Title = 'what it sees', Side = 'right' })
 
 learnConsole = LearnSection:Console({
@@ -559,6 +608,7 @@ ControlSection:Button({
         LockedRemote = nil
         LockedClass = nil
         LockedFullName = nil
+        LockedMethod = nil
         CandidateIndex = 0
         table.clear(Candidates)
         table.clear(seenCandidates)
@@ -602,8 +652,8 @@ task.spawn(function()
             lockedStat:Set(LockedFullName
                 and ('[%d/%d] %s'):format(CandidateIndex, #Candidates, LockedFullName)
                 or ('none yet (%d candidates)'):format(#Candidates))
-            if LockedClass then
-                callStat:Set((LockedClass == "RemoteFunction") and 'InvokeServer()' or 'FireServer()')
+            if LockedMethod then
+                callStat:Set(LockedMethod .. '()')
             else
                 callStat:Set('nothing yet')
             end
