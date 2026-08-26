@@ -147,11 +147,11 @@ end
 local LockedRemote = nil
 local LockedClass = nil
 local learning = false
-local recentlyPressed = false
+local lastPressAt = 0
 local learnOriginalNamecall = nil
 local learnInputConnection = nil
 local learnQueue = {}
-local LEARN_QUEUE_LIMIT = 20
+local LEARN_QUEUE_LIMIT = 300
 
 local function stopLearning()
     learning = false
@@ -189,17 +189,17 @@ local function startLearning()
     end
 
     learning = true
+    lastPressAt = 0
     table.clear(learnQueue)
 
     learnInputConnection = track(UserInputService.InputBegan:Connect(function(input, processed)
         if not isPressLikeInput(input.UserInputType) then return end
-        recentlyPressed = true
-        task.delay(0.5, function() recentlyPressed = false end)
+        lastPressAt = os.clock()
     end))
 
     local hookOk = pcall(function()
         learnOriginalNamecall = hookmetamethod(game, "__namecall", function(self, ...)
-            if learning and recentlyPressed and typeof(self) == "Instance" and #learnQueue < LEARN_QUEUE_LIMIT then
+            if typeof(self) == "Instance" and #learnQueue < LEARN_QUEUE_LIMIT then
                 local okMethod, method = pcall(getnamecallmethod)
                 if okMethod and (method == "FireServer" or method == "Fire" or method == "InvokeServer") then
                     local okName, name = pcall(function() return self.Name end)
@@ -207,7 +207,7 @@ local function startLearning()
                     local ignored = (okName and CAPTURE_IGNORE[name] == true) or CAPTURE_IGNORE_TAGS[firstArg] == true
 
                     if not ignored then
-                        learnQueue[#learnQueue + 1] = self
+                        learnQueue[#learnQueue + 1] = { instance = self, at = os.clock() }
                     end
                 end
             end
@@ -228,11 +228,15 @@ local function startLearning()
     task.spawn(function()
         while learning do
             if #learnQueue > 0 then
-                local candidate = table.remove(learnQueue, 1)
-                lockRemote(candidate)
-                break
+                local item = table.remove(learnQueue, 1)
+                local delta = item.at - lastPressAt
+                if lastPressAt > 0 and delta >= 0 and delta <= 0.5 then
+                    lockRemote(item.instance)
+                    break
+                end
+            else
+                task.wait(0.05)
             end
-            task.wait(0.05)
         end
     end)
 end
