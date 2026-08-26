@@ -416,6 +416,36 @@ local CAPTURE_LIMIT = 60
 local CAPTURE_IGNORE = { SetPointer = true, SetLook = true, Ping = true, Fps = true, MenuState = true, OnDeath = true }
 local CAPTURE_IGNORE_TAGS = { Activity = true, Snapshot = true, ["5455ef47-de02-4074-808c-8d82c2cd12ec"] = true }
 
+local LastCaptured = {}
+
+local function recordCaptured(instance, fullName)
+    local hash = fullName:match("/(%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x+)$")
+    LastCaptured[#LastCaptured + 1] = { instance = instance, hash = hash, fullName = fullName }
+    if #LastCaptured > 20 then table.remove(LastCaptured, 1) end
+end
+
+local function searchGameForValue(target)
+    local matches = {}
+    local scanned = 0
+    local descendants = game:GetDescendants()
+
+    for _, instance in ipairs(descendants) do
+        scanned = scanned + 1
+        if scanned % 500 == 0 then task.wait() end
+
+        local okAttrs, attrs = pcall(function() return instance:GetAttributes() end)
+        if okAttrs and attrs then
+            for key, value in pairs(attrs) do
+                if tostring(value) == target then
+                    matches[#matches + 1] = instance:GetFullName() .. " [" .. key .. "=" .. tostring(value) .. "]"
+                end
+            end
+        end
+    end
+
+    return matches, scanned
+end
+
 local function findPlacement(self)
     local okParent, parent = pcall(function() return self.Parent end)
     if not okParent or not parent then return nil end
@@ -715,8 +745,10 @@ local function runCaptureWindow(duration, pressFirst)
                         task.spawn(function()
                             local summary = describeCall(self, method, args)
                             summaries[#summaries + 1] = summary
-
                             log("capture #" .. count .. " -> " .. summary)
+
+                            local okFullName, fullName = pcall(function() return self:GetFullName() end)
+                            if okFullName then recordCaptured(self, fullName) end
                         end)
                     end
                 end
@@ -1395,6 +1427,54 @@ DiagSection:Button({
     Callback = function()
         resetSnapshots()
         notify('Both snapshot files cleared.')
+    end,
+})
+
+DiagSection:Paragraph({
+    Title = 'where does the hash come from',
+    Text = 'The hash is not necessarily pure noise - it could be derived from something else in the game (a JobId, a GUID stored as an attribute, anything). Searches every attribute on every instance in the game for an exact match to the most recently captured hash, plus a direct check against game.JobId. A match would reveal where the value actually comes from instead of treating it as unrecoverable.',
+})
+
+DiagSection:Button({
+    Title = 'search game for last captured hash',
+    Callback = function()
+        if #LastCaptured == 0 then
+            notify('Nothing captured yet - run Capture or Observe first.', 'warning', 6)
+            return
+        end
+
+        local entry = LastCaptured[#LastCaptured]
+        if not entry.hash then
+            notify('Last captured call had no hash-shaped name to search for.', 'warning', 6)
+            return
+        end
+
+        notify(('Searching the game for "%s"... this can take a moment.'):format(entry.hash), 'warning', 6)
+
+        task.spawn(function()
+            local jobIdMatch = game.JobId == entry.hash
+            local matches, scanned = searchGameForValue(entry.hash)
+
+            log(("search: scanned %d instances for %s, %d attribute match(es), JobId match=%s")
+                :format(scanned, entry.hash, #matches, tostring(jobIdMatch)))
+
+            if jobIdMatch then
+                notify('Matched game.JobId exactly - the hash is (or is derived from) the server JobId.', 'success', 10)
+                return
+            end
+
+            if #matches == 0 then
+                notify(('No attribute anywhere in the game matched - scanned %d instances.'):format(scanned), 'warning', 8)
+                return
+            end
+
+            local text = table.concat(matches, "\n")
+            local copied = typeof(setclipboard) == "function" and pcall(setclipboard, text)
+            notify(copied
+                and ('%d match(es) found - copied to clipboard.'):format(#matches)
+                or ('%d match(es) found - see %s'):format(#matches, LOG_PATH),
+                'success', 9)
+        end)
     end,
 })
 
