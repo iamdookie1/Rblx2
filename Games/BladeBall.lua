@@ -205,7 +205,7 @@ local function startLearning()
                     if not ignored then
                         recentlyPressed = false
                         local target = self
-                        task.spawn(function() lockRemote(target) end)
+                        task.defer(function() lockRemote(target) end)
                     end
                 end
             end
