@@ -64,6 +64,7 @@ local Stats = {
 
 local MethodScores = {
     Remote = { presses = 0, successes = 0 },
+    UIBlock = { presses = 0, successes = 0 },
     Bindable = { presses = 0, successes = 0 },
     Input = { presses = 0, successes = 0 },
     Capture = { presses = 0, successes = 0 },
@@ -95,6 +96,9 @@ local PackagesFolder = ReplicatedStorage:WaitForChild("Packages", 10)
 local NetModule = PackagesFolder and PackagesFolder:FindFirstChild("_Index")
 NetModule = NetModule and NetModule:FindFirstChild("sleitnick_net@0.1.0")
 NetModule = NetModule and NetModule:FindFirstChild("net")
+
+local UIBlockRemote = NetModule and NetModule:FindFirstChild(
+    "RE/39401853105429a6fe7a64f68bfa545f05c15db6dfca91b9c9f53836a9ada3ff")
 
 local PingModule = ReplicatedStorage:FindFirstChild("Shared")
 PingModule = PingModule and PingModule:FindFirstChild("Ping")
@@ -478,6 +482,13 @@ local Pressers = {
         return pcall(function() ParryAttempt:FireServer() end)
     end,
 
+    UIBlock = function()
+        if not UIBlockRemote then return false, "UIInteraction remote missing" end
+        return pcall(function()
+            UIBlockRemote:FireServer("UIInteraction", { ui = "Hotbar", inMatch = true, control = "Block" })
+        end)
+    end,
+
     Bindable = function()
         if not ParryButtonPress then return false, "ParryButtonPress missing" end
         return pcall(function() ParryButtonPress:Fire() end)
@@ -687,7 +698,7 @@ local ModeSection = MainTab:Section({ Title = 'mode', Side = 'left' })
 ModeSection:Dropdown({
     Title = 'mode',
     Flag = 'bb_mode',
-    Options = { 'Indicator', 'Remote', 'Bindable', 'Input', 'Capture' },
+    Options = { 'Indicator', 'Remote', 'UIBlock', 'Bindable', 'Input', 'Capture' },
     Default = 'Indicator',
     Callback = function(value)
         Config.Mode = value
@@ -884,6 +895,11 @@ RiskSection:Paragraph({
 RiskSection:Paragraph({
     Title = 'Remote - most likely to be the one that answered',
     Text = 'Fires ReplicatedStorage.Remotes.ParryAttempt. The arguments the real client sends were never read, because SwordsController.PRY is obfuscated, so this sends none at all. A server receiving that remote with no arguments, from a client whose parry did not come from input, is about as clear a signature as exploiting produces. If you only test one thing, do not make it this one.',
+})
+
+RiskSection:Paragraph({
+    Title = 'UIBlock - probably telemetry, not the real action',
+    Text = 'Replicates the exact UIInteraction call captured alongside a real parry - same shape as the UIInteraction/JumpButton call seen earlier, which is a UI click log, not what makes the character jump. This is very likely the same: a report that the Hotbar Block button was clicked, not the thing that actually resolves a hit. The real decision most likely still goes through the separate hashed RemoteFunction seen firing in the same window, which cannot be hardcoded because its name is salted fresh per lobby. Cheap to test, low expectation it does anything.',
 })
 
 RiskSection:Paragraph({
