@@ -252,8 +252,8 @@ local HAS_NAMECALL = typeof(hookmetamethod) == "function" and typeof(getnamecall
 local capturing = false
 
 local CAPTURE_LIMIT = 60
-local CAPTURE_IGNORE = { SetPointer = true, SetLook = true, Ping = true, Fps = true }
-local CAPTURE_IGNORE_TAGS = { Activity = true, Snapshot = true }
+local CAPTURE_IGNORE = { SetPointer = true, SetLook = true, Ping = true, Fps = true, MenuState = true, OnDeath = true }
+local CAPTURE_IGNORE_TAGS = { Activity = true, Snapshot = true, ["5455ef47-de02-4074-808c-8d82c2cd12ec"] = true }
 
 local function describeCall(self, method, args)
     local fullName = "?"
