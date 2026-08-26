@@ -274,24 +274,40 @@ local function fireButton()
     return false, "button had no usable signal"
 end
 
-local function pickFunction(globalName, debugName)
-    local fn = nil
-    pcall(function()
-        local candidate = rawget(getfenv(0), globalName)
-        if typeof(candidate) == "function" then fn = candidate end
-    end)
-    if fn then return fn end
-    pcall(function()
-        local candidate = debug and debug[debugName]
-        if typeof(candidate) == "function" then fn = candidate end
-    end)
-    return fn
+local function pickFunction(...)
+    local names = { ... }
+
+    for _, name in ipairs(names) do
+        local fn = nil
+
+        pcall(function()
+            if typeof(getgenv) == "function" then
+                local candidate = getgenv()[name]
+                if typeof(candidate) == "function" then fn = candidate end
+            end
+        end)
+        if fn then return fn end
+
+        pcall(function()
+            local candidate = getfenv(0)[name]
+            if typeof(candidate) == "function" then fn = candidate end
+        end)
+        if fn then return fn end
+
+        pcall(function()
+            local candidate = debug and debug[name]
+            if typeof(candidate) == "function" then fn = candidate end
+        end)
+        if fn then return fn end
+    end
+
+    return nil
 end
 
-local getUpvalues = pickFunction("getupvalues", "getupvalues")
-local getConstants = pickFunction("getconstants", "getconstants")
-local getProtos = pickFunction("getprotos", "getprotos")
-local getGc = pickFunction("getgc", "getgc")
+local getUpvalues = pickFunction("getupvalues", "debug_getupvalues")
+local getConstants = pickFunction("getconstants", "debug_getconstants")
+local getProtos = pickFunction("getprotos", "debug_getprotos")
+local getGc = pickFunction("getgc", "get_gc_objects", "getgarbagecollector")
 
 local INSPECT_PATH = "BladeBallInspect.txt"
 local PARRY_WORDS = { "parry", "block", "deflect", "swing", "slash" }
@@ -1119,12 +1135,13 @@ InspectSection:Button({
     Title = 'what this executor supports',
     Callback = function()
         local parts = {
-            "getconnections=" .. tostring(typeof(getconnections) == "function"),
+            "getconnections=" .. tostring(pickFunction("getconnections") ~= nil),
             "getupvalues=" .. tostring(getUpvalues ~= nil),
             "getconstants=" .. tostring(getConstants ~= nil),
             "getprotos=" .. tostring(getProtos ~= nil),
             "getgc=" .. tostring(getGc ~= nil),
-            "firesignal=" .. tostring(typeof(firesignal) == "function"),
+            "firesignal=" .. tostring(pickFunction("firesignal") ~= nil),
+            "getgenv=" .. tostring(typeof(getgenv) == "function"),
         }
         say(table.concat(parts, "  "), Color3.fromRGB(126, 217, 87))
     end,
