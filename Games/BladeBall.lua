@@ -36,6 +36,8 @@ local Config = {
     PingFactor = 1.0,
     MaxDistance = 160,
     Cooldown = 0.2,
+    PreWindow = 0.25,
+    PostWindow = 0.4,
 }
 
 local Fires = 0
@@ -56,6 +58,10 @@ local learning = false
 local lastPressAt = 0
 local learnQueue = {}
 local LEARN_QUEUE_LIMIT = 200
+
+local Candidates = {}
+local seenCandidates = setmetatable({}, { __mode = "k" })
+local CandidateIndex = 0
 
 local hookInstalled = false
 local originalNamecall = nil
@@ -199,32 +205,27 @@ local function stopLearning()
     table.clear(learnQueue)
 end
 
-local function lockRemote(instance)
-    local okClass, className = pcall(function() return instance.ClassName end)
-    if not okClass then return false end
+local function lockCandidate(index)
+    local entry = Candidates[index]
+    if not entry then return false end
 
-    local okFullName, fullName = pcall(function() return instance:GetFullName() end)
-    if not okFullName then return false end
-
-    LockedRemote = instance
-    LockedClass = className
-    LockedFullName = fullName
+    CandidateIndex = index
+    LockedRemote = entry.instance
+    LockedClass = entry.className
+    LockedFullName = entry.fullName
     CooldownUntil = os.clock() + 2
 
-    stopLearning()
-
-    local call = (className == "RemoteFunction") and "InvokeServer()" or "FireServer()"
-    log("locked remote: " .. fullName .. " (" .. className .. ") -> " .. call)
+    local call = (entry.className == "RemoteFunction") and "InvokeServer()" or "FireServer()"
+    log(("locked candidate %d/%d: %s -> %s"):format(index, #Candidates, entry.fullName, call))
     if learnConsole then
-        learnConsole:Add("LOCKED " .. fullName, Color3.fromRGB(126, 217, 87))
-        learnConsole:Add("will call: " .. call, Color3.fromRGB(126, 217, 87))
+        learnConsole:Add(("USING [%d] %s"):format(index, entry.fullName), Color3.fromRGB(126, 217, 87))
     end
-    notify('Learned: ' .. fullName, 'success', 10)
+    notify(('Using [%d/%d]: %s'):format(index, #Candidates, call), 'success', 7)
     return true
 end
 
 local function startLearning()
-    if learning or LockedRemote then return end
+    if learning then return end
 
     if not HAS_NAMECALL then
         notify('This executor has no hookmetamethod/getnamecallmethod.', 'error', 8)
@@ -253,19 +254,30 @@ local function startLearning()
                 local okName, fullName = pcall(function() return item.instance:GetFullName() end)
                 local okClass, className = pcall(function() return item.instance.ClassName end)
                 local shortName = okName and fullName:match("[^%.]+$") or "?"
-                local inWindow = lastPressAt > 0 and delta >= 0 and delta <= 0.4
+                local inWindow = lastPressAt > 0
+                    and delta >= -Config.PreWindow
+                    and delta <= Config.PostWindow
 
-                if learnConsole then
-                    learnConsole:Add(("%s %s %s  (%+.2fs)"):format(
-                        inWindow and "MATCH" or "skip",
-                        okClass and className or "?",
-                        shortName,
-                        lastPressAt > 0 and delta or 0),
-                        inWindow and Color3.fromRGB(126, 217, 87) or nil)
-                end
+                if inWindow and okName and not seenCandidates[item.instance] then
+                    seenCandidates[item.instance] = true
+                    Candidates[#Candidates + 1] = {
+                        instance = item.instance,
+                        className = okClass and className or "?",
+                        fullName = fullName,
+                        delta = delta,
+                    }
 
-                if inWindow and lockRemote(item.instance) then
-                    break
+                    if learnConsole then
+                        learnConsole:Add(("[%d] %s %s  (%+.3fs)"):format(
+                            #Candidates, okClass and className or "?", shortName, delta),
+                            Color3.fromRGB(126, 217, 87))
+                    end
+
+                    if #Candidates == 1 then
+                        lockCandidate(1)
+                    end
+                elseif learnConsole and not inWindow and lastPressAt > 0 and math.abs(delta) < 2 then
+                    learnConsole:Add(("skip %s  (%+.2fs)"):format(shortName, delta))
                 end
             else
                 task.wait(0.05)
@@ -443,8 +455,8 @@ EnabledToggle = MainSection:Toggle({
     Callback = function(value)
         Config.Enabled = value
         if value then
+            startLearning()
             if not LockedRemote then
-                startLearning()
                 notify('Parry once yourself - it will learn from that press.', 'warning', 9)
             end
         else
@@ -507,14 +519,52 @@ LearnSection:Button({
 local ControlSection = MainTab:Section({ Title = 'control', Side = 'right' })
 
 ControlSection:Button({
-    Title = 'forget learned remote',
+    Title = 'try next candidate',
+    Callback = function()
+        if #Candidates == 0 then
+            notify('No candidates captured yet.', 'warning', 6)
+            return
+        end
+        local nextIndex = CandidateIndex + 1
+        if nextIndex > #Candidates then nextIndex = 1 end
+        lockCandidate(nextIndex)
+    end,
+})
+
+ControlSection:Button({
+    Title = 'list candidates',
+    Callback = function()
+        if #Candidates == 0 then
+            notify('No candidates captured yet.', 'warning', 6)
+            return
+        end
+        local lines = {}
+        for index, entry in ipairs(Candidates) do
+            lines[#lines + 1] = ("[%d]%s %s %s (%+.3fs)"):format(
+                index, index == CandidateIndex and " *" or "",
+                entry.className, entry.fullName, entry.delta)
+        end
+        local text = table.concat(lines, "\n")
+        log("candidates ->\n" .. text)
+        local copied = typeof(setclipboard) == "function" and pcall(setclipboard, text)
+        notify(copied
+            and ('%d candidate(s) copied.'):format(#Candidates)
+            or ('%d candidate(s) - see %s'):format(#Candidates, LOG_PATH), 'success', 7)
+    end,
+})
+
+ControlSection:Button({
+    Title = 'forget everything',
     Callback = function()
         LockedRemote = nil
         LockedClass = nil
         LockedFullName = nil
+        CandidateIndex = 0
+        table.clear(Candidates)
+        table.clear(seenCandidates)
         stopLearning()
-        log("forgot learned remote")
-        notify('Forgotten. Turn auto parry off and on to learn again.', 'warning', 7)
+        log("forgot everything")
+        notify('Cleared. Turn auto parry off and on to learn again.', 'warning', 7)
     end,
 })
 
@@ -549,7 +599,9 @@ task.spawn(function()
             else
                 statusStat:Set('idle')
             end
-            lockedStat:Set(LockedFullName or 'none yet')
+            lockedStat:Set(LockedFullName
+                and ('[%d/%d] %s'):format(CandidateIndex, #Candidates, LockedFullName)
+                or ('none yet (%d candidates)'):format(#Candidates))
             if LockedClass then
                 callStat:Set((LockedClass == "RemoteFunction") and 'InvokeServer()' or 'FireServer()')
             else
