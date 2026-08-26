@@ -252,7 +252,7 @@ local HAS_NAMECALL = typeof(hookmetamethod) == "function" and typeof(getnamecall
 local capturing = false
 
 local CAPTURE_LIMIT = 60
-local CAPTURE_IGNORE = { SetPointer = true, SetLook = true }
+local CAPTURE_IGNORE = { SetPointer = true, SetLook = true, Ping = true, Fps = true }
 
 local function describeCall(self, method, args)
     local fullName = "?"
@@ -277,7 +277,8 @@ local function describeCall(self, method, args)
         parts[index] = ok and text or "<unreadable>"
     end
 
-    return ("%s : %s(%s)"):format(fullName, method, table.concat(parts, ", "))
+    local tag = fullName:find("sleitnick_net", 1, true) and "[NET] " or ""
+    return ("%s%s : %s(%s)"):format(tag, fullName, method, table.concat(parts, ", "))
 end
 
 local function pressInput()
