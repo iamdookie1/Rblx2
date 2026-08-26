@@ -82,6 +82,9 @@ pcall(function()
     end
 end)
 
+local RemotesFolder = ReplicatedStorage:WaitForChild("Remotes", 10)
+local ParryButtonPress = RemotesFolder and RemotesFolder:FindFirstChild("ParryButtonPress")
+
 local LOG_PATH = "BladeBallParry.txt"
 local canWrite = typeof(writefile) == "function"
 local canAppend = typeof(appendfile) == "function"
@@ -271,13 +274,21 @@ local function fireButton()
     return false, "button had no usable signal"
 end
 
+local function fireBindable()
+    if not ParryButtonPress then return false, "ParryButtonPress not found" end
+    local ok = pcall(function() ParryButtonPress:Fire() end)
+    if ok then return true, "bindable:ParryButtonPress" end
+    return false, "ParryButtonPress:Fire failed"
+end
+
 local Methods = {
+    Bindable = fireBindable,
     GameUIS = fireGameUIS,
     RealUIS = fireRealUIS,
     Button = fireButton,
 }
 
-local AUTO_ORDER = { "GameUIS", "RealUIS", "Button" }
+local AUTO_ORDER = { "Bindable", "GameUIS", "RealUIS", "Button" }
 
 local function doFire()
     if Config.Method ~= "Auto" then
@@ -404,7 +415,7 @@ EnabledToggle = MainSection:Toggle({
     Callback = function(value)
         Config.Enabled = value
         log(value and "auto parry ON" or "auto parry OFF")
-        if value and not CapturedInput then
+        if value and not ParryButtonPress and not CapturedInput then
             notify('Press parry once yourself so it has a real input to replay.', 'warning', 9)
         end
     end,
@@ -413,7 +424,7 @@ EnabledToggle = MainSection:Toggle({
 MainSection:Dropdown({
     Title = 'method',
     Flag = 'bb_method',
-    Options = { 'Auto', 'GameUIS', 'RealUIS', 'Button' },
+    Options = { 'Auto', 'Bindable', 'GameUIS', 'RealUIS', 'Button' },
     Default = 'Auto',
     Callback = function(value)
         Config.Method = value
@@ -424,7 +435,7 @@ MainSection:Dropdown({
 
 MainSection:Paragraph({
     Title = 'the methods',
-    Text = 'GameUIS pushes your captured input through ReplicatedStorage.UserInputService, a custom module the game uses instead of the real service - its own scripts listen there, not to Roblox. RealUIS fires the unlocked handlers on the real UserInputService.InputBegan, which is where the obfuscated sword controller appeared to sit. Button presses the Hotbar Block ImageButton. Auto tries them in that order. None of them use VirtualInputManager or send a remote directly.',
+    Text = 'Bindable fires ReplicatedStorage.Remotes.ParryButtonPress, a BindableEvent - the game\'s own internal "the parry button was pressed" signal, sitting among others like M1Stop and ResetFOV that its scripts Fire on themselves. Nothing leaves the client and there is no server call at all, so it is the closest thing to the game telling itself you pressed parry. GameUIS pushes your captured input through ReplicatedStorage.UserInputService, a custom module the game uses instead of the real service. RealUIS fires the unlocked handlers on the real UserInputService.InputBegan. Button presses the Hotbar Block ImageButton. Auto tries them in that order.',
 })
 
 local LiveSection = MainTab:Section({ Title = 'live', Side = 'left' })
@@ -524,7 +535,7 @@ task.spawn(function()
         pcall(function()
             if not Config.Enabled then
                 statusStat:Set('off')
-            elseif CapturedInput then
+            elseif ParryButtonPress or CapturedInput then
                 statusStat:Set(('armed - %d fired'):format(Fires), Color3.fromRGB(126, 217, 87))
             else
                 statusStat:Set('press parry once to arm', Color3.fromRGB(255, 180, 70))
