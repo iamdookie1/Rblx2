@@ -18,6 +18,7 @@ local PostSimulation = resolveEvent("PostSimulation", "Heartbeat")
 local Connections = {}
 local Unloading = false
 local notify
+local remoteConsole
 
 local EnabledToggle
 
@@ -773,6 +774,7 @@ local function setLiveRemoteLogging(enabled)
                         task.spawn(function()
                             local summary = describeCall(self, method, args)
                             log("live -> " .. summary)
+                            if remoteConsole then remoteConsole:Add(summary) end
 
                             local okFullName, fullName = pcall(function() return self:GetFullName() end)
                             if okFullName then recordCaptured(self, fullName) end
@@ -821,6 +823,7 @@ local function runCaptureWindow(duration, pressFirst)
                             local summary = describeCall(self, method, args)
                             summaries[#summaries + 1] = summary
                             log("capture #" .. count .. " -> " .. summary)
+                            if remoteConsole then remoteConsole:Add(summary) end
 
                             local okFullName, fullName = pcall(function() return self:GetFullName() end)
                             if okFullName then recordCaptured(self, fullName) end
@@ -1682,6 +1685,22 @@ LiveSection:Toggle({
 LiveSection:Paragraph({
     Title = 'always on, never remembered',
     Text = 'Hooks __namecall for as long as this stays on, logging every FireServer/Fire/InvokeServer call seen to file and into the same capture list FireCaptured reads from - no fixed window, so it can be left running while your paid script (or your own real presses) does the real work. Its Flag is a fresh random UUID every time this loads, so this toggle never restores a saved state across reloads - if leaving it on ever caused a kick, it will not silently turn itself back on next time.',
+})
+
+local ConsoleSection = RemoteTab:Section({ Title = 'log', Side = 'right' })
+
+remoteConsole = ConsoleSection:Console({
+    Title = 'captured calls',
+    Height = 260,
+    MaxLines = 200,
+    Timestamps = true,
+})
+
+ConsoleSection:Button({
+    Title = 'clear log',
+    Callback = function()
+        if remoteConsole then remoteConsole:Clear() end
+    end,
 })
 
 Window:Load()
