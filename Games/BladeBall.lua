@@ -69,6 +69,9 @@ local CandidateIndex = 0
 local SeenCalls = 0
 local SeenPresses = 0
 
+local ParryButton = nil
+local FireMethod = "none"
+
 local hookInstalled = false
 local originalNamecall = nil
 
@@ -327,6 +330,9 @@ local function bindParryButton(instance)
     if not instance:IsA("GuiButton") then return end
     if not PARRY_BUTTON_NAMES[instance.Name:lower()] then return end
     boundButtons[instance] = true
+    if not ParryButton or instance.Name:lower() == "block" then
+        ParryButton = instance
+    end
     track(instance.Activated:Connect(function() markPress("button " .. instance.Name) end))
     log("bound parry button: " .. instance:GetFullName())
 end
@@ -348,28 +354,85 @@ task.spawn(function()
     end))
 end)
 
-local function fireLocked()
+local BUTTON_SIGNALS = { "Activated", "MouseButton1Click", "MouseButton1Down" }
+
+local function tryFiresignal(button)
+    if typeof(firesignal) ~= "function" then return false end
+    for _, signalName in ipairs(BUTTON_SIGNALS) do
+        local okSignal, signal = pcall(function() return button[signalName] end)
+        if okSignal and signal and pcall(firesignal, signal) then
+            return true, "firesignal:" .. signalName
+        end
+    end
+    return false
+end
+
+local function tryConnections(button)
+    if typeof(getconnections) ~= "function" then return false end
+    for _, signalName in ipairs(BUTTON_SIGNALS) do
+        local okSignal, signal = pcall(function() return button[signalName] end)
+        if okSignal and signal then
+            local okConn, connections = pcall(getconnections, signal)
+            if okConn and typeof(connections) == "table" and #connections > 0 then
+                local fired = false
+                for _, connection in ipairs(connections) do
+                    if pcall(function() connection:Fire() end) then fired = true end
+                end
+                if fired then return true, "connections:" .. signalName end
+            end
+        end
+    end
+    return false
+end
+
+local function fireButton()
+    local button = ParryButton
+    if not button or not button.Parent then return false end
+
+    local ok, how = tryFiresignal(button)
+    if ok then return true, how end
+
+    ok, how = tryConnections(button)
+    if ok then return true, how end
+
+    return false
+end
+
+local function fireRemote()
     local remote = LockedRemote
     local method = LockedMethod
-    if not remote then return end
+    if not remote then return false end
+
+    local ok = pcall(function()
+        if method == "InvokeServer" then
+            remote:InvokeServer()
+        elseif method == "Fire" then
+            remote:Fire()
+        else
+            remote:FireServer()
+        end
+    end)
+
+    return ok, "remote:" .. tostring(method)
+end
+
+local function fireLocked()
+    if not ParryButton and not LockedRemote then return end
 
     CooldownUntil = os.clock() + Config.Cooldown
 
     task.spawn(function()
-        local ok = pcall(function()
-            if method == "InvokeServer" then
-                remote:InvokeServer()
-            elseif method == "Fire" then
-                remote:Fire()
-            else
-                remote:FireServer()
-            end
-        end)
+        local ok, how = fireButton()
+        if not ok then
+            ok, how = fireRemote()
+        end
 
         if ok then
             Fires = Fires + 1
+            FireMethod = how
         else
-            log("fire failed")
+            FireMethod = "nothing worked"
+            log("fire failed - no working method")
         end
     end)
 end
@@ -378,7 +441,7 @@ track(PreSimulation:Connect(function()
     if Unloading then return end
 
     if not Config.Enabled then Blocked = "off" return end
-    if not LockedRemote then Blocked = "nothing learned yet" return end
+    if not ParryButton and not LockedRemote then Blocked = "no parry button or remote" return end
 
     local ball, isTraining = realBall()
     if not ball then
@@ -653,8 +716,8 @@ ControlSection:Button({
 })
 
 ControlSection:Paragraph({
-    Title = 'how it learns',
-    Text = 'Turn auto parry on, then parry once yourself the normal way. Whatever remote your own press fires within 0.4s gets locked in and reused for every parry after that. The hook is installed once and stays installed as a plain passthrough - it is never uninstalled, because hookmetamethod does not restore, it replaces, and re-installing what it returned makes it call itself until the client dies.',
+    Title = 'how it fires',
+    Text = 'It presses the real Block button rather than sending anything itself: firesignal on the button Activated signal first, and if the executor has no firesignal, getconnections with Fire on each handler instead. No VirtualInputManager, no synthetic touch or mouse events at all - those glitch on mobile and are the obvious tell on a touch device. Whatever the game does on a real press it does here too, including any remote it would have sent, so the remote never has to be identified. A learned remote is only used as a fallback if no button can be found. The calls stat names the technique that actually worked.',
 })
 
 task.spawn(function()
@@ -673,11 +736,8 @@ task.spawn(function()
             lockedStat:Set(LockedFullName
                 and ('[%d/%d] %s'):format(CandidateIndex, #Candidates, LockedFullName)
                 or ('none yet (%d candidates)'):format(#Candidates))
-            if LockedMethod then
-                callStat:Set(LockedMethod .. '()')
-            else
-                callStat:Set('nothing yet')
-            end
+            callStat:Set(FireMethod ~= "none" and FireMethod
+                or (ParryButton and 'button ready' or 'nothing yet'))
 
             hookStat:Set(('%d calls / %d presses'):format(SeenCalls, SeenPresses),
                 (SeenCalls > 0 and SeenPresses > 0) and Color3.fromRGB(126, 217, 87)
