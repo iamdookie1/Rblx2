@@ -324,26 +324,31 @@ local Pressers = {
         capturing = true
 
         local count = 0
+        local ignoredCount = 0
         local summaries = {}
         local originalNamecall
         local hookOk = pcall(function()
             originalNamecall = hookmetamethod(game, "__namecall", function(self, ...)
                 if count < CAPTURE_LIMIT and typeof(self) == "Instance" then
-                    local okName, name = pcall(function() return self.Name end)
-                    local ignored = okName and CAPTURE_IGNORE[name] == true
                     local okMethod, method = pcall(getnamecallmethod)
-                    local firstArg = select(1, ...)
-                    if CAPTURE_IGNORE_TAGS[firstArg] then ignored = true end
-                    if not ignored and okMethod and (method == "FireServer" or method == "Fire" or method == "InvokeServer") then
-                        count = count + 1
-                        local args = { ... }
+                    if okMethod and (method == "FireServer" or method == "Fire" or method == "InvokeServer") then
+                        local okName, name = pcall(function() return self.Name end)
+                        local firstArg = select(1, ...)
+                        local ignored = (okName and CAPTURE_IGNORE[name] == true) or CAPTURE_IGNORE_TAGS[firstArg] == true
 
-                        task.spawn(function()
-                            local summary = describeCall(self, method, args)
-                            summaries[#summaries + 1] = summary
+                        if ignored then
+                            ignoredCount = ignoredCount + 1
+                        else
+                            count = count + 1
+                            local args = { ... }
 
-                            log("capture #" .. count .. " -> " .. summary)
-                        end)
+                            task.spawn(function()
+                                local summary = describeCall(self, method, args)
+                                summaries[#summaries + 1] = summary
+
+                                log("capture #" .. count .. " -> " .. summary)
+                            end)
+                        end
                     end
                 end
                 return originalNamecall(self, ...)
@@ -367,12 +372,16 @@ local Pressers = {
             capturing = false
 
             if count == 0 then
-                log(("capture: nothing observed within %.1fs"):format(Config.CaptureWindow))
-                notify('Nothing observed at all - the touch may not have registered.', 'warning', 6)
+                log(("capture: nothing new within %.1fs (%d filtered)"):format(Config.CaptureWindow, ignoredCount))
+                if ignoredCount > 0 then
+                    notify(('Hook saw %d already-known call(s) (Ping, MenuState, etc) but nothing new. The parry likely did not fire a FireServer/Fire/InvokeServer call at all.'):format(ignoredCount), 'warning', 8)
+                else
+                    notify('Hook saw zero remote calls of any kind - the touch may not have reached the server.', 'warning', 7)
+                end
                 return
             end
 
-            log(("capture: %d call(s) observed, see the lines above"):format(count))
+            log(("capture: %d call(s) observed (%d filtered), see the lines above"):format(count, ignoredCount))
             if typeof(setclipboard) == "function" then
                 local copied = pcall(setclipboard, table.concat(summaries, "\n"))
                 notify(copied
