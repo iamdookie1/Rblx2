@@ -65,6 +65,7 @@ local Stats = {
 local MethodScores = {
     Remote = { presses = 0, successes = 0 },
     UIBlock = { presses = 0, successes = 0 },
+    UIButton = { presses = 0, successes = 0 },
     Bindable = { presses = 0, successes = 0 },
     Input = { presses = 0, successes = 0 },
     Capture = { presses = 0, successes = 0 },
@@ -99,6 +100,10 @@ NetModule = NetModule and NetModule:FindFirstChild("net")
 
 local UIBlockRemote = NetModule and NetModule:FindFirstChild(
     "RE/39401853105429a6fe7a64f68bfa545f05c15db6dfca91b9c9f53836a9ada3ff")
+
+local PlayerGuiFolder = LocalPlayer:WaitForChild("PlayerGui", 10)
+local HotbarFrame = PlayerGuiFolder and PlayerGuiFolder:FindFirstChild("Hotbar")
+local BlockButton = HotbarFrame and HotbarFrame:FindFirstChild("Block")
 
 local PingModule = ReplicatedStorage:FindFirstChild("Shared")
 PingModule = PingModule and PingModule:FindFirstChild("Ping")
@@ -475,6 +480,51 @@ local function pressInput()
     end)
 end
 
+local function fireButtonConnections(guiButton)
+    if typeof(getconnections) ~= "function" then return false, "no getconnections on this executor" end
+
+    local signalNames = { "Activated", "MouseButton1Click", "MouseButton1Down" }
+    for _, signalName in ipairs(signalNames) do
+        local okSignal, signal = pcall(function() return guiButton[signalName] end)
+        if okSignal and signal then
+            local okConn, connections = pcall(getconnections, signal)
+            if okConn and typeof(connections) == "table" and #connections > 0 then
+                local fired = false
+                for _, connection in ipairs(connections) do
+                    if pcall(function() connection:Fire() end) then fired = true end
+                end
+                if fired then return true end
+            end
+        end
+    end
+
+    return false, "no working connections found"
+end
+
+local function clickButtonDirectly(guiButton)
+    local vim = game:GetService("VirtualInputManager")
+    if typeof(vim) ~= "Instance" then return false, "no VirtualInputManager" end
+
+    local okPos, center = pcall(function()
+        return guiButton.AbsolutePosition + guiButton.AbsoluteSize * 0.5
+    end)
+    if not okPos then return false, "could not read button position" end
+
+    local x, y = center.X, center.Y
+
+    if isTouchDevice() then
+        return pcall(function()
+            vim:SendTouchEvent(1, 0, x, y)
+            vim:SendTouchEvent(1, 2, x, y)
+        end)
+    end
+
+    return pcall(function()
+        vim:SendMouseButtonEvent(x, y, 0, true, game, 1)
+        vim:SendMouseButtonEvent(x, y, 0, false, game, 1)
+    end)
+end
+
 local Pressers = {
 
     Remote = function()
@@ -487,6 +537,13 @@ local Pressers = {
         return pcall(function()
             UIBlockRemote:FireServer("UIInteraction", { ui = "Hotbar", inMatch = true, control = "Block" })
         end)
+    end,
+
+    UIButton = function()
+        if not BlockButton then return false, "PlayerGui.Hotbar.Block missing" end
+        local ok, err = fireButtonConnections(BlockButton)
+        if ok then return true, "fired via connection" end
+        return clickButtonDirectly(BlockButton)
     end,
 
     Bindable = function()
@@ -698,7 +755,7 @@ local ModeSection = MainTab:Section({ Title = 'mode', Side = 'left' })
 ModeSection:Dropdown({
     Title = 'mode',
     Flag = 'bb_mode',
-    Options = { 'Indicator', 'Remote', 'UIBlock', 'Bindable', 'Input', 'Capture' },
+    Options = { 'Indicator', 'Remote', 'UIBlock', 'UIButton', 'Bindable', 'Input', 'Capture' },
     Default = 'Indicator',
     Callback = function(value)
         Config.Mode = value
@@ -900,6 +957,11 @@ RiskSection:Paragraph({
 RiskSection:Paragraph({
     Title = 'UIBlock - probably telemetry, not the real action',
     Text = 'Replicates the exact UIInteraction call captured alongside a real parry - same shape as the UIInteraction/JumpButton call seen earlier, which is a UI click log, not what makes the character jump. This is very likely the same: a report that the Hotbar Block button was clicked, not the thing that actually resolves a hit. The real decision most likely still goes through the separate hashed RemoteFunction seen firing in the same window, which cannot be hardcoded because its name is salted fresh per lobby. Cheap to test, low expectation it does anything.',
+})
+
+RiskSection:Paragraph({
+    Title = 'UIButton - runs the real handler instead of guessing a remote',
+    Text = 'Targets PlayerGui.Hotbar.Block directly. First tries getconnections on its Activated/MouseButton1Click signal and fires the bound function itself - if the executor supports that, this runs the exact same code a real click runs, whatever remote it calls and whatever the current lobby\'s hash happens to be, without this script ever needing to know either. No hook, no guessed name. Falls back to a synthetic click aimed at the button\'s actual screen position (not screen centre like Input mode) only if getconnections is unavailable. If the connection route works, this is the closest thing here to a real press - and also the least tested.',
 })
 
 RiskSection:Paragraph({
