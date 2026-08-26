@@ -66,6 +66,7 @@ local MethodScores = {
     Remote = { presses = 0, successes = 0 },
     UIBlock = { presses = 0, successes = 0 },
     UIButton = { presses = 0, successes = 0 },
+    ReplayInput = { presses = 0, successes = 0 },
     Bindable = { presses = 0, successes = 0 },
     Input = { presses = 0, successes = 0 },
     Capture = { presses = 0, successes = 0 },
@@ -576,6 +577,45 @@ local function clickButtonDirectly(guiButton)
     end)
 end
 
+local CapturedInput = nil
+local capturingInput = false
+
+local function armInputCapture()
+    if capturingInput then return false, "already capturing" end
+    capturingInput = true
+
+    local connection
+    connection = track(UserInputService.InputBegan:Connect(function(input, processed)
+        if input.UserInputType ~= parryInputType then return end
+        CapturedInput = input
+        capturingInput = false
+        if connection then connection:Disconnect() end
+        notify('Captured a real input - ReplayInput mode is ready.', 'success', 6)
+        log("captured real InputObject: " .. tostring(input.UserInputType))
+    end))
+
+    return true
+end
+
+local function replayCapturedInput()
+    if not CapturedInput then return false, "no captured input yet - use the capture button first" end
+    if typeof(getconnections) ~= "function" then return false, "no getconnections on this executor" end
+
+    local okConn, connections = pcall(getconnections, UserInputService.InputBegan)
+    if not okConn or typeof(connections) ~= "table" then return false, "getconnections failed" end
+
+    local fired = false
+    for _, connection in ipairs(connections) do
+        local okFn, fn = pcall(function() return connection.Function end)
+        if okFn and typeof(fn) == "function" then
+            if pcall(function() connection:Fire(CapturedInput, false) end) then fired = true end
+        end
+    end
+
+    if fired then return true end
+    return false, "no non-locked connections to fire"
+end
+
 local Pressers = {
 
     Remote = function()
@@ -596,6 +636,8 @@ local Pressers = {
         if fireButtonConnections(BlockButton) then return true, "fired via connection" end
         return clickButtonDirectly(BlockButton)
     end,
+
+    ReplayInput = replayCapturedInput,
 
     Bindable = function()
         if not ParryButtonPress then return false, "ParryButtonPress missing" end
@@ -806,7 +848,7 @@ local ModeSection = MainTab:Section({ Title = 'mode', Side = 'left' })
 ModeSection:Dropdown({
     Title = 'mode',
     Flag = 'bb_mode',
-    Options = { 'Indicator', 'Remote', 'UIBlock', 'UIButton', 'Bindable', 'Input', 'Capture' },
+    Options = { 'Indicator', 'Remote', 'UIBlock', 'UIButton', 'ReplayInput', 'Bindable', 'Input', 'Capture' },
     Default = 'Indicator',
     Callback = function(value)
         Config.Mode = value
@@ -1011,6 +1053,11 @@ RiskSection:Paragraph({
 })
 
 RiskSection:Paragraph({
+    Title = 'ReplayInput - fires the suspected real VM handler with real captured input',
+    Text = 'Requires capturing a real InputObject from your own keypress first (settings -> diagnostics -> capture next real press). Then fires every non-locked InputBegan connection with that real object - identified by elimination: 53 of 55 connections were locked C closures, 2 were real Luau functions with a scrambled Luraph-style source name, matching SwordsController.PRY. No synthetic click, no metamethod hook, no guessed remote name - but also the least proven, since firing a connection this way has never been tested against this specific VM before.',
+})
+
+RiskSection:Paragraph({
     Title = 'UIButton - runs the real handler instead of guessing a remote',
     Text = 'Targets PlayerGui.Hotbar.Block directly. First tries getconnections on its Activated/MouseButton1Click signal and fires the bound function itself - if the executor supports that, this runs the exact same code a real click runs, whatever remote it calls and whatever the current lobby\'s hash happens to be, without this script ever needing to know either. No hook, no guessed name. Falls back to a synthetic click aimed at the button\'s actual screen position (not screen centre like Input mode) only if getconnections is unavailable. If the connection route works, this is the closest thing here to a real press - and also the least tested.',
 })
@@ -1142,6 +1189,23 @@ DiagSection:Button({
             and ('%d connection(s) copied to clipboard.'):format(#lines)
             or ('%d connection(s) - see %s'):format(#lines, LOG_PATH),
             'success', 7)
+    end,
+})
+
+DiagSection:Paragraph({
+    Title = 'ReplayInput - capture a real press, then replay it',
+    Text = '53 of 55 InputBegan connections were locked C closures - normal engine plumbing. 2 came back as real Luau functions with a scrambled, unreadable source name, exactly what a Luraph chunk looks like through debug.info. That matches SwordsController.PRY. Capture below saves the very next real InputObject from your actual keypress, then ReplayInput mode fires every non-locked InputBegan connection with that real captured object - the VM runs its own real code on real input data, no synthetic click, no guessed remote name.',
+})
+
+DiagSection:Button({
+    Title = 'capture next real press (for ReplayInput)',
+    Callback = function()
+        local ok, err = armInputCapture()
+        if ok then
+            notify('Armed. Press your real parry key/button right now.', 'warning', 7)
+        else
+            notify(tostring(err), 'error', 6)
+        end
     end,
 })
 
