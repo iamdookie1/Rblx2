@@ -146,6 +146,7 @@ end
 
 local LockedRemote = nil
 local LockedClass = nil
+local LockedFullName = nil
 local learning = false
 local lastPressAt = 0
 local learnOriginalNamecall = nil
@@ -175,7 +176,8 @@ local function lockRemote(instance)
     stopLearning()
 
     local okFullName, fullName = pcall(function() return instance:GetFullName() end)
-    log("locked remote: " .. (okFullName and fullName or "?"))
+    LockedFullName = okFullName and fullName or "?"
+    log("locked remote: " .. LockedFullName)
     notify('Learned the real parry remote from your press - auto parry is armed.', 'success', 8)
 end
 
@@ -323,6 +325,7 @@ local MainTab = Window:Tab({ Title = 'main', Icon = 'crosshair' })
 local MainSection = MainTab:Section({ Title = 'auto parry', Side = 'left' })
 
 statusStat = MainSection:Stat({ Title = 'status', Value = 'off' })
+local lockedStat = MainSection:Stat({ Title = 'learned remote', Value = 'none yet' })
 
 EnabledToggle = MainSection:Toggle({
     Title = 'auto parry',
@@ -349,6 +352,7 @@ ControlSection:Button({
     Callback = function()
         LockedRemote = nil
         LockedClass = nil
+        LockedFullName = nil
         log("forgot learned remote")
         notify('Forgot the learned remote. Toggle auto parry off then on to learn again.', 'warning', 7)
     end,
@@ -380,6 +384,7 @@ task.spawn(function()
             else
                 statusStat:Set('starting...')
             end
+            lockedStat:Set(LockedFullName or 'none yet')
         end)
     end
 end)
