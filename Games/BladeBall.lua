@@ -19,9 +19,12 @@ local Unloading = false
 
 local notify
 local statusStat
-local lockedStat
-local callStat
-local learnConsole
+local methodStat
+local blockStat
+local targetStat
+local distStat
+local etaStat
+local logConsole
 local EnabledToggle
 
 local function track(connection)
@@ -31,19 +34,17 @@ end
 
 local Config = {
     Enabled = false,
+    Method = "Auto",
     Lead = 0.38,
     SpeedLead = 0.12,
     PingFactor = 1.0,
     MaxDistance = 160,
     Cooldown = 0.2,
-    PreWindow = 0.6,
-    PostWindow = 0.6,
-    Strict = false,
-    ShowAll = false,
 }
 
 local Fires = 0
 local CooldownUntil = 0
+local FireMethod = "none"
 
 local Blocked = "off"
 local LiveTarget = "-"
@@ -52,37 +53,8 @@ local LiveClosing = 0
 local LiveEta = 0
 local LiveLead = 0
 
-local LockedRemote = nil
-local LockedClass = nil
-local LockedMethod = nil
-local LockedFullName = nil
-
-local learning = false
-local lastPressAt = 0
-local learnQueue = {}
-local LEARN_QUEUE_LIMIT = 200
-
-local Candidates = {}
-local seenCandidates = setmetatable({}, { __mode = "k" })
-local CandidateIndex = 0
-
-local SeenCalls = 0
-local SeenPresses = 0
-
-local ParryButton = nil
-local FireMethod = "none"
 local CapturedInput = nil
-
-local GameUIS = nil
-pcall(function()
-    local module = ReplicatedStorage:FindFirstChild("UserInputService")
-    if module and module:IsA("ModuleScript") then
-        GameUIS = require(module)
-    end
-end)
-
-local hookInstalled = false
-local originalNamecall = nil
+local ParryButton = nil
 
 local function findChildCI(parent, name)
     if not parent then return nil end
@@ -101,6 +73,14 @@ local AliveFolder = Workspace:WaitForChild("Alive", 20)
 
 local PingModule = ReplicatedStorage:FindFirstChild("Shared")
 PingModule = PingModule and PingModule:FindFirstChild("Ping")
+
+local GameUIS = nil
+pcall(function()
+    local module = ReplicatedStorage:FindFirstChild("UserInputService")
+    if module and module:IsA("ModuleScript") then
+        GameUIS = require(module)
+    end
+end)
 
 local LOG_PATH = "BladeBallParry.txt"
 local canWrite = typeof(writefile) == "function"
@@ -122,6 +102,11 @@ end
 
 local function log(text)
     appendToFile(("[%s] %s\n"):format(os.date("%H:%M:%S"), text))
+end
+
+local function say(text, color)
+    log(text)
+    if logConsole then logConsole:Add(text, color) end
 end
 
 local function getRoot()
@@ -161,343 +146,182 @@ local function realBall()
     return nil, false
 end
 
-local HAS_NAMECALL = typeof(hookmetamethod) == "function" and typeof(getnamecallmethod) == "function"
-
-local IGNORE_NAMES = {
-    SetPointer = true,
-    SetLook = true,
-    Ping = true,
-    Fps = true,
-    MenuState = true,
-    OnDeath = true,
-}
-
-local IGNORE_TAGS = {
-    Activity = true,
-    Snapshot = true,
-    UIInteraction = true,
-    AFKStart = true,
-    AFKEnd = true,
-    FirstMove = true,
-    ["5455ef47-de02-4074-808c-8d82c2cd12ec"] = true,
-}
-
-local function installHook()
-    if hookInstalled or not HAS_NAMECALL then return hookInstalled end
-
-    local ok = pcall(function()
-        local hook = function(self, ...)
-            if learning and not Unloading and #learnQueue < LEARN_QUEUE_LIMIT and typeof(self) == "Instance" then
-                local okMethod, method = pcall(getnamecallmethod)
-                if okMethod and (method == "FireServer" or method == "InvokeServer" or method == "Fire") then
-                    local ignored = false
-                    if Config.Strict then
-                        local okName, name = pcall(function() return self.Name end)
-                        local firstArg = select(1, ...)
-                        ignored = (okName and IGNORE_NAMES[name] == true) or IGNORE_TAGS[firstArg] == true
-                    end
-                    if not ignored then
-                        SeenCalls = SeenCalls + 1
-                        learnQueue[#learnQueue + 1] = { instance = self, at = os.clock(), method = method }
-                    end
-                end
-            end
-            return originalNamecall(self, ...)
-        end
-
-        if typeof(newcclosure) == "function" then
-            local wrapped = newcclosure(hook)
-            originalNamecall = hookmetamethod(game, "__namecall", wrapped)
-        else
-            originalNamecall = hookmetamethod(game, "__namecall", hook)
-        end
-    end)
-
-    if not ok or not originalNamecall then
-        originalNamecall = nil
-        return false
-    end
-
-    hookInstalled = true
-    log("namecall hook installed (permanent, gated)")
-    return true
-end
-
-local function stopLearning()
-    learning = false
-    table.clear(learnQueue)
-end
-
-local function lockCandidate(index)
-    local entry = Candidates[index]
-    if not entry then return false end
-
-    CandidateIndex = index
-    LockedRemote = entry.instance
-    LockedClass = entry.className
-    LockedMethod = entry.method
-    LockedFullName = entry.fullName
-    CooldownUntil = os.clock() + 2
-
-    local call = entry.method .. "()"
-    log(("locked candidate %d/%d: %s -> %s"):format(index, #Candidates, entry.fullName, call))
-    if learnConsole then
-        learnConsole:Add(("USING [%d] %s"):format(index, entry.fullName), Color3.fromRGB(126, 217, 87))
-    end
-    notify(('Using [%d/%d]: %s'):format(index, #Candidates, call), 'success', 7)
-    return true
-end
-
-local function startLearning()
-    if learning then return end
-
-    if not HAS_NAMECALL then
-        notify('This executor has no hookmetamethod/getnamecallmethod.', 'error', 8)
-        Config.Enabled = false
-        if EnabledToggle then EnabledToggle:Set(false, true) end
-        return
-    end
-
-    if not installHook() then
-        notify('Failed to install the hook.', 'error', 7)
-        Config.Enabled = false
-        if EnabledToggle then EnabledToggle:Set(false, true) end
-        return
-    end
-
-    table.clear(learnQueue)
-    lastPressAt = 0
-    learning = true
-
-    task.spawn(function()
-        while learning and not Unloading do
-            if #learnQueue > 0 then
-                local item = table.remove(learnQueue, 1)
-                local delta = item.at - lastPressAt
-
-                local okName, fullName = pcall(function() return item.instance:GetFullName() end)
-                local okClass, className = pcall(function() return item.instance.ClassName end)
-                local shortName = okName and fullName:match("[^%.]+$") or "?"
-                local inWindow = Config.ShowAll or (lastPressAt > 0
-                    and delta >= -Config.PreWindow
-                    and delta <= Config.PostWindow)
-
-                if inWindow and okName and not seenCandidates[item.instance] then
-                    seenCandidates[item.instance] = true
-                    Candidates[#Candidates + 1] = {
-                        instance = item.instance,
-                        className = okClass and className or "?",
-                        fullName = fullName,
-                        delta = delta,
-                        method = item.method,
-                    }
-
-                    if learnConsole then
-                        local when = (lastPressAt > 0) and ("%+.3fs"):format(delta) or "no press yet"
-                        learnConsole:Add(("[%d] %s %s  (%s)"):format(
-                            #Candidates, item.method, shortName, when),
-                            Color3.fromRGB(126, 217, 87))
-                    end
-
-                    if #Candidates == 1 and not Config.ShowAll then
-                        lockCandidate(1)
-                    end
-                elseif learnConsole and not inWindow and lastPressAt > 0 and math.abs(delta) < 2 then
-                    learnConsole:Add(("skip %s  (%+.2fs)"):format(shortName, delta))
-                end
-            else
-                task.wait(0.05)
-            end
-        end
-    end)
-end
-
 local function isPressLikeInput(inputType)
     return inputType == Enum.UserInputType.MouseButton1
         or inputType == Enum.UserInputType.MouseButton2
         or inputType == Enum.UserInputType.Touch
 end
 
-local function markPress(source)
-    if Unloading or not learning then return end
-    lastPressAt = os.clock()
-    SeenPresses = SeenPresses + 1
-    if learnConsole then learnConsole:Add("-- press (" .. source .. ") --", Color3.fromRGB(255, 210, 80)) end
-end
-
-track(UserInputService.InputBegan:Connect(function(input, processed)
+track(UserInputService.InputBegan:Connect(function(input)
     if isPressLikeInput(input.UserInputType) or input.KeyCode == Enum.KeyCode.F then
+        if not CapturedInput then
+            say("captured a real input to replay: " .. tostring(input.UserInputType),
+                Color3.fromRGB(126, 217, 87))
+        end
         CapturedInput = input
-    end
-    if processed then return end
-    if isPressLikeInput(input.UserInputType) then
-        markPress("input")
-    elseif input.KeyCode == Enum.KeyCode.F then
-        markPress("key F")
     end
 end))
 
 local PARRY_BUTTON_NAMES = { block = true, parry = true }
 local boundButtons = setmetatable({}, { __mode = "k" })
 
-local function bindParryButton(instance)
+local function noteParryButton(instance)
     if boundButtons[instance] then return end
     if not instance:IsA("GuiButton") then return end
     if not PARRY_BUTTON_NAMES[instance.Name:lower()] then return end
     boundButtons[instance] = true
     if not ParryButton or instance.Name:lower() == "block" then
         ParryButton = instance
-    end
-    track(instance.Activated:Connect(function() markPress("button " .. instance.Name) end))
-    log("bound parry button: " .. instance:GetFullName())
-end
-
-local function bindAllParryButtons()
-    local playerGui = LocalPlayer:FindFirstChild("PlayerGui")
-    if not playerGui then return end
-    for _, descendant in ipairs(playerGui:GetDescendants()) do
-        pcall(bindParryButton, descendant)
+        say("found parry button: " .. instance:GetFullName())
     end
 end
 
 task.spawn(function()
     local playerGui = LocalPlayer:WaitForChild("PlayerGui", 20)
     if not playerGui then return end
-    bindAllParryButtons()
+    for _, descendant in ipairs(playerGui:GetDescendants()) do
+        pcall(noteParryButton, descendant)
+    end
     track(playerGui.DescendantAdded:Connect(function(descendant)
-        pcall(bindParryButton, descendant)
+        pcall(noteParryButton, descendant)
     end))
 end)
 
-local BUTTON_SIGNALS = { "Activated", "MouseButton1Click", "MouseButton1Down" }
+local function fireGameUIS()
+    if not GameUIS then return false, "no game UIS module" end
+    if not CapturedInput then return false, "press parry once first" end
 
-local function tryFiresignal(button)
-    if typeof(firesignal) ~= "function" then return false end
-    for _, signalName in ipairs(BUTTON_SIGNALS) do
-        local okSignal, signal = pcall(function() return button[signalName] end)
-        if okSignal and signal and pcall(firesignal, signal) then
-            return true, "firesignal:" .. signalName
+    local okSignal, signal = pcall(function() return GameUIS.InputBegan end)
+    if not okSignal or not signal then return false, "module has no InputBegan" end
+
+    if pcall(function() signal:Fire(CapturedInput, false) end) then
+        return true, "gameUIS:Fire"
+    end
+
+    if typeof(firesignal) == "function" and pcall(firesignal, signal, CapturedInput, false) then
+        return true, "gameUIS:firesignal"
+    end
+
+    if typeof(getconnections) == "function" then
+        local okConn, connections = pcall(getconnections, signal)
+        if okConn and typeof(connections) == "table" and #connections > 0 then
+            local any = false
+            for _, connection in ipairs(connections) do
+                if pcall(function() connection:Fire(CapturedInput, false) end) then any = true end
+            end
+            if any then return true, "gameUIS:connections" end
         end
     end
-    return false
+
+    return false, "gameUIS had no usable signal"
 end
 
-local function tryConnections(button)
-    if typeof(getconnections) ~= "function" then return false end
-    for _, signalName in ipairs(BUTTON_SIGNALS) do
-        local okSignal, signal = pcall(function() return button[signalName] end)
-        if okSignal and signal then
-            local okConn, connections = pcall(getconnections, signal)
-            if okConn and typeof(connections) == "table" and #connections > 0 then
-                local fired = false
-                for _, connection in ipairs(connections) do
-                    if pcall(function() connection:Fire() end) then fired = true end
-                end
-                if fired then return true, "connections:" .. signalName end
+local function fireRealUIS()
+    if not CapturedInput then return false, "press parry once first" end
+    if typeof(getconnections) ~= "function" then return false, "no getconnections" end
+
+    local okConn, connections = pcall(getconnections, UserInputService.InputBegan)
+    if not okConn or typeof(connections) ~= "table" then return false, "getconnections failed" end
+
+    local any = 0
+    for _, connection in ipairs(connections) do
+        local okFn, fn = pcall(function() return connection.Function end)
+        if okFn and typeof(fn) == "function" then
+            if pcall(function() connection:Fire(CapturedInput, false) end) then
+                any = any + 1
             end
         end
     end
-    return false
+
+    if any > 0 then return true, ("realUIS:%d handlers"):format(any) end
+    return false, "no unlocked handlers on real UIS"
 end
+
+local BUTTON_SIGNALS = { "Activated", "MouseButton1Click", "MouseButton1Down" }
 
 local function fireButton()
     local button = ParryButton
-    if not button or not button.Parent then return false end
+    if not button or not button.Parent then return false, "no parry button found" end
 
-    local ok, how = tryFiresignal(button)
-    if ok then return true, how end
-
-    ok, how = tryConnections(button)
-    if ok then return true, how end
-
-    return false
-end
-
-local GAME_UIS_SIGNALS = { "InputBegan", "InputEnded" }
-
-local function fireGameUIS()
-    if not GameUIS or not CapturedInput then return false end
-
-    for _, signalName in ipairs(GAME_UIS_SIGNALS) do
-        local okSignal, signal = pcall(function() return GameUIS[signalName] end)
-        if okSignal and signal then
-            local fired = pcall(function() signal:Fire(CapturedInput, false) end)
-            if fired then return true, "gameUIS:" .. signalName end
-
-            if typeof(firesignal) == "function" and pcall(firesignal, signal, CapturedInput, false) then
-                return true, "gameUIS-firesignal:" .. signalName
+    if typeof(firesignal) == "function" then
+        for _, signalName in ipairs(BUTTON_SIGNALS) do
+            local okSignal, signal = pcall(function() return button[signalName] end)
+            if okSignal and signal and pcall(firesignal, signal) then
+                return true, "button:firesignal:" .. signalName
             end
+        end
+    end
 
-            if typeof(getconnections) == "function" then
+    if typeof(getconnections) == "function" then
+        for _, signalName in ipairs(BUTTON_SIGNALS) do
+            local okSignal, signal = pcall(function() return button[signalName] end)
+            if okSignal and signal then
                 local okConn, connections = pcall(getconnections, signal)
                 if okConn and typeof(connections) == "table" and #connections > 0 then
                     local any = false
                     for _, connection in ipairs(connections) do
-                        if pcall(function() connection:Fire(CapturedInput, false) end) then any = true end
+                        if pcall(function() connection:Fire() end) then any = true end
                     end
-                    if any then return true, "gameUIS-conn:" .. signalName end
+                    if any then return true, "button:connections:" .. signalName end
                 end
             end
         end
     end
 
-    return false
+    return false, "button had no usable signal"
 end
 
-local function fireRemote()
-    local remote = LockedRemote
-    local method = LockedMethod
-    if not remote then return false end
+local Methods = {
+    GameUIS = fireGameUIS,
+    RealUIS = fireRealUIS,
+    Button = fireButton,
+}
 
-    local ok = pcall(function()
-        if method == "InvokeServer" then
-            remote:InvokeServer()
-        elseif method == "Fire" then
-            remote:Fire()
-        else
-            remote:FireServer()
-        end
-    end)
+local AUTO_ORDER = { "GameUIS", "RealUIS", "Button" }
 
-    return ok, "remote:" .. tostring(method)
+local function doFire()
+    if Config.Method ~= "Auto" then
+        local fn = Methods[Config.Method]
+        if not fn then return false, "unknown method" end
+        return fn()
+    end
+
+    local lastWhy = "nothing available"
+    for _, name in ipairs(AUTO_ORDER) do
+        local ok, why = Methods[name]()
+        if ok then return true, why end
+        lastWhy = why
+    end
+    return false, lastWhy
 end
 
-local function fireLocked()
-    if not ParryButton and not LockedRemote and not GameUIS then return end
-
+local function fireParry()
     CooldownUntil = os.clock() + Config.Cooldown
 
     task.spawn(function()
-        local ok, how = fireGameUIS()
-        if not ok then
-            ok, how = fireButton()
-        end
-        if not ok then
-            ok, how = fireRemote()
-        end
-
+        local ok, why = doFire()
         if ok then
             Fires = Fires + 1
-            FireMethod = how
+            if FireMethod ~= why then
+                say("firing via " .. why, Color3.fromRGB(126, 217, 87))
+            end
+            FireMethod = why
         else
-            FireMethod = "nothing worked"
-            log("fire failed - no working method")
+            if FireMethod ~= why then
+                say("could not fire: " .. tostring(why), Color3.fromRGB(255, 120, 120))
+            end
+            FireMethod = why
         end
     end)
 end
 
 track(PreSimulation:Connect(function()
     if Unloading then return end
-
     if not Config.Enabled then Blocked = "off" return end
-    if not ParryButton and not LockedRemote and not GameUIS then
-        Blocked = "no button, remote or game UIS"
-        return
-    end
 
     local ball, isTraining = realBall()
     if not ball then
-        Blocked = BallsFolder and "no ball in folder" or "no Balls folder found"
+        Blocked = BallsFolder and "no ball in folder" or "no Balls folder"
         LiveTarget, LiveDistance, LiveEta = "-", 0, 0
         return
     end
@@ -544,7 +368,7 @@ track(PreSimulation:Connect(function()
     if eta > lead then Blocked = "waiting for lead" return end
 
     Blocked = "FIRING"
-    fireLocked()
+    fireParry()
 end))
 
 local Centrl = loadstring(game:HttpGet(
@@ -571,15 +395,7 @@ local MainTab = Window:Tab({ Title = 'main', Icon = 'crosshair' })
 local MainSection = MainTab:Section({ Title = 'auto parry', Side = 'left' })
 
 statusStat = MainSection:Stat({ Title = 'status', Value = 'off' })
-lockedStat = MainSection:Stat({ Title = 'learned remote', Value = 'none yet' })
-callStat = MainSection:Stat({ Title = 'calls', Value = 'nothing yet' })
-local hookStat = MainSection:Stat({ Title = 'hook / presses', Value = '0 calls / 0 presses' })
-
-local LiveSection = MainTab:Section({ Title = 'live', Side = 'left' })
-local blockStat = LiveSection:Stat({ Title = 'why not firing', Value = 'off' })
-local targetStat = LiveSection:Stat({ Title = 'ball target', Value = '-' })
-local distStat = LiveSection:Stat({ Title = 'distance', Value = '-' })
-local etaStat = LiveSection:Stat({ Title = 'eta / lead', Value = '-' })
+methodStat = MainSection:Stat({ Title = 'firing via', Value = 'nothing yet' })
 
 EnabledToggle = MainSection:Toggle({
     Title = 'auto parry',
@@ -587,18 +403,37 @@ EnabledToggle = MainSection:Toggle({
     Default = false,
     Callback = function(value)
         Config.Enabled = value
-        if value then
-            startLearning()
-            if not LockedRemote then
-                notify('Parry once yourself - it will learn from that press.', 'warning', 9)
-            end
-        else
-            stopLearning()
+        log(value and "auto parry ON" or "auto parry OFF")
+        if value and not CapturedInput then
+            notify('Press parry once yourself so it has a real input to replay.', 'warning', 9)
         end
     end,
 })
 
-local TuningSection = MainTab:Section({ Title = 'timing', Side = 'left' })
+MainSection:Dropdown({
+    Title = 'method',
+    Flag = 'bb_method',
+    Options = { 'Auto', 'GameUIS', 'RealUIS', 'Button' },
+    Default = 'Auto',
+    Callback = function(value)
+        Config.Method = value
+        FireMethod = "none"
+        log("method set to " .. value)
+    end,
+})
+
+MainSection:Paragraph({
+    Title = 'the methods',
+    Text = 'GameUIS pushes your captured input through ReplicatedStorage.UserInputService, a custom module the game uses instead of the real service - its own scripts listen there, not to Roblox. RealUIS fires the unlocked handlers on the real UserInputService.InputBegan, which is where the obfuscated sword controller appeared to sit. Button presses the Hotbar Block ImageButton. Auto tries them in that order. None of them use VirtualInputManager or send a remote directly.',
+})
+
+local LiveSection = MainTab:Section({ Title = 'live', Side = 'left' })
+blockStat = LiveSection:Stat({ Title = 'why not firing', Value = 'off' })
+targetStat = LiveSection:Stat({ Title = 'ball target', Value = '-' })
+distStat = LiveSection:Stat({ Title = 'distance', Value = '-' })
+etaStat = LiveSection:Stat({ Title = 'eta / lead', Value = '-' })
+
+local TuningSection = MainTab:Section({ Title = 'timing', Side = 'right' })
 
 TuningSection:Slider({
     Title = 'lead',
@@ -633,143 +468,54 @@ TuningSection:Slider({
     Callback = function(value) Config.PingFactor = value end,
 })
 
-local FilterSection = MainTab:Section({ Title = 'learning filter', Side = 'left' })
-
-FilterSection:Toggle({
-    Title = 'strict filter',
-    Flag = 'bb_strict',
-    Default = false,
-    Callback = function(value)
-        Config.Strict = value
-        log("strict filter: " .. tostring(value))
-    end,
-})
-
-FilterSection:Slider({
-    Title = 'window before press',
-    Flag = 'bb_pre_window',
-    Min = 0,
-    Max = 2,
+TuningSection:Slider({
+    Title = 'cooldown',
+    Flag = 'bb_cooldown',
+    Min = 0.05,
+    Max = 1,
     Increment = 0.05,
-    Default = 0.6,
+    Default = 0.2,
     Suffix = 's',
-    Callback = function(value) Config.PreWindow = value end,
+    Callback = function(value) Config.Cooldown = value end,
 })
 
-FilterSection:Slider({
-    Title = 'window after press',
-    Flag = 'bb_post_window',
-    Min = 0,
-    Max = 2,
-    Increment = 0.05,
-    Default = 0.6,
-    Suffix = 's',
-    Callback = function(value) Config.PostWindow = value end,
+local LogSection = MainTab:Section({ Title = 'log', Side = 'right' })
+
+logConsole = LogSection:Console({
+    Title = 'what it is doing',
+    Height = 200,
+    MaxLines = 100,
+    Timestamps = true,
 })
 
-FilterSection:Toggle({
-    Title = 'show all traffic (ignore press timing)',
-    Flag = 'bb_show_all',
-    Default = false,
-    Callback = function(value)
-        Config.ShowAll = value
-        log("show all: " .. tostring(value))
-        if value then
-            notify('Every remote call is now listed regardless of timing, and nothing auto-selects. Use this to find out whether block sends anything at all.', 'warning', 9)
-        end
-    end,
-})
-
-FilterSection:Paragraph({
-    Title = 'if it is not finding it',
-    Text = 'Strict filter off means nothing is excluded by name or first argument - every FireServer, InvokeServer and Fire seen inside the window becomes a numbered candidate, telemetry included. Widen the windows if the call still is not showing up; the game may send it well before your press registers. Then cycle with try next candidate.',
-})
-
-local LearnSection = MainTab:Section({ Title = 'what it sees', Side = 'right' })
-
-learnConsole = LearnSection:Console({
-    Title = 'candidates',
-    Height = 220,
-    MaxLines = 120,
-    Timestamps = false,
-})
-
-LearnSection:Button({
-    Title = 'clear',
+LogSection:Button({
+    Title = 'test fire now',
     Callback = function()
-        if learnConsole then learnConsole:Clear() end
+        local ok, why = doFire()
+        say(ok and ("test fire ok: " .. why) or ("test fire failed: " .. tostring(why)),
+            ok and Color3.fromRGB(126, 217, 87) or Color3.fromRGB(255, 120, 120))
+    end,
+})
+
+LogSection:Button({
+    Title = 'clear log',
+    Callback = function()
+        if logConsole then logConsole:Clear() end
     end,
 })
 
 local ControlSection = MainTab:Section({ Title = 'control', Side = 'right' })
 
 ControlSection:Button({
-    Title = 'try next candidate',
-    Callback = function()
-        if #Candidates == 0 then
-            notify('No candidates captured yet.', 'warning', 6)
-            return
-        end
-        local nextIndex = CandidateIndex + 1
-        if nextIndex > #Candidates then nextIndex = 1 end
-        lockCandidate(nextIndex)
-    end,
-})
-
-ControlSection:Button({
-    Title = 'list candidates',
-    Callback = function()
-        if #Candidates == 0 then
-            notify('No candidates captured yet.', 'warning', 6)
-            return
-        end
-        local lines = {}
-        for index, entry in ipairs(Candidates) do
-            lines[#lines + 1] = ("[%d]%s %s %s (%+.3fs)"):format(
-                index, index == CandidateIndex and " *" or "",
-                entry.className, entry.fullName, entry.delta)
-        end
-        local text = table.concat(lines, "\n")
-        log("candidates ->\n" .. text)
-        local copied = typeof(setclipboard) == "function" and pcall(setclipboard, text)
-        notify(copied
-            and ('%d candidate(s) copied.'):format(#Candidates)
-            or ('%d candidate(s) - see %s'):format(#Candidates, LOG_PATH), 'success', 7)
-    end,
-})
-
-ControlSection:Button({
-    Title = 'forget everything',
-    Callback = function()
-        LockedRemote = nil
-        LockedClass = nil
-        LockedFullName = nil
-        LockedMethod = nil
-        CandidateIndex = 0
-        table.clear(Candidates)
-        table.clear(seenCandidates)
-        stopLearning()
-        log("forgot everything")
-        notify('Cleared. Turn auto parry off and on to learn again.', 'warning', 7)
-    end,
-})
-
-ControlSection:Button({
     Title = 'unload',
     Callback = function()
         Unloading = true
         Config.Enabled = false
-        stopLearning()
         for _, connection in ipairs(Connections) do
             pcall(function() connection:Disconnect() end)
         end
         Centrl:Unload()
     end,
-})
-
-ControlSection:Paragraph({
-    Title = 'how it fires',
-    Text = 'It presses the real Block button rather than sending anything itself: firesignal on the button Activated signal first, and if the executor has no firesignal, getconnections with Fire on each handler instead. No VirtualInputManager, no synthetic touch or mouse events at all - those glitch on mobile and are the obvious tell on a touch device. Whatever the game does on a real press it does here too, including any remote it would have sent, so the remote never has to be identified. A learned remote is only used as a fallback if no button can be found. The calls stat names the technique that actually worked.',
 })
 
 task.spawn(function()
@@ -778,24 +524,13 @@ task.spawn(function()
         pcall(function()
             if not Config.Enabled then
                 statusStat:Set('off')
-            elseif LockedRemote then
+            elseif CapturedInput then
                 statusStat:Set(('armed - %d fired'):format(Fires), Color3.fromRGB(126, 217, 87))
-            elseif learning then
-                statusStat:Set('parry once yourself...', Color3.fromRGB(255, 180, 70))
             else
-                statusStat:Set('idle')
+                statusStat:Set('press parry once to arm', Color3.fromRGB(255, 180, 70))
             end
-            lockedStat:Set(LockedFullName
-                and ('[%d/%d] %s'):format(CandidateIndex, #Candidates, LockedFullName)
-                or ('none yet (%d candidates)'):format(#Candidates))
-            callStat:Set(FireMethod ~= "none" and FireMethod
-                or (GameUIS and (CapturedInput and 'game UIS ready' or 'press once to arm')
-                    or (ParryButton and 'button ready' or 'nothing yet')))
 
-            hookStat:Set(('%d calls / %d presses'):format(SeenCalls, SeenPresses),
-                (SeenCalls > 0 and SeenPresses > 0) and Color3.fromRGB(126, 217, 87)
-                or Color3.fromRGB(255, 180, 70))
-
+            methodStat:Set(FireMethod)
             blockStat:Set(Blocked, Blocked == "FIRING" and Color3.fromRGB(126, 217, 87) or nil)
             targetStat:Set(LiveTarget == LocalPlayer.Name and (LiveTarget .. '  (YOU)') or LiveTarget,
                 LiveTarget == LocalPlayer.Name and Color3.fromRGB(255, 90, 90) or nil)
@@ -809,3 +544,5 @@ end)
 
 Window:Load()
 log("loaded")
+say(GameUIS and "found the game's custom UserInputService module"
+    or "no custom UserInputService module found")
