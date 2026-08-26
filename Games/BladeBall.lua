@@ -20,6 +20,8 @@ local Unloading = false
 local notify
 local statusStat
 local lockedStat
+local callStat
+local learnConsole
 local EnabledToggle
 
 local function track(connection)
@@ -204,7 +206,12 @@ local function lockRemote(instance)
 
     stopLearning()
 
-    log("locked remote: " .. fullName .. " (" .. className .. ")")
+    local call = (className == "RemoteFunction") and "InvokeServer()" or "FireServer()"
+    log("locked remote: " .. fullName .. " (" .. className .. ") -> " .. call)
+    if learnConsole then
+        learnConsole:Add("LOCKED " .. fullName, Color3.fromRGB(126, 217, 87))
+        learnConsole:Add("will call: " .. call, Color3.fromRGB(126, 217, 87))
+    end
     notify('Learned: ' .. fullName, 'success', 10)
     return true
 end
@@ -235,10 +242,23 @@ local function startLearning()
             if #learnQueue > 0 then
                 local item = table.remove(learnQueue, 1)
                 local delta = item.at - lastPressAt
-                if lastPressAt > 0 and delta >= 0 and delta <= 0.4 then
-                    if lockRemote(item.instance) then
-                        break
-                    end
+
+                local okName, fullName = pcall(function() return item.instance:GetFullName() end)
+                local okClass, className = pcall(function() return item.instance.ClassName end)
+                local shortName = okName and fullName:match("[^%.]+$") or "?"
+                local inWindow = lastPressAt > 0 and delta >= 0 and delta <= 0.4
+
+                if learnConsole then
+                    learnConsole:Add(("%s %s %s  (%+.2fs)"):format(
+                        inWindow and "MATCH" or "skip",
+                        okClass and className or "?",
+                        shortName,
+                        lastPressAt > 0 and delta or 0),
+                        inWindow and Color3.fromRGB(126, 217, 87) or nil)
+                end
+
+                if inWindow and lockRemote(item.instance) then
+                    break
                 end
             else
                 task.wait(0.05)
@@ -253,12 +273,46 @@ local function isPressLikeInput(inputType)
         or inputType == Enum.UserInputType.Touch
 end
 
-track(UserInputService.InputBegan:Connect(function(input, processed)
+local function markPress(source)
     if Unloading or not learning then return end
+    lastPressAt = os.clock()
+    if learnConsole then learnConsole:Add("-- press (" .. source .. ") --", Color3.fromRGB(255, 210, 80)) end
+end
+
+track(UserInputService.InputBegan:Connect(function(input, processed)
     if processed then return end
     if not isPressLikeInput(input.UserInputType) then return end
-    lastPressAt = os.clock()
+    markPress("input")
 end))
+
+local PARRY_BUTTON_NAMES = { block = true, parry = true }
+local boundButtons = setmetatable({}, { __mode = "k" })
+
+local function bindParryButton(instance)
+    if boundButtons[instance] then return end
+    if not instance:IsA("GuiButton") then return end
+    if not PARRY_BUTTON_NAMES[instance.Name:lower()] then return end
+    boundButtons[instance] = true
+    track(instance.Activated:Connect(function() markPress("button " .. instance.Name) end))
+    log("bound parry button: " .. instance:GetFullName())
+end
+
+local function bindAllParryButtons()
+    local playerGui = LocalPlayer:FindFirstChild("PlayerGui")
+    if not playerGui then return end
+    for _, descendant in ipairs(playerGui:GetDescendants()) do
+        pcall(bindParryButton, descendant)
+    end
+end
+
+task.spawn(function()
+    local playerGui = LocalPlayer:WaitForChild("PlayerGui", 20)
+    if not playerGui then return end
+    bindAllParryButtons()
+    track(playerGui.DescendantAdded:Connect(function(descendant)
+        pcall(bindParryButton, descendant)
+    end))
+end)
 
 local function fireLocked()
     local remote = LockedRemote
@@ -352,6 +406,7 @@ local MainSection = MainTab:Section({ Title = 'auto parry', Side = 'left' })
 
 statusStat = MainSection:Stat({ Title = 'status', Value = 'off' })
 lockedStat = MainSection:Stat({ Title = 'learned remote', Value = 'none yet' })
+callStat = MainSection:Stat({ Title = 'calls', Value = 'nothing yet' })
 
 EnabledToggle = MainSection:Toggle({
     Title = 'auto parry',
@@ -405,6 +460,22 @@ TuningSection:Slider({
     Callback = function(value) Config.PingFactor = value end,
 })
 
+local LearnSection = MainTab:Section({ Title = 'what it sees', Side = 'right' })
+
+learnConsole = LearnSection:Console({
+    Title = 'candidates',
+    Height = 220,
+    MaxLines = 120,
+    Timestamps = false,
+})
+
+LearnSection:Button({
+    Title = 'clear',
+    Callback = function()
+        if learnConsole then learnConsole:Clear() end
+    end,
+})
+
 local ControlSection = MainTab:Section({ Title = 'control', Side = 'right' })
 
 ControlSection:Button({
@@ -451,6 +522,11 @@ task.spawn(function()
                 statusStat:Set('idle')
             end
             lockedStat:Set(LockedFullName or 'none yet')
+            if LockedClass then
+                callStat:Set((LockedClass == "RemoteFunction") and 'InvokeServer()' or 'FireServer()')
+            else
+                callStat:Set('nothing yet')
+            end
         end)
     end
 end)
