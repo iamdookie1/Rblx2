@@ -583,8 +583,27 @@ end
 local captureHookInstalled = false
 local captureOriginal = nil
 local capturing = false
+local watching = false
 local captureQueue = {}
-local CAPTURE_QUEUE_LIMIT = 200
+local CAPTURE_QUEUE_LIMIT = 400
+
+local WATCH_METHODS = {
+    FireServer = true,
+    InvokeServer = true,
+    Fire = true,
+    Invoke = true,
+    SendTouchEvent = true,
+    SendMouseButtonEvent = true,
+    SendKeyEvent = true,
+    SendMouseMoveEvent = true,
+    Play = true,
+    Stop = true,
+    AdjustSpeed = true,
+    LoadAnimation = true,
+    BindAction = true,
+    BindActionAtPriority = true,
+    CallFunction = true,
+}
 
 local function installCaptureHook()
     if captureHookInstalled then return true end
@@ -595,14 +614,28 @@ local function installCaptureHook()
 
     local ok = pcall(function()
         local body = function(self, ...)
-            if capturing and typeof(self) == "Instance" and #captureQueue < CAPTURE_QUEUE_LIMIT then
+            if (capturing or watching) and typeof(self) == "Instance"
+                and #captureQueue < CAPTURE_QUEUE_LIMIT then
+
                 local okMethod, method = pcall(getNamecall)
-                if okMethod and (method == "FireServer" or method == "InvokeServer") then
-                    captureQueue[#captureQueue + 1] = {
-                        instance = self,
-                        method = method,
-                        at = os.clock(),
-                    }
+                if okMethod then
+                    local wanted = watching
+                        and WATCH_METHODS[method]
+                        or (method == "FireServer" or method == "InvokeServer")
+
+                    if wanted then
+                        local caller = "?"
+                        if watching then
+                            pcall(function() caller = tostring(debug.info(2, "s")) end)
+                        end
+
+                        captureQueue[#captureQueue + 1] = {
+                            instance = self,
+                            method = method,
+                            at = os.clock(),
+                            caller = caller,
+                        }
+                    end
                 end
             end
             return captureOriginal(self, ...)
@@ -619,6 +652,83 @@ local function installCaptureHook()
 
     captureHookInstalled = true
     return true
+end
+
+local function watchEverything(duration)
+    if watching or capturing then
+        say("already running", Color3.fromRGB(255, 180, 70))
+        return
+    end
+
+    if not installCaptureHook() then
+        say("could not install hook", Color3.fromRGB(255, 120, 120))
+        return
+    end
+
+    table.clear(captureQueue)
+    table.clear(FoundRemotes)
+    watching = true
+
+    say(("watching everything for %ds - let the paid script parry NOW"):format(duration),
+        Color3.fromRGB(255, 210, 80))
+
+    task.spawn(function()
+        local started = os.clock()
+        local lines = { "everything called during the window" }
+        local records = {}
+
+        while os.clock() - started < duration do
+            while #captureQueue > 0 do
+                local item = table.remove(captureQueue, 1)
+                local okName, fullName = pcall(function() return item.instance:GetFullName() end)
+                records[#records + 1] = {
+                    method = item.method,
+                    fullName = okName and fullName or "?",
+                    className = item.instance.ClassName,
+                    caller = item.caller,
+                    offset = item.at - started,
+                    instance = item.instance,
+                }
+            end
+            task.wait(0.03)
+        end
+
+        watching = false
+
+        local byCaller = {}
+        for _, record in ipairs(records) do
+            byCaller[record.caller] = (byCaller[record.caller] or 0) + 1
+        end
+
+        lines[#lines + 1] = "-- callers seen --"
+        for caller, count in pairs(byCaller) do
+            lines[#lines + 1] = ("  %d call(s) from %s"):format(count, caller)
+        end
+
+        lines[#lines + 1] = "-- calls in order --"
+        local seen = {}
+        for _, record in ipairs(records) do
+            lines[#lines + 1] = ("+%.3fs %s %s %s")
+                :format(record.offset, record.method, record.className, record.fullName)
+            lines[#lines + 1] = ("        from %s"):format(record.caller)
+
+            if isRemoteInstance(record.instance) and not seen[record.instance] then
+                seen[record.instance] = true
+                FoundRemotes[#FoundRemotes + 1] = {
+                    instance = record.instance,
+                    className = record.className,
+                    fullName = record.fullName,
+                    method = record.method,
+                }
+            end
+        end
+
+        lines[#lines + 1] = ("%d call(s) total, %d distinct remote(s) kept")
+            :format(#records, #FoundRemotes)
+        deliverDump(lines, "watch")
+        say(("watched %d call(s), kept %d remote(s)"):format(#records, #FoundRemotes),
+            Color3.fromRGB(255, 210, 80))
+    end)
 end
 
 local function captureDuringParry(duration)
@@ -1170,6 +1280,18 @@ InspectSection:Button({
         end
         scanBySource(query)
     end,
+})
+
+InspectSection:Button({
+    Title = 'watch paid script (6s)',
+    Callback = function()
+        watchEverything(6)
+    end,
+})
+
+InspectSection:Paragraph({
+    Title = 'copying what the paid script does',
+    Text = 'Run the paid script with its auto parry on, press this, and let it parry. It records every remote fire, bindable fire, synthetic input, animation play and action bind seen in the window, and tags each one with the chunk that called it - so its calls are separated from the game\'s own. Whatever it does that a manual parry does not is the mechanism. Any remotes seen are kept in the numbered list so they can be fired straight afterwards.',
 })
 
 InspectSection:Button({
