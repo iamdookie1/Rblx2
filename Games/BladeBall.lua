@@ -41,6 +41,7 @@ local Config = {
     UseClosingSpeed = true,
 
     PressBudget = 2,
+    CaptureWindow = 2.0,
 
     Sound = true,
     Logging = true,
@@ -250,7 +251,8 @@ end
 local HAS_NAMECALL = typeof(hookmetamethod) == "function" and typeof(getnamecallmethod) == "function"
 local capturing = false
 
-local CAPTURE_LIMIT = 25
+local CAPTURE_LIMIT = 60
+local CAPTURE_IGNORE = { SetPointer = true, SetLook = true }
 
 local function describeCall(self, method, args)
     local fullName = "?"
@@ -325,8 +327,10 @@ local Pressers = {
         local hookOk = pcall(function()
             originalNamecall = hookmetamethod(game, "__namecall", function(self, ...)
                 if count < CAPTURE_LIMIT and typeof(self) == "Instance" then
+                    local okName, name = pcall(function() return self.Name end)
+                    local ignored = okName and CAPTURE_IGNORE[name] == true
                     local okMethod, method = pcall(getnamecallmethod)
-                    if okMethod and (method == "FireServer" or method == "Fire" or method == "InvokeServer") then
+                    if not ignored and okMethod and (method == "FireServer" or method == "Fire" or method == "InvokeServer") then
                         count = count + 1
                         local args = { ... }
 
@@ -351,7 +355,7 @@ local Pressers = {
 
         task.spawn(function()
 
-            local deadline = os.clock() + 0.5
+            local deadline = os.clock() + Config.CaptureWindow
             while os.clock() < deadline do
                 task.wait()
             end
@@ -359,7 +363,7 @@ local Pressers = {
             capturing = false
 
             if count == 0 then
-                log("capture: nothing observed within 0.5s")
+                log(("capture: nothing observed within %.1fs"):format(Config.CaptureWindow))
                 notify('Nothing observed at all - the touch may not have registered.', 'warning', 6)
                 return
             end
@@ -540,6 +544,17 @@ ModeSection:Slider({
         Config.PressBudget = value
         Stats.Budget = value
     end,
+})
+
+ModeSection:Slider({
+    Title = 'capture window',
+    Flag = 'bb_capture_window',
+    Min = 0.3,
+    Max = 4,
+    Increment = 0.1,
+    Default = 2.0,
+    Suffix = 's',
+    Callback = function(value) Config.CaptureWindow = value end,
 })
 
 ModeSection:Toggle({
