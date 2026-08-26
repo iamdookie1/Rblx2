@@ -69,7 +69,19 @@ local MethodScores = {
     Capture = { presses = 0, successes = 0 },
 }
 
-local BallsFolder = Workspace:WaitForChild("Balls", 20)
+local function findChildCI(parent, name)
+    if not parent then return nil end
+    local lowered = name:lower()
+    for _, child in ipairs(parent:GetChildren()) do
+        if child.Name:lower() == lowered then
+            return child
+        end
+    end
+    return nil
+end
+
+local BallsFolder = Workspace:WaitForChild("Balls", 6)
+local TrainingBallsFolder = findChildCI(Workspace, "TrainingBalls")
 local AliveFolder = Workspace:WaitForChild("Alive", 20)
 local Remotes = ReplicatedStorage:WaitForChild("Remotes", 20)
 
@@ -118,14 +130,29 @@ local function isPlaying()
     return humanoid ~= nil and humanoid.Health > 0
 end
 
+local function isAlive()
+    local char = LocalPlayer.Character
+    if not char then return false end
+    local humanoid = char:FindFirstChildOfClass("Humanoid")
+    return humanoid ~= nil and humanoid.Health > 0
+end
+
 local function realBall()
-    if not BallsFolder then return nil end
-    for _, part in ipairs(BallsFolder:GetChildren()) do
-        if part:IsA("BasePart") and part:GetAttribute("realBall") ~= false then
-            return part
+    if BallsFolder then
+        for _, part in ipairs(BallsFolder:GetChildren()) do
+            if part:IsA("BasePart") and part:GetAttribute("realBall") ~= false then
+                return part, false
+            end
         end
     end
-    return nil
+    if TrainingBallsFolder then
+        for _, part in ipairs(TrainingBallsFolder:GetChildren()) do
+            if part:IsA("BasePart") then
+                return part, true
+            end
+        end
+    end
+    return nil, false
 end
 
 local function closingSpeed(ball, root)
@@ -333,8 +360,11 @@ local Pressers = {
                     local okMethod, method = pcall(getnamecallmethod)
                     if okMethod and (method == "FireServer" or method == "Fire" or method == "InvokeServer") then
                         local okName, name = pcall(function() return self.Name end)
+                        local okFullName, fullName = pcall(function() return self:GetFullName() end)
                         local firstArg = select(1, ...)
-                        local ignored = (okName and CAPTURE_IGNORE[name] == true) or CAPTURE_IGNORE_TAGS[firstArg] == true
+                        local ignored = (okName and CAPTURE_IGNORE[name] == true)
+                            or CAPTURE_IGNORE_TAGS[firstArg] == true
+                            or (okFullName and fullName:find("ClientKit", 1, true) ~= nil)
 
                         if ignored then
                             ignoredCount = ignoredCount + 1
@@ -444,7 +474,7 @@ track(PostSimulation:Connect(function()
     cueRing.Visible = showCue
     cueLabel.Visible = showCue
 
-    local ball = realBall()
+    local ball, isTraining = realBall()
     local root = getRoot()
 
     if not ball or not root then
@@ -455,7 +485,7 @@ track(PostSimulation:Connect(function()
         return
     end
 
-    Stats.LastTarget = tostring(ball:GetAttribute("target"))
+    Stats.LastTarget = isTraining and "(training)" or tostring(ball:GetAttribute("target"))
 
     local distance = (ball.Position - root.Position).Magnitude
     local speed = closingSpeed(ball, root)
@@ -467,8 +497,12 @@ track(PostSimulation:Connect(function()
     Stats.LastEta = eta
 
     if not Config.Enabled then return end
-    if not isPlaying() then return end
-    if ball:GetAttribute("target") ~= LocalPlayer.Name then return end
+    if isTraining then
+        if not isAlive() then return end
+    else
+        if not isPlaying() then return end
+    end
+    if not isTraining and ball:GetAttribute("target") ~= LocalPlayer.Name then return end
     if os.clock() < Stats.CooldownUntil then return end
     if distance > Config.MaxDistance then return end
 
@@ -504,8 +538,10 @@ function notify(content, kind, duration)
     })
 end
 
-if not BallsFolder then
+if not BallsFolder and not TrainingBallsFolder then
     notify('workspace.Balls not found - the game may have changed.', 'error', 8)
+elseif not BallsFolder then
+    notify(('Using workspace.%s - workspace.Balls not found.'):format(TrainingBallsFolder.Name), 'warning', 6)
 end
 
 local MainTab = Window:Tab({ Title = 'parry', Icon = 'crosshair' })
