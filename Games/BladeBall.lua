@@ -41,6 +41,13 @@ local Config = {
 local Fires = 0
 local CooldownUntil = 0
 
+local Blocked = "off"
+local LiveTarget = "-"
+local LiveDistance = 0
+local LiveClosing = 0
+local LiveEta = 0
+local LiveLead = 0
+
 local LockedRemote = nil
 local LockedClass = nil
 local LockedFullName = nil
@@ -339,33 +346,36 @@ local function fireLocked()
 end
 
 track(PreSimulation:Connect(function()
-    if Unloading or not Config.Enabled or not LockedRemote then return end
-    if os.clock() < CooldownUntil then return end
+    if Unloading then return end
+
+    if not Config.Enabled then Blocked = "off" return end
+    if not LockedRemote then Blocked = "nothing learned yet" return end
 
     local ball, isTraining = realBall()
-    if not ball then return end
+    if not ball then
+        Blocked = BallsFolder and "no ball in folder" or "no Balls folder found"
+        LiveTarget, LiveDistance, LiveEta = "-", 0, 0
+        return
+    end
 
     local root = getRoot()
-    if not root then return end
+    if not root then Blocked = "no character" return end
 
-    if isTraining then
-        if not isAlive() then return end
-    else
-        if not isPlaying() then return end
-        if ball:GetAttribute("target") ~= LocalPlayer.Name then return end
-    end
+    local targetAttr = ball:GetAttribute("target")
+    LiveTarget = isTraining and "(training)" or tostring(targetAttr)
 
     local offset = root.Position - ball.Position
     local distance = offset.Magnitude
-    if distance > Config.MaxDistance then return end
+    LiveDistance = distance
 
-    local velocity = ball.AssemblyLinearVelocity
-    if distance < 0.01 then return end
+    local closing = 0
+    if distance >= 0.01 then
+        closing = ball.AssemblyLinearVelocity:Dot(offset.Unit)
+    end
+    LiveClosing = closing
 
-    local closing = velocity:Dot(offset.Unit)
-    if closing <= 1 then return end
-
-    local eta = distance / closing
+    local eta = (closing > 1) and (distance / closing) or math.huge
+    LiveEta = eta
 
     local ping = 0
     if PingModule then
@@ -375,9 +385,21 @@ track(PreSimulation:Connect(function()
     local lead = Config.Lead
         + (ping * 0.5 * Config.PingFactor)
         + math.clamp(closing / 1000, 0, 1) * Config.SpeedLead
+    LiveLead = lead
 
-    if eta > lead then return end
+    if isTraining then
+        if not isAlive() then Blocked = "dead" return end
+    else
+        if not isPlaying() then Blocked = "not in Alive folder" return end
+        if targetAttr ~= LocalPlayer.Name then Blocked = "not my ball" return end
+    end
 
+    if os.clock() < CooldownUntil then Blocked = "cooldown" return end
+    if distance > Config.MaxDistance then Blocked = "too far" return end
+    if closing <= 1 then Blocked = "not closing" return end
+    if eta > lead then Blocked = "waiting for lead" return end
+
+    Blocked = "FIRING"
     fireLocked()
 end))
 
@@ -407,6 +429,12 @@ local MainSection = MainTab:Section({ Title = 'auto parry', Side = 'left' })
 statusStat = MainSection:Stat({ Title = 'status', Value = 'off' })
 lockedStat = MainSection:Stat({ Title = 'learned remote', Value = 'none yet' })
 callStat = MainSection:Stat({ Title = 'calls', Value = 'nothing yet' })
+
+local LiveSection = MainTab:Section({ Title = 'live', Side = 'left' })
+local blockStat = LiveSection:Stat({ Title = 'why not firing', Value = 'off' })
+local targetStat = LiveSection:Stat({ Title = 'ball target', Value = '-' })
+local distStat = LiveSection:Stat({ Title = 'distance', Value = '-' })
+local etaStat = LiveSection:Stat({ Title = 'eta / lead', Value = '-' })
 
 EnabledToggle = MainSection:Toggle({
     Title = 'auto parry',
@@ -527,6 +555,14 @@ task.spawn(function()
             else
                 callStat:Set('nothing yet')
             end
+
+            blockStat:Set(Blocked, Blocked == "FIRING" and Color3.fromRGB(126, 217, 87) or nil)
+            targetStat:Set(LiveTarget == LocalPlayer.Name and (LiveTarget .. '  (YOU)') or LiveTarget,
+                LiveTarget == LocalPlayer.Name and Color3.fromRGB(255, 90, 90) or nil)
+            distStat:Set(('%.1f studs @ %.0f/s'):format(LiveDistance, LiveClosing))
+            etaStat:Set(LiveEta == math.huge
+                and ('- / %.2fs'):format(LiveLead)
+                or ('%.3fs / %.2fs'):format(LiveEta, LiveLead))
         end)
     end
 end)
