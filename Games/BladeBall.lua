@@ -68,6 +68,7 @@ local MethodScores = {
     UIBlock = { presses = 0, successes = 0 },
     UIButton = { presses = 0, successes = 0 },
     ReplayInput = { presses = 0, successes = 0 },
+    FireCaptured = { presses = 0, successes = 0 },
     Animation = { presses = 0, successes = 0 },
     Bindable = { presses = 0, successes = 0 },
     Input = { presses = 0, successes = 0 },
@@ -824,6 +825,22 @@ local Pressers = {
 
     ReplayInput = replayCapturedInput,
 
+    FireCaptured = function()
+        if #LastCaptured == 0 then return false, "nothing captured yet" end
+        local entry = LastCaptured[#LastCaptured]
+
+        local okClass, className = pcall(function() return entry.instance.ClassName end)
+        if not okClass then return false, "captured instance is gone" end
+
+        return pcall(function()
+            if className == "RemoteFunction" then
+                entry.instance:InvokeServer()
+            else
+                entry.instance:FireServer()
+            end
+        end)
+    end,
+
     Animation = function()
         local animTrack = getGrabParryTrack()
         if not animTrack then return false, "could not load GrabParry animation track" end
@@ -969,7 +986,7 @@ local ModeSection = MainTab:Section({ Title = 'mode', Side = 'left' })
 ModeSection:Dropdown({
     Title = 'mode',
     Flag = 'bb_mode',
-    Options = { 'Indicator', 'Remote', 'UIBlock', 'UIButton', 'ReplayInput', 'Animation', 'Bindable', 'Input', 'Capture', 'Observe' },
+    Options = { 'Indicator', 'Remote', 'UIBlock', 'UIButton', 'ReplayInput', 'FireCaptured', 'Animation', 'Bindable', 'Input', 'Capture', 'Observe' },
     Default = 'Indicator',
     Callback = function(value)
         Config.Mode = value
@@ -1193,6 +1210,11 @@ RiskSection:Paragraph({
 RiskSection:Paragraph({
     Title = 'Animation - plays GrabParry directly, no remote at all',
     Text = 'Loads and plays rbxassetid://13772445960 (GrabParry) on the current Animator - the exact animation confirmed to play on every real block press. Animation state replicates to the server automatically the same way a real press would, with no remote call from this script at all - the lowest-footprint method tried yet if the theory holds that blocking is resolved from replicated pose rather than an explicit attempt message. Unconfirmed: whether the server can tell a programmatically-played animation apart from one driven by real input.',
+})
+
+RiskSection:Paragraph({
+    Title = 'FireCaptured - calls the exact instance Capture or Observe last saw',
+    Text = 'Uses the literal Instance reference from the most recent Capture/Observe hit, not its name - so it works even though names rotate, as long as you are still in the lobby that instance came from. Strongest candidate yet if that last capture came from watching a script confirmed to actually work: calling the same real remote it used, timed against a real ball the same way every other mode is. Only as good as whatever was last captured - re-run Capture or Observe first if you switch targets.',
 })
 
 RiskSection:Paragraph({
