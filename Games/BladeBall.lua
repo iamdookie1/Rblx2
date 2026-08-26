@@ -577,6 +577,48 @@ local function clickButtonDirectly(guiButton)
     end)
 end
 
+local animWatching = false
+
+local function watchAnimations(duration)
+    if animWatching then return false, "already watching" end
+    local char = LocalPlayer.Character
+    if not char then return false, "no character" end
+    local humanoid = char:FindFirstChildOfClass("Humanoid")
+    local animator = humanoid and humanoid:FindFirstChildOfClass("Animator")
+    if not animator then return false, "no Animator found on current character" end
+
+    animWatching = true
+    local found = {}
+    local connection
+    connection = track(animator.AnimationPlayed:Connect(function(animTrack)
+        local id = "?"
+        pcall(function() id = animTrack.Animation.AnimationId end)
+        local line = ("%s | %s | weight=%.2f"):format(id, animTrack.Name, animTrack.WeightTarget)
+        found[#found + 1] = line
+        log("animation played -> " .. line)
+    end))
+
+    task.spawn(function()
+        task.wait(duration)
+        if connection then connection:Disconnect() end
+        animWatching = false
+
+        if #found == 0 then
+            notify('No animations observed during the window.', 'warning', 7)
+            return
+        end
+
+        local text = table.concat(found, "\n")
+        local copied = typeof(setclipboard) == "function" and pcall(setclipboard, text)
+        notify(copied
+            and ('%d animation(s) captured - copied to clipboard.'):format(#found)
+            or ('%d animation(s) captured - see %s'):format(#found, LOG_PATH),
+            'success', 8)
+    end)
+
+    return true
+end
+
 local CapturedInput = nil
 local capturingInput = false
 
@@ -1209,6 +1251,23 @@ DiagSection:Button({
         local ok, err = armInputCapture()
         if ok then
             notify('Armed. Press your real parry key/button right now.', 'warning', 7)
+        else
+            notify(tostring(err), 'error', 6)
+        end
+    end,
+})
+
+DiagSection:Paragraph({
+    Title = 'maybe there is no remote - animation watch',
+    Text = 'Every remote-based method tried so far (Remote, UIBlock, UIButton, ReplayInput) produced no effect, including ReplayInput firing the suspected real VM handler with a genuinely captured InputObject - and training confirmed it resolves hits for real (getting hit ejects you), so that is not explained away by a fake test environment. Blade-dodging games commonly resolve blocks by animation instead of by remote: press block plays a local animation, which replicates automatically with no remote call needed, and the server checks your replicated pose against its own ball tracking. Watch below for 10s and do one real manual block press - whatever animation ID plays is the next thing worth targeting instead of another remote guess.',
+})
+
+DiagSection:Button({
+    Title = 'watch animations (10s, real press)',
+    Callback = function()
+        local ok, err = watchAnimations(10)
+        if ok then
+            notify('Watching for 10s. Do one real manual block press right now.', 'warning', 7)
         else
             notify(tostring(err), 'error', 6)
         end
