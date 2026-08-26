@@ -122,6 +122,79 @@ local function log(text)
     appendToFile(("[%s] %s\n"):format(os.date("%H:%M:%S"), text))
 end
 
+local SNAP_PATH_1 = "RemotesSnap.txt"
+local SNAP_PATH_2 = "RemotesSnap2.txt"
+local canRead = typeof(readfile) == "function"
+local canCheckFile = typeof(isfile) == "function"
+local canDelete = typeof(delfile) == "function"
+
+local function dumpNetLines()
+    local lines = {}
+    if NetModule then
+        for _, child in ipairs(NetModule:GetChildren()) do
+            lines[#lines + 1] = child.ClassName .. " | " .. child.Name
+        end
+    end
+    table.sort(lines)
+    return lines
+end
+
+local function snapshotRemotes()
+    if not NetModule then return false, "net module missing" end
+    if not canWrite or not canCheckFile then return false, "executor has no writefile/isfile" end
+
+    local dump = table.concat(dumpNetLines(), "\n")
+    local target
+    if not isfile(SNAP_PATH_1) then
+        target = SNAP_PATH_1
+    elseif not isfile(SNAP_PATH_2) then
+        target = SNAP_PATH_2
+    else
+        return false, "both snapshots already exist - reset first"
+    end
+
+    local ok = pcall(writefile, target, dump)
+    if not ok then return false, "writefile failed for " .. target end
+    return true, target
+end
+
+local function resetSnapshots()
+    if canDelete then
+        pcall(delfile, SNAP_PATH_1)
+        pcall(delfile, SNAP_PATH_2)
+    elseif canWrite then
+        pcall(writefile, SNAP_PATH_1, "")
+        pcall(writefile, SNAP_PATH_2, "")
+    end
+end
+
+local function compareSnapshots()
+    if not canRead or not canCheckFile then return nil, "executor has no readfile/isfile" end
+    if not isfile(SNAP_PATH_1) or not isfile(SNAP_PATH_2) then
+        return nil, "need both " .. SNAP_PATH_1 .. " and " .. SNAP_PATH_2
+    end
+
+    local okA, contentsA = pcall(readfile, SNAP_PATH_1)
+    local okB, contentsB = pcall(readfile, SNAP_PATH_2)
+    if not okA or not okB then return nil, "readfile failed" end
+
+    local setA, setB = {}, {}
+    for line in contentsA:gmatch("[^\n]+") do setA[line] = true end
+    for line in contentsB:gmatch("[^\n]+") do setB[line] = true end
+
+    local onlyA, onlyB = {}, {}
+    for line in pairs(setA) do
+        if not setB[line] then onlyA[#onlyA + 1] = line end
+    end
+    for line in pairs(setB) do
+        if not setA[line] then onlyB[#onlyB + 1] = line end
+    end
+    table.sort(onlyA)
+    table.sort(onlyB)
+
+    return { onlyA = onlyA, onlyB = onlyB }
+end
+
 local function getRoot()
     local char = LocalPlayer.Character
     return char and char:FindFirstChild("HumanoidRootPart")
@@ -876,6 +949,62 @@ DiagSection:Button({
         else
             notify(tostring(err), 'error', 6)
         end
+    end,
+})
+
+DiagSection:Paragraph({
+    Title = 'compare across lobbies',
+    Text = 'Snapshot saves every remote name under net to RemotesSnap.txt. Do it once this lobby, rejoin or queue into a new match, then snapshot again - it writes to RemotesSnap2.txt automatically since the first file already exists. Compare then reads both and reports exactly which names differ between the two lobbies. Reset clears both files to start over.',
+})
+
+DiagSection:Button({
+    Title = 'snapshot remotes (for lobby compare)',
+    Callback = function()
+        local ok, result = snapshotRemotes()
+        if ok then
+            notify(('Saved %s (%d remotes).'):format(result, #dumpNetLines()), 'success', 6)
+        else
+            notify(tostring(result), 'error', 6)
+        end
+    end,
+})
+
+DiagSection:Button({
+    Title = 'compare snapshots',
+    Callback = function()
+        local result, err = compareSnapshots()
+        if not result then
+            notify(tostring(err), 'error', 6)
+            return
+        end
+
+        local totalDiff = #result.onlyA + #result.onlyB
+        log(("compare: %d only in snap1, %d only in snap2"):format(#result.onlyA, #result.onlyB))
+
+        local lines = {}
+        table.insert(lines, ("-- only in %s (%d) --"):format(SNAP_PATH_1, #result.onlyA))
+        for _, line in ipairs(result.onlyA) do table.insert(lines, line) end
+        table.insert(lines, ("-- only in %s (%d) --"):format(SNAP_PATH_2, #result.onlyB))
+        for _, line in ipairs(result.onlyB) do table.insert(lines, line) end
+        local text = table.concat(lines, "\n")
+
+        if canWrite then pcall(writefile, "RemotesSnapDiff.txt", text) end
+        local copied = typeof(setclipboard) == "function" and pcall(setclipboard, text)
+
+        if totalDiff == 0 then
+            notify('No differences - every remote name matched across both lobbies.', 'success', 8)
+        else
+            notify(('%d remote(s) differ between lobbies.%s'):format(
+                totalDiff, copied and ' Copied to clipboard.' or ' See RemotesSnapDiff.txt'), 'warning', 8)
+        end
+    end,
+})
+
+DiagSection:Button({
+    Title = 'reset snapshots',
+    Callback = function()
+        resetSnapshots()
+        notify('Both snapshot files cleared.')
     end,
 })
 
