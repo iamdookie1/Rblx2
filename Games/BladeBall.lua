@@ -333,16 +333,32 @@ end
 -- uses, and grabs whatever the game's own code sends to the server as a result.
 -- That is the real call with real arguments, straight from the source.
 --
+-- Originally filtered to remotes with "parry" in the name. A real test found
+-- nothing that way and still got kicked - faster than previous kicks, though
+-- not instantly - which most likely means the real call has some other name
+-- entirely (this game hashes a lot of its remotes) and the earlier version was
+-- watching for the wrong thing while still paying the exposure cost of
+-- watching. So the filter is gone: this now records every FireServer, Fire and
+-- InvokeServer call observed while armed, not just ones that look parry-shaped,
+-- and writes each one to file the moment it happens rather than waiting for
+-- the window to close - if BladeBallParry.txt exists at all after a capture,
+-- something was seen even if the script never got to say so out loud.
+--
 -- The hook is live for as short a time as this can manage: installed
--- immediately before the touch fires, torn down the moment a match is seen or
--- after 0.5s, whichever comes first. This does not make it invisible - a
--- __namecall hook is exactly what a debug.info(fn, "s") ~= "[C]" check catches,
--- which is the same technique SwordsController.PRY already uses on debug.info
--- itself. It only makes the window as small as possible.
+-- immediately before the touch fires, torn down at 0.5s. It can no longer stop
+-- early on a first match, because a real match might not be the first thing
+-- seen - so the full window is now always paid, not just on a miss. This does
+-- not make the hook invisible - a __namecall hook is exactly what a
+-- debug.info(fn, "s") ~= "[C]" check catches, which is the same technique
+-- SwordsController.PRY already uses on debug.info itself.
 local HAS_NAMECALL = typeof(hookmetamethod) == "function" and typeof(getnamecallmethod) == "function"
 local capturing = false
+-- Hard ceiling on how many individual calls get written out per capture, so a
+-- window that happens to land during heavy remote traffic cannot turn into an
+-- unbounded write storm. Well above what one parry press should ever produce.
+local CAPTURE_LIMIT = 25
 
-local function reportCapture(self, method, args)
+local function describeCall(self, method, args)
     local fullName = "?"
     pcall(function() fullName = self:GetFullName() end)
 
@@ -366,16 +382,7 @@ local function reportCapture(self, method, args)
         parts[index] = ok and text or "<unreadable>"
     end
 
-    local summary = ("%s : %s(%s)"):format(fullName, method, table.concat(parts, ", "))
-    log("CAPTURED real parry call -> " .. summary)
-
-    if typeof(setclipboard) == "function" then
-        local copied = pcall(setclipboard, summary)
-        notify(copied and 'Captured the real parry call. Copied to your clipboard.'
-            or ('Captured it, but copying failed - see ' .. LOG_PATH), copied and 'success' or 'warning', 8)
-    else
-        notify('Captured it, but this executor has no setclipboard - see ' .. LOG_PATH, 'warning', 8)
-    end
+    return ("%s : %s(%s)"):format(fullName, method, table.concat(parts, ", "))
 end
 
 -- Synthesised input at the centre of the screen, not at the ball: the handler
@@ -445,19 +452,28 @@ local Pressers = {
         if capturing then return false, "already capturing" end
         capturing = true
 
-        local seen = false
+        local count = 0
+        local summaries = {}
         local originalNamecall
         local hookOk = pcall(function()
             originalNamecall = hookmetamethod(game, "__namecall", function(self, ...)
-                if not seen and typeof(self) == "Instance" then
+                if count < CAPTURE_LIMIT and typeof(self) == "Instance" then
                     local okMethod, method = pcall(getnamecallmethod)
-                    if okMethod and (method == "FireServer" or method == "Fire") then
-                        local okName, name = pcall(function() return self.Name end)
-                        if okName and typeof(name) == "string" and name:lower():find("parry") then
-                            seen = true
-                            local args = { ... }
-                            task.spawn(reportCapture, self, method, args)
-                        end
+                    if okMethod and (method == "FireServer" or method == "Fire" or method == "InvokeServer") then
+                        count = count + 1
+                        local args = { ... }
+                        -- Kept out of the hook body itself: this call is on the
+                        -- hot path for every namecall in the game while armed,
+                        -- so the hook stays as close to a single branch as
+                        -- possible and the actual work happens off to the side.
+                        task.spawn(function()
+                            local summary = describeCall(self, method, args)
+                            summaries[#summaries + 1] = summary
+                            -- Written the instant it is seen, not batched for
+                            -- the window's end - if the kick lands mid-window
+                            -- this line already made it to disk.
+                            log("capture #" .. count .. " -> " .. summary)
+                        end)
                     end
                 end
                 return originalNamecall(self, ...)
@@ -474,19 +490,35 @@ local Pressers = {
         local pressOk = pressInput()
 
         task.spawn(function()
+            -- No early exit on a first match anymore: a real hit might not be
+            -- the first thing seen, so the whole window is paid every time,
+            -- not only on a miss.
             local deadline = os.clock() + 0.5
-            while not seen and os.clock() < deadline do
+            while os.clock() < deadline do
                 task.wait()
             end
             pcall(function() hookmetamethod(game, "__namecall", originalNamecall) end)
             capturing = false
-            if not seen then
-                log("capture: no parry-shaped remote observed within 0.5s")
-                notify('No matching remote observed - the touch may not have registered as a parry.', 'warning', 6)
+
+            if count == 0 then
+                log("capture: nothing observed within 0.5s")
+                notify('Nothing observed at all - the touch may not have registered.', 'warning', 6)
+                return
+            end
+
+            log(("capture: %d call(s) observed, see the lines above"):format(count))
+            if typeof(setclipboard) == "function" then
+                local copied = pcall(setclipboard, table.concat(summaries, "\n"))
+                notify(copied
+                    and ('Captured %d call(s). All copied to your clipboard.'):format(count)
+                    or ('Captured %d call(s), but copying failed - see %s'):format(count, LOG_PATH),
+                    copied and 'success' or 'warning', 8)
+            else
+                notify(('Captured %d call(s), but this executor has no setclipboard - see %s'):format(count, LOG_PATH), 'warning', 8)
             end
         end)
 
-        return pressOk, seen and "captured" or "armed"
+        return pressOk, "armed"
     end,
 }
 
@@ -626,7 +658,7 @@ ModeSection:Dropdown({
             if not HAS_NAMECALL then
                 notify('This executor has no hookmetamethod/getnamecallmethod - Capture cannot run here.', 'error', 8)
             else
-                notify('Capture fires a real touch and briefly hooks __namecall to grab what it sends. One or two attempts is enough - lower the press budget below.', 'warning', 10)
+                notify('Capture fires a real touch and records EVERY remote call seen for 0.5s, not just parry-shaped ones - written to file as each is seen. One attempt is enough - lower the press budget below.', 'warning', 10)
             end
         else
             notify(('%s mode: %d presses then it turns itself off. This is the part that gets people kicked.')
@@ -819,7 +851,12 @@ RiskSection:Paragraph({
 
 RiskSection:Paragraph({
     Title = 'Capture - grabs the real arguments instead of guessing them',
-    Text = 'Fires the same real touch or click Input does, but arms a __namecall hook a moment before and tears it down a moment after - long enough to see whatever remote the game\'s own code sends as a result, with its real arguments, and copy that to your clipboard. It is not the same as having no hook: a hook is briefly live either way, and the window being short reduces exposure, it does not remove it. Use it once or twice, not as a standing mode - lower the press budget below before trying it.',
+    Text = 'Fires the same real touch or click Input does, with a __namecall hook armed for the 0.5s around it. It no longer filters by name - a real test filtered for "parry" in the remote name, found nothing, and still got kicked, faster than previous kicks though not instantly. Most likely the real call has a different name entirely, so now every FireServer, Fire and InvokeServer seen in that window gets written to BladeBallParry.txt the instant it happens, not batched at the end. If the kick lands mid-window, whatever was already seen is already on disk.',
+})
+
+RiskSection:Paragraph({
+    Title = 'this is a wider hook than it used to be',
+    Text = 'Watching everything instead of one name means the hook can no longer stop the moment it sees a match - there might be more after it - so the full 0.5s is paid every time now, not just on a miss. That is more of the game\'s own traffic passing through code this script wrote, for longer, on every attempt. It is not a smaller risk than before; treat one capture as the whole budget for this mode.',
 })
 
 RiskSection:Paragraph({
