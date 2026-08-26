@@ -274,6 +274,199 @@ local function fireButton()
     return false, "button had no usable signal"
 end
 
+local function pickFunction(globalName, debugName)
+    local fn = nil
+    pcall(function()
+        local candidate = rawget(getfenv(0), globalName)
+        if typeof(candidate) == "function" then fn = candidate end
+    end)
+    if fn then return fn end
+    pcall(function()
+        local candidate = debug and debug[debugName]
+        if typeof(candidate) == "function" then fn = candidate end
+    end)
+    return fn
+end
+
+local getUpvalues = pickFunction("getupvalues", "getupvalues")
+local getConstants = pickFunction("getconstants", "getconstants")
+local getProtos = pickFunction("getprotos", "getprotos")
+local getGc = pickFunction("getgc", "getgc")
+
+local INSPECT_PATH = "BladeBallInspect.txt"
+local PARRY_WORDS = { "parry", "block", "deflect", "swing", "slash" }
+
+local function shortValue(value)
+    local kind = typeof(value)
+    if kind == "Instance" then
+        local ok, full = pcall(function() return value:GetFullName() end)
+        return "Instance(" .. (ok and full or value.ClassName) .. ")"
+    end
+    if kind == "string" then
+        if #value > 120 then return ('string("%s...")'):format(value:sub(1, 120)) end
+        return ('string("%s")'):format(value)
+    end
+    if kind == "table" then
+        local count = 0
+        pcall(function() for _ in pairs(value) do count = count + 1 end end)
+        return ("table(%d keys)"):format(count)
+    end
+    if kind == "function" then
+        local ok, source = pcall(debug.info, value, "s")
+        return "function(" .. (ok and tostring(source) or "?") .. ")"
+    end
+    return kind .. "(" .. tostring(value) .. ")"
+end
+
+local function looksInteresting(text)
+    local lowered = text:lower()
+    for _, word in ipairs(PARRY_WORDS) do
+        if lowered:find(word, 1, true) then return true end
+    end
+    return false
+end
+
+local function deliverDump(lines, label)
+    local text = table.concat(lines, "\n")
+    if canWrite then pcall(writefile, INSPECT_PATH, text) end
+    local copied = typeof(setclipboard) == "function" and pcall(setclipboard, text)
+    say(("%s: %d lines%s"):format(label, #lines,
+        copied and " - copied to clipboard" or (" - see " .. INSPECT_PATH)),
+        Color3.fromRGB(126, 217, 87))
+end
+
+local function inspectFunction(fn, lines, label)
+    lines[#lines + 1] = "== " .. label .. " =="
+
+    local okInfo, source, line, name = pcall(debug.info, fn, "sln")
+    if okInfo then
+        lines[#lines + 1] = ("  source=%s line=%s name=%s")
+            :format(tostring(source), tostring(line), tostring(name))
+    end
+
+    if getUpvalues then
+        local ok, ups = pcall(getUpvalues, fn)
+        if ok and typeof(ups) == "table" then
+            lines[#lines + 1] = "  -- upvalues --"
+            for index, value in pairs(ups) do
+                lines[#lines + 1] = ("    [%s] %s"):format(tostring(index), shortValue(value))
+            end
+        end
+    else
+        lines[#lines + 1] = "  (no getupvalues on this executor)"
+    end
+
+    if getConstants then
+        local ok, consts = pcall(getConstants, fn)
+        if ok and typeof(consts) == "table" then
+            lines[#lines + 1] = "  -- constants --"
+            for index, value in pairs(consts) do
+                lines[#lines + 1] = ("    [%s] %s"):format(tostring(index), shortValue(value))
+            end
+        end
+    else
+        lines[#lines + 1] = "  (no getconstants on this executor)"
+    end
+
+    if getProtos then
+        local ok, protos = pcall(getProtos, fn)
+        if ok and typeof(protos) == "table" then
+            lines[#lines + 1] = ("  -- %d nested function(s) --"):format(#protos)
+        end
+    end
+end
+
+local function inspectInputHandlers()
+    local lines = {}
+    lines[#lines + 1] = "InputBegan handler inspection"
+
+    if typeof(getconnections) ~= "function" then
+        say("no getconnections on this executor", Color3.fromRGB(255, 120, 120))
+        return
+    end
+
+    local okConn, connections = pcall(getconnections, UserInputService.InputBegan)
+    if not okConn or typeof(connections) ~= "table" then
+        say("getconnections failed", Color3.fromRGB(255, 120, 120))
+        return
+    end
+
+    lines[#lines + 1] = ("%d connection(s) total"):format(#connections)
+
+    local inspected = 0
+    for index, connection in ipairs(connections) do
+        local okFn, fn = pcall(function() return connection.Function end)
+        if okFn and typeof(fn) == "function" then
+            inspected = inspected + 1
+            inspectFunction(fn, lines, ("connection #%d"):format(index))
+        end
+    end
+
+    lines[#lines + 1] = ("%d were readable Luau closures"):format(inspected)
+    deliverDump(lines, "input handlers")
+end
+
+local function scanGarbageCollector()
+    if not getGc then
+        say("no getgc on this executor", Color3.fromRGB(255, 120, 120))
+        return
+    end
+
+    say("scanning memory, this takes a moment...", Color3.fromRGB(255, 180, 70))
+
+    task.spawn(function()
+        local lines = {}
+        lines[#lines + 1] = "garbage collector scan"
+
+        local ok, objects = pcall(getGc, true)
+        if not ok or typeof(objects) ~= "table" then
+            say("getgc failed", Color3.fromRGB(255, 120, 120))
+            return
+        end
+
+        local scanned = 0
+        local hits = 0
+
+        for _, object in pairs(objects) do
+            scanned = scanned + 1
+            if scanned % 2000 == 0 then task.wait() end
+            if hits >= 60 then break end
+
+            local kind = typeof(object)
+
+            if kind == "table" then
+                pcall(function()
+                    for key, value in pairs(object) do
+                        if typeof(key) == "string" and looksInteresting(key) then
+                            hits = hits + 1
+                            lines[#lines + 1] = ("table key %s = %s"):format(key, shortValue(value))
+                            break
+                        end
+                    end
+                end)
+            elseif kind == "function" and getConstants then
+                pcall(function()
+                    local okConst, consts = pcall(getConstants, object)
+                    if okConst and typeof(consts) == "table" then
+                        for _, value in pairs(consts) do
+                            if typeof(value) == "string" and looksInteresting(value) then
+                                hits = hits + 1
+                                local okSrc, source = pcall(debug.info, object, "s")
+                                lines[#lines + 1] = ("function const %q in %s")
+                                    :format(value:sub(1, 80), okSrc and tostring(source) or "?")
+                                break
+                            end
+                        end
+                    end
+                end)
+            end
+        end
+
+        lines[#lines + 1] = ("scanned %d objects, %d hit(s)"):format(scanned, hits)
+        deliverDump(lines, "gc scan")
+    end)
+end
+
 local GuiService = game:GetService("GuiService")
 local TOUCH_ID = 87
 
@@ -574,6 +767,48 @@ LogSection:Button({
     Callback = function()
         if logConsole then logConsole:Clear() end
     end,
+})
+
+local InspectTab = Window:Tab({ Title = 'inspect', Icon = 'search' })
+local InspectSection = InspectTab:Section({ Title = 'read the VM', Side = 'left' })
+
+InspectSection:Paragraph({
+    Title = 'why this instead of another method',
+    Text = 'Every firing method reports success and nothing happens, so the parry is not reachable from any entrance we can find. This stops trying to send it and reads what the VM already holds instead. Inspect handlers dumps the upvalues, constants and nested functions of every readable Luau closure on UserInputService.InputBegan - two of those had scrambled Luraph source names, which is where the sword controller appeared to sit, and their upvalues are its live state. Scan memory walks every table and function alive and reports anything whose keys or string constants mention parry, block, deflect, swing or slash. Both are read only: nothing is fired, nothing is sent.',
+})
+
+InspectSection:Button({
+    Title = 'inspect InputBegan handlers',
+    Callback = function()
+        task.spawn(inspectInputHandlers)
+    end,
+})
+
+InspectSection:Button({
+    Title = 'scan memory for parry',
+    Callback = scanGarbageCollector,
+})
+
+InspectSection:Button({
+    Title = 'what this executor supports',
+    Callback = function()
+        local parts = {
+            "getconnections=" .. tostring(typeof(getconnections) == "function"),
+            "getupvalues=" .. tostring(getUpvalues ~= nil),
+            "getconstants=" .. tostring(getConstants ~= nil),
+            "getprotos=" .. tostring(getProtos ~= nil),
+            "getgc=" .. tostring(getGc ~= nil),
+            "firesignal=" .. tostring(typeof(firesignal) == "function"),
+        }
+        say(table.concat(parts, "  "), Color3.fromRGB(126, 217, 87))
+    end,
+})
+
+local InspectLogSection = InspectTab:Section({ Title = 'notes', Side = 'right' })
+
+InspectLogSection:Paragraph({
+    Title = 'what to look for',
+    Text = 'In the handler dump, an upvalue printed as Instance(...) pointing at something under Packages._Index.sleitnick_net is the remote the controller captured for itself - that is the one worth firing. A constant that reads as a plain string naming a remote is just as good. In the gc scan, a table key like Parry or Block whose value is a function is a callable entry point. Paste whatever comes out and it can be turned into a real method.',
 })
 
 local ControlSection = MainTab:Section({ Title = 'control', Side = 'right' })
