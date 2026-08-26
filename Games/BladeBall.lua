@@ -39,6 +39,7 @@ local Config = {
     PreWindow = 0.6,
     PostWindow = 0.6,
     Strict = false,
+    ShowAll = false,
 }
 
 local Fires = 0
@@ -64,6 +65,9 @@ local LEARN_QUEUE_LIMIT = 200
 local Candidates = {}
 local seenCandidates = setmetatable({}, { __mode = "k" })
 local CandidateIndex = 0
+
+local SeenCalls = 0
+local SeenPresses = 0
 
 local hookInstalled = false
 local originalNamecall = nil
@@ -181,6 +185,7 @@ local function installHook()
                         ignored = (okName and IGNORE_NAMES[name] == true) or IGNORE_TAGS[firstArg] == true
                     end
                     if not ignored then
+                        SeenCalls = SeenCalls + 1
                         learnQueue[#learnQueue + 1] = { instance = self, at = os.clock(), method = method }
                     end
                 end
@@ -261,9 +266,9 @@ local function startLearning()
                 local okName, fullName = pcall(function() return item.instance:GetFullName() end)
                 local okClass, className = pcall(function() return item.instance.ClassName end)
                 local shortName = okName and fullName:match("[^%.]+$") or "?"
-                local inWindow = lastPressAt > 0
+                local inWindow = Config.ShowAll or (lastPressAt > 0
                     and delta >= -Config.PreWindow
-                    and delta <= Config.PostWindow
+                    and delta <= Config.PostWindow)
 
                 if inWindow and okName and not seenCandidates[item.instance] then
                     seenCandidates[item.instance] = true
@@ -276,12 +281,13 @@ local function startLearning()
                     }
 
                     if learnConsole then
-                        learnConsole:Add(("[%d] %s %s  (%+.3fs)"):format(
-                            #Candidates, item.method, shortName, delta),
+                        local when = (lastPressAt > 0) and ("%+.3fs"):format(delta) or "no press yet"
+                        learnConsole:Add(("[%d] %s %s  (%s)"):format(
+                            #Candidates, item.method, shortName, when),
                             Color3.fromRGB(126, 217, 87))
                     end
 
-                    if #Candidates == 1 then
+                    if #Candidates == 1 and not Config.ShowAll then
                         lockCandidate(1)
                     end
                 elseif learnConsole and not inWindow and lastPressAt > 0 and math.abs(delta) < 2 then
@@ -303,6 +309,7 @@ end
 local function markPress(source)
     if Unloading or not learning then return end
     lastPressAt = os.clock()
+    SeenPresses = SeenPresses + 1
     if learnConsole then learnConsole:Add("-- press (" .. source .. ") --", Color3.fromRGB(255, 210, 80)) end
 end
 
@@ -451,6 +458,7 @@ local MainSection = MainTab:Section({ Title = 'auto parry', Side = 'left' })
 statusStat = MainSection:Stat({ Title = 'status', Value = 'off' })
 lockedStat = MainSection:Stat({ Title = 'learned remote', Value = 'none yet' })
 callStat = MainSection:Stat({ Title = 'calls', Value = 'nothing yet' })
+local hookStat = MainSection:Stat({ Title = 'hook / presses', Value = '0 calls / 0 presses' })
 
 local LiveSection = MainTab:Section({ Title = 'live', Side = 'left' })
 local blockStat = LiveSection:Stat({ Title = 'why not firing', Value = 'off' })
@@ -542,6 +550,19 @@ FilterSection:Slider({
     Default = 0.6,
     Suffix = 's',
     Callback = function(value) Config.PostWindow = value end,
+})
+
+FilterSection:Toggle({
+    Title = 'show all traffic (ignore press timing)',
+    Flag = 'bb_show_all',
+    Default = false,
+    Callback = function(value)
+        Config.ShowAll = value
+        log("show all: " .. tostring(value))
+        if value then
+            notify('Every remote call is now listed regardless of timing, and nothing auto-selects. Use this to find out whether block sends anything at all.', 'warning', 9)
+        end
+    end,
 })
 
 FilterSection:Paragraph({
@@ -657,6 +678,10 @@ task.spawn(function()
             else
                 callStat:Set('nothing yet')
             end
+
+            hookStat:Set(('%d calls / %d presses'):format(SeenCalls, SeenPresses),
+                (SeenCalls > 0 and SeenPresses > 0) and Color3.fromRGB(126, 217, 87)
+                or Color3.fromRGB(255, 180, 70))
 
             blockStat:Set(Blocked, Blocked == "FIRING" and Color3.fromRGB(126, 217, 87) or nil)
             targetStat:Set(LiveTarget == LocalPlayer.Name and (LiveTarget .. '  (YOU)') or LiveTarget,
