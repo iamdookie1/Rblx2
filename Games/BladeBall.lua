@@ -515,26 +515,36 @@ local function fireButtonConnections(guiButton)
     return false, "no working connections found"
 end
 
-local function describeButtonConnections(guiButton)
+local function describeSignalConnections(signal, label)
     local lines = {}
     if typeof(getconnections) ~= "function" then return lines end
+
+    local okConn, connections = pcall(getconnections, signal)
+    if okConn and typeof(connections) == "table" then
+        for index, connection in ipairs(connections) do
+            local line = ("%s #%d: "):format(label, index)
+            local okFn, fn = pcall(function() return connection.Function end)
+            if okFn and typeof(fn) == "function" then
+                local okInfo, info = pcall(debug.info, fn, "s")
+                line = line .. (okInfo and tostring(info) or "<no debug.info>")
+            else
+                line = line .. "<no Function field / locked>"
+            end
+            lines[#lines + 1] = line
+        end
+    end
+
+    return lines
+end
+
+local function describeButtonConnections(guiButton)
+    local lines = {}
 
     for _, signalName in ipairs(BUTTON_SIGNAL_NAMES) do
         local okSignal, signal = pcall(function() return guiButton[signalName] end)
         if okSignal and signal then
-            local okConn, connections = pcall(getconnections, signal)
-            if okConn and typeof(connections) == "table" then
-                for index, connection in ipairs(connections) do
-                    local line = ("%s #%d: "):format(signalName, index)
-                    local okFn, fn = pcall(function() return connection.Function end)
-                    if okFn and typeof(fn) == "function" then
-                        local okInfo, info = pcall(debug.info, fn, "s")
-                        line = line .. (okInfo and tostring(info) or "<no debug.info>")
-                    else
-                        line = line .. "<no Function field / locked>"
-                    end
-                    lines[#lines + 1] = line
-                end
+            for _, line in ipairs(describeSignalConnections(signal, signalName)) do
+                lines[#lines + 1] = line
             end
         end
     end
@@ -1104,6 +1114,29 @@ DiagSection:Button({
         end
         local text = table.concat(lines, "\n")
         log("connections -> " .. text)
+        local copied = typeof(setclipboard) == "function" and pcall(setclipboard, text)
+        notify(copied
+            and ('%d connection(s) copied to clipboard.'):format(#lines)
+            or ('%d connection(s) - see %s'):format(#lines, LOG_PATH),
+            'success', 7)
+    end,
+})
+
+DiagSection:Paragraph({
+    Title = 'why InputBegan is next',
+    Text = 'Both connections found on Hotbar.Block (ClickSFX, AnalyticsController) are generic UI components attached to every button in the game, not this one specifically. If that is everything on this instance, the real block detection is not wired to this button at all - it is more likely watching raw input directly, which is also the only way KeybindM2 (letting you rebind M1/M2) would make sense in the first place.',
+})
+
+DiagSection:Button({
+    Title = 'copy InputBegan connections',
+    Callback = function()
+        local lines = describeSignalConnections(UserInputService.InputBegan, "InputBegan")
+        if #lines == 0 then
+            notify('No connections found (or no getconnections on this executor).', 'warning', 7)
+            return
+        end
+        local text = table.concat(lines, "\n")
+        log("InputBegan connections -> " .. text)
         local copied = typeof(setclipboard) == "function" and pcall(setclipboard, text)
         notify(copied
             and ('%d connection(s) copied to clipboard.'):format(#lines)
