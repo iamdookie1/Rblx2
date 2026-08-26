@@ -274,6 +274,61 @@ local function fireButton()
     return false, "button had no usable signal"
 end
 
+local GuiService = game:GetService("GuiService")
+local TOUCH_ID = 87
+
+local function buttonScreenPoint(button)
+    local okPos, centre = pcall(function()
+        return button.AbsolutePosition + button.AbsoluteSize * 0.5
+    end)
+    if not okPos then return nil end
+
+    local ignoresInset = false
+    pcall(function()
+        local ancestor = button
+        while ancestor do
+            if ancestor:IsA("ScreenGui") then
+                ignoresInset = ancestor.IgnoreGuiInset
+                break
+            end
+            ancestor = ancestor.Parent
+        end
+    end)
+
+    if ignoresInset then
+        return centre.X, centre.Y
+    end
+
+    local okInset, inset = pcall(function() return GuiService:GetGuiInset() end)
+    if okInset and inset then
+        return centre.X + inset.X, centre.Y + inset.Y
+    end
+    return centre.X, centre.Y
+end
+
+local function fireTouch()
+    local button = ParryButton
+    if not button or not button.Parent then return false, "no parry button found" end
+
+    local vim = nil
+    pcall(function() vim = game:GetService("VirtualInputManager") end)
+    if typeof(vim) ~= "Instance" then return false, "no VirtualInputManager" end
+
+    local x, y = buttonScreenPoint(button)
+    if not x then return false, "could not read button position" end
+
+    local ok = pcall(function()
+        vim:SendTouchEvent(TOUCH_ID, 0, x, y)
+    end)
+    if not ok then return false, "SendTouchEvent begin failed" end
+
+    task.delay(0.05, function()
+        pcall(function() vim:SendTouchEvent(TOUCH_ID, 2, x, y) end)
+    end)
+
+    return true, ("touch:%d,%d"):format(math.floor(x), math.floor(y))
+end
+
 local function fireBindable()
     if not ParryButtonPress then return false, "ParryButtonPress not found" end
     local ok = pcall(function() ParryButtonPress:Fire() end)
@@ -286,6 +341,7 @@ local Methods = {
     GameUIS = fireGameUIS,
     RealUIS = fireRealUIS,
     Button = fireButton,
+    Touch = fireTouch,
 }
 
 local AUTO_ORDER = { "Bindable", "GameUIS", "RealUIS", "Button" }
@@ -424,7 +480,7 @@ EnabledToggle = MainSection:Toggle({
 MainSection:Dropdown({
     Title = 'method',
     Flag = 'bb_method',
-    Options = { 'Auto', 'Bindable', 'GameUIS', 'RealUIS', 'Button' },
+    Options = { 'Auto', 'Bindable', 'GameUIS', 'RealUIS', 'Button', 'Touch' },
     Default = 'Auto',
     Callback = function(value)
         Config.Method = value
@@ -436,6 +492,11 @@ MainSection:Dropdown({
 MainSection:Paragraph({
     Title = 'the methods',
     Text = 'Bindable fires ReplicatedStorage.Remotes.ParryButtonPress, a BindableEvent - the game\'s own internal "the parry button was pressed" signal, sitting among others like M1Stop and ResetFOV that its scripts Fire on themselves. Nothing leaves the client and there is no server call at all, so it is the closest thing to the game telling itself you pressed parry. GameUIS pushes your captured input through ReplicatedStorage.UserInputService, a custom module the game uses instead of the real service. RealUIS fires the unlocked handlers on the real UserInputService.InputBegan. Button presses the Hotbar Block ImageButton. Auto tries them in that order.',
+})
+
+MainSection:Paragraph({
+    Title = 'Touch - a real tap, aimed properly',
+    Text = 'Not in Auto, pick it deliberately. It sends a genuine touch at the Block button\'s own screen position, worked out from AbsolutePosition plus half its size and corrected for the GUI inset, so it lands on the button rather than wherever the screen centre happens to be. It uses touch id 87 rather than 1, so it cannot collide with the fingers you are actually using - the old version reused the same id as your real touches, which is what made it fight your input. Begin and end are sent 0.05s apart so it reads as a tap. This is the only method here that goes through VirtualInputManager, so it is also the one an anti-cheat is most likely to notice.',
 })
 
 local LiveSection = MainTab:Section({ Title = 'live', Side = 'left' })
