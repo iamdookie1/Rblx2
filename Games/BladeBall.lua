@@ -568,6 +568,37 @@ local function isRemoteInstance(value)
     return ok and result
 end
 
+local function findNetFolder()
+    local packages = ReplicatedStorage:FindFirstChild("Packages")
+    if packages then
+        local index = packages:FindFirstChild("_Index")
+        if index then
+            for _, child in ipairs(index:GetChildren()) do
+                if child.Name:match("^sleitnick_net") then
+                    local net = child:FindFirstChild("net")
+                    if net then return net end
+                end
+            end
+        end
+    end
+
+    local ok, found = pcall(function()
+        for _, descendant in ipairs(ReplicatedStorage:GetDescendants()) do
+            local okChildren, children = pcall(function() return descendant:GetChildren() end)
+            if okChildren then
+                for _, child in ipairs(children) do
+                    if child.Name:find("^RF/") or child.Name:find("^RE/") then
+                        return descendant
+                    end
+                end
+            end
+        end
+        return nil
+    end)
+    if ok then return found end
+    return nil
+end
+
 local function noteFoundRemote(instance, where, lines, seen)
     if seen[instance] then return end
     seen[instance] = true
@@ -1485,6 +1516,59 @@ InspectSection:Button({
                 ok and Color3.fromRGB(126, 217, 87) or Color3.fromRGB(255, 120, 120))
         end)
     end,
+})
+
+local exactRemotePath = ""
+
+InspectSection:Textbox({
+    Title = 'exact remote path (e.g. RE/8d42c66b...)',
+    Flag = 'bb_exact_remote',
+    Default = '',
+    Placeholder = 'RE/hash or RF/hash',
+    Callback = function(value)
+        exactRemotePath = tostring(value or ""):gsub("^%s+", ""):gsub("%s+$", "")
+    end,
+})
+
+InspectSection:Button({
+    Title = 'fire exact remote path',
+    Callback = function()
+        if exactRemotePath == "" then
+            say("type a path first, like RE/8d42c66b...", Color3.fromRGB(255, 120, 120))
+            return
+        end
+
+        local net = findNetFolder()
+        if not net then
+            say("could not find the net folder", Color3.fromRGB(255, 120, 120))
+            return
+        end
+
+        local instance = net:FindFirstChild(exactRemotePath)
+        if not instance then
+            say(("not found under net: %s"):format(exactRemotePath), Color3.fromRGB(255, 120, 120))
+            return
+        end
+
+        task.spawn(function()
+            local ok = pcall(function()
+                if instance:IsA("RemoteFunction") then
+                    instance:InvokeServer()
+                elseif instance:IsA("BindableEvent") then
+                    instance:Fire()
+                else
+                    instance:FireServer()
+                end
+            end)
+            say(("%s -> %s"):format(exactRemotePath, ok and "fired" or "failed"),
+                ok and Color3.fromRGB(126, 217, 87) or Color3.fromRGB(255, 120, 120))
+        end)
+    end,
+})
+
+InspectSection:Paragraph({
+    Title = 'testing the two candidates from the paid script capture',
+    Text = 'RF/829d7bb3e047f317880690c70424c8a313befd880db26a3760624ef802784810 fired on a steady ~5.5s beat in the capture, which looks like a timer/heartbeat call rather than a parry. RE/8d42c66b56c002146c648eeb9eb7ae409a5444e5dfba0e66d16fb523ed453613 fired at irregular gaps that lined up better with balls actually arriving. Type one in above and fire it while a ball is closing in. Remote names re-salt every lobby, so these exact hashes only work in the same lobby the capture came from - if you left, re-run the watch tool to get fresh hashes first.',
 })
 
 InspectSection:Button({
