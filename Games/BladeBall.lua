@@ -150,9 +150,12 @@ local learning = false
 local recentlyPressed = false
 local learnOriginalNamecall = nil
 local learnInputConnection = nil
+local learnQueue = {}
+local LEARN_QUEUE_LIMIT = 20
 
 local function stopLearning()
     learning = false
+    table.clear(learnQueue)
     if learnOriginalNamecall then
         pcall(function() hookmetamethod(game, "__namecall", learnOriginalNamecall) end)
         learnOriginalNamecall = nil
@@ -186,6 +189,7 @@ local function startLearning()
     end
 
     learning = true
+    table.clear(learnQueue)
 
     learnInputConnection = track(UserInputService.InputBegan:Connect(function(input, processed)
         if not isPressLikeInput(input.UserInputType) then return end
@@ -195,7 +199,7 @@ local function startLearning()
 
     local hookOk = pcall(function()
         learnOriginalNamecall = hookmetamethod(game, "__namecall", function(self, ...)
-            if learning and recentlyPressed and typeof(self) == "Instance" then
+            if learning and recentlyPressed and typeof(self) == "Instance" and #learnQueue < LEARN_QUEUE_LIMIT then
                 local okMethod, method = pcall(getnamecallmethod)
                 if okMethod and (method == "FireServer" or method == "Fire" or method == "InvokeServer") then
                     local okName, name = pcall(function() return self.Name end)
@@ -203,9 +207,7 @@ local function startLearning()
                     local ignored = (okName and CAPTURE_IGNORE[name] == true) or CAPTURE_IGNORE_TAGS[firstArg] == true
 
                     if not ignored then
-                        recentlyPressed = false
-                        local target = self
-                        task.defer(function() lockRemote(target) end)
+                        learnQueue[#learnQueue + 1] = self
                     end
                 end
             end
@@ -220,7 +222,19 @@ local function startLearning()
             learnInputConnection = nil
         end
         notify('Failed to install the learning hook.', 'error', 6)
+        return
     end
+
+    task.spawn(function()
+        while learning do
+            if #learnQueue > 0 then
+                local candidate = table.remove(learnQueue, 1)
+                lockRemote(candidate)
+                break
+            end
+            task.wait(0.05)
+        end
+    end)
 end
 
 local function fireLocked()
