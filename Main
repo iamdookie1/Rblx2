@@ -23,7 +23,6 @@ local Games = {
     -- 3008's testing place, from a PlaceId check in the game's own source.
     -- Kept alongside the public place so the hub works on both.
     [2788336572] = { Name = '3008 (test place)', Script = 'Games/3008.lua' },
-    [117311404196294] = { Name = 'Runaways', Script = 'Games/Runaways.lua' },
 }
 
 -- The UI ships in this repo now, so the hub and everything it loads are
