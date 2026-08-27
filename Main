@@ -1,6 +1,5 @@
 local RunService = game:GetService("RunService")
 local Players = game:GetService("Players")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 local REPO_RAW_BASE = 'https://raw.githubusercontent.com/iamdookie1/Rblx2/main/'
 local WATCH_DURATION = 5
@@ -24,27 +23,6 @@ local Games = {
     -- 3008's testing place, from a PlaceId check in the game's own source.
     -- Kept alongside the public place so the hub works on both.
     [2788336572] = { Name = '3008 (test place)', Script = 'Games/3008.lua' },
-    [84637477108843] = { Name = 'Build an AI', Script = 'Games/BuildAnAI.lua' },
-}
-
--- Games that cannot be pinned to a PlaceId. Blade Ball runs across a whole set
--- of them - lobby, match servers, private servers - and listing the one place
--- you happened to be in only works until the next queue drops you somewhere
--- else. So these are identified by something the game itself has instead.
---
--- One check each, and deliberately the one the script already depends on: if
--- the signature is missing the script could not work anyway, so a false
--- positive and a broken load are the same failure caught one step earlier.
-local Unlisted = {
-    {
-        Name = 'Blade Ball',
-        Script = 'Games/BladeBall.lua',
-        Signature = 'ReplicatedStorage.Remotes.ParryAttempt',
-        Check = function()
-            local remotes = ReplicatedStorage:FindFirstChild('Remotes')
-            return remotes ~= nil and remotes:FindFirstChild('ParryAttempt') ~= nil
-        end,
-    },
 }
 
 -- The UI ships in this repo now, so the hub and everything it loads are
@@ -65,14 +43,6 @@ local Window = Centrl:Window({
 local HubTab = Window:Tab({ Title = 'hub', Icon = 'gamepad-2' })
 
 local LoadPage = HubTab:Tab({ Title = 'load', Icon = 'play' })
-
--- Only built when the place is not in the registry, because that is the only
--- time it has anything to offer.
-local UnknownPage = nil
-if not Games[game.PlaceId] then
-    UnknownPage = HubTab:Tab({ Title = 'unknown', Icon = 'help-circle' })
-end
-
 local GamesPage = HubTab:Tab({ Title = 'games', Icon = 'list' })
 local SessionPage = HubTab:Tab({ Title = 'session', Icon = 'info' })
 
@@ -149,84 +119,6 @@ Load:Button({
         Centrl:Unload()
     end,
 })
-
---// unknown -----------------------------------------------------------------
--- This place is not in the registry. Some games still have a script here, they
--- just cannot be matched by PlaceId, so each one gets a button that looks for
--- its own signature before running anything.
-if UnknownPage then
-    UnknownPage:SetBadge('?')
-
-    local Detect = UnknownPage:Section({ Title = 'identify this game', Side = 'left' })
-
-    Detect:Label({
-        Text = 'Place ' .. tostring(game.PlaceId) .. ' is not in the registry. '
-            .. 'A game that runs across several places cannot be recognised by id, '
-            .. 'so the buttons below look for something the game itself has instead.',
-    })
-
-    for _, entry in ipairs(Unlisted) do
-        local resultStat = Detect:Stat({ Title = entry.Name, Value = 'not checked' })
-
-        Detect:Button({
-            Title = 'load ' .. entry.Name,
-            Callback = function()
-                local ok, present = pcall(entry.Check)
-                if not ok then
-                    resultStat:Set('check errored', Color3.fromRGB(255, 96, 106))
-                    Log:Error(entry.Name .. ' check errored: ' .. tostring(present))
-                    return
-                end
-
-                if not present then
-                    resultStat:Set('not found', Color3.fromRGB(255, 96, 106))
-                    Log:Warn('this is not ' .. entry.Name .. ' — ' .. entry.Signature .. ' is missing')
-                    Centrl:Notify({
-                        Title = 'hub',
-                        Content = 'This does not look like ' .. entry.Name .. '. Nothing was loaded.',
-                        Type = 'error',
-                        Duration = 6,
-                    })
-                    return
-                end
-
-                resultStat:Set('confirmed', Color3.fromRGB(126, 217, 87))
-                Log:Success(entry.Name .. ' confirmed by ' .. entry.Signature)
-                runScript(entry)
-            end,
-        })
-
-        Detect:Label({ Text = 'Looks for ' .. entry.Signature .. '. Nothing loads without it.' })
-    end
-
-    local Why = UnknownPage:Section({ Title = 'why there is no place id', Side = 'right' })
-
-    Why:Label({
-        Text = 'Blade Ball is spread over a set of places — lobby, match servers, '
-            .. 'private servers — and the one you get dropped into changes between '
-            .. 'queues. Pinning the hub to whichever id you happened to be in when '
-            .. 'the script was written works exactly until the next match. Checking '
-            .. 'for a piece of the game instead works in all of them.',
-    })
-
-    Why:Label({
-        Text = 'Each check is the single thing the script itself needs. If the '
-            .. 'signature is missing the script could not run anyway, so a wrong '
-            .. 'guess is caught here rather than halfway through loading.',
-    })
-
-    Why:Button({
-        Title = 'copy place id',
-        Callback = function()
-            if setclipboard then
-                setclipboard(tostring(game.PlaceId))
-                Log:Add('place id copied')
-            else
-                Log:Warn('no setclipboard in this executor')
-            end
-        end,
-    })
-end
 
 --// games --------------------------------------------------------------------
 
@@ -354,9 +246,4 @@ task.spawn(function()
 
     DetectedStat:Set('unsupported', Color3.fromRGB(255, 96, 106))
     Log:Warn('no supported game for place ' .. tostring(game.PlaceId))
-
-    if UnknownPage then
-        HubTab:SetBadge('?')
-        Log:Add('check the unknown tab — some games are identified by signature')
-    end
 end)
