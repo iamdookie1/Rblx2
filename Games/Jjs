@@ -1536,12 +1536,38 @@ end
 
 local watchedInfo = setmetatable({}, { __mode = 'k' })
 
+-- Info states already accounted for elsewhere in this script. Anything else
+-- that shows up here is unhandled - which is exactly the case for a Chase
+-- (the server-side lunge Front routes to instead of a real dash): it never
+-- announces through a service's RE.Effects the way every other move does,
+-- so the Effects-based feed above has nothing to react to for it. Info is
+-- server-created ground truth rather than a broadcast that can be filtered
+-- or mis-attributed, so whatever state a Chase actually sets here - once
+-- this has logged it - is the reliable thing to gate auto block on instead.
+local KNOWN_INFO_STATES = {
+    Stun = true, Block = true, IFrame = true, InSkill = true,
+    NoBlock = true, Wakeup = true,
+}
+
+local DebugStates = { Enabled = false }
+local seenStateNames = {}
+
+local function watchedInfo_debugLog(char, state)
+    if not DebugStates.Enabled then return end
+    if KNOWN_INFO_STATES[state.Name] then return end
+    local firstSeen = not seenStateNames[state.Name]
+    seenStateNames[state.Name] = true
+    pushFeed(('[state] %s -> %s%s'):format(char.Name, state.Name, firstSeen and '  (new)' or ''),
+        firstSeen and 'warn' or nil)
+end
+
 local function watchInfo(char)
     local info = infoOf(char)
     if not info or watchedInfo[info] then return end
     watchedInfo[info] = true
 
     info.ChildAdded:Connect(function(state)
+        watchedInfo_debugLog(char, state)
         if state.Name ~= 'Stun' then return end
         -- Anyone's broken guard is worth knowing about, not only ours.
         if Outcomes.Enabled and hasState(char, 'Block') then
@@ -2160,6 +2186,18 @@ IntelSection:Toggle({
     Flag = 'intel_learn',
     Default = true,
     Callback = function(state) Intel.Learning = state end,
+})
+
+IntelSection:Toggle({
+    Title = 'log unhandled states (debug)',
+    Flag = 'intel_debug_states',
+    Default = false,
+    Callback = function(state) DebugStates.Enabled = state end,
+})
+
+IntelSection:Paragraph({
+    Title = 'why this exists',
+    Text = 'Every move detected above announces itself over a service\'s RE.Effects, which is how the feed knows something started. Front dash does not - it routes to a server-side Chase that never fires one of those, which is very likely why auto block and auto manji miss it specifically. Turn this on, get chased or front-dashed, and whatever Info state the server actually sets during it will show up here tagged (new). Report that name back and it can be wired in directly as a second, more reliable detection path instead of depending on Effects for it.',
 })
 
 IntelSection:Paragraph({
