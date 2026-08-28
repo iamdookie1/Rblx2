@@ -1049,6 +1049,17 @@ local REACH_MARGIN = 1.25
 
 local function blameFor(victim, at)
     local best, bestScore, bestReach = nil, -math.huge, nil
+    -- A second, distance-blind pass running alongside the first. A move whose
+    -- true reach is well past BLAME_DEFAULT_REACH can never earn its first
+    -- sample under the strict pass alone: the reach limit rejects every hit
+    -- from that move until reach has been learned, and reach can only be
+    -- learned from a hit that pass would have accepted. Ranged moves like
+    -- ReserveBall.Fire or ReversalRed.Red deadlock here - permanently "out of
+    -- reach" against a default that was only ever a stand-in for melee.
+    -- Falling back to the best fit regardless of distance, but only when the
+    -- strict pass found nothing at all, breaks that deadlock without touching
+    -- the accuracy of ordinary close-range attribution.
+    local fallbackBest, fallbackScore, fallbackReach = nil, -math.huge, nil
     local target = positionOf(victim)
     for index = #Intel.Recent, 1, -1 do
         local event = Intel.Recent[index]
@@ -1066,20 +1077,26 @@ local function blameFor(victim, at)
             end
             local reach = learnedReach(event.key)
             local limit = reach and (reach * REACH_MARGIN) or BLAME_DEFAULT_REACH
-            if reachedFor <= limit then
-                -- Recency and closeness break ties; fit dominates when known.
-                local score = -gap * 0.5 - reachedFor / 200
-                local lead = predictedLead(event.key)
-                if lead then
-                    score = score + 2 - math.min(2, math.abs(gap - lead) / 0.15)
-                end
-                if score > bestScore then
-                    best, bestScore, bestReach = event, score, reachedFor
-                end
+
+            -- Recency and closeness break ties; fit dominates when known.
+            local score = -gap * 0.5 - reachedFor / 200
+            local lead = predictedLead(event.key)
+            if lead then
+                score = score + 2 - math.min(2, math.abs(gap - lead) / 0.15)
+            end
+
+            if reachedFor <= limit and score > bestScore then
+                best, bestScore, bestReach = event, score, reachedFor
+            end
+            if score > fallbackScore then
+                fallbackBest, fallbackScore, fallbackReach = event, score, reachedFor
             end
         end
     end
-    return best, bestReach
+    if best then
+        return best, bestReach
+    end
+    return fallbackBest, fallbackReach
 end
 
 local pendingThrow = nil
@@ -1173,17 +1190,39 @@ end
 local noteEspMove
 
 local hookedServices = {}
+local retryWatchedServices = {}
+
+-- Info states already accounted for elsewhere in this script (watchInfo,
+-- further down). Anything else is unhandled by name; DebugStates also gates
+-- the "no actor" log just below, so both diagnostics share one toggle.
+local KNOWN_INFO_STATES = {
+    Stun = true, Block = true, IFrame = true, InSkill = true,
+    NoBlock = true, Wakeup = true,
+}
+
+local DebugStates = { Enabled = false }
+local seenStateNames = {}
 
 local function hookService(serviceFolder)
     if hookedServices[serviceFolder] then return end
     local re = serviceFolder:FindFirstChild('RE')
     local effects = re and re:FindFirstChild('Effects')
-    if not effects or not effects:IsA('RemoteEvent') then
-        -- Some services use UnreliableRemoteEvent for Effects; both fire
-        -- OnClientEvent, so only the class check needs widening.
-        if not (effects and effects:IsA('UnreliableRemoteEvent')) then
-            return
+    local isEffects = effects
+        and (effects:IsA('RemoteEvent') or effects:IsA('UnreliableRemoteEvent'))
+    if not isEffects then
+        -- RE.Effects sometimes replicates in after the service folder itself
+        -- already exists, and Services.ChildAdded below only fires for a new
+        -- service folder appearing - never for something showing up inside
+        -- one that was already there. Without this, a service whose Effects
+        -- remote was simply a beat late never gets a second chance and stays
+        -- unhooked for the rest of the session, silently, with no error.
+        if not retryWatchedServices[serviceFolder] then
+            retryWatchedServices[serviceFolder] = true
+            serviceFolder.DescendantAdded:Connect(function()
+                pcall(hookService, serviceFolder)
+            end)
         end
+        return
     end
     hookedServices[serviceFolder] = true
     Intel.Hooked = Intel.Hooked + 1
@@ -1225,7 +1264,18 @@ local function hookService(serviceFolder)
         end
 
         local actor = actorFrom(...)
-        if not actor then return end
+        if not actor then
+            -- actorFrom only accepts a Model with a HumanoidRootPart, which a
+            -- thrown projectile's own announcement may not pass - the ball
+            -- itself, not the character who threw it. A ranged move whose
+            -- Effects never yield an actor this way is silently invisible to
+            -- everything below, which is worth surfacing rather than guessing
+            -- at blind.
+            if DebugStates.Enabled then
+                pushFeed(('[no actor] %s.%s'):format(serviceName, tostring(effectName)), 'warn')
+            end
+            return
+        end
         if is_impact_effect(effectName) then return end
 
         local distance = distanceTo(actor)
@@ -1537,21 +1587,10 @@ end
 local watchedInfo = setmetatable({}, { __mode = 'k' })
 
 -- Info states already accounted for elsewhere in this script. Anything else
--- that shows up here is unhandled - which is exactly the case for a Chase
--- (the server-side lunge Front routes to instead of a real dash): it never
--- announces through a service's RE.Effects the way every other move does,
--- so the Effects-based feed above has nothing to react to for it. Info is
--- server-created ground truth rather than a broadcast that can be filtered
--- or mis-attributed, so whatever state a Chase actually sets here - once
--- this has logged it - is the reliable thing to gate auto block on instead.
-local KNOWN_INFO_STATES = {
-    Stun = true, Block = true, IFrame = true, InSkill = true,
-    NoBlock = true, Wakeup = true,
-}
-
-local DebugStates = { Enabled = false }
-local seenStateNames = {}
-
+-- that shows up here is unhandled - kept as a general diagnostic even now
+-- that Chase is known to announce through the same per-moveset Effects path
+-- as everything else (as "(Moveset).Chase"), in case some other move turns
+-- out to rely on Info state instead of an announcement.
 local function watchedInfo_debugLog(char, state)
     if not DebugStates.Enabled then return end
     if KNOWN_INFO_STATES[state.Name] then return end
@@ -2197,7 +2236,7 @@ IntelSection:Toggle({
 
 IntelSection:Paragraph({
     Title = 'why this exists',
-    Text = 'Every move detected above announces itself over a service\'s RE.Effects, which is how the feed knows something started. Front dash does not - it routes to a server-side Chase that never fires one of those, which is very likely why auto block and auto manji miss it specifically. Turn this on, get chased or front-dashed, and whatever Info state the server actually sets during it will show up here tagged (new). Report that name back and it can be wired in directly as a second, more reliable detection path instead of depending on Effects for it.',
+    Text = 'Chase turned out to announce through the same per-moveset RE.Effects path as everything else - as "(Moveset).Chase" - so it was never actually invisible to the feed the way this used to assume. Two real bugs were found and fixed instead: a service whose Effects remote replicated in a beat late than the rest of that service could stay permanently unhooked, and a move blamed for a hit farther away than its reach had ever been measured - true of any ranged move before its first sample - got no blame at all, which meant it could never earn that first sample either. Both are fixed now. This toggle still logs two things worth knowing if something is still missed: an Info state nothing else in the script recognises (tagged (new)), and a "[no actor]" line when an Effects announcement fires but no character could be identified in its arguments - the shape a thrown projectile\'s own announcement is likely to have, since it names the ball rather than whoever threw it.',
 })
 
 IntelSection:Paragraph({
