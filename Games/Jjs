@@ -1189,8 +1189,112 @@ end
 -- to this local rather than compiling into a nil global lookup.
 local noteEspMove
 
-local hookedServices = {}
-local retryWatchedServices = {}
+--// Tracked projectiles ------------------------------------------------------
+-- Every ranged moveset in this game shares one mechanism: an "Interp"
+-- announcement hands over a bare BasePart (no character, so actorFrom finds
+-- nothing) and the client itself carries it forward at a constant speed
+-- every Stepped frame via workspace:BulkMoveTo. The part is real and it
+-- really moves through workspace, which means its time to reach us is not
+-- something to predict from an announcement-to-stun average at all - it is
+-- distance divided by however fast it is actually observed moving, recomputed
+-- every frame from its own live position. That sidesteps the single biggest
+-- problem with the Effects-based lead: a fixed average lead is meaningless
+-- for a move whose real flight time scales with how far away it was thrown
+-- from, since a close shot and a cross-map shot get blended into one number
+-- that fits neither. Declared here, ahead of hookService below, since that is
+-- where an Interp announcement is actually caught.
+-- Grouped into one table rather than one local apiece: this script is a
+-- single top-level chunk and Luau caps a chunk at 200 locals, a ceiling this
+-- file was already close to.
+local Projectiles = {
+    Tracked = {},
+    MaxAge = 6,
+    MinSpeed = 5,
+    Alignment = 0.85,
+}
+
+function Projectiles.partFrom(...)
+    for index = 1, select('#', ...) do
+        local value = select(index, ...)
+        if typeof(value) == 'Instance' and value:IsA('BasePart') then
+            return value
+        end
+    end
+    return nil
+end
+
+function Projectiles.note(serviceName, part)
+    for _, rec in ipairs(Projectiles.Tracked) do
+        if rec.part == part then return end
+    end
+    local now = tick()
+    Projectiles.Tracked[#Projectiles.Tracked + 1] = {
+        part = part,
+        key = timingKey(serviceName, 'Interp'),
+        service = serviceName,
+        startedAt = now,
+        lastPos = part.Position,
+        lastT = now,
+        speed = 0,
+        velocity = Vector3.new(),
+    }
+end
+
+function Projectiles.update()
+    local now = tick()
+    for index = #Projectiles.Tracked, 1, -1 do
+        local rec = Projectiles.Tracked[index]
+        local part = rec.part
+        if not part.Parent or now - rec.startedAt > Projectiles.MaxAge then
+            table.remove(Projectiles.Tracked, index)
+        else
+            local dt = now - rec.lastT
+            if dt > 0.01 then
+                local pos = part.Position
+                rec.velocity = (pos - rec.lastPos) / dt
+                rec.speed = rec.velocity.Magnitude
+                rec.lastPos = pos
+                rec.lastT = now
+            end
+        end
+    end
+end
+
+-- The most urgent tracked projectile actually heading at us, in the same
+-- shape pendingThreat's Effects-based branch returns, so tryBlock and
+-- tryManji cannot tell the two apart.
+function Projectiles.threat()
+    local mine = ownCharacter()
+    local myPos = mine and positionOf(mine)
+    if not myPos then return nil end
+    local best, bestTimeLeft = nil, math.huge
+    for _, rec in ipairs(Projectiles.Tracked) do
+        if rec.speed > Projectiles.MinSpeed then
+            local toUs = myPos - rec.lastPos
+            local distance = toUs.Magnitude
+            if distance > 0.01 then
+                local towardUs = toUs.Unit:Dot(rec.velocity.Unit)
+                if towardUs >= Projectiles.Alignment then
+                    local timeLeft = distance / rec.speed
+                    if timeLeft < bestTimeLeft then
+                        best, bestTimeLeft = rec, timeLeft
+                    end
+                end
+            end
+        end
+    end
+    if not best then return nil end
+    return {
+        event = { key = best.key, service = best.service, at = best.startedAt, projectile = true },
+        actor = best.part,
+        distance = (myPos - best.lastPos).Magnitude,
+        measured = true,
+        samples = 1,
+        timeLeft = bestTimeLeft,
+    }
+end
+
+local ServiceHooks = { Done = {}, RetryWatched = {} }
 
 -- Info states already accounted for elsewhere in this script (watchInfo,
 -- further down). Anything else is unhandled by name; DebugStates also gates
@@ -1200,11 +1304,10 @@ local KNOWN_INFO_STATES = {
     NoBlock = true, Wakeup = true,
 }
 
-local DebugStates = { Enabled = false }
-local seenStateNames = {}
+local DebugStates = { Enabled = false, Seen = {} }
 
 local function hookService(serviceFolder)
-    if hookedServices[serviceFolder] then return end
+    if ServiceHooks.Done[serviceFolder] then return end
     local re = serviceFolder:FindFirstChild('RE')
     local effects = re and re:FindFirstChild('Effects')
     local isEffects = effects
@@ -1216,15 +1319,15 @@ local function hookService(serviceFolder)
         -- one that was already there. Without this, a service whose Effects
         -- remote was simply a beat late never gets a second chance and stays
         -- unhooked for the rest of the session, silently, with no error.
-        if not retryWatchedServices[serviceFolder] then
-            retryWatchedServices[serviceFolder] = true
+        if not ServiceHooks.RetryWatched[serviceFolder] then
+            ServiceHooks.RetryWatched[serviceFolder] = true
             serviceFolder.DescendantAdded:Connect(function()
                 pcall(hookService, serviceFolder)
             end)
         end
         return
     end
-    hookedServices[serviceFolder] = true
+    ServiceHooks.Done[serviceFolder] = true
     Intel.Hooked = Intel.Hooked + 1
 
     local serviceName = serviceFolder.Name:gsub('Service$', '')
@@ -1245,6 +1348,18 @@ local function hookService(serviceFolder)
         end
 
         if type(effectName) ~= 'string' then return end
+
+        -- Every ranged moveset's projectile carries itself with this same
+        -- announcement - see the tracked-projectiles section above pendingThreat
+        -- for why it gets tracked directly instead of going through actorFrom
+        -- and the announcement-lead system below at all.
+        if effectName == 'Interp' then
+            local part = Projectiles.partFrom(...)
+            if part then
+                Projectiles.note(serviceName, part)
+            end
+            return
+        end
 
         -- ManjiKick's Hit names attacker and victim, so a Hit naming us is an
         -- unambiguous "the counter caught something". Checked before the
@@ -1594,8 +1709,8 @@ local watchedInfo = setmetatable({}, { __mode = 'k' })
 local function watchedInfo_debugLog(char, state)
     if not DebugStates.Enabled then return end
     if KNOWN_INFO_STATES[state.Name] then return end
-    local firstSeen = not seenStateNames[state.Name]
-    seenStateNames[state.Name] = true
+    local firstSeen = not DebugStates.Seen[state.Name]
+    DebugStates.Seen[state.Name] = true
     pushFeed(('[state] %s -> %s%s'):format(char.Name, state.Name, firstSeen and '  (new)' or ''),
         firstSeen and 'warn' or nil)
 end
@@ -1846,7 +1961,7 @@ local function pendingThreat(cfg)
                     lead = cfg.AssumeLead
                     samples = 0
                 end
-                return {
+                local announced = {
                     event = event,
                     actor = actor,
                     distance = distance,
@@ -1854,9 +1969,21 @@ local function pendingThreat(cfg)
                     samples = samples or 0,
                     timeLeft = (event.at + lead) - now,
                 }
+                -- A live-tracked projectile, if one is closer to landing, is
+                -- strictly better information than an announcement-derived
+                -- guess - real position, real speed, recomputed this frame -
+                -- so it wins the comparison rather than being a fallback only
+                -- reached when nothing else was found at all.
+                local proj = Projectiles.threat()
+                if proj and proj.timeLeft < announced.timeLeft then
+                    return proj
+                end
+                return announced
             end
         end
     end
+    local proj = Projectiles.threat()
+    if proj then return proj end
     return nil, skipped or 'nothing incoming'
 end
 
@@ -1999,9 +2126,18 @@ end
 -- work" test and the "will this look like a 360 block" test.
 local function angleToward(char, actor)
     local mine = char and char:FindFirstChild('HumanoidRootPart')
-    local theirs = actor and actor:FindFirstChild('HumanoidRootPart')
-    if not mine or not theirs then return 180 end
-    local toward = (theirs.Position - mine.Position) * Vector3.new(1, 0, 1)
+    if not mine or not actor then return 180 end
+    -- A tracked projectile is a bare BasePart, not a character, so it has no
+    -- HumanoidRootPart to read - its own Position stands in directly, which
+    -- is the more honest question anyway ("are we facing the incoming
+    -- ball") rather than trying to recover whoever threw it.
+    local theirsPart = actor:FindFirstChild('HumanoidRootPart')
+    local theirPosition = theirsPart and theirsPart.Position
+    if not theirPosition and actor:IsA('BasePart') then
+        theirPosition = actor.Position
+    end
+    if not theirPosition then return 180 end
+    local toward = (theirPosition - mine.Position) * Vector3.new(1, 0, 1)
     if toward.Magnitude < 0.01 then return 0 end
     local look = mine.CFrame.LookVector * Vector3.new(1, 0, 1)
     if look.Magnitude < 0.01 then return 180 end
@@ -2043,10 +2179,30 @@ local function tryBlock()
         setStatus(BlockConfig, ('waiting (%.2fs out)'):format(threat.timeLeft))
         return
     end
-    local age = tick() - threat.event.at
-    if age > BlockConfig.Sustain then
-        setStatus(BlockConfig, 'nothing recent')
-        return
+    -- Sustain exists so the guard lingers past one hit for the rest of a
+    -- chain, but as a flat cap it ends up vetoing a correctly-timed reaction
+    -- to any move whose own measured lead already runs longer than it - a
+    -- charge-up ranged throw (ReserveBall, ReversalRed) can easily take over
+    -- a second between the "Red"/"Fire" announcement and actually landing,
+    -- past this constant on its own before travel time is even added.
+    -- timeLeft above already handles "is this too far out to react to yet"
+    -- correctly from the measured lead; Sustain should only ever raise that
+    -- ceiling for a slow move, never lower it below what has actually been
+    -- measured.
+    -- A tracked projectile's timeLeft is recomputed from its live position
+    -- every frame, so "how long ago did tracking start" says nothing about
+    -- whether it is still worth reacting to - the LookAhead check above
+    -- already covers that correctly. Sustain only means anything for an
+    -- announcement, which goes stale the moment nothing new confirms it.
+    if not threat.event.projectile then
+        local lead = predictedLead(threat.event.key)
+        local sustainLimit = lead and math.max(BlockConfig.Sustain, lead + BlockConfig.LookAhead)
+            or BlockConfig.Sustain
+        local age = tick() - threat.event.at
+        if age > sustainLimit then
+            setStatus(BlockConfig, 'nothing recent')
+            return
+        end
     end
 
     -- Learned refusal: if blocking this move has been tried and mostly failed,
@@ -2107,6 +2263,7 @@ task.spawn(function()
     while true do
         RunService.Heartbeat:Wait()
         if IntelConfig.Enabled then
+            pcall(Projectiles.update)
             pcall(tryManji)
             pcall(tryBlock)
         end
