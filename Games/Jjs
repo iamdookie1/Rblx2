@@ -2138,6 +2138,18 @@ end
 --// Auto block ---------------------------------------------------------------
 
 local blockReleaseToken = 0
+-- Calling Block() does not make hasState(char, 'Block') true on the same
+-- frame - that only appears once the server round-trip actually creates the
+-- Info state, which is never instant. Removing the old fixed hold timer to
+-- fix "holding through" also removed the only thing that had been stopping
+-- tryBlock from calling Block() again on every single Heartbeat in between:
+-- not yet confirmed as blocking, so it looked identical to never having
+-- tried at all, and it tried again, and again, spamming the same block on
+-- top of itself until the state finally landed. This is a short debounce
+-- covering only that specific confirmation gap - once hasState is actually
+-- true, the hold-through branch below takes over and this plays no part.
+local BLOCK_REQUEST_DEBOUNCE = 0.25
+local blockRequestedUntil = 0
 
 local function releaseBlock()
     if BlockDeactivated then
@@ -2215,6 +2227,8 @@ local function tryBlock()
         end
         return
     end
+
+    if now < blockRequestedUntil then return end
 
     local threat, reason = pendingThreat(BlockConfig)
     if not threat then
@@ -2296,6 +2310,7 @@ local function tryBlock()
     end
 
     BlockConfig.Attempts = BlockConfig.Attempts + 1
+    blockRequestedUntil = now + BLOCK_REQUEST_DEBOUNCE
     extendBlockHold()
     setStatus(BlockConfig, ('blocked %s at %.0f deg'):format(threat.event.service, angle))
     pushFeed(('block -> %s (%.0f deg, %.2fs)'):format(threat.event.service, angle, threat.timeLeft), 'success')
