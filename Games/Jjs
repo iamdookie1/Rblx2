@@ -803,6 +803,17 @@ end
 -- second-largest to mean anything. One bad blame no longer decides anything:
 -- it takes two independent hits from that far out.
 local REACH_MIN_SAMPLES = 4
+-- learnedReach feeds inReach()'s distance limit, which feeds back into what
+-- blameFor() is willing to attribute next time - each accepted sample can
+-- raise the ceiling for the next one by REACH_MARGIN. With no ceiling of its
+-- own that compounds: 25% growth per generation reaches the thousands within
+-- a few dozen stuns and keeps going from there, all inside one play session.
+-- This is the actual fix for that - not a bigger BLAME_DEFAULT_REACH or a
+-- smarter blame heuristic, just a wall the ratchet cannot climb past no
+-- matter how many bad generations it already went through. Ranged moves
+-- do not need this system to reach far: they are tracked by real position
+-- now (see Projectiles above), so this only ever needs to cover melee.
+local REACH_HARD_CAP = 250
 
 local function learnedReach(key)
     local entry = Intel.Timing[key]
@@ -816,7 +827,7 @@ local function learnedReach(key)
         end
     end
     if second <= 0 then return nil end
-    return second
+    return math.min(second, REACH_HARD_CAP)
 end
 
 
@@ -1819,6 +1830,14 @@ local ManjiConfig = {
     AimFrom = 25,
     AimConeNear = 105,
     AimCone = 50,
+    -- A counter-kick only ever makes sense against something that has to
+    -- actually reach you - an M1, Cursed Strikes, anything in a chain - not
+    -- a thrown projectile closing from across the map. MaxRange is a hard
+    -- ceiling independent of whatever a move's own learned reach says, kept
+    -- deliberately tight, so this never depends on that number being
+    -- trustworthy.
+    MeleeOnly = true,
+    MaxRange = 15,
     Attempts = 0,
     Skipped = 0,
     Last = 'idle',
@@ -2059,6 +2078,19 @@ local function tryManji()
         return
     end
 
+    if ManjiConfig.MeleeOnly then
+        if threat.event.projectile then
+            ManjiConfig.Skipped = ManjiConfig.Skipped + 1
+            setStatus(ManjiConfig, 'ranged - not a kick target')
+            return
+        end
+        if threat.distance > ManjiConfig.MaxRange then
+            ManjiConfig.Skipped = ManjiConfig.Skipped + 1
+            setStatus(ManjiConfig, ('%.0fst - too far to be melee'):format(threat.distance))
+            return
+        end
+    end
+
     -- The waste test. A counter thrown too early expires before the hit
     -- arrives and eats its cooldown for nothing; thrown too late it does not
     -- come out in time at all. Only the band between the two is worth spending
@@ -2105,7 +2137,6 @@ end
 
 --// Auto block ---------------------------------------------------------------
 
-local blockHeldUntil = 0
 local blockReleaseToken = 0
 
 local function releaseBlock()
@@ -2114,7 +2145,6 @@ local function releaseBlock()
             BlockDeactivated:FireServer()
         end)
     end
-    blockHeldUntil = 0
 end
 
 -- How far off our facing the attacker is, in degrees. The game breaks a block
@@ -2141,10 +2171,25 @@ local function angleToward(char, actor)
     return math.deg(math.acos(dot))
 end
 
+-- Pushes the scheduled release forward instead of letting the original one
+-- fire on schedule. Shared by the "still under threat" branch below so a
+-- sustained chain gets one continuous hold instead of release-then-reacquire
+-- every Hold seconds - the reacquire gap is exactly where an unguarded hit
+-- got through, which is what made holding feel like it wasn't happening at
+-- all.
+local function extendBlockHold()
+    blockReleaseToken = blockReleaseToken + 1
+    local token = blockReleaseToken
+    task.delay(BlockConfig.Hold, function()
+        if token == blockReleaseToken then
+            releaseBlock()
+        end
+    end)
+end
+
 local function tryBlock()
     if not BlockConfig.Enabled then return end
     local now = tick()
-    if now < blockHeldUntil then return end
 
     local char = ownCharacter()
     local able, why = canAct(char)
@@ -2157,7 +2202,17 @@ local function tryBlock()
         return
     end
     if hasState(char, 'Block') then
-        setStatus(BlockConfig, 'already blocking')
+        -- Already guarding for real (server-confirmed, not just our own
+        -- timer) - keep holding through as long as something is still
+        -- worth guarding against, rather than always releasing on a fixed
+        -- schedule and needing a fresh Block() call a moment later.
+        local threat = pendingThreat(BlockConfig)
+        if threat and threat.timeLeft <= BlockConfig.LookAhead then
+            extendBlockHold()
+            setStatus(BlockConfig, 'holding through')
+        else
+            setStatus(BlockConfig, 'already blocking')
+        end
         return
     end
 
@@ -2241,16 +2296,7 @@ local function tryBlock()
     end
 
     BlockConfig.Attempts = BlockConfig.Attempts + 1
-    blockHeldUntil = now + BlockConfig.Hold
-    blockReleaseToken = blockReleaseToken + 1
-    local token = blockReleaseToken
-    task.delay(BlockConfig.Hold, function()
-        -- A newer block may have taken over in the meantime; only the most
-        -- recent hold is allowed to release.
-        if token == blockReleaseToken then
-            releaseBlock()
-        end
-    end)
+    extendBlockHold()
     setStatus(BlockConfig, ('blocked %s at %.0f deg'):format(threat.event.service, angle))
     pushFeed(('block -> %s (%.0f deg, %.2fs)'):format(threat.event.service, angle, threat.timeLeft), 'success')
 end
@@ -2716,6 +2762,24 @@ ManjiSection:Slider({
     Default = 60,
     Suffix = 'st',
     Callback = function(v) ManjiConfig.Range = v end,
+})
+
+ManjiSection:Toggle({
+    Title = 'melee only (ignore ranged threats)',
+    Flag = 'manji_meleeonly',
+    Default = true,
+    Callback = function(state) ManjiConfig.MeleeOnly = state end,
+})
+
+ManjiSection:Slider({
+    Title = 'melee max range (hard cap)',
+    Flag = 'manji_maxrange',
+    Min = 5,
+    Max = 40,
+    Increment = 1,
+    Default = 15,
+    Suffix = 'st',
+    Callback = function(v) ManjiConfig.MaxRange = v end,
 })
 
 ManjiSection:Toggle({
