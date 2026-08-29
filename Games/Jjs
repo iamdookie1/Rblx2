@@ -1049,17 +1049,6 @@ local REACH_MARGIN = 1.25
 
 local function blameFor(victim, at)
     local best, bestScore, bestReach = nil, -math.huge, nil
-    -- A second, distance-blind pass running alongside the first. A move whose
-    -- true reach is well past BLAME_DEFAULT_REACH can never earn its first
-    -- sample under the strict pass alone: the reach limit rejects every hit
-    -- from that move until reach has been learned, and reach can only be
-    -- learned from a hit that pass would have accepted. Ranged moves like
-    -- ReserveBall.Fire or ReversalRed.Red deadlock here - permanently "out of
-    -- reach" against a default that was only ever a stand-in for melee.
-    -- Falling back to the best fit regardless of distance, but only when the
-    -- strict pass found nothing at all, breaks that deadlock without touching
-    -- the accuracy of ordinary close-range attribution.
-    local fallbackBest, fallbackScore, fallbackReach = nil, -math.huge, nil
     local target = positionOf(victim)
     for index = #Intel.Recent, 1, -1 do
         local event = Intel.Recent[index]
@@ -1077,27 +1066,34 @@ local function blameFor(victim, at)
             end
             local reach = learnedReach(event.key)
             local limit = reach and (reach * REACH_MARGIN) or BLAME_DEFAULT_REACH
-
-            -- Recency and closeness break ties; fit dominates when known.
-            local score = -gap * 0.5 - reachedFor / 200
-            local lead = predictedLead(event.key)
-            if lead then
-                score = score + 2 - math.min(2, math.abs(gap - lead) / 0.15)
-            end
-
-            if reachedFor <= limit and score > bestScore then
-                best, bestScore, bestReach = event, score, reachedFor
-            end
-            if score > fallbackScore then
-                fallbackBest, fallbackScore, fallbackReach = event, score, reachedFor
+            if reachedFor <= limit then
+                -- Recency and closeness break ties; fit dominates when known.
+                local score = -gap * 0.5 - reachedFor / 200
+                local lead = predictedLead(event.key)
+                if lead then
+                    score = score + 2 - math.min(2, math.abs(gap - lead) / 0.15)
+                end
+                if score > bestScore then
+                    best, bestScore, bestReach = event, score, reachedFor
+                end
             end
         end
     end
-    if best then
-        return best, bestReach
-    end
-    return fallbackBest, fallbackReach
+    return best, bestReach
 end
+-- A distance-blind fallback pass used to live here, meant to let a move
+-- whose true reach exceeds BLAME_DEFAULT_REACH earn its first sample instead
+-- of deadlocking against a limit nothing had taught it yet. It shipped and
+-- immediately backfired: blameFor runs for *every* stun on *every* player,
+-- so any hit with no good nearby explanation got attributed to whatever
+-- scored best regardless of how far away it actually was, teaching some
+-- ordinary move a wildly inflated reach and making inReach() accept it from
+-- absurd range afterward - reported back as auto block firing on things
+-- "10 million studs away". The tracked-projectile system added at the same
+-- time already solves the actual ranged-move problem this was for, through
+-- real position tracking rather than attribution guesswork, so the fallback
+-- is gone rather than tuned - it was never needed for the fix that shipped
+-- alongside it.
 
 local pendingThrow = nil
 
