@@ -335,14 +335,22 @@ local CombatConfig = {
     AutoFaceSpeed = 10,
     AutoFaceRequireCone = false,
     AutoFaceCone = 120,
+    -- Targets a lead position (current position + AssemblyLinearVelocity *
+    -- lead time) instead of where they are right now. Against someone
+    -- strafing or running, "right now" is already behind them by the time
+    -- you finish turning or the swing actually connects.
+    FacePredictionEnabled = false,
+    FacePredictionTime = 0.15,
     AutoAttackEnabled = false,
     AttackInterval = 0.15,
+    AttackPredictionEnabled = false,
+    AttackPredictionTime = 0.15,
     Attempts = 0,
 }
 
 FaceSection:Paragraph({
     Title = 'auto m1',
-    Text = 'Auto attack calls the stick tool the same way a real click does (Tool:Activate), so it goes through the game\'s own swing/animation/cooldown - it does not fake a hit. Auto face turns your character toward the current target so swings actually land on it. They pick targets independently, each within its own range - auto attack\'s default is grounded in the real melee hitbox size found in the game\'s own code, not guessed.',
+    Text = 'Auto attack calls the stick tool the same way a real click does (Tool:Activate), so it goes through the game\'s own swing/animation/cooldown - it does not fake a hit. Auto face turns your character toward the current target so swings actually land on it. They pick targets independently, each within its own range - auto attack\'s default is grounded in the real melee hitbox size found in the game\'s own code, not guessed. Each has its own "predict movement" toggle: with it on, a target\'s real AssemblyLinearVelocity is used to aim/range-check a lead position (current position + velocity * prediction time) instead of where they physically are the instant this reads them - a fast-moving target is otherwise always a little behind by the time you finish turning or the swing lands.',
 })
 
 FaceSection:Slider({
@@ -390,6 +398,21 @@ FaceSection:Slider({
     Callback = function(v) CombatConfig.AutoFaceCone = v end,
 })
 
+FaceSection:Toggle({
+    Title = 'predict movement',
+    Flag = 'combat_face_predict',
+    Default = false,
+    Callback = function(state) CombatConfig.FacePredictionEnabled = state end,
+})
+
+FaceSection:Slider({
+    Title = 'prediction time',
+    Flag = 'combat_face_predict_time',
+    Min = 0, Max = 1, Increment = 0.05, Default = 0.15,
+    Suffix = 's',
+    Callback = function(v) CombatConfig.FacePredictionTime = v end,
+})
+
 local FaceStatus = FaceSection:Stat({ Title = 'status', Value = 'idle' })
 
 AttackSection:Toggle({
@@ -407,6 +430,21 @@ AttackSection:Slider({
     Callback = function(v) CombatConfig.AttackRange = v end,
 })
 
+AttackSection:Toggle({
+    Title = 'predict movement',
+    Flag = 'combat_attack_predict',
+    Default = false,
+    Callback = function(state) CombatConfig.AttackPredictionEnabled = state end,
+})
+
+AttackSection:Slider({
+    Title = 'prediction time',
+    Flag = 'combat_attack_predict_time',
+    Min = 0, Max = 1, Increment = 0.05, Default = 0.15,
+    Suffix = 's',
+    Callback = function(v) CombatConfig.AttackPredictionTime = v end,
+})
+
 AttackSection:Slider({
     Title = 'attack interval',
     Flag = 'combat_attack_interval',
@@ -418,26 +456,43 @@ AttackSection:Slider({
 local AttackStatus = AttackSection:Stat({ Title = 'status', Value = 'idle' })
 local AttackCount = AttackSection:Stat({ Title = 'attempts', Value = '0' })
 
-local function findTarget(range)
+-- AssemblyLinearVelocity is the part's real current velocity (Roblox
+-- engine property, not something the game has to expose) - a plain,
+-- reliable way to lead a moving target without needing anything
+-- game-specific.
+local function predictedPosition(hrp, leadTime)
+    if leadTime <= 0 then return hrp.Position end
+    return hrp.Position + hrp.AssemblyLinearVelocity * leadTime
+end
+
+-- Returns both the real HumanoidRootPart (for cooldown/tool checks and
+-- naming in status text) and the position actually worth aiming at, which
+-- is the predicted lead position when prediction is on for that caller,
+-- otherwise just where they really are. Range is checked against that same
+-- aim position, so a fast target closing in from just past the range slider
+-- can already be picked up before it visibly enters it, and one moving away
+-- can drop out early.
+local function findTarget(range, predict, leadTime)
     local root = getRoot()
     if not root then return nil end
-    local best, bestScore = nil, nil
+    local best, bestScore, bestAimPos = nil, nil, nil
     for _, plr in ipairs(Players:GetPlayers()) do
         if plr ~= LocalPlayer and plr.Character then
             local hum = plr.Character:FindFirstChildOfClass("Humanoid")
             local hrp = plr.Character:FindFirstChild("HumanoidRootPart")
             if hum and hum.Health > 0 and hrp then
-                local dist = (hrp.Position - root.Position).Magnitude
+                local aimPos = predict and predictedPosition(hrp, leadTime) or hrp.Position
+                local dist = (aimPos - root.Position).Magnitude
                 if dist <= range then
                     local score = CombatConfig.Priority == 'Lowest Health' and hum.Health or dist
                     if not best or score < bestScore then
-                        best, bestScore = hrp, score
+                        best, bestScore, bestAimPos = hrp, score, aimPos
                     end
                 end
             end
         end
     end
-    return best
+    return best, bestAimPos
 end
 
 local function inCone(root, targetPos, coneDeg)
@@ -462,14 +517,15 @@ track(RunService.Heartbeat:Connect(function(dt)
     end
 
     if CombatConfig.AutoFaceEnabled then
-        local faceTarget = findTarget(CombatConfig.FaceRange)
+        local faceTarget, aimPos = findTarget(CombatConfig.FaceRange,
+            CombatConfig.FacePredictionEnabled, CombatConfig.FacePredictionTime)
         if not faceTarget then
             FaceStatus:Set('no target in range')
         else
-            local flat = (faceTarget.Position - root.Position) * Vector3.new(1, 0, 1)
+            local flat = (aimPos - root.Position) * Vector3.new(1, 0, 1)
             if flat.Magnitude > 0.1 then
                 local allowed = not CombatConfig.AutoFaceRequireCone
-                    or inCone(root, faceTarget.Position, CombatConfig.AutoFaceCone)
+                    or inCone(root, aimPos, CombatConfig.AutoFaceCone)
                 if allowed then
                     local desired = CFrame.lookAt(root.Position, root.Position + flat)
                     local alpha = math.clamp(CombatConfig.AutoFaceSpeed * dt, 0, 1)
@@ -483,7 +539,8 @@ track(RunService.Heartbeat:Connect(function(dt)
     end
 
     if CombatConfig.AutoAttackEnabled then
-        local attackTarget = findTarget(CombatConfig.AttackRange)
+        local attackTarget = findTarget(CombatConfig.AttackRange,
+            CombatConfig.AttackPredictionEnabled, CombatConfig.AttackPredictionTime)
         if not attackTarget then
             AttackStatus:Set('no target in attack range')
             return
