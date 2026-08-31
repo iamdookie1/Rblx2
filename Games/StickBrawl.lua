@@ -318,7 +318,18 @@ local FaceSection = CombatTab:Section({ Title = 'auto face', Side = 'left' })
 local AttackSection = CombatTab:Section({ Title = 'auto attack', Side = 'right' })
 
 local CombatConfig = {
-    Range = 15,
+    -- The actual melee hitbox is a fixed OverlapParams block, Vector3.new(4.5, 4, 6),
+    -- centered a short offset in front of your own HumanoidRootPart - found
+    -- identical across every stick's swing code in the dump, not tied to the
+    -- equipped tool's Handle at all (there is no per-stick reach value to read).
+    -- 7 studs is that box's real forward reach plus a small margin, not a
+    -- guess - attacking from farther than this cannot land regardless of
+    -- what auto attack does.
+    AttackRange = 7,
+    -- Auto face has no equivalent real number to ground it in - how far out
+    -- you want to start turning toward someone is just a preference, so it
+    -- stays independent and a plain default.
+    FaceRange = 20,
     Priority = 'Nearest',
     AutoFaceEnabled = false,
     AutoFaceSpeed = 10,
@@ -331,15 +342,15 @@ local CombatConfig = {
 
 FaceSection:Paragraph({
     Title = 'auto m1',
-    Text = 'Auto attack calls the stick tool the same way a real click does (Tool:Activate), so it goes through the game\'s own swing/animation/cooldown - it does not fake a hit. Auto face turns your character toward the current target so swings actually land on it. Both share the range and target settings below.',
+    Text = 'Auto attack calls the stick tool the same way a real click does (Tool:Activate), so it goes through the game\'s own swing/animation/cooldown - it does not fake a hit. Auto face turns your character toward the current target so swings actually land on it. They pick targets independently, each within its own range - auto attack\'s default is grounded in the real melee hitbox size found in the game\'s own code, not guessed.',
 })
 
 FaceSection:Slider({
-    Title = 'target range',
-    Flag = 'combat_range',
-    Min = 5, Max = 60, Increment = 1, Default = 15,
+    Title = 'auto face range',
+    Flag = 'combat_face_range',
+    Min = 5, Max = 100, Increment = 1, Default = 20,
     Suffix = 'st',
-    Callback = function(v) CombatConfig.Range = v end,
+    Callback = function(v) CombatConfig.FaceRange = v end,
 })
 
 FaceSection:Dropdown({
@@ -379,11 +390,21 @@ FaceSection:Slider({
     Callback = function(v) CombatConfig.AutoFaceCone = v end,
 })
 
+local FaceStatus = FaceSection:Stat({ Title = 'status', Value = 'idle' })
+
 AttackSection:Toggle({
     Title = 'auto attack',
     Flag = 'combat_attack_enabled',
     Default = false,
     Callback = function(state) CombatConfig.AutoAttackEnabled = state end,
+})
+
+AttackSection:Slider({
+    Title = 'auto attack range',
+    Flag = 'combat_attack_range',
+    Min = 4, Max = 25, Increment = 0.5, Default = 7,
+    Suffix = 'st',
+    Callback = function(v) CombatConfig.AttackRange = v end,
 })
 
 AttackSection:Slider({
@@ -435,30 +456,38 @@ track(RunService.Heartbeat:Connect(function(dt)
     local root = getRoot()
     if not hum or hum.Health <= 0 or not root then return end
     if inSafeZone() then
-        AttackStatus:Set('in safe zone')
-        return
-    end
-
-    local target = findTarget(CombatConfig.Range)
-    if not target then
-        AttackStatus:Set('no target in range')
+        if CombatConfig.AutoFaceEnabled then FaceStatus:Set('in safe zone') end
+        if CombatConfig.AutoAttackEnabled then AttackStatus:Set('in safe zone') end
         return
     end
 
     if CombatConfig.AutoFaceEnabled then
-        local flat = (target.Position - root.Position) * Vector3.new(1, 0, 1)
-        if flat.Magnitude > 0.1 then
-            local allowed = not CombatConfig.AutoFaceRequireCone
-                or inCone(root, target.Position, CombatConfig.AutoFaceCone)
-            if allowed then
-                local desired = CFrame.lookAt(root.Position, root.Position + flat)
-                local alpha = math.clamp(CombatConfig.AutoFaceSpeed * dt, 0, 1)
-                root.CFrame = root.CFrame:Lerp(desired, alpha)
+        local faceTarget = findTarget(CombatConfig.FaceRange)
+        if not faceTarget then
+            FaceStatus:Set('no target in range')
+        else
+            local flat = (faceTarget.Position - root.Position) * Vector3.new(1, 0, 1)
+            if flat.Magnitude > 0.1 then
+                local allowed = not CombatConfig.AutoFaceRequireCone
+                    or inCone(root, faceTarget.Position, CombatConfig.AutoFaceCone)
+                if allowed then
+                    local desired = CFrame.lookAt(root.Position, root.Position + flat)
+                    local alpha = math.clamp(CombatConfig.AutoFaceSpeed * dt, 0, 1)
+                    root.CFrame = root.CFrame:Lerp(desired, alpha)
+                    FaceStatus:Set('facing ' .. (faceTarget.Parent and faceTarget.Parent.Name or '?'))
+                else
+                    FaceStatus:Set('target outside cone')
+                end
             end
         end
     end
 
     if CombatConfig.AutoAttackEnabled then
+        local attackTarget = findTarget(CombatConfig.AttackRange)
+        if not attackTarget then
+            AttackStatus:Set('no target in attack range')
+            return
+        end
         local tool = getTool()
         if not tool then
             AttackStatus:Set('no stick equipped')
@@ -471,11 +500,9 @@ track(RunService.Heartbeat:Connect(function(dt)
             if ok then
                 CombatConfig.Attempts = CombatConfig.Attempts + 1
                 AttackCount:Set(tostring(CombatConfig.Attempts))
-                AttackStatus:Set('attacking ' .. (target.Parent and target.Parent.Name or '?'))
+                AttackStatus:Set('attacking ' .. (attackTarget.Parent and attackTarget.Parent.Name or '?'))
             end
         end
-    else
-        AttackStatus:Set('facing ' .. (target.Parent and target.Parent.Name or '?'))
     end
 end))
 
