@@ -31,6 +31,7 @@ local Players = game:GetService('Players')
 local ReplicatedStorage = game:GetService('ReplicatedStorage')
 local Workspace = game:GetService('Workspace')
 local CollectionService = game:GetService('CollectionService')
+local UserInputService = game:GetService('UserInputService')
 
 local LocalPlayer = Players.LocalPlayer
 
@@ -186,6 +187,11 @@ local Config = {
     -- The delay is the rate-limit budget; there is nothing to gain by shaving
     -- it and a Net_Ratelimiter_Fail analytics event to lose.
     ExtraDelay = 0.05,
+
+    -- While the mouse is actually held down the player is mining something on
+    -- purpose. Overriding their target then is the bug, not the feature.
+    YieldToManualInput = true,
+    ManualGrace = 0.4,
 
     RequireLineOfSight = true,
     FaceTarget = true,
@@ -571,9 +577,44 @@ end
 -- tool we are driving, the mouse "points at" whatever our loop chose. Off, or
 -- on any other tool, the original runs and nothing is different.
 
+-- Real input tracking. UserInputService sees the press whoever else is
+-- listening, so this stays true even though the tool's own mouse connections
+-- are what actually drive the loop.
+local Manual = { down = false, releasedAt = 0 }
+
+local function manualActive()
+    if not Config.YieldToManualInput then return false end
+    if Manual.down then return true end
+    return tick() - Manual.releasedAt < Config.ManualGrace
+end
+
+local function isManualInput(input)
+    return input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch
+end
+
+track(UserInputService.InputBegan:Connect(function(input, processed)
+    if processed or not isManualInput(input) then return end
+    Manual.down = true
+end))
+
+track(UserInputService.InputEnded:Connect(function(input)
+    if not isManualInput(input) then return end
+    Manual.down = false
+    Manual.releasedAt = tick()
+    -- The tool's own Button1Up handler set breakCancelled, which ends the swing
+    -- loop a frame later. Clear it once the grace window is up so auto break
+    -- picks straight back up instead of sitting out a restart.
+    task.delay(Config.ManualGrace + 0.05, function()
+        if Config.Enabled and not Manual.down and State.Tool then
+            State.Tool.breakCancelled = false
+        end
+    end)
+end))
+
 Hooks.getTargettedBlock = Game.AxeTool.getTargettedBlock
 Game.AxeTool.getTargettedBlock = function(self, ...)
-    if not (Config.Enabled and State.Tool == self) then
+    if not (Config.Enabled and State.Tool == self) or manualActive() then
         return Hooks.getTargettedBlock(self, ...)
     end
     local hit = State.Hit
@@ -704,6 +745,12 @@ local function tick_()
         end
     end
 
+    if manualActive() then
+        State.LastReason = 'standing down — you are mining by hand'
+        clearHighlight()
+        return
+    end
+
     if tick() < State.NextAllowed then return end
 
     if targetStillGood() then
@@ -811,6 +858,539 @@ function Picker.all()
     return labels
 end
 
+--// optional client services -------------------------------------------------
+-- These live under PlayerScripts rather than ReplicatedStorage, so they load
+-- separately and the features that need them switch themselves off when they
+-- are missing instead of taking the whole script down with them.
+
+local Services = {}
+
+local function requireExport(module, key)
+    if not module then return nil end
+    local ok, result = pcall(require, module)
+    if not ok then return nil end
+    return result and result[key] or nil
+end
+
+do
+    local scripts = LocalPlayer:FindFirstChild('PlayerScripts')
+    local playerTS = scripts and scripts:FindFirstChild('TS')
+    if playerTS then
+        Services.Crop = requireExport(resolve(playerTS, 'block', 'crop', 'crop-service'), 'CropService')
+        Services.Inventory = requireExport(
+            resolve(playerTS, 'ui', 'inventory', 'client-inventory-service'), 'ClientInventoryService')
+    end
+    Services.Remotes = requireExport(resolve(ReplicatedStorage, 'TS', 'remotes', 'remotes'), 'default')
+    Services.Requests = requireExport(
+        resolve(ReplicatedStorage, 'TS', 'legacy-network', 'legacy-requests'), 'LegacyRequests')
+end
+
+-- Several requests carry a fixed field the client always attaches. It is a
+-- constant in the client rather than something derived, so a request without it
+-- looks nothing like one the game would have sent. Copied byte for byte.
+local PLACE_SIGNATURE_KEY = 'uwhiHAMdjExWka'
+local PLACE_SIGNATURE = '\7\240\159\164\163\240\159\164\161\7\n\7\n\7\nffEgdldU'
+
+local function callRequest(name, payload)
+    if not (Services.Remotes and Services.Requests) then return nil end
+    local id = Services.Requests[name]
+    if not id then return nil end
+    local ok, result = pcall(function()
+        return Services.Remotes.Client:Get(id):CallServer(payload)
+    end)
+    if not ok then return nil end
+    return result
+end
+
+--// shared block scanning ----------------------------------------------------
+
+local Scan = {}
+
+-- One helper for every "what is near me" question in the script, so the radius
+-- and the character filter are handled the same way everywhere.
+-- maxParts matters at the radii the ESP uses: blocks are three studs, so a
+-- 300-stud sphere is tens of thousands of parts and an uncapped query there
+-- costs more than the highlights it feeds.
+function Scan.partsNear(radius, maxParts)
+    local root = getRoot()
+    if not root then return {} end
+    local params = OverlapParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = { getChar() }
+    if maxParts then
+        params.MaxParts = maxParts
+    end
+    local ok, parts = pcall(function()
+        return Workspace:GetPartBoundsInRadius(root.Position, radius, params)
+    end)
+    if not ok or type(parts) ~= 'table' then return {} end
+    return parts
+end
+
+function Scan.blocksNear(radius, test, maxParts)
+    local seen, out = {}, {}
+    for _, part in ipairs(Scan.partsNear(radius, maxParts)) do
+        local block = Game.BlockUtils.getIslandBlockFromChild(part)
+        if block and not seen[block] then
+            seen[block] = true
+            if not test or test(block) then
+                out[#out + 1] = block
+            end
+        end
+    end
+    return out
+end
+
+-- getBlocksFromLocation is the game's own occupancy check, so this answers
+-- "would a place here be rejected" the way the game would answer it.
+function Scan.spaceIsFree(position)
+    local ok, blocks = pcall(function()
+        return Game.BlockUtils.getBlocksFromLocation(position, {}, 1, true)
+    end)
+    if not ok or type(blocks) ~= 'table' then return false end
+    return #blocks == 0
+end
+
+--// farm ---------------------------------------------------------------------
+
+local Farm = {
+    Harvest = false,
+    Plant = false,
+    Till = false,
+    Radius = 24,
+    Interval = 0.4,
+    PerPass = 6,
+    Harvested = 0,
+    Planted = 0,
+    Tilled = 0,
+    Reason = 'idle',
+}
+
+-- CropPrediction.activateStageModel shows the live stage model and reads
+-- Harvestable off it, so the same two lookups say whether a crop is ready.
+function Farm.cropReady(model)
+    local stage = model:FindFirstChild('stage')
+    if not stage then return false end
+    local staged = model:FindFirstChild('stage-' .. tostring(stage.Value))
+    if not staged then return false end
+    local flag = staged:FindFirstChild('Harvestable')
+    return flag ~= nil and flag.Value == true
+end
+
+function Farm.isCrop(block)
+    local meta = Game.BlockMeta[block.Name]
+    return meta ~= nil and meta.cropHarvestConfig ~= nil
+end
+
+function Farm.canTill(block)
+    local meta = Game.BlockMeta[block.Name]
+    if not (meta and meta.hoeTillsTo) then return false end
+    local centre = Target.centreOf(block)
+    if not centre then return false end
+    return Scan.spaceIsFree(centre + Vector3.new(0, Game.BlockUtils.BLOCK_SIZE, 0))
+end
+
+-- The seed in hand decides what gets planted and where it is allowed to go,
+-- exactly as SeedTool's placement behaviour does.
+function Farm.equippedSeed()
+    local char = getChar()
+    local tool = char and char:FindFirstChildOfClass('Tool')
+    if not tool then return nil end
+    local meta = Game.ToolMeta[tool.Name]
+    local seed = meta and meta.cropSeed
+    if not seed or not seed.cropName then return nil end
+    return seed.cropName, seed.placedOnBlocks or { 'soil' }
+end
+
+function Farm.plantOn(block, cropName)
+    -- The seed spreader tool sends exactly this: the soil block's CFrame lifted
+    -- one block, the crop name, and the place signature.
+    return callRequest('CLIENT_BLOCK_PLACE_REQUEST', {
+        cframe = block.CFrame + Vector3.new(0, Game.BlockUtils.BLOCK_SIZE, 0),
+        blockType = cropName,
+        [PLACE_SIGNATURE_KEY] = PLACE_SIGNATURE,
+    }) ~= nil
+end
+
+function Farm.runHarvest()
+    if not Services.Crop then
+        Farm.Reason = 'crop service missing'
+        return
+    end
+    local ready = Scan.blocksNear(Farm.Radius, function(block)
+        return Farm.isCrop(block) and Farm.cropReady(block)
+    end)
+    if #ready == 0 then return end
+
+    for index, crop in ipairs(ready) do
+        if index > Farm.PerPass or not Farm.Harvest then break end
+        local ok = pcall(function()
+            Services.Crop:harvestCrop(LocalPlayer, crop)
+        end)
+        if ok then
+            Farm.Harvested = Farm.Harvested + 1
+            Farm.Reason = 'harvested ' .. tostring(crop.Name)
+        end
+        task.wait(0.12)
+    end
+end
+
+function Farm.runPlant()
+    local cropName, placedOn = Farm.equippedSeed()
+    if not cropName then
+        Farm.Reason = 'no seed equipped'
+        return
+    end
+
+    local allowed = {}
+    for _, name in ipairs(placedOn) do
+        allowed[name] = true
+    end
+
+    local lift = Vector3.new(0, Game.BlockUtils.BLOCK_SIZE, 0)
+    local soil = Scan.blocksNear(Farm.Radius, function(block)
+        if not allowed[block.Name] then return false end
+        local centre = Target.centreOf(block)
+        return centre ~= nil and Scan.spaceIsFree(centre + lift)
+    end)
+    if #soil == 0 then return end
+
+    for index, block in ipairs(soil) do
+        if index > Farm.PerPass or not Farm.Plant then break end
+        if block:IsA('BasePart') and Farm.plantOn(block, cropName) then
+            Farm.Planted = Farm.Planted + 1
+            Farm.Reason = 'planted ' .. tostring(cropName)
+        end
+        task.wait(0.12)
+    end
+end
+
+function Farm.runTill()
+    local plots = Scan.blocksNear(Farm.Radius, Farm.canTill)
+    if #plots == 0 then return end
+    for index, block in ipairs(plots) do
+        if index > Farm.PerPass or not Farm.Till then break end
+        if callRequest('CLIENT_PLOW_BLOCK_REQUEST', { block = block }) ~= nil then
+            Farm.Tilled = Farm.Tilled + 1
+            Farm.Reason = 'tilled ' .. tostring(block.Name)
+        end
+        task.wait(0.12)
+    end
+end
+
+task.spawn(function()
+    while true do
+        task.wait(Farm.Interval)
+        if State.Running then
+            if Farm.Harvest then pcall(Farm.runHarvest) end
+            if Farm.Plant then pcall(Farm.runPlant) end
+            if Farm.Till then pcall(Farm.runTill) end
+        end
+    end
+end)
+
+--// collect ------------------------------------------------------------------
+
+local Collect = {
+    Drops = false,
+    Deposit = false,
+    DropRadius = 30,
+    ChestRadius = 20,
+    Interval = 0.5,
+    Items = {},
+    KeepHeld = true,
+    Picked = 0,
+    Deposited = 0,
+    Reason = 'idle',
+}
+
+-- A dropped item is a Tool whose visible part is called HandleDisabled, which
+-- is the part pickupTool tweens toward the player before it asks the server.
+function Collect.droppedTools(radius)
+    local seen, out = {}, {}
+    for _, part in ipairs(Scan.partsNear(radius)) do
+        if part.Name == 'HandleDisabled' then
+            local tool = part.Parent
+            if tool and tool:IsA('Tool') and not seen[tool] then
+                seen[tool] = true
+                out[#out + 1] = tool
+            end
+        end
+    end
+    return out
+end
+
+function Collect.runDrops()
+    if not Services.Inventory then
+        Collect.Reason = 'inventory service missing'
+        return
+    end
+    for _, tool in ipairs(Collect.droppedTools(Collect.DropRadius)) do
+        if not Collect.Drops then break end
+        if tool.Parent then
+            local ok = pcall(function()
+                Services.Inventory:pickupTool(tool)
+            end)
+            if ok then
+                Collect.Picked = Collect.Picked + 1
+                Collect.Reason = 'picked up ' .. tostring(tool.Name)
+            end
+            task.wait(0.15)
+        end
+    end
+end
+
+function Collect.nearestChest()
+    local root = getRoot()
+    if not root then return nil end
+    local chests = Scan.blocksNear(Collect.ChestRadius, function(block)
+        local ok, isChest = pcall(function()
+            return Game.BlockUtils.isChestBlock(block)
+        end)
+        return ok and isChest and true or false
+    end)
+    local best, bestDistance = nil, math.huge
+    for _, chest in ipairs(chests) do
+        local centre = Target.centreOf(chest)
+        if centre then
+            local distance = (centre - root.Position).Magnitude
+            if distance < bestDistance then
+                best, bestDistance = chest, distance
+            end
+        end
+    end
+    return best
+end
+
+function Collect.backpackTools()
+    local backpack = LocalPlayer:FindFirstChild('Backpack')
+    if not backpack then return {} end
+    local out = {}
+    for _, item in ipairs(backpack:GetChildren()) do
+        if item:IsA('Tool') and item:FindFirstChild('Amount') then
+            out[#out + 1] = item
+        end
+    end
+    return out
+end
+
+function Collect.labelOfTool(tool)
+    local display = tool:FindFirstChild('DisplayName')
+    if display and display.Value ~= '' then return display.Value end
+    local meta = Game.ToolMeta[tool.Name]
+    if meta and meta.displayName then return meta.displayName end
+    return tool.Name
+end
+
+-- The same shape ChestInventoryClickHandler sends: the chest block, the tool,
+-- and the amount read straight off the tool.
+function Collect.deposit(chest, tool)
+    local amount = tool:FindFirstChild('Amount')
+    local result = callRequest('CLIENT_CHEST_TRANSACTION', {
+        player_tracking_category = 'join_from_web',
+        chest = chest,
+        action = 'deposit',
+        tool = tool,
+        amount = amount and amount.Value or 1,
+    })
+    return type(result) == 'table' and result.success == true
+end
+
+function Collect.runDeposit()
+    if next(Collect.Items) == nil then
+        Collect.Reason = 'nothing selected to deposit'
+        return
+    end
+    local chest = Collect.nearestChest()
+    if not chest then
+        Collect.Reason = 'no chest in range'
+        return
+    end
+
+    local char = getChar()
+    local held = char and char:FindFirstChildOfClass('Tool')
+    for _, tool in ipairs(Collect.backpackTools()) do
+        if not Collect.Deposit then break end
+        if not (Collect.KeepHeld and held and held.Name == tool.Name) then
+            if Collect.Items[Collect.labelOfTool(tool)] then
+                if Collect.deposit(chest, tool) then
+                    Collect.Deposited = Collect.Deposited + 1
+                    Collect.Reason = 'deposited ' .. Collect.labelOfTool(tool)
+                end
+                task.wait(0.15)
+            end
+        end
+    end
+end
+
+task.spawn(function()
+    while true do
+        task.wait(Collect.Interval)
+        if State.Running then
+            if Collect.Drops then pcall(Collect.runDrops) end
+            if Collect.Deposit then pcall(Collect.runDeposit) end
+        end
+    end
+end)
+
+--// block esp ----------------------------------------------------------------
+
+local Esp = {
+    Enabled = false,
+    Radius = 250,
+    MaxBoxes = 120,
+    Colour = Color3.fromRGB(255, 200, 60),
+    Transparency = 0.75,
+    Categories = { ['ores & rocks'] = true },
+    Blocks = {},
+    Live = {},
+}
+
+function Esp.wants(block)
+    local meta = Game.BlockMeta[block.Name]
+    if not meta then return false end
+    if next(Esp.Blocks) ~= nil then
+        return Esp.Blocks[Classify.labelOf(meta, block.Name)] == true
+    end
+    if next(Esp.Categories) == nil then return false end
+    return Esp.Categories[Classify.categoryOf(meta)] == true
+end
+
+function Esp.clear()
+    for block, highlight in pairs(Esp.Live) do
+        highlight:Destroy()
+        Esp.Live[block] = nil
+    end
+end
+
+function Esp.refresh()
+    if not Esp.Enabled then
+        if next(Esp.Live) ~= nil then Esp.clear() end
+        return
+    end
+
+    local wanted = Scan.blocksNear(Esp.Radius, Esp.wants, Esp.MaxBoxes * 40)
+    local keep = {}
+    for index, block in ipairs(wanted) do
+        if index > Esp.MaxBoxes then break end
+        keep[block] = true
+        local highlight = Esp.Live[block]
+        if not highlight then
+            highlight = Instance.new('Highlight')
+            highlight.Name = 'centrl_block_esp'
+            highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+            highlight.OutlineTransparency = 0
+            highlight.Adornee = block
+            highlight.Parent = Workspace
+            Esp.Live[block] = highlight
+        end
+        highlight.FillColor = Esp.Colour
+        highlight.OutlineColor = Esp.Colour
+        highlight.FillTransparency = Esp.Transparency
+    end
+
+    for block, highlight in pairs(Esp.Live) do
+        if not keep[block] or not block.Parent then
+            highlight:Destroy()
+            Esp.Live[block] = nil
+        end
+    end
+end
+
+task.spawn(function()
+    while true do
+        task.wait(0.6)
+        if State.Running then
+            pcall(Esp.refresh)
+        end
+    end
+end)
+
+--// deposit race -------------------------------------------------------------
+-- This is a test, not a feature. Every item remote in this client hands the
+-- server an Instance it owns plus an amount it can read off that same Instance,
+-- so there is no number to inflate; the only opening left is two requests
+-- landing in the same server frame, both reading the state before either
+-- writes. Whether the handler yields in the middle is server code, which no
+-- client dump contains, so firing it and counting is the only way to know.
+--
+-- It is also the loudest thing in this script by a distance: N deposits of one
+-- stack, N-1 of which the server should refuse.
+
+local Race = {
+    Parallel = 3,
+    Item = nil,
+    Busy = false,
+    Log = nil,
+}
+
+function Race.snapshot(label)
+    local total = 0
+    for _, tool in ipairs(Collect.backpackTools()) do
+        if Collect.labelOfTool(tool) == label then
+            local amount = tool:FindFirstChild('Amount')
+            total = total + (amount and amount.Value or 0)
+        end
+    end
+    return total
+end
+
+function Race.run()
+    if Race.Busy then return end
+    local label = Race.Item
+    if not label then
+        Race.Log:Warn('pick an item first')
+        return
+    end
+
+    local chest = Collect.nearestChest()
+    if not chest then
+        Race.Log:Warn('stand next to a chest')
+        return
+    end
+
+    local target = nil
+    for _, tool in ipairs(Collect.backpackTools()) do
+        if Collect.labelOfTool(tool) == label then
+            target = tool
+            break
+        end
+    end
+    if not target then
+        Race.Log:Warn('no ' .. label .. ' in the backpack')
+        return
+    end
+
+    Race.Busy = true
+    local before = Race.snapshot(label)
+    local amount = target:FindFirstChild('Amount')
+    local stack = amount and amount.Value or 0
+    Race.Log:Add(('firing %d deposits of %s (stack %d, carried %d)')
+        :format(Race.Parallel, label, stack, before))
+
+    local successes, replies = 0, 0
+    for _ = 1, Race.Parallel do
+        task.spawn(function()
+            local ok = Collect.deposit(chest, target)
+            replies = replies + 1
+            if ok then successes = successes + 1 end
+        end)
+    end
+
+    task.delay(2.5, function()
+        local after = Race.snapshot(label)
+        Race.Log:Add(('%d/%d replied, %d reported success')
+            :format(replies, Race.Parallel, successes))
+        Race.Log:Add(('carried %d -> %d, so %d left the backpack'):format(before, after, before - after))
+        if successes > 1 then
+            Race.Log:Warn('more than one succeeded — count the chest, that is the dupe')
+        else
+            Race.Log:Add('one success. the server serialised them, so no race here.')
+        end
+        Race.Busy = false
+    end)
+end
+
 --// tabs ---------------------------------------------------------------------
 
 local BreakTab = Window:Tab({ Title = 'break', Icon = 'pickaxe' })
@@ -905,6 +1485,23 @@ ReachSec:Slider({
     Min = 0, Max = 1, Increment = 0.05, Default = 0.05,
     Suffix = 's',
     Callback = function(v) Config.ExtraDelay = v end,
+})
+
+ReachSec:Toggle({
+    Title = 'yield to my clicks',
+    Desc = 'hold the mouse and you mine what you point at, not what it picked',
+    Flag = 'ib_manual',
+    Default = true,
+    Callback = function(state) Config.YieldToManualInput = state end,
+})
+
+ReachSec:Slider({
+    Title = 'yield grace',
+    Desc = 'how long after letting go before it takes over again',
+    Flag = 'ib_manualgrace',
+    Min = 0, Max = 3, Increment = 0.1, Default = 0.4,
+    Suffix = 's',
+    Callback = function(v) Config.ManualGrace = v end,
 })
 
 ReachSec:Toggle({
@@ -1033,6 +1630,342 @@ BlockSec:Button({
     end,
 })
 
+--// farm tab -----------------------------------------------------------------
+
+local FarmTab = Window:Tab({ Title = 'farm', Icon = 'sprout' })
+local HarvestSec = FarmTab:Section({ Title = 'harvest & plant', Side = 'left' })
+local FarmPaceSec = FarmTab:Section({ Title = 'pacing', Side = 'right' })
+
+local FarmStats = {
+    harvested = HarvestSec:Stat({ Title = 'harvested', Value = '0' }),
+    planted = HarvestSec:Stat({ Title = 'planted', Value = '0' }),
+    doing = HarvestSec:Stat({ Title = 'doing', Value = 'idle' }),
+}
+
+HarvestSec:Toggle({
+    Title = 'auto harvest',
+    Desc = 'only crops whose live stage model says Harvestable',
+    Flag = 'if_harvest',
+    Default = false,
+    Callback = function(state)
+        Farm.Harvest = state
+        if state and not Services.Crop then
+            notify('farm', 'crop service not found — harvest will do nothing', 'warning', 6)
+        end
+    end,
+})
+
+HarvestSec:Toggle({
+    Title = 'auto plant',
+    Desc = 'plants whatever seed you hold, on the blocks that seed allows',
+    Flag = 'if_plant',
+    Default = false,
+    Callback = function(state)
+        Farm.Plant = state
+        if state and not Farm.equippedSeed() then
+            notify('farm', 'hold a seed — that is what decides the crop', 'warning', 6)
+        end
+    end,
+})
+
+HarvestSec:Toggle({
+    Title = 'auto till',
+    Desc = 'hoes anything with a hoeTillsTo entry and nothing sitting on it',
+    Flag = 'if_till',
+    Default = false,
+    Callback = function(state) Farm.Till = state end,
+})
+
+HarvestSec:Button({
+    Title = 'reset farm counters',
+    Callback = function()
+        Farm.Harvested, Farm.Planted, Farm.Tilled = 0, 0, 0
+    end,
+})
+
+FarmPaceSec:Paragraph({
+    Title = 'how planting knows what to plant',
+    Content = 'ToolMeta for the seed in your hand carries cropSeed.cropName and '
+        .. 'cropSeed.placedOnBlocks. The first is what gets placed, the second is where it '
+        .. 'is allowed to go — normally soil. The request is the one the seed spreader tool '
+        .. 'sends, lifted one block above the soil, signature field included.',
+})
+
+FarmPaceSec:Slider({
+    Title = 'radius',
+    Flag = 'if_radius',
+    Min = 6, Max = 60, Increment = 2, Default = 24,
+    Suffix = 'st',
+    Callback = function(v) Farm.Radius = v end,
+})
+
+FarmPaceSec:Slider({
+    Title = 'pass interval',
+    Flag = 'if_interval',
+    Min = 0.2, Max = 3, Increment = 0.1, Default = 0.4,
+    Suffix = 's',
+    Callback = function(v) Farm.Interval = v end,
+})
+
+FarmPaceSec:Slider({
+    Title = 'actions per pass',
+    Desc = 'the cap on how many crops one pass will touch',
+    Flag = 'if_perpass',
+    Min = 1, Max = 20, Increment = 1, Default = 6,
+    Callback = function(v) Farm.PerPass = v end,
+})
+
+--// collect tab --------------------------------------------------------------
+
+local CollectTab = Window:Tab({ Title = 'collect', Icon = 'package' })
+local DropSec = CollectTab:Section({ Title = 'drops', Side = 'left' })
+local ChestSec = CollectTab:Section({ Title = 'chest deposit', Side = 'right' })
+
+local CollectStats = {
+    picked = DropSec:Stat({ Title = 'picked up', Value = '0' }),
+    deposited = DropSec:Stat({ Title = 'deposited', Value = '0' }),
+    doing = DropSec:Stat({ Title = 'doing', Value = 'idle' }),
+}
+
+DropSec:Toggle({
+    Title = 'auto pick up drops',
+    Desc = 'goes through the game\'s own pickupTool, permission checks and all',
+    Flag = 'ic_drops',
+    Default = false,
+    Callback = function(state)
+        Collect.Drops = state
+        if state and not Services.Inventory then
+            notify('collect', 'inventory service not found — pickup will do nothing', 'warning', 6)
+        end
+    end,
+})
+
+DropSec:Slider({
+    Title = 'drop radius',
+    Flag = 'ic_dropradius',
+    Min = 8, Max = 80, Increment = 2, Default = 30,
+    Suffix = 'st',
+    Callback = function(v) Collect.DropRadius = v end,
+})
+
+DropSec:Slider({
+    Title = 'pass interval',
+    Flag = 'ic_interval',
+    Min = 0.2, Max = 3, Increment = 0.1, Default = 0.5,
+    Suffix = 's',
+    Callback = function(v) Collect.Interval = v end,
+})
+
+ChestSec:Toggle({
+    Title = 'auto deposit',
+    Desc = 'into the nearest chest, for the items picked below',
+    Flag = 'ic_deposit',
+    Default = false,
+    Callback = function(state) Collect.Deposit = state end,
+})
+
+ChestSec:Toggle({
+    Title = 'never deposit what I am holding',
+    Flag = 'ic_keepheld',
+    Default = true,
+    Callback = function(state) Collect.KeepHeld = state end,
+})
+
+ChestSec:Slider({
+    Title = 'chest radius',
+    Flag = 'ic_chestradius',
+    Min = 6, Max = 40, Increment = 2, Default = 20,
+    Suffix = 'st',
+    Callback = function(v) Collect.ChestRadius = v end,
+})
+
+local DepositDropdown = ChestSec:Dropdown({
+    Title = 'items to deposit',
+    Desc = 'nothing selected means nothing gets deposited',
+    Multi = true,
+    Values = {},
+    Flag = 'ic_items',
+    Callback = function(_, selection)
+        Collect.Items = {}
+        for name, on in pairs(selection or {}) do
+            if on then Collect.Items[name] = true end
+        end
+    end,
+})
+
+ChestSec:Button({
+    Title = 'read my backpack',
+    Desc = 'fills the list above with what you are carrying now',
+    Callback = function()
+        local labels, seen = {}, {}
+        for _, tool in ipairs(Collect.backpackTools()) do
+            local label = Collect.labelOfTool(tool)
+            if not seen[label] then
+                seen[label] = true
+                labels[#labels + 1] = label
+            end
+        end
+        table.sort(labels)
+        DepositDropdown:SetOptions(labels)
+        notify('collect', tostring(#labels) .. ' kinds carried', 'success', 4)
+    end,
+})
+
+--// esp tab ------------------------------------------------------------------
+
+local EspTab = Window:Tab({ Title = 'esp', Icon = 'eye' })
+local EspSec = EspTab:Section({ Title = 'block esp', Side = 'left' })
+local EspLookSec = EspTab:Section({ Title = 'appearance', Side = 'right' })
+
+EspSec:Toggle({
+    Title = 'enabled',
+    Flag = 'ie_enabled',
+    Default = false,
+    Callback = function(state)
+        Esp.Enabled = state
+        if not state then Esp.clear() end
+    end,
+})
+
+EspSec:Dropdown({
+    Title = 'categories',
+    Desc = 'its own filter, so you can light up diamonds while breaking stone',
+    Multi = true,
+    Values = Classify.Order,
+    Default = { 'ores & rocks' },
+    Flag = 'ie_categories',
+    Callback = function(_, selection)
+        Esp.Categories = {}
+        for name, on in pairs(selection or {}) do
+            if on then Esp.Categories[name] = true end
+        end
+    end,
+})
+
+local EspBlockDropdown = EspSec:Dropdown({
+    Title = 'blocks',
+    Desc = 'picking any block here overrides the categories',
+    Multi = true,
+    Values = {},
+    Flag = 'ie_blocks',
+    Callback = function(_, selection)
+        Esp.Blocks = {}
+        for name, on in pairs(selection or {}) do
+            if on then Esp.Blocks[name] = true end
+        end
+    end,
+})
+
+EspSec:Button({
+    Title = 'fill from every block in the game',
+    Callback = function()
+        local labels = Picker.all()
+        EspBlockDropdown:SetOptions(labels)
+        notify('esp', tostring(#labels) .. ' kinds listed', 'success', 4)
+    end,
+})
+
+EspLookSec:Slider({
+    Title = 'radius',
+    Flag = 'ie_radius',
+    Min = 50, Max = 600, Increment = 25, Default = 250,
+    Suffix = 'st',
+    Callback = function(v) Esp.Radius = v end,
+})
+
+EspLookSec:Slider({
+    Title = 'max highlights',
+    Desc = 'a cap, because an ore vein can be hundreds of blocks',
+    Flag = 'ie_max',
+    Min = 10, Max = 400, Increment = 10, Default = 120,
+    Callback = function(v) Esp.MaxBoxes = v end,
+})
+
+EspLookSec:Colorpicker({
+    Title = 'colour',
+    Flag = 'ie_colour',
+    Default = Color3.fromRGB(255, 200, 60),
+    Callback = function(c) Esp.Colour = c end,
+})
+
+EspLookSec:Slider({
+    Title = 'fill transparency',
+    Flag = 'ie_fill',
+    Min = 0, Max = 1, Increment = 0.05, Default = 0.75,
+    Callback = function(v) Esp.Transparency = v end,
+})
+
+--// race tab -----------------------------------------------------------------
+
+local RaceTab = Window:Tab({ Title = 'race', Icon = 'flask-conical' })
+local RaceSec = RaceTab:Section({ Title = 'concurrent deposit', Side = 'left' })
+local RaceNoteSec = RaceTab:Section({ Title = 'read this first', Side = 'right' })
+
+RaceNoteSec:Paragraph({
+    Title = 'what this is and is not',
+    Content = 'It is not a dupe. It is the one test that would tell you whether a dupe '
+        .. 'exists. Every item remote in this client hands the server an Instance it owns '
+        .. 'plus an amount it can read off that same Instance, so there is no number to '
+        .. 'inflate. The only opening left is two requests landing in the same server frame, '
+        .. 'both reading state before either writes.',
+})
+
+RaceNoteSec:Paragraph({
+    Title = 'why a dump cannot answer it',
+    Content = 'Whether the deposit handler yields mid-transaction is server code, and Roblox '
+        .. 'never replicates server scripts to a client — which is why the dump holds 5321 '
+        .. 'scripts and not one of them server-side. Firing it and counting is the only way '
+        .. 'to find out.',
+})
+
+RaceNoteSec:Paragraph({
+    Title = 'this is the loudest thing here',
+    Content = 'N deposits of one stack, N-1 of which the server should refuse. Refused '
+        .. 'economy requests are exactly the pattern the rest of this script is built to '
+        .. 'avoid generating. Run it once, read the answer, then leave it alone.',
+})
+
+local RaceItemDropdown = RaceSec:Dropdown({
+    Title = 'item',
+    Values = {},
+    Flag = 'ir_item',
+    Callback = function(value) Race.Item = value end,
+})
+
+RaceSec:Button({
+    Title = 'read my backpack',
+    Callback = function()
+        local labels, seen = {}, {}
+        for _, tool in ipairs(Collect.backpackTools()) do
+            local label = Collect.labelOfTool(tool)
+            if not seen[label] then
+                seen[label] = true
+                labels[#labels + 1] = label
+            end
+        end
+        table.sort(labels)
+        RaceItemDropdown:SetOptions(labels)
+    end,
+})
+
+RaceSec:Slider({
+    Title = 'parallel requests',
+    Flag = 'ir_parallel',
+    Min = 2, Max = 8, Increment = 1, Default = 3,
+    Callback = function(v) Race.Parallel = v end,
+})
+
+Race.Log = RaceSec:Console({ Title = 'result', Height = 130, MaxLines = 40, Timestamps = true })
+Race.Log:Add('stand next to a chest, pick an item, then fire')
+
+RaceSec:Button({
+    Title = 'fire',
+    Desc = 'one shot; the result prints above',
+    Callback = function()
+        task.spawn(Race.run)
+    end,
+})
+
 --// status -------------------------------------------------------------------
 
 local StatusTab = Window:Tab({ Title = 'status', Icon = 'activity' })
@@ -1049,6 +1982,10 @@ LiveSec:Button({
     Callback = function()
         Config.Enabled = false
         State.Running = false
+        Farm.Harvest, Farm.Plant, Farm.Till = false, false, false
+        Collect.Drops, Collect.Deposit = false, false
+        Esp.Enabled = false
+        Esp.clear()
         stopSwinging()
         clearHighlight()
         Game.ToolScript.onClickSetup = Hooks.onClickSetup
@@ -1106,6 +2043,14 @@ task.spawn(function()
             ReasonStat:Set(State.LastReason)
             SwingStat:Set(tostring(State.Swings))
             RejectStat:Set(tostring(State.Rejects))
+
+            FarmStats.harvested:Set(tostring(Farm.Harvested))
+            FarmStats.planted:Set(tostring(Farm.Planted))
+            FarmStats.doing:Set(Farm.Reason)
+
+            CollectStats.picked:Set(tostring(Collect.Picked))
+            CollectStats.deposited:Set(tostring(Collect.Deposited))
+            CollectStats.doing:Set(Collect.Reason)
         end)
     end
 end)
