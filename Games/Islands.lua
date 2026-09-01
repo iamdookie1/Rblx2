@@ -203,7 +203,12 @@ local Config = {
     JitterAim = true,
 
     StopAfter = 0,          -- 0 = no limit
-    RejectLimit = 3,        -- consecutive blocks the server refused before stopping
+
+    -- A run of refusals used to switch auto break off, which meant walking back
+    -- to the menu to flip it on again. It pauses instead: same back-off, no
+    -- babysitting.
+    RejectLimit = 3,
+    PauseSeconds = 20,
 
     Categories = { ['ores & rocks'] = true },
     Blocks = {},            -- specific display names; empty means "no extra filter"
@@ -220,10 +225,13 @@ local State = {
     Broken = 0,
     Rejects = 0,
     Blacklist = {},         -- block -> expiry tick
-    Watch = nil,            -- { block, health, swings }
+    Watch = nil,            -- { block, health, since }
     Pending = {},           -- blocks the client removed, awaiting the server's answer
     NextRestart = 0,
     NextPick = 0,
+    NextRecapture = 0,
+    LastSwingAt = 0,
+    PausedUntil = 0,
     Highlight = nil,
     Running = false,
     LastReason = 'idle',
@@ -533,6 +541,15 @@ local function showHighlight(block)
 end
 
 --// swing accounting ---------------------------------------------------------
+
+-- How long a block's replicated Health can sit still while we swing at it
+-- before we accept the server is refusing rather than lagging.
+local REFUSAL_WINDOW = 2.5
+
+-- No swing landing for this long while we hold a target means the game's loop
+-- died on us — a manual click that cancelled it, a tool swap, a yield that
+-- never came back. Restart it rather than sitting there looking enabled.
+local SWING_WATCHDOG = 3
 -- The break request is fired inside a deferred closure we cannot hook, but the
 -- server's answer is observable: a real hit moves the block's replicated Health
 -- value, and a refused one does not. Three swings with no movement means the
@@ -540,6 +557,7 @@ end
 
 local function noteSwing(block)
     State.Swings = State.Swings + 1
+    State.LastSwingAt = tick()
     State.NextAllowed = tick() + Config.ExtraDelay
 
     local health = block:FindFirstChild('Health')
@@ -547,19 +565,22 @@ local function noteSwing(block)
     local watch = State.Watch
 
     if watch and watch.block == block then
-        watch.swings = watch.swings + 1
         if value ~= nil and watch.health ~= nil and value < watch.health then
             watch.health = value
-            watch.swings = 0
+            watch.since = tick()
             State.Rejects = 0
-        elseif watch.swings >= 3 then
+        elseif tick() - watch.since >= REFUSAL_WINDOW then
+            -- Timed rather than counted. The first reading is taken before the
+            -- server has answered this swing at all, so counting swings punished
+            -- latency; a block whose replicated health has not moved in this
+            -- long is one the server is genuinely refusing.
             State.Blacklist[block] = tick() + 30
             State.Rejects = State.Rejects + 1
             State.Watch = nil
             State.LastReason = 'server refused ' .. tostring(block.Name)
         end
     else
-        State.Watch = { block = block, health = value, swings = 1 }
+        State.Watch = { block = block, health = value, since = tick() }
     end
 end
 
@@ -577,15 +598,59 @@ end
 -- tool we are driving, the mouse "points at" whatever our loop chose. Off, or
 -- on any other tool, the original runs and nothing is different.
 
--- Real input tracking. UserInputService sees the press whoever else is
--- listening, so this stays true even though the tool's own mouse connections
--- are what actually drive the loop.
-local Manual = { down = false, releasedAt = 0 }
+-- Deciding whether a press is a mining press, the way the game decides it.
+--
+-- AxeTool.onEquip binds Button1Down straight to startBlockHit on desktop, and
+-- on touch it binds a "block-confirm" render step that needs the finger held
+-- for 0.3s on a target that has not changed, cancelled the moment the humanoid
+-- starts moving. Either way the swing only lands if getTargettedBlock actually
+-- returns a block. So a press is a mining press when it is held over a block
+-- the real mouse ray reaches — a click on the sky, on the UI, or on a wall is
+-- not one, and standing down for it was the thing that made auto break feel
+-- like it had stopped working.
+local Manual = {
+    down = false,
+    downAt = 0,
+    releasedAt = 0,
+    touch = false,
+    moveCancelled = false,
+    wasMining = false,
+    cache = nil,
+    cacheAt = 0,
+}
+
+local TOUCH_HOLD = 0.3      -- the block-confirm threshold, from AxeTool.onEquip
+
+-- The original, asked at most twenty times a second. It raycasts, and it gets
+-- called twice per iteration of the game's own loop as well as from our tick.
+local function realTargetBlock()
+    local tool = State.Tool
+    if not tool then return nil end
+    if tick() - Manual.cacheAt < 0.05 then
+        return Manual.cache
+    end
+    local ok, result = pcall(Hooks.getTargettedBlock, tool)
+    Manual.cache = (ok and type(result) == 'table') and result.block or nil
+    Manual.cacheAt = tick()
+    return Manual.cache
+end
 
 local function manualActive()
     if not Config.YieldToManualInput then return false end
-    if Manual.down then return true end
-    return tick() - Manual.releasedAt < Config.ManualGrace
+
+    if not Manual.down then
+        -- Still inside the grace window after a release that was mining.
+        return Manual.wasMining == true
+            and tick() - Manual.releasedAt < Config.ManualGrace
+    end
+
+    if Manual.moveCancelled then return false end
+    -- Touch needs the hold, exactly as block-confirm does.
+    if Manual.touch and tick() - Manual.downAt < TOUCH_HOLD then return false end
+
+    local mining = realTargetBlock() ~= nil
+    Manual.wasMining = mining
+    return mining
 end
 
 local function isManualInput(input)
@@ -596,6 +661,21 @@ end
 track(UserInputService.InputBegan:Connect(function(input, processed)
     if processed or not isManualInput(input) then return end
     Manual.down = true
+    Manual.downAt = tick()
+    Manual.touch = input.UserInputType == Enum.UserInputType.Touch
+    Manual.moveCancelled = false
+    Manual.wasMining = false
+end))
+
+-- TouchMoved with the humanoid moving unbinds block-confirm in the game, so a
+-- drag is a camera drag, not a mining hold.
+track(UserInputService.InputChanged:Connect(function(input)
+    if input.UserInputType ~= Enum.UserInputType.Touch then return end
+    if not Manual.down then return end
+    local humanoid = getHumanoid()
+    if humanoid and humanoid.MoveDirection.Magnitude > 0 then
+        Manual.moveCancelled = true
+    end
 end))
 
 track(UserInputService.InputEnded:Connect(function(input)
@@ -691,10 +771,26 @@ end
 local function tick_()
     if not Config.Enabled then return end
 
+    if tick() < State.PausedUntil then
+        State.LastReason = ('paused %ds — server was refusing blocks')
+            :format(math.ceil(State.PausedUntil - tick()))
+        return
+    end
+
     if not toolIsEquipped() then
         State.LastReason = 'no breaking tool equipped'
         State.Hit = nil
         clearHighlight()
+        -- The tool object only arrives through an Equipped, so a respawn or a
+        -- hotbar swap leaves us with nothing to drive. Re-equip what is in hand
+        -- and the capture hook fires again; without this the fix was toggling
+        -- the whole thing off and on.
+        if tick() >= State.NextRecapture then
+            State.NextRecapture = tick() + 3
+            task.spawn(function()
+                pcall(reEquipHeldTool)
+            end)
+        end
         return
     end
 
@@ -707,10 +803,12 @@ local function tick_()
     end
 
     if State.Rejects >= Config.RejectLimit then
-        Config.Enabled = false
+        State.Rejects = 0
+        State.PausedUntil = tick() + Config.PauseSeconds
         stopSwinging()
-        State.LastReason = 'stopped — server refused ' .. tostring(State.Rejects) .. ' blocks in a row'
-        notify('auto break', State.LastReason, 'warning', 8)
+        State.LastReason = 'pausing — server refused ' .. tostring(Config.RejectLimit) .. ' blocks in a row'
+        notify('auto break', ('backing off for %ds, then carrying on'):format(Config.PauseSeconds),
+            'warning', 6)
         return
     end
 
@@ -749,6 +847,22 @@ local function tick_()
         State.LastReason = 'standing down — you are mining by hand'
         clearHighlight()
         return
+    end
+
+    -- Watchdog. The game's loop exits on breakCancelled, which a real click
+    -- sets, and it can also be left holding isHitting after a tool swap. If we
+    -- have a target and nothing has landed for a while, break it out of
+    -- whatever it is stuck in and let the restart below run.
+    if State.Target and State.LastSwingAt > 0
+        and tick() - State.LastSwingAt > SWING_WATCHDOG then
+        local tool = State.Tool
+        if tool then
+            tool.breakCancelled = true
+            tool.isHitting = false
+        end
+        State.LastSwingAt = tick()
+        State.NextRestart = 0
+        State.LastReason = 'swing loop stalled — restarting it'
     end
 
     if tick() < State.NextAllowed then return end
@@ -890,6 +1004,8 @@ end
 -- looks nothing like one the game would have sent. Copied byte for byte.
 local PLACE_SIGNATURE_KEY = 'uwhiHAMdjExWka'
 local PLACE_SIGNATURE = '\7\240\159\164\163\240\159\164\161\7\n\7\n\7\nffEgdldU'
+local WORKER_SIGNATURE_KEY = 'gyxibhsvlSg'
+local WORKER_SIGNATURE = '\7\240\159\164\163\240\159\164\161\7\n\7\n\7\nzjnceexFHUHoxcyirpdxflnudifxnil'
 
 local function callRequest(name, payload)
     if not (Services.Remotes and Services.Requests) then return nil end
@@ -1238,12 +1354,15 @@ end)
 local Esp = {
     Enabled = false,
     Radius = 250,
-    MaxBoxes = 120,
+    MaxBoxes = 250,
+    Interval = 0.8,
     Colour = Color3.fromRGB(255, 200, 60),
-    Transparency = 0.75,
+    Transparency = 0.6,
     Categories = { ['ores & rocks'] = true },
     Blocks = {},
     Live = {},
+    Folders = {},
+    FoldersAt = 0,
 }
 
 function Esp.wants(block)
@@ -1257,10 +1376,38 @@ function Esp.wants(block)
 end
 
 function Esp.clear()
-    for block, highlight in pairs(Esp.Live) do
-        highlight:Destroy()
+    for block, adorn in pairs(Esp.Live) do
+        adorn:Destroy()
         Esp.Live[block] = nil
     end
+end
+
+-- The block folders, not a spatial query. GetPartBoundsInRadius has to be
+-- given a MaxParts at ESP range or it walks tens of thousands of parts, and
+-- once capped it returns an arbitrary subset — in practice the ground you are
+-- standing on, never the vein forty studs out. Walking Blocks directly is both
+-- exact and bounded by the number of blocks that actually exist.
+function Esp.blockFolders()
+    if tick() < Esp.FoldersAt and #Esp.Folders > 0 then
+        return Esp.Folders
+    end
+    local folders = {}
+    local islands = Workspace:FindFirstChild('Islands')
+    if islands then
+        for _, island in ipairs(islands:GetChildren()) do
+            local blocks = island:FindFirstChild('Blocks')
+            if blocks then
+                folders[#folders + 1] = blocks
+            end
+        end
+    end
+    local wilderness = Workspace:FindFirstChild('WildernessBlocks')
+    if wilderness then
+        folders[#folders + 1] = wilderness
+    end
+    Esp.Folders = folders
+    Esp.FoldersAt = tick() + 5
+    return folders
 end
 
 function Esp.refresh()
@@ -1269,29 +1416,56 @@ function Esp.refresh()
         return
     end
 
-    local wanted = Scan.blocksNear(Esp.Radius, Esp.wants, Esp.MaxBoxes * 40)
-    local keep = {}
-    for index, block in ipairs(wanted) do
-        if index > Esp.MaxBoxes then break end
-        keep[block] = true
-        local highlight = Esp.Live[block]
-        if not highlight then
-            highlight = Instance.new('Highlight')
-            highlight.Name = 'centrl_block_esp'
-            highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
-            highlight.OutlineTransparency = 0
-            highlight.Adornee = block
-            highlight.Parent = Workspace
-            Esp.Live[block] = highlight
+    local root = getRoot()
+    if not root then return end
+    local origin = root.Position
+    local limit = Esp.Radius * Esp.Radius
+
+    local found = {}
+    for _, folder in ipairs(Esp.blockFolders()) do
+        for _, block in ipairs(folder:GetChildren()) do
+            local centre = Target.centreOf(block)
+            if centre and (centre - origin).Magnitude ^ 2 <= limit and Esp.wants(block) then
+                found[#found + 1] = { block = block, distance = (centre - origin).Magnitude }
+            end
         end
-        highlight.FillColor = Esp.Colour
-        highlight.OutlineColor = Esp.Colour
-        highlight.FillTransparency = Esp.Transparency
     end
 
-    for block, highlight in pairs(Esp.Live) do
+    table.sort(found, function(a, b) return a.distance < b.distance end)
+
+    local keep = {}
+    for index, entry in ipairs(found) do
+        if index > Esp.MaxBoxes then break end
+        local block = entry.block
+        keep[block] = true
+        local adorn = Esp.Live[block]
+        if not adorn then
+            -- BoxHandleAdornment rather than Highlight: Roblox renders only
+            -- about thirty Highlights per client at once, so a hundred of them
+            -- is ninety that silently draw nothing. Adornments have no such
+            -- ceiling, and they take a Model's bounding box just as happily.
+            local cf, size = Target.boxOf(block)
+            if cf and size then
+                adorn = Instance.new('BoxHandleAdornment')
+                adorn.Name = 'centrl_block_esp'
+                adorn.Adornee = Workspace.Terrain
+                adorn.AlwaysOnTop = true
+                adorn.ZIndex = 1
+                adorn.Size = size + Vector3.new(0.06, 0.06, 0.06)
+                adorn.CFrame = cf
+                adorn.Parent = Workspace.Terrain
+                Esp.Live[block] = adorn
+            end
+        end
+        if adorn then
+            adorn.Color3 = Esp.Colour
+            adorn.Transparency = Esp.Transparency
+        end
+    end
+
+    for block, adorn in pairs(Esp.Live) do
         if not keep[block] or not block.Parent then
-            highlight:Destroy()
+            adorn:Destroy()
             Esp.Live[block] = nil
         end
     end
@@ -1299,9 +1473,176 @@ end
 
 task.spawn(function()
     while true do
-        task.wait(0.6)
+        task.wait(Esp.Interval)
         if State.Running then
             pcall(Esp.refresh)
+        end
+    end
+end)
+
+--// animals ------------------------------------------------------------------
+-- Animals sit in Workspace.Islands.<id>-island.Entities as models carrying
+-- their own state: LastPet, AnimalProductReady, FoodLevel, Happiness,
+-- Favorites.Food. Every gate below is one the client's own interact handlers
+-- check before they offer the option, so nothing here asks for something the
+-- menu would have refused to show.
+
+local Animals = {
+    Pet = false,
+    Milk = false,
+    Feed = false,
+    Honey = false,
+    Radius = 60,
+    Interval = 1,
+    Petted = 0,
+    Milked = 0,
+    Fed = 0,
+    Collected = 0,
+    Reason = 'idle',
+    Folders = {},
+    FoldersAt = 0,
+}
+
+local TIME_BETWEEN_PET_SEC = 300    -- AnimalConst.TIME_BETWEEN_PET_SEC
+local NECTAR_FOR_HONEY = 250        -- BeehiveInteractHandler's own threshold
+local ANIMAL_MAX_FOOD = 1000        -- AnimalConst.ANIMAL_MAX_FOOD
+
+function Animals.entityFolders()
+    if tick() < Animals.FoldersAt and #Animals.Folders > 0 then
+        return Animals.Folders
+    end
+    local folders = {}
+    local islands = Workspace:FindFirstChild('Islands')
+    if islands then
+        for _, island in ipairs(islands:GetChildren()) do
+            local entities = island:FindFirstChild('Entities')
+            if entities then
+                folders[#folders + 1] = entities
+            end
+        end
+    end
+    Animals.Folders = folders
+    Animals.FoldersAt = tick() + 5
+    return folders
+end
+
+function Animals.near()
+    local root = getRoot()
+    if not root then return {} end
+    local out = {}
+    for _, folder in ipairs(Animals.entityFolders()) do
+        for _, model in ipairs(folder:GetChildren()) do
+            local part = model:FindFirstChild('HumanoidRootPart')
+            if part and (part.Position - root.Position).Magnitude <= Animals.Radius then
+                out[#out + 1] = model
+            end
+        end
+    end
+    return out
+end
+
+function Animals.heldToolName()
+    local char = getChar()
+    local tool = char and char:FindFirstChildOfClass('Tool')
+    return tool and tool.Name or nil
+end
+
+function Animals.canPet(model)
+    local last = model:FindFirstChild('LastPet')
+    if not last then return false end
+    return os.time() - last.Value >= TIME_BETWEEN_PET_SEC
+end
+
+-- CowInteractHandler only offers Milk when an emptyBucket is in hand and the
+-- animal has a product waiting, so both are checked here too.
+function Animals.canMilk(model)
+    local ready = model:FindFirstChild('AnimalProductReady')
+    if not (ready and ready.Value > 0) then return false end
+    local held = Animals.heldToolName()
+    if not held then return false end
+    local meta = Game.ToolMeta[held]
+    return meta ~= nil and meta.emptyBucket ~= nil
+end
+
+-- AnimalInteractHandler offers Feed when the held tool is in the species'
+-- definite foods or in this animal's own Favorites.Food folder. The favourites
+-- are replicated per animal, so that half is exact.
+function Animals.canFeed(model)
+    local held = Animals.heldToolName()
+    if not held then return false end
+    local meta = Game.ToolMeta[held]
+    if not (meta and (meta.food or meta.animalFood)) then return false end
+    local food = model:FindFirstChild('FoodLevel')
+    if food and food.Value >= ANIMAL_MAX_FOOD * 0.95 then return false end
+    local favorites = model:FindFirstChild('Favorites')
+    favorites = favorites and favorites:FindFirstChild('Food')
+    if favorites and favorites:FindFirstChild(held) then return true end
+    -- Not a favourite, but still food; feeding it is what the menu would do.
+    return true
+end
+
+function Animals.runPet()
+    for _, model in ipairs(Animals.near()) do
+        if not Animals.Pet then break end
+        if Animals.canPet(model) then
+            if callRequest('CLIENT_PET_ANIMAL', { animal = model }) ~= nil then
+                Animals.Petted = Animals.Petted + 1
+                Animals.Reason = 'petted ' .. tostring(model.Name)
+            end
+            task.wait(0.2)
+        end
+    end
+end
+
+function Animals.runMilk()
+    for _, model in ipairs(Animals.near()) do
+        if not Animals.Milk then break end
+        if Animals.canMilk(model) then
+            if callRequest('CLIENT_MILK_COW', { animal = model }) ~= nil then
+                Animals.Milked = Animals.Milked + 1
+                Animals.Reason = 'milked ' .. tostring(model.Name)
+            end
+            task.wait(0.25)
+        end
+    end
+end
+
+function Animals.runFeed()
+    for _, model in ipairs(Animals.near()) do
+        if not Animals.Feed then break end
+        if Animals.canFeed(model) then
+            if callRequest('CLIENT_FEED_ANIMAL', { animal = model }) ~= nil then
+                Animals.Fed = Animals.Fed + 1
+                Animals.Reason = 'fed ' .. tostring(model.Name)
+            end
+            task.wait(0.25)
+        end
+    end
+end
+
+function Animals.runHoney()
+    local hives = Scan.blocksNear(Animals.Radius, function(block)
+        local nectar = block:FindFirstChild('Nectar')
+        return nectar ~= nil and nectar.Value >= NECTAR_FOR_HONEY
+    end)
+    for _, hive in ipairs(hives) do
+        if not Animals.Honey then break end
+        if callRequest('CLIENT_COLLECT_HONEY', { tree = hive }) ~= nil then
+            Animals.Collected = Animals.Collected + 1
+            Animals.Reason = 'collected honey'
+        end
+        task.wait(0.25)
+    end
+end
+
+task.spawn(function()
+    while true do
+        task.wait(Animals.Interval)
+        if State.Running then
+            if Animals.Pet then pcall(Animals.runPet) end
+            if Animals.Milk then pcall(Animals.runMilk) end
+            if Animals.Feed then pcall(Animals.runFeed) end
+            if Animals.Honey then pcall(Animals.runHoney) end
         end
     end
 end)
@@ -1320,75 +1661,216 @@ end)
 local Race = {
     Parallel = 3,
     Item = nil,
+    CraftName = '',
+    Amount = -1,
     Busy = false,
     Log = nil,
 }
 
-function Race.snapshot(label)
-    local total = 0
+-- Whole-inventory diff. Measuring one item by name misses the interesting
+-- case, which is a craft that pays back its ingredients; this way whatever
+-- moved shows up without knowing the recipe.
+function Race.inventory()
+    local totals = {}
     for _, tool in ipairs(Collect.backpackTools()) do
-        if Collect.labelOfTool(tool) == label then
-            local amount = tool:FindFirstChild('Amount')
-            total = total + (amount and amount.Value or 0)
-        end
+        local amount = tool:FindFirstChild('Amount')
+        totals[tool.Name] = (totals[tool.Name] or 0) + (amount and amount.Value or 0)
     end
-    return total
+    return totals
 end
 
-function Race.run()
-    if Race.Busy then return end
+function Race.report(before, note)
+    local after = Race.inventory()
+    local changed = false
+    for name, amount in pairs(after) do
+        local was = before[name] or 0
+        if amount ~= was then
+            changed = true
+            Race.Log:Add(('%s %+d (%d -> %d)'):format(name, amount - was, was, amount))
+        end
+    end
+    for name, was in pairs(before) do
+        if after[name] == nil then
+            changed = true
+            Race.Log:Add(('%s %+d (%d -> 0)'):format(name, -was, was))
+        end
+    end
+    if not changed then
+        Race.Log:Add('nothing in the backpack moved')
+    end
+    if note then Race.Log:Add(note) end
+    Race.Busy = false
+end
+
+function Race.begin()
+    if Race.Busy then return nil end
+    Race.Busy = true
+    return Race.inventory()
+end
+
+function Race.findTool(label)
+    for _, tool in ipairs(Collect.backpackTools()) do
+        if Collect.labelOfTool(tool) == label then return tool end
+    end
+    return nil
+end
+
+-- Test 1: the deposit race. Already run and answered - the server serialises
+-- them - but kept because it is the control the others are read against.
+function Race.runRace()
     local label = Race.Item
     if not label then
         Race.Log:Warn('pick an item first')
         return
     end
-
     local chest = Collect.nearestChest()
     if not chest then
         Race.Log:Warn('stand next to a chest')
         return
     end
-
-    local target = nil
-    for _, tool in ipairs(Collect.backpackTools()) do
-        if Collect.labelOfTool(tool) == label then
-            target = tool
-            break
-        end
-    end
+    local target = Race.findTool(label)
     if not target then
         Race.Log:Warn('no ' .. label .. ' in the backpack')
         return
     end
 
-    Race.Busy = true
-    local before = Race.snapshot(label)
-    local amount = target:FindFirstChild('Amount')
-    local stack = amount and amount.Value or 0
-    Race.Log:Add(('firing %d deposits of %s (stack %d, carried %d)')
-        :format(Race.Parallel, label, stack, before))
+    local before = Race.begin()
+    if not before then return end
+    Race.Log:Add(('race: %d parallel deposits of %s'):format(Race.Parallel, label))
 
-    local successes, replies = 0, 0
+    local successes = 0
     for _ = 1, Race.Parallel do
         task.spawn(function()
-            local ok = Collect.deposit(chest, target)
-            replies = replies + 1
-            if ok then successes = successes + 1 end
+            if Collect.deposit(chest, target) then successes = successes + 1 end
         end)
     end
 
     task.delay(2.5, function()
-        local after = Race.snapshot(label)
-        Race.Log:Add(('%d/%d replied, %d reported success')
-            :format(replies, Race.Parallel, successes))
-        Race.Log:Add(('carried %d -> %d, so %d left the backpack'):format(before, after, before - after))
-        if successes > 1 then
-            Race.Log:Warn('more than one succeeded — count the chest, that is the dupe')
-        else
-            Race.Log:Add('one success. the server serialised them, so no race here.')
-        end
-        Race.Busy = false
+        Race.report(before, ('%d of %d reported success'):format(successes, Race.Parallel))
     end)
+end
+
+-- Test 2: a negative craft amount.
+--
+-- CraftTool takes { workbenchBlock, toolName, amount, upgrade } - a name and a
+-- number, with no Instance for the server to re-read the amount from. The
+-- shared inventory-service that the server runs spends ingredients through
+-- decrementToolTypeAmount, and that function checks the amount for NaN and for
+-- being a whole number and then stops checking. It never checks the sign.
+--
+-- Follow a negative through it: decrementToolAmount does
+-- Amount.Value = Amount.Value - delta, so a delta of -5 writes Amount + 5. It
+-- returns the delta, the caller sums it to -5, and the guard `amount <= taken`
+-- reads -5 <= -5 and reports success. hasToolAmount has the same shape and
+-- passes negatives for the same reason.
+--
+-- So if the crafting handler multiplies each ingredient by this amount and
+-- spends it that way, a negative craft pays the ingredients back instead of
+-- taking them. That is the hypothesis; the diff below is the answer.
+function Race.runNegativeCraft()
+    local bench = Race.workbench()
+    if not bench then
+        Race.Log:Warn('stand next to a workbench')
+        return
+    end
+    local toolName = Race.CraftName
+    if not toolName or toolName == '' then
+        Race.Log:Warn('type the internal tool name to craft, e.g. woodPlank')
+        return
+    end
+
+    local before = Race.begin()
+    if not before then return end
+    Race.Log:Add(('craft %s amount %d at %s'):format(toolName, Race.Amount, bench.Name))
+
+    task.spawn(function()
+        local result = nil
+        local ok = pcall(function()
+            result = Services.Remotes.Client:Get('CraftTool'):CallServer({
+                workbenchBlock = bench,
+                toolName = toolName,
+                amount = Race.Amount,
+                upgrade = nil,
+            })
+        end)
+        task.wait(1.5)
+        local verdict
+        if not ok then
+            verdict = 'the call itself errored, so the server rejected the shape'
+        elseif type(result) == 'table' then
+            verdict = 'server replied success=' .. tostring(result.success)
+        else
+            verdict = 'server replied ' .. tostring(result)
+        end
+        Race.report(before, verdict)
+    end)
+end
+
+-- Test 3: a negative worker deposit.
+--
+-- CLIENT_BLOCK_WORKER_DEPOSIT_TOOL_REQUEST is the same shape and the better
+-- target of the two, because it names the item outright:
+-- { block, toolName, amount, <signature> }. If the handler spends the deposit
+-- through the same decrementToolTypeAmount, a negative amount hands the items
+-- back rather than taking them.
+function Race.runNegativeWorker()
+    local label = Race.Item
+    if not label then
+        Race.Log:Warn('pick an item first')
+        return
+    end
+    local target = Race.findTool(label)
+    if not target then
+        Race.Log:Warn('no ' .. label .. ' in the backpack')
+        return
+    end
+    local worker = Race.worker()
+    if not worker then
+        Race.Log:Warn('stand next to a furnace, forge or other worker block')
+        return
+    end
+
+    local before = Race.begin()
+    if not before then return end
+    Race.Log:Add(('worker deposit %s amount %d into %s')
+        :format(target.Name, Race.Amount, worker.Name))
+
+    task.spawn(function()
+        local result = callRequest('CLIENT_BLOCK_WORKER_DEPOSIT_TOOL_REQUEST', {
+            block = worker,
+            toolName = target.Name,
+            amount = Race.Amount,
+            [WORKER_SIGNATURE_KEY] = WORKER_SIGNATURE,
+        })
+        task.wait(1.5)
+        local verdict
+        if type(result) == 'table' then
+            verdict = 'server replied success=' .. tostring(result.success)
+        else
+            verdict = 'server replied ' .. tostring(result)
+        end
+        Race.report(before, verdict)
+    end)
+end
+
+function Race.workbench()
+    local benches = Scan.blocksNear(24, function(block)
+        local ok, isBench = pcall(function()
+            return Game.BlockUtils.isWorkbenchBlock(block)
+        end)
+        return ok and isBench and true or false
+    end)
+    return benches[1]
+end
+
+function Race.worker()
+    local workers = Scan.blocksNear(24, function(block)
+        local ok, isWorker = pcall(function()
+            return Game.BlockUtils.isWorkerBlock(block)
+        end)
+        return ok and isWorker and true or false
+    end)
+    return workers[1]
 end
 
 --// tabs ---------------------------------------------------------------------
@@ -1412,6 +1894,8 @@ MainSec:Toggle({
             State.Broken = 0
             State.Swings = 0
             State.Rejects = 0
+            State.PausedUntil = 0
+            State.LastSwingAt = tick()
             State.Watch = nil
             table.clear(State.Blacklist)
             table.clear(State.Pending)
@@ -1450,11 +1934,20 @@ MainSec:Slider({
 })
 
 MainSec:Slider({
-    Title = 'stop after refusals',
+    Title = 'pause after refusals',
     Desc = 'blocks the server would not let you break, in a row',
     Flag = 'ib_rejectlimit',
     Min = 1, Max = 10, Increment = 1, Default = 3,
     Callback = function(v) Config.RejectLimit = v end,
+})
+
+MainSec:Slider({
+    Title = 'pause length',
+    Desc = 'it backs off and carries on by itself — no re-toggling',
+    Flag = 'ib_pause',
+    Min = 5, Max = 120, Increment = 5, Default = 20,
+    Suffix = 's',
+    Callback = function(v) Config.PauseSeconds = v end,
 })
 
 ReachSec:Paragraph({
@@ -1874,11 +2367,29 @@ EspLookSec:Slider({
 })
 
 EspLookSec:Slider({
-    Title = 'max highlights',
-    Desc = 'a cap, because an ore vein can be hundreds of blocks',
+    Title = 'max boxes',
+    Desc = 'nearest first, so the cap trims the far ones',
     Flag = 'ie_max',
-    Min = 10, Max = 400, Increment = 10, Default = 120,
+    Min = 25, Max = 800, Increment = 25, Default = 250,
     Callback = function(v) Esp.MaxBoxes = v end,
+})
+
+EspLookSec:Slider({
+    Title = 'refresh interval',
+    Flag = 'ie_interval',
+    Min = 0.3, Max = 3, Increment = 0.1, Default = 0.8,
+    Suffix = 's',
+    Callback = function(v) Esp.Interval = v end,
+})
+
+EspLookSec:Paragraph({
+    Title = 'why it was drawing nothing',
+    Content = 'Two reasons, both fixed. It used Highlight, and Roblox renders only about '
+        .. 'thirty of those per client at once, so most were silently blank — these are '
+        .. 'BoxHandleAdornments now, which have no ceiling. And it found blocks with a '
+        .. 'radius query, which at ESP range has to be capped and then returns an arbitrary '
+        .. 'subset — the ground under you, never the vein. It walks the island Blocks '
+        .. 'folders directly now.',
 })
 
 EspLookSec:Colorpicker({
@@ -1895,44 +2406,135 @@ EspLookSec:Slider({
     Callback = function(v) Esp.Transparency = v end,
 })
 
---// race tab -----------------------------------------------------------------
+--// pets tab -----------------------------------------------------------------
 
-local RaceTab = Window:Tab({ Title = 'race', Icon = 'flask-conical' })
-local RaceSec = RaceTab:Section({ Title = 'concurrent deposit', Side = 'left' })
-local RaceNoteSec = RaceTab:Section({ Title = 'read this first', Side = 'right' })
+local PetTab = Window:Tab({ Title = 'pets', Icon = 'heart' })
+local PetSec = PetTab:Section({ Title = 'animal care', Side = 'left' })
+local PetPaceSec = PetTab:Section({ Title = 'pacing & notes', Side = 'right' })
 
-RaceNoteSec:Paragraph({
-    Title = 'what this is and is not',
-    Content = 'It is not a dupe. It is the one test that would tell you whether a dupe '
-        .. 'exists. Every item remote in this client hands the server an Instance it owns '
-        .. 'plus an amount it can read off that same Instance, so there is no number to '
-        .. 'inflate. The only opening left is two requests landing in the same server frame, '
-        .. 'both reading state before either writes.',
+local PetStats = {
+    petted = PetSec:Stat({ Title = 'petted', Value = '0' }),
+    milked = PetSec:Stat({ Title = 'milked', Value = '0' }),
+    doing = PetSec:Stat({ Title = 'doing', Value = 'idle' }),
+}
+
+PetSec:Toggle({
+    Title = 'auto pet',
+    Desc = 'each animal once its own 5 minute cooldown is up',
+    Flag = 'ip_pet',
+    Default = false,
+    Callback = function(state) Animals.Pet = state end,
 })
 
-RaceNoteSec:Paragraph({
-    Title = 'why a dump cannot answer it',
-    Content = 'Whether the deposit handler yields mid-transaction is server code, and Roblox '
-        .. 'never replicates server scripts to a client — which is why the dump holds 5321 '
-        .. 'scripts and not one of them server-side. Firing it and counting is the only way '
-        .. 'to find out.',
+PetSec:Toggle({
+    Title = 'auto milk',
+    Desc = 'needs an empty bucket in hand and a product ready',
+    Flag = 'ip_milk',
+    Default = false,
+    Callback = function(state)
+        Animals.Milk = state
+        if state and not Animals.heldToolName() then
+            notify('pets', 'hold an empty bucket', 'warning', 5)
+        end
+    end,
 })
 
-RaceNoteSec:Paragraph({
-    Title = 'this is the loudest thing here',
-    Content = 'N deposits of one stack, N-1 of which the server should refuse. Refused '
-        .. 'economy requests are exactly the pattern the rest of this script is built to '
-        .. 'avoid generating. Run it once, read the answer, then leave it alone.',
+PetSec:Toggle({
+    Title = 'auto feed',
+    Desc = 'feeds whatever food you are holding to anything still hungry',
+    Flag = 'ip_feed',
+    Default = false,
+    Callback = function(state) Animals.Feed = state end,
 })
 
-local RaceItemDropdown = RaceSec:Dropdown({
+PetSec:Toggle({
+    Title = 'auto collect honey',
+    Desc = 'hives at 250 nectar or more, the same bar the menu uses',
+    Flag = 'ip_honey',
+    Default = false,
+    Callback = function(state) Animals.Honey = state end,
+})
+
+PetSec:Button({
+    Title = 'reset pet counters',
+    Callback = function()
+        Animals.Petted, Animals.Milked, Animals.Fed, Animals.Collected = 0, 0, 0, 0
+    end,
+})
+
+PetPaceSec:Paragraph({
+    Title = 'every gate here is the game\'s own',
+    Content = 'Petting waits out AnimalConst.TIME_BETWEEN_PET_SEC, which is 300, read off '
+        .. 'each animal\'s LastPet. Milk needs a tool whose ToolMeta has emptyBucket and an '
+        .. 'AnimalProductReady above zero, which is exactly when CowInteractHandler offers '
+        .. 'the option. Honey wants Nectar at 250. Asking outside those windows is a refused '
+        .. 'request, and refused requests are the thing worth not generating.',
+})
+
+PetPaceSec:Slider({
+    Title = 'radius',
+    Flag = 'ip_radius',
+    Min = 15, Max = 150, Increment = 5, Default = 60,
+    Suffix = 'st',
+    Callback = function(v) Animals.Radius = v end,
+})
+
+PetPaceSec:Slider({
+    Title = 'pass interval',
+    Flag = 'ip_interval',
+    Min = 0.5, Max = 5, Increment = 0.5, Default = 1,
+    Suffix = 's',
+    Callback = function(v) Animals.Interval = v end,
+})
+
+--// lab tab ------------------------------------------------------------------
+
+local LabTab = Window:Tab({ Title = 'lab', Icon = 'flask-conical' })
+local LabSec = LabTab:Section({ Title = 'tests', Side = 'left' })
+local LabNoteSec = LabTab:Section({ Title = 'what is being tested', Side = 'right' })
+
+LabNoteSec:Paragraph({
+    Title = 'the race is answered, and it was no',
+    Content = 'Kept as the control. The server serialises concurrent deposits, so that '
+        .. 'vector is closed. The two below are a different shape and a much better bet.',
+})
+
+LabNoteSec:Paragraph({
+    Title = 'the sign is never checked',
+    Content = 'inventory-service is shared code the server runs. decrementToolTypeAmount '
+        .. 'checks its amount for NaN and for being a whole number, then stops. '
+        .. 'decrementToolAmount does Amount.Value = Amount.Value - delta, so a delta of -5 '
+        .. 'writes Amount + 5, returns -5, and the guard amount <= taken reads -5 <= -5 and '
+        .. 'reports success. hasToolAmount passes negatives for the same reason.',
+})
+
+LabNoteSec:Paragraph({
+    Title = 'which remotes can reach it',
+    Content = 'Two carry a name and a client number with no Instance for the server to '
+        .. 're-read from. CraftTool sends { workbenchBlock, toolName, amount, upgrade }. '
+        .. 'CLIENT_BLOCK_WORKER_DEPOSIT_TOOL_REQUEST sends { block, toolName, amount } and '
+        .. 'is the better of the two because it names the item outright. If either spends '
+        .. 'through decrementToolTypeAmount, a negative amount pays you instead of charging '
+        .. 'you. A third, the trade remote setTradeItemQuantity, has the same shape and is '
+        .. 'worth a look if these two come back clean.',
+})
+
+LabNoteSec:Paragraph({
+    Title = 'how to read the result',
+    Content = 'Every test diffs your whole backpack before and after and prints what moved, '
+        .. 'so you do not need to know the recipe. An item going up is the answer. Nothing '
+        .. 'moving means the server clamped it. Run one at a time.',
+})
+
+local LabItemDropdown = LabSec:Dropdown({
     Title = 'item',
+    Desc = 'used by the race and the worker deposit',
     Values = {},
     Flag = 'ir_item',
     Callback = function(value) Race.Item = value end,
 })
 
-RaceSec:Button({
+LabSec:Button({
     Title = 'read my backpack',
     Callback = function()
         local labels, seen = {}, {}
@@ -1944,26 +2546,52 @@ RaceSec:Button({
             end
         end
         table.sort(labels)
-        RaceItemDropdown:SetOptions(labels)
+        LabItemDropdown:SetOptions(labels)
     end,
 })
 
-RaceSec:Slider({
+LabSec:Slider({
+    Title = 'amount',
+    Desc = 'negative is the whole point; -1 first',
+    Flag = 'ir_amount',
+    Min = -20, Max = 20, Increment = 1, Default = -1,
+    Callback = function(v) Race.Amount = v end,
+})
+
+LabSec:Textbox({
+    Title = 'craft tool name',
+    Desc = 'the internal name, not the display one — woodPlank, stoneBrick',
+    Flag = 'ir_craftname',
+    Default = '',
+    Callback = function(text) Race.CraftName = text end,
+})
+
+Race.Log = LabSec:Console({ Title = 'result', Height = 150, MaxLines = 60, Timestamps = true })
+Race.Log:Add('one test at a time; the backpack diff prints here')
+
+LabSec:Button({
+    Title = 'negative worker deposit',
+    Desc = 'stand at a furnace or forge — the best bet of the three',
+    Callback = function() task.spawn(Race.runNegativeWorker) end,
+})
+
+LabSec:Button({
+    Title = 'negative craft',
+    Desc = 'stand at a workbench',
+    Callback = function() task.spawn(Race.runNegativeCraft) end,
+})
+
+LabSec:Slider({
     Title = 'parallel requests',
     Flag = 'ir_parallel',
     Min = 2, Max = 8, Increment = 1, Default = 3,
     Callback = function(v) Race.Parallel = v end,
 })
 
-Race.Log = RaceSec:Console({ Title = 'result', Height = 130, MaxLines = 40, Timestamps = true })
-Race.Log:Add('stand next to a chest, pick an item, then fire')
-
-RaceSec:Button({
-    Title = 'fire',
-    Desc = 'one shot; the result prints above',
-    Callback = function()
-        task.spawn(Race.run)
-    end,
+LabSec:Button({
+    Title = 'deposit race (the control)',
+    Desc = 'stand at a chest',
+    Callback = function() task.spawn(Race.runRace) end,
 })
 
 --// status -------------------------------------------------------------------
@@ -1984,6 +2612,7 @@ LiveSec:Button({
         State.Running = false
         Farm.Harvest, Farm.Plant, Farm.Till = false, false, false
         Collect.Drops, Collect.Deposit = false, false
+        Animals.Pet, Animals.Milk, Animals.Feed, Animals.Honey = false, false, false, false
         Esp.Enabled = false
         Esp.clear()
         stopSwinging()
@@ -2051,6 +2680,10 @@ task.spawn(function()
             CollectStats.picked:Set(tostring(Collect.Picked))
             CollectStats.deposited:Set(tostring(Collect.Deposited))
             CollectStats.doing:Set(Collect.Reason)
+
+            PetStats.petted:Set(tostring(Animals.Petted))
+            PetStats.milked:Set(tostring(Animals.Milked))
+            PetStats.doing:Set(Animals.Reason)
         end)
     end
 end)
