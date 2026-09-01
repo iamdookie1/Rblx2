@@ -84,6 +84,8 @@ local function loadGameModules()
         { 'BlockUtils', { 'util', 'block-utils' }, 'BlockUtils' },
         { 'IslandUtils', { 'util', 'island-utils' }, 'IslandUtils' },
         { 'ToolUtils', { 'util', 'tool-utils' }, 'ToolUtils' },
+        { 'CombatUtils', { 'combat', 'combat-utils' }, 'CombatUtils' },
+        { 'LivingEntity', { 'combat', 'living-entity' }, 'LivingEntityUtils' },
     }
 
     for _, entry in ipairs(wanted) do
@@ -218,6 +220,8 @@ local Config = {
 local State = {
     Tool = nil,
     ToolName = '-',
+    Weapon = nil,
+    WeaponName = '-',
     Target = nil,
     Hit = nil,
     NextAllowed = 0,
@@ -248,9 +252,18 @@ local Hooks = {}
 
 Hooks.onClickSetup = Game.ToolScript.onClickSetup
 Game.ToolScript.onClickSetup = function(self, ...)
-    if type(self) == 'table' and rawget(self, 'instance') and self.startBlockHit then
-        State.Tool = self
-        State.ToolName = tostring(self.instance and self.instance.Name or '?')
+    if type(self) == 'table' and rawget(self, 'instance') then
+        if self.startBlockHit then
+            State.Tool = self
+            State.ToolName = tostring(self.instance and self.instance.Name or '?')
+        end
+        -- SwordTool is the only class with attemptHit, and every weapon in the
+        -- game is one, so this catches swords, hammers and the rest without a
+        -- name list to keep up to date.
+        if self.attemptHit then
+            State.Weapon = self
+            State.WeaponName = tostring(self.instance and self.instance.Name or '?')
+        end
     end
     return Hooks.onClickSetup(self, ...)
 end
@@ -1564,21 +1577,58 @@ function Animals.canMilk(model)
     return meta ~= nil and meta.emptyBucket ~= nil
 end
 
--- AnimalInteractHandler offers Feed when the held tool is in the species'
--- definite foods or in this animal's own Favorites.Food folder. The favourites
--- are replicated per animal, so that half is exact.
+-- Feeding, written against AnimalInteractHandler.getInteractOptions rather than
+-- guessed at. The first version of this was wrong on every clause: it tested
+-- ToolMeta.food, which food tools have and animal feed does not; it never
+-- looked at the species' own definite list at all; and it read favourites by
+-- child name when getFavoriteFoods reads their Value. Feeding did nothing
+-- because the server was being asked for things the menu would never offer.
+--
+-- The real gate, in order:
+--   BlockMeta[animal.Name].animal exists, and the animal is not Sleeping
+--   ToolMeta[held].animalFood exists
+--   if that food triggers breeding, the animal has to be an adult
+--   FoodLevel is under 95% of max, unless the food breeds or is vitamins
+--   held name is in animal.foods.definite, or in this animal's Favorites.Food
 function Animals.canFeed(model)
-    local held = Animals.heldToolName()
+    local char = getChar()
+    local held = char and char:FindFirstChildOfClass('Tool')
     if not held then return false end
-    local meta = Game.ToolMeta[held]
-    if not (meta and (meta.food or meta.animalFood)) then return false end
+
+    local animalMeta = Game.BlockMeta[model.Name]
+    if not (animalMeta and animalMeta.animal) then return false end
+
+    local toolMeta = Game.ToolMeta[held.Name]
+    local animalFood = toolMeta and toolMeta.animalFood
+    if not animalFood then return false end
+
+    local sleeping = model:FindFirstChild('Sleeping')
+    if sleeping and sleeping.Value then return false end
+
+    local adult = model:FindFirstChild('IsAdult')
+    if animalFood.triggerBreed and not (adult and adult.Value) then return false end
+
     local food = model:FindFirstChild('FoodLevel')
-    if food and food.Value >= ANIMAL_MAX_FOOD * 0.95 then return false end
+    local hungry = food ~= nil and food.Value <= ANIMAL_MAX_FOOD * 0.95
+    if not hungry and not (animalFood.triggerBreed or animalFood.vitamins) then
+        return false
+    end
+
+    local foods = animalMeta.animal.foods
+    if foods and foods.definite and table.find(foods.definite, held.Name) then
+        return true
+    end
+
     local favorites = model:FindFirstChild('Favorites')
     favorites = favorites and favorites:FindFirstChild('Food')
-    if favorites and favorites:FindFirstChild(held) then return true end
-    -- Not a favourite, but still food; feeding it is what the menu would do.
-    return true
+    if favorites then
+        for _, entry in ipairs(favorites:GetChildren()) do
+            if entry:IsA('StringValue') and entry.Value == held.Name then
+                return true
+            end
+        end
+    end
+    return false
 end
 
 function Animals.runPet()
@@ -1647,6 +1697,258 @@ task.spawn(function()
     end
 end)
 
+--// combat -------------------------------------------------------------------
+-- Same shape as auto break, one layer up. SwordTool.onClick finds its victim
+-- through CombatUtils.findTarget, which is a mouse ray; patch that one function
+-- and the tool's own cooldown, swing index, animation, crit roll and the
+-- request with its signature field all run untouched.
+--
+--   CombatUtils.findTarget(player, range) -> { entity, hitPos, hitPart }
+--   LivingEntityUtils.SWORD_HIT_RANGE     15
+--   a living entity is a Model carrying LastDamagedTick, CurrentHealth,
+--   MaxHealth, IsPlayer and IsDead
+--   attemptHit fires namespace fLafXsVXagmlXhlc, remote UlpaomJfNzwc,
+--   with { hitUnit = entity, <signature> }
+
+local Combat = {
+    Enabled = false,
+    Range = 12,
+    Targets = 'mobs',       -- mobs | players | both
+    IgnoreDead = true,
+    FaceTarget = true,
+    Esp = false,
+    EspRange = 300,
+    EspLive = {},
+    Target = nil,
+    CurrentHit = nil,
+    Hits = 0,
+    Reason = 'idle',
+}
+
+local SWORD_HIT_RANGE = tonumber(Game.LivingEntity.SWORD_HIT_RANGE) or 15
+
+function Combat.isSelf(entity)
+    return entity == getChar()
+end
+
+function Combat.isDead(entity)
+    local dead = entity:FindFirstChild('IsDead')
+    if dead and dead.Value then return true end
+    local health = entity:FindFirstChild('CurrentHealth')
+    return health ~= nil and health.Value <= 0
+end
+
+function Combat.wanted(entity)
+    if Combat.isSelf(entity) then return false end
+    if Combat.IgnoreDead and Combat.isDead(entity) then return false end
+    local isPlayer = entity:FindFirstChild('IsPlayer')
+    isPlayer = isPlayer ~= nil and isPlayer.Value == true
+    if Combat.Targets == 'mobs' then return not isPlayer end
+    if Combat.Targets == 'players' then return isPlayer end
+    return true
+end
+
+-- Walks the Entities folders and the player list rather than a radius query.
+-- At ESP range a spatial query returns every block on the island before it
+-- returns a single mob, which is the same trap the block ESP fell into.
+function Combat.near(range)
+    local root = getRoot()
+    if not root then return {} end
+    local origin = root.Position
+    local seen, out = {}, {}
+
+    local function consider(model)
+        if not model or seen[model] then return end
+        seen[model] = true
+        local ok, entity = pcall(Game.LivingEntity.isLivingEntityModel, model)
+        if not (ok and entity) then return end
+        if (model:GetPivot().Position - origin).Magnitude > range then return end
+        if Combat.wanted(model) then
+            out[#out + 1] = model
+        end
+    end
+
+    for _, folder in ipairs(Animals.entityFolders()) do
+        for _, model in ipairs(folder:GetChildren()) do
+            consider(model)
+        end
+    end
+
+    local wilderness = Workspace:FindFirstChild('WildernessIsland')
+    wilderness = wilderness and wilderness:FindFirstChild('Entities')
+    if wilderness then
+        for _, model in ipairs(wilderness:GetChildren()) do
+            consider(model)
+        end
+    end
+
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player ~= LocalPlayer then
+            consider(player.Character)
+        end
+    end
+
+    return out
+end
+
+-- The same treatment the block targeting gets: a real ray, so the hit part and
+-- position handed back describe something the server could reproduce.
+function Combat.hitFor(entity)
+    local pivot = entity:GetPivot().Position
+    local origin = camPos()
+    local delta = pivot - origin
+    if delta.Magnitude > SWORD_HIT_RANGE * 3 then return nil end
+
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = { getChar() }
+    local result = Workspace:Raycast(origin, delta.Unit * (delta.Magnitude + 1), params)
+    if result then
+        local ok, hit = pcall(Game.LivingEntity.getLivingEntityFromChildPart, result.Instance)
+        if ok and hit == entity then
+            return { entity, result.Position, result.Instance }
+        end
+    end
+
+    -- No clean line: fall back to the entity's own primary part, which is where
+    -- the game's ray would have landed on a body shot anyway.
+    local part = entity.PrimaryPart or entity:FindFirstChildWhichIsA('BasePart')
+    if not part then return nil end
+    return { entity, part.Position, part }
+end
+
+function Combat.pick()
+    local root = getRoot()
+    if not root then return nil end
+    local best, bestDistance = nil, math.huge
+    for _, entity in ipairs(Combat.near(Combat.Range)) do
+        local distance = (entity:GetPivot().Position - root.Position).Magnitude
+        if distance < bestDistance then
+            best, bestDistance = entity, distance
+        end
+    end
+    return best
+end
+
+Hooks.findTarget = Game.CombatUtils.findTarget
+Game.CombatUtils.findTarget = function(player, range, ...)
+    if Combat.Enabled and player == LocalPlayer and not manualActive() then
+        local hit = Combat.CurrentHit
+        if hit and hit[1] and hit[1].Parent then
+            return hit
+        end
+    end
+    return Hooks.findTarget(player, range, ...)
+end
+
+function Combat.step()
+    local weapon = State.Weapon
+    if not weapon then
+        Combat.Reason = 'no weapon equipped'
+        return
+    end
+    local instance = weapon.instance
+    if not (instance and instance.Parent == getChar()) then
+        Combat.Reason = 'weapon not in hand'
+        return
+    end
+    if manualActive() then
+        Combat.Reason = 'standing down — you are swinging by hand'
+        return
+    end
+
+    local entity = Combat.pick()
+    if not entity then
+        Combat.Target = nil
+        Combat.CurrentHit = nil
+        Combat.Reason = 'nothing in range'
+        return
+    end
+
+    local hit = Combat.hitFor(entity)
+    if not hit then
+        Combat.Reason = 'no line to target'
+        return
+    end
+
+    Combat.Target = entity
+    Combat.CurrentHit = hit
+    Combat.Reason = 'hitting ' .. tostring(entity.Name)
+
+    if Combat.FaceTarget then
+        pcall(faceTowards, entity:GetPivot().Position)
+    end
+
+    -- onClick re-checks toolMeta.combat.cooldown and its own isHitting flag, so
+    -- calling it faster than the weapon allows just gets refused rather than
+    -- producing a request.
+    local mouse = LocalPlayer:GetMouse()
+    local ok = pcall(function()
+        weapon:onClick(mouse, mouse.Button1Down, nil)
+    end)
+    if ok then
+        Combat.Hits = Combat.Hits + 1
+    end
+end
+
+function Combat.clearEsp()
+    for entity, adorn in pairs(Combat.EspLive) do
+        adorn:Destroy()
+        Combat.EspLive[entity] = nil
+    end
+end
+
+function Combat.refreshEsp()
+    if not Combat.Esp then
+        if next(Combat.EspLive) ~= nil then Combat.clearEsp() end
+        return
+    end
+    local keep = {}
+    for _, entity in ipairs(Combat.near(Combat.EspRange)) do
+        keep[entity] = true
+        local adorn = Combat.EspLive[entity]
+        if not adorn then
+            adorn = Instance.new('Highlight')
+            adorn.Name = 'centrl_entity_esp'
+            adorn.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+            adorn.FillTransparency = 0.7
+            adorn.OutlineTransparency = 0
+            adorn.Adornee = entity
+            adorn.Parent = Workspace
+            Combat.EspLive[entity] = adorn
+        end
+        local isPlayer = entity:FindFirstChild('IsPlayer')
+        local colour = (isPlayer and isPlayer.Value)
+            and Color3.fromRGB(255, 90, 90) or Color3.fromRGB(90, 200, 255)
+        adorn.FillColor = colour
+        adorn.OutlineColor = colour
+    end
+    for entity, adorn in pairs(Combat.EspLive) do
+        if not keep[entity] or not entity.Parent then
+            adorn:Destroy()
+            Combat.EspLive[entity] = nil
+        end
+    end
+end
+
+task.spawn(function()
+    while true do
+        task.wait(0.15)
+        if State.Running and Combat.Enabled then
+            pcall(Combat.step)
+        end
+    end
+end)
+
+task.spawn(function()
+    while true do
+        task.wait(0.7)
+        if State.Running then
+            pcall(Combat.refreshEsp)
+        end
+    end
+end)
+
 --// deposit race -------------------------------------------------------------
 -- This is a test, not a feature. Every item remote in this client hands the
 -- server an Instance it owns plus an amount it can read off that same Instance,
@@ -1661,7 +1963,9 @@ end)
 local Race = {
     Parallel = 3,
     Item = nil,
-    CraftName = '',
+    Probe = nil,
+    Text = '',
+    Text2 = '',
     Amount = -1,
     Busy = false,
     Log = nil,
@@ -1750,109 +2054,6 @@ function Race.runRace()
     end)
 end
 
--- Test 2: a negative craft amount.
---
--- CraftTool takes { workbenchBlock, toolName, amount, upgrade } - a name and a
--- number, with no Instance for the server to re-read the amount from. The
--- shared inventory-service that the server runs spends ingredients through
--- decrementToolTypeAmount, and that function checks the amount for NaN and for
--- being a whole number and then stops checking. It never checks the sign.
---
--- Follow a negative through it: decrementToolAmount does
--- Amount.Value = Amount.Value - delta, so a delta of -5 writes Amount + 5. It
--- returns the delta, the caller sums it to -5, and the guard `amount <= taken`
--- reads -5 <= -5 and reports success. hasToolAmount has the same shape and
--- passes negatives for the same reason.
---
--- So if the crafting handler multiplies each ingredient by this amount and
--- spends it that way, a negative craft pays the ingredients back instead of
--- taking them. That is the hypothesis; the diff below is the answer.
-function Race.runNegativeCraft()
-    local bench = Race.workbench()
-    if not bench then
-        Race.Log:Warn('stand next to a workbench')
-        return
-    end
-    local toolName = Race.CraftName
-    if not toolName or toolName == '' then
-        Race.Log:Warn('type the internal tool name to craft, e.g. woodPlank')
-        return
-    end
-
-    local before = Race.begin()
-    if not before then return end
-    Race.Log:Add(('craft %s amount %d at %s'):format(toolName, Race.Amount, bench.Name))
-
-    task.spawn(function()
-        local result = nil
-        local ok = pcall(function()
-            result = Services.Remotes.Client:Get('CraftTool'):CallServer({
-                workbenchBlock = bench,
-                toolName = toolName,
-                amount = Race.Amount,
-                upgrade = nil,
-            })
-        end)
-        task.wait(1.5)
-        local verdict
-        if not ok then
-            verdict = 'the call itself errored, so the server rejected the shape'
-        elseif type(result) == 'table' then
-            verdict = 'server replied success=' .. tostring(result.success)
-        else
-            verdict = 'server replied ' .. tostring(result)
-        end
-        Race.report(before, verdict)
-    end)
-end
-
--- Test 3: a negative worker deposit.
---
--- CLIENT_BLOCK_WORKER_DEPOSIT_TOOL_REQUEST is the same shape and the better
--- target of the two, because it names the item outright:
--- { block, toolName, amount, <signature> }. If the handler spends the deposit
--- through the same decrementToolTypeAmount, a negative amount hands the items
--- back rather than taking them.
-function Race.runNegativeWorker()
-    local label = Race.Item
-    if not label then
-        Race.Log:Warn('pick an item first')
-        return
-    end
-    local target = Race.findTool(label)
-    if not target then
-        Race.Log:Warn('no ' .. label .. ' in the backpack')
-        return
-    end
-    local worker = Race.worker()
-    if not worker then
-        Race.Log:Warn('stand next to a furnace, forge or other worker block')
-        return
-    end
-
-    local before = Race.begin()
-    if not before then return end
-    Race.Log:Add(('worker deposit %s amount %d into %s')
-        :format(target.Name, Race.Amount, worker.Name))
-
-    task.spawn(function()
-        local result = callRequest('CLIENT_BLOCK_WORKER_DEPOSIT_TOOL_REQUEST', {
-            block = worker,
-            toolName = target.Name,
-            amount = Race.Amount,
-            [WORKER_SIGNATURE_KEY] = WORKER_SIGNATURE,
-        })
-        task.wait(1.5)
-        local verdict
-        if type(result) == 'table' then
-            verdict = 'server replied success=' .. tostring(result.success)
-        else
-            verdict = 'server replied ' .. tostring(result)
-        end
-        Race.report(before, verdict)
-    end)
-end
-
 function Race.workbench()
     local benches = Scan.blocksNear(24, function(block)
         local ok, isBench = pcall(function()
@@ -1871,6 +2072,137 @@ function Race.worker()
         return ok and isWorker and true or false
     end)
     return workers[1]
+end
+
+--// probes -------------------------------------------------------------------
+-- Craft and worker deposit came back clamped, so the sign check exists on the
+-- server even though the shared helper has none. These are the remaining
+-- remotes that take a number the server cannot re-derive from an Instance it
+-- owns. Rather than shipping one at a time and waiting for a merge, each is a
+-- row here: pick it, set the number and the string, fire, read the diff.
+
+local Probes = {}
+
+-- The vending machine's customer transaction is the obvious fourth entry and it
+-- is deliberately not here: the dump has the remote defined but no call site
+-- for it, so its payload shape would be a guess, and a probe built on a guess
+-- tells you nothing when it comes back empty.
+Probes.Order = {
+    'merchant order',
+    'trade quantity',
+    'claim reward',
+    'worker deposit',
+    'craft',
+}
+
+-- CLIENT_MERCHANT_ORDER_REQUEST is { merchant, offerId, amount }. Worth trying
+-- because it is a different handler from crafting and it moves coins as well as
+-- items, and the client's own restock maths does stock - amount, which a
+-- negative would raise rather than lower.
+Probes['merchant order'] = {
+    needs = 'string is the offerId; merchant id goes in the second box',
+    run = function(amount, text, second)
+        return callRequest('CLIENT_MERCHANT_ORDER_REQUEST', {
+            merchant = second ~= '' and second or nil,
+            offerId = text,
+            amount = amount,
+        })
+    end,
+}
+
+-- The trade namespace's setTradeItemQuantity, { toolName, quantity }. Same
+-- shape as the two that failed, but a different subsystem, and trade offers are
+-- held server-side between two players rather than written straight to an
+-- inventory.
+Probes['trade quantity'] = {
+    needs = 'be in an open trade; string is the internal tool name',
+    run = function(amount, text)
+        if not Services.Remotes then return nil end
+        local ok, result = pcall(function()
+            return Services.Remotes.Client
+                :GetNamespace('sfsiuWqmBlalIf')
+                :Get('gSqxaHqzsgcLolubtmwuuzZoprcsuj')
+                :CallServerAsync({ toolName = text, quantity = amount })
+                :expect()
+        end)
+        return ok and result or nil
+    end,
+}
+
+-- ClaimReward takes a bare reward key string, with HasClaimedReward as its
+-- companion. Not a dupe of arbitrary items, but if the claimed flag is written
+-- after the grant rather than before, firing the same key twice is free goods.
+Probes['claim reward'] = {
+    needs = 'string is the reward key; amount is how many times to fire it',
+    run = function(amount, text)
+        if not Services.Remotes then return nil end
+        local fired = math.max(1, math.abs(amount))
+        local last = nil
+        for _ = 1, fired do
+            pcall(function()
+                last = Services.Remotes.Client:Get('ClaimReward'):CallServerAsync(text):expect()
+            end)
+        end
+        return last
+    end,
+}
+
+Probes['worker deposit'] = {
+    needs = 'stand at a furnace or forge; string is the internal tool name',
+    run = function(amount, text)
+        local worker = Race.worker()
+        if not worker then return nil end
+        return callRequest('CLIENT_BLOCK_WORKER_DEPOSIT_TOOL_REQUEST', {
+            block = worker,
+            toolName = text,
+            amount = amount,
+            [WORKER_SIGNATURE_KEY] = WORKER_SIGNATURE,
+        })
+    end,
+}
+
+Probes['craft'] = {
+    needs = 'stand at a workbench; string is the internal tool name',
+    run = function(amount, text)
+        local bench = Race.workbench()
+        if not (bench and Services.Remotes) then return nil end
+        local ok, result = pcall(function()
+            return Services.Remotes.Client:Get('CraftTool'):CallServer({
+                workbenchBlock = bench,
+                toolName = text,
+                amount = amount,
+                upgrade = nil,
+            })
+        end)
+        return ok and result or nil
+    end,
+}
+
+function Race.runProbe()
+    local name = Race.Probe
+    local probe = name and Probes[name]
+    if not probe then
+        Race.Log:Warn('pick a probe first')
+        return
+    end
+
+    local before = Race.begin()
+    if not before then return end
+    Race.Log:Add(('%s | amount %d | "%s"'):format(name, Race.Amount, tostring(Race.Text)))
+
+    task.spawn(function()
+        local result = probe.run(Race.Amount, Race.Text or '', Race.Text2 or '')
+        task.wait(1.5)
+        local verdict
+        if result == nil then
+            verdict = 'no reply — the call failed or a precondition was missing (' .. probe.needs .. ')'
+        elseif type(result) == 'table' then
+            verdict = 'replied success=' .. tostring(result.success)
+        else
+            verdict = 'replied ' .. tostring(result)
+        end
+        Race.report(before, verdict)
+    end)
 end
 
 --// tabs ---------------------------------------------------------------------
@@ -2487,6 +2819,112 @@ PetPaceSec:Slider({
     Callback = function(v) Animals.Interval = v end,
 })
 
+--// combat tab ---------------------------------------------------------------
+
+local CombatTab = Window:Tab({ Title = 'combat', Icon = 'swords' })
+local CombatSec = CombatTab:Section({ Title = 'auto attack', Side = 'left' })
+local CombatNoteSec = CombatTab:Section({ Title = 'targeting & notes', Side = 'right' })
+
+local CombatStats = {
+    weapon = CombatSec:Stat({ Title = 'weapon', Value = '-' }),
+    target = CombatSec:Stat({ Title = 'target', Value = '-' }),
+    doing = CombatSec:Stat({ Title = 'doing', Value = 'idle' }),
+}
+
+CombatSec:Toggle({
+    Title = 'enabled',
+    Desc = 'drives SwordTool.onClick, so the weapon\'s own cooldown still rules',
+    Flag = 'iw_enabled',
+    Default = false,
+    Callback = function(state)
+        Combat.Enabled = state
+        if not state then
+            Combat.Target = nil
+            Combat.CurrentHit = nil
+        elseif not State.Weapon then
+            notify('combat', 'equip a weapon, then re-equip if it does not pick up', 'warning', 6)
+        end
+    end,
+})
+
+CombatSec:Dropdown({
+    Title = 'target',
+    Values = { 'mobs', 'players', 'both' },
+    Default = 'mobs',
+    Flag = 'iw_targets',
+    Callback = function(value) Combat.Targets = value end,
+})
+
+CombatSec:Toggle({
+    Title = 'skip the dead',
+    Flag = 'iw_ignoredead',
+    Default = true,
+    Callback = function(state) Combat.IgnoreDead = state end,
+})
+
+CombatSec:Toggle({
+    Title = 'face the target',
+    Flag = 'iw_face',
+    Default = true,
+    Callback = function(state) Combat.FaceTarget = state end,
+})
+
+CombatSec:Toggle({
+    Title = 'entity esp',
+    Desc = 'blue for mobs, red for players',
+    Flag = 'iw_esp',
+    Default = false,
+    Callback = function(state)
+        Combat.Esp = state
+        if not state then Combat.clearEsp() end
+    end,
+})
+
+CombatSec:Button({
+    Title = 'reset hit counter',
+    Callback = function() Combat.Hits = 0 end,
+})
+
+CombatNoteSec:Paragraph({
+    Title = 'the range ceiling is the game\'s',
+    Content = 'LivingEntityUtils.SWORD_HIT_RANGE is 15, which is how far the weapon\'s own '
+        .. 'target ray reaches. The slider stops there for the same reason the mining one '
+        .. 'stops at 24: past it you are asking for a hit no unmodified client could have '
+        .. 'produced.',
+})
+
+CombatNoteSec:Slider({
+    Title = 'range',
+    Flag = 'iw_range',
+    Min = 4, Max = SWORD_HIT_RANGE, Increment = 1,
+    Default = math.min(12, SWORD_HIT_RANGE),
+    Suffix = 'st',
+    Callback = function(v) Combat.Range = math.min(v, SWORD_HIT_RANGE) end,
+})
+
+CombatNoteSec:Paragraph({
+    Title = 'about hitting players',
+    Content = 'CombatUtils.isPvPAllowed only returns true on the PvP island, and past its '
+        .. 'divider at that. Off it the server refuses every swing at a player, and a run of '
+        .. 'refused combat requests is the same bad pattern as refused break requests — so '
+        .. 'mobs is the default, and players is only worth turning on where PvP is live.',
+})
+
+CombatNoteSec:Slider({
+    Title = 'esp range',
+    Desc = 'the esp only, not the attack',
+    Flag = 'iw_esprange',
+    Min = 50, Max = 800, Increment = 25, Default = 300,
+    Suffix = 'st',
+    Callback = function(v) Combat.EspRange = v end,
+})
+
+CombatNoteSec:Paragraph({
+    Title = 'it yields to your clicks too',
+    Content = 'The same manual-input check the miner uses. While you are actually swinging '
+        .. 'at something, findTarget goes back to reading your mouse.',
+})
+
 --// lab tab ------------------------------------------------------------------
 
 local LabTab = Window:Tab({ Title = 'lab', Icon = 'flask-conical' })
@@ -2494,41 +2932,90 @@ local LabSec = LabTab:Section({ Title = 'tests', Side = 'left' })
 local LabNoteSec = LabTab:Section({ Title = 'what is being tested', Side = 'right' })
 
 LabNoteSec:Paragraph({
-    Title = 'the race is answered, and it was no',
-    Content = 'Kept as the control. The server serialises concurrent deposits, so that '
-        .. 'vector is closed. The two below are a different shape and a much better bet.',
+    Title = 'what has been ruled out',
+    Content = 'The concurrent deposit race: the server serialises them. Negative amounts '
+        .. 'through CraftTool and through the block worker deposit: clamped. So the server '
+        .. 'does check the sign, even though the shared helper it calls does not — '
+        .. 'decrementToolTypeAmount validates NaN and integrality and nothing else, and '
+        .. 'decrementToolAmount would happily write Amount + 5 for a delta of -5. The guard '
+        .. 'is somewhere above it, in the handlers those two remotes reach.',
 })
 
 LabNoteSec:Paragraph({
-    Title = 'the sign is never checked',
-    Content = 'inventory-service is shared code the server runs. decrementToolTypeAmount '
-        .. 'checks its amount for NaN and for being a whole number, then stops. '
-        .. 'decrementToolAmount does Amount.Value = Amount.Value - delta, so a delta of -5 '
-        .. 'writes Amount + 5, returns -5, and the guard amount <= taken reads -5 <= -5 and '
-        .. 'reports success. hasToolAmount passes negatives for the same reason.',
+    Title = 'what is left, and why these',
+    Content = 'Every remaining remote that hands the server a number it cannot re-derive '
+        .. 'from an Instance it owns. The merchant order is the best of them: a different '
+        .. 'handler from crafting, it moves coins as well as items, and the client\'s own '
+        .. 'restock maths does stock minus amount, which a negative raises. Trade quantity '
+        .. 'is the same shape in a subsystem that holds offers between two players rather '
+        .. 'than writing an inventory. Claim reward is a different shape entirely — a bare '
+        .. 'key string with a separate has-claimed check, so if the flag is written after '
+        .. 'the grant, firing twice is free goods.',
 })
 
 LabNoteSec:Paragraph({
-    Title = 'which remotes can reach it',
-    Content = 'Two carry a name and a client number with no Instance for the server to '
-        .. 're-read from. CraftTool sends { workbenchBlock, toolName, amount, upgrade }. '
-        .. 'CLIENT_BLOCK_WORKER_DEPOSIT_TOOL_REQUEST sends { block, toolName, amount } and '
-        .. 'is the better of the two because it names the item outright. If either spends '
-        .. 'through decrementToolTypeAmount, a negative amount pays you instead of charging '
-        .. 'you. A third, the trade remote setTradeItemQuantity, has the same shape and is '
-        .. 'worth a look if these two come back clean.',
+    Title = 'how to sweep',
+    Content = 'Pick a probe, set the amount and the string it needs, fire, read the diff. '
+        .. 'Every probe reports the whole backpack before and after, so an item going up is '
+        .. 'the answer and nothing moving is a clamp. Try -1 first, then -1000: some guards '
+        .. 'catch small negatives and overflow on large ones. Then try a huge positive, '
+        .. 'which is the other half of an unchecked bound.',
 })
 
 LabNoteSec:Paragraph({
-    Title = 'how to read the result',
-    Content = 'Every test diffs your whole backpack before and after and prints what moved, '
-        .. 'so you do not need to know the recipe. An item going up is the answer. Nothing '
-        .. 'moving means the server clamped it. Run one at a time.',
+    Title = 'this stays the loudest tab',
+    Content = 'Every one of these produces requests the server should refuse, which is the '
+        .. 'exact pattern the rest of the script is built to avoid. Fire deliberately, read '
+        .. 'the answer, stop.',
+})
+
+local LabProbeDropdown = LabSec:Dropdown({
+    Title = 'probe',
+    Values = Probes.Order,
+    Default = 'merchant order',
+    Flag = 'ir_probe',
+    Callback = function(value)
+        Race.Probe = value
+        local probe = Probes[value]
+        if probe then Race.Log:Add('needs: ' .. probe.needs) end
+    end,
+})
+
+LabSec:Slider({
+    Title = 'amount',
+    Desc = 'negative first, then very negative, then very large',
+    Flag = 'ir_amount',
+    Min = -10000, Max = 10000, Increment = 1, Default = -1,
+    Callback = function(v) Race.Amount = v end,
+})
+
+LabSec:Textbox({
+    Title = 'string',
+    Desc = 'internal tool name, offer id or reward key, depending on the probe',
+    Flag = 'ir_text',
+    Default = '',
+    Callback = function(text) Race.Text = text end,
+})
+
+LabSec:Textbox({
+    Title = 'second string',
+    Desc = 'only the merchant order uses this — the merchant id',
+    Flag = 'ir_text2',
+    Default = '',
+    Callback = function(text) Race.Text2 = text end,
+})
+
+Race.Log = LabSec:Console({ Title = 'result', Height = 150, MaxLines = 60, Timestamps = true })
+Race.Log:Add('pick a probe; its preconditions print here')
+
+LabSec:Button({
+    Title = 'fire probe',
+    Desc = 'one shot; the backpack diff prints above',
+    Callback = function() task.spawn(Race.runProbe) end,
 })
 
 local LabItemDropdown = LabSec:Dropdown({
-    Title = 'item',
-    Desc = 'used by the race and the worker deposit',
+    Title = 'item (for the race control)',
     Values = {},
     Flag = 'ir_item',
     Callback = function(value) Race.Item = value end,
@@ -2551,37 +3038,6 @@ LabSec:Button({
 })
 
 LabSec:Slider({
-    Title = 'amount',
-    Desc = 'negative is the whole point; -1 first',
-    Flag = 'ir_amount',
-    Min = -20, Max = 20, Increment = 1, Default = -1,
-    Callback = function(v) Race.Amount = v end,
-})
-
-LabSec:Textbox({
-    Title = 'craft tool name',
-    Desc = 'the internal name, not the display one — woodPlank, stoneBrick',
-    Flag = 'ir_craftname',
-    Default = '',
-    Callback = function(text) Race.CraftName = text end,
-})
-
-Race.Log = LabSec:Console({ Title = 'result', Height = 150, MaxLines = 60, Timestamps = true })
-Race.Log:Add('one test at a time; the backpack diff prints here')
-
-LabSec:Button({
-    Title = 'negative worker deposit',
-    Desc = 'stand at a furnace or forge — the best bet of the three',
-    Callback = function() task.spawn(Race.runNegativeWorker) end,
-})
-
-LabSec:Button({
-    Title = 'negative craft',
-    Desc = 'stand at a workbench',
-    Callback = function() task.spawn(Race.runNegativeCraft) end,
-})
-
-LabSec:Slider({
     Title = 'parallel requests',
     Flag = 'ir_parallel',
     Min = 2, Max = 8, Increment = 1, Default = 3,
@@ -2589,7 +3045,7 @@ LabSec:Slider({
 })
 
 LabSec:Button({
-    Title = 'deposit race (the control)',
+    Title = 'deposit race (the control, already answered)',
     Desc = 'stand at a chest',
     Callback = function() task.spawn(Race.runRace) end,
 })
@@ -2613,6 +3069,8 @@ LiveSec:Button({
         Farm.Harvest, Farm.Plant, Farm.Till = false, false, false
         Collect.Drops, Collect.Deposit = false, false
         Animals.Pet, Animals.Milk, Animals.Feed, Animals.Honey = false, false, false, false
+        Combat.Enabled, Combat.Esp = false, false
+        Combat.clearEsp()
         Esp.Enabled = false
         Esp.clear()
         stopSwinging()
@@ -2620,6 +3078,7 @@ LiveSec:Button({
         Game.ToolScript.onClickSetup = Hooks.onClickSetup
         Game.AxeTool.onBlockHit = Hooks.onBlockHit
         Game.AxeTool.getTargettedBlock = Hooks.getTargettedBlock
+        Game.CombatUtils.findTarget = Hooks.findTarget
         for _, conn in ipairs(Connections) do
             pcall(function() conn:Disconnect() end)
         end
@@ -2684,6 +3143,10 @@ task.spawn(function()
             PetStats.petted:Set(tostring(Animals.Petted))
             PetStats.milked:Set(tostring(Animals.Milked))
             PetStats.doing:Set(Animals.Reason)
+
+            CombatStats.weapon:Set(State.Weapon and State.WeaponName or '-')
+            CombatStats.target:Set(Combat.Target and Combat.Target.Name or '-')
+            CombatStats.doing:Set(Combat.Reason)
         end)
     end
 end)
