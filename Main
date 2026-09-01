@@ -28,7 +28,7 @@ local Games = {
 -- The UI ships in this repo now, so the hub and everything it loads are
 -- versioned together: a change to the library lands with the scripts written
 -- against it instead of drifting in a second repo.
-local Centrl = loadstring(game:HttpGet(REPO_RAW_BASE .. 'UI/Lib2.lua'))()
+local Centrl = loadstring(game:HttpGet(REPO_RAW_BASE .. 'UI/Lib3.lua'))()
 
 local Window = Centrl:Window({
     Title = 'hub',

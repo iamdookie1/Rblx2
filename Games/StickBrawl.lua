@@ -31,7 +31,7 @@ local function inSafeZone()
     return char ~= nil and char:GetAttribute("SafeZone") == true
 end
 
-local Centrl = loadstring(game:HttpGet('https://raw.githubusercontent.com/iamdookie1/Rblx2/main/UI/Lib2.lua'))()
+local Centrl = loadstring(game:HttpGet('https://raw.githubusercontent.com/iamdookie1/Rblx2/main/UI/Lib3.lua'))()
 
 local Window = Centrl:Window({
     Title = 'stick brawl',
@@ -244,7 +244,6 @@ local function screenBoxFor(char)
     return minX, minY, maxX - minX, maxY - minY
 end
 
-local espUpdateAccum = 0
 track(RunService.RenderStepped:Connect(function(dt)
     if not EspConfig.Enabled then
         if next(espEntries) then clearEsp() end
