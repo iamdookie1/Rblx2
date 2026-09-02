@@ -8,6 +8,12 @@ local WATCH_DURATION = 5
 local Games = {
     [9391468976] = { Name = 'Jujutsu Shenanigans', Script = 'Games/Jjs' },
     [155615604] = { Name = 'Prison Life', Script = 'Games/PrisonLife.lua' },
+    -- Real MM2 place id, confirmed from a fresh script dump's own PlaceId
+    -- check (ReplicatedFirst.UISelector.Loading). Alternate/test place ids
+    -- also seen in that dump (335132309, 333740520, 5895823254, 5928494131,
+    -- 636649648) weren't registered - no way to tell from the dump alone
+    -- whether those are still live, mobile-only, or long since retired.
+    [142823291] = { Name = 'Murder Mystery 2', Script = 'Games/MM2.lua' },
     [2768379856] = { Name = '3008', Script = 'Games/3008.lua' },
     [119789365111500] = { Name = 'Tanks', Script = 'Games/Tanks.lua' },
     [7871169780] = { Name = 'Minesweeper', Script = 'Games/Minesweeper.lua' },
