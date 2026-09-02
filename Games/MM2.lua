@@ -242,6 +242,38 @@ spawnLoop(function()
 end)
 
 --// Tab 2: silent aim -------------------------------------------------------------
+-- Two weapons, two very different aim problems:
+--
+--   Gun (hitscan) - Shoot:FireServer(origin, target). The server gets told
+--   the answer directly, no travel time modeled anywhere in the client
+--   code, so the only thing worth leading for is round-trip latency between
+--   "the target is here right now" and the server actually processing the
+--   call - not a physical bullet flight.
+--
+--   Knife (thrown) - KnifeThrown:FireServer(handleCFrame, target). This one
+--   really is a physical projectile with travel time, but "ThrowSpeed" -
+--   the only attribute the client exposes - turned out from reading
+--   KnifeClient to be the charge-up duration in seconds, not a studs/sec
+--   velocity (the charge loop waits until elapsed time reaches ThrowSpeed).
+--   The real flight speed isn't in any client-readable data, so knife lead
+--   uses an assumed studs/sec constant below - tune it against what you
+--   actually see connect, it is not a value pulled from the dump.
+--
+-- The sheriff's gun exists to kill the murderer, and only the murderer -
+-- RoundData (see the header) names them by role, so the gun redirect is
+-- restricted to whichever player currently has Role == "Murderer" rather
+-- than "nearest player". The knife has no such restriction: the murderer
+-- can legally kill anyone, so it keeps the general nearest-target scan.
+--
+-- Both weapons also get a second, late check right before the redirect:
+-- the scan below picks a candidate using a camera-based sightline (cheap,
+-- runs first), but the shot itself is re-validated with a fresh raycast
+-- from the REAL origin the game just handed this hook - the gun's actual
+-- muzzle attachment, the knife's actual Handle position - not the camera.
+-- Camera and muzzle are not the same point, especially off-center or in a
+-- tight corner, so a target that reads as clear from the camera can still
+-- be wall-blocked from where the shot truly leaves. A blocked shot is left
+-- un-redirected rather than forced, so it just goes out as originally aimed.
 local Aim = {
     SilentAim = false,
     WallCheck = true,
@@ -250,6 +282,8 @@ local Aim = {
     FOVEnabled = true,
     FOVRadius = 200,
     FOVFollowMouse = true,
+    Predict = true,
+    KnifeSpeed = 120,        -- assumed studs/sec - see the note above, this is a tuned guess
 }
 
 local function isAlivePlr(plr)
@@ -262,6 +296,7 @@ local visionParams = RaycastParams.new()
 visionParams.FilterType = Enum.RaycastFilterType.Exclude
 visionParams.IgnoreWater = true
 
+-- Coarse, camera-based - used only to pick a candidate during the scan.
 local function isVisible(char, origin)
     if not Aim.WallCheck then return true end
     local part = char:FindFirstChild(Aim.AimPart) or char:FindFirstChild("HumanoidRootPart")
@@ -275,6 +310,20 @@ local function isVisible(char, origin)
     return (result.Position - origin).Magnitude >= direction.Magnitude - 2
 end
 
+-- Precise, real-origin-based - the final gate right before a shot is
+-- actually redirected. See the header note on why this has to be separate
+-- from isVisible above rather than reusing it.
+local function clearFromOrigin(originPos, targetPos, char)
+    if not Aim.WallCheck then return true end
+    local params = visionParams
+    params.FilterDescendantsInstances = { LocalPlayer.Character, char }
+    local direction = targetPos - originPos
+    local ok, result = pcall(function() return Workspace:Raycast(originPos, direction, params) end)
+    if not ok then return true end
+    if not result then return true end
+    return (result.Position - originPos).Magnitude >= direction.Magnitude - 2
+end
+
 local function screenAnchor()
     if Aim.FOVFollowMouse then
         return UserInputService:GetMouseLocation()
@@ -283,54 +332,60 @@ local function screenAnchor()
     return Vector2.new(viewport.X / 2, viewport.Y / 2)
 end
 
-local function getTarget()
+local function evaluateCandidate(plr, anchor, origin)
+    local char = plr.Character
+    local part = char and (char:FindFirstChild(Aim.AimPart) or char:FindFirstChild("HumanoidRootPart"))
+    if not part then return nil end
+    if (part.Position - origin).Magnitude > Aim.MaxRange then return nil end
+    local screenPos, onScreen = Camera:WorldToViewportPoint(part.Position)
+    if not onScreen then return nil end
+    local screenDist = (Vector2.new(screenPos.X, screenPos.Y) - anchor).Magnitude
+    if Aim.FOVEnabled and screenDist > Aim.FOVRadius then return nil end
+    if not isVisible(char, origin) then return nil end
+    return part, screenDist
+end
+
+-- filterFn narrows the candidate pool before ranking - the gun passes
+-- isMurderer, the knife passes nil (anyone alive and in view is fair game).
+local function scanTarget(filterFn)
     local origin = Camera.CFrame.Position
     local anchor = screenAnchor()
-    local best, bestScore
+    local best, bestPart, bestScore
 
     for _, plr in ipairs(Players:GetPlayers()) do
-        if plr ~= LocalPlayer and isAlivePlr(plr) then
-            local char = plr.Character
-            local part = char and (char:FindFirstChild(Aim.AimPart) or char:FindFirstChild("HumanoidRootPart"))
-            if part then
-                local dist = (part.Position - origin).Magnitude
-                if dist <= Aim.MaxRange then
-                    local screenPos, onScreen = Camera:WorldToViewportPoint(part.Position)
-                    if onScreen then
-                        local screenDist = (Vector2.new(screenPos.X, screenPos.Y) - anchor).Magnitude
-                        if not Aim.FOVEnabled or screenDist <= Aim.FOVRadius then
-                            if isVisible(char, origin) then
-                                if not bestScore or screenDist < bestScore then
-                                    bestScore = screenDist
-                                    best = part
-                                end
-                            end
-                        end
-                    end
-                end
+        if plr ~= LocalPlayer and isAlivePlr(plr) and (not filterFn or filterFn(plr)) then
+            local part, screenDist = evaluateCandidate(plr, anchor, origin)
+            if part and (not bestScore or screenDist < bestScore) then
+                bestScore = screenDist
+                best = plr
+                bestPart = part
             end
         end
     end
 
-    return best
+    return best, bestPart
 end
 
--- getTarget scans every player and raycasts per candidate; the namecall hook
--- below runs on every single method call in the entire game, not just shots,
--- so it can't afford to do that scan itself. Recomputed at most 30x/sec and
--- reused for whichever calls land inside that window.
-local cachedTarget, cachedTargetAt = nil, 0
-local TARGET_CACHE_SECONDS = 1 / 30
+local function isMurderer(plr)
+    local data = RoundData[plr.Name]
+    return data ~= nil and data.Role == "Murderer" and data.Dead ~= true
+end
 
-local function getCachedTarget()
-    local now = os.clock()
-    if cachedTarget and cachedTarget.Parent and (now - cachedTargetAt) < TARGET_CACHE_SECONDS then
-        return cachedTarget
+local function getPing()
+    local ok, ping = pcall(function() return LocalPlayer:GetNetworkPing() end)
+    if ok and typeof(ping) == "number" and ping > 0 then return ping end
+    return 0.08
+end
+
+-- Where the target will actually be once the shot lands, not where they
+-- were when the scan ran a moment earlier.
+local function leadPosition(part, travelTime)
+    if not Aim.Predict or not travelTime or travelTime <= 0 then
+        return part.Position
     end
-    cachedTargetAt = now
-    local ok, result = pcall(getTarget)
-    cachedTarget = ok and result or nil
-    return cachedTarget
+    local ok, velocity = pcall(function() return part.AssemblyLinearVelocity end)
+    if not ok or not velocity then return part.Position end
+    return part.Position + velocity * travelTime
 end
 
 local hasNamecallHook = typeof(hookmetamethod) == "function" and typeof(getnamecallmethod) == "function"
@@ -339,17 +394,36 @@ if hasNamecallHook then
     local originalNamecall
     originalNamecall = hookmetamethod(game, "__namecall", function(self, ...)
         if not Unloading and Aim.SilentAim and typeof(self) == "Instance" and getnamecallmethod() == "FireServer" then
-            -- Matched by shape (a RemoteEvent named "Shoot" whose parent is
-            -- a Tool named "Gun"), not by a cached instance reference, so
-            -- this keeps working across every respawn and every new gun
-            -- instance without needing to re-find anything.
+            -- Matched by shape, not a cached instance reference, so both
+            -- branches keep working across every respawn and every new
+            -- tool instance without needing to re-find anything.
             if self.Name == "Shoot" and self.ClassName == "RemoteEvent" then
                 local parent = self.Parent
                 if parent and parent.ClassName == "Tool" and parent.Name == "Gun" then
-                    local target = getCachedTarget()
-                    if target and target.Parent then
+                    local plr, part = scanTarget(isMurderer)
+                    if plr and part then
                         local origin = ...
-                        return originalNamecall(self, origin, CFrame.new(target.Position))
+                        local originPos = typeof(origin) == "CFrame" and origin.Position or Camera.CFrame.Position
+                        local aimPos = leadPosition(part, getPing())
+                        if clearFromOrigin(originPos, aimPos, plr.Character) then
+                            return originalNamecall(self, origin, CFrame.new(aimPos))
+                        end
+                    end
+                end
+            elseif self.Name == "KnifeThrown" then
+                local eventsFolder = self.Parent
+                local tool = eventsFolder and eventsFolder.Parent
+                if eventsFolder and eventsFolder.Name == "Events" and tool and tool.ClassName == "Tool" and tool.Name == "Knife" then
+                    local plr, part = scanTarget(nil)
+                    if plr and part then
+                        local handleCFrame = ...
+                        local originPos = typeof(handleCFrame) == "CFrame" and handleCFrame.Position or Camera.CFrame.Position
+                        local dist = (part.Position - originPos).Magnitude
+                        local travelTime = dist / math.max(Aim.KnifeSpeed, 1) + getPing()
+                        local aimPos = leadPosition(part, travelTime)
+                        if clearFromOrigin(originPos, aimPos, plr.Character) then
+                            return originalNamecall(self, handleCFrame, CFrame.new(aimPos))
+                        end
                     end
                 end
             end
@@ -370,13 +444,13 @@ AimSection:Stat({
 
 AimSection:Toggle({
     Title = 'silent aim',
-    Desc = 'redirects the shot you actually fire to the nearest valid target - your click, animation and the origin attachment all stay real, only the aim point changes',
+    Desc = 'gun: redirects only to the murderer. knife: redirects to the nearest valid target. either way your click, animation and the real origin stay exactly as fired - only the aim point changes, and only when the shot is actually clear from where it truly leaves',
     Flag = 'mm2_silent_aim',
     Callback = function(state)
         if state and not hasNamecallHook then
             Centrl:Notify({
                 Title = 'mm2',
-                Content = 'hookmetamethod/getnamecallmethod not available on this executor - silent aim cannot hook Shoot:FireServer.',
+                Content = 'hookmetamethod/getnamecallmethod not available on this executor - silent aim cannot hook Shoot/KnifeThrown:FireServer.',
                 Type = 'error',
                 Duration = 6,
             })
@@ -394,7 +468,7 @@ AimSection:Dropdown({
 
 AimSection:Toggle({
     Title = 'wall check',
-    Desc = 'requires a clear line of sight from your camera to the target before it counts',
+    Desc = 'requires a clear line of sight both to pick the target and, separately, from the real muzzle/handle position right before the shot is redirected',
     Flag = 'mm2_silent_aim_wallcheck',
     Default = true,
     Callback = function(state) Aim.WallCheck = state end,
@@ -409,6 +483,26 @@ AimSection:Slider({
     Suffix = ' studs',
     Flag = 'mm2_silent_aim_range',
     Callback = function(value) Aim.MaxRange = value end,
+})
+
+AimSection:Toggle({
+    Title = 'predict movement',
+    Desc = "leads the target's current velocity - ping round-trip for the gun, travel time plus ping for the thrown knife - instead of aiming at where they were when the scan ran",
+    Flag = 'mm2_silent_aim_predict',
+    Default = true,
+    Callback = function(state) Aim.Predict = state end,
+})
+
+AimSection:Slider({
+    Title = 'assumed knife speed',
+    Desc = "the client never exposes the knife's real flight speed (see the tab header) - tune this against what you actually see connect",
+    Min = 40,
+    Max = 300,
+    Increment = 5,
+    Default = 120,
+    Suffix = ' studs/s',
+    Flag = 'mm2_silent_aim_knife_speed',
+    Callback = function(value) Aim.KnifeSpeed = value end,
 })
 
 local FovSection = SilentAimTab:Section({ Title = 'fov', Side = 'right' })
