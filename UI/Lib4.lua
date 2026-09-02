@@ -28,23 +28,25 @@
         place of Fluent's rounded pill look
       - Squared-off toggle and slider chrome instead of a fully round pill
         and a circular grab handle
-      - A bigger baseline type and spacing scale. Obsidian ships its own
-        Library.Scales UIScale system for exactly this; Centrl already had
-        the same mechanism (Library:SetScale), so the "Obsidian" part here
-        is raising what it defaults to rather than adding something new -
-        see the DPI note below.
+      - A bigger baseline scale. Obsidian's own scale system
+        (Library.DPIScale / Library:SetDPIScale) is a raw, direct multiplier
+        with no dampening layered over it - set it and every UIScale it
+        drives updates immediately. Centrl's own Library:SetScale used to run
+        every request back through a viewport-fit calculation meant only for
+        the very first paint, which could visibly blunt a slider drag on a
+        smaller screen. It no longer does that - see the scale note below.
 
-    DPI - "bigger without being bigger":
+    Scale - "bigger without being bigger":
       The window's own on-screen footprint does not change. Its logical grid
-      (WINDOW_WIDTH/HEIGHT) shrinks by DPI_SCALE, and the baseline UI scale
+      (WINDOW_WIDTH/HEIGHT) shrinks by BASE_SCALE, and the baseline UI scale
       grows by the same factor, so the two cancel out for the outer window -
       same pixels on screen - while everything drawn inside it (text, rows,
-      padding, icons, everything) renders DPI_SCALE times bigger, because it
+      padding, icons, everything) renders BASE_SCALE times bigger, because it
       is all authored in that shrunken logical grid and then scaled back up
-      by the one UIScale every root object already carries. That is what a
-      display's own DPI setting does: same physical footprint, larger and
-      crisper content. The 'ui scale' slider in Settings still works exactly
-      as before - this only moves its default.
+      by the one UIScale every root object already carries. Nudging the 'ui
+      scale' slider in Settings afterward moves every registered UIScale the
+      instant it moves - directly, the way Obsidian's SetDPIScale does it,
+      not softened by anything.
 
     Usage:
       local Centrl = loadstring(game:HttpGet('.../Lib4.lua'))()
@@ -82,11 +84,11 @@ local set_clipboard = setclipboard or toclipboard or (syn and syn.write_clipboar
 --// Constants ---------------------------------------------------------------
 
 -- Same on-screen window, bigger-reading everything inside it: see the
--- DPI note at the top of the file. The logical grid shrinks by this
+-- scale note at the top of the file. The logical grid shrinks by this
 -- factor and the baseline UIScale grows by it, which cancel out for the
 -- window's own footprint but not for anything drawn inside it.
-local DPI_SCALE = 1.15
-local WINDOW_WIDTH, WINDOW_HEIGHT = 640 / DPI_SCALE, 424 / DPI_SCALE
+local BASE_SCALE = 1.15
+local WINDOW_WIDTH, WINDOW_HEIGHT = 640 / BASE_SCALE, 424 / BASE_SCALE
 local TAB_RAIL_WIDTH = 132
 local TOPBAR_HEIGHT = 42
 local SCREEN_MARGIN = 24
@@ -1253,7 +1255,12 @@ local function register_scale(ui_scale)
 end
 
 function Library:ApplyScale()
-    Library._scale = auto_scale(Library._user_scale)
+    -- Direct, the way Obsidian's SetDPIScale is direct: whatever the caller
+    -- set _user_scale to is what every UIScale gets, full stop. The
+    -- viewport-fit maths in auto_scale only ever runs once, to pick where
+    -- _user_scale starts out - see Window() below - so it can never again
+    -- dampen a scale someone actually asked for.
+    Library._scale = math.clamp(Library._user_scale, 0.35, 2)
     for ui_scale in pairs(Library._scale_objects) do
         if typeof(ui_scale) == 'Instance' and ui_scale.Parent then
             ui_scale.Scale = Library._scale
@@ -1511,7 +1518,7 @@ function Library:Window(options)
     local toggle_key = pick(options, Enum.KeyCode.RightShift, 'ToggleKey', 'toggle_key', 'Keybind')
     local accent_color = pick(options, nil, 'Accent', 'accent', 'AccentColor')
     local theme_name = pick(options, nil, 'Theme', 'theme', 'ThemeName')
-    local user_scale = tonumber(pick(options, DPI_SCALE, 'Scale', 'scale')) or DPI_SCALE
+    local user_scale = tonumber(pick(options, BASE_SCALE, 'Scale', 'scale')) or BASE_SCALE
 
     -- Applied before anything is built, so every element picks the right
     -- colours up front rather than being repainted a frame later. An explicit
@@ -1535,8 +1542,8 @@ function Library:Window(options)
     if accent_color then
         Library.Accent = accent_color
     end
-    Library._user_scale = math.clamp(user_scale, 0.25, 2)
-    Library._scale = auto_scale(Library._user_scale)
+    Library._user_scale = auto_scale(user_scale)
+    Library._scale = Library._user_scale
 
     local self = setmetatable({}, Window)
     self.Tabs = {}
@@ -1854,8 +1861,10 @@ function Library:Window(options)
 
     --// Scale reactions ------------------------------------------------------
 
+    -- A resize no longer touches scale - ApplyScale is a direct passthrough
+    -- now, so re-running it here would only ever reproduce the same number.
+    -- What a resize still needs is the window kept on screen.
     track(Camera:GetPropertyChangedSignal('ViewportSize'):Connect(function()
-        Library:ApplyScale()
         self:ClampToScreen()
     end))
     Library:ApplyScale()

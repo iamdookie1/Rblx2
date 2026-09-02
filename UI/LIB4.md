@@ -57,23 +57,27 @@ Taken from Obsidian, because it reads better than Fluent's glass did:
 - Ten themes, still swappable at runtime — the palette is Centrl's own, the
   chrome they sit in is Obsidian's
 
-## "Bigger without being bigger" (DPI)
+## "Bigger without being bigger" (scale)
 
 The window's on-screen footprint is unchanged from Lib3's default. What
 changed is the ratio between that footprint and everything drawn inside it:
 the window's logical grid (`WINDOW_WIDTH`/`WINDOW_HEIGHT`) shrinks by
-`DPI_SCALE` and the baseline UI scale grows by the same factor, so the two
+`BASE_SCALE` and the baseline UI scale grows by the same factor, so the two
 cancel out for the window itself — same pixels on screen — while every row,
 font, padding and icon inside it, all authored against that smaller logical
-grid, renders `DPI_SCALE`× bigger once the one `UIScale` every window already
-carries scales it back up. That's the same trick a display's own DPI setting
-plays: identical physical size, larger and crisper content.
+grid, renders `BASE_SCALE`× bigger once the one `UIScale` every window already
+carries scales it back up.
 
-This reuses Obsidian's own idea for this — it ships a `Library.Scales`
-`UIScale` system for exactly this purpose — over Centrl's existing one
-(`Library:SetScale`, already there before this file). The 'ui scale' slider
-in the settings tab still does exactly what it always did; only its default
-moved.
+This runs on the same `UIScale` system Obsidian's own `Library.DPIScale` /
+`Library:SetDPIScale` use, and now works the same way theirs does: a direct,
+unconditional set with nothing softening it. Centrl's `Library:SetScale`
+used to run every request — including one the settings-tab slider had just
+made on purpose — back through the viewport-fit calculation meant only for
+picking a sane size on the very first paint, which could visibly blunt or
+swallow a slider drag on a smaller screen. That calculation now only ever
+runs once, to choose where the scale starts out; from then on, dragging the
+'ui scale' slider in the settings tab updates every registered `UIScale`
+immediately, exactly the value you set it to.
 
 ## Themes
 
