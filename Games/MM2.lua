@@ -388,38 +388,74 @@ local function leadPosition(part, travelTime)
     return part.Position + velocity * travelTime
 end
 
--- The candidate scan (Camera:WorldToViewportPoint, UserInputService:
--- GetMouseLocation, a Workspace:Raycast per candidate) does NOT run inside
--- the namecall hook below, even though the previous version did exactly
--- that and it's what actually broke firing entirely. Every one of those is
--- itself a method call on an Instance, so calling them from inside a
--- game.__namecall hook re-enters that same hook recursively - normally
--- harmless (they never match method == "FireServer", so they fall straight
--- through), but running that whole reentrant scan on literally every single
--- shot, with no throttling, turned out to be more than this executor's
--- getnamecallmethod()/hookmetamethod implementation tolerates back-to-back.
--- Scanning here instead, on a plain timer with no hook involved at all,
--- and having the hook only ever read the cached result, cuts the
--- reentrancy down to the one real raycast a shot actually needs (the
--- real-origin hit check right before redirecting).
-local cachedMurdererTarget, cachedMurdererPart = nil, nil
-local cachedFreeTarget, cachedFreePart = nil, nil
--- getPing() also moves out of the hook for the same reason - it's a
--- GetNetworkPing() namecall, which is one more reentrant call the hook
--- doesn't need to make on the fire path when a value from a moment ago is
--- just as good for a latency estimate.
+-- Wrapping the hook in newcclosure and cutting it down to one raycast
+-- (both tried in an earlier pass at this) were not enough - the error kept
+-- happening. The actual problem is more fundamental than "too many
+-- reentrant calls": on this executor, ANY namecall made from inside the
+-- hook, between it receiving the FireServer call and it finally calling
+-- originalNamecall, can corrupt which method/self that originalNamecall
+-- call actually resolves to - which is exactly what "Raycast is not a
+-- valid member of RemoteEvent" is: the *final* originalNamecall(self, ...)
+-- call, meant to dispatch FireServer on the Shoot/KnifeThrown remote,
+-- instead replayed the METHOD of the last thing that happened to run
+-- in between (a Raycast) against the ORIGINAL self (the remote).
+--
+-- So nothing that triggers a namecall can run inside the hook at all
+-- anymore, not even the one hit-check raycast, not even GetNetworkPing.
+-- Every part of the decision - the target scan, the lead calculation, AND
+-- the real-origin wall-check raycast - now happens entirely in this
+-- background loop, using the gun/knife's actual origin attachment read
+-- fresh each tick (the same GunRaycastAttachment / Knife Handle the game's
+-- own client code reads from). That origin is up to 1/30s old rather than
+-- the exact instant of the click, an imperceptible difference for a
+-- torso-mounted attachment, and it means the hook itself only ever reads
+-- already-decided values and makes the one namecall it can't avoid making:
+-- the actual FireServer redirect, once, at the very end.
+local cachedGunRedirect = nil
+local cachedKnifeRedirect = nil
 local cachedPing = 0.08
+
+local function findGunOrigin()
+    local char = LocalPlayer.Character
+    local root = char and char:FindFirstChild("HumanoidRootPart")
+    local attachment = root and root:FindFirstChild("GunRaycastAttachment")
+    return attachment and attachment.WorldPosition
+end
+
+local function findKnifeOrigin()
+    local char = LocalPlayer.Character
+    local tool = char and char:FindFirstChild("Knife")
+    local handle = tool and tool:FindFirstChild("Handle")
+    return handle and handle.Position
+end
 
 spawnLoop(function()
     while not Unloading do
         task.wait(1 / 30)
         cachedPing = getPing()
-        if Aim.SilentAim then
-            cachedMurdererTarget, cachedMurdererPart = scanTarget(isMurderer)
-            cachedFreeTarget, cachedFreePart = scanTarget(nil)
+
+        if not Aim.SilentAim then
+            cachedGunRedirect, cachedKnifeRedirect = nil, nil
         else
-            cachedMurdererTarget, cachedMurdererPart = nil, nil
-            cachedFreeTarget, cachedFreePart = nil, nil
+            local gPlr, gPart = scanTarget(isMurderer)
+            local gOrigin = findGunOrigin()
+            if gPlr and gPart and gOrigin then
+                local aimPos = leadPosition(gPart, cachedPing)
+                cachedGunRedirect = clearFromOrigin(gOrigin, aimPos, gPlr.Character) and CFrame.new(aimPos) or nil
+            else
+                cachedGunRedirect = nil
+            end
+
+            local kPlr, kPart = scanTarget(nil)
+            local kOrigin = findKnifeOrigin()
+            if kPlr and kPart and kOrigin then
+                local dist = (kPart.Position - kOrigin).Magnitude
+                local travelTime = dist / math.max(Aim.KnifeSpeed, 1) + cachedPing
+                local aimPos = leadPosition(kPart, travelTime)
+                cachedKnifeRedirect = clearFromOrigin(kOrigin, aimPos, kPlr.Character) and CFrame.new(aimPos) or nil
+            else
+                cachedKnifeRedirect = nil
+            end
         end
     end
 end)
@@ -430,71 +466,37 @@ if hasNamecallHook then
     local originalNamecall
 
     local function onNamecall(self, ...)
-        if not Unloading and Aim.SilentAim and typeof(self) == "Instance" and getnamecallmethod() == "FireServer" then
-            -- Matched by shape, not a cached instance reference, so both
-            -- branches keep working across every respawn and every new
-            -- tool instance without needing to re-find anything.
-            if self.Name == "Shoot" and self.ClassName == "RemoteEvent" then
-                local parent = self.Parent
-                if parent and parent.ClassName == "Tool" and parent.Name == "Gun" then
-                    -- Capture the vararg into a local before it's touched
-                    -- from inside a nested pcall closure below - "..."
-                    -- doesn't reach into a nested function.
-                    local origin = ...
-                    local plr, part = cachedMurdererTarget, cachedMurdererPart
-                    if typeof(origin) == "CFrame" and plr and plr.Parent and part and part.Parent then
-                        -- clearFromOrigin still re-enters this same hook
-                        -- once (one Raycast) - if that ever throws for any
-                        -- reason, this pcall guarantees the real shot still
-                        -- goes out below with its original, un-redirected
-                        -- aim rather than silently eating the click.
-                        local ok, newTarget = pcall(function()
-                            local aimPos = leadPosition(part, cachedPing)
-                            if clearFromOrigin(origin.Position, aimPos, plr.Character) then
-                                return CFrame.new(aimPos)
-                            end
-                            return nil
-                        end)
-                        if ok and newTarget then
-                            return originalNamecall(self, origin, newTarget)
-                        end
-                    end
+        if Unloading or not Aim.SilentAim or typeof(self) ~= "Instance" or getnamecallmethod() ~= "FireServer" then
+            return originalNamecall(self, ...)
+        end
+
+        -- Matched by shape, not a cached instance reference, so both
+        -- branches keep working across every respawn and every new tool
+        -- instance without needing to re-find anything. Everything from
+        -- here down is property/vararg reads and table lookups - no
+        -- namecall of any kind - right up to the single redirect call.
+        if self.Name == "Shoot" and self.ClassName == "RemoteEvent" and cachedGunRedirect then
+            local parent = self.Parent
+            if parent and parent.ClassName == "Tool" and parent.Name == "Gun" then
+                local origin = ...
+                if typeof(origin) == "CFrame" then
+                    return originalNamecall(self, origin, cachedGunRedirect)
                 end
-            elseif self.Name == "KnifeThrown" then
-                local eventsFolder = self.Parent
-                local tool = eventsFolder and eventsFolder.Parent
-                if eventsFolder and eventsFolder.Name == "Events" and tool and tool.ClassName == "Tool" and tool.Name == "Knife" then
-                    local handleCFrame = ...
-                    local plr, part = cachedFreeTarget, cachedFreePart
-                    if typeof(handleCFrame) == "CFrame" and plr and plr.Parent and part and part.Parent then
-                        local ok, newTarget = pcall(function()
-                            local dist = (part.Position - handleCFrame.Position).Magnitude
-                            local travelTime = dist / math.max(Aim.KnifeSpeed, 1) + cachedPing
-                            local aimPos = leadPosition(part, travelTime)
-                            if clearFromOrigin(handleCFrame.Position, aimPos, plr.Character) then
-                                return CFrame.new(aimPos)
-                            end
-                            return nil
-                        end)
-                        if ok and newTarget then
-                            return originalNamecall(self, handleCFrame, newTarget)
-                        end
-                    end
+            end
+        elseif self.Name == "KnifeThrown" and cachedKnifeRedirect then
+            local eventsFolder = self.Parent
+            local tool = eventsFolder and eventsFolder.Parent
+            if eventsFolder and eventsFolder.Name == "Events" and tool and tool.ClassName == "Tool" and tool.Name == "Knife" then
+                local handleCFrame = ...
+                if typeof(handleCFrame) == "CFrame" then
+                    return originalNamecall(self, handleCFrame, cachedKnifeRedirect)
                 end
             end
         end
+
         return originalNamecall(self, ...)
     end
 
-    -- newcclosure isolates the replacement from Luau's normal closure
-    -- semantics, which is the standard, documented fix for the class of bug
-    -- this hit: a hooked __namecall re-entering itself (every Raycast
-    -- inside onNamecall is itself a namecall) got its "self" mixed up
-    -- between the outer FireServer call and an inner Raycast call, which is
-    -- exactly what an error like "Raycast is not a valid member of
-    -- RemoteEvent" looks like - a Raycast call that landed with the
-    -- RemoteEvent as self instead of Workspace. Falls back to the plain
-    -- function if this executor doesn't expose newcclosure.
     if typeof(newcclosure) == "function" then
         onNamecall = newcclosure(onNamecall)
     end
