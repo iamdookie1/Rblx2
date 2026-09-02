@@ -1,33 +1,53 @@
 --[[
-    Centrl UI Library — Lib3
+    Centrl UI Library — Lib4
     ------------------------
-    Lib2's engine wearing Fluent's clothes.
+    Lib3 wore Fluent's clothes. This one wears Obsidian's - deividcomsono's
+    library (github.com/deividcomsono/Obsidian) - over the same Centrl
+    engine, because a flat, sharp, high-contrast tool-window reads better on
+    a screen crowded with a dozen other cheat menus than a translucent one
+    does. Lib3 is gone; nothing in this repo loads it anymore.
 
-    Lib2 stays where it is and keeps working; this is the one to point new
-    scripts at. The API is identical on purpose - every element, every option
-    alias, every returned method - so moving a script over is a one-line URL
-    change and nothing else.
+    The API did not move. Every element, every option alias, every returned
+    method is identical to Lib2 and Lib3 before it, so pointing a script here
+    is still a one-line URL change.
 
-    Kept from Lib2 (the parts Fluent has no answer for):
+    Kept from Centrl (Obsidian has no answer for these):
       - Two scrolling columns of section cards instead of one long list
       - Icon tab rail with sub-tabs and badges
       - Console, Stat, Progress, Image, RangeSlider and Buttons elements
       - Per-game config saving, named config files, a built-in settings tab
-      - Real mobile support: touch drag, touch sliders, viewport scaling,
-        and a unibar button so a phone can open the panel without a keyboard
+      - Real mobile support: touch drag, touch sliders, a unibar button so a
+        phone can open the panel without a keyboard
 
-    Taken from Fluent (the parts that make it look better than Lib2 did):
-      - Acrylic window: gradient body, noise overlay, hairline border
-      - Every control is its own rounded card with a border, not a bare row
-      - A description line under any element's title
-      - Pill toggle with a sliding knob on a quint ease
-      - Slider as a thin rail with a round grab handle
-      - A theme set - Dark, Charcoal, Deep Violet, Blood Red, Neon Purple,
-        Deep Ocean, Midnight Blue, Rose, Pearl White, AMOLED - swappable at
-        runtime, since colours are registered rather than baked in at build
+    Taken from Obsidian:
+      - Flat, opaque cards instead of Fluent's translucent acrylic glass -
+        no gradient body, no film-grain overlay, nothing to see through
+      - A crisp, actually-visible outline around the whole window, the way
+        Obsidian's AddOutline does it, instead of a stroke set to invisible
+      - Sharp corners (4px on cards, matching Obsidian's own default) in
+        place of Fluent's rounded pill look
+      - Squared-off toggle and slider chrome instead of a fully round pill
+        and a circular grab handle
+      - A bigger baseline type and spacing scale. Obsidian ships its own
+        Library.Scales UIScale system for exactly this; Centrl already had
+        the same mechanism (Library:SetScale), so the "Obsidian" part here
+        is raising what it defaults to rather than adding something new -
+        see the DPI note below.
+
+    DPI - "bigger without being bigger":
+      The window's own on-screen footprint does not change. Its logical grid
+      (WINDOW_WIDTH/HEIGHT) shrinks by DPI_SCALE, and the baseline UI scale
+      grows by the same factor, so the two cancel out for the outer window -
+      same pixels on screen - while everything drawn inside it (text, rows,
+      padding, icons, everything) renders DPI_SCALE times bigger, because it
+      is all authored in that shrunken logical grid and then scaled back up
+      by the one UIScale every root object already carries. That is what a
+      display's own DPI setting does: same physical footprint, larger and
+      crisper content. The 'ui scale' slider in Settings still works exactly
+      as before - this only moves its default.
 
     Usage:
-      local Centrl = loadstring(game:HttpGet('.../Lib3.lua'))()
+      local Centrl = loadstring(game:HttpGet('.../Lib4.lua'))()
       local Window = Centrl:Window({ Title = 'centrl', Folder = 'centrl' })
       local Tab    = Window:Tab({ Title = 'Legit', Icon = 'target' })
       local Sec    = Tab:Section({ Title = 'Aimbot', Side = 'left' })
@@ -61,7 +81,12 @@ local set_clipboard = setclipboard or toclipboard or (syn and syn.write_clipboar
 
 --// Constants ---------------------------------------------------------------
 
-local WINDOW_WIDTH, WINDOW_HEIGHT = 640, 424
+-- Same on-screen window, bigger-reading everything inside it: see the
+-- DPI note at the top of the file. The logical grid shrinks by this
+-- factor and the baseline UIScale grows by it, which cancel out for the
+-- window's own footprint but not for anything drawn inside it.
+local DPI_SCALE = 1.15
+local WINDOW_WIDTH, WINDOW_HEIGHT = 640 / DPI_SCALE, 424 / DPI_SCALE
 local TAB_RAIL_WIDTH = 132
 local TOPBAR_HEIGHT = 42
 local SCREEN_MARGIN = 24
@@ -78,28 +103,28 @@ local Library = {
     Accent = Color3.fromRGB(227, 255, 42),
 }
 
--- Fluent keeps one flat table of colour roles per theme and tags every
--- instance with the role it uses, so a theme swap is a repaint rather than a
--- rebuild. Same idea here: `Theme` is the live table, `Themes` holds the
--- presets, and `themed()` further down registers an object against the roles
--- it reads so SetTheme can walk them.
+-- Obsidian's own Scheme table works the same way it does here: a flat set of
+-- colour roles, with properties set by role name (its ThemeManager reads
+-- string keys like 'DarkColor' off Library.Scheme) so a theme swap is a
+-- repaint rather than a rebuild. `Theme` is the live table, `Themes` holds
+-- the presets, and `themed()` further down registers an object against the
+-- roles it reads so SetTheme can walk them.
 --
--- Gradient is the acrylic body fill; Backdrop is what sits behind it. Every
--- theme has to define the full set - a missing key would leave whatever the
--- previous theme painted, which reads as a bug rather than a theme.
+-- Backdrop is the body fill and the rail behind it. Every theme has to
+-- define the full set - a missing key would leave whatever the previous
+-- theme painted, which reads as a bug rather than a theme.
 Library.Themes = {
     Dark = {
         Accent = Color3.fromRGB(227, 255, 42),
         Backdrop = Color3.fromRGB(12, 12, 12),
-        Gradient = ColorSequence.new(Color3.fromRGB(30, 30, 30), Color3.fromRGB(14, 14, 14)),
         Border = Color3.fromRGB(58, 58, 58),
         Topbar = Color3.fromRGB(20, 20, 20),
         Rail = Color3.fromRGB(18, 18, 18),
-        Section = Color3.fromRGB(23, 23, 23),
-        Element = Color3.fromRGB(38, 38, 38),
-        ElementHover = Color3.fromRGB(58, 58, 58),
-        Stroke = Color3.fromRGB(48, 48, 48),
-        StrokeSoft = Color3.fromRGB(34, 34, 34),
+        Section = Color3.fromRGB(19, 19, 19),
+        Element = Color3.fromRGB(30, 30, 30),
+        ElementHover = Color3.fromRGB(52, 52, 52),
+        Stroke = Color3.fromRGB(58, 58, 58),
+        StrokeSoft = Color3.fromRGB(40, 40, 40),
         Text = Color3.fromRGB(238, 238, 238),
         SubText = Color3.fromRGB(150, 152, 162),
         Dim = Color3.fromRGB(100, 100, 100),
@@ -111,15 +136,14 @@ Library.Themes = {
     Charcoal = {
         Accent = Color3.fromRGB(90, 160, 255),
         Backdrop = Color3.fromRGB(14, 14, 14),
-        Gradient = ColorSequence.new(Color3.fromRGB(34, 34, 34), Color3.fromRGB(12, 12, 12)),
         Border = Color3.fromRGB(66, 66, 66),
         Topbar = Color3.fromRGB(22, 22, 22),
         Rail = Color3.fromRGB(19, 19, 19),
-        Section = Color3.fromRGB(26, 26, 26),
-        Element = Color3.fromRGB(42, 42, 42),
-        ElementHover = Color3.fromRGB(62, 62, 62),
-        Stroke = Color3.fromRGB(56, 56, 56),
-        StrokeSoft = Color3.fromRGB(38, 38, 38),
+        Section = Color3.fromRGB(21, 21, 21),
+        Element = Color3.fromRGB(33, 33, 33),
+        ElementHover = Color3.fromRGB(56, 56, 56),
+        Stroke = Color3.fromRGB(68, 68, 68),
+        StrokeSoft = Color3.fromRGB(44, 44, 44),
         Text = Color3.fromRGB(240, 240, 240),
         SubText = Color3.fromRGB(170, 170, 170),
         Dim = Color3.fromRGB(110, 110, 110),
@@ -131,15 +155,14 @@ Library.Themes = {
     ['Deep Violet'] = {
         Accent = Color3.fromRGB(150, 110, 235),
         Backdrop = Color3.fromRGB(14, 10, 20),
-        Gradient = ColorSequence.new(Color3.fromRGB(60, 42, 92), Color3.fromRGB(22, 15, 34)),
         Border = Color3.fromRGB(110, 90, 140),
         Topbar = Color3.fromRGB(26, 19, 38),
         Rail = Color3.fromRGB(22, 16, 32),
-        Section = Color3.fromRGB(30, 22, 44),
-        Element = Color3.fromRGB(74, 58, 102),
-        ElementHover = Color3.fromRGB(96, 76, 130),
-        Stroke = Color3.fromRGB(78, 62, 104),
-        StrokeSoft = Color3.fromRGB(48, 36, 66),
+        Section = Color3.fromRGB(24, 17, 35),
+        Element = Color3.fromRGB(58, 45, 80),
+        ElementHover = Color3.fromRGB(86, 68, 116),
+        Stroke = Color3.fromRGB(92, 73, 122),
+        StrokeSoft = Color3.fromRGB(56, 42, 76),
         Text = Color3.fromRGB(245, 240, 252),
         SubText = Color3.fromRGB(176, 162, 200),
         Dim = Color3.fromRGB(122, 108, 146),
@@ -151,15 +174,14 @@ Library.Themes = {
     ['Blood Red'] = {
         Accent = Color3.fromRGB(226, 62, 68),
         Backdrop = Color3.fromRGB(16, 8, 9),
-        Gradient = ColorSequence.new(Color3.fromRGB(62, 22, 25), Color3.fromRGB(20, 10, 11)),
         Border = Color3.fromRGB(120, 58, 62),
         Topbar = Color3.fromRGB(28, 14, 15),
         Rail = Color3.fromRGB(23, 11, 12),
-        Section = Color3.fromRGB(32, 16, 18),
-        Element = Color3.fromRGB(74, 34, 37),
-        ElementHover = Color3.fromRGB(100, 46, 50),
-        Stroke = Color3.fromRGB(88, 42, 45),
-        StrokeSoft = Color3.fromRGB(52, 25, 27),
+        Section = Color3.fromRGB(25, 12, 14),
+        Element = Color3.fromRGB(58, 26, 29),
+        ElementHover = Color3.fromRGB(90, 40, 44),
+        Stroke = Color3.fromRGB(104, 50, 54),
+        StrokeSoft = Color3.fromRGB(60, 30, 33),
         Text = Color3.fromRGB(250, 238, 238),
         SubText = Color3.fromRGB(196, 156, 158),
         Dim = Color3.fromRGB(140, 104, 106),
@@ -171,15 +193,14 @@ Library.Themes = {
     ['Neon Purple'] = {
         Accent = Color3.fromRGB(196, 82, 255),
         Backdrop = Color3.fromRGB(12, 8, 18),
-        Gradient = ColorSequence.new(Color3.fromRGB(54, 26, 78), Color3.fromRGB(18, 10, 28)),
         Border = Color3.fromRGB(132, 74, 178),
         Topbar = Color3.fromRGB(24, 14, 34),
         Rail = Color3.fromRGB(20, 12, 29),
-        Section = Color3.fromRGB(28, 17, 40),
-        Element = Color3.fromRGB(70, 42, 98),
-        ElementHover = Color3.fromRGB(94, 56, 130),
-        Stroke = Color3.fromRGB(86, 50, 118),
-        StrokeSoft = Color3.fromRGB(48, 29, 68),
+        Section = Color3.fromRGB(22, 13, 32),
+        Element = Color3.fromRGB(55, 33, 77),
+        ElementHover = Color3.fromRGB(84, 50, 116),
+        Stroke = Color3.fromRGB(102, 60, 140),
+        StrokeSoft = Color3.fromRGB(58, 35, 82),
         Text = Color3.fromRGB(246, 238, 255),
         SubText = Color3.fromRGB(184, 162, 208),
         Dim = Color3.fromRGB(130, 110, 152),
@@ -191,15 +212,14 @@ Library.Themes = {
     ['Deep Ocean'] = {
         Accent = Color3.fromRGB(56, 178, 222),
         Backdrop = Color3.fromRGB(8, 14, 20),
-        Gradient = ColorSequence.new(Color3.fromRGB(22, 48, 66), Color3.fromRGB(10, 18, 26)),
         Border = Color3.fromRGB(58, 108, 136),
         Topbar = Color3.fromRGB(14, 26, 36),
         Rail = Color3.fromRGB(11, 21, 30),
-        Section = Color3.fromRGB(16, 30, 42),
-        Element = Color3.fromRGB(34, 64, 86),
-        ElementHover = Color3.fromRGB(46, 86, 114),
-        Stroke = Color3.fromRGB(44, 82, 106),
-        StrokeSoft = Color3.fromRGB(26, 48, 64),
+        Section = Color3.fromRGB(13, 24, 33),
+        Element = Color3.fromRGB(27, 50, 67),
+        ElementHover = Color3.fromRGB(42, 78, 104),
+        Stroke = Color3.fromRGB(52, 97, 125),
+        StrokeSoft = Color3.fromRGB(30, 56, 74),
         Text = Color3.fromRGB(236, 246, 252),
         SubText = Color3.fromRGB(152, 180, 198),
         Dim = Color3.fromRGB(106, 132, 150),
@@ -211,15 +231,14 @@ Library.Themes = {
     ['Midnight Blue'] = {
         Accent = Color3.fromRGB(88, 124, 255),
         Backdrop = Color3.fromRGB(9, 11, 20),
-        Gradient = ColorSequence.new(Color3.fromRGB(28, 34, 68), Color3.fromRGB(11, 14, 28)),
         Border = Color3.fromRGB(70, 84, 148),
         Topbar = Color3.fromRGB(16, 20, 38),
         Rail = Color3.fromRGB(13, 16, 31),
-        Section = Color3.fromRGB(19, 23, 44),
-        Element = Color3.fromRGB(42, 50, 92),
-        ElementHover = Color3.fromRGB(58, 68, 122),
-        Stroke = Color3.fromRGB(54, 64, 114),
-        StrokeSoft = Color3.fromRGB(30, 36, 68),
+        Section = Color3.fromRGB(15, 18, 35),
+        Element = Color3.fromRGB(33, 39, 72),
+        ElementHover = Color3.fromRGB(52, 62, 110),
+        Stroke = Color3.fromRGB(64, 76, 135),
+        StrokeSoft = Color3.fromRGB(36, 43, 78),
         Text = Color3.fromRGB(238, 242, 255),
         SubText = Color3.fromRGB(158, 168, 206),
         Dim = Color3.fromRGB(110, 120, 158),
@@ -231,15 +250,14 @@ Library.Themes = {
     Rose = {
         Accent = Color3.fromRGB(244, 114, 160),
         Backdrop = Color3.fromRGB(18, 10, 14),
-        Gradient = ColorSequence.new(Color3.fromRGB(64, 30, 44), Color3.fromRGB(22, 12, 17)),
         Border = Color3.fromRGB(128, 68, 92),
         Topbar = Color3.fromRGB(30, 16, 22),
         Rail = Color3.fromRGB(25, 13, 18),
-        Section = Color3.fromRGB(34, 18, 25),
-        Element = Color3.fromRGB(78, 42, 56),
-        ElementHover = Color3.fromRGB(104, 56, 74),
-        Stroke = Color3.fromRGB(92, 50, 66),
-        StrokeSoft = Color3.fromRGB(54, 29, 39),
+        Section = Color3.fromRGB(27, 14, 20),
+        Element = Color3.fromRGB(61, 33, 44),
+        ElementHover = Color3.fromRGB(94, 51, 67),
+        Stroke = Color3.fromRGB(109, 59, 78),
+        StrokeSoft = Color3.fromRGB(62, 34, 45),
         Text = Color3.fromRGB(252, 240, 245),
         SubText = Color3.fromRGB(202, 164, 178),
         Dim = Color3.fromRGB(144, 110, 124),
@@ -251,15 +269,14 @@ Library.Themes = {
     AMOLED = {
         Accent = Color3.fromRGB(255, 255, 255),
         Backdrop = Color3.fromRGB(0, 0, 0),
-        Gradient = ColorSequence.new(Color3.fromRGB(16, 16, 16), Color3.fromRGB(0, 0, 0)),
         Border = Color3.fromRGB(52, 52, 52),
         Topbar = Color3.fromRGB(0, 0, 0),
         Rail = Color3.fromRGB(0, 0, 0),
-        Section = Color3.fromRGB(8, 8, 8),
-        Element = Color3.fromRGB(26, 26, 26),
-        ElementHover = Color3.fromRGB(44, 44, 44),
-        Stroke = Color3.fromRGB(40, 40, 40),
-        StrokeSoft = Color3.fromRGB(24, 24, 24),
+        Section = Color3.fromRGB(6, 6, 6),
+        Element = Color3.fromRGB(20, 20, 20),
+        ElementHover = Color3.fromRGB(38, 38, 38),
+        Stroke = Color3.fromRGB(50, 50, 50),
+        StrokeSoft = Color3.fromRGB(30, 30, 30),
         Text = Color3.fromRGB(245, 245, 245),
         SubText = Color3.fromRGB(150, 150, 150),
         Dim = Color3.fromRGB(96, 96, 96),
@@ -271,15 +288,14 @@ Library.Themes = {
     ['Pearl White'] = {
         Accent = Color3.fromRGB(58, 110, 220),
         Backdrop = Color3.fromRGB(226, 228, 233),
-        Gradient = ColorSequence.new(Color3.fromRGB(250, 250, 252), Color3.fromRGB(226, 228, 234)),
         Border = Color3.fromRGB(188, 192, 200),
         Topbar = Color3.fromRGB(242, 243, 246),
         Rail = Color3.fromRGB(236, 238, 242),
         Section = Color3.fromRGB(246, 247, 250),
         Element = Color3.fromRGB(255, 255, 255),
-        ElementHover = Color3.fromRGB(236, 239, 245),
-        Stroke = Color3.fromRGB(206, 210, 218),
-        StrokeSoft = Color3.fromRGB(224, 227, 233),
+        ElementHover = Color3.fromRGB(233, 236, 242),
+        Stroke = Color3.fromRGB(190, 194, 204),
+        StrokeSoft = Color3.fromRGB(212, 216, 224),
         Text = Color3.fromRGB(26, 28, 34),
         SubText = Color3.fromRGB(104, 110, 124),
         Dim = Color3.fromRGB(146, 152, 164),
@@ -306,11 +322,11 @@ end
 
 local Theme = Library.Theme
 
--- How see-through an element card sits over the acrylic body. Fluent's own
--- number; low enough that the gradient reads through, high enough that the
--- card still has an edge.
-local ELEMENT_TRANSPARENCY = 0.86
-local CARD_CORNER = 5
+-- Obsidian's cards are flat and opaque, not glass - low enough that a card
+-- still reads as slightly lifted off the body, nowhere near Fluent's 0.86.
+local ELEMENT_TRANSPARENCY = 0.08
+local ELEMENT_TRANSPARENCY_HOVER = 0
+local CARD_CORNER = 4
 
 --// Small helpers -----------------------------------------------------------
 
@@ -487,9 +503,9 @@ local function accent(object, properties)
     return object
 end
 
--- Fluent's ThemeTag, spelled as a function. `themed(frame, { BackgroundColor3
--- = 'Element' })` both paints it now and records the role, so SetTheme can
--- repaint it later without the caller having kept a reference.
+-- `themed(frame, { BackgroundColor3 = 'Element' })` both paints an instance
+-- now and records the role it was painted with, so SetTheme can repaint it
+-- later without the caller having kept a reference around to do it.
 local function themed(object, roles)
     Library._theme_objects[object] = roles
     for property, role in pairs(roles) do
@@ -539,10 +555,10 @@ end
 
 Library.set_theme = Library.SetTheme
 
--- The single biggest visual difference between Lib2 and Fluent: Lib2 laid
--- elements out as bare rows on the section background, Fluent gives each one
--- its own rounded, bordered, semi-transparent card. Everything else here is
--- detail; this is the look.
+-- The single biggest visual difference from Lib2: Lib2 laid elements out as
+-- bare rows on the section background; this gives each one its own flat,
+-- opaque, bordered card - Obsidian's own look, not Fluent's translucent
+-- one. Everything else here is detail; this is the look.
 --
 -- `inner` is the frame children are positioned against - usually a full-size
 -- click target sitting inside the card. The inset goes on that rather than on
@@ -558,7 +574,7 @@ local function cardify(frame, inner, pad_top, pad_bottom)
     local border = create('UIStroke', {
         Parent = frame,
         Color = Theme.Stroke,
-        Transparency = 0.45,
+        Transparency = 0.18,
         Thickness = 1,
         ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
     })
@@ -570,7 +586,7 @@ end
 -- A card that lights up under the cursor.
 local function card_hover(frame)
     track(frame.MouseEnter:Connect(function()
-        tween(frame, QUAD, { BackgroundTransparency = ELEMENT_TRANSPARENCY - 0.22 })
+        tween(frame, QUAD, { BackgroundTransparency = ELEMENT_TRANSPARENCY_HOVER })
     end))
     track(frame.MouseLeave:Connect(function()
         tween(frame, QUAD, { BackgroundTransparency = ELEMENT_TRANSPARENCY })
@@ -578,8 +594,8 @@ local function card_hover(frame)
     return frame
 end
 
--- Fluent puts an optional description line under an element's title. Lib2 had
--- no equivalent, so this adds one without disturbing elements that pass no
+-- An optional description line under an element's title. Lib2 had no
+-- equivalent, so this adds one without disturbing elements that pass no
 -- description: the card only grows when there is something to show.
 local function attach_desc(card, title_label, text, extra_height)
     if not text or text == '' then return nil end
@@ -1495,7 +1511,7 @@ function Library:Window(options)
     local toggle_key = pick(options, Enum.KeyCode.RightShift, 'ToggleKey', 'toggle_key', 'Keybind')
     local accent_color = pick(options, nil, 'Accent', 'accent', 'AccentColor')
     local theme_name = pick(options, nil, 'Theme', 'theme', 'ThemeName')
-    local user_scale = tonumber(pick(options, 1, 'Scale', 'scale')) or 1
+    local user_scale = tonumber(pick(options, DPI_SCALE, 'Scale', 'scale')) or DPI_SCALE
 
     -- Applied before anything is built, so every element picks the right
     -- colours up front rather than being repainted a frame later. An explicit
@@ -1553,10 +1569,12 @@ function Library:Window(options)
         Visible = false,
     })
     register_scale(create('UIScale', { Parent = root }))
-    corner(root, 10)
-    -- Fluent's window edge is a visible hairline, not Lib2's invisible one -
-    -- it's what separates the acrylic from whatever game is behind it.
-    local root_stroke = stroke(root, Theme.Border, 1)
+    corner(root, 8)
+    -- Obsidian outlines the whole window in a real, visible line rather than
+    -- a stroke set to Transparency = 1 - it is what separates the panel from
+    -- whatever game is behind it, now that the body has no acrylic edge of
+    -- its own to do that job.
+    local root_stroke = stroke(root, Theme.Border, 0.25)
     themed(root_stroke, { Color = 'Border' })
 
     self.Root = root
@@ -1583,56 +1601,28 @@ function Library:Window(options)
         Size = UDim2.new(1, 0, 1, 0),
         ClipsDescendants = true,
     })
-    corner(body, 10)
+    corner(body, 8)
 
-    -- Fluent's acrylic. A real blur of what's behind the window needs a
-    -- DepthOfField pass on the camera, which fights every other script that
-    -- touches Lighting and looks wrong the moment one of them wins. This does
-    -- the half of it that actually reads as acrylic - a lit gradient body with
-    -- film grain over it - and skips the half that breaks.
-    local acrylic = create('Frame', {
-        Name = 'acrylic',
+    -- Obsidian is flat, not glass: one solid fill, no gradient, no grain, no
+    -- DepthOfField pass on the camera to fight every other script that
+    -- touches Lighting.
+    local fill = create('Frame', {
+        Name = 'fill',
         Parent = body,
         BackgroundColor3 = Theme.Backdrop,
-        BackgroundTransparency = 0.02,
+        BackgroundTransparency = 0,
         Size = UDim2.new(1, 0, 1, 0),
         BorderSizePixel = 0,
         ZIndex = 0,
     })
-    themed(acrylic, { BackgroundColor3 = 'Backdrop' })
-    corner(acrylic, 10)
-
-    local acrylic_gradient = create('UIGradient', {
-        Parent = acrylic,
-        Color = Theme.Gradient,
-        Rotation = 90,
-        Transparency = NumberSequence.new({
-            NumberSequenceKeypoint.new(0, 0.12),
-            NumberSequenceKeypoint.new(1, 0.35),
-        }),
-    })
-    themed(acrylic_gradient, { Color = 'Gradient' })
-
-    -- Grain, at the transparency Fluent uses. Without it the gradient reads as
-    -- a flat fill; with it the body has texture and the elements sitting on it
-    -- look like they are on glass.
-    create('ImageLabel', {
-        Name = 'noise',
-        Parent = acrylic,
-        BackgroundTransparency = 1,
-        Size = UDim2.new(1, 0, 1, 0),
-        Image = 'rbxassetid://9968344227',
-        ImageTransparency = 0.93,
-        ScaleType = Enum.ScaleType.Tile,
-        TileSize = UDim2.fromOffset(128, 128),
-        ZIndex = 0,
-    })
+    themed(fill, { BackgroundColor3 = 'Backdrop' })
+    corner(fill, 8)
 
     --// Topbar --------------------------------------------------------------
 
-    -- Transparent over the acrylic with only a hairline under it, which is how
-    -- Fluent does its title bar. Lib2 painted this opaque, which cut the
-    -- gradient off at the top and made the window look like two stacked boxes.
+    -- Transparent over the flat body with only a hairline under it - the same
+    -- treatment Obsidian's own TopBar uses, and it means there is only ever
+    -- one fill colour to keep in sync (the body's), not two.
     local topbar = create('Frame', {
         Name = 'topbar',
         Parent = body,
@@ -1663,7 +1653,7 @@ function Library:Window(options)
     }), { 'ImageColor3' })
     Library:ApplyIcon(logo_image, logo, ui_icon_options(16))
 
-    local title_label = accent(label(topbar, title, 15, 'bold'), { 'TextColor3' })
+    local title_label = accent(label(topbar, title, 16, 'bold'), { 'TextColor3' })
     title_label.Name = 'work'
     title_label.Position = UDim2.new(0, 37, 0.5, 0)
     title_label.AnchorPoint = Vector2.new(0, 0.5)
@@ -1755,7 +1745,7 @@ function Library:Window(options)
         Name = 'tabholder',
         Parent = content,
         BackgroundColor3 = Theme.Backdrop,
-        BackgroundTransparency = 0.55,
+        BackgroundTransparency = 0.15,
         Size = UDim2.new(0, TAB_RAIL_WIDTH, 1, 0),
         BorderSizePixel = 0,
     })
@@ -1763,7 +1753,7 @@ function Library:Window(options)
     local rail_line = create('Frame', {
         Parent = rail,
         BackgroundColor3 = Theme.Border,
-        BackgroundTransparency = 0.5,
+        BackgroundTransparency = 0.2,
         Position = UDim2.new(1, -1, 0, 0),
         Size = UDim2.new(0, 1, 1, 0),
         BorderSizePixel = 0,
@@ -2173,7 +2163,7 @@ Library.Destroy = Library.Unload
 --// Tabs -------------------------------------------------------------------
 
 -- Taller than Lib2's 28: a row is a card now, and a card needs room for the
--- border and the text to not sit against it. Fluent uses 38.
+-- border and the text to not sit against it.
 local ROW_HEIGHT = 38
 local TOUCH_ROW_HEIGHT = 44
 
@@ -2239,7 +2229,7 @@ function Window:Tab(options)
         AutoButtonColor = false,
         LayoutOrder = #self.Tabs + 1,
     })
-    corner(button, 5)
+    corner(button, 4)
 
     local indicator = accent(create('Frame', {
         Name = 'indi',
@@ -2284,7 +2274,7 @@ function Window:Tab(options)
         Visible = false,
         ZIndex = 2,
     }), { 'BackgroundColor3' })
-    corner(badge, 8)
+    corner(badge, 6)
     padding(badge, 0, 0, 5, 5)
     local badge_label = label(badge, '', 10, 'bold', Theme.Backdrop)
     badge_label.Name = 'count'
@@ -2508,7 +2498,7 @@ function Tab:Tab(options)
         Visible = false,
         LayoutOrder = 2,
     }), { 'BackgroundColor3' })
-    corner(badge, 8)
+    corner(badge, 6)
     padding(badge, 0, 0, 5, 5)
     local badge_label = label(badge, '', 10, 'bold', Theme.Backdrop)
     badge_label.Name = 'count'
@@ -2980,9 +2970,10 @@ function Section:Toggle(options)
     local callback = pick(options, function() end, 'Callback', 'callback')
     local ignore_saved = pick(options, false, 'IgnoreSaved', 'ignoresaved')
 
-    -- Fluent's pill: a 36x18 track with a round knob that slides across it,
-    -- rather than Lib2's square checkbox. Slightly wider on touch so a thumb
-    -- has something to hit.
+    -- A 36x18 track with a knob that slides across it, rather than Lib2's
+    -- square checkbox - Obsidian's own toggle switch is the same idea, just
+    -- squared off rather than a full stadium pill (see the corner() calls
+    -- below). Slightly wider on touch so a thumb has something to hit.
     local track_width = is_touch() and 42 or 36
     local track_height = is_touch() and 22 or 18
     local knob_size = track_height - 4
@@ -3018,7 +3009,7 @@ function Section:Toggle(options)
         Size = UDim2.fromOffset(track_width, track_height),
     })
     accent(pill, { 'BackgroundColor3' })
-    corner(pill, math.floor(track_height / 2))
+    corner(pill, 6)
     local box_stroke = stroke(pill, Theme.SubText, 0.4)
     themed(box_stroke, { Color = 'SubText' })
 
@@ -3030,7 +3021,7 @@ function Section:Toggle(options)
         Position = UDim2.new(0, 2, 0.5, 0),
         Size = UDim2.fromOffset(knob_size, knob_size),
     })
-    corner(knob, math.floor(knob_size / 2))
+    corner(knob, 4)
     themed(knob, { BackgroundColor3 = 'SubText' })
 
     local state = default
@@ -3125,9 +3116,9 @@ function Section:Slider(options)
     local callback = pick(options, function() end, 'Callback', 'callback')
     local ignore_saved = pick(options, false, 'IgnoreSaved', 'ignoresaved')
 
-    -- Fluent draws the rail as a hairline, not a chunky bar, and puts a round
-    -- grab handle on it. The handle is what reads as draggable, so the rail
-    -- itself can be thin.
+    -- Drawn as a hairline, not a chunky bar, with a small squared-off handle
+    -- doing the actual grabbing - the handle is what reads as draggable, so
+    -- the rail itself can stay thin.
     local bar_height = is_touch() and 5 or 4
     local knob_size = is_touch() and 16 or 12
     local desc_text = desc_of(options)
@@ -3191,7 +3182,7 @@ function Section:Slider(options)
         Position = UDim2.new(0, 0, 0.5, 0),
         Size = UDim2.new(1, 0, 0, bar_height),
     })
-    corner(bar, math.floor(bar_height / 2))
+    corner(bar, 2)
     themed(bar, { BackgroundColor3 = 'SubText' })
 
     local fill = accent(create('Frame', {
@@ -3200,7 +3191,7 @@ function Section:Slider(options)
         BackgroundColor3 = Library.Accent,
         Size = UDim2.new(0, 0, 1, 0),
     }), { 'BackgroundColor3' })
-    corner(fill, math.floor(bar_height / 2))
+    corner(fill, 2)
 
     local knob = accent(create('Frame', {
         Name = 'knob',
@@ -3211,7 +3202,7 @@ function Section:Slider(options)
         Size = UDim2.fromOffset(knob_size, knob_size),
         ZIndex = 2,
     }), { 'BackgroundColor3' })
-    corner(knob, math.floor(knob_size / 2))
+    corner(knob, 4)
     -- A ring in the window colour so the handle reads as sitting on the rail
     -- rather than merging into the fill behind it.
     local knob_ring = stroke(knob, Theme.Backdrop, 0, 2)
@@ -3410,7 +3401,7 @@ function Section:RangeSlider(options)
         Size = UDim2.new(1, 0, 0, bar_height),
     })
     themed(bar, { BackgroundColor3 = 'SubText' })
-    corner(bar, math.floor(bar_height / 2))
+    corner(bar, 2)
 
     -- The accent sits between the two knobs rather than running from the left
     -- edge, so the bar reads as "this span is selected".
@@ -3433,7 +3424,7 @@ function Section:RangeSlider(options)
             Size = UDim2.fromOffset(knob_size, knob_size),
             ZIndex = 2,
         }), { 'BackgroundColor3' })
-        corner(knob, math.floor(knob_size / 2))
+        corner(knob, 4)
         local ring = stroke(knob, Theme.Backdrop, 0, 2)
         themed(ring, { Color = 'Backdrop' })
         return knob
@@ -3680,7 +3671,7 @@ function Section:Textbox(options)
     end
 
     -- The field sits a shade darker than the card it lives on, which is how
-    -- Fluent separates an input from the element around it.
+    -- an input separates itself from the element around it.
     local field = create('Frame', {
         Parent = inner,
         BackgroundColor3 = Theme.Backdrop,
