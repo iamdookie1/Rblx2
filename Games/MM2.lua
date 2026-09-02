@@ -404,10 +404,16 @@ end
 -- real-origin hit check right before redirecting).
 local cachedMurdererTarget, cachedMurdererPart = nil, nil
 local cachedFreeTarget, cachedFreePart = nil, nil
+-- getPing() also moves out of the hook for the same reason - it's a
+-- GetNetworkPing() namecall, which is one more reentrant call the hook
+-- doesn't need to make on the fire path when a value from a moment ago is
+-- just as good for a latency estimate.
+local cachedPing = 0.08
 
 spawnLoop(function()
     while not Unloading do
         task.wait(1 / 30)
+        cachedPing = getPing()
         if Aim.SilentAim then
             cachedMurdererTarget, cachedMurdererPart = scanTarget(isMurderer)
             cachedFreeTarget, cachedFreePart = scanTarget(nil)
@@ -422,7 +428,8 @@ local hasNamecallHook = typeof(hookmetamethod) == "function" and typeof(getnamec
 
 if hasNamecallHook then
     local originalNamecall
-    originalNamecall = hookmetamethod(game, "__namecall", function(self, ...)
+
+    local function onNamecall(self, ...)
         if not Unloading and Aim.SilentAim and typeof(self) == "Instance" and getnamecallmethod() == "FireServer" then
             -- Matched by shape, not a cached instance reference, so both
             -- branches keep working across every respawn and every new
@@ -436,14 +443,13 @@ if hasNamecallHook then
                     local origin = ...
                     local plr, part = cachedMurdererTarget, cachedMurdererPart
                     if typeof(origin) == "CFrame" and plr and plr.Parent and part and part.Parent then
-                        -- getPing/clearFromOrigin still re-enter this same
-                        -- hook once each (GetNetworkPing, one Raycast) - if
-                        -- that ever throws for any reason, this pcall
-                        -- guarantees the real shot still goes out below
-                        -- with its original, un-redirected aim rather than
-                        -- silently eating the click.
+                        -- clearFromOrigin still re-enters this same hook
+                        -- once (one Raycast) - if that ever throws for any
+                        -- reason, this pcall guarantees the real shot still
+                        -- goes out below with its original, un-redirected
+                        -- aim rather than silently eating the click.
                         local ok, newTarget = pcall(function()
-                            local aimPos = leadPosition(part, getPing())
+                            local aimPos = leadPosition(part, cachedPing)
                             if clearFromOrigin(origin.Position, aimPos, plr.Character) then
                                 return CFrame.new(aimPos)
                             end
@@ -463,7 +469,7 @@ if hasNamecallHook then
                     if typeof(handleCFrame) == "CFrame" and plr and plr.Parent and part and part.Parent then
                         local ok, newTarget = pcall(function()
                             local dist = (part.Position - handleCFrame.Position).Magnitude
-                            local travelTime = dist / math.max(Aim.KnifeSpeed, 1) + getPing()
+                            local travelTime = dist / math.max(Aim.KnifeSpeed, 1) + cachedPing
                             local aimPos = leadPosition(part, travelTime)
                             if clearFromOrigin(handleCFrame.Position, aimPos, plr.Character) then
                                 return CFrame.new(aimPos)
@@ -478,7 +484,22 @@ if hasNamecallHook then
             end
         end
         return originalNamecall(self, ...)
-    end)
+    end
+
+    -- newcclosure isolates the replacement from Luau's normal closure
+    -- semantics, which is the standard, documented fix for the class of bug
+    -- this hit: a hooked __namecall re-entering itself (every Raycast
+    -- inside onNamecall is itself a namecall) got its "self" mixed up
+    -- between the outer FireServer call and an inner Raycast call, which is
+    -- exactly what an error like "Raycast is not a valid member of
+    -- RemoteEvent" looks like - a Raycast call that landed with the
+    -- RemoteEvent as self instead of Workspace. Falls back to the plain
+    -- function if this executor doesn't expose newcclosure.
+    if typeof(newcclosure) == "function" then
+        onNamecall = newcclosure(onNamecall)
+    end
+
+    originalNamecall = hookmetamethod(game, "__namecall", onNamecall)
 end
 
 local SilentAimTab = Window:Tab({ Title = 'silent aim', Icon = 'crosshair' })
