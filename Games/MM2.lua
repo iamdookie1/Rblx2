@@ -27,15 +27,33 @@
 --       dashboard shows the same level/progress numbers the game's own UI
 --       computes from NewXP.
 --
--- The Sheriff's gun tool script never showed up in the dump - nobody had it
--- equipped when the dump was taken, and a Tool's LocalScript only exists
--- (and only decompiles) while it's actually held. So the silent aim tab
--- below is deliberately empty for now; there is nothing in this dump to
--- hook a gun raycast onto yet.
+-- A second dump caught someone actually holding the Sheriff's gun, which is
+-- what GunClient below comes from (Workspace.<player>.Gun.GunClient). Its
+-- fire path is:
+--
+--   Tool.Activated:Connect(function()
+--       local target = WeaponService:GetMouseTargetCFrame()  -- client raycast
+--       local origin = HumanoidRootPart.GunRaycastAttachment.WorldCFrame
+--       Tool.Shoot:FireServer(origin, target)
+--   end)
+--
+-- Both arguments are entirely client-computed and sent as-is - origin comes
+-- off a fixed attachment on your own torso, target off the same
+-- screen-to-world raycast the knife throw uses. There's also a client-only
+-- "can't shoot" gate (a raycast from your Head to the gun attachment, to
+-- catch a blocked third-person angle) that toggles a CantShoot BindableEvent
+-- for the crosshair - but nothing reads that BindableEvent before firing, so
+-- it never actually stops Shoot:FireServer from going out.
+--
+-- Silent aim below hooks Shoot:FireServer itself (game.__namecall) rather
+-- than replacing the click handler: it lets the real Activated connection
+-- do everything - animation, the origin attachment, whatever cooldown the
+-- server enforces - and only ever rewrites the target CFrame argument.
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local UserInputService = game:GetService("UserInputService")
 local Workspace = workspace
 
 local LocalPlayer = Players.LocalPlayer
@@ -223,8 +241,203 @@ spawnLoop(function()
     end
 end)
 
---// Tab 2: silent aim (empty for now - see header) --------------------------------
-Window:Tab({ Title = 'silent aim', Icon = 'crosshair' })
+--// Tab 2: silent aim -------------------------------------------------------------
+local Aim = {
+    SilentAim = false,
+    WallCheck = true,
+    AimPart = "Head",
+    MaxRange = 300,          -- WeaponService:GetMouseTargetCFrame caps its own raycast at 300 studs
+    FOVEnabled = true,
+    FOVRadius = 200,
+    FOVFollowMouse = true,
+}
+
+local function isAlivePlr(plr)
+    local char = plr.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    return hum ~= nil and hum.Health > 0
+end
+
+local visionParams = RaycastParams.new()
+visionParams.FilterType = Enum.RaycastFilterType.Exclude
+visionParams.IgnoreWater = true
+
+local function isVisible(char, origin)
+    if not Aim.WallCheck then return true end
+    local part = char:FindFirstChild(Aim.AimPart) or char:FindFirstChild("HumanoidRootPart")
+    if not part then return false end
+    local params = visionParams
+    params.FilterDescendantsInstances = { LocalPlayer.Character, char }
+    local direction = part.Position - origin
+    local ok, result = pcall(function() return Workspace:Raycast(origin, direction, params) end)
+    if not ok then return true end
+    if not result then return true end
+    return (result.Position - origin).Magnitude >= direction.Magnitude - 2
+end
+
+local function screenAnchor()
+    if Aim.FOVFollowMouse then
+        return UserInputService:GetMouseLocation()
+    end
+    local viewport = Camera.ViewportSize
+    return Vector2.new(viewport.X / 2, viewport.Y / 2)
+end
+
+local function getTarget()
+    local origin = Camera.CFrame.Position
+    local anchor = screenAnchor()
+    local best, bestScore
+
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr ~= LocalPlayer and isAlivePlr(plr) then
+            local char = plr.Character
+            local part = char and (char:FindFirstChild(Aim.AimPart) or char:FindFirstChild("HumanoidRootPart"))
+            if part then
+                local dist = (part.Position - origin).Magnitude
+                if dist <= Aim.MaxRange then
+                    local screenPos, onScreen = Camera:WorldToViewportPoint(part.Position)
+                    if onScreen then
+                        local screenDist = (Vector2.new(screenPos.X, screenPos.Y) - anchor).Magnitude
+                        if not Aim.FOVEnabled or screenDist <= Aim.FOVRadius then
+                            if isVisible(char, origin) then
+                                if not bestScore or screenDist < bestScore then
+                                    bestScore = screenDist
+                                    best = part
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    return best
+end
+
+-- getTarget scans every player and raycasts per candidate; the namecall hook
+-- below runs on every single method call in the entire game, not just shots,
+-- so it can't afford to do that scan itself. Recomputed at most 30x/sec and
+-- reused for whichever calls land inside that window.
+local cachedTarget, cachedTargetAt = nil, 0
+local TARGET_CACHE_SECONDS = 1 / 30
+
+local function getCachedTarget()
+    local now = os.clock()
+    if cachedTarget and cachedTarget.Parent and (now - cachedTargetAt) < TARGET_CACHE_SECONDS then
+        return cachedTarget
+    end
+    cachedTargetAt = now
+    local ok, result = pcall(getTarget)
+    cachedTarget = ok and result or nil
+    return cachedTarget
+end
+
+local hasNamecallHook = typeof(hookmetamethod) == "function" and typeof(getnamecallmethod) == "function"
+
+if hasNamecallHook then
+    local originalNamecall
+    originalNamecall = hookmetamethod(game, "__namecall", function(self, ...)
+        if not Unloading and Aim.SilentAim and typeof(self) == "Instance" and getnamecallmethod() == "FireServer" then
+            -- Matched by shape (a RemoteEvent named "Shoot" whose parent is
+            -- a Tool named "Gun"), not by a cached instance reference, so
+            -- this keeps working across every respawn and every new gun
+            -- instance without needing to re-find anything.
+            if self.Name == "Shoot" and self.ClassName == "RemoteEvent" then
+                local parent = self.Parent
+                if parent and parent.ClassName == "Tool" and parent.Name == "Gun" then
+                    local target = getCachedTarget()
+                    if target and target.Parent then
+                        local origin = ...
+                        return originalNamecall(self, origin, CFrame.new(target.Position))
+                    end
+                end
+            end
+        end
+        return originalNamecall(self, ...)
+    end)
+end
+
+local SilentAimTab = Window:Tab({ Title = 'silent aim', Icon = 'crosshair' })
+
+local AimSection = SilentAimTab:Section({ Title = 'aim', Side = 'left' })
+
+AimSection:Stat({
+    Title = 'hook api',
+    Value = hasNamecallHook and 'available' or 'missing',
+    Color = hasNamecallHook and Color3.fromRGB(126, 217, 87) or Color3.fromRGB(255, 96, 106),
+})
+
+AimSection:Toggle({
+    Title = 'silent aim',
+    Desc = 'redirects the shot you actually fire to the nearest valid target - your click, animation and the origin attachment all stay real, only the aim point changes',
+    Flag = 'mm2_silent_aim',
+    Callback = function(state)
+        if state and not hasNamecallHook then
+            Centrl:Notify({
+                Title = 'mm2',
+                Content = 'hookmetamethod/getnamecallmethod not available on this executor - silent aim cannot hook Shoot:FireServer.',
+                Type = 'error',
+                Duration = 6,
+            })
+        end
+        Aim.SilentAim = state
+    end,
+})
+
+AimSection:Dropdown({
+    Title = 'aim part',
+    Values = { 'Head', 'HumanoidRootPart' },
+    Default = 'Head',
+    Callback = function(value) Aim.AimPart = value end,
+})
+
+AimSection:Toggle({
+    Title = 'wall check',
+    Desc = 'requires a clear line of sight from your camera to the target before it counts',
+    Flag = 'mm2_silent_aim_wallcheck',
+    Default = true,
+    Callback = function(state) Aim.WallCheck = state end,
+})
+
+AimSection:Slider({
+    Title = 'max range',
+    Min = 25,
+    Max = 300,
+    Increment = 5,
+    Default = 300,
+    Suffix = ' studs',
+    Flag = 'mm2_silent_aim_range',
+    Callback = function(value) Aim.MaxRange = value end,
+})
+
+local FovSection = SilentAimTab:Section({ Title = 'fov', Side = 'right' })
+
+FovSection:Toggle({
+    Title = 'fov limit',
+    Desc = 'only considers targets within the radius below',
+    Flag = 'mm2_silent_aim_fov',
+    Default = true,
+    Callback = function(state) Aim.FOVEnabled = state end,
+})
+
+FovSection:Slider({
+    Title = 'fov radius',
+    Min = 20,
+    Max = 600,
+    Increment = 10,
+    Default = 200,
+    Flag = 'mm2_silent_aim_fov_radius',
+    Callback = function(value) Aim.FOVRadius = value end,
+})
+
+FovSection:Toggle({
+    Title = 'follow mouse',
+    Desc = 'centers the fov on the mouse instead of the middle of the screen',
+    Flag = 'mm2_silent_aim_follow_mouse',
+    Default = true,
+    Callback = function(state) Aim.FOVFollowMouse = state end,
+})
 
 --// Tab 3: visual ------------------------------------------------------------------
 local Visual = {
@@ -252,8 +465,15 @@ local DEFAULT_ESP_COLOR = Color3.fromRGB(255, 255, 255)
 local function espColorFor(plr)
     if Visual.ColorByRole then
         local entry = RoundData[plr.Name]
-        local color = entry and entry.Role and ROLE_COLORS[entry.Role]
-        if color then return color end
+        -- entry.Dead was missing from this check, so once ColorByRole had
+        -- colored someone in, they stayed that color forever: RoundData
+        -- keeps a dead player's Role around (the round-end scoreboard reads
+        -- it straight off the same table), so "role -> color" alone never
+        -- stopped matching just because they died mid-round.
+        if entry and entry.Role and entry.Dead ~= true then
+            local color = ROLE_COLORS[entry.Role]
+            if color then return color end
+        end
     end
     return DEFAULT_ESP_COLOR
 end
