@@ -388,6 +388,36 @@ local function leadPosition(part, travelTime)
     return part.Position + velocity * travelTime
 end
 
+-- The candidate scan (Camera:WorldToViewportPoint, UserInputService:
+-- GetMouseLocation, a Workspace:Raycast per candidate) does NOT run inside
+-- the namecall hook below, even though the previous version did exactly
+-- that and it's what actually broke firing entirely. Every one of those is
+-- itself a method call on an Instance, so calling them from inside a
+-- game.__namecall hook re-enters that same hook recursively - normally
+-- harmless (they never match method == "FireServer", so they fall straight
+-- through), but running that whole reentrant scan on literally every single
+-- shot, with no throttling, turned out to be more than this executor's
+-- getnamecallmethod()/hookmetamethod implementation tolerates back-to-back.
+-- Scanning here instead, on a plain timer with no hook involved at all,
+-- and having the hook only ever read the cached result, cuts the
+-- reentrancy down to the one real raycast a shot actually needs (the
+-- real-origin hit check right before redirecting).
+local cachedMurdererTarget, cachedMurdererPart = nil, nil
+local cachedFreeTarget, cachedFreePart = nil, nil
+
+spawnLoop(function()
+    while not Unloading do
+        task.wait(1 / 30)
+        if Aim.SilentAim then
+            cachedMurdererTarget, cachedMurdererPart = scanTarget(isMurderer)
+            cachedFreeTarget, cachedFreePart = scanTarget(nil)
+        else
+            cachedMurdererTarget, cachedMurdererPart = nil, nil
+            cachedFreeTarget, cachedFreePart = nil, nil
+        end
+    end
+end)
+
 local hasNamecallHook = typeof(hookmetamethod) == "function" and typeof(getnamecallmethod) == "function"
 
 if hasNamecallHook then
@@ -400,13 +430,27 @@ if hasNamecallHook then
             if self.Name == "Shoot" and self.ClassName == "RemoteEvent" then
                 local parent = self.Parent
                 if parent and parent.ClassName == "Tool" and parent.Name == "Gun" then
-                    local plr, part = scanTarget(isMurderer)
-                    if plr and part then
-                        local origin = ...
-                        local originPos = typeof(origin) == "CFrame" and origin.Position or Camera.CFrame.Position
-                        local aimPos = leadPosition(part, getPing())
-                        if clearFromOrigin(originPos, aimPos, plr.Character) then
-                            return originalNamecall(self, origin, CFrame.new(aimPos))
+                    -- Capture the vararg into a local before it's touched
+                    -- from inside a nested pcall closure below - "..."
+                    -- doesn't reach into a nested function.
+                    local origin = ...
+                    local plr, part = cachedMurdererTarget, cachedMurdererPart
+                    if typeof(origin) == "CFrame" and plr and plr.Parent and part and part.Parent then
+                        -- getPing/clearFromOrigin still re-enter this same
+                        -- hook once each (GetNetworkPing, one Raycast) - if
+                        -- that ever throws for any reason, this pcall
+                        -- guarantees the real shot still goes out below
+                        -- with its original, un-redirected aim rather than
+                        -- silently eating the click.
+                        local ok, newTarget = pcall(function()
+                            local aimPos = leadPosition(part, getPing())
+                            if clearFromOrigin(origin.Position, aimPos, plr.Character) then
+                                return CFrame.new(aimPos)
+                            end
+                            return nil
+                        end)
+                        if ok and newTarget then
+                            return originalNamecall(self, origin, newTarget)
                         end
                     end
                 end
@@ -414,15 +458,20 @@ if hasNamecallHook then
                 local eventsFolder = self.Parent
                 local tool = eventsFolder and eventsFolder.Parent
                 if eventsFolder and eventsFolder.Name == "Events" and tool and tool.ClassName == "Tool" and tool.Name == "Knife" then
-                    local plr, part = scanTarget(nil)
-                    if plr and part then
-                        local handleCFrame = ...
-                        local originPos = typeof(handleCFrame) == "CFrame" and handleCFrame.Position or Camera.CFrame.Position
-                        local dist = (part.Position - originPos).Magnitude
-                        local travelTime = dist / math.max(Aim.KnifeSpeed, 1) + getPing()
-                        local aimPos = leadPosition(part, travelTime)
-                        if clearFromOrigin(originPos, aimPos, plr.Character) then
-                            return originalNamecall(self, handleCFrame, CFrame.new(aimPos))
+                    local handleCFrame = ...
+                    local plr, part = cachedFreeTarget, cachedFreePart
+                    if typeof(handleCFrame) == "CFrame" and plr and plr.Parent and part and part.Parent then
+                        local ok, newTarget = pcall(function()
+                            local dist = (part.Position - handleCFrame.Position).Magnitude
+                            local travelTime = dist / math.max(Aim.KnifeSpeed, 1) + getPing()
+                            local aimPos = leadPosition(part, travelTime)
+                            if clearFromOrigin(handleCFrame.Position, aimPos, plr.Character) then
+                                return CFrame.new(aimPos)
+                            end
+                            return nil
+                        end)
+                        if ok and newTarget then
+                            return originalNamecall(self, handleCFrame, newTarget)
                         end
                     end
                 end
