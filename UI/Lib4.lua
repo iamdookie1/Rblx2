@@ -1261,15 +1261,39 @@ function Library:ApplyScale()
     -- _user_scale starts out - see Window() below - so it can never again
     -- dampen a scale someone actually asked for.
     Library._scale = math.clamp(Library._user_scale, 0.35, 2)
+
+    -- Root is anchored top-left, so just setting Scale grows or shrinks the
+    -- window from that corner - on a window already sitting near an edge,
+    -- ClampToScreen below can end up cancelling most of that growth back out
+    -- before it is ever visible. Capturing each window's centre first and
+    -- restoring it after means a scale change grows or shrinks the window
+    -- around where it already is instead of away from one corner of it.
+    local centres = {}
+    for _, window in pairs(Library._windows) do
+        local root = window.Root
+        if root and root.Parent then
+            centres[window] = root.AbsolutePosition + root.AbsoluteSize / 2
+        end
+    end
+
     for ui_scale in pairs(Library._scale_objects) do
         if typeof(ui_scale) == 'Instance' and ui_scale.Parent then
             ui_scale.Scale = Library._scale
         end
     end
+
     -- Scaling changes how much room everything takes; deferred so AbsoluteSize
     -- has caught up before anything is measured against the viewport.
     task.defer(function()
         for _, window in pairs(Library._windows) do
+            local root = window.Root
+            local centre = centres[window]
+            if root and root.Parent and centre then
+                local half = root.AbsoluteSize / 2
+                root.Position = UDim2.fromOffset(
+                    math.round(centre.X - half.X),
+                    math.round(centre.Y - half.Y))
+            end
             if window.ClampToScreen and window.Root and window.Root.Parent then
                 window:ClampToScreen()
             end
@@ -5332,6 +5356,7 @@ function Window:_build_settings_tab()
 
     interface:Slider({
         Title = 'ui scale',
+        Desc = 'resizes the whole panel live, around wherever it already is',
         Flag = 'centrl_scale',
         Min = 0.5,
         Max = 2,
@@ -5452,6 +5477,16 @@ function Window:_build_settings_tab()
     configs:Button({
         Title = 'refresh list',
         Callback = refresh,
+    })
+
+    local session = tab:Section({ Title = 'session', Side = tab.SingleColumn and 'left' or 'right' })
+
+    session:Button({
+        Title = 'unload',
+        Desc = 'tears down the whole panel - cannot be undone without re-running the script',
+        Callback = function()
+            Library:Unload()
+        end,
     })
 
     return tab
