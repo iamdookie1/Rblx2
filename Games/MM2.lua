@@ -280,6 +280,14 @@ end)
 -- actually moved on screen tracks whatever the target visibly does, at the
 -- same rate the scan itself runs.
 --
+-- Both then hand that to auto prediction, which is a closed feedback loop
+-- rather than a formula: it records every prediction it makes, checks each
+-- one against where the target actually was when it came due, and corrects
+-- a per-target lead multiplier from the measured miss. Ping estimate off,
+-- knife speed off, replication further behind than assumed - it never has
+-- to know which; they all present as "the lead was too long or too short"
+-- and all get corrected the same way. See the auto prediction engine.
+--
 -- The sheriff's gun exists to kill the murderer, and only the murderer -
 -- RoundData (see the header) names them by role, so the gun redirect is
 -- restricted to whichever player currently has Role == "Murderer" rather
@@ -299,13 +307,11 @@ end)
 -- Prediction has two independent on/off switches and a five-way dial:
 -- "predict movement" is the master switch (off = aim at exactly where the
 -- target is right now, nothing else below matters); "use ping" controls
--- whether adaptive mode's lead time includes the one-way-latency estimate
--- at all, for whenever that estimate is doing more harm than good on a
--- given connection; and "adaptive" chooses between the velocity/
--- acceleration model (see adaptiveVelocityAndAccel, tuned by the "adaptive
--- amount" dropdown - lesser/normal/extra/advanced/best, each a genuinely
--- different model, not a relabeled slider) and a flat manual lead time per
--- weapon when it's off.
+-- whether the one-way-latency estimate is included in lead time at all,
+-- for whenever that estimate is doing more harm than good on a given
+-- connection; and "auto prediction" chooses between the self-correcting
+-- model (see the auto prediction engine further down) and a flat manual
+-- lead time per weapon when it's off.
 local Aim = {
     SilentAim = false,
     WallCheck = true,
@@ -315,10 +321,10 @@ local Aim = {
     FOVRadius = 200,
     FOVFollowMouse = true,
     Predict = true,
-    UsePing = true,          -- adds the one-way-latency component to adaptive lead; off = lead purely on measured motion
-    Adaptive = true,
-    AdaptiveLevel = 'Normal', -- 'Lesser' | 'Normal' | 'Extra' | 'Advanced' | 'Best' - see adaptiveVelocityAndAccel below
-    ManualLeadTimeGun = 0.05,   -- seconds - used INSTEAD of the adaptive model when Adaptive is off
+    UsePing = true,          -- adds the one-way-latency component to lead time; off = lead purely on measured motion
+    AutoPredict = true,
+    AutoLevel = 'Normal',    -- 'Lesser' | 'Normal' | 'Extra' | 'Advanced' | 'Best' - see AUTO_LEVELS below
+    ManualLeadTimeGun = 0.05,   -- seconds - used INSTEAD of auto prediction when it's off
     ManualLeadTimeKnife = 0.15,
     KnifeSpeed = 96,         -- the real default (ThrowingKnifeVisuals) - overwritten live once any knife is seen thrown, see below
 }
@@ -470,15 +476,13 @@ end
 -- AssemblyLinearVelocity only for a target's very first tick, when there
 -- is no prior sample yet to measure from.
 --
--- Every sample also feeds a short rolling history per player, which is
--- what the "adaptive amount" levels below actually differ on - raw,
--- averaged, or exponentially-smoothed velocity, with or without an
--- acceleration term. None of this replaces the ping-based lead-time work
--- above; it decides WHAT velocity gets multiplied by that time, not the
--- time itself.
+-- Every sample also feeds a short rolling history per player - the auto
+-- prediction engine below smooths velocity out of it, derives acceleration
+-- from it, and uses how consistent it is to decide whether a given
+-- prediction is worth learning from.
 local lastSample = {} -- [player name] = { Position = Vector3, Time = number }
 local velocityHistory = {} -- [player name] = { {v=Vector3, t=number}, ... } newest last
-local ADAPTIVE_HISTORY = 6
+local VELOCITY_HISTORY = 6
 
 track(Players.PlayerRemoving:Connect(function(plr)
     lastSample[plr.Name] = nil
@@ -508,7 +512,7 @@ local function trackedVelocity(plr, part)
         velocityHistory[plr.Name] = hist
     end
     hist[#hist + 1] = { v = raw, t = now }
-    while #hist > ADAPTIVE_HISTORY do
+    while #hist > VELOCITY_HISTORY do
         table.remove(hist, 1)
     end
 
@@ -517,10 +521,9 @@ end
 
 -- How consistently the last few velocity samples point the same way: 1 =
 -- moving dead straight, 0 = no correlation, -1 = reversing every sample.
--- This is the actual live signal "adaptive" reacts to below - not a fixed
--- choice of formula per level, which never adapted to anything, it just
--- picked one algorithm and stuck with it regardless of what the target
--- was actually doing.
+-- Used purely as a gate on LEARNING below - a prediction made while the
+-- target was mid-juke tells you nothing useful about whether your lead
+-- maths is calibrated, so those get measured but not learned from.
 local function steadiness(hist)
     if #hist < 2 then return 0 end
     local total, count = 0, 0
@@ -555,47 +558,6 @@ local function accelerationOf(hist)
     return (newer.v - older.v) / dt
 end
 
--- The actual adaptation: a target holding a steady direction gets trusted
--- more - a higher smoothing alpha, closer to its raw recent velocity,
--- reacting fast to anything that actually changes - while one juking or
--- reversing gets smoothed harder, riding out the noise instead of chasing
--- every frame of it. This recomputes from the live history every tick, so
--- it genuinely responds to what the target is doing right now. A fixed
--- per-level formula that never looked at how the target was actually
--- moving was never adaptive to begin with, whatever it was called.
---
--- The "adaptive amount" dropdown controls how far that live adaptation is
--- allowed to swing, plus what else comes with it - a real difference per
--- level, not a relabeled slider:
---   Lesser   - narrow swing - stays close to a flat, heavily-smoothed
---              velocity almost regardless of steadiness. No acceleration.
---   Normal   - a wider swing, still no acceleration.
---   Extra    - wider still, plus an acceleration term (velocity +=
---              acceleration * time), so a target actively speeding up or
---              turning is led further than one holding steady.
---   Advanced - the widest swing plus acceleration - trusts a steady
---              target's raw recent motion almost completely, smooths an
---              erratic one hard.
---   Best     - Advanced's live adaptation, plus (for the knife only, see
---              knifeLeadBest below) iterating the travel-time calculation
---              against the predicted point itself, since leading changes
---              the distance the knife actually has to cross.
-local LEVEL_SWING = { Lesser = 0.15, Normal = 0.35, Extra = 0.55, Advanced = 0.8, Best = 0.8 }
-local LEVEL_ACCEL = { Lesser = false, Normal = false, Extra = true, Advanced = true, Best = true }
-
-local function adaptiveVelocityAndAccel(hist, level)
-    local swing = LEVEL_SWING[level] or LEVEL_SWING.Normal
-    local trust = (steadiness(hist) + 1) / 2 -- -1..1 -> 0..1
-    -- base alpha of 0.35 regardless of level; the level's swing decides
-    -- how far a steady (trust -> 1) or erratic (trust -> 0) reading is
-    -- allowed to push it from there
-    local alpha = math.clamp(0.35 + (trust - 0.5) * 2 * swing, 0.1, 0.95)
-
-    local velocity = exponentialVelocity(hist, alpha)
-    local acceleration = (LEVEL_ACCEL[level] and accelerationOf(hist)) or Vector3.zero
-    return velocity, acceleration
-end
-
 -- Where the target will actually be once the shot lands, not where they
 -- were when the scan ran a moment earlier. Capped so one stray velocity
 -- reading - a teleport, a knockback, a fresh respawn - can't fling the aim
@@ -613,19 +575,144 @@ local function leadPosition(part, velocity, acceleration, travelTime)
     return part.Position + offset
 end
 
--- Best-level knife lead only: travel time depends on distance, and leading
--- moves the aim point, which changes the distance - a target moving
--- straight toward or away from you makes one pass slightly under-correct.
--- Re-deriving travel time from the predicted point and re-predicting from
--- that converges in a couple of passes at these speeds and ranges.
-local function knifeLeadBest(origin, part, velocity, acceleration, pingComponent)
-    local aimPos = part.Position
-    for _ = 1, 2 do
-        local dist = (aimPos - origin).Magnitude
-        local travelTime = pingComponent + dist / math.max(Aim.KnifeSpeed, 1)
-        aimPos = leadPosition(part, velocity, acceleration, travelTime)
+--// Auto prediction -------------------------------------------------------------
+-- Everything before this was open-loop: pick a velocity, multiply by a
+-- travel time, fire, and never once check whether that actually landed
+-- where it said it would. Every parameter feeding it - the ping estimate,
+-- the knife's speed, how far behind the replicated position really is,
+-- however long the server sits on a shot before resolving it - is a guess,
+-- and an open-loop predictor has no way to ever find out any of them are
+-- wrong.
+--
+-- Auto prediction closes the loop. Every tick it makes a prediction and
+-- writes it down with the time it's supposed to come true. When that time
+-- arrives it looks at where the target ACTUALLY is, measures the error
+-- along the direction it led in, and nudges a per-target gain - a straight
+-- multiplier on the lead - toward whatever would have been right. Led too
+-- far, gain comes down; not far enough, gain goes up.
+--
+-- The point is that it doesn't matter WHICH of those guesses is wrong, or
+-- by how much. They all show up as the same measurable symptom (the lead
+-- was too long or too short) and they all get corrected by the same
+-- feedback, from real observed outcomes, without anyone tuning anything.
+-- It runs at the scan rate whether or not you ever fire a shot, so it is
+-- calibrated by the time you do.
+--
+-- Two guards keep it honest: it only learns from predictions made while
+-- the target was moving consistently (steadiness above), because a juke
+-- mid-flight is the target's fault and not a calibration error, and the
+-- gain is clamped, so a bad streak can bend the lead but never invert or
+-- run away with it.
+--
+-- The "auto prediction amount" dropdown sets how aggressive that feedback
+-- loop is allowed to be:
+--   Lesser   - learns slowly, corrects at most +/-15%. Velocity only.
+--   Normal   - moderate rate, +/-30%.
+--   Extra    - faster, down to 0.45x or up to 1.55x, and models
+--              acceleration as well as velocity.
+--   Advanced - faster still, 0.30x to 1.80x, acceleration, less smoothing
+--              so it tracks sharp changes.
+--   Best     - the most aggressive correction (a quarter up to double),
+--              and the knife additionally re-derives its travel time
+--              against its own predicted point, since leading changes the
+--              distance the knife has to cross.
+-- Monotonic on purpose: every level up learns faster and is allowed to
+-- correct further than the one below it, and none of them can collapse the
+-- lead to nothing or run it away past double.
+local AUTO_LEVELS = {
+    Lesser   = { rate = 0.02, gainMin = 0.85, gainMax = 1.15, accel = false, smooth = 0.35, passes = 1 },
+    Normal   = { rate = 0.05, gainMin = 0.70, gainMax = 1.30, accel = false, smooth = 0.50, passes = 1 },
+    Extra    = { rate = 0.08, gainMin = 0.45, gainMax = 1.55, accel = true,  smooth = 0.60, passes = 1 },
+    Advanced = { rate = 0.12, gainMin = 0.30, gainMax = 1.80, accel = true,  smooth = 0.70, passes = 1 },
+    Best     = { rate = 0.18, gainMin = 0.25, gainMax = 2.00, accel = true,  smooth = 0.80, passes = 2 },
+}
+
+local LEARN_STEADINESS_MIN = 0.6   -- below this the target was turning; measure, don't learn
+local LEARN_MIN_LEAD = 0.75        -- studs - too short a lead and the error is all noise
+local MAX_PENDING = 24
+
+local autoState = {} -- [player name] = { gain, pending = {}, verified, lastError }
+
+-- A player who left takes their learned gain with them; the next person to
+-- hold that name starts from scratch rather than inheriting it.
+track(Players.PlayerRemoving:Connect(function(plr)
+    autoState[plr.Name] = nil
+end))
+
+local function autoStateFor(name)
+    local state = autoState[name]
+    if not state then
+        state = { gain = 1, pending = {}, verified = 0, lastError = 0 }
+        autoState[name] = state
     end
-    return aimPos
+    return state
+end
+
+-- Retire every prediction whose due time has arrived, scoring each against
+-- where the target actually ended up.
+local function verifyPending(state, part, settings, now)
+    local pending = state.pending
+    local index = 1
+    while index <= #pending do
+        local entry = pending[index]
+        if now < entry.dueAt then
+            index = index + 1
+        else
+            local leadLength = entry.lead.Magnitude
+            if leadLength >= LEARN_MIN_LEAD then
+                -- Positive = the target travelled further along our lead
+                -- direction than we predicted (we under-led). Negative =
+                -- they fell short of it (we over-led).
+                local signedError = (part.Position - entry.aimPos):Dot(entry.lead.Unit)
+                state.lastError = signedError
+                if entry.learnable then
+                    local relative = math.clamp(signedError / leadLength, -1, 1)
+                    state.gain = math.clamp(
+                        state.gain * (1 + relative * settings.rate),
+                        settings.gainMin, settings.gainMax)
+                    state.verified = state.verified + 1
+                end
+            end
+            table.remove(pending, index)
+        end
+    end
+end
+
+local function autoPredictAim(plr, part, hist, velocity, acceleration, travelTime, settings, now)
+    local state = autoStateFor(plr.Name)
+    verifyPending(state, part, settings, now)
+
+    local lead = (velocity * travelTime + acceleration * (0.5 * travelTime * travelTime)) * state.gain
+    if lead.Magnitude > MAX_LEAD_OFFSET then
+        lead = lead.Unit * MAX_LEAD_OFFSET
+    end
+
+    local aimPos = part.Position + lead
+
+    if lead.Magnitude >= LEARN_MIN_LEAD and #state.pending < MAX_PENDING then
+        state.pending[#state.pending + 1] = {
+            dueAt = now + travelTime,
+            aimPos = aimPos,
+            lead = lead,
+            learnable = steadiness(hist) >= LEARN_STEADINESS_MIN,
+        }
+    end
+
+    return aimPos, state
+end
+
+-- The knife's travel time depends on how far it has to fly, and leading
+-- moves the point it's flying at, which changes that distance - so for a
+-- target moving toward or away from you, one pass under-corrects. Solving
+-- it against the predicted point converges within a pass or two at these
+-- speeds and ranges. passes = 1 just returns the straight-line answer.
+local function knifeTravelTime(origin, part, velocity, pingComponent, passes)
+    local travelTime = pingComponent + (part.Position - origin).Magnitude / math.max(Aim.KnifeSpeed, 1)
+    for _ = 2, (passes or 1) do
+        local predicted = part.Position + velocity * travelTime
+        travelTime = pingComponent + (predicted - origin).Magnitude / math.max(Aim.KnifeSpeed, 1)
+    end
+    return travelTime
 end
 
 -- Self-calibrating knife speed - see the header note on ThrowingKnifeVisuals.
@@ -693,12 +780,22 @@ local function findKnifeOrigin()
     return handle and handle.Position
 end
 
+-- Live readout of what auto prediction has actually learned, surfaced in
+-- the UI so the loop isn't a black box - "1.14x over 62" means it settled
+-- on leading 14% further than the raw maths said, across 62 scored
+-- predictions.
+local autoSummary = 'idle'
+
 -- Computes where a candidate should actually be aimed at, per the current
--- Predict/Adaptive settings. `sampled` memoizes trackedVelocity per player
--- for this tick only - the gun (murderer-only) and knife (anyone) scans
--- can land on the same player, and sampling them twice in the same instant
--- would measure ~0 elapsed time on the second call instead of a real
--- velocity, corrupting the reading.
+-- Predict/AutoPredict settings. `sampled` memoizes trackedVelocity per
+-- player for this tick only - the gun (murderer-only) and knife (anyone)
+-- scans can land on the same player, and sampling them twice in the same
+-- instant would measure ~0 elapsed time on the second call instead of a
+-- real velocity, corrupting the reading.
+--
+-- travelTimeFn(isAuto, velocity) hands back the flight/latency time for
+-- this weapon; the knife's depends on the velocity being used, which is
+-- why it's a callback rather than a number.
 local function computeAimPoint(plr, part, sampled, travelTimeFn)
     if not Aim.Predict then return part.Position end
 
@@ -709,12 +806,18 @@ local function computeAimPoint(plr, part, sampled, travelTimeFn)
         sampled[plr.Name] = s
     end
 
-    if not Aim.Adaptive then
-        return leadPosition(part, s.raw, Vector3.zero, travelTimeFn(false, s.raw, Vector3.zero))
+    if not Aim.AutoPredict then
+        return leadPosition(part, s.raw, Vector3.zero, travelTimeFn(false, s.raw))
     end
 
-    local velocity, acceleration = adaptiveVelocityAndAccel(s.hist, Aim.AdaptiveLevel)
-    return leadPosition(part, velocity, acceleration, travelTimeFn(true, velocity, acceleration))
+    local settings = AUTO_LEVELS[Aim.AutoLevel] or AUTO_LEVELS.Normal
+    local velocity = exponentialVelocity(s.hist, settings.smooth)
+    local acceleration = settings.accel and accelerationOf(s.hist) or Vector3.zero
+    local travelTime = travelTimeFn(true, velocity, settings)
+
+    local aimPos, state = autoPredictAim(plr, part, s.hist, velocity, acceleration, travelTime, settings, os.clock())
+    autoSummary = ('%.2fx over %d'):format(state.gain, state.verified)
+    return aimPos
 end
 
 -- 60Hz rather than 30: this loop no longer runs inside the hook (nothing
@@ -763,8 +866,10 @@ spawnLoop(function()
             else
                 local gPlr, gPart = scanTarget(isMurderer)
                 if gPlr and gPart then
-                    local aimPos = computeAimPoint(gPlr, gPart, sampled, function(adaptive)
-                        if not adaptive then return Aim.ManualLeadTimeGun end
+                    -- Hitscan: the server resolves it the moment the call
+                    -- lands, so lead time is just the one-way trip there.
+                    local aimPos = computeAimPoint(gPlr, gPart, sampled, function(auto)
+                        if not auto then return Aim.ManualLeadTimeGun end
                         return Aim.UsePing and (cachedPing / 2) or 0
                     end)
                     cachedGunRedirect = clearFromOrigin(gOrigin, aimPos, gPlr.Character) and CFrame.new(aimPos) or nil
@@ -779,25 +884,14 @@ spawnLoop(function()
             else
                 local kPlr, kPart = scanTarget(nil)
                 if kPlr and kPart then
-                    local aimPos
-                    if Aim.Predict and Aim.Adaptive and Aim.AdaptiveLevel == 'Best' then
-                        local s = sampled[kPlr.Name]
-                        if not s then
-                            local raw, hist = trackedVelocity(kPlr, kPart)
-                            s = { raw = raw, hist = hist }
-                            sampled[kPlr.Name] = s
-                        end
-                        local velocity, acceleration = adaptiveVelocityAndAccel(s.hist, Aim.AdaptiveLevel)
+                    -- Real projectile: the one-way trip plus however long
+                    -- the knife itself is in the air, solved against the
+                    -- predicted point at Best (settings.passes).
+                    local aimPos = computeAimPoint(kPlr, kPart, sampled, function(auto, velocity, settings)
+                        if not auto then return Aim.ManualLeadTimeKnife end
                         local pingComponent = Aim.UsePing and (cachedPing / 2) or 0
-                        aimPos = knifeLeadBest(kOrigin, kPart, velocity, acceleration, pingComponent)
-                    else
-                        aimPos = computeAimPoint(kPlr, kPart, sampled, function(adaptive)
-                            if not adaptive then return Aim.ManualLeadTimeKnife end
-                            local pingComponent = Aim.UsePing and (cachedPing / 2) or 0
-                            local dist = (kPart.Position - kOrigin).Magnitude
-                            return pingComponent + dist / math.max(Aim.KnifeSpeed, 1)
-                        end)
-                    end
+                        return knifeTravelTime(kOrigin, kPart, velocity, pingComponent, settings.passes)
+                    end)
                     cachedKnifeRedirect = clearFromOrigin(kOrigin, aimPos, kPlr.Character) and CFrame.new(aimPos) or nil
                 else
                     cachedKnifeRedirect = nil
@@ -961,32 +1055,34 @@ local PredictionSection = SilentAimTab:Section({ Title = 'prediction', Side = 'r
 
 PredictionSection:Toggle({
     Title = 'use ping',
-    Desc = 'adds the one-way-latency estimate to adaptive lead. off = lead purely on measured motion, nothing added for how long the shot takes to reach the server',
+    Desc = 'adds the one-way-latency estimate to lead time. off = lead purely on measured motion, nothing added for how long the shot takes to reach the server. auto prediction corrects around whichever you pick either way',
     Flag = 'mm2_silent_aim_use_ping',
     Default = true,
     Callback = function(state) Aim.UsePing = state end,
 })
 
 PredictionSection:Toggle({
-    Title = 'adaptive',
-    Desc = 'on: velocity/acceleration model below, tuned by the amount dropdown. off: a flat manual lead time per weapon instead - see the sliders under that',
-    Flag = 'mm2_silent_aim_adaptive',
+    Title = 'auto prediction',
+    Desc = 'scores its own predictions against where the target actually ended up and corrects the lead from those results, live, per target - so a wrong ping estimate, a wrong knife speed or replication lag all get absorbed without tuning anything. off: a flat manual lead time per weapon instead, see the sliders below',
+    Flag = 'mm2_silent_aim_auto_predict',
     Default = true,
-    Callback = function(state) Aim.Adaptive = state end,
+    Callback = function(state) Aim.AutoPredict = state end,
 })
 
 PredictionSection:Dropdown({
-    Title = 'adaptive amount',
-    Desc = 'how far the live model is allowed to swing between "trust a steady target\'s raw motion" and "smooth out an erratic one" - lesser barely swings at all, best swings the most and adds an acceleration term (plus, for the knife, a 2-pass travel-time refinement). This reacts to the target\'s actual movement every tick, not a fixed formula per level',
+    Title = 'auto prediction amount',
+    Desc = 'how hard the feedback loop is allowed to correct. lesser: learns slowly, +/-15%. normal: +/-30%. extra: 0.45x-1.55x and models acceleration. advanced: 0.30x-1.80x, tracks sharp changes. best: a quarter up to double, and the knife solves its travel time against its own predicted point',
     Values = { 'Lesser', 'Normal', 'Extra', 'Advanced', 'Best' },
     Default = 'Normal',
-    Flag = 'mm2_silent_aim_adaptive_level',
-    Callback = function(value) Aim.AdaptiveLevel = value end,
+    Flag = 'mm2_silent_aim_auto_level',
+    Callback = function(value) Aim.AutoLevel = value end,
 })
+
+local AutoStat = PredictionSection:Stat({ Title = 'learned lead', Value = 'idle' })
 
 PredictionSection:Slider({
     Title = 'manual gun lead time',
-    Desc = 'only used while adaptive is off - a flat lead time for the hitscan gun instead of the ping-based one-way estimate',
+    Desc = 'only used while auto prediction is off - a flat lead time for the hitscan gun instead of the ping-based one-way estimate',
     Min = 0,
     Max = 0.5,
     Increment = 0.01,
@@ -998,7 +1094,7 @@ PredictionSection:Slider({
 
 PredictionSection:Slider({
     Title = 'manual knife lead time',
-    Desc = 'only used while adaptive is off - a flat lead time for the thrown knife instead of ping + distance/speed',
+    Desc = 'only used while auto prediction is off - a flat lead time for the thrown knife instead of ping + distance/speed',
     Min = 0,
     Max = 1,
     Increment = 0.01,
@@ -1007,6 +1103,15 @@ PredictionSection:Slider({
     Flag = 'mm2_silent_aim_manual_knife',
     Callback = function(value) Aim.ManualLeadTimeKnife = value end,
 })
+
+spawnLoop(function()
+    while not Unloading do
+        task.wait(0.4)
+        pcall(function()
+            AutoStat:Set(Aim.SilentAim and Aim.Predict and Aim.AutoPredict and autoSummary or 'off')
+        end)
+    end
+end)
 
 --// Tab 3: visual ------------------------------------------------------------------
 local Visual = {
