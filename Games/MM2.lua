@@ -295,6 +295,17 @@ end)
 -- tight corner, so a target that reads as clear from the camera can still
 -- be wall-blocked from where the shot truly leaves. A blocked shot is left
 -- un-redirected rather than forced, so it just goes out as originally aimed.
+--
+-- Prediction has two independent on/off switches and a five-way dial:
+-- "predict movement" is the master switch (off = aim at exactly where the
+-- target is right now, nothing else below matters); "use ping" controls
+-- whether adaptive mode's lead time includes the one-way-latency estimate
+-- at all, for whenever that estimate is doing more harm than good on a
+-- given connection; and "adaptive" chooses between the velocity/
+-- acceleration model (see adaptiveVelocityAndAccel, tuned by the "adaptive
+-- amount" dropdown - lesser/normal/extra/advanced/best, each a genuinely
+-- different model, not a relabeled slider) and a flat manual lead time per
+-- weapon when it's off.
 local Aim = {
     SilentAim = false,
     WallCheck = true,
@@ -304,6 +315,11 @@ local Aim = {
     FOVRadius = 200,
     FOVFollowMouse = true,
     Predict = true,
+    UsePing = true,          -- adds the one-way-latency component to adaptive lead; off = lead purely on measured motion
+    Adaptive = true,
+    AdaptiveLevel = 'Normal', -- 'Lesser' | 'Normal' | 'Extra' | 'Advanced' | 'Best' - see adaptiveVelocityAndAccel below
+    ManualLeadTimeGun = 0.05,   -- seconds - used INSTEAD of the adaptive model when Adaptive is off
+    ManualLeadTimeKnife = 0.15,
     KnifeSpeed = 96,         -- the real default (ThrowingKnifeVisuals) - overwritten live once any knife is seen thrown, see below
 }
 
@@ -415,23 +431,113 @@ end
 -- the target's physics happens to be replicating right now. Falls back to
 -- AssemblyLinearVelocity only for a target's very first tick, when there
 -- is no prior sample yet to measure from.
+--
+-- Every sample also feeds a short rolling history per player, which is
+-- what the "adaptive amount" levels below actually differ on - raw,
+-- averaged, or exponentially-smoothed velocity, with or without an
+-- acceleration term. None of this replaces the ping-based lead-time work
+-- above; it decides WHAT velocity gets multiplied by that time, not the
+-- time itself.
 local lastSample = {} -- [player name] = { Position = Vector3, Time = number }
+local velocityHistory = {} -- [player name] = { {v=Vector3, t=number}, ... } newest last
+local ADAPTIVE_HISTORY = 6
 
-local function measuredVelocity(plr, part)
+track(Players.PlayerRemoving:Connect(function(plr)
+    lastSample[plr.Name] = nil
+    velocityHistory[plr.Name] = nil
+end))
+
+local function trackedVelocity(plr, part)
     local now = os.clock()
     local prev = lastSample[plr.Name]
     lastSample[plr.Name] = { Position = part.Position, Time = now }
 
+    local raw
     if prev then
         local dt = now - prev.Time
         if dt > 0 and dt < 0.5 then
-            return (part.Position - prev.Position) / dt
+            raw = (part.Position - prev.Position) / dt
         end
     end
+    if not raw then
+        local ok, velocity = pcall(function() return part.AssemblyLinearVelocity end)
+        raw = (ok and velocity) or Vector3.zero
+    end
 
-    local ok, velocity = pcall(function() return part.AssemblyLinearVelocity end)
-    if ok and velocity then return velocity end
-    return Vector3.zero
+    local hist = velocityHistory[plr.Name]
+    if not hist then
+        hist = {}
+        velocityHistory[plr.Name] = hist
+    end
+    hist[#hist + 1] = { v = raw, t = now }
+    while #hist > ADAPTIVE_HISTORY do
+        table.remove(hist, 1)
+    end
+
+    return raw, hist
+end
+
+local function averageVelocity(hist, count)
+    count = math.min(count, #hist)
+    if count <= 0 then return Vector3.zero end
+    local sum = Vector3.zero
+    for i = #hist - count + 1, #hist do
+        sum = sum + hist[i].v
+    end
+    return sum / count
+end
+
+-- Weighted toward the most recent samples rather than a flat average, so a
+-- genuine direction change shows up faster while single-frame noise still
+-- gets smoothed out. alpha closer to 1 trusts the newest sample more.
+local function exponentialVelocity(hist, alpha)
+    if #hist == 0 then return Vector3.zero end
+    local result = hist[1].v
+    for i = 2, #hist do
+        result = result:Lerp(hist[i].v, alpha)
+    end
+    return result
+end
+
+local function accelerationOf(hist)
+    if #hist < 2 then return Vector3.zero end
+    local newer, older = hist[#hist], hist[#hist - 1]
+    local dt = newer.t - older.t
+    if dt <= 0 then return Vector3.zero end
+    return (newer.v - older.v) / dt
+end
+
+-- The five "adaptive amount" levels, each a genuinely different model, not
+-- just a relabeled slider:
+--   Lesser   - the single most recent raw sample. Reacts instantly, jitters
+--              with it too.
+--   Normal   - a flat average of the last 2 samples. Removes the worst of
+--              that jitter at a small cost in reaction time.
+--   Extra    - a flat average of the last 4 samples, plus an acceleration
+--              term (velocity += acceleration * time), so a target actively
+--              speeding up or turning is led further than one holding
+--              steady.
+--   Advanced - the same acceleration term, but velocity is exponentially
+--              smoothed instead of flat-averaged - noise gets filtered
+--              without lagging behind a real, sustained direction change
+--              the way a flat average does.
+--   Best     - Advanced's smoothing and acceleration, plus (for the knife
+--              only, see knifeLeadBest below) iterating the travel-time
+--              calculation against the predicted point itself, since
+--              leading changes the distance the knife actually has to
+--              cross.
+local function adaptiveVelocityAndAccel(hist, level)
+    if level == 'Lesser' then
+        return (hist[#hist] and hist[#hist].v) or Vector3.zero, Vector3.zero
+    elseif level == 'Normal' then
+        return averageVelocity(hist, 2), Vector3.zero
+    elseif level == 'Extra' then
+        return averageVelocity(hist, 4), accelerationOf(hist)
+    elseif level == 'Advanced' then
+        return exponentialVelocity(hist, 0.6), accelerationOf(hist)
+    else -- 'Best'
+        return exponentialVelocity(hist, 0.75), accelerationOf(hist)
+    end
 end
 
 -- Where the target will actually be once the shot lands, not where they
@@ -440,15 +546,30 @@ end
 -- point somewhere the target was never actually headed.
 local MAX_LEAD_OFFSET = 15 -- studs
 
-local function leadPosition(part, velocity, travelTime)
-    if not Aim.Predict or not travelTime or travelTime <= 0 then
+local function leadPosition(part, velocity, acceleration, travelTime)
+    if not travelTime or travelTime <= 0 then
         return part.Position
     end
-    local offset = velocity * travelTime
+    local offset = velocity * travelTime + acceleration * (0.5 * travelTime * travelTime)
     if offset.Magnitude > MAX_LEAD_OFFSET then
         offset = offset.Unit * MAX_LEAD_OFFSET
     end
     return part.Position + offset
+end
+
+-- Best-level knife lead only: travel time depends on distance, and leading
+-- moves the aim point, which changes the distance - a target moving
+-- straight toward or away from you makes one pass slightly under-correct.
+-- Re-deriving travel time from the predicted point and re-predicting from
+-- that converges in a couple of passes at these speeds and ranges.
+local function knifeLeadBest(origin, part, velocity, acceleration, pingComponent)
+    local aimPos = part.Position
+    for _ = 1, 2 do
+        local dist = (aimPos - origin).Magnitude
+        local travelTime = pingComponent + dist / math.max(Aim.KnifeSpeed, 1)
+        aimPos = leadPosition(part, velocity, acceleration, travelTime)
+    end
+    return aimPos
 end
 
 -- Self-calibrating knife speed - see the header note on ThrowingKnifeVisuals.
@@ -516,24 +637,63 @@ local function findKnifeOrigin()
     return handle and handle.Position
 end
 
+-- Computes where a candidate should actually be aimed at, per the current
+-- Predict/Adaptive settings. `sampled` memoizes trackedVelocity per player
+-- for this tick only - the gun (murderer-only) and knife (anyone) scans
+-- can land on the same player, and sampling them twice in the same instant
+-- would measure ~0 elapsed time on the second call instead of a real
+-- velocity, corrupting the reading.
+local function computeAimPoint(plr, part, sampled, travelTimeFn)
+    if not Aim.Predict then return part.Position end
+
+    local s = sampled[plr.Name]
+    if not s then
+        local raw, hist = trackedVelocity(plr, part)
+        s = { raw = raw, hist = hist }
+        sampled[plr.Name] = s
+    end
+
+    if not Aim.Adaptive then
+        return leadPosition(part, s.raw, Vector3.zero, travelTimeFn(false, s.raw, Vector3.zero))
+    end
+
+    local velocity, acceleration = adaptiveVelocityAndAccel(s.hist, Aim.AdaptiveLevel)
+    return leadPosition(part, velocity, acceleration, travelTimeFn(true, velocity, acceleration))
+end
+
 -- 60Hz rather than 30: this loop no longer runs inside the hook (nothing
 -- about reentrancy limits it anymore), and a tighter tick means a smaller
 -- worst-case gap between "the target moved" and "the cached redirect
 -- reflects it" - the other half of what made slight movements hard to
 -- track, on top of the velocity source and the ping fix above.
+--
+-- The whole tick body runs inside a pcall: a background loop with no
+-- protection dies silently and permanently the moment anything in it
+-- throws once (a nil Camera mid-respawn, a destroyed part, whatever) -
+-- task.spawn just lets the error end that coroutine, and there is nothing
+-- left to restart it. One bad tick should cost one tick, not silent aim
+-- for the rest of the session.
 spawnLoop(function()
     while not Unloading do
         task.wait(1 / 60)
-        cachedPing = getPing()
 
-        if not Aim.SilentAim then
-            cachedGunRedirect, cachedKnifeRedirect = nil, nil
-        else
+        local ok = pcall(function()
+            cachedPing = getPing()
+
+            if not Aim.SilentAim then
+                cachedGunRedirect, cachedKnifeRedirect = nil, nil
+                return
+            end
+
+            local sampled = {}
+
             local gPlr, gPart = scanTarget(isMurderer)
             local gOrigin = findGunOrigin()
             if gPlr and gPart and gOrigin then
-                local velocity = measuredVelocity(gPlr, gPart)
-                local aimPos = leadPosition(gPart, velocity, cachedPing / 2)
+                local aimPos = computeAimPoint(gPlr, gPart, sampled, function(adaptive)
+                    if not adaptive then return Aim.ManualLeadTimeGun end
+                    return Aim.UsePing and (cachedPing / 2) or 0
+                end)
                 cachedGunRedirect = clearFromOrigin(gOrigin, aimPos, gPlr.Character) and CFrame.new(aimPos) or nil
             else
                 cachedGunRedirect = nil
@@ -542,14 +702,33 @@ spawnLoop(function()
             local kPlr, kPart = scanTarget(nil)
             local kOrigin = findKnifeOrigin()
             if kPlr and kPart and kOrigin then
-                local velocity = measuredVelocity(kPlr, kPart)
-                local dist = (kPart.Position - kOrigin).Magnitude
-                local travelTime = cachedPing / 2 + dist / math.max(Aim.KnifeSpeed, 1)
-                local aimPos = leadPosition(kPart, velocity, travelTime)
+                local aimPos
+                if Aim.Predict and Aim.Adaptive and Aim.AdaptiveLevel == 'Best' then
+                    local s = sampled[kPlr.Name]
+                    if not s then
+                        local raw, hist = trackedVelocity(kPlr, kPart)
+                        s = { raw = raw, hist = hist }
+                        sampled[kPlr.Name] = s
+                    end
+                    local velocity, acceleration = adaptiveVelocityAndAccel(s.hist, Aim.AdaptiveLevel)
+                    local pingComponent = Aim.UsePing and (cachedPing / 2) or 0
+                    aimPos = knifeLeadBest(kOrigin, kPart, velocity, acceleration, pingComponent)
+                else
+                    aimPos = computeAimPoint(kPlr, kPart, sampled, function(adaptive)
+                        if not adaptive then return Aim.ManualLeadTimeKnife end
+                        local pingComponent = Aim.UsePing and (cachedPing / 2) or 0
+                        local dist = (kPart.Position - kOrigin).Magnitude
+                        return pingComponent + dist / math.max(Aim.KnifeSpeed, 1)
+                    end)
+                end
                 cachedKnifeRedirect = clearFromOrigin(kOrigin, aimPos, kPlr.Character) and CFrame.new(aimPos) or nil
             else
                 cachedKnifeRedirect = nil
             end
+        end)
+
+        if not ok then
+            cachedGunRedirect, cachedKnifeRedirect = nil, nil
         end
     end
 end)
@@ -629,6 +808,7 @@ AimSection:Dropdown({
     Title = 'aim part',
     Values = { 'Head', 'HumanoidRootPart' },
     Default = 'Head',
+    Flag = 'mm2_silent_aim_part',
     Callback = function(value) Aim.AimPart = value end,
 })
 
@@ -697,6 +877,57 @@ FovSection:Toggle({
     Flag = 'mm2_silent_aim_follow_mouse',
     Default = true,
     Callback = function(state) Aim.FOVFollowMouse = state end,
+})
+
+local PredictionSection = SilentAimTab:Section({ Title = 'prediction', Side = 'right' })
+
+PredictionSection:Toggle({
+    Title = 'use ping',
+    Desc = 'adds the one-way-latency estimate to adaptive lead. off = lead purely on measured motion, nothing added for how long the shot takes to reach the server',
+    Flag = 'mm2_silent_aim_use_ping',
+    Default = true,
+    Callback = function(state) Aim.UsePing = state end,
+})
+
+PredictionSection:Toggle({
+    Title = 'adaptive',
+    Desc = 'on: velocity/acceleration model below, tuned by the amount dropdown. off: a flat manual lead time per weapon instead - see the sliders under that',
+    Flag = 'mm2_silent_aim_adaptive',
+    Default = true,
+    Callback = function(state) Aim.Adaptive = state end,
+})
+
+PredictionSection:Dropdown({
+    Title = 'adaptive amount',
+    Desc = 'lesser: raw last sample. normal: 2-sample average. extra: 4-sample average + acceleration. advanced: exponential smoothing + acceleration. best: advanced, plus the knife re-derives its travel time against its own predicted point',
+    Values = { 'Lesser', 'Normal', 'Extra', 'Advanced', 'Best' },
+    Default = 'Normal',
+    Flag = 'mm2_silent_aim_adaptive_level',
+    Callback = function(value) Aim.AdaptiveLevel = value end,
+})
+
+PredictionSection:Slider({
+    Title = 'manual gun lead time',
+    Desc = 'only used while adaptive is off - a flat lead time for the hitscan gun instead of the ping-based one-way estimate',
+    Min = 0,
+    Max = 0.5,
+    Increment = 0.01,
+    Default = Aim.ManualLeadTimeGun,
+    Suffix = 's',
+    Flag = 'mm2_silent_aim_manual_gun',
+    Callback = function(value) Aim.ManualLeadTimeGun = value end,
+})
+
+PredictionSection:Slider({
+    Title = 'manual knife lead time',
+    Desc = 'only used while adaptive is off - a flat lead time for the thrown knife instead of ping + distance/speed',
+    Min = 0,
+    Max = 1,
+    Increment = 0.01,
+    Default = Aim.ManualLeadTimeKnife,
+    Suffix = 's',
+    Flag = 'mm2_silent_aim_manual_knife',
+    Callback = function(value) Aim.ManualLeadTimeKnife = value end,
 })
 
 --// Tab 3: visual ------------------------------------------------------------------
@@ -797,65 +1028,77 @@ local function buildRoleLabel(plr, char)
     return roleObjects[plr]
 end
 
+-- Wrapped in pcall for the same reason the silent-aim loop is: an
+-- unprotected background loop dies silently and permanently the first
+-- time anything in it throws, and there's nothing left afterward to
+-- restart it.
 spawnLoop(function()
     while not Unloading do
         task.wait(0.4)
 
-        if Visual.Enabled then
-            for _, plr in ipairs(Players:GetPlayers()) do
-                if plr ~= LocalPlayer then
-                    local char = plr.Character
-                    local obj = espObjects[plr]
-                    if not char then
-                        if obj then destroyEsp(plr) end
-                    elseif not obj or obj.Char ~= char then
-                        buildEsp(plr, char)
-                    else
-                        local color = espColorFor(plr)
-                        obj.Highlight.FillColor = color
-                        obj.Highlight.OutlineColor = color
+        local ok = pcall(function()
+            if Visual.Enabled then
+                for _, plr in ipairs(Players:GetPlayers()) do
+                    if plr ~= LocalPlayer then
+                        local char = plr.Character
+                        local obj = espObjects[plr]
+                        if not char then
+                            if obj then destroyEsp(plr) end
+                        elseif not obj or obj.Char ~= char then
+                            buildEsp(plr, char)
+                        else
+                            local color = espColorFor(plr)
+                            obj.Highlight.FillColor = color
+                            obj.Highlight.OutlineColor = color
+                        end
                     end
                 end
+            else
+                for plr in pairs(espObjects) do destroyEsp(plr) end
             end
-        else
-            for plr in pairs(espObjects) do destroyEsp(plr) end
-        end
 
-        -- Role ESP: only for a player who currently HAS a role (they're in
-        -- this round) and isn't dead, and never for the local player - they
-        -- already know their own role from the game's own reveal screen.
-        if Visual.RoleESP then
-            for _, plr in ipairs(Players:GetPlayers()) do
-                if plr == LocalPlayer then
-                    if roleObjects[plr] then destroyRoleLabel(plr) end
-                else
-                    local char = plr.Character
-                    local entry = RoundData[plr.Name]
-                    local hasRole = entry ~= nil and entry.Role ~= nil and entry.Dead ~= true
-
-                    if not char or not hasRole then
+            -- Role ESP: only for a player who currently HAS a role (they're
+            -- in this round) and isn't dead, and never for the local
+            -- player - they already know their own role from the game's
+            -- own reveal screen.
+            if Visual.RoleESP then
+                for _, plr in ipairs(Players:GetPlayers()) do
+                    if plr == LocalPlayer then
                         if roleObjects[plr] then destroyRoleLabel(plr) end
                     else
-                        local obj = roleObjects[plr]
-                        if not obj or obj.Char ~= char then
-                            obj = buildRoleLabel(plr, char)
-                        end
-                        if obj then
-                            local text = entry.Role
-                            -- The murderer's perk, and only on the
-                            -- murderer's own label - entry is this specific
-                            -- player's round data, so this can never leak
-                            -- onto anyone else's head.
-                            if Visual.ShowMurdererPerk and entry.Role == "Murderer" and entry.Perk then
-                                text = text .. " (" .. tostring(entry.Perk) .. ")"
+                        local char = plr.Character
+                        local entry = RoundData[plr.Name]
+                        local hasRole = entry ~= nil and entry.Role ~= nil and entry.Dead ~= true
+
+                        if not char or not hasRole then
+                            if roleObjects[plr] then destroyRoleLabel(plr) end
+                        else
+                            local obj = roleObjects[plr]
+                            if not obj or obj.Char ~= char then
+                                obj = buildRoleLabel(plr, char)
                             end
-                            obj.Label.Text = text
-                            obj.Label.TextColor3 = ROLE_COLORS[entry.Role] or DEFAULT_ESP_COLOR
+                            if obj then
+                                local text = entry.Role
+                                -- The murderer's perk, and only on the
+                                -- murderer's own label - entry is this
+                                -- specific player's round data, so this can
+                                -- never leak onto anyone else's head.
+                                if Visual.ShowMurdererPerk and entry.Role == "Murderer" and entry.Perk then
+                                    text = text .. " (" .. tostring(entry.Perk) .. ")"
+                                end
+                                obj.Label.Text = text
+                                obj.Label.TextColor3 = ROLE_COLORS[entry.Role] or DEFAULT_ESP_COLOR
+                            end
                         end
                     end
                 end
+            else
+                for plr in pairs(roleObjects) do destroyRoleLabel(plr) end
             end
-        else
+        end)
+
+        if not ok then
+            for plr in pairs(espObjects) do destroyEsp(plr) end
             for plr in pairs(roleObjects) do destroyRoleLabel(plr) end
         end
     end
@@ -864,6 +1107,150 @@ end)
 track(Players.PlayerRemoving:Connect(function(plr)
     destroyEsp(plr)
     destroyRoleLabel(plr)
+end))
+
+--// X-ray ----------------------------------------------------------------------
+-- Every BasePart within range of the local player gets pinned to the
+-- slider's transparency - EXCEPT one that was already at least partly
+-- see-through before x-ray ever touched it (glass, effects, windows: left
+-- exactly as they were, never tracked, never overwritten) - and every part
+-- x-ray HAS touched is tracked with its real, original transparency so it
+-- can go back to looking normal the instant it leaves range or x-ray turns
+-- off. Player characters are excluded from the sweep entirely; this is a
+-- see-through-walls tool, not a way to make people invisible, and doing
+-- that would fight visually with the player ESP above.
+local Xray = {
+    Enabled = false,
+    Transparency = 0.5,
+    Range = 100,
+}
+
+local xrayObjects = {} -- [part] = original transparency (always 0 - see above)
+
+local xrayOverlapParams = OverlapParams.new()
+xrayOverlapParams.FilterType = Enum.RaycastFilterType.Exclude
+
+local function xrayRestore(part, original)
+    if part and part.Parent then
+        pcall(function() part.Transparency = original end)
+    end
+end
+
+local function xrayRestoreAll()
+    for part, original in pairs(xrayObjects) do
+        xrayRestore(part, original)
+    end
+    table.clear(xrayObjects)
+end
+
+local function xrayFilterList()
+    local list = {}
+    local char = LocalPlayer.Character
+    if char then list[#list + 1] = char end
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr.Character then list[#list + 1] = plr.Character end
+    end
+    return list
+end
+
+spawnLoop(function()
+    while not Unloading do
+        task.wait(0.5)
+
+        if not Xray.Enabled then
+            if next(xrayObjects) then xrayRestoreAll() end
+        else
+            local ok = pcall(function()
+                local char = LocalPlayer.Character
+                local root = char and char:FindFirstChild("HumanoidRootPart")
+                if not root then
+                    xrayRestoreAll()
+                    return
+                end
+
+                xrayOverlapParams.FilterDescendantsInstances = xrayFilterList()
+                local parts = Workspace:GetPartBoundsInRadius(root.Position, Xray.Range, xrayOverlapParams)
+
+                local seen = {}
+                for _, part in ipairs(parts) do
+                    if part:IsA("BasePart") and part.Parent then
+                        seen[part] = true
+                        if xrayObjects[part] == nil then
+                            -- entering range for the first time - only take
+                            -- it over if it started fully opaque
+                            if part.Transparency == 0 then
+                                xrayObjects[part] = 0
+                                part.Transparency = Xray.Transparency
+                            end
+                        elseif part.Transparency ~= Xray.Transparency then
+                            -- already tracked - keep it pinned to whatever
+                            -- the slider currently says
+                            part.Transparency = Xray.Transparency
+                        end
+                    end
+                end
+
+                for part, original in pairs(xrayObjects) do
+                    if not seen[part] then
+                        xrayRestore(part, original)
+                        xrayObjects[part] = nil
+                    end
+                end
+            end)
+
+            if not ok then xrayRestoreAll() end
+        end
+    end
+end)
+
+--// Trap ESP ---------------------------------------------------------------------
+-- TrapScriptClient (see the dump) parents every placed trap's visual as a
+-- part literally named "TrapVisual" - `p2.TrapVisual.CFrame`,
+-- `.Transparency`, both read and written by the game's own trap-hit and
+-- trap-placed handlers. Watching for anything with that exact name is
+-- exactly what the game's own trap code keys off, not a guess at a naming
+-- convention.
+local TrapEsp = { Enabled = false }
+local trapObjects = {} -- [TrapVisual part] = Highlight
+
+local function isTrapVisual(inst)
+    return typeof(inst) == "Instance" and inst.Name == "TrapVisual" and inst:IsA("BasePart")
+end
+
+local function destroyTrapEsp(part)
+    local hl = trapObjects[part]
+    if hl then hl:Destroy() end
+    trapObjects[part] = nil
+end
+
+local function buildTrapEsp(part)
+    if trapObjects[part] then return end
+    local hl = Instance.new("Highlight")
+    hl.FillColor = Color3.fromRGB(255, 170, 0)
+    hl.OutlineColor = Color3.fromRGB(255, 170, 0)
+    hl.FillTransparency = 0.3
+    hl.OutlineTransparency = 0
+    hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+    hl.Parent = part
+    trapObjects[part] = hl
+end
+
+local function trapEspRefreshAll()
+    for part in pairs(trapObjects) do destroyTrapEsp(part) end
+    if not TrapEsp.Enabled then return end
+    for _, inst in ipairs(Workspace:GetDescendants()) do
+        if isTrapVisual(inst) then buildTrapEsp(inst) end
+    end
+end
+
+track(Workspace.DescendantAdded:Connect(function(inst)
+    if TrapEsp.Enabled and isTrapVisual(inst) then
+        buildTrapEsp(inst)
+    end
+end))
+
+track(Workspace.DescendantRemoving:Connect(function(inst)
+    if trapObjects[inst] then destroyTrapEsp(inst) end
 end))
 
 local VisualTab = Window:Tab({ Title = 'visual', Icon = 'eye' })
@@ -898,6 +1285,85 @@ RoleEspSection:Toggle({
     Desc = "appends the murderer's currently active perk to their label only - nobody else's",
     Flag = 'mm2_role_esp_perk',
     Callback = function(state) Visual.ShowMurdererPerk = state end,
+})
+
+local XraySection = VisualTab:Section({ Title = 'xray', Side = 'left' })
+
+XraySection:Toggle({
+    Title = 'xray',
+    Desc = 'fades every opaque part within range so you can see through them - anything already partly see-through (glass, effects) is left alone entirely',
+    Flag = 'mm2_xray',
+    Callback = function(state)
+        Xray.Enabled = state
+        if not state then xrayRestoreAll() end
+    end,
+})
+
+XraySection:Slider({
+    Title = 'xray transparency',
+    Desc = 'what every affected part gets set to - 1 makes them fully invisible, lower keeps a faint outline of the geometry',
+    Min = 0,
+    Max = 1,
+    Increment = 0.05,
+    Default = Xray.Transparency,
+    Flag = 'mm2_xray_transparency',
+    Callback = function(value)
+        Xray.Transparency = value
+        for part in pairs(xrayObjects) do
+            if part and part.Parent then
+                pcall(function() part.Transparency = value end)
+            end
+        end
+    end,
+})
+
+XraySection:Slider({
+    Title = 'xray range',
+    Desc = 'radius around you that gets swept for opaque parts',
+    Min = 20,
+    Max = 300,
+    Increment = 10,
+    Default = Xray.Range,
+    Suffix = ' studs',
+    Flag = 'mm2_xray_range',
+    Callback = function(value) Xray.Range = value end,
+})
+
+local TrapSection = VisualTab:Section({ Title = 'traps', Side = 'right' })
+
+TrapSection:Toggle({
+    Title = 'trap esp',
+    Desc = 'highlights every placed trap (TrapVisual, the same part name the game\'s own trap scripts read and write) so you can see and avoid them',
+    Flag = 'mm2_trap_esp',
+    Callback = function(state)
+        TrapEsp.Enabled = state
+        trapEspRefreshAll()
+    end,
+})
+
+local SessionSection = VisualTab:Section({ Title = 'session', Side = 'right' })
+
+SessionSection:Button({
+    Title = 'unload',
+    Callback = function()
+        Unloading = true
+
+        for _, connection in ipairs(Connections) do
+            pcall(function() connection:Disconnect() end)
+        end
+
+        for plr in pairs(espObjects) do destroyEsp(plr) end
+        for plr in pairs(roleObjects) do destroyRoleLabel(plr) end
+        for part in pairs(trapObjects) do destroyTrapEsp(part) end
+        xrayRestoreAll()
+
+        Centrl:Unload()
+    end,
+})
+
+SessionSection:Paragraph({
+    Title = 'unload',
+    Text = 'Disconnects every hook and loop, restores every part xray touched, clears all esp, then closes the menu. The Shoot/KnifeThrown namecall hook cannot be reversed without rejoining.',
 })
 
 Window:Load()
