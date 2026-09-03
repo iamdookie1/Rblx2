@@ -1,69 +1,3 @@
---// Murder Mystery 2 -------------------------------------------------------
--- Built against a fresh script dump of the live game. The remotes below are
--- the real ones the game's own client modules use, not guesses - and every
--- one of them is a read, nothing here fires anything back at the server:
---
---   Remotes.Gameplay.GetCurrentPlayerData :InvokeServer()
---       Every player's current round data, keyed by name:
---       { [name] = { Role, Perk, Dead, Knife, Gun } }. This is the exact
---       table ReplicatedStorage.Modules.CurrentRoundClient and the
---       round-end scoreboard both read from, and it is NOT limited to your
---       own entry - it carries everyone's role for the whole round.
---   Remotes.Gameplay.PlayerDataChanged.OnClientEvent(playerData)
---       Pushes that same table the instant it changes - role assignment,
---       deaths, perk swaps - which is what makes the role ESP below live
---       instead of polled from a private per-player signal.
---   Remotes.Inventory.GetProfileData :InvokeServer()
---       Your own save: Coins, Gems, NewXP, Prestige, and
---       Weapons/Pets/Materials.Owned - the exact table
---       ReplicatedStorage.Modules.ProfileData wraps and the retry shape
---       (nil until the server responds) it uses.
---   Remotes.Inventory.ChangeProfileData.OnClientEvent(key, value)
---       Live field updates to the table above.
---   Remotes.Inventory.ChangeInventoryItem.OnClientEvent(type, id, amount)
---       Live inventory updates (new weapon/pet/material, amount changes).
---   Modules.LevelModule
---       Pure XP-to-level math, no side effects - required directly so the
---       dashboard shows the same level/progress numbers the game's own UI
---       computes from NewXP.
---
--- A second dump caught someone actually holding the Sheriff's gun, which is
--- what GunClient below comes from (Workspace.<player>.Gun.GunClient). Its
--- fire path is:
---
---   Tool.Activated:Connect(function()
---       local target = WeaponService:GetMouseTargetCFrame()  -- client raycast
---       local origin = HumanoidRootPart.GunRaycastAttachment.WorldCFrame
---       Tool.Shoot:FireServer(origin, target)
---   end)
---
--- Both arguments are entirely client-computed and sent as-is - origin comes
--- off a fixed attachment on your own torso, target off the same
--- screen-to-world raycast the knife throw uses. There's also a client-only
--- "can't shoot" gate (a raycast from your Head to the gun attachment, to
--- catch a blocked third-person angle) that toggles a CantShoot BindableEvent
--- for the crosshair - but nothing reads that BindableEvent before firing, so
--- it never actually stops Shoot:FireServer from going out.
---
--- Silent aim below hooks Shoot:FireServer itself (game.__namecall) rather
--- than replacing the click handler: it lets the real Activated connection
--- do everything - animation, the origin attachment, whatever cooldown the
--- server enforces - and only ever rewrites the target CFrame argument.
---
--- The knife's real flight speed also turned out to be readable after all -
--- just not off the Tool. PlayerScripts.WeaponVisuals.ThrowingKnifeVisuals
--- (the script that renders every OTHER player's flying knife, tagged
--- "ThrowingKnife" via CollectionService) steps the visual forward every
--- frame with `position += Direction * ThrowSpeed * dt`, reading ThrowSpeed
--- straight off that flying instance - `GetAttribute("ThrowSpeed") or 96`.
--- That's a real, direct studs/sec constant (96 by default), completely
--- unrelated to the same-named charge-duration attribute on the Knife Tool.
--- Silent aim listens for the same CollectionService tag the game's own
--- script does and reads it live off the first knife it ever sees thrown -
--- by anyone, not just you - so the knife-speed slider below starts at the
--- real default and self-corrects the moment it has real data instead of
--- running on a guess.
-
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -74,7 +8,6 @@ local Workspace = workspace
 local LocalPlayer = Players.LocalPlayer
 local Camera = Workspace.CurrentCamera
 
---// Lifecycle ------------------------------------------------------------------
 local Connections = {}
 local Unloading = false
 
@@ -83,15 +16,18 @@ local function track(connection)
     return connection
 end
 
-local function spawnLoop(fn)
-    return task.spawn(fn)
+local function resolveEvent(modern, legacy)
+    local ok, event = pcall(function() return RunService[modern] end)
+    if ok and event then return event end
+    return RunService[legacy]
 end
 
-Workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(function()
-    if Workspace.CurrentCamera then Camera = Workspace.CurrentCamera end
-end)
+local PreSimulation = resolveEvent("PreSimulation", "Stepped")
 
---// Remotes --------------------------------------------------------------------
+track(Workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(function()
+    if Workspace.CurrentCamera then Camera = Workspace.CurrentCamera end
+end))
+
 local function waitForPath(root, path, timeout)
     local current = root
     for _, name in ipairs(path) do
@@ -124,7 +60,6 @@ do
     end
 end
 
---// Live round data (role/perk/dead, for every player) -------------------------
 local RoundData = {}
 
 local function refreshRoundData()
@@ -145,7 +80,55 @@ if PlayerDataChangedRemote then
     end))
 end
 
---// Live profile data (own coins/gems/xp/inventory) -----------------------------
+task.spawn(function()
+    while not Unloading do
+        task.wait(2)
+        pcall(refreshRoundData)
+    end
+end)
+
+local function heldWeapon(char)
+    if not char then return nil end
+    for _, item in ipairs(char:GetChildren()) do
+        if item:IsA("Tool") then
+            local tagged = false
+            pcall(function() tagged = CollectionService:HasTag(item, "Weapon_Gun") end)
+            if item.Name == "Gun" or item:FindFirstChild("IsGun") or tagged then
+                return "Gun"
+            end
+            if item.Name == "Knife" or item:FindFirstChild("KnifeClient") or item:FindFirstChild("Stab") then
+                return "Knife"
+            end
+        end
+    end
+    return nil
+end
+
+local function roleOf(plr)
+    local entry = RoundData[plr.Name]
+    local role = entry and entry.Role or nil
+    local dead = entry ~= nil and entry.Dead == true
+    local held = heldWeapon(plr.Character)
+
+    if held == "Knife" then
+        role = "Murderer"
+    elseif held == "Gun" then
+        if role == nil then
+            role = "Sheriff"
+        elseif role ~= "Sheriff" and role ~= "Hero" then
+            role = "Hero"
+        end
+    end
+
+    return role, dead, entry
+end
+
+local function isAlivePlr(plr)
+    local char = plr.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    return hum ~= nil and hum.Health > 0
+end
+
 local ProfileData = nil
 
 local function fetchProfileData()
@@ -172,9 +155,6 @@ if ChangeProfileData then
     end))
 end
 
--- Mirrors ProfileData's own onInventoryItemChanged: Weapons/Pets/Materials are
--- id -> amount dictionaries, everything else (Emotes, Toys, ...) is a plain
--- array of owned ids.
 local DICT_INVENTORY_TYPES = { Weapons = true, Pets = true, Materials = true }
 
 if ChangeInventoryItem then
@@ -195,7 +175,6 @@ local function countOwned(owned)
     return n
 end
 
---// UI ---------------------------------------------------------------------------
 local Centrl = loadstring(game:HttpGet('https://raw.githubusercontent.com/iamdookie1/Rblx2/main/UI/Lib2.lua'))()
 
 local Window = Centrl:Window({
@@ -206,7 +185,6 @@ local Window = Centrl:Window({
     Accent = Color3.fromRGB(210, 45, 45),
 })
 
---// Tab 1: profile ---------------------------------------------------------------
 local ProfileTab = Window:Tab({ Title = 'profile', Icon = 'user' })
 
 local EconomySection = ProfileTab:Section({ Title = 'economy', Side = 'left' })
@@ -235,7 +213,6 @@ local function refreshDashboard()
     if LevelModule then
         local ok, level = pcall(LevelModule.GetLevel, xp)
         if ok then LevelStat:Set(tostring(level)) end
-
         local ok2, progress = pcall(LevelModule.GetProgressToNextLevel, xp)
         if ok2 and typeof(progress) == "number" then
             XPBar:Set(math.clamp(progress, 0, 1) * 100)
@@ -249,122 +226,58 @@ local function refreshDashboard()
     MaterialsStat:Set(tostring(countOwned(ProfileData.Materials and ProfileData.Materials.Owned)))
 end
 
-spawnLoop(function()
+task.spawn(function()
     while not Unloading do
         task.wait(0.5)
-        refreshDashboard()
+        pcall(refreshDashboard)
     end
 end)
 
---// Tab 2: silent aim -------------------------------------------------------------
--- Two weapons, two very different aim problems:
---
---   Gun (hitscan) - Shoot:FireServer(origin, target). The server gets told
---   the answer directly, no travel time modeled anywhere in the client
---   code, so the only thing worth leading for is the ONE-WAY trip to the
---   server, not a physical bullet flight - see getPing() below for why
---   that's half of ping, not all of it.
---
---   Knife (thrown) - KnifeThrown:FireServer(handleCFrame, target). This one
---   really is a physical projectile with travel time, and unlike the gun
---   its real flight speed IS readable - see the header note on
---   ThrowingKnifeVisuals for where 96 studs/sec and the live calibration
---   below actually come from.
---
--- Both weapons lead using velocity measured from the target's own position
--- across our scan ticks, not part.AssemblyLinearVelocity - a remote
--- player's parts are replication-driven, not fully simulated on your
--- client, so that property can read stale or flat-zero for exactly the
--- kind of slight, subtle movement (strafing, small corrections) leading
--- most needs to get right. Measuring it ourselves from how far the part
--- actually moved on screen tracks whatever the target visibly does, at the
--- same rate the scan itself runs.
---
--- Both then hand that to auto prediction, which is a closed feedback loop
--- rather than a formula: it records every prediction it makes, checks each
--- one against where the target actually was when it came due, and corrects
--- a per-target lead multiplier from the measured miss. Ping estimate off,
--- knife speed off, replication further behind than assumed - it never has
--- to know which; they all present as "the lead was too long or too short"
--- and all get corrected the same way. See the auto prediction engine.
---
--- The sheriff's gun exists to kill the murderer, and only the murderer -
--- RoundData (see the header) names them by role, so the gun redirect is
--- restricted to whichever player currently has Role == "Murderer" rather
--- than "nearest player". The knife has no such restriction: the murderer
--- can legally kill anyone, so it keeps the general nearest-target scan.
---
--- Both weapons also get a second, late check right before the redirect:
--- the scan below picks a candidate using a camera-based sightline (cheap,
--- runs first), but the shot itself is re-validated with a fresh raycast
--- from the REAL origin the game just handed this hook - the gun's actual
--- muzzle attachment, the knife's actual Handle position - not the camera.
--- Camera and muzzle are not the same point, especially off-center or in a
--- tight corner, so a target that reads as clear from the camera can still
--- be wall-blocked from where the shot truly leaves. A blocked shot is left
--- un-redirected rather than forced, so it just goes out as originally aimed.
---
--- Prediction has two independent on/off switches and a five-way dial:
--- "predict movement" is the master switch (off = aim at exactly where the
--- target is right now, nothing else below matters); "use ping" controls
--- whether the one-way-latency estimate is included in lead time at all,
--- for whenever that estimate is doing more harm than good on a given
--- connection; and "auto prediction" chooses between the self-correcting
--- model (see the auto prediction engine further down) and a flat manual
--- lead time per weapon when it's off.
 local Aim = {
     SilentAim = false,
     WallCheck = true,
     AimPart = "Head",
-    MaxRange = 300,          -- WeaponService:GetMouseTargetCFrame caps its own raycast at 300 studs
+    MaxRange = 300,
     FOVEnabled = true,
     FOVRadius = 200,
     FOVFollowMouse = true,
     Predict = true,
-    UsePing = true,          -- adds the one-way-latency component to lead time; off = lead purely on measured motion
+    UsePing = true,
     AutoPredict = true,
-    AutoLevel = 'Normal',    -- 'Lesser' | 'Normal' | 'Extra' | 'Advanced' | 'Best' - see AUTO_LEVELS below
-    ManualLeadTimeGun = 0.05,   -- seconds - used INSTEAD of auto prediction when it's off
+    AutoLevel = 'Normal',
+    ManualLeadTimeGun = 0.05,
     ManualLeadTimeKnife = 0.15,
-    KnifeSpeed = 96,         -- the real default (ThrowingKnifeVisuals) - overwritten live once any knife is seen thrown, see below
+    KnifeSpeed = 96,
+    JumpAware = true,
 }
 
-local function isAlivePlr(plr)
-    local char = plr.Character
-    local hum = char and char:FindFirstChildOfClass("Humanoid")
-    return hum ~= nil and hum.Health > 0
-end
+local AUTO_LEVELS = {
+    Lesser   = { rate = 0.02, gainMin = 0.85, gainMax = 1.15, smooth = 0.35, passes = 1 },
+    Normal   = { rate = 0.05, gainMin = 0.70, gainMax = 1.30, smooth = 0.50, passes = 2 },
+    Extra    = { rate = 0.08, gainMin = 0.45, gainMax = 1.55, smooth = 0.60, passes = 2 },
+    Advanced = { rate = 0.12, gainMin = 0.30, gainMax = 1.80, smooth = 0.70, passes = 3 },
+    Best     = { rate = 0.18, gainMin = 0.25, gainMax = 2.00, smooth = 0.80, passes = 3 },
+}
+
+local MAX_LEAD_OFFSET = 18
+local LEARN_MIN_LEAD = 0.75
+local MAX_PENDING = 24
+local JUMP_SPAM_WINDOW = 3
+local JUMP_SPAM_COUNT = 3
+local SAMPLE_STALE = 0.5
 
 local visionParams = RaycastParams.new()
 visionParams.FilterType = Enum.RaycastFilterType.Exclude
 visionParams.IgnoreWater = true
 
--- Coarse, camera-based - used only to pick a candidate during the scan.
-local function isVisible(char, origin)
+local function clearPath(origin, target, char)
     if not Aim.WallCheck then return true end
-    local part = char:FindFirstChild(Aim.AimPart) or char:FindFirstChild("HumanoidRootPart")
-    if not part then return false end
-    local params = visionParams
-    params.FilterDescendantsInstances = { LocalPlayer.Character, char }
-    local direction = part.Position - origin
-    local ok, result = pcall(function() return Workspace:Raycast(origin, direction, params) end)
+    visionParams.FilterDescendantsInstances = { LocalPlayer.Character, char }
+    local direction = target - origin
+    local ok, result = pcall(function() return Workspace:Raycast(origin, direction, visionParams) end)
     if not ok then return true end
     if not result then return true end
     return (result.Position - origin).Magnitude >= direction.Magnitude - 2
-end
-
--- Precise, real-origin-based - the final gate right before a shot is
--- actually redirected. See the header note on why this has to be separate
--- from isVisible above rather than reusing it.
-local function clearFromOrigin(originPos, targetPos, char)
-    if not Aim.WallCheck then return true end
-    local params = visionParams
-    params.FilterDescendantsInstances = { LocalPlayer.Character, char }
-    local direction = targetPos - originPos
-    local ok, result = pcall(function() return Workspace:Raycast(originPos, direction, params) end)
-    if not ok then return true end
-    if not result then return true end
-    return (result.Position - originPos).Magnitude >= direction.Magnitude - 2
 end
 
 local function screenAnchor()
@@ -375,7 +288,156 @@ local function screenAnchor()
     return Vector2.new(viewport.X / 2, viewport.Y / 2)
 end
 
--- Cheap: distance and a screen projection, no raycast.
+local function getPing()
+    local ok, ping = pcall(function() return LocalPlayer:GetNetworkPing() end)
+    if ok and typeof(ping) == "number" and ping > 0 then return ping end
+    return 0.08
+end
+
+local function gravity()
+    local ok, value = pcall(function() return Workspace.Gravity end)
+    if ok and typeof(value) == "number" and value > 0 then return value end
+    return 196.2
+end
+
+local motion = {}
+
+local function airborneState(char)
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    if not hum then return false end
+    local ok, state = pcall(function() return hum:GetState() end)
+    if not ok then return false end
+    return state == Enum.HumanoidStateType.Freefall
+        or state == Enum.HumanoidStateType.Jumping
+        or state == Enum.HumanoidStateType.FallingDown
+end
+
+local function sampleMotion(plr, root, now)
+    local name = plr.Name
+    local entry = motion[name]
+    local position = root.Position
+    local airborne = airborneState(plr.Character)
+
+    if not entry then
+        entry = {
+            position = position,
+            time = now,
+            horizontal = Vector3.zero,
+            vertical = 0,
+            groundY = position.Y,
+            airborne = airborne,
+            jumps = {},
+            gain = 1,
+            pending = {},
+            verified = 0,
+        }
+        motion[name] = entry
+        return entry
+    end
+
+    local dt = now - entry.time
+    if dt > 0 and dt < SAMPLE_STALE then
+        local delta = position - entry.position
+        local rawHorizontal = Vector3.new(delta.X, 0, delta.Z) / dt
+        local rawVertical = delta.Y / dt
+        local settings = AUTO_LEVELS[Aim.AutoLevel] or AUTO_LEVELS.Normal
+        entry.horizontal = entry.horizontal:Lerp(rawHorizontal, settings.smooth)
+        entry.vertical = entry.vertical + (rawVertical - entry.vertical) * 0.65
+    elseif dt >= SAMPLE_STALE then
+        entry.horizontal = Vector3.zero
+        entry.vertical = 0
+    end
+
+    if airborne and not entry.airborne then
+        table.insert(entry.jumps, now)
+    end
+    while entry.jumps[1] and now - entry.jumps[1] > JUMP_SPAM_WINDOW do
+        table.remove(entry.jumps, 1)
+    end
+
+    if not airborne then
+        entry.groundY = position.Y
+    end
+
+    entry.airborne = airborne
+    entry.position = position
+    entry.time = now
+    return entry
+end
+
+local function isSpamJumper(entry)
+    return #entry.jumps >= JUMP_SPAM_COUNT
+end
+
+local function predictRoot(entry, travelTime, gain)
+    local base = entry.position
+    if not Aim.Predict or travelTime <= 0 then
+        return base
+    end
+
+    local horizontal = entry.horizontal * travelTime * (gain or 1)
+    if horizontal.Magnitude > MAX_LEAD_OFFSET then
+        horizontal = horizontal.Unit * MAX_LEAD_OFFSET
+    end
+
+    local y = base.Y
+    if Aim.JumpAware then
+        if entry.airborne then
+            local g = gravity()
+            y = base.Y + entry.vertical * travelTime - 0.5 * g * travelTime * travelTime
+            if y < entry.groundY then y = entry.groundY end
+        end
+    else
+        y = base.Y + math.clamp(entry.vertical * travelTime, -MAX_LEAD_OFFSET, MAX_LEAD_OFFSET)
+    end
+
+    return Vector3.new(base.X + horizontal.X, y, base.Z + horizontal.Z)
+end
+
+local function verifyPredictions(entry, settings, now)
+    local pending = entry.pending
+    local index = 1
+    while index <= #pending do
+        local record = pending[index]
+        if now < record.dueAt then
+            index = index + 1
+        else
+            local lead = record.lead
+            local length = lead.Magnitude
+            if length >= LEARN_MIN_LEAD and record.learnable then
+                local actual = Vector3.new(entry.position.X, 0, entry.position.Z)
+                local predicted = Vector3.new(record.root.X, 0, record.root.Z)
+                local drift = (actual - predicted):Dot(lead.Unit)
+                local relative = math.clamp(drift / length, -1, 1)
+                entry.gain = math.clamp(entry.gain * (1 + relative * settings.rate), settings.gainMin, settings.gainMax)
+                entry.verified = entry.verified + 1
+            end
+            table.remove(pending, index)
+        end
+    end
+end
+
+local function logPrediction(entry, predictedRoot, travelTime, now)
+    local lead = Vector3.new(predictedRoot.X - entry.position.X, 0, predictedRoot.Z - entry.position.Z)
+    if lead.Magnitude < LEARN_MIN_LEAD or #entry.pending >= MAX_PENDING then return end
+    table.insert(entry.pending, {
+        dueAt = now + travelTime,
+        root = predictedRoot,
+        lead = lead,
+        learnable = not entry.airborne and not isSpamJumper(entry),
+    })
+end
+
+local autoSummary = 'idle'
+
+local function aimPartFor(char, entry)
+    local preferred = Aim.AimPart
+    if Aim.AutoPredict and Aim.JumpAware and preferred == "Head" and entry and isSpamJumper(entry) then
+        preferred = "HumanoidRootPart"
+    end
+    return char:FindFirstChild(preferred) or char:FindFirstChild("HumanoidRootPart") or char:FindFirstChild("Head")
+end
+
 local function candidateScreenDist(part, anchor, origin)
     if (part.Position - origin).Magnitude > Aim.MaxRange then return nil end
     local screenPos, onScreen = Camera:WorldToViewportPoint(part.Position)
@@ -385,33 +447,11 @@ local function candidateScreenDist(part, anchor, origin)
     return screenDist
 end
 
--- filterFn narrows the candidate pool before ranking - the gun passes
--- isMurderer, the knife passes nil (anyone alive and in view is fair game).
---
--- isVisible does a real raycast, and used to run once per candidate before
--- picking the nearest-to-crosshair one that passed - on an unrestricted
--- (knife) scan against a full lobby, that's a raycast per player in the
--- server, every single tick, for as long as you're holding a knife. Since
--- only the single best candidate ever actually matters, candidates are
--- sorted by screen distance first (cheap - no raycast) and the raycast
--- only runs, nearest-to-crosshair first, until one of them actually passes
--- it. The common case - the closest thing to your aim isn't hiding behind
--- a wall - costs exactly one raycast a tick instead of one per player.
---
--- isVisible's raycast originates at the CAMERA, though, which is not the
--- same point as the real muzzle/handle - especially in third person, where
--- the camera can be blocked by something (a railing, a doorframe, the
--- camera clipped into geometry) that the actual weapon origin, a couple of
--- studs away on your own character, is completely clear of. Treating that
--- camera-only obstruction as a hard "no valid target" used to make silent
--- aim go dead - no candidate at all - the moment your VIEW was blocked
--- even while you were plainly aimed at someone. Screen position (distance
--- to crosshair) still picks WHICH candidate is preferred, same as before;
--- if none of them clear the camera check, the nearest one is still
--- returned rather than nothing, because the check that actually decides
--- whether a shot goes out is clearFromOrigin's real, muzzle/handle-based
--- raycast right before it fires - not this one, which only exists to rank
--- candidates faster than raycasting all of them.
+local function isMurderer(plr)
+    local role, dead = roleOf(plr)
+    return role == "Murderer" and not dead
+end
+
 local function scanTarget(filterFn)
     local origin = Camera.CFrame.Position
     local anchor = screenAnchor()
@@ -420,7 +460,7 @@ local function scanTarget(filterFn)
     for _, plr in ipairs(Players:GetPlayers()) do
         if plr ~= LocalPlayer and isAlivePlr(plr) and (not filterFn or filterFn(plr)) then
             local char = plr.Character
-            local part = char and (char:FindFirstChild(Aim.AimPart) or char:FindFirstChild("HumanoidRootPart"))
+            local part = char and aimPartFor(char, motion[plr.Name])
             if part then
                 local screenDist = candidateScreenDist(part, anchor, origin)
                 if screenDist then
@@ -430,297 +470,21 @@ local function scanTarget(filterFn)
         end
     end
 
-    if #candidates == 0 then return nil, nil end
+    if #candidates == 0 then return nil, nil, nil end
 
     table.sort(candidates, function(a, b) return a.screenDist < b.screenDist end)
 
     for _, candidate in ipairs(candidates) do
-        if isVisible(candidate.char, origin) then
-            return candidate.plr, candidate.part
+        if clearPath(origin, candidate.part.Position, candidate.char) then
+            return candidate.plr, candidate.part, candidate.char
         end
     end
 
-    -- Nothing cleared the camera's own sightline - fall back to nearest-
-    -- to-crosshair anyway rather than returning nothing. clearFromOrigin
-    -- still gets the final say once the real origin is known.
     local nearest = candidates[1]
-    return nearest.plr, nearest.part
+    return nearest.plr, nearest.part, nearest.char
 end
 
-local function isMurderer(plr)
-    local data = RoundData[plr.Name]
-    return data ~= nil and data.Role == "Murderer" and data.Dead ~= true
-end
-
--- GetNetworkPing() is a round trip. Only half of that is the part that
--- matters for a hitscan lead - the time for YOUR shot to reach the server -
--- the other half is the server's reply coming back, which has no bearing
--- on where the target already was when the server received the shot.
--- Leading on the full round trip (what this used to do) overcorrects by
--- roughly 2x, which is exactly what "doesn't detect slight movements"
--- looks like from outside: a small, real motion gets doubled into an aim
--- point that sails past it instead of landing on it.
-local function getPing()
-    local ok, ping = pcall(function() return LocalPlayer:GetNetworkPing() end)
-    if ok and typeof(ping) == "number" and ping > 0 then return ping end
-    return 0.08
-end
-
--- part.AssemblyLinearVelocity is driven by physics replication for every
--- character but your own, which updates in coarse steps and can sit flat
--- at the wrong value between them - it is not a reliable source for
--- "slight movements". Measuring how far a part actually moved between two
--- of our own scan ticks sidesteps that: it reflects exactly what showed up
--- on screen, at the scan's own tick rate, with no dependency on how well
--- the target's physics happens to be replicating right now. Falls back to
--- AssemblyLinearVelocity only for a target's very first tick, when there
--- is no prior sample yet to measure from.
---
--- Every sample also feeds a short rolling history per player - the auto
--- prediction engine below smooths velocity out of it, derives acceleration
--- from it, and uses how consistent it is to decide whether a given
--- prediction is worth learning from.
-local lastSample = {} -- [player name] = { Position = Vector3, Time = number }
-local velocityHistory = {} -- [player name] = { {v=Vector3, t=number}, ... } newest last
-local VELOCITY_HISTORY = 6
-
-track(Players.PlayerRemoving:Connect(function(plr)
-    lastSample[plr.Name] = nil
-    velocityHistory[plr.Name] = nil
-end))
-
-local function trackedVelocity(plr, part)
-    local now = os.clock()
-    local prev = lastSample[plr.Name]
-    lastSample[plr.Name] = { Position = part.Position, Time = now }
-
-    local raw
-    if prev then
-        local dt = now - prev.Time
-        if dt > 0 and dt < 0.5 then
-            raw = (part.Position - prev.Position) / dt
-        end
-    end
-    if not raw then
-        local ok, velocity = pcall(function() return part.AssemblyLinearVelocity end)
-        raw = (ok and velocity) or Vector3.zero
-    end
-
-    local hist = velocityHistory[plr.Name]
-    if not hist then
-        hist = {}
-        velocityHistory[plr.Name] = hist
-    end
-    hist[#hist + 1] = { v = raw, t = now }
-    while #hist > VELOCITY_HISTORY do
-        table.remove(hist, 1)
-    end
-
-    return raw, hist
-end
-
--- How consistently the last few velocity samples point the same way: 1 =
--- moving dead straight, 0 = no correlation, -1 = reversing every sample.
--- Used purely as a gate on LEARNING below - a prediction made while the
--- target was mid-juke tells you nothing useful about whether your lead
--- maths is calibrated, so those get measured but not learned from.
-local function steadiness(hist)
-    if #hist < 2 then return 0 end
-    local total, count = 0, 0
-    for i = 2, #hist do
-        local a, b = hist[i - 1].v, hist[i].v
-        if a.Magnitude > 0.05 and b.Magnitude > 0.05 then
-            total = total + a.Unit:Dot(b.Unit)
-            count = count + 1
-        end
-    end
-    if count == 0 then return 0 end
-    return total / count
-end
-
--- Weighted toward the most recent samples rather than a flat average, so a
--- genuine direction change shows up faster while single-frame noise still
--- gets smoothed out. alpha closer to 1 trusts the newest sample more.
-local function exponentialVelocity(hist, alpha)
-    if #hist == 0 then return Vector3.zero end
-    local result = hist[1].v
-    for i = 2, #hist do
-        result = result:Lerp(hist[i].v, alpha)
-    end
-    return result
-end
-
-local function accelerationOf(hist)
-    if #hist < 2 then return Vector3.zero end
-    local newer, older = hist[#hist], hist[#hist - 1]
-    local dt = newer.t - older.t
-    if dt <= 0 then return Vector3.zero end
-    return (newer.v - older.v) / dt
-end
-
--- Where the target will actually be once the shot lands, not where they
--- were when the scan ran a moment earlier. Capped so one stray velocity
--- reading - a teleport, a knockback, a fresh respawn - can't fling the aim
--- point somewhere the target was never actually headed.
-local MAX_LEAD_OFFSET = 15 -- studs
-
-local function leadPosition(part, velocity, acceleration, travelTime)
-    if not travelTime or travelTime <= 0 then
-        return part.Position
-    end
-    local offset = velocity * travelTime + acceleration * (0.5 * travelTime * travelTime)
-    if offset.Magnitude > MAX_LEAD_OFFSET then
-        offset = offset.Unit * MAX_LEAD_OFFSET
-    end
-    return part.Position + offset
-end
-
---// Auto prediction -------------------------------------------------------------
--- Everything before this was open-loop: pick a velocity, multiply by a
--- travel time, fire, and never once check whether that actually landed
--- where it said it would. Every parameter feeding it - the ping estimate,
--- the knife's speed, how far behind the replicated position really is,
--- however long the server sits on a shot before resolving it - is a guess,
--- and an open-loop predictor has no way to ever find out any of them are
--- wrong.
---
--- Auto prediction closes the loop. Every tick it makes a prediction and
--- writes it down with the time it's supposed to come true. When that time
--- arrives it looks at where the target ACTUALLY is, measures the error
--- along the direction it led in, and nudges a per-target gain - a straight
--- multiplier on the lead - toward whatever would have been right. Led too
--- far, gain comes down; not far enough, gain goes up.
---
--- The point is that it doesn't matter WHICH of those guesses is wrong, or
--- by how much. They all show up as the same measurable symptom (the lead
--- was too long or too short) and they all get corrected by the same
--- feedback, from real observed outcomes, without anyone tuning anything.
--- It runs at the scan rate whether or not you ever fire a shot, so it is
--- calibrated by the time you do.
---
--- Two guards keep it honest: it only learns from predictions made while
--- the target was moving consistently (steadiness above), because a juke
--- mid-flight is the target's fault and not a calibration error, and the
--- gain is clamped, so a bad streak can bend the lead but never invert or
--- run away with it.
---
--- The "auto prediction amount" dropdown sets how aggressive that feedback
--- loop is allowed to be:
---   Lesser   - learns slowly, corrects at most +/-15%. Velocity only.
---   Normal   - moderate rate, +/-30%.
---   Extra    - faster, down to 0.45x or up to 1.55x, and models
---              acceleration as well as velocity.
---   Advanced - faster still, 0.30x to 1.80x, acceleration, less smoothing
---              so it tracks sharp changes.
---   Best     - the most aggressive correction (a quarter up to double),
---              and the knife additionally re-derives its travel time
---              against its own predicted point, since leading changes the
---              distance the knife has to cross.
--- Monotonic on purpose: every level up learns faster and is allowed to
--- correct further than the one below it, and none of them can collapse the
--- lead to nothing or run it away past double.
-local AUTO_LEVELS = {
-    Lesser   = { rate = 0.02, gainMin = 0.85, gainMax = 1.15, accel = false, smooth = 0.35, passes = 1 },
-    Normal   = { rate = 0.05, gainMin = 0.70, gainMax = 1.30, accel = false, smooth = 0.50, passes = 1 },
-    Extra    = { rate = 0.08, gainMin = 0.45, gainMax = 1.55, accel = true,  smooth = 0.60, passes = 1 },
-    Advanced = { rate = 0.12, gainMin = 0.30, gainMax = 1.80, accel = true,  smooth = 0.70, passes = 1 },
-    Best     = { rate = 0.18, gainMin = 0.25, gainMax = 2.00, accel = true,  smooth = 0.80, passes = 2 },
-}
-
-local LEARN_STEADINESS_MIN = 0.6   -- below this the target was turning; measure, don't learn
-local LEARN_MIN_LEAD = 0.75        -- studs - too short a lead and the error is all noise
-local MAX_PENDING = 24
-
-local autoState = {} -- [player name] = { gain, pending = {}, verified, lastError }
-
--- A player who left takes their learned gain with them; the next person to
--- hold that name starts from scratch rather than inheriting it.
-track(Players.PlayerRemoving:Connect(function(plr)
-    autoState[plr.Name] = nil
-end))
-
-local function autoStateFor(name)
-    local state = autoState[name]
-    if not state then
-        state = { gain = 1, pending = {}, verified = 0, lastError = 0 }
-        autoState[name] = state
-    end
-    return state
-end
-
--- Retire every prediction whose due time has arrived, scoring each against
--- where the target actually ended up.
-local function verifyPending(state, part, settings, now)
-    local pending = state.pending
-    local index = 1
-    while index <= #pending do
-        local entry = pending[index]
-        if now < entry.dueAt then
-            index = index + 1
-        else
-            local leadLength = entry.lead.Magnitude
-            if leadLength >= LEARN_MIN_LEAD then
-                -- Positive = the target travelled further along our lead
-                -- direction than we predicted (we under-led). Negative =
-                -- they fell short of it (we over-led).
-                local signedError = (part.Position - entry.aimPos):Dot(entry.lead.Unit)
-                state.lastError = signedError
-                if entry.learnable then
-                    local relative = math.clamp(signedError / leadLength, -1, 1)
-                    state.gain = math.clamp(
-                        state.gain * (1 + relative * settings.rate),
-                        settings.gainMin, settings.gainMax)
-                    state.verified = state.verified + 1
-                end
-            end
-            table.remove(pending, index)
-        end
-    end
-end
-
-local function autoPredictAim(plr, part, hist, velocity, acceleration, travelTime, settings, now)
-    local state = autoStateFor(plr.Name)
-    verifyPending(state, part, settings, now)
-
-    local lead = (velocity * travelTime + acceleration * (0.5 * travelTime * travelTime)) * state.gain
-    if lead.Magnitude > MAX_LEAD_OFFSET then
-        lead = lead.Unit * MAX_LEAD_OFFSET
-    end
-
-    local aimPos = part.Position + lead
-
-    if lead.Magnitude >= LEARN_MIN_LEAD and #state.pending < MAX_PENDING then
-        state.pending[#state.pending + 1] = {
-            dueAt = now + travelTime,
-            aimPos = aimPos,
-            lead = lead,
-            learnable = steadiness(hist) >= LEARN_STEADINESS_MIN,
-        }
-    end
-
-    return aimPos, state
-end
-
--- The knife's travel time depends on how far it has to fly, and leading
--- moves the point it's flying at, which changes that distance - so for a
--- target moving toward or away from you, one pass under-corrects. Solving
--- it against the predicted point converges within a pass or two at these
--- speeds and ranges. passes = 1 just returns the straight-line answer.
-local function knifeTravelTime(origin, part, velocity, pingComponent, passes)
-    local travelTime = pingComponent + (part.Position - origin).Magnitude / math.max(Aim.KnifeSpeed, 1)
-    for _ = 2, (passes or 1) do
-        local predicted = part.Position + velocity * travelTime
-        travelTime = pingComponent + (predicted - origin).Magnitude / math.max(Aim.KnifeSpeed, 1)
-    end
-    return travelTime
-end
-
--- Self-calibrating knife speed - see the header note on ThrowingKnifeVisuals.
--- Listens for the exact same CollectionService tag that script watches and
--- reads ThrowSpeed straight off the flying knife itself, from anyone's
--- throw, not just yours. ">1" guards against a momentarily-unset attribute
--- reading back as 0 or a bool default rather than a real speed.
-local knifeSpeedSlider = nil -- assigned once the settings UI below builds it
+local knifeSpeedSlider = nil
 
 local function onThrowingKnifeAdded(instance)
     local ok, speed = pcall(function() return instance:GetAttribute("ThrowSpeed") end)
@@ -733,35 +497,10 @@ local function onThrowingKnifeAdded(instance)
 end
 
 track(CollectionService:GetInstanceAddedSignal("ThrowingKnife"):Connect(onThrowingKnifeAdded))
--- Catch one that's already flying when this script loads - the signal
--- above only fires for instances tagged AFTER the connection is made.
 for _, instance in ipairs(CollectionService:GetTagged("ThrowingKnife")) do
     task.spawn(onThrowingKnifeAdded, instance)
 end
 
--- Wrapping the hook in newcclosure and cutting it down to one raycast
--- (both tried in an earlier pass at this) were not enough - the error kept
--- happening. The actual problem is more fundamental than "too many
--- reentrant calls": on this executor, ANY namecall made from inside the
--- hook, between it receiving the FireServer call and it finally calling
--- originalNamecall, can corrupt which method/self that originalNamecall
--- call actually resolves to - which is exactly what "Raycast is not a
--- valid member of RemoteEvent" is: the *final* originalNamecall(self, ...)
--- call, meant to dispatch FireServer on the Shoot/KnifeThrown remote,
--- instead replayed the METHOD of the last thing that happened to run
--- in between (a Raycast) against the ORIGINAL self (the remote).
---
--- So nothing that triggers a namecall can run inside the hook at all
--- anymore, not even the one hit-check raycast, not even GetNetworkPing.
--- Every part of the decision - the target scan, the lead calculation, AND
--- the real-origin wall-check raycast - now happens entirely in this
--- background loop, using the gun/knife's actual origin attachment read
--- fresh each tick (the same GunRaycastAttachment / Knife Handle the game's
--- own client code reads from). That origin is up to 1/30s old rather than
--- the exact instant of the click, an imperceptible difference for a
--- torso-mounted attachment, and it means the hook itself only ever reads
--- already-decided values and makes the one namecall it can't avoid making:
--- the actual FireServer redirect, once, at the very end.
 local cachedGunRedirect = nil
 local cachedKnifeRedirect = nil
 local cachedPing = 0.08
@@ -780,130 +519,90 @@ local function findKnifeOrigin()
     return handle and handle.Position
 end
 
--- Live readout of what auto prediction has actually learned, surfaced in
--- the UI so the loop isn't a black box - "1.14x over 62" means it settled
--- on leading 14% further than the raw maths said, across 62 scored
--- predictions.
-local autoSummary = 'idle'
+local function solveAim(plr, part, char, origin, isKnife, now)
+    local root = char and char:FindFirstChild("HumanoidRootPart")
+    if not root then return part.Position end
 
--- Computes where a candidate should actually be aimed at, per the current
--- Predict/AutoPredict settings. `sampled` memoizes trackedVelocity per
--- player for this tick only - the gun (murderer-only) and knife (anyone)
--- scans can land on the same player, and sampling them twice in the same
--- instant would measure ~0 elapsed time on the second call instead of a
--- real velocity, corrupting the reading.
---
--- travelTimeFn(isAuto, velocity) hands back the flight/latency time for
--- this weapon; the knife's depends on the velocity being used, which is
--- why it's a callback rather than a number.
-local function computeAimPoint(plr, part, sampled, travelTimeFn)
-    if not Aim.Predict then return part.Position end
+    local entry = sampleMotion(plr, root, now)
+    local settings = AUTO_LEVELS[Aim.AutoLevel] or AUTO_LEVELS.Normal
+    local offset = part.Position - root.Position
 
-    local s = sampled[plr.Name]
-    if not s then
-        local raw, hist = trackedVelocity(plr, part)
-        s = { raw = raw, hist = hist }
-        sampled[plr.Name] = s
+    if Aim.AutoPredict then
+        verifyPredictions(entry, settings, now)
+    end
+
+    if not Aim.Predict then
+        return part.Position
     end
 
     if not Aim.AutoPredict then
-        return leadPosition(part, s.raw, Vector3.zero, travelTimeFn(false, s.raw))
+        local travelTime = isKnife and Aim.ManualLeadTimeKnife or Aim.ManualLeadTimeGun
+        return predictRoot(entry, travelTime, 1) + offset
     end
 
-    local settings = AUTO_LEVELS[Aim.AutoLevel] or AUTO_LEVELS.Normal
-    local velocity = exponentialVelocity(s.hist, settings.smooth)
-    local acceleration = settings.accel and accelerationOf(s.hist) or Vector3.zero
-    local travelTime = travelTimeFn(true, velocity, settings)
+    local pingComponent = Aim.UsePing and (cachedPing / 2) or 0
+    local travelTime
+    local predicted
 
-    local aimPos, state = autoPredictAim(plr, part, s.hist, velocity, acceleration, travelTime, settings, os.clock())
-    autoSummary = ('%.2fx over %d'):format(state.gain, state.verified)
-    return aimPos
+    if isKnife then
+        local speed = math.max(Aim.KnifeSpeed, 1)
+        travelTime = pingComponent + (part.Position - origin).Magnitude / speed
+        predicted = predictRoot(entry, travelTime, entry.gain)
+        for _ = 2, settings.passes do
+            travelTime = pingComponent + ((predicted + offset) - origin).Magnitude / speed
+            predicted = predictRoot(entry, travelTime, entry.gain)
+        end
+    else
+        travelTime = pingComponent
+        predicted = predictRoot(entry, travelTime, entry.gain)
+    end
+
+    logPrediction(entry, predicted, travelTime, now)
+    autoSummary = ('%.2fx over %d'):format(entry.gain, entry.verified)
+    return predicted + offset
 end
 
--- 60Hz rather than 30: this loop no longer runs inside the hook (nothing
--- about reentrancy limits it anymore), and a tighter tick means a smaller
--- worst-case gap between "the target moved" and "the cached redirect
--- reflects it" - the other half of what made slight movements hard to
--- track, on top of the velocity source and the ping fix above.
---
--- The whole tick body runs inside a pcall: a background loop with no
--- protection dies silently and permanently the moment anything in it
--- throws once (a nil Camera mid-respawn, a destroyed part, whatever) -
--- task.spawn just lets the error end that coroutine, and there is nothing
--- left to restart it. One bad tick should cost one tick, not silent aim
--- for the rest of the session.
-spawnLoop(function()
-    while not Unloading do
-        task.wait(1 / 60)
-
-        local ok = pcall(function()
-            if not Aim.SilentAim then
-                cachedGunRedirect, cachedKnifeRedirect = nil, nil
-                return
-            end
-
-            -- findGunOrigin/findKnifeOrigin are a couple of FindFirstChild
-            -- calls - cheap. scanTarget is not: unrestricted, it raycasts
-            -- and projects every alive player in the server, every tick.
-            -- The previous version ran BOTH scans unconditionally, every
-            -- single tick, at 60/sec, regardless of whether the local
-            -- player was even holding the corresponding weapon - which for
-            -- most of a round is neither (only the murderer holds a knife,
-            -- only the sheriff a gun). That's a large, constant, entirely
-            -- wasted background cost, and it's exactly what a throw's own
-            -- extra frame work (the knife visual spawning, its trail,
-            -- everything ThrowingKnifeVisuals does) would tip over into a
-            -- visible stutter. Checking the origin first and skipping the
-            -- scan whenever it's nil - not holding that weapon - cuts this
-            -- down to only the two players in the server who can ever
-            -- benefit from it.
-            cachedPing = getPing()
-            local sampled = {}
-
-            local gOrigin = findGunOrigin()
-            if not gOrigin then
-                cachedGunRedirect = nil
-            else
-                local gPlr, gPart = scanTarget(isMurderer)
-                if gPlr and gPart then
-                    -- Hitscan: the server resolves it the moment the call
-                    -- lands, so lead time is just the one-way trip there.
-                    local aimPos = computeAimPoint(gPlr, gPart, sampled, function(auto)
-                        if not auto then return Aim.ManualLeadTimeGun end
-                        return Aim.UsePing and (cachedPing / 2) or 0
-                    end)
-                    cachedGunRedirect = clearFromOrigin(gOrigin, aimPos, gPlr.Character) and CFrame.new(aimPos) or nil
-                else
-                    cachedGunRedirect = nil
-                end
-            end
-
-            local kOrigin = findKnifeOrigin()
-            if not kOrigin then
-                cachedKnifeRedirect = nil
-            else
-                local kPlr, kPart = scanTarget(nil)
-                if kPlr and kPart then
-                    -- Real projectile: the one-way trip plus however long
-                    -- the knife itself is in the air, solved against the
-                    -- predicted point at Best (settings.passes).
-                    local aimPos = computeAimPoint(kPlr, kPart, sampled, function(auto, velocity, settings)
-                        if not auto then return Aim.ManualLeadTimeKnife end
-                        local pingComponent = Aim.UsePing and (cachedPing / 2) or 0
-                        return knifeTravelTime(kOrigin, kPart, velocity, pingComponent, settings.passes)
-                    end)
-                    cachedKnifeRedirect = clearFromOrigin(kOrigin, aimPos, kPlr.Character) and CFrame.new(aimPos) or nil
-                else
-                    cachedKnifeRedirect = nil
-                end
-            end
-        end)
-
-        if not ok then
-            cachedGunRedirect, cachedKnifeRedirect = nil, nil
-        end
+track(PreSimulation:Connect(function()
+    if Unloading or not Aim.SilentAim then
+        cachedGunRedirect, cachedKnifeRedirect = nil, nil
+        return
     end
-end)
+
+    local ok = pcall(function()
+        local now = os.clock()
+        cachedPing = getPing()
+
+        local gunOrigin = findGunOrigin()
+        if not gunOrigin then
+            cachedGunRedirect = nil
+        else
+            local plr, part, char = scanTarget(isMurderer)
+            if plr and part then
+                local aim = solveAim(plr, part, char, gunOrigin, false, now)
+                cachedGunRedirect = clearPath(gunOrigin, aim, char) and CFrame.new(aim) or nil
+            else
+                cachedGunRedirect = nil
+            end
+        end
+
+        local knifeOrigin = findKnifeOrigin()
+        if not knifeOrigin then
+            cachedKnifeRedirect = nil
+        else
+            local plr, part, char = scanTarget(nil)
+            if plr and part then
+                local aim = solveAim(plr, part, char, knifeOrigin, true, now)
+                cachedKnifeRedirect = clearPath(knifeOrigin, aim, char) and CFrame.new(aim) or nil
+            else
+                cachedKnifeRedirect = nil
+            end
+        end
+    end)
+
+    if not ok then
+        cachedGunRedirect, cachedKnifeRedirect = nil, nil
+    end
+end))
 
 local hasNamecallHook = typeof(hookmetamethod) == "function" and typeof(getnamecallmethod) == "function"
 
@@ -915,11 +614,6 @@ if hasNamecallHook then
             return originalNamecall(self, ...)
         end
 
-        -- Matched by shape, not a cached instance reference, so both
-        -- branches keep working across every respawn and every new tool
-        -- instance without needing to re-find anything. Everything from
-        -- here down is property/vararg reads and table lookups - no
-        -- namecall of any kind - right up to the single redirect call.
         if self.Name == "Shoot" and self.ClassName == "RemoteEvent" and cachedGunRedirect then
             local parent = self.Parent
             if parent and parent.ClassName == "Tool" and parent.Name == "Gun" then
@@ -929,12 +623,12 @@ if hasNamecallHook then
                 end
             end
         elseif self.Name == "KnifeThrown" and cachedKnifeRedirect then
-            local eventsFolder = self.Parent
-            local tool = eventsFolder and eventsFolder.Parent
-            if eventsFolder and eventsFolder.Name == "Events" and tool and tool.ClassName == "Tool" and tool.Name == "Knife" then
-                local handleCFrame = ...
-                if typeof(handleCFrame) == "CFrame" then
-                    return originalNamecall(self, handleCFrame, cachedKnifeRedirect)
+            local events = self.Parent
+            local tool = events and events.Parent
+            if events and events.Name == "Events" and tool and tool.ClassName == "Tool" and tool.Name == "Knife" then
+                local handle = ...
+                if typeof(handle) == "CFrame" then
+                    return originalNamecall(self, handle, cachedKnifeRedirect)
                 end
             end
         end
@@ -961,13 +655,13 @@ AimSection:Stat({
 
 AimSection:Toggle({
     Title = 'silent aim',
-    Desc = 'gun: redirects only to the murderer. knife: redirects to the nearest valid target. either way your click, animation and the real origin stay exactly as fired - only the aim point changes, and only when the shot is actually clear from where it truly leaves',
+    Desc = 'gun redirects only to the murderer, knife to the nearest valid target. your click, animation and the real origin stay as fired',
     Flag = 'mm2_silent_aim',
     Callback = function(state)
         if state and not hasNamecallHook then
             Centrl:Notify({
                 Title = 'mm2',
-                Content = 'hookmetamethod/getnamecallmethod not available on this executor - silent aim cannot hook Shoot/KnifeThrown:FireServer.',
+                Content = 'hookmetamethod/getnamecallmethod not available on this executor.',
                 Type = 'error',
                 Duration = 6,
             })
@@ -986,7 +680,7 @@ AimSection:Dropdown({
 
 AimSection:Toggle({
     Title = 'wall check',
-    Desc = 'prefers a target with a clear camera sightline when ranking candidates, then requires one from the real muzzle/handle position right before the shot is redirected - a blocked camera view alone never blocks targeting, only the real check does',
+    Desc = 'prefers a clear camera sightline when ranking, requires one from the real muzzle before redirecting',
     Flag = 'mm2_silent_aim_wallcheck',
     Default = true,
     Callback = function(state) Aim.WallCheck = state end,
@@ -1003,17 +697,9 @@ AimSection:Slider({
     Callback = function(value) Aim.MaxRange = value end,
 })
 
-AimSection:Toggle({
-    Title = 'predict movement',
-    Desc = "leads the target's velocity, measured from how they actually moved on your last few scans rather than trusted off their replicated physics - half of ping for the gun's one-way trip, that plus flight time for the thrown knife",
-    Flag = 'mm2_silent_aim_predict',
-    Default = true,
-    Callback = function(state) Aim.Predict = state end,
-})
-
 knifeSpeedSlider = AimSection:Slider({
     Title = 'knife speed',
-    Desc = "starts at the real default (96 studs/s, read straight off ThrowingKnifeVisuals) and self-corrects the moment any knife - yours or anyone's - is actually seen flying. Only matters as a manual override before that happens",
+    Desc = 'starts at the real default and self-corrects the moment any knife is seen flying',
     Min = 40,
     Max = 300,
     Increment = 5,
@@ -1027,7 +713,6 @@ local FovSection = SilentAimTab:Section({ Title = 'fov', Side = 'right' })
 
 FovSection:Toggle({
     Title = 'fov limit',
-    Desc = 'only considers targets within the radius below',
     Flag = 'mm2_silent_aim_fov',
     Default = true,
     Callback = function(state) Aim.FOVEnabled = state end,
@@ -1045,7 +730,6 @@ FovSection:Slider({
 
 FovSection:Toggle({
     Title = 'follow mouse',
-    Desc = 'centers the fov on the mouse instead of the middle of the screen',
     Flag = 'mm2_silent_aim_follow_mouse',
     Default = true,
     Callback = function(state) Aim.FOVFollowMouse = state end,
@@ -1054,8 +738,24 @@ FovSection:Toggle({
 local PredictionSection = SilentAimTab:Section({ Title = 'prediction', Side = 'right' })
 
 PredictionSection:Toggle({
+    Title = 'predict movement',
+    Desc = 'master switch. off aims exactly where the target is right now',
+    Flag = 'mm2_silent_aim_predict',
+    Default = true,
+    Callback = function(state) Aim.Predict = state end,
+})
+
+PredictionSection:Toggle({
+    Title = 'jump aware',
+    Desc = 'solves a jumping target as a real arc under gravity instead of extrapolating their vertical speed in a straight line, and drops head aim to torso against repeat jumpers',
+    Flag = 'mm2_silent_aim_jump',
+    Default = true,
+    Callback = function(state) Aim.JumpAware = state end,
+})
+
+PredictionSection:Toggle({
     Title = 'use ping',
-    Desc = 'adds the one-way-latency estimate to lead time. off = lead purely on measured motion, nothing added for how long the shot takes to reach the server. auto prediction corrects around whichever you pick either way',
+    Desc = 'adds the one-way latency estimate to lead time',
     Flag = 'mm2_silent_aim_use_ping',
     Default = true,
     Callback = function(state) Aim.UsePing = state end,
@@ -1063,7 +763,7 @@ PredictionSection:Toggle({
 
 PredictionSection:Toggle({
     Title = 'auto prediction',
-    Desc = 'scores its own predictions against where the target actually ended up and corrects the lead from those results, live, per target - so a wrong ping estimate, a wrong knife speed or replication lag all get absorbed without tuning anything. off: a flat manual lead time per weapon instead, see the sliders below',
+    Desc = 'scores its own predictions against where the target actually ended up and corrects the horizontal lead from the result, live, per target',
     Flag = 'mm2_silent_aim_auto_predict',
     Default = true,
     Callback = function(state) Aim.AutoPredict = state end,
@@ -1071,7 +771,7 @@ PredictionSection:Toggle({
 
 PredictionSection:Dropdown({
     Title = 'auto prediction amount',
-    Desc = 'how hard the feedback loop is allowed to correct. lesser: learns slowly, +/-15%. normal: +/-30%. extra: 0.45x-1.55x and models acceleration. advanced: 0.30x-1.80x, tracks sharp changes. best: a quarter up to double, and the knife solves its travel time against its own predicted point',
+    Desc = 'how hard the feedback loop corrects, how heavily velocity is smoothed, and how many passes the knife takes solving its travel time',
     Values = { 'Lesser', 'Normal', 'Extra', 'Advanced', 'Best' },
     Default = 'Normal',
     Flag = 'mm2_silent_aim_auto_level',
@@ -1082,7 +782,7 @@ local AutoStat = PredictionSection:Stat({ Title = 'learned lead', Value = 'idle'
 
 PredictionSection:Slider({
     Title = 'manual gun lead time',
-    Desc = 'only used while auto prediction is off - a flat lead time for the hitscan gun instead of the ping-based one-way estimate',
+    Desc = 'used while auto prediction is off',
     Min = 0,
     Max = 0.5,
     Increment = 0.01,
@@ -1094,7 +794,7 @@ PredictionSection:Slider({
 
 PredictionSection:Slider({
     Title = 'manual knife lead time',
-    Desc = 'only used while auto prediction is off - a flat lead time for the thrown knife instead of ping + distance/speed',
+    Desc = 'used while auto prediction is off',
     Min = 0,
     Max = 1,
     Increment = 0.01,
@@ -1104,98 +804,54 @@ PredictionSection:Slider({
     Callback = function(value) Aim.ManualLeadTimeKnife = value end,
 })
 
-spawnLoop(function()
-    while not Unloading do
-        task.wait(0.4)
-        pcall(function()
-            AutoStat:Set(Aim.SilentAim and Aim.Predict and Aim.AutoPredict and autoSummary or 'off')
-        end)
-    end
-end)
-
---// Tab 3: visual ------------------------------------------------------------------
 local Visual = {
-    Enabled = false,
+    Esp = false,
     ColorByRole = false,
-    RoleESP = false,
-    ShowMurdererPerk = false,
+    RoleEsp = false,
+    ShowPerk = false,
+    ShowDistance = false,
 }
 
--- Straight out of ReplicatedStorage.GUI.MainPC.Game/RoleSelector's own role
--- color table, so the ESP matches the colors the game itself uses for these
--- roles rather than inventing a new palette.
 local ROLE_COLORS = {
     Innocent = Color3.fromRGB(0, 255, 0),
     Sheriff = Color3.fromRGB(0, 0, 255),
     Murderer = Color3.fromRGB(255, 0, 0),
-    Hero = Color3.fromRGB(0, 0, 255),
+    Hero = Color3.fromRGB(255, 196, 60),
     Zombie = Color3.fromRGB(25, 172, 0),
     Survivor = Color3.fromRGB(43, 154, 238),
     Freezer = Color3.fromRGB(150, 220, 250),
     Runner = Color3.fromRGB(0, 200, 100),
 }
-local DEFAULT_ESP_COLOR = Color3.fromRGB(255, 255, 255)
+local NEUTRAL_COLOR = Color3.fromRGB(255, 255, 255)
 
-local function espColorFor(plr)
-    if Visual.ColorByRole then
-        local entry = RoundData[plr.Name]
-        -- entry.Dead was missing from this check, so once ColorByRole had
-        -- colored someone in, they stayed that color forever: RoundData
-        -- keeps a dead player's Role around (the round-end scoreboard reads
-        -- it straight off the same table), so "role -> color" alone never
-        -- stopped matching just because they died mid-round.
-        if entry and entry.Role and entry.Dead ~= true then
-            local color = ROLE_COLORS[entry.Role]
-            if color then return color end
-        end
-    end
-    return DEFAULT_ESP_COLOR
-end
-
---// Player ESP (Highlight) ---------------------------------------------------------
 local espObjects = {}
 
 local function destroyEsp(plr)
     local obj = espObjects[plr]
     if not obj then return end
     if obj.Highlight then obj.Highlight:Destroy() end
+    if obj.Billboard then obj.Billboard:Destroy() end
     espObjects[plr] = nil
 end
 
 local function buildEsp(plr, char)
     destroyEsp(plr)
-    local color = espColorFor(plr)
-    local hl = Instance.new("Highlight")
-    hl.FillColor = color
-    hl.OutlineColor = color
-    hl.FillTransparency = 0.5
-    hl.OutlineTransparency = 0
-    hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
-    hl.Parent = char
-    espObjects[plr] = { Char = char, Highlight = hl }
-end
 
---// Role ESP (name-above-head billboard) --------------------------------------------
-local roleObjects = {}
+    local highlight = Instance.new("Highlight")
+    highlight.FillTransparency = 0.5
+    highlight.OutlineTransparency = 0
+    highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+    highlight.Enabled = false
+    highlight.Parent = char
 
-local function destroyRoleLabel(plr)
-    local obj = roleObjects[plr]
-    if not obj then return end
-    if obj.Billboard then obj.Billboard:Destroy() end
-    roleObjects[plr] = nil
-end
-
-local function buildRoleLabel(plr, char)
-    destroyRoleLabel(plr)
-    local head = char:FindFirstChild("Head")
-    if not head then return nil end
-
+    local head = char:FindFirstChild("Head") or char:FindFirstChild("HumanoidRootPart")
     local billboard = Instance.new("BillboardGui")
-    billboard.Name = "MM2RoleESP"
+    billboard.Name = "MM2Esp"
     billboard.Adornee = head
-    billboard.Size = UDim2.fromOffset(200, 36)
-    billboard.StudsOffset = Vector3.new(0, 2.2, 0)
+    billboard.Size = UDim2.fromOffset(220, 38)
+    billboard.StudsOffset = Vector3.new(0, 2.4, 0)
     billboard.AlwaysOnTop = true
+    billboard.Enabled = false
 
     local label = Instance.new("TextLabel")
     label.BackgroundTransparency = 1
@@ -1207,121 +863,103 @@ local function buildRoleLabel(plr, char)
     label.Parent = billboard
 
     billboard.Parent = char
-    roleObjects[plr] = { Char = char, Billboard = billboard, Label = label }
-    return roleObjects[plr]
+
+    espObjects[plr] = {
+        Char = char,
+        Highlight = highlight,
+        Billboard = billboard,
+        Label = label,
+    }
+    return espObjects[plr]
 end
 
--- Wrapped in pcall for the same reason the silent-aim loop is: an
--- unprotected background loop dies silently and permanently the first
--- time anything in it throws, and there's nothing left afterward to
--- restart it.
-spawnLoop(function()
-    while not Unloading do
-        task.wait(0.4)
+local function distanceTo(part)
+    local char = LocalPlayer.Character
+    local root = char and char:FindFirstChild("HumanoidRootPart")
+    if not root or not part then return nil end
+    return (root.Position - part.Position).Magnitude
+end
 
-        local ok = pcall(function()
-            if Visual.Enabled then
-                for _, plr in ipairs(Players:GetPlayers()) do
-                    if plr ~= LocalPlayer then
-                        local char = plr.Character
-                        local obj = espObjects[plr]
-                        if not char then
-                            if obj then destroyEsp(plr) end
-                        elseif not obj or obj.Char ~= char then
-                            buildEsp(plr, char)
-                        else
-                            local color = espColorFor(plr)
-                            obj.Highlight.FillColor = color
-                            obj.Highlight.OutlineColor = color
-                        end
-                    end
-                end
+local function updateEsp()
+    if not Visual.Esp and not Visual.RoleEsp then
+        for plr in pairs(espObjects) do destroyEsp(plr) end
+        return
+    end
+
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr ~= LocalPlayer then
+            local char = plr.Character
+            local obj = espObjects[plr]
+
+            if not char or not isAlivePlr(plr) then
+                if obj then destroyEsp(plr) end
             else
-                for plr in pairs(espObjects) do destroyEsp(plr) end
-            end
+                if not obj or obj.Char ~= char or not obj.Highlight.Parent then
+                    obj = buildEsp(plr, char)
+                end
 
-            -- Role ESP: only for a player who currently HAS a role (they're
-            -- in this round) and isn't dead, and never for the local
-            -- player - they already know their own role from the game's
-            -- own reveal screen.
-            if Visual.RoleESP then
-                for _, plr in ipairs(Players:GetPlayers()) do
-                    if plr == LocalPlayer then
-                        if roleObjects[plr] then destroyRoleLabel(plr) end
-                    else
-                        local char = plr.Character
-                        local entry = RoundData[plr.Name]
-                        local hasRole = entry ~= nil and entry.Role ~= nil and entry.Dead ~= true
+                if obj then
+                    local role, dead = roleOf(plr)
+                    local color = (role and ROLE_COLORS[role]) or NEUTRAL_COLOR
+                    local espColor = Visual.ColorByRole and not dead and color or NEUTRAL_COLOR
 
-                        if not char or not hasRole then
-                            if roleObjects[plr] then destroyRoleLabel(plr) end
-                        else
-                            local obj = roleObjects[plr]
-                            if not obj or obj.Char ~= char then
-                                obj = buildRoleLabel(plr, char)
-                            end
-                            if obj then
-                                local text = entry.Role
-                                -- The murderer's perk, and only on the
-                                -- murderer's own label - entry is this
-                                -- specific player's round data, so this can
-                                -- never leak onto anyone else's head.
-                                if Visual.ShowMurdererPerk and entry.Role == "Murderer" and entry.Perk then
-                                    text = text .. " (" .. tostring(entry.Perk) .. ")"
-                                end
-                                obj.Label.Text = text
-                                obj.Label.TextColor3 = ROLE_COLORS[entry.Role] or DEFAULT_ESP_COLOR
+                    obj.Highlight.Enabled = Visual.Esp
+                    obj.Highlight.FillColor = espColor
+                    obj.Highlight.OutlineColor = espColor
+
+                    local showRole = Visual.RoleEsp and role ~= nil and not dead
+                    obj.Billboard.Enabled = showRole
+                    if showRole then
+                        local text = role
+                        if Visual.ShowPerk and role == "Murderer" then
+                            local entry = RoundData[plr.Name]
+                            if entry and entry.Perk then
+                                text = text .. " (" .. tostring(entry.Perk) .. ")"
                             end
                         end
+                        if Visual.ShowDistance then
+                            local dist = distanceTo(char:FindFirstChild("HumanoidRootPart"))
+                            if dist then
+                                text = text .. (" [%d]"):format(math.floor(dist))
+                            end
+                        end
+                        obj.Label.Text = text
+                        obj.Label.TextColor3 = color
                     end
                 end
-            else
-                for plr in pairs(roleObjects) do destroyRoleLabel(plr) end
             end
-        end)
-
-        if not ok then
-            for plr in pairs(espObjects) do destroyEsp(plr) end
-            for plr in pairs(roleObjects) do destroyRoleLabel(plr) end
         end
+    end
+end
+
+task.spawn(function()
+    while not Unloading do
+        task.wait(0.15)
+        pcall(updateEsp)
     end
 end)
 
 track(Players.PlayerRemoving:Connect(function(plr)
     destroyEsp(plr)
-    destroyRoleLabel(plr)
+    motion[plr.Name] = nil
 end))
 
---// X-ray ----------------------------------------------------------------------
--- Every BasePart within range of the local player gets pinned to the
--- slider's transparency - EXCEPT one that was already at least partly
--- see-through before x-ray ever touched it (glass, effects, windows: left
--- exactly as they were, never tracked, never overwritten) - and every part
--- x-ray HAS touched is tracked with its real, original transparency so it
--- can go back to looking normal the instant it leaves range or x-ray turns
--- off. Player characters are excluded from the sweep entirely; this is a
--- see-through-walls tool, not a way to make people invisible, and doing
--- that would fight visually with the player ESP above.
 local Xray = {
     Enabled = false,
     Transparency = 0.5,
     Range = 100,
 }
 
-local xrayObjects = {} -- [part] = original transparency (always 0 - see above)
+local xrayObjects = {}
 
-local xrayOverlapParams = OverlapParams.new()
-xrayOverlapParams.FilterType = Enum.RaycastFilterType.Exclude
-
-local function xrayRestore(part, original)
-    if part and part.Parent then
-        pcall(function() part.Transparency = original end)
-    end
-end
+local xrayParams = OverlapParams.new()
+xrayParams.FilterType = Enum.RaycastFilterType.Exclude
 
 local function xrayRestoreAll()
     for part, original in pairs(xrayObjects) do
-        xrayRestore(part, original)
+        if part and part.Parent then
+            pcall(function() part.Transparency = original end)
+        end
     end
     table.clear(xrayObjects)
 end
@@ -1336,7 +974,7 @@ local function xrayFilterList()
     return list
 end
 
-spawnLoop(function()
+task.spawn(function()
     while not Unloading do
         task.wait(0.5)
 
@@ -1351,23 +989,19 @@ spawnLoop(function()
                     return
                 end
 
-                xrayOverlapParams.FilterDescendantsInstances = xrayFilterList()
-                local parts = Workspace:GetPartBoundsInRadius(root.Position, Xray.Range, xrayOverlapParams)
+                xrayParams.FilterDescendantsInstances = xrayFilterList()
+                local parts = Workspace:GetPartBoundsInRadius(root.Position, Xray.Range, xrayParams)
 
                 local seen = {}
                 for _, part in ipairs(parts) do
                     if part:IsA("BasePart") and part.Parent then
                         seen[part] = true
                         if xrayObjects[part] == nil then
-                            -- entering range for the first time - only take
-                            -- it over if it started fully opaque
                             if part.Transparency == 0 then
                                 xrayObjects[part] = 0
                                 part.Transparency = Xray.Transparency
                             end
                         elseif part.Transparency ~= Xray.Transparency then
-                            -- already tracked - keep it pinned to whatever
-                            -- the slider currently says
                             part.Transparency = Xray.Transparency
                         end
                     end
@@ -1375,7 +1009,9 @@ spawnLoop(function()
 
                 for part, original in pairs(xrayObjects) do
                     if not seen[part] then
-                        xrayRestore(part, original)
+                        if part and part.Parent then
+                            pcall(function() part.Transparency = original end)
+                        end
                         xrayObjects[part] = nil
                     end
                 end
@@ -1386,15 +1022,8 @@ spawnLoop(function()
     end
 end)
 
---// Trap ESP ---------------------------------------------------------------------
--- TrapScriptClient (see the dump) parents every placed trap's visual as a
--- part literally named "TrapVisual" - `p2.TrapVisual.CFrame`,
--- `.Transparency`, both read and written by the game's own trap-hit and
--- trap-placed handlers. Watching for anything with that exact name is
--- exactly what the game's own trap code keys off, not a guess at a naming
--- convention.
 local TrapEsp = { Enabled = false }
-local trapObjects = {} -- [TrapVisual part] = Highlight
+local trapObjects = {}
 
 local function isTrapVisual(inst)
     return typeof(inst) == "Instance" and inst.Name == "TrapVisual" and inst:IsA("BasePart")
@@ -1442,14 +1071,14 @@ local EspSection = VisualTab:Section({ Title = 'esp', Side = 'left' })
 
 EspSection:Toggle({
     Title = 'esp',
-    Desc = 'highlights every other player',
+    Desc = 'highlights every other living player',
     Flag = 'mm2_esp',
-    Callback = function(state) Visual.Enabled = state end,
+    Callback = function(state) Visual.Esp = state end,
 })
 
 EspSection:Toggle({
     Title = 'color by role',
-    Desc = "esp color follows each player's current role (innocent/sheriff/murderer, or infection/freeze tag) instead of a flat color",
+    Desc = 'colors the highlight by current role instead of a flat white',
     Flag = 'mm2_esp_role_color',
     Callback = function(state) Visual.ColorByRole = state end,
 })
@@ -1458,23 +1087,28 @@ local RoleEspSection = VisualTab:Section({ Title = 'role esp', Side = 'right' })
 
 RoleEspSection:Toggle({
     Title = 'role esp',
-    Desc = "shows each player's role above their head - only while they're alive and actually have a role this round, never on you",
+    Desc = 'shows role above the head while alive and in the round, never on you. a dropped gun being picked up reads as hero the moment it is equipped',
     Flag = 'mm2_role_esp',
-    Callback = function(state) Visual.RoleESP = state end,
+    Callback = function(state) Visual.RoleEsp = state end,
 })
 
 RoleEspSection:Toggle({
     Title = "show murderer's perk",
-    Desc = "appends the murderer's currently active perk to their label only - nobody else's",
     Flag = 'mm2_role_esp_perk',
-    Callback = function(state) Visual.ShowMurdererPerk = state end,
+    Callback = function(state) Visual.ShowPerk = state end,
+})
+
+RoleEspSection:Toggle({
+    Title = 'show distance',
+    Flag = 'mm2_role_esp_distance',
+    Callback = function(state) Visual.ShowDistance = state end,
 })
 
 local XraySection = VisualTab:Section({ Title = 'xray', Side = 'left' })
 
 XraySection:Toggle({
     Title = 'xray',
-    Desc = 'fades every opaque part within range so you can see through them - anything already partly see-through (glass, effects) is left alone entirely',
+    Desc = 'fades opaque parts in range, leaves anything already see-through alone',
     Flag = 'mm2_xray',
     Callback = function(state)
         Xray.Enabled = state
@@ -1484,7 +1118,6 @@ XraySection:Toggle({
 
 XraySection:Slider({
     Title = 'xray transparency',
-    Desc = 'what every affected part gets set to - 1 makes them fully invisible, lower keeps a faint outline of the geometry',
     Min = 0,
     Max = 1,
     Increment = 0.05,
@@ -1502,7 +1135,6 @@ XraySection:Slider({
 
 XraySection:Slider({
     Title = 'xray range',
-    Desc = 'radius around you that gets swept for opaque parts',
     Min = 20,
     Max = 300,
     Increment = 10,
@@ -1516,7 +1148,7 @@ local TrapSection = VisualTab:Section({ Title = 'traps', Side = 'right' })
 
 TrapSection:Toggle({
     Title = 'trap esp',
-    Desc = 'highlights every placed trap (TrapVisual, the same part name the game\'s own trap scripts read and write) so you can see and avoid them',
+    Desc = 'highlights every placed trap',
     Flag = 'mm2_trap_esp',
     Callback = function(state)
         TrapEsp.Enabled = state
@@ -1536,7 +1168,6 @@ SessionSection:Button({
         end
 
         for plr in pairs(espObjects) do destroyEsp(plr) end
-        for plr in pairs(roleObjects) do destroyRoleLabel(plr) end
         for part in pairs(trapObjects) do destroyTrapEsp(part) end
         xrayRestoreAll()
 
@@ -1548,5 +1179,14 @@ SessionSection:Paragraph({
     Title = 'unload',
     Text = 'Disconnects every hook and loop, restores every part xray touched, clears all esp, then closes the menu. The Shoot/KnifeThrown namecall hook cannot be reversed without rejoining.',
 })
+
+task.spawn(function()
+    while not Unloading do
+        task.wait(0.4)
+        pcall(function()
+            AutoStat:Set(Aim.SilentAim and Aim.Predict and Aim.AutoPredict and autoSummary or 'off')
+        end)
+    end
+end)
 
 Window:Load()
