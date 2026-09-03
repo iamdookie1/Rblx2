@@ -49,11 +49,26 @@
 -- than replacing the click handler: it lets the real Activated connection
 -- do everything - animation, the origin attachment, whatever cooldown the
 -- server enforces - and only ever rewrites the target CFrame argument.
+--
+-- The knife's real flight speed also turned out to be readable after all -
+-- just not off the Tool. PlayerScripts.WeaponVisuals.ThrowingKnifeVisuals
+-- (the script that renders every OTHER player's flying knife, tagged
+-- "ThrowingKnife" via CollectionService) steps the visual forward every
+-- frame with `position += Direction * ThrowSpeed * dt`, reading ThrowSpeed
+-- straight off that flying instance - `GetAttribute("ThrowSpeed") or 96`.
+-- That's a real, direct studs/sec constant (96 by default), completely
+-- unrelated to the same-named charge-duration attribute on the Knife Tool.
+-- Silent aim listens for the same CollectionService tag the game's own
+-- script does and reads it live off the first knife it ever sees thrown -
+-- by anyone, not just you - so the knife-speed slider below starts at the
+-- real default and self-corrects the moment it has real data instead of
+-- running on a guess.
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local UserInputService = game:GetService("UserInputService")
+local CollectionService = game:GetService("CollectionService")
 local Workspace = workspace
 
 local LocalPlayer = Players.LocalPlayer
@@ -246,18 +261,24 @@ end)
 --
 --   Gun (hitscan) - Shoot:FireServer(origin, target). The server gets told
 --   the answer directly, no travel time modeled anywhere in the client
---   code, so the only thing worth leading for is round-trip latency between
---   "the target is here right now" and the server actually processing the
---   call - not a physical bullet flight.
+--   code, so the only thing worth leading for is the ONE-WAY trip to the
+--   server, not a physical bullet flight - see getPing() below for why
+--   that's half of ping, not all of it.
 --
 --   Knife (thrown) - KnifeThrown:FireServer(handleCFrame, target). This one
---   really is a physical projectile with travel time, but "ThrowSpeed" -
---   the only attribute the client exposes - turned out from reading
---   KnifeClient to be the charge-up duration in seconds, not a studs/sec
---   velocity (the charge loop waits until elapsed time reaches ThrowSpeed).
---   The real flight speed isn't in any client-readable data, so knife lead
---   uses an assumed studs/sec constant below - tune it against what you
---   actually see connect, it is not a value pulled from the dump.
+--   really is a physical projectile with travel time, and unlike the gun
+--   its real flight speed IS readable - see the header note on
+--   ThrowingKnifeVisuals for where 96 studs/sec and the live calibration
+--   below actually come from.
+--
+-- Both weapons lead using velocity measured from the target's own position
+-- across our scan ticks, not part.AssemblyLinearVelocity - a remote
+-- player's parts are replication-driven, not fully simulated on your
+-- client, so that property can read stale or flat-zero for exactly the
+-- kind of slight, subtle movement (strafing, small corrections) leading
+-- most needs to get right. Measuring it ourselves from how far the part
+-- actually moved on screen tracks whatever the target visibly does, at the
+-- same rate the scan itself runs.
 --
 -- The sheriff's gun exists to kill the murderer, and only the murderer -
 -- RoundData (see the header) names them by role, so the gun redirect is
@@ -283,7 +304,7 @@ local Aim = {
     FOVRadius = 200,
     FOVFollowMouse = true,
     Predict = true,
-    KnifeSpeed = 120,        -- assumed studs/sec - see the note above, this is a tuned guess
+    KnifeSpeed = 96,         -- the real default (ThrowingKnifeVisuals) - overwritten live once any knife is seen thrown, see below
 }
 
 local function isAlivePlr(plr)
@@ -371,21 +392,87 @@ local function isMurderer(plr)
     return data ~= nil and data.Role == "Murderer" and data.Dead ~= true
 end
 
+-- GetNetworkPing() is a round trip. Only half of that is the part that
+-- matters for a hitscan lead - the time for YOUR shot to reach the server -
+-- the other half is the server's reply coming back, which has no bearing
+-- on where the target already was when the server received the shot.
+-- Leading on the full round trip (what this used to do) overcorrects by
+-- roughly 2x, which is exactly what "doesn't detect slight movements"
+-- looks like from outside: a small, real motion gets doubled into an aim
+-- point that sails past it instead of landing on it.
 local function getPing()
     local ok, ping = pcall(function() return LocalPlayer:GetNetworkPing() end)
     if ok and typeof(ping) == "number" and ping > 0 then return ping end
     return 0.08
 end
 
+-- part.AssemblyLinearVelocity is driven by physics replication for every
+-- character but your own, which updates in coarse steps and can sit flat
+-- at the wrong value between them - it is not a reliable source for
+-- "slight movements". Measuring how far a part actually moved between two
+-- of our own scan ticks sidesteps that: it reflects exactly what showed up
+-- on screen, at the scan's own tick rate, with no dependency on how well
+-- the target's physics happens to be replicating right now. Falls back to
+-- AssemblyLinearVelocity only for a target's very first tick, when there
+-- is no prior sample yet to measure from.
+local lastSample = {} -- [player name] = { Position = Vector3, Time = number }
+
+local function measuredVelocity(plr, part)
+    local now = os.clock()
+    local prev = lastSample[plr.Name]
+    lastSample[plr.Name] = { Position = part.Position, Time = now }
+
+    if prev then
+        local dt = now - prev.Time
+        if dt > 0 and dt < 0.5 then
+            return (part.Position - prev.Position) / dt
+        end
+    end
+
+    local ok, velocity = pcall(function() return part.AssemblyLinearVelocity end)
+    if ok and velocity then return velocity end
+    return Vector3.zero
+end
+
 -- Where the target will actually be once the shot lands, not where they
--- were when the scan ran a moment earlier.
-local function leadPosition(part, travelTime)
+-- were when the scan ran a moment earlier. Capped so one stray velocity
+-- reading - a teleport, a knockback, a fresh respawn - can't fling the aim
+-- point somewhere the target was never actually headed.
+local MAX_LEAD_OFFSET = 15 -- studs
+
+local function leadPosition(part, velocity, travelTime)
     if not Aim.Predict or not travelTime or travelTime <= 0 then
         return part.Position
     end
-    local ok, velocity = pcall(function() return part.AssemblyLinearVelocity end)
-    if not ok or not velocity then return part.Position end
-    return part.Position + velocity * travelTime
+    local offset = velocity * travelTime
+    if offset.Magnitude > MAX_LEAD_OFFSET then
+        offset = offset.Unit * MAX_LEAD_OFFSET
+    end
+    return part.Position + offset
+end
+
+-- Self-calibrating knife speed - see the header note on ThrowingKnifeVisuals.
+-- Listens for the exact same CollectionService tag that script watches and
+-- reads ThrowSpeed straight off the flying knife itself, from anyone's
+-- throw, not just yours. ">1" guards against a momentarily-unset attribute
+-- reading back as 0 or a bool default rather than a real speed.
+local knifeSpeedSlider = nil -- assigned once the settings UI below builds it
+
+local function onThrowingKnifeAdded(instance)
+    local ok, speed = pcall(function() return instance:GetAttribute("ThrowSpeed") end)
+    if ok and typeof(speed) == "number" and speed > 1 and speed ~= Aim.KnifeSpeed then
+        Aim.KnifeSpeed = speed
+        if knifeSpeedSlider then
+            pcall(function() knifeSpeedSlider:Set(speed) end)
+        end
+    end
+end
+
+track(CollectionService:GetInstanceAddedSignal("ThrowingKnife"):Connect(onThrowingKnifeAdded))
+-- Catch one that's already flying when this script loads - the signal
+-- above only fires for instances tagged AFTER the connection is made.
+for _, instance in ipairs(CollectionService:GetTagged("ThrowingKnife")) do
+    task.spawn(onThrowingKnifeAdded, instance)
 end
 
 -- Wrapping the hook in newcclosure and cutting it down to one raycast
@@ -429,9 +516,14 @@ local function findKnifeOrigin()
     return handle and handle.Position
 end
 
+-- 60Hz rather than 30: this loop no longer runs inside the hook (nothing
+-- about reentrancy limits it anymore), and a tighter tick means a smaller
+-- worst-case gap between "the target moved" and "the cached redirect
+-- reflects it" - the other half of what made slight movements hard to
+-- track, on top of the velocity source and the ping fix above.
 spawnLoop(function()
     while not Unloading do
-        task.wait(1 / 30)
+        task.wait(1 / 60)
         cachedPing = getPing()
 
         if not Aim.SilentAim then
@@ -440,7 +532,8 @@ spawnLoop(function()
             local gPlr, gPart = scanTarget(isMurderer)
             local gOrigin = findGunOrigin()
             if gPlr and gPart and gOrigin then
-                local aimPos = leadPosition(gPart, cachedPing)
+                local velocity = measuredVelocity(gPlr, gPart)
+                local aimPos = leadPosition(gPart, velocity, cachedPing / 2)
                 cachedGunRedirect = clearFromOrigin(gOrigin, aimPos, gPlr.Character) and CFrame.new(aimPos) or nil
             else
                 cachedGunRedirect = nil
@@ -449,9 +542,10 @@ spawnLoop(function()
             local kPlr, kPart = scanTarget(nil)
             local kOrigin = findKnifeOrigin()
             if kPlr and kPart and kOrigin then
+                local velocity = measuredVelocity(kPlr, kPart)
                 local dist = (kPart.Position - kOrigin).Magnitude
-                local travelTime = dist / math.max(Aim.KnifeSpeed, 1) + cachedPing
-                local aimPos = leadPosition(kPart, travelTime)
+                local travelTime = cachedPing / 2 + dist / math.max(Aim.KnifeSpeed, 1)
+                local aimPos = leadPosition(kPart, velocity, travelTime)
                 cachedKnifeRedirect = clearFromOrigin(kOrigin, aimPos, kPlr.Character) and CFrame.new(aimPos) or nil
             else
                 cachedKnifeRedirect = nil
@@ -559,19 +653,19 @@ AimSection:Slider({
 
 AimSection:Toggle({
     Title = 'predict movement',
-    Desc = "leads the target's current velocity - ping round-trip for the gun, travel time plus ping for the thrown knife - instead of aiming at where they were when the scan ran",
+    Desc = "leads the target's velocity, measured from how they actually moved on your last few scans rather than trusted off their replicated physics - half of ping for the gun's one-way trip, that plus flight time for the thrown knife",
     Flag = 'mm2_silent_aim_predict',
     Default = true,
     Callback = function(state) Aim.Predict = state end,
 })
 
-AimSection:Slider({
-    Title = 'assumed knife speed',
-    Desc = "the client never exposes the knife's real flight speed (see the tab header) - tune this against what you actually see connect",
+knifeSpeedSlider = AimSection:Slider({
+    Title = 'knife speed',
+    Desc = "starts at the real default (96 studs/s, read straight off ThrowingKnifeVisuals) and self-corrects the moment any knife - yours or anyone's - is actually seen flying. Only matters as a manual override before that happens",
     Min = 40,
     Max = 300,
     Increment = 5,
-    Default = 120,
+    Default = Aim.KnifeSpeed,
     Suffix = ' studs/s',
     Flag = 'mm2_silent_aim_knife_speed',
     Callback = function(value) Aim.KnifeSpeed = value end,
