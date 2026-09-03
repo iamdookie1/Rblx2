@@ -1372,17 +1372,36 @@ local function hookService(serviceFolder)
         -- unambiguous "the counter caught something". Checked before the
         -- impact-effect filter below, which exists to keep hit-time events out
         -- of the *threat* feed and would otherwise drop this too.
-        if Outcomes.Enabled and serviceName == 'ManjiKick' then
-            local first = ...
-            if typeof(first) == 'Instance' and isOwn(first) then
-                if effectName == 'Startup' then
-                    noteThrow()
-                elseif effectName == 'Hit' or effectName == 'Fade' then
-                    -- Hit is the counter's kick connecting, Fade the dodge
-                    -- afterimage; either means it caught something.
-                    resolveThrow(true)
+        --
+        -- This used to fall through into the generic path below after this
+        -- block, same as any other service. Its own Startup and Fade are
+        -- neither in IMPACT_EFFECTS nor contain "Hit", so is_impact_effect
+        -- never caught them either, and they landed in noteAnnouncement -
+        -- the exact table pendingThreat scans for something worth putting a
+        -- guard up against. A counter kick is not an attack the block system
+        -- should ever be reasoning about, ours or an opponent's - it is what
+        -- happens to whoever overswung, not a move that respects the block
+        -- rules the rest of this file measures. That is what "literally
+        -- tried to block manji kick which is a counter" was: an opponent's
+        -- ManjiKick Startup, recorded as a plain incoming attack because
+        -- nothing ever told this handler ManjiKick was different. It is
+        -- fully special-cased above already, so it returns unconditionally
+        -- below rather than also being run through logic built for moves
+        -- that actually are attacks.
+        if serviceName == 'ManjiKick' then
+            if Outcomes.Enabled then
+                local first = ...
+                if typeof(first) == 'Instance' and isOwn(first) then
+                    if effectName == 'Startup' then
+                        noteThrow()
+                    elseif effectName == 'Hit' or effectName == 'Fade' then
+                        -- Hit is the counter's kick connecting, Fade the dodge
+                        -- afterimage; either means it caught something.
+                        resolveThrow(true)
+                    end
                 end
             end
+            return
         end
 
         local actor = actorFrom(...)
