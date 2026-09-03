@@ -391,6 +391,21 @@ end
 -- only runs, nearest-to-crosshair first, until one of them actually passes
 -- it. The common case - the closest thing to your aim isn't hiding behind
 -- a wall - costs exactly one raycast a tick instead of one per player.
+--
+-- isVisible's raycast originates at the CAMERA, though, which is not the
+-- same point as the real muzzle/handle - especially in third person, where
+-- the camera can be blocked by something (a railing, a doorframe, the
+-- camera clipped into geometry) that the actual weapon origin, a couple of
+-- studs away on your own character, is completely clear of. Treating that
+-- camera-only obstruction as a hard "no valid target" used to make silent
+-- aim go dead - no candidate at all - the moment your VIEW was blocked
+-- even while you were plainly aimed at someone. Screen position (distance
+-- to crosshair) still picks WHICH candidate is preferred, same as before;
+-- if none of them clear the camera check, the nearest one is still
+-- returned rather than nothing, because the check that actually decides
+-- whether a shot goes out is clearFromOrigin's real, muzzle/handle-based
+-- raycast right before it fires - not this one, which only exists to rank
+-- candidates faster than raycasting all of them.
 local function scanTarget(filterFn)
     local origin = Camera.CFrame.Position
     local anchor = screenAnchor()
@@ -409,6 +424,8 @@ local function scanTarget(filterFn)
         end
     end
 
+    if #candidates == 0 then return nil, nil end
+
     table.sort(candidates, function(a, b) return a.screenDist < b.screenDist end)
 
     for _, candidate in ipairs(candidates) do
@@ -417,7 +434,11 @@ local function scanTarget(filterFn)
         end
     end
 
-    return nil, nil
+    -- Nothing cleared the camera's own sightline - fall back to nearest-
+    -- to-crosshair anyway rather than returning nothing. clearFromOrigin
+    -- still gets the final say once the real origin is known.
+    local nearest = candidates[1]
+    return nearest.plr, nearest.part
 end
 
 local function isMurderer(plr)
@@ -494,14 +515,24 @@ local function trackedVelocity(plr, part)
     return raw, hist
 end
 
-local function averageVelocity(hist, count)
-    count = math.min(count, #hist)
-    if count <= 0 then return Vector3.zero end
-    local sum = Vector3.zero
-    for i = #hist - count + 1, #hist do
-        sum = sum + hist[i].v
+-- How consistently the last few velocity samples point the same way: 1 =
+-- moving dead straight, 0 = no correlation, -1 = reversing every sample.
+-- This is the actual live signal "adaptive" reacts to below - not a fixed
+-- choice of formula per level, which never adapted to anything, it just
+-- picked one algorithm and stuck with it regardless of what the target
+-- was actually doing.
+local function steadiness(hist)
+    if #hist < 2 then return 0 end
+    local total, count = 0, 0
+    for i = 2, #hist do
+        local a, b = hist[i - 1].v, hist[i].v
+        if a.Magnitude > 0.05 and b.Magnitude > 0.05 then
+            total = total + a.Unit:Dot(b.Unit)
+            count = count + 1
+        end
     end
-    return sum / count
+    if count == 0 then return 0 end
+    return total / count
 end
 
 -- Weighted toward the most recent samples rather than a flat average, so a
@@ -524,37 +555,45 @@ local function accelerationOf(hist)
     return (newer.v - older.v) / dt
 end
 
--- The five "adaptive amount" levels, each a genuinely different model, not
--- just a relabeled slider:
---   Lesser   - the single most recent raw sample. Reacts instantly, jitters
---              with it too.
---   Normal   - a flat average of the last 2 samples. Removes the worst of
---              that jitter at a small cost in reaction time.
---   Extra    - a flat average of the last 4 samples, plus an acceleration
---              term (velocity += acceleration * time), so a target actively
---              speeding up or turning is led further than one holding
---              steady.
---   Advanced - the same acceleration term, but velocity is exponentially
---              smoothed instead of flat-averaged - noise gets filtered
---              without lagging behind a real, sustained direction change
---              the way a flat average does.
---   Best     - Advanced's smoothing and acceleration, plus (for the knife
---              only, see knifeLeadBest below) iterating the travel-time
---              calculation against the predicted point itself, since
---              leading changes the distance the knife actually has to
---              cross.
+-- The actual adaptation: a target holding a steady direction gets trusted
+-- more - a higher smoothing alpha, closer to its raw recent velocity,
+-- reacting fast to anything that actually changes - while one juking or
+-- reversing gets smoothed harder, riding out the noise instead of chasing
+-- every frame of it. This recomputes from the live history every tick, so
+-- it genuinely responds to what the target is doing right now. A fixed
+-- per-level formula that never looked at how the target was actually
+-- moving was never adaptive to begin with, whatever it was called.
+--
+-- The "adaptive amount" dropdown controls how far that live adaptation is
+-- allowed to swing, plus what else comes with it - a real difference per
+-- level, not a relabeled slider:
+--   Lesser   - narrow swing - stays close to a flat, heavily-smoothed
+--              velocity almost regardless of steadiness. No acceleration.
+--   Normal   - a wider swing, still no acceleration.
+--   Extra    - wider still, plus an acceleration term (velocity +=
+--              acceleration * time), so a target actively speeding up or
+--              turning is led further than one holding steady.
+--   Advanced - the widest swing plus acceleration - trusts a steady
+--              target's raw recent motion almost completely, smooths an
+--              erratic one hard.
+--   Best     - Advanced's live adaptation, plus (for the knife only, see
+--              knifeLeadBest below) iterating the travel-time calculation
+--              against the predicted point itself, since leading changes
+--              the distance the knife actually has to cross.
+local LEVEL_SWING = { Lesser = 0.15, Normal = 0.35, Extra = 0.55, Advanced = 0.8, Best = 0.8 }
+local LEVEL_ACCEL = { Lesser = false, Normal = false, Extra = true, Advanced = true, Best = true }
+
 local function adaptiveVelocityAndAccel(hist, level)
-    if level == 'Lesser' then
-        return (hist[#hist] and hist[#hist].v) or Vector3.zero, Vector3.zero
-    elseif level == 'Normal' then
-        return averageVelocity(hist, 2), Vector3.zero
-    elseif level == 'Extra' then
-        return averageVelocity(hist, 4), accelerationOf(hist)
-    elseif level == 'Advanced' then
-        return exponentialVelocity(hist, 0.6), accelerationOf(hist)
-    else -- 'Best'
-        return exponentialVelocity(hist, 0.75), accelerationOf(hist)
-    end
+    local swing = LEVEL_SWING[level] or LEVEL_SWING.Normal
+    local trust = (steadiness(hist) + 1) / 2 -- -1..1 -> 0..1
+    -- base alpha of 0.35 regardless of level; the level's swing decides
+    -- how far a steady (trust -> 1) or erratic (trust -> 0) reading is
+    -- allowed to push it from there
+    local alpha = math.clamp(0.35 + (trust - 0.5) * 2 * swing, 0.1, 0.95)
+
+    local velocity = exponentialVelocity(hist, alpha)
+    local acceleration = (LEVEL_ACCEL[level] and accelerationOf(hist)) or Vector3.zero
+    return velocity, acceleration
 end
 
 -- Where the target will actually be once the shot lands, not where they
@@ -853,7 +892,7 @@ AimSection:Dropdown({
 
 AimSection:Toggle({
     Title = 'wall check',
-    Desc = 'requires a clear line of sight both to pick the target and, separately, from the real muzzle/handle position right before the shot is redirected',
+    Desc = 'prefers a target with a clear camera sightline when ranking candidates, then requires one from the real muzzle/handle position right before the shot is redirected - a blocked camera view alone never blocks targeting, only the real check does',
     Flag = 'mm2_silent_aim_wallcheck',
     Default = true,
     Callback = function(state) Aim.WallCheck = state end,
@@ -938,7 +977,7 @@ PredictionSection:Toggle({
 
 PredictionSection:Dropdown({
     Title = 'adaptive amount',
-    Desc = 'lesser: raw last sample. normal: 2-sample average. extra: 4-sample average + acceleration. advanced: exponential smoothing + acceleration. best: advanced, plus the knife re-derives its travel time against its own predicted point',
+    Desc = 'how far the live model is allowed to swing between "trust a steady target\'s raw motion" and "smooth out an erratic one" - lesser barely swings at all, best swings the most and adds an acceleration term (plus, for the knife, a 2-pass travel-time refinement). This reacts to the target\'s actual movement every tick, not a fixed formula per level',
     Values = { 'Lesser', 'Normal', 'Extra', 'Advanced', 'Best' },
     Default = 'Normal',
     Flag = 'mm2_silent_aim_adaptive_level',
