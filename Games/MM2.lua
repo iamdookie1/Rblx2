@@ -252,14 +252,15 @@ local Aim = {
 }
 
 local AUTO_LEVELS = {
-    Lesser   = { rate = 0.02, gainMin = 0.85, gainMax = 1.15, smooth = 0.35, passes = 1 },
-    Normal   = { rate = 0.05, gainMin = 0.70, gainMax = 1.30, smooth = 0.50, passes = 2 },
-    Extra    = { rate = 0.08, gainMin = 0.45, gainMax = 1.55, smooth = 0.60, passes = 2 },
-    Advanced = { rate = 0.12, gainMin = 0.30, gainMax = 1.80, smooth = 0.70, passes = 3 },
-    Best     = { rate = 0.18, gainMin = 0.25, gainMax = 2.00, smooth = 0.80, passes = 3 },
+    Lesser   = { rate = 0.03, gunMin = 45, gunMax = 160, knifeMulMin = 0.70, knifeMulMax = 1.30, smooth = 0.35, passes = 1 },
+    Normal   = { rate = 0.06, gunMin = 30, gunMax = 200, knifeMulMin = 0.60, knifeMulMax = 1.40, smooth = 0.50, passes = 2 },
+    Extra    = { rate = 0.09, gunMin = 22, gunMax = 240, knifeMulMin = 0.50, knifeMulMax = 1.50, smooth = 0.60, passes = 2 },
+    Advanced = { rate = 0.13, gunMin = 18, gunMax = 260, knifeMulMin = 0.45, knifeMulMax = 1.55, smooth = 0.70, passes = 3 },
+    Best     = { rate = 0.18, gunMin = 15, gunMax = 280, knifeMulMin = 0.40, knifeMulMax = 1.60, smooth = 0.80, passes = 3 },
 }
 
-local MAX_LEAD_OFFSET = 18
+local GUN_SEED_SPEED = 70
+local MAX_LEAD_OFFSET = 50
 local LEARN_MIN_LEAD = 0.75
 local MAX_PENDING = 24
 local JUMP_SPAM_WINDOW = 3
@@ -327,9 +328,6 @@ local function sampleMotion(plr, root, now)
             groundY = position.Y,
             airborne = airborne,
             jumps = {},
-            gain = 1,
-            pending = {},
-            verified = 0,
         }
         motion[name] = entry
         return entry
@@ -369,13 +367,13 @@ local function isSpamJumper(entry)
     return #entry.jumps >= JUMP_SPAM_COUNT
 end
 
-local function predictRoot(entry, travelTime, gain)
+local function predictRoot(entry, travelTime)
     local base = entry.position
     if not Aim.Predict or travelTime <= 0 then
         return base
     end
 
-    local horizontal = entry.horizontal * travelTime * (gain or 1)
+    local horizontal = entry.horizontal * travelTime
     if horizontal.Magnitude > MAX_LEAD_OFFSET then
         horizontal = horizontal.Unit * MAX_LEAD_OFFSET
     end
@@ -394,34 +392,51 @@ local function predictRoot(entry, travelTime, gain)
     return Vector3.new(base.X + horizontal.X, y, base.Z + horizontal.Z)
 end
 
-local function verifyPredictions(entry, settings, now)
-    local pending = entry.pending
+local function newLeadState(seed)
+    return { value = seed, pending = {}, verified = 0 }
+end
+
+local GunLead = newLeadState(GUN_SEED_SPEED)
+local KnifeLead = newLeadState(1)
+
+local function adjustGunLead(state, relative, settings)
+    state.value = math.clamp(state.value * (1 - relative * settings.rate), settings.gunMin, settings.gunMax)
+end
+
+local function adjustKnifeLead(state, relative, settings)
+    state.value = math.clamp(state.value * (1 - relative * settings.rate), settings.knifeMulMin, settings.knifeMulMax)
+end
+
+local function verifyLead(state, settings, adjust, now)
+    local pending = state.pending
     local index = 1
     while index <= #pending do
         local record = pending[index]
         if now < record.dueAt then
             index = index + 1
         else
+            local entry = record.entry
             local lead = record.lead
             local length = lead.Magnitude
-            if length >= LEARN_MIN_LEAD and record.learnable then
+            if entry and length >= LEARN_MIN_LEAD and record.learnable and (now - entry.time) < SAMPLE_STALE then
                 local actual = Vector3.new(entry.position.X, 0, entry.position.Z)
                 local predicted = Vector3.new(record.root.X, 0, record.root.Z)
                 local drift = (actual - predicted):Dot(lead.Unit)
                 local relative = math.clamp(drift / length, -1, 1)
-                entry.gain = math.clamp(entry.gain * (1 + relative * settings.rate), settings.gainMin, settings.gainMax)
-                entry.verified = entry.verified + 1
+                adjust(state, relative, settings)
+                state.verified = state.verified + 1
             end
             table.remove(pending, index)
         end
     end
 end
 
-local function logPrediction(entry, predictedRoot, travelTime, now)
+local function logLead(state, entry, predictedRoot, travelTime, now)
     local lead = Vector3.new(predictedRoot.X - entry.position.X, 0, predictedRoot.Z - entry.position.Z)
-    if lead.Magnitude < LEARN_MIN_LEAD or #entry.pending >= MAX_PENDING then return end
-    table.insert(entry.pending, {
+    if lead.Magnitude < LEARN_MIN_LEAD or #state.pending >= MAX_PENDING then return end
+    table.insert(state.pending, {
         dueAt = now + travelTime,
+        entry = entry,
         root = predictedRoot,
         lead = lead,
         learnable = not entry.airborne and not isSpamJumper(entry),
@@ -519,17 +534,12 @@ local function findKnifeOrigin()
     return handle and handle.Position
 end
 
-local function solveAim(plr, part, char, origin, isKnife, now)
+local function solveAim(plr, part, char, origin, isKnife, now, settings)
     local root = char and char:FindFirstChild("HumanoidRootPart")
     if not root then return part.Position end
 
     local entry = sampleMotion(plr, root, now)
-    local settings = AUTO_LEVELS[Aim.AutoLevel] or AUTO_LEVELS.Normal
     local offset = part.Position - root.Position
-
-    if Aim.AutoPredict then
-        verifyPredictions(entry, settings, now)
-    end
 
     if not Aim.Predict then
         return part.Position
@@ -537,28 +547,21 @@ local function solveAim(plr, part, char, origin, isKnife, now)
 
     if not Aim.AutoPredict then
         local travelTime = isKnife and Aim.ManualLeadTimeKnife or Aim.ManualLeadTimeGun
-        return predictRoot(entry, travelTime, 1) + offset
+        return predictRoot(entry, travelTime) + offset
     end
 
     local pingComponent = Aim.UsePing and (cachedPing / 2) or 0
-    local travelTime
-    local predicted
+    local state = isKnife and KnifeLead or GunLead
+    local speed = isKnife and math.max(Aim.KnifeSpeed * state.value, 1) or math.max(state.value, 1)
 
-    if isKnife then
-        local speed = math.max(Aim.KnifeSpeed, 1)
-        travelTime = pingComponent + (part.Position - origin).Magnitude / speed
-        predicted = predictRoot(entry, travelTime, entry.gain)
-        for _ = 2, settings.passes do
-            travelTime = pingComponent + ((predicted + offset) - origin).Magnitude / speed
-            predicted = predictRoot(entry, travelTime, entry.gain)
-        end
-    else
-        travelTime = pingComponent
-        predicted = predictRoot(entry, travelTime, entry.gain)
+    local travelTime = pingComponent + (part.Position - origin).Magnitude / speed
+    local predicted = predictRoot(entry, travelTime)
+    for _ = 2, settings.passes do
+        travelTime = pingComponent + ((predicted + offset) - origin).Magnitude / speed
+        predicted = predictRoot(entry, travelTime)
     end
 
-    logPrediction(entry, predicted, travelTime, now)
-    autoSummary = ('%.2fx over %d'):format(entry.gain, entry.verified)
+    logLead(state, entry, predicted, travelTime, now)
     return predicted + offset
 end
 
@@ -571,6 +574,14 @@ track(PreSimulation:Connect(function()
     local ok = pcall(function()
         local now = os.clock()
         cachedPing = getPing()
+        local settings = AUTO_LEVELS[Aim.AutoLevel] or AUTO_LEVELS.Normal
+
+        if Aim.AutoPredict then
+            verifyLead(GunLead, settings, adjustGunLead, now)
+            verifyLead(KnifeLead, settings, adjustKnifeLead, now)
+            autoSummary = ('gun %d st/s (%d)  knife %.2fx (%d)')
+                :format(math.floor(GunLead.value), GunLead.verified, KnifeLead.value, KnifeLead.verified)
+        end
 
         local gunOrigin = findGunOrigin()
         if not gunOrigin then
@@ -578,7 +589,7 @@ track(PreSimulation:Connect(function()
         else
             local plr, part, char = scanTarget(isMurderer)
             if plr and part then
-                local aim = solveAim(plr, part, char, gunOrigin, false, now)
+                local aim = solveAim(plr, part, char, gunOrigin, false, now, settings)
                 cachedGunRedirect = clearPath(gunOrigin, aim, char) and CFrame.new(aim) or nil
             else
                 cachedGunRedirect = nil
@@ -591,7 +602,7 @@ track(PreSimulation:Connect(function()
         else
             local plr, part, char = scanTarget(nil)
             if plr and part then
-                local aim = solveAim(plr, part, char, knifeOrigin, true, now)
+                local aim = solveAim(plr, part, char, knifeOrigin, true, now, settings)
                 cachedKnifeRedirect = clearPath(knifeOrigin, aim, char) and CFrame.new(aim) or nil
             else
                 cachedKnifeRedirect = nil
@@ -763,7 +774,7 @@ PredictionSection:Toggle({
 
 PredictionSection:Toggle({
     Title = 'auto prediction',
-    Desc = 'scores its own predictions against where the target actually ended up and corrects the horizontal lead from the result, live, per target',
+    Desc = 'travel time is distance / a learned speed, so lead grows with range and stays tight up close. scores its own shots against where the target ended up and corrects that learned speed live',
     Flag = 'mm2_silent_aim_auto_predict',
     Default = true,
     Callback = function(state) Aim.AutoPredict = state end,
@@ -771,7 +782,7 @@ PredictionSection:Toggle({
 
 PredictionSection:Dropdown({
     Title = 'auto prediction amount',
-    Desc = 'how hard the feedback loop corrects, how heavily velocity is smoothed, and how many passes the knife takes solving its travel time',
+    Desc = 'how hard the feedback loop corrects, how far the learned speed is allowed to move, how heavily velocity is smoothed, and how many passes the travel time solves for',
     Values = { 'Lesser', 'Normal', 'Extra', 'Advanced', 'Best' },
     Default = 'Normal',
     Flag = 'mm2_silent_aim_auto_level',
@@ -782,10 +793,10 @@ local AutoStat = PredictionSection:Stat({ Title = 'learned lead', Value = 'idle'
 
 PredictionSection:Slider({
     Title = 'manual gun lead time',
-    Desc = 'used while auto prediction is off',
+    Desc = 'used while auto prediction is off - flat, not distance scaled',
     Min = 0,
-    Max = 0.5,
-    Increment = 0.01,
+    Max = 2.5,
+    Increment = 0.05,
     Default = Aim.ManualLeadTimeGun,
     Suffix = 's',
     Flag = 'mm2_silent_aim_manual_gun',
@@ -794,10 +805,10 @@ PredictionSection:Slider({
 
 PredictionSection:Slider({
     Title = 'manual knife lead time',
-    Desc = 'used while auto prediction is off',
+    Desc = 'used while auto prediction is off - flat, not distance scaled',
     Min = 0,
-    Max = 1,
-    Increment = 0.01,
+    Max = 3,
+    Increment = 0.05,
     Default = Aim.ManualLeadTimeKnife,
     Suffix = 's',
     Flag = 'mm2_silent_aim_manual_knife',
