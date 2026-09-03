@@ -369,38 +369,55 @@ local function screenAnchor()
     return Vector2.new(viewport.X / 2, viewport.Y / 2)
 end
 
-local function evaluateCandidate(plr, anchor, origin)
-    local char = plr.Character
-    local part = char and (char:FindFirstChild(Aim.AimPart) or char:FindFirstChild("HumanoidRootPart"))
-    if not part then return nil end
+-- Cheap: distance and a screen projection, no raycast.
+local function candidateScreenDist(part, anchor, origin)
     if (part.Position - origin).Magnitude > Aim.MaxRange then return nil end
     local screenPos, onScreen = Camera:WorldToViewportPoint(part.Position)
     if not onScreen then return nil end
     local screenDist = (Vector2.new(screenPos.X, screenPos.Y) - anchor).Magnitude
     if Aim.FOVEnabled and screenDist > Aim.FOVRadius then return nil end
-    if not isVisible(char, origin) then return nil end
-    return part, screenDist
+    return screenDist
 end
 
 -- filterFn narrows the candidate pool before ranking - the gun passes
 -- isMurderer, the knife passes nil (anyone alive and in view is fair game).
+--
+-- isVisible does a real raycast, and used to run once per candidate before
+-- picking the nearest-to-crosshair one that passed - on an unrestricted
+-- (knife) scan against a full lobby, that's a raycast per player in the
+-- server, every single tick, for as long as you're holding a knife. Since
+-- only the single best candidate ever actually matters, candidates are
+-- sorted by screen distance first (cheap - no raycast) and the raycast
+-- only runs, nearest-to-crosshair first, until one of them actually passes
+-- it. The common case - the closest thing to your aim isn't hiding behind
+-- a wall - costs exactly one raycast a tick instead of one per player.
 local function scanTarget(filterFn)
     local origin = Camera.CFrame.Position
     local anchor = screenAnchor()
-    local best, bestPart, bestScore
 
+    local candidates = {}
     for _, plr in ipairs(Players:GetPlayers()) do
         if plr ~= LocalPlayer and isAlivePlr(plr) and (not filterFn or filterFn(plr)) then
-            local part, screenDist = evaluateCandidate(plr, anchor, origin)
-            if part and (not bestScore or screenDist < bestScore) then
-                bestScore = screenDist
-                best = plr
-                bestPart = part
+            local char = plr.Character
+            local part = char and (char:FindFirstChild(Aim.AimPart) or char:FindFirstChild("HumanoidRootPart"))
+            if part then
+                local screenDist = candidateScreenDist(part, anchor, origin)
+                if screenDist then
+                    candidates[#candidates + 1] = { plr = plr, char = char, part = part, screenDist = screenDist }
+                end
             end
         end
     end
 
-    return best, bestPart
+    table.sort(candidates, function(a, b) return a.screenDist < b.screenDist end)
+
+    for _, candidate in ipairs(candidates) do
+        if isVisible(candidate.char, origin) then
+            return candidate.plr, candidate.part
+        end
+    end
+
+    return nil, nil
 end
 
 local function isMurderer(plr)
@@ -678,52 +695,74 @@ spawnLoop(function()
         task.wait(1 / 60)
 
         local ok = pcall(function()
-            cachedPing = getPing()
-
             if not Aim.SilentAim then
                 cachedGunRedirect, cachedKnifeRedirect = nil, nil
                 return
             end
 
+            -- findGunOrigin/findKnifeOrigin are a couple of FindFirstChild
+            -- calls - cheap. scanTarget is not: unrestricted, it raycasts
+            -- and projects every alive player in the server, every tick.
+            -- The previous version ran BOTH scans unconditionally, every
+            -- single tick, at 60/sec, regardless of whether the local
+            -- player was even holding the corresponding weapon - which for
+            -- most of a round is neither (only the murderer holds a knife,
+            -- only the sheriff a gun). That's a large, constant, entirely
+            -- wasted background cost, and it's exactly what a throw's own
+            -- extra frame work (the knife visual spawning, its trail,
+            -- everything ThrowingKnifeVisuals does) would tip over into a
+            -- visible stutter. Checking the origin first and skipping the
+            -- scan whenever it's nil - not holding that weapon - cuts this
+            -- down to only the two players in the server who can ever
+            -- benefit from it.
+            cachedPing = getPing()
             local sampled = {}
 
-            local gPlr, gPart = scanTarget(isMurderer)
             local gOrigin = findGunOrigin()
-            if gPlr and gPart and gOrigin then
-                local aimPos = computeAimPoint(gPlr, gPart, sampled, function(adaptive)
-                    if not adaptive then return Aim.ManualLeadTimeGun end
-                    return Aim.UsePing and (cachedPing / 2) or 0
-                end)
-                cachedGunRedirect = clearFromOrigin(gOrigin, aimPos, gPlr.Character) and CFrame.new(aimPos) or nil
-            else
+            if not gOrigin then
                 cachedGunRedirect = nil
+            else
+                local gPlr, gPart = scanTarget(isMurderer)
+                if gPlr and gPart then
+                    local aimPos = computeAimPoint(gPlr, gPart, sampled, function(adaptive)
+                        if not adaptive then return Aim.ManualLeadTimeGun end
+                        return Aim.UsePing and (cachedPing / 2) or 0
+                    end)
+                    cachedGunRedirect = clearFromOrigin(gOrigin, aimPos, gPlr.Character) and CFrame.new(aimPos) or nil
+                else
+                    cachedGunRedirect = nil
+                end
             end
 
-            local kPlr, kPart = scanTarget(nil)
             local kOrigin = findKnifeOrigin()
-            if kPlr and kPart and kOrigin then
-                local aimPos
-                if Aim.Predict and Aim.Adaptive and Aim.AdaptiveLevel == 'Best' then
-                    local s = sampled[kPlr.Name]
-                    if not s then
-                        local raw, hist = trackedVelocity(kPlr, kPart)
-                        s = { raw = raw, hist = hist }
-                        sampled[kPlr.Name] = s
-                    end
-                    local velocity, acceleration = adaptiveVelocityAndAccel(s.hist, Aim.AdaptiveLevel)
-                    local pingComponent = Aim.UsePing and (cachedPing / 2) or 0
-                    aimPos = knifeLeadBest(kOrigin, kPart, velocity, acceleration, pingComponent)
-                else
-                    aimPos = computeAimPoint(kPlr, kPart, sampled, function(adaptive)
-                        if not adaptive then return Aim.ManualLeadTimeKnife end
-                        local pingComponent = Aim.UsePing and (cachedPing / 2) or 0
-                        local dist = (kPart.Position - kOrigin).Magnitude
-                        return pingComponent + dist / math.max(Aim.KnifeSpeed, 1)
-                    end)
-                end
-                cachedKnifeRedirect = clearFromOrigin(kOrigin, aimPos, kPlr.Character) and CFrame.new(aimPos) or nil
-            else
+            if not kOrigin then
                 cachedKnifeRedirect = nil
+            else
+                local kPlr, kPart = scanTarget(nil)
+                if kPlr and kPart then
+                    local aimPos
+                    if Aim.Predict and Aim.Adaptive and Aim.AdaptiveLevel == 'Best' then
+                        local s = sampled[kPlr.Name]
+                        if not s then
+                            local raw, hist = trackedVelocity(kPlr, kPart)
+                            s = { raw = raw, hist = hist }
+                            sampled[kPlr.Name] = s
+                        end
+                        local velocity, acceleration = adaptiveVelocityAndAccel(s.hist, Aim.AdaptiveLevel)
+                        local pingComponent = Aim.UsePing and (cachedPing / 2) or 0
+                        aimPos = knifeLeadBest(kOrigin, kPart, velocity, acceleration, pingComponent)
+                    else
+                        aimPos = computeAimPoint(kPlr, kPart, sampled, function(adaptive)
+                            if not adaptive then return Aim.ManualLeadTimeKnife end
+                            local pingComponent = Aim.UsePing and (cachedPing / 2) or 0
+                            local dist = (kPart.Position - kOrigin).Magnitude
+                            return pingComponent + dist / math.max(Aim.KnifeSpeed, 1)
+                        end)
+                    end
+                    cachedKnifeRedirect = clearFromOrigin(kOrigin, aimPos, kPlr.Character) and CFrame.new(aimPos) or nil
+                else
+                    cachedKnifeRedirect = nil
+                end
             end
         end)
 
