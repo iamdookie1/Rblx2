@@ -249,7 +249,6 @@ local Aim = {
     ManualLeadTimeKnife = 0.15,
     KnifeSpeed = 96,
     JumpAware = true,
-    ExtraPredict = 1,
 }
 
 local AUTO_LEVELS = {
@@ -262,7 +261,6 @@ local AUTO_LEVELS = {
 
 local GUN_SEED_SPEED = 500
 local MAX_LEAD_OFFSET = 50
-local EXTRA_PREDICT_CAP = MAX_LEAD_OFFSET * 3
 local LEARN_MIN_LEAD = 0.75
 local MAX_PENDING = 24
 local JUMP_SPAM_WINDOW = 3
@@ -577,11 +575,7 @@ local function findKnifeOrigin()
     return handle and handle.Position
 end
 
-local function solveAim(plr, part, char, origin, isKnife, now, settings)
-    local root = char and char:FindFirstChild("HumanoidRootPart")
-    if not root then return part.Position end
-
-    local entry = sampleMotion(plr, root, now)
+local function solveAim(entry, part, root, char, origin, isKnife, now, settings)
     local offset = part.Position - root.Position
     if Aim.JumpAware and entry.airborne then
         offset = Vector3.new(offset.X, -feetOffset(char), offset.Z)
@@ -608,15 +602,6 @@ local function solveAim(plr, part, char, origin, isKnife, now, settings)
     end
 
     logLead(state, entry, predicted, travelTime, now)
-
-    if Aim.ExtraPredict ~= 1 then
-        local boost = Vector3.new(predicted.X - entry.position.X, 0, predicted.Z - entry.position.Z) * Aim.ExtraPredict
-        if boost.Magnitude > EXTRA_PREDICT_CAP then
-            boost = boost.Unit * EXTRA_PREDICT_CAP
-        end
-        predicted = Vector3.new(entry.position.X + boost.X, predicted.Y, entry.position.Z + boost.Z)
-    end
-
     return predicted + offset
 end
 
@@ -638,30 +623,34 @@ track(PreSimulation:Connect(function()
                 :format(math.floor(GunLead.value), GunLead.verified, KnifeLead.value, KnifeLead.verified)
         end
 
+        local gPlr, gPart, gChar = scanTarget(isMurderer)
+        local gEntry, gRoot = nil, nil
+        if gPlr and gPart and gChar then
+            gRoot = gChar:FindFirstChild("HumanoidRootPart")
+            if gRoot then gEntry = sampleMotion(gPlr, gRoot, now) end
+        end
+
+        local kPlr, kPart, kChar = scanTarget(nil)
+        local kEntry, kRoot = nil, nil
+        if kPlr and kPart and kChar then
+            kRoot = kChar:FindFirstChild("HumanoidRootPart")
+            if kRoot then kEntry = sampleMotion(kPlr, kRoot, now) end
+        end
+
         local gunOrigin = findGunOrigin()
-        if not gunOrigin then
+        if not gunOrigin or not gEntry then
             cachedGunRedirect = nil
         else
-            local plr, part, char = scanTarget(isMurderer)
-            if plr and part then
-                local aim = solveAim(plr, part, char, gunOrigin, false, now, settings)
-                cachedGunRedirect = clearPath(gunOrigin, aim, char) and CFrame.new(aim) or nil
-            else
-                cachedGunRedirect = nil
-            end
+            local aim = solveAim(gEntry, gPart, gRoot, gChar, gunOrigin, false, now, settings)
+            cachedGunRedirect = clearPath(gunOrigin, aim, gChar) and CFrame.new(aim) or nil
         end
 
         local knifeOrigin = findKnifeOrigin()
-        if not knifeOrigin then
+        if not knifeOrigin or not kEntry then
             cachedKnifeRedirect = nil
         else
-            local plr, part, char = scanTarget(nil)
-            if plr and part then
-                local aim = solveAim(plr, part, char, knifeOrigin, true, now, settings)
-                cachedKnifeRedirect = clearPath(knifeOrigin, aim, char) and CFrame.new(aim) or nil
-            else
-                cachedKnifeRedirect = nil
-            end
+            local aim = solveAim(kEntry, kPart, kRoot, kChar, knifeOrigin, true, now, settings)
+            cachedKnifeRedirect = clearPath(knifeOrigin, aim, kChar) and CFrame.new(aim) or nil
         end
     end)
 
@@ -842,18 +831,6 @@ PredictionSection:Dropdown({
     Default = 'Normal',
     Flag = 'mm2_silent_aim_auto_level',
     Callback = function(value) Aim.AutoLevel = value end,
-})
-
-PredictionSection:Slider({
-    Title = 'extra prediction',
-    Desc = 'multiplies the horizontal lead auto prediction already computed, on top of it - 1x is exactly what auto prediction alone gives you, 2x leads twice as far along their movement. does not touch the vertical jump arc, and is not something the learning loop can correct away since it is applied after that loop scores itself',
-    Min = 1,
-    Max = 3,
-    Increment = 0.05,
-    Default = Aim.ExtraPredict,
-    Suffix = 'x',
-    Flag = 'mm2_silent_aim_extra_predict',
-    Callback = function(value) Aim.ExtraPredict = value end,
 })
 
 local AutoStat = PredictionSection:Stat({ Title = 'learned lead', Value = 'idle' })
