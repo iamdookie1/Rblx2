@@ -252,14 +252,15 @@ local Aim = {
 }
 
 local AUTO_LEVELS = {
-    Lesser   = { rate = 0.03, gunMin = 250, gunMax = 900,  knifeMulMin = 0.70, knifeMulMax = 1.30, smooth = 0.35, passes = 1 },
-    Normal   = { rate = 0.06, gunMin = 180, gunMax = 1200, knifeMulMin = 0.60, knifeMulMax = 1.40, smooth = 0.50, passes = 2 },
-    Extra    = { rate = 0.09, gunMin = 140, gunMax = 1600, knifeMulMin = 0.50, knifeMulMax = 1.50, smooth = 0.60, passes = 2 },
-    Advanced = { rate = 0.13, gunMin = 110, gunMax = 2000, knifeMulMin = 0.45, knifeMulMax = 1.55, smooth = 0.70, passes = 3 },
-    Best     = { rate = 0.18, gunMin = 90,  gunMax = 2500, knifeMulMin = 0.40, knifeMulMax = 1.60, smooth = 0.80, passes = 3 },
+    Lesser   = { rate = 0.05, gunMin = 40, gunMax = 400,  knifeMulMin = 0.50, knifeMulMax = 1.30, smooth = 0.35, passes = 1 },
+    Normal   = { rate = 0.08, gunMin = 25, gunMax = 500,  knifeMulMin = 0.40, knifeMulMax = 1.40, smooth = 0.50, passes = 2 },
+    Extra    = { rate = 0.11, gunMin = 18, gunMax = 650,  knifeMulMin = 0.32, knifeMulMax = 1.50, smooth = 0.60, passes = 2 },
+    Advanced = { rate = 0.15, gunMin = 12, gunMax = 800,  knifeMulMin = 0.26, knifeMulMax = 1.55, smooth = 0.70, passes = 3 },
+    Best     = { rate = 0.20, gunMin = 8,  gunMax = 1000, knifeMulMin = 0.20, knifeMulMax = 1.60, smooth = 0.80, passes = 3 },
 }
 
-local GUN_SEED_SPEED = 500
+local GUN_SEED_SPEED = 60
+local MAX_TRAVEL_TIME = 2.5
 local MAX_LEAD_OFFSET = 50
 local LEARN_MIN_LEAD = 0.75
 local MAX_PENDING = 24
@@ -594,10 +595,10 @@ local function solveAim(entry, part, root, char, origin, isKnife, now, settings)
     local state = isKnife and KnifeLead or GunLead
     local speed = isKnife and math.max(Aim.KnifeSpeed * state.value, 1) or math.max(state.value, 1)
 
-    local travelTime = pingComponent + (part.Position - origin).Magnitude / speed
+    local travelTime = math.min(pingComponent + (part.Position - origin).Magnitude / speed, MAX_TRAVEL_TIME)
     local predicted = predictRoot(entry, travelTime)
     for _ = 2, settings.passes do
-        travelTime = pingComponent + ((predicted + offset) - origin).Magnitude / speed
+        travelTime = math.min(pingComponent + ((predicted + offset) - origin).Magnitude / speed, MAX_TRAVEL_TIME)
         predicted = predictRoot(entry, travelTime)
     end
 
