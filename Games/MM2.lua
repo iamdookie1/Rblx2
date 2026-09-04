@@ -249,6 +249,7 @@ local Aim = {
     ManualLeadTimeKnife = 0.15,
     KnifeSpeed = 96,
     JumpAware = true,
+    ExtraPredict = 1,
 }
 
 local AUTO_LEVELS = {
@@ -261,6 +262,7 @@ local AUTO_LEVELS = {
 
 local GUN_SEED_SPEED = 500
 local MAX_LEAD_OFFSET = 50
+local EXTRA_PREDICT_CAP = MAX_LEAD_OFFSET * 3
 local LEARN_MIN_LEAD = 0.75
 local MAX_PENDING = 24
 local JUMP_SPAM_WINDOW = 3
@@ -594,6 +596,15 @@ local function solveAim(plr, part, char, origin, isKnife, now, settings)
     end
 
     logLead(state, entry, predicted, travelTime, now)
+
+    if Aim.ExtraPredict ~= 1 then
+        local boost = Vector3.new(predicted.X - entry.position.X, 0, predicted.Z - entry.position.Z) * Aim.ExtraPredict
+        if boost.Magnitude > EXTRA_PREDICT_CAP then
+            boost = boost.Unit * EXTRA_PREDICT_CAP
+        end
+        predicted = Vector3.new(entry.position.X + boost.X, predicted.Y, entry.position.Z + boost.Z)
+    end
+
     return predicted + offset
 end
 
@@ -819,6 +830,18 @@ PredictionSection:Dropdown({
     Default = 'Normal',
     Flag = 'mm2_silent_aim_auto_level',
     Callback = function(value) Aim.AutoLevel = value end,
+})
+
+PredictionSection:Slider({
+    Title = 'extra prediction',
+    Desc = 'multiplies the horizontal lead auto prediction already computed, on top of it - 1x is exactly what auto prediction alone gives you, 2x leads twice as far along their movement. does not touch the vertical jump arc, and is not something the learning loop can correct away since it is applied after that loop scores itself',
+    Min = 1,
+    Max = 3,
+    Increment = 0.05,
+    Default = Aim.ExtraPredict,
+    Suffix = 'x',
+    Flag = 'mm2_silent_aim_extra_predict',
+    Callback = function(value) Aim.ExtraPredict = value end,
 })
 
 local AutoStat = PredictionSection:Stat({ Title = 'learned lead', Value = 'idle' })
