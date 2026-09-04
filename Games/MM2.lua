@@ -329,6 +329,15 @@ local function jumpLaunchVelocity(hum)
     return nil
 end
 
+local function feetOffset(char)
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    local ok, hip = pcall(function() return hum and hum.HipHeight end)
+    if ok and typeof(hip) == "number" and hip > 0 then
+        return hip + 0.5
+    end
+    return 2.5
+end
+
 local function sampleMotion(plr, root, now)
     local name = plr.Name
     local entry = motion[name]
@@ -574,9 +583,12 @@ local function solveAim(plr, part, char, origin, isKnife, now, settings)
 
     local entry = sampleMotion(plr, root, now)
     local offset = part.Position - root.Position
+    if Aim.JumpAware and entry.airborne then
+        offset = Vector3.new(offset.X, -feetOffset(char), offset.Z)
+    end
 
     if not Aim.Predict then
-        return part.Position
+        return root.Position + offset
     end
 
     if not Aim.AutoPredict then
@@ -801,7 +813,7 @@ PredictionSection:Toggle({
 
 PredictionSection:Toggle({
     Title = 'jump aware',
-    Desc = 'solves a jumping target as a real arc under gravity instead of extrapolating their vertical speed in a straight line, and drops head aim to torso against repeat jumpers',
+    Desc = 'solves a jumping target as a real arc under gravity instead of extrapolating their vertical speed in a straight line, aims at their feet rather than head/torso while airborne so a slightly-off vertical read still lands, and drops head aim to torso against repeat jumpers',
     Flag = 'mm2_silent_aim_jump',
     Default = true,
     Callback = function(state) Aim.JumpAware = state end,
