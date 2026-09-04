@@ -238,9 +238,10 @@ local Aim = {
     WallCheck = true,
     AimPart = "Head",
     MaxRange = 300,
-    FOVEnabled = true,
+    FOVEnabled = false,
     FOVRadius = 200,
     FOVFollowMouse = true,
+    OffScreen = false,
     Predict = true,
     UsePing = true,
     AutoPredict = true,
@@ -250,6 +251,7 @@ local Aim = {
     KnifeSpeed = 96,
     JumpAware = true,
     Method = 'Delay + travel',
+    MathMethod = 'Linear',
     BulletSpeed = 400,
 }
 
@@ -262,6 +264,7 @@ local AUTO_LEVELS = {
 }
 
 local AIM_METHODS = { 'Delay + travel', 'Delay only', 'Travel only', 'Ping only' }
+local MATH_METHODS = { 'Linear', 'Acceleration', 'Curve', 'Damped', 'Raw' }
 local GUN_SEED_DELAY = 0.6
 local KNIFE_SEED_DELAY = 0.25
 local MAX_TRAVEL_TIME = 2.5
@@ -353,6 +356,9 @@ local function sampleMotion(plr, root, now)
             time = now,
             horizontal = Vector3.zero,
             vertical = 0,
+            raw = Vector3.zero,
+            accel = Vector3.zero,
+            turnRate = 0,
             groundY = position.Y,
             airborne = airborne,
             jumps = {},
@@ -371,10 +377,29 @@ local function sampleMotion(plr, root, now)
         local rawHorizontal = Vector3.new(delta.X, 0, delta.Z) / dt
         local rawVertical = delta.Y / dt
         local settings = AUTO_LEVELS[Aim.AutoLevel] or AUTO_LEVELS.Normal
-        entry.horizontal = entry.horizontal:Lerp(rawHorizontal, settings.smooth)
+        local previous = entry.horizontal
+
+        entry.raw = rawHorizontal
+        entry.horizontal = previous:Lerp(rawHorizontal, settings.smooth)
         entry.vertical = entry.vertical + (rawVertical - entry.vertical) * 0.65
+
+        local accel = (entry.horizontal - previous) / dt
+        entry.accel = entry.accel:Lerp(accel, 0.4)
+
+        if previous.Magnitude > 1 and entry.horizontal.Magnitude > 1 then
+            local a, b = previous.Unit, entry.horizontal.Unit
+            local dot = math.clamp(a:Dot(b), -1, 1)
+            local cross = a.X * b.Z - a.Z * b.X
+            local turn = math.atan2(cross, dot) / dt
+            entry.turnRate = entry.turnRate + (turn - entry.turnRate) * 0.35
+        else
+            entry.turnRate = entry.turnRate * 0.8
+        end
     elseif dt >= SAMPLE_STALE then
         entry.horizontal = Vector3.zero
+        entry.raw = Vector3.zero
+        entry.accel = Vector3.zero
+        entry.turnRate = 0
         entry.vertical = 0
     end
 
@@ -408,13 +433,53 @@ local function isSpamJumper(entry)
     return #entry.jumps >= JUMP_SPAM_COUNT
 end
 
+local function horizontalLead(entry, t)
+    local method = Aim.MathMethod
+
+    if method == 'Raw' then
+        return entry.raw * t
+    end
+
+    if method == 'Acceleration' then
+        return entry.horizontal * t + entry.accel * (0.5 * t * t)
+    end
+
+    if method == 'Curve' then
+        local omega = entry.turnRate
+        if math.abs(omega) < 0.05 then
+            return entry.horizontal * t
+        end
+        local steps = 4
+        local step = t / steps
+        local displacement = Vector3.zero
+        local velocity = entry.horizontal
+        for _ = 1, steps do
+            displacement = displacement + velocity * step
+            local angle = omega * step
+            local cos, sin = math.cos(angle), math.sin(angle)
+            velocity = Vector3.new(
+                velocity.X * cos - velocity.Z * sin,
+                0,
+                velocity.X * sin + velocity.Z * cos)
+        end
+        return displacement
+    end
+
+    if method == 'Damped' then
+        local tau = 0.6
+        return entry.horizontal * (tau * (1 - math.exp(-t / tau)))
+    end
+
+    return entry.horizontal * t
+end
+
 local function predictRoot(entry, travelTime)
     local base = entry.position
     if not Aim.Predict or travelTime <= 0 then
         return base
     end
 
-    local horizontal = entry.horizontal * travelTime
+    local horizontal = horizontalLead(entry, travelTime)
     if horizontal.Magnitude > MAX_LEAD_OFFSET then
         horizontal = horizontal.Unit * MAX_LEAD_OFFSET
     end
@@ -513,8 +578,18 @@ end
 
 local function candidateScreenDist(part, anchor, origin)
     if (part.Position - origin).Magnitude > Aim.MaxRange then return nil end
+
     local screenPos, onScreen = Camera:WorldToViewportPoint(part.Position)
-    if not onScreen then return nil end
+    if not onScreen then
+        if not Aim.OffScreen then return nil end
+        local look = Camera.CFrame.LookVector
+        local toward = part.Position - origin
+        if toward.Magnitude < 0.01 then return nil end
+        local angle = math.deg(math.acos(math.clamp(look.Unit:Dot(toward.Unit), -1, 1)))
+        local viewport = Camera.ViewportSize
+        return viewport.Magnitude + angle
+    end
+
     local screenDist = (Vector2.new(screenPos.X, screenPos.Y) - anchor).Magnitude
     if Aim.FOVEnabled and screenDist > Aim.FOVRadius then return nil end
     return screenDist
@@ -787,13 +862,15 @@ local FovSection = SilentAimTab:Section({ Title = 'fov', Side = 'right' })
 
 FovSection:Toggle({
     Title = 'fov limit',
+    Desc = 'off means the whole screen is fair game - anything visible can be targeted. on restricts it to the radius below',
     Flag = 'mm2_silent_aim_fov',
-    Default = true,
+    Default = false,
     Callback = function(state) Aim.FOVEnabled = state end,
 })
 
 FovSection:Slider({
     Title = 'fov radius',
+    Desc = 'only used while fov limit is on',
     Min = 20,
     Max = 600,
     Increment = 10,
@@ -807,6 +884,14 @@ FovSection:Toggle({
     Flag = 'mm2_silent_aim_follow_mouse',
     Default = true,
     Callback = function(state) Aim.FOVFollowMouse = state end,
+})
+
+FovSection:Toggle({
+    Title = 'off screen targets',
+    Desc = 'also allows targets that are off screen entirely, including behind you, ranked by angle from where the camera points. on screen targets always take priority',
+    Flag = 'mm2_silent_aim_offscreen',
+    Default = false,
+    Callback = function(state) Aim.OffScreen = state end,
 })
 
 local PredictionSection = SilentAimTab:Section({ Title = 'prediction', Side = 'right' })
@@ -859,6 +944,15 @@ PredictionSection:Dropdown({
     Default = 'Delay + travel',
     Flag = 'mm2_silent_aim_method',
     Callback = function(value) Aim.Method = value end,
+})
+
+PredictionSection:Dropdown({
+    Title = 'math',
+    Desc = 'how the future position itself is worked out from their movement. linear: velocity times time, a straight line. acceleration: adds their rate of speeding up or turning, leads harder into a build up. curve: measures how fast their direction is rotating and bends the lead along that arc, for someone circling or strafing rather than running straight. damped: lead stops growing past about half a second, on the basis that nobody holds a line that long. raw: the unsmoothed latest sample, twitchiest and most reactive',
+    Values = MATH_METHODS,
+    Default = 'Linear',
+    Flag = 'mm2_silent_aim_math',
+    Callback = function(value) Aim.MathMethod = value end,
 })
 
 PredictionSection:Slider({
