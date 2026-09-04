@@ -249,17 +249,21 @@ local Aim = {
     ManualLeadTimeKnife = 0.15,
     KnifeSpeed = 96,
     JumpAware = true,
+    Method = 'Delay + travel',
+    BulletSpeed = 400,
 }
 
 local AUTO_LEVELS = {
-    Lesser   = { rate = 0.05, gunMin = 40, gunMax = 400,  knifeMulMin = 0.50, knifeMulMax = 1.30, smooth = 0.35, passes = 1 },
-    Normal   = { rate = 0.08, gunMin = 25, gunMax = 500,  knifeMulMin = 0.40, knifeMulMax = 1.40, smooth = 0.50, passes = 2 },
-    Extra    = { rate = 0.11, gunMin = 18, gunMax = 650,  knifeMulMin = 0.32, knifeMulMax = 1.50, smooth = 0.60, passes = 2 },
-    Advanced = { rate = 0.15, gunMin = 12, gunMax = 800,  knifeMulMin = 0.26, knifeMulMax = 1.55, smooth = 0.70, passes = 3 },
-    Best     = { rate = 0.20, gunMin = 8,  gunMax = 1000, knifeMulMin = 0.20, knifeMulMax = 1.60, smooth = 0.80, passes = 3 },
+    Lesser   = { rate = 0.10, delayMin = 0, delayMax = 0.8, smooth = 0.35, passes = 1 },
+    Normal   = { rate = 0.18, delayMin = 0, delayMax = 1.3, smooth = 0.50, passes = 2 },
+    Extra    = { rate = 0.26, delayMin = 0, delayMax = 1.8, smooth = 0.60, passes = 2 },
+    Advanced = { rate = 0.34, delayMin = 0, delayMax = 2.2, smooth = 0.70, passes = 3 },
+    Best     = { rate = 0.45, delayMin = 0, delayMax = 2.5, smooth = 0.80, passes = 3 },
 }
 
-local GUN_SEED_SPEED = 60
+local AIM_METHODS = { 'Delay + travel', 'Delay only', 'Travel only', 'Ping only' }
+local GUN_SEED_DELAY = 0.6
+local KNIFE_SEED_DELAY = 0.25
 local MAX_TRAVEL_TIME = 2.5
 local MAX_LEAD_OFFSET = 50
 local LEARN_MIN_LEAD = 0.75
@@ -435,21 +439,32 @@ local function predictRoot(entry, travelTime)
 end
 
 local function newLeadState(seed)
-    return { value = seed, pending = {}, verified = 0 }
+    return { delay = seed, pending = {}, verified = 0 }
 end
 
-local GunLead = newLeadState(GUN_SEED_SPEED)
-local KnifeLead = newLeadState(1)
+local GunLead = newLeadState(GUN_SEED_DELAY)
+local KnifeLead = newLeadState(KNIFE_SEED_DELAY)
 
-local function adjustGunLead(state, relative, settings)
-    state.value = math.clamp(state.value * (1 - relative * settings.rate), settings.gunMin, settings.gunMax)
+local function methodUsesDelay()
+    return Aim.Method == 'Delay + travel' or Aim.Method == 'Delay only'
 end
 
-local function adjustKnifeLead(state, relative, settings)
-    state.value = math.clamp(state.value * (1 - relative * settings.rate), settings.knifeMulMin, settings.knifeMulMax)
+local function methodUsesTravel()
+    return Aim.Method == 'Delay + travel' or Aim.Method == 'Travel only'
 end
 
-local function verifyLead(state, settings, adjust, now)
+local function travelTimeFor(state, distance, weaponSpeed, pingComponent)
+    local total = pingComponent
+    if methodUsesDelay() then
+        total = total + state.delay
+    end
+    if methodUsesTravel() then
+        total = total + distance / math.max(weaponSpeed, 1)
+    end
+    return math.min(total, MAX_TRAVEL_TIME)
+end
+
+local function verifyLead(state, settings, now)
     local pending = state.pending
     local index = 1
     while index <= #pending do
@@ -464,8 +479,8 @@ local function verifyLead(state, settings, adjust, now)
                 local actual = Vector3.new(entry.position.X, 0, entry.position.Z)
                 local predicted = Vector3.new(record.root.X, 0, record.root.Z)
                 local drift = (actual - predicted):Dot(lead.Unit)
-                local relative = math.clamp(drift / length, -1, 1)
-                adjust(state, relative, settings)
+                local timeError = drift / math.max(record.speed, 1)
+                state.delay = math.clamp(state.delay + timeError * settings.rate, settings.delayMin, settings.delayMax)
                 state.verified = state.verified + 1
             end
             table.remove(pending, index)
@@ -481,6 +496,7 @@ local function logLead(state, entry, predictedRoot, travelTime, now)
         entry = entry,
         root = predictedRoot,
         lead = lead,
+        speed = entry.horizontal.Magnitude,
         learnable = not entry.airborne and not isSpamJumper(entry),
     })
 end
@@ -593,16 +609,18 @@ local function solveAim(entry, part, root, char, origin, isKnife, now, settings)
 
     local pingComponent = Aim.UsePing and (cachedPing / 2) or 0
     local state = isKnife and KnifeLead or GunLead
-    local speed = isKnife and math.max(Aim.KnifeSpeed * state.value, 1) or math.max(state.value, 1)
+    local weaponSpeed = isKnife and Aim.KnifeSpeed or Aim.BulletSpeed
 
-    local travelTime = math.min(pingComponent + (part.Position - origin).Magnitude / speed, MAX_TRAVEL_TIME)
+    local travelTime = travelTimeFor(state, (part.Position - origin).Magnitude, weaponSpeed, pingComponent)
     local predicted = predictRoot(entry, travelTime)
     for _ = 2, settings.passes do
-        travelTime = math.min(pingComponent + ((predicted + offset) - origin).Magnitude / speed, MAX_TRAVEL_TIME)
+        travelTime = travelTimeFor(state, ((predicted + offset) - origin).Magnitude, weaponSpeed, pingComponent)
         predicted = predictRoot(entry, travelTime)
     end
 
-    logLead(state, entry, predicted, travelTime, now)
+    if methodUsesDelay() then
+        logLead(state, entry, predicted, travelTime, now)
+    end
     return predicted + offset
 end
 
@@ -618,10 +636,10 @@ track(PreSimulation:Connect(function()
         local settings = AUTO_LEVELS[Aim.AutoLevel] or AUTO_LEVELS.Normal
 
         if Aim.AutoPredict then
-            verifyLead(GunLead, settings, adjustGunLead, now)
-            verifyLead(KnifeLead, settings, adjustKnifeLead, now)
-            autoSummary = ('gun %d st/s (%d)  knife %.2fx (%d)')
-                :format(math.floor(GunLead.value), GunLead.verified, KnifeLead.value, KnifeLead.verified)
+            verifyLead(GunLead, settings, now)
+            verifyLead(KnifeLead, settings, now)
+            autoSummary = ('gun %.2fs (%d)  knife %.2fs (%d)')
+                :format(GunLead.delay, GunLead.verified, KnifeLead.delay, KnifeLead.verified)
         end
 
         local gPlr, gPart, gChar = scanTarget(isMurderer)
@@ -827,14 +845,35 @@ PredictionSection:Toggle({
 
 PredictionSection:Dropdown({
     Title = 'auto prediction amount',
-    Desc = 'how hard the feedback loop corrects, how far the learned speed is allowed to move, how heavily velocity is smoothed, and how many passes the travel time solves for',
+    Desc = 'how hard the feedback loop corrects, how far the learned delay is allowed to move, how heavily velocity is smoothed, and how many passes the travel time solves for',
     Values = { 'Lesser', 'Normal', 'Extra', 'Advanced', 'Best' },
     Default = 'Normal',
     Flag = 'mm2_silent_aim_auto_level',
     Callback = function(value) Aim.AutoLevel = value end,
 })
 
-local AutoStat = PredictionSection:Stat({ Title = 'learned lead', Value = 'idle' })
+PredictionSection:Dropdown({
+    Title = 'method',
+    Desc = 'delay + travel: a learned constant delay plus distance/speed flight time, the full model. delay only: constant lead everywhere, ignores distance - use when the delay is what matters and range is not. travel only: distance/speed alone, lead scales with range and goes near zero up close. ping only: raw half-ping, effectively no prediction, for comparison',
+    Values = AIM_METHODS,
+    Default = 'Delay + travel',
+    Flag = 'mm2_silent_aim_method',
+    Callback = function(value) Aim.Method = value end,
+})
+
+PredictionSection:Slider({
+    Title = 'bullet speed',
+    Desc = 'the travel component for the gun. high means the distance part barely adds anything and the learned delay does the work - a fast shot can still land late',
+    Min = 50,
+    Max = 1500,
+    Increment = 10,
+    Default = Aim.BulletSpeed,
+    Suffix = ' studs/s',
+    Flag = 'mm2_silent_aim_bullet_speed',
+    Callback = function(value) Aim.BulletSpeed = value end,
+})
+
+local AutoStat = PredictionSection:Stat({ Title = 'learned delay', Value = 'idle' })
 
 PredictionSection:Slider({
     Title = 'manual gun lead time',
