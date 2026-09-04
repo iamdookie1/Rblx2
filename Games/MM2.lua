@@ -269,6 +269,8 @@ local GUN_SEED_DELAY = 0.6
 local KNIFE_SEED_DELAY = 0.25
 local MAX_TRAVEL_TIME = 2.5
 local MAX_LEAD_OFFSET = 50
+local MAX_VERTICAL_RISE = 2
+local MAX_VERTICAL_DROP = 12
 local LEARN_MIN_LEAD = 0.75
 local MAX_PENDING = 24
 local JUMP_SPAM_WINDOW = 3
@@ -494,10 +496,19 @@ local function predictRoot(entry, travelTime)
             else
                 y = base.Y + entry.vertical * travelTime - 0.5 * g * travelTime * travelTime
             end
-            if y < entry.groundY then y = entry.groundY end
         end
-    else
-        y = base.Y + math.clamp(entry.vertical * travelTime, -MAX_LEAD_OFFSET, MAX_LEAD_OFFSET)
+    elseif entry.airborne then
+        y = base.Y + entry.vertical * travelTime
+    end
+
+    if y > base.Y + MAX_VERTICAL_RISE then
+        y = base.Y + MAX_VERTICAL_RISE
+    end
+    if y < base.Y - MAX_VERTICAL_DROP then
+        y = base.Y - MAX_VERTICAL_DROP
+    end
+    if entry.groundY and base.Y >= entry.groundY and y < entry.groundY then
+        y = entry.groundY
     end
 
     return Vector3.new(base.X + horizontal.X, y, base.Z + horizontal.Z)
