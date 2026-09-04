@@ -252,14 +252,14 @@ local Aim = {
 }
 
 local AUTO_LEVELS = {
-    Lesser   = { rate = 0.03, gunMin = 45, gunMax = 160, knifeMulMin = 0.70, knifeMulMax = 1.30, smooth = 0.35, passes = 1 },
-    Normal   = { rate = 0.06, gunMin = 30, gunMax = 200, knifeMulMin = 0.60, knifeMulMax = 1.40, smooth = 0.50, passes = 2 },
-    Extra    = { rate = 0.09, gunMin = 22, gunMax = 240, knifeMulMin = 0.50, knifeMulMax = 1.50, smooth = 0.60, passes = 2 },
-    Advanced = { rate = 0.13, gunMin = 18, gunMax = 260, knifeMulMin = 0.45, knifeMulMax = 1.55, smooth = 0.70, passes = 3 },
-    Best     = { rate = 0.18, gunMin = 15, gunMax = 280, knifeMulMin = 0.40, knifeMulMax = 1.60, smooth = 0.80, passes = 3 },
+    Lesser   = { rate = 0.03, gunMin = 250, gunMax = 900,  knifeMulMin = 0.70, knifeMulMax = 1.30, smooth = 0.35, passes = 1 },
+    Normal   = { rate = 0.06, gunMin = 180, gunMax = 1200, knifeMulMin = 0.60, knifeMulMax = 1.40, smooth = 0.50, passes = 2 },
+    Extra    = { rate = 0.09, gunMin = 140, gunMax = 1600, knifeMulMin = 0.50, knifeMulMax = 1.50, smooth = 0.60, passes = 2 },
+    Advanced = { rate = 0.13, gunMin = 110, gunMax = 2000, knifeMulMin = 0.45, knifeMulMax = 1.55, smooth = 0.70, passes = 3 },
+    Best     = { rate = 0.18, gunMin = 90,  gunMax = 2500, knifeMulMin = 0.40, knifeMulMax = 1.60, smooth = 0.80, passes = 3 },
 }
 
-local GUN_SEED_SPEED = 70
+local GUN_SEED_SPEED = 500
 local MAX_LEAD_OFFSET = 50
 local LEARN_MIN_LEAD = 0.75
 local MAX_PENDING = 24
@@ -303,21 +303,35 @@ end
 
 local motion = {}
 
-local function airborneState(char)
+local function humanoidState(char)
     local hum = char and char:FindFirstChildOfClass("Humanoid")
-    if not hum then return false end
+    if not hum then return nil, false end
     local ok, state = pcall(function() return hum:GetState() end)
-    if not ok then return false end
-    return state == Enum.HumanoidStateType.Freefall
+    local airborne = ok and (state == Enum.HumanoidStateType.Freefall
         or state == Enum.HumanoidStateType.Jumping
-        or state == Enum.HumanoidStateType.FallingDown
+        or state == Enum.HumanoidStateType.FallingDown)
+    return hum, airborne and true or false
+end
+
+local function jumpLaunchVelocity(hum)
+    local ok, useJumpPower = pcall(function() return hum.UseJumpPower end)
+    if ok and useJumpPower then
+        local ok2, power = pcall(function() return hum.JumpPower end)
+        if ok2 and typeof(power) == "number" and power > 0 then return power end
+        return nil
+    end
+    local ok3, height = pcall(function() return hum.JumpHeight end)
+    if ok3 and typeof(height) == "number" and height > 0 then
+        return math.sqrt(2 * gravity() * height)
+    end
+    return nil
 end
 
 local function sampleMotion(plr, root, now)
     local name = plr.Name
     local entry = motion[name]
     local position = root.Position
-    local airborne = airborneState(plr.Character)
+    local hum, airborne = humanoidState(plr.Character)
 
     if not entry then
         entry = {
@@ -328,6 +342,10 @@ local function sampleMotion(plr, root, now)
             groundY = position.Y,
             airborne = airborne,
             jumps = {},
+            jumpStart = nil,
+            jumpFromY = position.Y,
+            jumpLaunchV = nil,
+            jumpElapsed = 0,
         }
         motion[name] = entry
         return entry
@@ -348,13 +366,22 @@ local function sampleMotion(plr, root, now)
 
     if airborne and not entry.airborne then
         table.insert(entry.jumps, now)
+        entry.jumpStart = now
+        entry.jumpFromY = entry.position.Y
+        entry.jumpLaunchV = hum and jumpLaunchVelocity(hum) or nil
     end
     while entry.jumps[1] and now - entry.jumps[1] > JUMP_SPAM_WINDOW do
         table.remove(entry.jumps, 1)
     end
 
+    if airborne and entry.jumpStart then
+        entry.jumpElapsed = now - entry.jumpStart
+    end
+
     if not airborne then
         entry.groundY = position.Y
+        entry.jumpStart = nil
+        entry.jumpLaunchV = nil
     end
 
     entry.airborne = airborne
@@ -382,7 +409,12 @@ local function predictRoot(entry, travelTime)
     if Aim.JumpAware then
         if entry.airborne then
             local g = gravity()
-            y = base.Y + entry.vertical * travelTime - 0.5 * g * travelTime * travelTime
+            if entry.jumpLaunchV then
+                local t = entry.jumpElapsed + travelTime
+                y = entry.jumpFromY + entry.jumpLaunchV * t - 0.5 * g * t * t
+            else
+                y = base.Y + entry.vertical * travelTime - 0.5 * g * travelTime * travelTime
+            end
             if y < entry.groundY then y = entry.groundY end
         end
     else
