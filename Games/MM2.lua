@@ -264,7 +264,25 @@ local AUTO_LEVELS = {
 }
 
 local AIM_METHODS = { 'Delay + travel', 'Delay only', 'Travel only', 'Ping only' }
-local MATH_METHODS = { 'Linear', 'Acceleration', 'Curve', 'Damped', 'Raw' }
+local MATH_METHODS = {
+    'Linear',
+    'Acceleration',
+    'Jerk',
+    'Curve',
+    'Circular',
+    'Damped',
+    'Raw',
+    'Average',
+    'Median',
+    'Displacement',
+    'Facing',
+    'Strafe',
+    'Capped',
+    'Blend',
+    'Conservative',
+    'Aggressive',
+    'Adaptive',
+}
 local GUN_SEED_DELAY = 0.6
 local KNIFE_SEED_DELAY = 0.25
 local MAX_TRAVEL_TIME = 2.5
@@ -276,6 +294,8 @@ local MAX_PENDING = 24
 local JUMP_SPAM_WINDOW = 3
 local JUMP_SPAM_COUNT = 3
 local SAMPLE_STALE = 0.5
+local HISTORY_LIMIT = 14
+local HISTORY_WINDOW = 0.7
 
 local visionParams = RaycastParams.new()
 visionParams.FilterType = Enum.RaycastFilterType.Exclude
@@ -312,6 +332,12 @@ local function gravity()
 end
 
 local motion = {}
+
+local function flatten(vector)
+    local flat = Vector3.new(vector.X, 0, vector.Z)
+    if flat.Magnitude < 0.001 then return Vector3.new(0, 0, 1) end
+    return flat.Unit
+end
 
 local function humanoidState(char)
     local hum = char and char:FindFirstChildOfClass("Humanoid")
@@ -360,7 +386,13 @@ local function sampleMotion(plr, root, now)
             vertical = 0,
             raw = Vector3.zero,
             accel = Vector3.zero,
+            jerk = Vector3.zero,
             turnRate = 0,
+            steady = 1,
+            facing = flatten(root.CFrame.LookVector),
+            walkSpeed = 16,
+            speedCheck = 0,
+            history = {},
             groundY = position.Y,
             airborne = airborne,
             jumps = {},
@@ -385,8 +417,10 @@ local function sampleMotion(plr, root, now)
         entry.horizontal = previous:Lerp(rawHorizontal, settings.smooth)
         entry.vertical = entry.vertical + (rawVertical - entry.vertical) * 0.65
 
+        local previousAccel = entry.accel
         local accel = (entry.horizontal - previous) / dt
         entry.accel = entry.accel:Lerp(accel, 0.4)
+        entry.jerk = entry.jerk:Lerp((entry.accel - previousAccel) / dt, 0.25)
 
         if previous.Magnitude > 1 and entry.horizontal.Magnitude > 1 then
             local a, b = previous.Unit, entry.horizontal.Unit
@@ -394,15 +428,34 @@ local function sampleMotion(plr, root, now)
             local cross = a.X * b.Z - a.Z * b.X
             local turn = math.atan2(cross, dot) / dt
             entry.turnRate = entry.turnRate + (turn - entry.turnRate) * 0.35
+            entry.steady = entry.steady + (math.max(dot, 0) - entry.steady) * 0.3
         else
             entry.turnRate = entry.turnRate * 0.8
+            entry.steady = entry.steady + (1 - entry.steady) * 0.1
+        end
+
+        table.insert(entry.history, { v = rawHorizontal, p = position, t = now })
+        while #entry.history > HISTORY_LIMIT or (entry.history[1] and now - entry.history[1].t > HISTORY_WINDOW) do
+            table.remove(entry.history, 1)
         end
     elseif dt >= SAMPLE_STALE then
         entry.horizontal = Vector3.zero
         entry.raw = Vector3.zero
         entry.accel = Vector3.zero
+        entry.jerk = Vector3.zero
         entry.turnRate = 0
         entry.vertical = 0
+        entry.steady = 1
+        table.clear(entry.history)
+    end
+
+    entry.facing = flatten(root.CFrame.LookVector)
+    if now - entry.speedCheck > 0.5 then
+        entry.speedCheck = now
+        local okSpeed, speed = pcall(function() return hum and hum.WalkSpeed end)
+        if okSpeed and typeof(speed) == "number" and speed > 0 then
+            entry.walkSpeed = speed
+        end
     end
 
     if airborne and not entry.airborne then
@@ -435,44 +488,179 @@ local function isSpamJumper(entry)
     return #entry.jumps >= JUMP_SPAM_COUNT
 end
 
-local function horizontalLead(entry, t)
-    local method = Aim.MathMethod
+local LEAD_MATH = {}
 
-    if method == 'Raw' then
-        return entry.raw * t
-    end
+local function historyAt(entry, index)
+    return entry.history and entry.history[index] or nil
+end
 
-    if method == 'Acceleration' then
-        return entry.horizontal * t + entry.accel * (0.5 * t * t)
-    end
+local function medianOf(values)
+    table.sort(values)
+    local count = #values
+    if count == 0 then return 0 end
+    if count % 2 == 1 then return values[(count + 1) / 2] end
+    return (values[count / 2] + values[count / 2 + 1]) * 0.5
+end
 
-    if method == 'Curve' then
-        local omega = entry.turnRate
-        if math.abs(omega) < 0.05 then
-            return entry.horizontal * t
-        end
-        local steps = 4
-        local step = t / steps
-        local displacement = Vector3.zero
-        local velocity = entry.horizontal
-        for _ = 1, steps do
-            displacement = displacement + velocity * step
-            local angle = omega * step
-            local cos, sin = math.cos(angle), math.sin(angle)
-            velocity = Vector3.new(
-                velocity.X * cos - velocity.Z * sin,
-                0,
-                velocity.X * sin + velocity.Z * cos)
-        end
-        return displacement
-    end
-
-    if method == 'Damped' then
-        local tau = 0.6
-        return entry.horizontal * (tau * (1 - math.exp(-t / tau)))
-    end
-
+LEAD_MATH.Linear = function(entry, t)
     return entry.horizontal * t
+end
+
+LEAD_MATH.Raw = function(entry, t)
+    return entry.raw * t
+end
+
+LEAD_MATH.Acceleration = function(entry, t)
+    return entry.horizontal * t + entry.accel * (0.5 * t * t)
+end
+
+LEAD_MATH.Jerk = function(entry, t)
+    return entry.horizontal * t
+        + entry.accel * (0.5 * t * t)
+        + (entry.jerk or Vector3.zero) * (t * t * t / 6)
+end
+
+LEAD_MATH.Curve = function(entry, t)
+    local omega = entry.turnRate
+    if math.abs(omega) < 0.05 then
+        return entry.horizontal * t
+    end
+    local steps = 4
+    local step = t / steps
+    local displacement = Vector3.zero
+    local velocity = entry.horizontal
+    for _ = 1, steps do
+        displacement = displacement + velocity * step
+        local angle = omega * step
+        local cos, sin = math.cos(angle), math.sin(angle)
+        velocity = Vector3.new(
+            velocity.X * cos - velocity.Z * sin,
+            0,
+            velocity.X * sin + velocity.Z * cos)
+    end
+    return displacement
+end
+
+LEAD_MATH.Circular = function(entry, t)
+    local omega = entry.turnRate
+    local speed = entry.horizontal.Magnitude
+    if math.abs(omega) < 0.05 or speed < 0.5 then
+        return entry.horizontal * t
+    end
+    local forward = entry.horizontal.Unit
+    local side = Vector3.new(-forward.Z, 0, forward.X)
+    local radius = speed / omega
+    local angle = omega * t
+    return forward * (radius * math.sin(angle)) + side * (radius * (1 - math.cos(angle)))
+end
+
+LEAD_MATH.Damped = function(entry, t)
+    local tau = 0.6
+    return entry.horizontal * (tau * (1 - math.exp(-t / tau)))
+end
+
+LEAD_MATH.Average = function(entry, t)
+    local history = entry.history
+    if not history or #history == 0 then
+        return entry.horizontal * t
+    end
+    local sum = Vector3.zero
+    for _, sample in ipairs(history) do
+        sum = sum + sample.v
+    end
+    return (sum / #history) * t
+end
+
+LEAD_MATH.Median = function(entry, t)
+    local history = entry.history
+    if not history or #history < 3 then
+        return entry.horizontal * t
+    end
+    local xs, zs = {}, {}
+    for index, sample in ipairs(history) do
+        xs[index] = sample.v.X
+        zs[index] = sample.v.Z
+    end
+    return Vector3.new(medianOf(xs), 0, medianOf(zs)) * t
+end
+
+LEAD_MATH.Displacement = function(entry, t)
+    local first = historyAt(entry, 1)
+    local last = historyAt(entry, entry.history and #entry.history or 0)
+    if not first or not last then
+        return entry.horizontal * t
+    end
+    local span = last.t - first.t
+    if span < 0.05 then
+        return entry.horizontal * t
+    end
+    local delta = last.p - first.p
+    return Vector3.new(delta.X, 0, delta.Z) * (t / span)
+end
+
+LEAD_MATH.Facing = function(entry, t)
+    local facing = entry.facing
+    if not facing then
+        return entry.horizontal * t
+    end
+    local speed = entry.horizontal.Magnitude
+    if speed < 0.5 then
+        return Vector3.zero
+    end
+    return facing * (speed * t)
+end
+
+LEAD_MATH.Strafe = function(entry, t)
+    local facing = entry.facing
+    if not facing then
+        return entry.horizontal * t
+    end
+    local along = facing * entry.horizontal:Dot(facing)
+    local lateral = entry.horizontal - along
+    return (along + lateral * 0.35) * t
+end
+
+LEAD_MATH.Capped = function(entry, t)
+    local velocity = entry.horizontal
+    local speed = velocity.Magnitude
+    local ceiling = (entry.walkSpeed or 16) * 1.15
+    if speed > ceiling and speed > 0.001 then
+        velocity = velocity.Unit * ceiling
+    end
+    return velocity * t
+end
+
+LEAD_MATH.Blend = function(entry, t)
+    local steady = math.clamp(entry.steady or 1, 0, 1)
+    local linear = entry.horizontal * t
+    local curved = entry.horizontal * t + entry.accel * (0.5 * t * t)
+    return linear:Lerp(curved, steady)
+end
+
+LEAD_MATH.Conservative = function(entry, t)
+    return entry.horizontal * (t * 0.6)
+end
+
+LEAD_MATH.Aggressive = function(entry, t)
+    return entry.horizontal * (t * 1.25) + entry.accel * (0.5 * t * t)
+end
+
+LEAD_MATH.Adaptive = function(entry, t)
+    if math.abs(entry.turnRate) > 1.2 then
+        return LEAD_MATH.Circular(entry, t)
+    end
+    if entry.accel.Magnitude > 40 then
+        return LEAD_MATH.Acceleration(entry, t)
+    end
+    if (entry.steady or 1) < 0.35 then
+        return LEAD_MATH.Damped(entry, t)
+    end
+    return LEAD_MATH.Linear(entry, t)
+end
+
+local function horizontalLead(entry, t)
+    local solver = LEAD_MATH[Aim.MathMethod] or LEAD_MATH.Linear
+    return solver(entry, t)
 end
 
 local function predictRoot(entry, travelTime)
@@ -959,7 +1147,7 @@ PredictionSection:Dropdown({
 
 PredictionSection:Dropdown({
     Title = 'math',
-    Desc = 'how the future position itself is worked out from their movement. linear: velocity times time, a straight line. acceleration: adds their rate of speeding up or turning, leads harder into a build up. curve: measures how fast their direction is rotating and bends the lead along that arc, for someone circling or strafing rather than running straight. damped: lead stops growing past about half a second, on the basis that nobody holds a line that long. raw: the unsmoothed latest sample, twitchiest and most reactive',
+    Desc = 'how the future position is worked out from their movement. linear: velocity times time, a straight line. acceleration: adds their rate of speeding up, leads harder into a build up. jerk: one order further, catches a lead that is itself still ramping. curve: steps the lead along their measured turn. circular: the exact arc for that turn rate instead of stepping it, better for long leads on someone orbiting you. damped: lead stops growing past about half a second, nobody holds a line that long. raw: the unsmoothed latest sample, twitchiest. average: mean of the last ~0.7s of samples, ignores single-frame spikes. median: middle sample of that window, throws out lag spikes entirely. displacement: where they actually got over the window divided by the time, so a strafer who ended up nowhere gets almost no lead. facing: their speed sent along the way they are looking, for someone who turns before they move. strafe: keeps the forward part of their run and cuts the side-to-side part, for a-d spammers. capped: their direction but never faster than their walkspeed, kills teleport and rubberband spikes. blend: linear and acceleration mixed by how consistent their direction has been. conservative: 60% lead, for close range where overshooting is the whole problem. aggressive: 125% lead plus acceleration, for far targets running flat out. adaptive: picks circular, acceleration, damped or linear per target from their measured turn, acceleration and steadiness',
     Values = MATH_METHODS,
     Default = 'Linear',
     Flag = 'mm2_silent_aim_math',
