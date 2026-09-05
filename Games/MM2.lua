@@ -273,6 +273,8 @@ local Debug = {
     Markers = true,
 }
 
+local cachedPing = 0.08
+
 local shotStats = { seen = 0, redirected = 0, suppressed = 0, proved = 0, error = 0 }
 local shotEvents = {}
 local lastSolve = {}
@@ -843,7 +845,6 @@ end
 
 local gunPlan = nil
 local knifePlan = nil
-local cachedPing = 0.08
 
 local function findGunOrigin()
     local char = LocalPlayer.Character
