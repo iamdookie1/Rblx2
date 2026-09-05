@@ -273,21 +273,22 @@ local legitSeen = {}
 local legitLock = {}
 
 local AUTO_LEVELS = {
-    Lesser   = { rate = 0.10, delayMin = 0, delayMax = 0.8, smooth = 0.35, passes = 1 },
-    Normal   = { rate = 0.18, delayMin = 0, delayMax = 1.3, smooth = 0.50, passes = 2 },
-    Extra    = { rate = 0.26, delayMin = 0, delayMax = 1.8, smooth = 0.60, passes = 2 },
-    Advanced = { rate = 0.34, delayMin = 0, delayMax = 2.2, smooth = 0.70, passes = 3 },
-    Best     = { rate = 0.45, delayMin = 0, delayMax = 2.5, smooth = 0.80, passes = 3 },
+    Lesser   = { rate = 0.10, delayMin = 0, delayMax = 0.30, smooth = 0.35, passes = 1 },
+    Normal   = { rate = 0.18, delayMin = 0, delayMax = 0.45, smooth = 0.50, passes = 2 },
+    Extra    = { rate = 0.26, delayMin = 0, delayMax = 0.60, smooth = 0.60, passes = 2 },
+    Advanced = { rate = 0.34, delayMin = 0, delayMax = 0.75, smooth = 0.70, passes = 3 },
+    Best     = { rate = 0.45, delayMin = 0, delayMax = 0.90, smooth = 0.80, passes = 3 },
 }
 
 local AIM_METHODS = { 'Delay + travel', 'Delay only', 'Travel only', 'Ping only' }
-local GUN_SEED_DELAY = 0.6
-local KNIFE_SEED_DELAY = 0.25
+local GUN_SEED_DELAY = 0.08
+local KNIFE_SEED_DELAY = 0.12
 local MAX_TRAVEL_TIME = 2.5
 local MAX_LEAD_OFFSET = 50
 local MAX_VERTICAL_RISE = 2
 local MAX_VERTICAL_DROP = 12
 local LEARN_MIN_LEAD = 0.75
+local LEARN_MIN_SPEED = 6
 local MAX_PENDING = 24
 local JUMP_SPAM_WINDOW = 3
 local JUMP_SPAM_COUNT = 3
@@ -776,7 +777,7 @@ local function logLead(state, entry, base, predictedRoot, travelTime, distance, 
         used = travelTime,
         distance = distance,
         ping = pingComponent,
-        learnable = not entry.airborne and not isSpamJumper(entry),
+        learnable = entry.horizontal.Magnitude >= LEARN_MIN_SPEED,
     })
 end
 
@@ -930,7 +931,7 @@ local function solveAim(plan, origin, now, leadScale)
         predicted = predictRoot(entry, rootPos, sinceSample, travelTime)
     end
 
-    return predicted + offset, rootPos, travelTime, distance, pingComponent
+    return predicted + offset, rootPos, travelTime, distance, pingComponent, predicted
 end
 
 local function crossOf(a, b)
@@ -1057,7 +1058,8 @@ local function buildPlan(filter, isKnife, origin, now, settings)
 
                 if clearPath(origin, part.Position, char) then
                     for _, scale in ipairs(LEAD_SCALES) do
-                        local aim, base, travelTime, distance, ping = solveAim(plan, origin, now, scale)
+                        local aim, base, travelTime, distance, ping, predictedRoot =
+                            solveAim(plan, origin, now, scale)
                         budget = budget - (guaranteed and 5 or 1)
 
                         if clearPath(origin, aim, char)
@@ -1065,8 +1067,8 @@ local function buildPlan(filter, isKnife, origin, now, settings)
                             plan.leadScale = scale
                             plan.fallback = CFrame.new(aim)
 
-                            if Aim.AutoPredict and methodUsesDelay() and scale == 1 and distance then
-                                logLead(plan.state, entry, base, aim, travelTime, distance, ping, now)
+                            if Aim.AutoPredict and methodUsesDelay() and distance and predictedRoot then
+                                logLead(plan.state, entry, base, predictedRoot, travelTime, distance, ping, now)
                             end
 
                             if Legit.Enabled then
