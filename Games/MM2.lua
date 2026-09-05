@@ -251,7 +251,6 @@ local Aim = {
     KnifeSpeed = 96,
     JumpAware = true,
     Method = 'Delay + travel',
-    MathMethod = 'Circular',
     BulletSpeed = 400,
 }
 
@@ -264,37 +263,6 @@ local AUTO_LEVELS = {
 }
 
 local AIM_METHODS = { 'Delay + travel', 'Delay only', 'Travel only', 'Ping only' }
-local MATH_METHODS = {
-    'Circular',
-    'Circle fit',
-    'Orbit',
-    'Spiral',
-    'Arc jerk',
-    'Decay arc',
-    'Tight arc',
-    'Steady arc',
-    'Arc blend',
-    'Arc capped',
-    'Arc strafe',
-    'Reverse arc',
-    'Adaptive arc',
-    'Curve',
-    'Linear',
-    'Acceleration',
-    'Jerk',
-    'Damped',
-    'Raw',
-    'Average',
-    'Median',
-    'Displacement',
-    'Facing',
-    'Strafe',
-    'Capped',
-    'Blend',
-    'Conservative',
-    'Aggressive',
-    'Adaptive',
-}
 local GUN_SEED_DELAY = 0.6
 local KNIFE_SEED_DELAY = 0.25
 local MAX_TRAVEL_TIME = 2.5
@@ -309,9 +277,15 @@ local SAMPLE_STALE = 0.5
 local HISTORY_LIMIT = 14
 local HISTORY_WINDOW = 0.7
 local MIN_TURN_RATE = 0.05
+local MAX_TURN_RATE = 4
 local MIN_TURN_RADIUS = 2.5
 local MAX_TURN_RADIUS = 400
 local TURN_DECAY = 0.45
+local MAX_TANGENTIAL = 120
+local SPEED_CEILING = 1.6
+local TRUST_FLOOR = 0.7
+local ARC_STEPS = 6
+local PLAN_STALE = 0.25
 
 local visionParams = RaycastParams.new()
 visionParams.FilterType = Enum.RaycastFilterType.Exclude
@@ -348,12 +322,6 @@ local function gravity()
 end
 
 local motion = {}
-
-local function flatten(vector)
-    local flat = Vector3.new(vector.X, 0, vector.Z)
-    if flat.Magnitude < 0.001 then return Vector3.new(0, 0, 1) end
-    return flat.Unit
-end
 
 local function humanoidState(char)
     local hum = char and char:FindFirstChildOfClass("Humanoid")
@@ -400,12 +368,9 @@ local function sampleMotion(plr, root, now)
             time = now,
             horizontal = Vector3.zero,
             vertical = 0,
-            raw = Vector3.zero,
             accel = Vector3.zero,
-            jerk = Vector3.zero,
             turnRate = 0,
             steady = 1,
-            facing = flatten(root.CFrame.LookVector),
             walkSpeed = 16,
             speedCheck = 0,
             history = {},
@@ -429,14 +394,11 @@ local function sampleMotion(plr, root, now)
         local settings = AUTO_LEVELS[Aim.AutoLevel] or AUTO_LEVELS.Normal
         local previous = entry.horizontal
 
-        entry.raw = rawHorizontal
         entry.horizontal = previous:Lerp(rawHorizontal, settings.smooth)
         entry.vertical = entry.vertical + (rawVertical - entry.vertical) * 0.65
 
-        local previousAccel = entry.accel
         local accel = (entry.horizontal - previous) / dt
         entry.accel = entry.accel:Lerp(accel, 0.4)
-        entry.jerk = entry.jerk:Lerp((entry.accel - previousAccel) / dt, 0.25)
 
         if previous.Magnitude > 1 and entry.horizontal.Magnitude > 1 then
             local a, b = previous.Unit, entry.horizontal.Unit
@@ -450,22 +412,19 @@ local function sampleMotion(plr, root, now)
             entry.steady = entry.steady + (1 - entry.steady) * 0.1
         end
 
-        table.insert(entry.history, { v = rawHorizontal, p = position, t = now })
+        table.insert(entry.history, { p = position, t = now })
         while #entry.history > HISTORY_LIMIT or (entry.history[1] and now - entry.history[1].t > HISTORY_WINDOW) do
             table.remove(entry.history, 1)
         end
     elseif dt >= SAMPLE_STALE then
         entry.horizontal = Vector3.zero
-        entry.raw = Vector3.zero
         entry.accel = Vector3.zero
-        entry.jerk = Vector3.zero
         entry.turnRate = 0
         entry.vertical = 0
         entry.steady = 1
         table.clear(entry.history)
     end
 
-    entry.facing = flatten(root.CFrame.LookVector)
     if now - entry.speedCheck > 0.5 then
         entry.speedCheck = now
         local okSpeed, speed = pcall(function() return hum and hum.WalkSpeed end)
@@ -504,43 +463,11 @@ local function isSpamJumper(entry)
     return #entry.jumps >= JUMP_SPAM_COUNT
 end
 
-local LEAD_MATH = {}
-
-local function historyAt(entry, index)
-    return entry.history and entry.history[index] or nil
-end
-
-local function medianOf(values)
-    table.sort(values)
-    local count = #values
-    if count == 0 then return 0 end
-    if count % 2 == 1 then return values[(count + 1) / 2] end
-    return (values[count / 2] + values[count / 2 + 1]) * 0.5
-end
-
 local function perpOf(forward)
     return Vector3.new(-forward.Z, 0, forward.X)
 end
 
-local function arcDisplacement(forward, speed, omega, t)
-    if math.abs(omega) < MIN_TURN_RATE or math.abs(speed) < 0.25 then
-        return forward * (speed * t)
-    end
-    local radius = speed / omega
-    local angle = omega * t
-    return forward * (radius * math.sin(angle))
-        + perpOf(forward) * (radius * (1 - math.cos(angle)))
-end
-
-local function rotateAbout(offset, angle)
-    local cos, sin = math.cos(angle), math.sin(angle)
-    return Vector3.new(
-        offset.X * cos - offset.Z * sin,
-        0,
-        offset.X * sin + offset.Z * cos)
-end
-
-local function fitCircle(entry)
+local function fitTurnRate(entry, speed)
     local history = entry.history
     local count = history and #history or 0
     if count < 5 then return nil end
@@ -566,323 +493,67 @@ local function fitCircle(entry)
     local radius = math.sqrt(cx * cx + cz * cz)
     if radius < MIN_TURN_RADIUS or radius > MAX_TURN_RADIUS then return nil end
 
-    local center = Vector3.new(origin.X + cx, 0, origin.Z + cz)
-    local toStart = Vector3.new(first.p.X - center.X, 0, first.p.Z - center.Z)
-    local toEnd = Vector3.new(origin.X - center.X, 0, origin.Z - center.Z)
+    local toStart = Vector3.new(first.p.X - origin.X - cx, 0, first.p.Z - origin.Z - cz)
+    local toEnd = Vector3.new(-cx, 0, -cz)
     if toStart.Magnitude < 0.001 or toEnd.Magnitude < 0.001 then return nil end
 
     local startUnit, endUnit = toStart.Unit, toEnd.Unit
     local dot = math.clamp(startUnit:Dot(endUnit), -1, 1)
     local cross = startUnit.X * endUnit.Z - startUnit.Z * endUnit.X
-    local swept = math.atan2(cross, dot)
-    local omega = swept / span
+    local omega = math.atan2(cross, dot) / span
     if math.abs(omega) < MIN_TURN_RATE then return nil end
 
-    return center, radius, omega, toEnd
+    local implied = radius * math.abs(omega)
+    if implied < speed * 0.5 or implied > speed * 2 then return nil end
+
+    return omega
 end
 
-LEAD_MATH.Linear = function(entry, t)
-    return entry.horizontal * t
-end
+local function predictHorizontal(entry, t)
+    if t <= 0 then return Vector3.zero end
 
-LEAD_MATH.Raw = function(entry, t)
-    return entry.raw * t
-end
-
-LEAD_MATH.Acceleration = function(entry, t)
-    return entry.horizontal * t + entry.accel * (0.5 * t * t)
-end
-
-LEAD_MATH.Jerk = function(entry, t)
-    return entry.horizontal * t
-        + entry.accel * (0.5 * t * t)
-        + (entry.jerk or Vector3.zero) * (t * t * t / 6)
-end
-
-LEAD_MATH.Curve = function(entry, t)
-    local omega = entry.turnRate
-    if math.abs(omega) < 0.05 then
-        return entry.horizontal * t
-    end
-    local steps = 4
-    local step = t / steps
-    local displacement = Vector3.zero
-    local velocity = entry.horizontal
-    for _ = 1, steps do
-        displacement = displacement + velocity * step
-        local angle = omega * step
-        local cos, sin = math.cos(angle), math.sin(angle)
-        velocity = Vector3.new(
-            velocity.X * cos - velocity.Z * sin,
-            0,
-            velocity.X * sin + velocity.Z * cos)
-    end
-    return displacement
-end
-
-LEAD_MATH.Circular = function(entry, t)
-    local speed = entry.horizontal.Magnitude
-    if speed < 0.5 then return entry.horizontal * t end
-    return arcDisplacement(entry.horizontal.Unit, speed, entry.turnRate, t)
-end
-
-LEAD_MATH.Spiral = function(entry, t)
-    local omega = entry.turnRate
-    local speed = entry.horizontal.Magnitude
-    if math.abs(omega) < MIN_TURN_RATE or speed < 0.5 then
-        return LEAD_MATH.Acceleration(entry, t)
-    end
-
-    local forward = entry.horizontal.Unit
-    local tangential = entry.accel:Dot(forward)
-    local angle = omega * t
-    local cos, sin = math.cos(angle), math.sin(angle)
-
-    local along = speed * sin / omega
-        + tangential * ((cos - 1) / (omega * omega) + t * sin / omega)
-    local across = speed * (1 - cos) / omega
-        + tangential * (sin / (omega * omega) - t * cos / omega)
-
-    return forward * along + perpOf(forward) * across
-end
-
-LEAD_MATH['Circle fit'] = function(entry, t)
-    local center, _, omega, spoke = fitCircle(entry)
-    if not center then return LEAD_MATH.Circular(entry, t) end
-    return rotateAbout(spoke, omega * t) - spoke
-end
-
-LEAD_MATH.Orbit = function(entry, t)
-    local center, radius, omega, spoke = fitCircle(entry)
-    if not center then return LEAD_MATH.Circular(entry, t) end
-    local speed = entry.horizontal.Magnitude
-    if speed > 0.5 and radius > 0 then
-        local paced = speed / radius
-        omega = omega >= 0 and paced or -paced
-    end
-    return rotateAbout(spoke, omega * t) - spoke
-end
-
-LEAD_MATH['Decay arc'] = function(entry, t)
-    local omega = entry.turnRate
-    local speed = entry.horizontal.Magnitude
-    if math.abs(omega) < MIN_TURN_RATE or speed < 0.5 then
-        return entry.horizontal * t
-    end
-
-    local forward = entry.horizontal.Unit
-    local side = perpOf(forward)
-    local steps = 6
-    local step = t / steps
-    local displacement = Vector3.zero
-    for index = 1, steps do
-        local mid = (index - 0.5) * step
-        local heading = omega * TURN_DECAY * (1 - math.exp(-mid / TURN_DECAY))
-        displacement = displacement
-            + (forward * math.cos(heading) + side * math.sin(heading)) * (speed * step)
-    end
-    return displacement
-end
-
-LEAD_MATH['Tight arc'] = function(entry, t)
-    local speed = entry.horizontal.Magnitude
-    local omega = entry.turnRate
-    if speed < 0.5 then return entry.horizontal * t end
-    if math.abs(omega) >= MIN_TURN_RATE then
-        local radius = speed / omega
-        if math.abs(radius) < MIN_TURN_RADIUS then
-            omega = radius >= 0 and (speed / MIN_TURN_RADIUS) or -(speed / MIN_TURN_RADIUS)
-        end
-    end
-    return arcDisplacement(entry.horizontal.Unit, speed, omega, t)
-end
-
-LEAD_MATH['Steady arc'] = function(entry, t)
-    local history = entry.history
-    if not history or #history < 3 then return LEAD_MATH.Circular(entry, t) end
-    local sum = Vector3.zero
-    for _, sample in ipairs(history) do
-        sum = sum + sample.v
-    end
-    local mean = sum / #history
-    local speed = mean.Magnitude
-    if speed < 0.5 then return entry.horizontal * t end
-    return arcDisplacement(mean.Unit, speed, entry.turnRate, t)
-end
-
-LEAD_MATH['Arc blend'] = function(entry, t)
-    local steady = math.clamp(entry.steady or 1, 0, 1)
-    return (entry.horizontal * t):Lerp(LEAD_MATH.Circular(entry, t), steady)
-end
-
-LEAD_MATH['Arc capped'] = function(entry, t)
-    local speed = entry.horizontal.Magnitude
-    if speed < 0.5 then return entry.horizontal * t end
-    local ceiling = (entry.walkSpeed or 16) * 1.15
-    if speed > ceiling then speed = ceiling end
-    return arcDisplacement(entry.horizontal.Unit, speed, entry.turnRate, t)
-end
-
-LEAD_MATH['Reverse arc'] = function(entry, t)
-    local speed = entry.horizontal.Magnitude
-    if speed < 0.5 then return entry.horizontal * t end
-    return arcDisplacement(entry.horizontal.Unit, speed, -entry.turnRate, t)
-end
-
-LEAD_MATH['Arc strafe'] = function(entry, t)
-    local facing = entry.facing
-    if not facing then return LEAD_MATH.Circular(entry, t) end
-    local speed = entry.horizontal:Dot(facing)
-    if math.abs(speed) < 0.5 then return Vector3.zero end
-    return arcDisplacement(facing, speed, entry.turnRate, t)
-end
-
-LEAD_MATH['Arc jerk'] = function(entry, t)
-    local base = LEAD_MATH.Spiral(entry, t)
-    local jerk = entry.jerk or Vector3.zero
-    return base + jerk * (t * t * t / 6)
-end
-
-LEAD_MATH.Damped = function(entry, t)
-    local tau = 0.6
-    return entry.horizontal * (tau * (1 - math.exp(-t / tau)))
-end
-
-LEAD_MATH.Average = function(entry, t)
-    local history = entry.history
-    if not history or #history == 0 then
-        return entry.horizontal * t
-    end
-    local sum = Vector3.zero
-    for _, sample in ipairs(history) do
-        sum = sum + sample.v
-    end
-    return (sum / #history) * t
-end
-
-LEAD_MATH.Median = function(entry, t)
-    local history = entry.history
-    if not history or #history < 3 then
-        return entry.horizontal * t
-    end
-    local xs, zs = {}, {}
-    for index, sample in ipairs(history) do
-        xs[index] = sample.v.X
-        zs[index] = sample.v.Z
-    end
-    return Vector3.new(medianOf(xs), 0, medianOf(zs)) * t
-end
-
-LEAD_MATH.Displacement = function(entry, t)
-    local first = historyAt(entry, 1)
-    local last = historyAt(entry, entry.history and #entry.history or 0)
-    if not first or not last then
-        return entry.horizontal * t
-    end
-    local span = last.t - first.t
-    if span < 0.05 then
-        return entry.horizontal * t
-    end
-    local delta = last.p - first.p
-    return Vector3.new(delta.X, 0, delta.Z) * (t / span)
-end
-
-LEAD_MATH.Facing = function(entry, t)
-    local facing = entry.facing
-    if not facing then
-        return entry.horizontal * t
-    end
-    local speed = entry.horizontal.Magnitude
-    if speed < 0.5 then
-        return Vector3.zero
-    end
-    return facing * (speed * t)
-end
-
-LEAD_MATH.Strafe = function(entry, t)
-    local facing = entry.facing
-    if not facing then
-        return entry.horizontal * t
-    end
-    local along = facing * entry.horizontal:Dot(facing)
-    local lateral = entry.horizontal - along
-    return (along + lateral * 0.35) * t
-end
-
-LEAD_MATH.Capped = function(entry, t)
     local velocity = entry.horizontal
     local speed = velocity.Magnitude
-    local ceiling = (entry.walkSpeed or 16) * 1.15
-    if speed > ceiling and speed > 0.001 then
-        velocity = velocity.Unit * ceiling
-    end
-    return velocity * t
-end
-
-LEAD_MATH.Blend = function(entry, t)
-    local steady = math.clamp(entry.steady or 1, 0, 1)
-    local linear = entry.horizontal * t
-    local curved = entry.horizontal * t + entry.accel * (0.5 * t * t)
-    return linear:Lerp(curved, steady)
-end
-
-LEAD_MATH.Conservative = function(entry, t)
-    return entry.horizontal * (t * 0.6)
-end
-
-LEAD_MATH.Aggressive = function(entry, t)
-    return entry.horizontal * (t * 1.25) + entry.accel * (0.5 * t * t)
-end
-
-LEAD_MATH.Adaptive = function(entry, t)
-    if math.abs(entry.turnRate) > 1.2 then
-        return LEAD_MATH.Circular(entry, t)
-    end
-    if entry.accel.Magnitude > 40 then
-        return LEAD_MATH.Acceleration(entry, t)
-    end
-    if (entry.steady or 1) < 0.35 then
-        return LEAD_MATH.Damped(entry, t)
-    end
-    return LEAD_MATH.Linear(entry, t)
-end
-
-LEAD_MATH['Adaptive arc'] = function(entry, t)
-    local steady = entry.steady or 1
-    local speed = entry.horizontal.Magnitude
-
     if speed < 0.5 then return Vector3.zero end
-    if steady < 0.3 then return LEAD_MATH['Arc blend'](entry, t) end
 
-    local center = fitCircle(entry)
-    if center and steady > 0.55 then
-        return LEAD_MATH.Orbit(entry, t)
+    local ceiling = (entry.walkSpeed or 16) * SPEED_CEILING
+    if speed > ceiling then speed = ceiling end
+
+    local forward = velocity.Unit
+    local steady = math.clamp(entry.steady or 1, 0, 1)
+
+    local fitted = fitTurnRate(entry, speed)
+    local omega = math.clamp(fitted or entry.turnRate, -MAX_TURN_RATE, MAX_TURN_RATE) * steady
+
+    local tangential = math.clamp(entry.accel:Dot(forward), -MAX_TANGENTIAL, MAX_TANGENTIAL)
+    local horizon = t * (TRUST_FLOOR + (1 - TRUST_FLOOR) * steady)
+
+    local side = perpOf(forward)
+    local step = horizon / ARC_STEPS
+    local displacement = Vector3.zero
+
+    for index = 1, ARC_STEPS do
+        local mid = (index - 0.5) * step
+        local heading
+        if fitted then
+            heading = omega * mid
+        else
+            heading = omega * TURN_DECAY * (1 - math.exp(-mid / TURN_DECAY))
+        end
+        local moving = math.clamp(speed + tangential * mid, 0, ceiling)
+        displacement = displacement
+            + (forward * math.cos(heading) + side * math.sin(heading)) * (moving * step)
     end
 
-    if math.abs(entry.accel:Dot(entry.horizontal.Unit)) > 25 then
-        return LEAD_MATH.Spiral(entry, t)
-    end
-    if t > 0.8 then
-        return LEAD_MATH['Decay arc'](entry, t)
-    end
-    if speed > (entry.walkSpeed or 16) * 1.4 then
-        return LEAD_MATH['Arc capped'](entry, t)
-    end
-    return LEAD_MATH['Tight arc'](entry, t)
+    return displacement
 end
 
-local function horizontalLead(entry, t)
-    local solver = LEAD_MATH[Aim.MathMethod] or LEAD_MATH.Linear
-    return solver(entry, t)
-end
-
-local function predictRoot(entry, travelTime)
-    local base = entry.position
+local function predictRoot(entry, base, sinceSample, travelTime)
     if not Aim.Predict or travelTime <= 0 then
         return base
     end
 
-    local horizontal = horizontalLead(entry, travelTime)
+    local horizontal = predictHorizontal(entry, travelTime)
     if horizontal.Magnitude > MAX_LEAD_OFFSET then
         horizontal = horizontal.Unit * MAX_LEAD_OFFSET
     end
@@ -892,7 +563,7 @@ local function predictRoot(entry, travelTime)
         if entry.airborne then
             local g = gravity()
             if entry.jumpLaunchV then
-                local t = entry.jumpElapsed + travelTime
+                local t = entry.jumpElapsed + sinceSample + travelTime
                 y = entry.jumpFromY + entry.jumpLaunchV * t - 0.5 * g * t * t
             else
                 y = base.Y + entry.vertical * travelTime - 0.5 * g * travelTime * travelTime
@@ -965,8 +636,8 @@ local function verifyLead(state, settings, now)
     end
 end
 
-local function logLead(state, entry, predictedRoot, travelTime, now)
-    local lead = Vector3.new(predictedRoot.X - entry.position.X, 0, predictedRoot.Z - entry.position.Z)
+local function logLead(state, entry, base, predictedRoot, travelTime, now)
+    local lead = Vector3.new(predictedRoot.X - base.X, 0, predictedRoot.Z - base.Z)
     if lead.Magnitude < LEARN_MIN_LEAD or #state.pending >= MAX_PENDING then return end
     table.insert(state.pending, {
         dueAt = now + travelTime,
@@ -1061,8 +732,8 @@ for _, instance in ipairs(CollectionService:GetTagged("ThrowingKnife")) do
     task.spawn(onThrowingKnifeAdded, instance)
 end
 
-local cachedGunRedirect = nil
-local cachedKnifeRedirect = nil
+local gunPlan = nil
+local knifePlan = nil
 local cachedPing = 0.08
 
 local function findGunOrigin()
@@ -1079,41 +750,83 @@ local function findKnifeOrigin()
     return handle and handle.Position
 end
 
-local function solveAim(entry, part, root, char, origin, isKnife, now, settings)
-    local offset = part.Position - root.Position
+local function solveAim(plan, origin, now)
+    local entry = plan.entry
+    local rootPos = plan.root.Position
+    local partPos = plan.part.Position
+    local sinceSample = now - entry.time
+    if sinceSample < 0 then sinceSample = 0 end
+    if sinceSample > SAMPLE_STALE then sinceSample = SAMPLE_STALE end
+
+    local offset = partPos - rootPos
     if Aim.JumpAware and entry.airborne then
-        offset = Vector3.new(offset.X, -feetOffset(char), offset.Z)
+        offset = Vector3.new(offset.X, -plan.hipOffset, offset.Z)
     end
 
     if not Aim.Predict then
-        return root.Position + offset
+        return rootPos + offset, rootPos, 0
     end
 
     if not Aim.AutoPredict then
-        local travelTime = isKnife and Aim.ManualLeadTimeKnife or Aim.ManualLeadTimeGun
-        return predictRoot(entry, travelTime) + offset
+        local travelTime = plan.isKnife and Aim.ManualLeadTimeKnife or Aim.ManualLeadTimeGun
+        local manual = predictRoot(entry, rootPos, sinceSample, travelTime)
+        return manual + offset, rootPos, travelTime
     end
 
     local pingComponent = Aim.UsePing and (cachedPing / 2) or 0
-    local state = isKnife and KnifeLead or GunLead
-    local weaponSpeed = isKnife and Aim.KnifeSpeed or Aim.BulletSpeed
+    local state = plan.state
+    local weaponSpeed = plan.isKnife and Aim.KnifeSpeed or Aim.BulletSpeed
+    local settings = plan.settings
 
-    local travelTime = travelTimeFor(state, (part.Position - origin).Magnitude, weaponSpeed, pingComponent)
-    local predicted = predictRoot(entry, travelTime)
+    local travelTime = travelTimeFor(state, (partPos - origin).Magnitude, weaponSpeed, pingComponent)
+    local predicted = predictRoot(entry, rootPos, sinceSample, travelTime)
     for _ = 2, settings.passes do
         travelTime = travelTimeFor(state, ((predicted + offset) - origin).Magnitude, weaponSpeed, pingComponent)
-        predicted = predictRoot(entry, travelTime)
+        predicted = predictRoot(entry, rootPos, sinceSample, travelTime)
     end
 
-    if methodUsesDelay() then
-        logLead(state, entry, predicted, travelTime, now)
+    return predicted + offset, rootPos, travelTime
+end
+
+local function livePlan(plan, now)
+    if not plan or now - plan.stamp > PLAN_STALE then return nil end
+    return plan
+end
+
+local function buildPlan(filter, isKnife, origin, now, settings)
+    if not origin then return nil end
+
+    local plr, part, char = scanTarget(filter)
+    if not plr or not part or not char then return nil end
+
+    local root = char:FindFirstChild("HumanoidRootPart")
+    if not root then return nil end
+
+    local plan = {
+        entry = sampleMotion(plr, root, now),
+        part = part,
+        root = root,
+        char = char,
+        hipOffset = feetOffset(char),
+        state = isKnife and KnifeLead or GunLead,
+        settings = settings,
+        isKnife = isKnife,
+        stamp = now,
+    }
+
+    local aim, base, travelTime = solveAim(plan, origin, now)
+    if not clearPath(origin, aim, char) then return nil end
+
+    if Aim.AutoPredict and methodUsesDelay() then
+        logLead(plan.state, plan.entry, base, aim, travelTime, now)
     end
-    return predicted + offset
+
+    return plan
 end
 
 track(PreSimulation:Connect(function()
     if Unloading or not Aim.SilentAim then
-        cachedGunRedirect, cachedKnifeRedirect = nil, nil
+        gunPlan, knifePlan = nil, nil
         return
     end
 
@@ -1129,39 +842,12 @@ track(PreSimulation:Connect(function()
                 :format(GunLead.delay, GunLead.verified, KnifeLead.delay, KnifeLead.verified)
         end
 
-        local gPlr, gPart, gChar = scanTarget(isMurderer)
-        local gEntry, gRoot = nil, nil
-        if gPlr and gPart and gChar then
-            gRoot = gChar:FindFirstChild("HumanoidRootPart")
-            if gRoot then gEntry = sampleMotion(gPlr, gRoot, now) end
-        end
-
-        local kPlr, kPart, kChar = scanTarget(nil)
-        local kEntry, kRoot = nil, nil
-        if kPlr and kPart and kChar then
-            kRoot = kChar:FindFirstChild("HumanoidRootPart")
-            if kRoot then kEntry = sampleMotion(kPlr, kRoot, now) end
-        end
-
-        local gunOrigin = findGunOrigin()
-        if not gunOrigin or not gEntry then
-            cachedGunRedirect = nil
-        else
-            local aim = solveAim(gEntry, gPart, gRoot, gChar, gunOrigin, false, now, settings)
-            cachedGunRedirect = clearPath(gunOrigin, aim, gChar) and CFrame.new(aim) or nil
-        end
-
-        local knifeOrigin = findKnifeOrigin()
-        if not knifeOrigin or not kEntry then
-            cachedKnifeRedirect = nil
-        else
-            local aim = solveAim(kEntry, kPart, kRoot, kChar, knifeOrigin, true, now, settings)
-            cachedKnifeRedirect = clearPath(knifeOrigin, aim, kChar) and CFrame.new(aim) or nil
-        end
+        gunPlan = buildPlan(isMurderer, false, findGunOrigin(), now, settings)
+        knifePlan = buildPlan(nil, true, findKnifeOrigin(), now, settings)
     end)
 
     if not ok then
-        cachedGunRedirect, cachedKnifeRedirect = nil, nil
+        gunPlan, knifePlan = nil, nil
     end
 end))
 
@@ -1175,21 +861,31 @@ if hasNamecallHook then
             return originalNamecall(self, ...)
         end
 
-        if self.Name == "Shoot" and self.ClassName == "RemoteEvent" and cachedGunRedirect then
+        if self.Name == "Shoot" and self.ClassName == "RemoteEvent" then
             local parent = self.Parent
             if parent and parent.ClassName == "Tool" and parent.Name == "Gun" then
                 local origin = ...
                 if typeof(origin) == "CFrame" then
-                    return originalNamecall(self, origin, cachedGunRedirect)
+                    local now = os.clock()
+                    local plan = livePlan(gunPlan, now)
+                    if plan then
+                        local aim = solveAim(plan, origin.Position, now)
+                        return originalNamecall(self, origin, CFrame.new(aim))
+                    end
                 end
             end
-        elseif self.Name == "KnifeThrown" and cachedKnifeRedirect then
+        elseif self.Name == "KnifeThrown" then
             local events = self.Parent
             local tool = events and events.Parent
             if events and events.Name == "Events" and tool and tool.ClassName == "Tool" and tool.Name == "Knife" then
                 local handle = ...
                 if typeof(handle) == "CFrame" then
-                    return originalNamecall(self, handle, cachedKnifeRedirect)
+                    local now = os.clock()
+                    local plan = livePlan(knifePlan, now)
+                    if plan then
+                        local aim = solveAim(plan, handle.Position, now)
+                        return originalNamecall(self, handle, CFrame.new(aim))
+                    end
                 end
             end
         end
@@ -1310,7 +1006,7 @@ local PredictionSection = SilentAimTab:Section({ Title = 'prediction', Side = 'r
 
 PredictionSection:Toggle({
     Title = 'predict movement',
-    Desc = 'master switch. off aims exactly where the target is right now',
+    Desc = 'master switch. off aims exactly where the target is right now. on, the lead is solved on the frame the shot actually fires, from the real muzzle position the game passes in, so nothing is a frame behind. the path is an arc: their turn is measured by fitting a circle through where they actually were, and when that fit holds up it is trusted for the whole lead. when it does not the arc falls back to a smoothed turn that fades out across the lead. speed is held to their walkspeed so a rubberband spike cannot throw the aim, and the whole lead shortens on someone whose direction keeps flipping',
     Flag = 'mm2_silent_aim_predict',
     Default = true,
     Callback = function(state) Aim.Predict = state end,
@@ -1356,15 +1052,6 @@ PredictionSection:Dropdown({
     Default = 'Delay + travel',
     Flag = 'mm2_silent_aim_method',
     Callback = function(value) Aim.Method = value end,
-})
-
-PredictionSection:Dropdown({
-    Title = 'math',
-    Desc = 'how the future position is worked out from their movement. the arc family is listed first. circular: the exact arc for their measured turn rate, no stepping error. circle fit: fits a real circle through three of their past positions and walks them around it, so the arc comes from where they actually went rather than a smoothed turn number. orbit: same fit but paced by their current speed, for someone holding a lap around you. spiral: an arc whose speed is also changing, for a turn taken while accelerating out of it. arc jerk: spiral plus the third order term. decay arc: the turn fades out across the lead, nobody holds a constant turn for a whole second. tight arc: an arc whose radius cannot go below a real player turning circle, so a noisy turn reading cannot produce a silly tight loop. steady arc: the arc driven by the averaged window instead of the latest sample. arc blend: arc and straight line mixed by how consistent their direction has been. arc capped: the arc with speed held to their walkspeed, kills rubberband spikes. arc strafe: the arc along the way they are facing only. reverse arc: assumes they flip the turn, for jukers. adaptive arc: picks from the arc family per target. curve: the old stepped version of circular. then the straight line family - linear, acceleration, jerk, damped, raw, average, median, displacement, facing, strafe, capped, blend, conservative, aggressive, adaptive',
-    Values = MATH_METHODS,
-    Default = 'Circular',
-    Flag = 'mm2_silent_aim_math',
-    Callback = function(value) Aim.MathMethod = value end,
 })
 
 PredictionSection:Slider({
