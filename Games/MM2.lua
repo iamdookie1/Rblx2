@@ -792,9 +792,15 @@ local function solveAim(plan, origin, now)
     return predicted + offset, rootPos, travelTime
 end
 
-local function livePlan(plan, now)
-    if not plan or now - plan.stamp > PLAN_STALE then return nil end
-    return plan
+local function resolveRedirect(plan, originCFrame)
+    if not plan then return nil end
+    if os.clock() - plan.stamp > PLAN_STALE then return nil end
+
+    local ok, aim = pcall(solveAim, plan, originCFrame.Position, os.clock())
+    if ok and typeof(aim) == "Vector3" then
+        return CFrame.new(aim)
+    end
+    return plan.fallback
 end
 
 local function buildPlan(filter, isKnife, origin, now, settings)
@@ -825,6 +831,7 @@ local function buildPlan(filter, isKnife, origin, now, settings)
         logLead(plan.state, plan.entry, base, aim, travelTime, now)
     end
 
+    plan.fallback = CFrame.new(aim)
     return plan
 end
 
@@ -870,11 +877,14 @@ if hasNamecallHook then
             if parent and parent.ClassName == "Tool" and parent.Name == "Gun" then
                 local origin = ...
                 if typeof(origin) == "CFrame" then
-                    local now = os.clock()
-                    local plan = livePlan(gunPlan, now)
-                    if plan then
-                        local aim = solveAim(plan, origin.Position, now)
-                        return originalNamecall(self, origin, CFrame.new(aim))
+                    local redirect = resolveRedirect(gunPlan, origin)
+                    if redirect then
+                        local fire = self.FireServer
+                        if typeof(fire) == "function" then
+                            fire(self, origin, redirect)
+                            return
+                        end
+                        return originalNamecall(self, origin, redirect)
                     end
                 end
             end
@@ -884,11 +894,14 @@ if hasNamecallHook then
             if events and events.Name == "Events" and tool and tool.ClassName == "Tool" and tool.Name == "Knife" then
                 local handle = ...
                 if typeof(handle) == "CFrame" then
-                    local now = os.clock()
-                    local plan = livePlan(knifePlan, now)
-                    if plan then
-                        local aim = solveAim(plan, handle.Position, now)
-                        return originalNamecall(self, handle, CFrame.new(aim))
+                    local redirect = resolveRedirect(knifePlan, handle)
+                    if redirect then
+                        local fire = self.FireServer
+                        if typeof(fire) == "function" then
+                            fire(self, handle, redirect)
+                            return
+                        end
+                        return originalNamecall(self, handle, redirect)
                     end
                 end
             end
