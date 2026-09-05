@@ -315,7 +315,7 @@ local TRUST_FLOOR = 0.7
 local ARC_STEPS = 6
 local PLAN_STALE = 0.25
 local TRANSPARENT_SKIPS = 8
-local HIT_MARGIN = 0.6
+local HIT_MARGIN = 0.45
 local LEAD_SCALES = { 1, 0.65, 0.3, 0 }
 local LEGIT_REACQUIRE = 0.4
 local DRIFT_STEP = 0.06
@@ -992,6 +992,7 @@ local function noteShot(plan, reason, origin, sent, aimed, predictedRoot, travel
         root = plan ~= nil and plan.root ~= nil and plan.root.Position or nil,
         predicted = predictedRoot,
         travel = travel,
+        scale = plan ~= nil and plan.leadScale or nil,
     }
 end
 
@@ -1103,14 +1104,21 @@ local function buildPlan(filter, isKnife, origin, now, settings)
                 plan.part = part
                 budget = budget - 1
 
-                if clearPath(origin, part.Position, char) then
+                local exposed
+                if guaranteed then
+                    budget = budget - 5
+                    exposed = landsWithMargin(origin, part.Position, char)
+                else
+                    exposed = clearPath(origin, part.Position, char)
+                end
+
+                if exposed then
                     for _, scale in ipairs(LEAD_SCALES) do
                         local aim, base, travelTime, distance, ping, predictedRoot =
                             solveAim(plan, origin, now, scale)
-                        budget = budget - (guaranteed and 5 or 1)
+                        budget = budget - 1
 
-                        if clearPath(origin, aim, char)
-                            and (not guaranteed or landsWithMargin(origin, aim, char)) then
+                        if clearPath(origin, aim, char) then
                             plan.leadScale = scale
                             plan.fallback = CFrame.new(aim)
 
@@ -1128,7 +1136,7 @@ local function buildPlan(filter, isKnife, origin, now, settings)
                             return plan
                         end
 
-                        if not guaranteed or budget <= 0 then break end
+                        if budget <= 0 then break end
                     end
                 end
             end
@@ -1203,12 +1211,13 @@ local function debugTick(now)
             local moved = event.sent and event.aimed and (event.aimed - event.sent).Magnitude or nil
             local lead = event.root and event.predicted and flatDistance(event.predicted, event.root) or nil
             if debugLog then
-                debugLog:Add(("%s -> %s | moved %s | lead %s | travel %s"):format(
+                debugLog:Add(("%s -> %s | moved %s | lead %s | travel %s | lead scale %s"):format(
                     tag,
                     event.target or "?",
                     moved and ("%.1f studs"):format(moved) or "n/a",
                     lead and ("%.1f studs"):format(lead) or "n/a",
-                    event.travel and ("%.3fs"):format(event.travel) or "n/a"))
+                    event.travel and ("%.3fs"):format(event.travel) or "n/a",
+                    event.scale and ("%.2f"):format(event.scale) or "n/a"))
             end
             showMarker("aim", event.aimed)
 
