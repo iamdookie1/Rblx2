@@ -252,7 +252,25 @@ local Aim = {
     JumpAware = true,
     Method = 'Delay + travel',
     BulletSpeed = 400,
+    RedirectChance = 100,
+    HitCheck = true,
 }
+
+local Legit = {
+    Enabled = false,
+    RedirectChance = 65,
+    ReactionTime = 0.22,
+    Stickiness = 1.2,
+    ErrorDegrees = 0.7,
+    DriftShare = 0.6,
+    MissChance = 18,
+    MissSpread = 3.5,
+}
+
+local legitDriftX = 0
+local legitDriftY = 0
+local legitSeen = {}
+local legitLock = {}
 
 local AUTO_LEVELS = {
     Lesser   = { rate = 0.10, delayMin = 0, delayMax = 0.8, smooth = 0.35, passes = 1 },
@@ -286,19 +304,77 @@ local SPEED_CEILING = 1.6
 local TRUST_FLOOR = 0.7
 local ARC_STEPS = 6
 local PLAN_STALE = 0.25
+local TRANSPARENT_SKIPS = 8
+local HIT_MARGIN = 0.6
+local LEAD_SCALES = { 1, 0.65, 0.3, 0 }
+local LEGIT_REACQUIRE = 0.4
+local DRIFT_STEP = 0.06
 
 local visionParams = RaycastParams.new()
 visionParams.FilterType = Enum.RaycastFilterType.Exclude
 visionParams.IgnoreWater = true
 
+local function weaponCast(origin, direction, ignore)
+    local filter = { LocalPlayer.Character }
+    if ignore then
+        for _, extra in ipairs(ignore) do
+            filter[#filter + 1] = extra
+        end
+    end
+
+    for _ = 1, TRANSPARENT_SKIPS do
+        visionParams.FilterDescendantsInstances = filter
+        local ok, result = pcall(function() return Workspace:Raycast(origin, direction, visionParams) end)
+        if not ok or not result then return nil end
+
+        local instance = result.Instance
+        if not instance then return result end
+
+        local transparent = false
+        pcall(function() transparent = instance.Transparency == 1 end)
+        if not transparent then return result end
+
+        filter[#filter + 1] = instance
+    end
+
+    return nil
+end
+
 local function clearPath(origin, target, char)
     if not Aim.WallCheck then return true end
-    visionParams.FilterDescendantsInstances = { LocalPlayer.Character, char }
     local direction = target - origin
-    local ok, result = pcall(function() return Workspace:Raycast(origin, direction, visionParams) end)
-    if not ok then return true end
+    local result = weaponCast(origin, direction, { char })
     if not result then return true end
     return (result.Position - origin).Magnitude >= direction.Magnitude - 2
+end
+
+local function landsOn(origin, point, char)
+    local direction = point - origin
+    if direction.Magnitude < 0.1 then return false end
+    local result = weaponCast(origin, direction, nil)
+    if not result then return false end
+    local instance = result.Instance
+    return instance ~= nil and instance:IsDescendantOf(char)
+end
+
+local function landsWithMargin(origin, point, char)
+    if not landsOn(origin, point, char) then return false end
+
+    local direction = point - origin
+    local forward = direction.Unit
+    local side = Vector3.new(-forward.Z, 0, forward.X)
+    if side.Magnitude < 0.001 then
+        side = Vector3.new(1, 0, 0)
+    else
+        side = side.Unit
+    end
+    local lift = Vector3.new(0, HIT_MARGIN, 0)
+    side = side * HIT_MARGIN
+
+    return landsOn(origin, point + side, char)
+        and landsOn(origin, point - side, char)
+        and landsOn(origin, point + lift, char)
+        and landsOn(origin, point - lift, char)
 end
 
 local function screenAnchor()
@@ -754,7 +830,8 @@ local function findKnifeOrigin()
     return handle and handle.Position
 end
 
-local function solveAim(plan, origin, now)
+local function solveAim(plan, origin, now, leadScale)
+    leadScale = leadScale or plan.leadScale or 1
     local entry = plan.entry
     local rootPos = plan.root.Position
     local partPos = plan.part.Position
@@ -772,7 +849,7 @@ local function solveAim(plan, origin, now)
     end
 
     if not Aim.AutoPredict then
-        local travelTime = plan.isKnife and Aim.ManualLeadTimeKnife or Aim.ManualLeadTimeGun
+        local travelTime = (plan.isKnife and Aim.ManualLeadTimeKnife or Aim.ManualLeadTimeGun) * leadScale
         local manual = predictRoot(entry, rootPos, sinceSample, travelTime)
         return manual + offset, rootPos, travelTime
     end
@@ -782,32 +859,104 @@ local function solveAim(plan, origin, now)
     local weaponSpeed = plan.isKnife and Aim.KnifeSpeed or Aim.BulletSpeed
     local settings = plan.settings
 
-    local travelTime = travelTimeFor(state, (partPos - origin).Magnitude, weaponSpeed, pingComponent)
+    local travelTime = travelTimeFor(state, (partPos - origin).Magnitude, weaponSpeed, pingComponent) * leadScale
     local predicted = predictRoot(entry, rootPos, sinceSample, travelTime)
     for _ = 2, settings.passes do
-        travelTime = travelTimeFor(state, ((predicted + offset) - origin).Magnitude, weaponSpeed, pingComponent)
+        travelTime = travelTimeFor(state, ((predicted + offset) - origin).Magnitude, weaponSpeed, pingComponent) * leadScale
         predicted = predictRoot(entry, rootPos, sinceSample, travelTime)
     end
 
     return predicted + offset, rootPos, travelTime
 end
 
+local function crossOf(a, b)
+    return Vector3.new(
+        a.Y * b.Z - a.Z * b.Y,
+        a.Z * b.X - a.X * b.Z,
+        a.X * b.Y - a.Y * b.X)
+end
+
+local function humanise(origin, aim)
+    local direction = aim - origin
+    local distance = direction.Magnitude
+    if distance < 0.1 then return aim end
+
+    local forward = direction.Unit
+    local right = crossOf(forward, Vector3.new(0, 1, 0))
+    if right.Magnitude < 0.001 then
+        right = Vector3.new(1, 0, 0)
+    else
+        right = right.Unit
+    end
+    local lift = crossOf(right, forward).Unit
+
+    local share = math.clamp(Legit.DriftShare, 0, 1)
+    local ex = legitDriftX * share + (math.random() * 2 - 1) * (1 - share)
+    local ey = legitDriftY * share + (math.random() * 2 - 1) * (1 - share)
+
+    local radius = distance * math.tan(math.rad(Legit.ErrorDegrees))
+    if math.random() * 100 < Legit.MissChance then
+        radius = radius + Legit.MissSpread
+    end
+
+    if radius < 0.001 then return aim end
+
+    return aim + (right * ex + lift * ey) * radius
+end
+
 local function resolveRedirect(plan, originCFrame)
     if not plan then return nil end
     if os.clock() - plan.stamp > PLAN_STALE then return nil end
 
-    local ok, aim = pcall(solveAim, plan, originCFrame.Position, os.clock())
-    if ok and typeof(aim) == "Vector3" then
-        return CFrame.new(aim)
+    local chance = Legit.Enabled and Legit.RedirectChance or Aim.RedirectChance
+    if chance < 100 and math.random() * 100 >= chance then return nil end
+
+    local origin = originCFrame.Position
+    local aim
+    local ok, solved = pcall(solveAim, plan, origin, os.clock())
+    if ok and typeof(solved) == "Vector3" then
+        aim = solved
+    elseif plan.fallback then
+        aim = plan.fallback.Position
+    else
+        return nil
     end
-    return plan.fallback
+
+    if Legit.Enabled then
+        aim = humanise(origin, aim)
+    end
+
+    return CFrame.new(aim)
 end
 
 local function buildPlan(filter, isKnife, origin, now, settings)
     if not origin then return nil end
 
     local plr, part, char = scanTarget(filter)
+    local slot = isKnife and "k" or "g"
+
+    if Legit.Enabled then
+        local lock = legitLock[slot]
+        if lock and now < lock.expires then
+            local held = lock.player
+            if held and held.Parent and isAlivePlr(held) and (not filter or filter(held)) then
+                local heldChar = held.Character
+                local heldPart = heldChar and aimPartFor(heldChar, motion[held.Name])
+                if heldPart then
+                    plr, part, char = held, heldPart, heldChar
+                end
+            end
+        end
+    end
+
     if not plr or not part or not char then return nil end
+
+    if Legit.Enabled then
+        local lock = legitLock[slot]
+        if not lock or lock.player ~= plr or now >= lock.expires then
+            legitLock[slot] = { player = plr, expires = now + Legit.Stickiness }
+        end
+    end
 
     local root = char:FindFirstChild("HumanoidRootPart")
     if not root then return nil end
@@ -824,10 +973,34 @@ local function buildPlan(filter, isKnife, origin, now, settings)
         stamp = now,
     }
 
-    local aim, base, travelTime = solveAim(plan, origin, now)
-    if not clearPath(origin, aim, char) then return nil end
+    if Legit.Enabled then
+        local key = slot .. plr.Name
+        local seen = legitSeen[key]
+        if not seen or now - seen.last > LEGIT_REACQUIRE then
+            legitSeen[key] = { first = now, last = now }
+            return nil
+        end
+        seen.last = now
+        if now - seen.first < Legit.ReactionTime then return nil end
+    end
 
-    if Aim.AutoPredict and methodUsesDelay() then
+    local guaranteed = Aim.HitCheck and not Legit.Enabled
+    local aim, base, travelTime, chosen
+
+    for _, scale in ipairs(LEAD_SCALES) do
+        local candidate, candidateBase, candidateTime = solveAim(plan, origin, now, scale)
+        if clearPath(origin, candidate, char)
+            and (not guaranteed or landsWithMargin(origin, candidate, char)) then
+            aim, base, travelTime, chosen = candidate, candidateBase, candidateTime, scale
+            break
+        end
+        if not guaranteed then break end
+    end
+
+    if not aim then return nil end
+
+    plan.leadScale = chosen
+    if Aim.AutoPredict and methodUsesDelay() and chosen == 1 then
         logLead(plan.state, plan.entry, base, aim, travelTime, now)
     end
 
@@ -845,6 +1018,11 @@ track(PreSimulation:Connect(function()
         local now = os.clock()
         cachedPing = getPing()
         local settings = AUTO_LEVELS[Aim.AutoLevel] or AUTO_LEVELS.Normal
+
+        if Legit.Enabled then
+            legitDriftX = math.clamp(legitDriftX + (math.random() * 2 - 1) * DRIFT_STEP, -1, 1)
+            legitDriftY = math.clamp(legitDriftY + (math.random() * 2 - 1) * DRIFT_STEP, -1, 1)
+        end
 
         if Aim.AutoPredict then
             verifyLead(GunLead, settings, now)
@@ -981,6 +1159,26 @@ knifeSpeedSlider = AimSection:Slider({
     Suffix = ' studs/s',
     Flag = 'mm2_silent_aim_knife_speed',
     Callback = function(value) Aim.KnifeSpeed = value end,
+})
+
+AimSection:Slider({
+    Title = 'redirect chance',
+    Desc = 'percent of shots that get redirected at all. the rest fire exactly where you aimed, untouched. 100 redirects every shot',
+    Min = 0,
+    Max = 100,
+    Increment = 1,
+    Default = 100,
+    Suffix = '%',
+    Flag = 'mm2_silent_aim_redirect_chance',
+    Callback = function(value) Aim.RedirectChance = value end,
+})
+
+AimSection:Toggle({
+    Title = 'guaranteed hit',
+    Desc = 'before redirecting, casts the shot the same way the game does - from the real muzzle, skipping fully transparent parts, same as its own weapon raycast - and only redirects if it lands on the target with room to spare on all four sides. if the lead would miss it walks the lead back and retests, and drops the redirect rather than fire a miss. off lets it fire unverified',
+    Flag = 'mm2_silent_aim_hitcheck',
+    Default = true,
+    Callback = function(state) Aim.HitCheck = state end,
 })
 
 local FovSection = SilentAimTab:Section({ Title = 'fov', Side = 'right' })
@@ -1247,6 +1445,11 @@ end)
 track(Players.PlayerRemoving:Connect(function(plr)
     destroyEsp(plr)
     motion[plr.Name] = nil
+    legitSeen["g" .. plr.Name] = nil
+    legitSeen["k" .. plr.Name] = nil
+    for slot, lock in pairs(legitLock) do
+        if lock.player == plr then legitLock[slot] = nil end
+    end
 end))
 
 local Xray = {
@@ -1369,6 +1572,108 @@ end))
 track(Workspace.DescendantRemoving:Connect(function(inst)
     if trapObjects[inst] then destroyTrapEsp(inst) end
 end))
+
+local LegitTab = Window:Tab({ Title = 'legit', Icon = 'user-check' })
+
+local LegitSection = LegitTab:Section({ Title = 'legit mode', Side = 'left' })
+
+LegitSection:Toggle({
+    Title = 'legit mode',
+    Desc = 'trades accuracy for looking human. overrides the silent aim redirect chance with its own and turns guaranteed hit off, since the two want opposite things',
+    Flag = 'mm2_legit',
+    Default = false,
+    Callback = function(state) Legit.Enabled = state end,
+})
+
+LegitSection:Slider({
+    Title = 'redirect chance',
+    Desc = 'percent of shots that get redirected while legit mode is on',
+    Min = 0,
+    Max = 100,
+    Increment = 1,
+    Default = 65,
+    Suffix = '%',
+    Flag = 'mm2_legit_chance',
+    Callback = function(value) Legit.RedirectChance = value end,
+})
+
+LegitSection:Slider({
+    Title = 'reaction time',
+    Desc = 'will not redirect onto a target until it has been the candidate this long, so it never tracks someone faster than you could have seen them. resets if they stop being the candidate for 0.4s',
+    Min = 0,
+    Max = 600,
+    Increment = 10,
+    Default = 220,
+    Suffix = ' ms',
+    Flag = 'mm2_legit_reaction',
+    Callback = function(value) Legit.ReactionTime = value / 1000 end,
+})
+
+LegitSection:Slider({
+    Title = 'target stickiness',
+    Desc = 'holds the current target this long before it is allowed to switch, so it does not snap between people mid fight',
+    Min = 0,
+    Max = 5,
+    Increment = 0.1,
+    Default = 1.2,
+    Suffix = 's',
+    Flag = 'mm2_legit_sticky',
+    Callback = function(value) Legit.Stickiness = value end,
+})
+
+local LegitErrorSection = LegitTab:Section({ Title = 'aim error', Side = 'right' })
+
+LegitErrorSection:Slider({
+    Title = 'aim error',
+    Desc = 'angular error added to the solved point. angular rather than fixed studs, so it opens up with range the way real aim error does',
+    Min = 0,
+    Max = 5,
+    Increment = 0.1,
+    Default = 0.7,
+    Suffix = ' deg',
+    Flag = 'mm2_legit_error',
+    Callback = function(value) Legit.ErrorDegrees = value end,
+})
+
+LegitErrorSection:Slider({
+    Title = 'error drift',
+    Desc = 'how much of that error is a slow wander versus fresh randomness each shot. human error is streaky - you are on or off for a few seconds - and pure per shot noise scatters too evenly around dead centre to look real. 0 is all jitter, 100 is all drift',
+    Min = 0,
+    Max = 100,
+    Increment = 5,
+    Default = 60,
+    Suffix = '%',
+    Flag = 'mm2_legit_drift',
+    Callback = function(value) Legit.DriftShare = value / 100 end,
+})
+
+LegitErrorSection:Slider({
+    Title = 'miss chance',
+    Desc = 'percent of redirected shots thrown wide on purpose. this is the one that matters most - a hit rate of 100 is what gets you called, not how the shots look',
+    Min = 0,
+    Max = 100,
+    Increment = 1,
+    Default = 18,
+    Suffix = '%',
+    Flag = 'mm2_legit_miss',
+    Callback = function(value) Legit.MissChance = value end,
+})
+
+LegitErrorSection:Slider({
+    Title = 'miss spread',
+    Desc = 'how far wide a deliberate miss goes, on top of the normal error',
+    Min = 1,
+    Max = 12,
+    Increment = 0.5,
+    Default = 3.5,
+    Suffix = ' studs',
+    Flag = 'mm2_legit_miss_spread',
+    Callback = function(value) Legit.MissSpread = value end,
+})
+
+LegitSection:Label({
+    Text = 'Silent aim still has to be on. Legit mode only changes how its shots behave - the camera never moves either way.',
+})
 
 local VisualTab = Window:Tab({ Title = 'visual', Icon = 'eye' })
 
