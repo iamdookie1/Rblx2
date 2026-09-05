@@ -267,6 +267,15 @@ local Legit = {
     MissSpread = 3.5,
 }
 
+local Debug = {
+    Enabled = false,
+    Markers = true,
+}
+
+local shotStats = { seen = 0, redirected = 0, suppressed = 0, proved = 0, error = 0 }
+local shotEvents = {}
+local lastSolve = {}
+
 local legitDriftX = 0
 local legitDriftY = 0
 local legitSeen = {}
@@ -909,13 +918,13 @@ local function solveAim(plan, origin, now, leadScale)
     end
 
     if not Aim.Predict then
-        return rootPos + offset, rootPos, 0
+        return rootPos + offset, rootPos, 0, (partPos - origin).Magnitude, 0, rootPos
     end
 
     if not Aim.AutoPredict then
         local travelTime = (plan.isKnife and Aim.ManualLeadTimeKnife or Aim.ManualLeadTimeGun) * leadScale
         local manual = predictRoot(entry, rootPos, sinceSample, travelTime)
-        return manual + offset, rootPos, travelTime
+        return manual + offset, rootPos, travelTime, (partPos - origin).Magnitude, 0, manual
     end
 
     local pingComponent = Aim.UsePing and (cachedPing / 2) or 0
@@ -969,21 +978,57 @@ local function humanise(origin, aim)
     return aim + (right * ex + lift * ey) * radius
 end
 
-local function resolveRedirect(plan, originCFrame)
-    if not plan then return nil end
-    if os.clock() - plan.stamp > PLAN_STALE then return nil end
+local function noteShot(plan, reason, origin, sent, aimed, predictedRoot, travel)
+    if not Debug.Enabled or #shotEvents >= 24 then return end
+    shotEvents[#shotEvents + 1] = {
+        at = os.clock(),
+        reason = reason,
+        knife = plan ~= nil and plan.isKnife or false,
+        target = plan ~= nil and plan.char ~= nil and plan.char.Name or nil,
+        char = plan ~= nil and plan.char or nil,
+        origin = origin,
+        sent = sent,
+        aimed = aimed,
+        root = plan ~= nil and plan.root ~= nil and plan.root.Position or nil,
+        predicted = predictedRoot,
+        travel = travel,
+    }
+end
 
-    local chance = Legit.Enabled and Legit.RedirectChance or Aim.RedirectChance
-    if chance < 100 and math.random() * 100 >= chance then return nil end
+local function resolveRedirect(plan, originCFrame, sentCFrame)
+    shotStats.seen = shotStats.seen + 1
 
     local origin = originCFrame.Position
-    local aim
-    local ok, solved = pcall(solveAim, plan, origin, os.clock())
+    local sent = typeof(sentCFrame) == "CFrame" and sentCFrame.Position or nil
+
+    if not plan then
+        shotStats.suppressed = shotStats.suppressed + 1
+        noteShot(nil, "no target", origin, sent, nil, nil, nil)
+        return nil
+    end
+
+    if os.clock() - plan.stamp > PLAN_STALE then
+        shotStats.suppressed = shotStats.suppressed + 1
+        noteShot(plan, "plan stale", origin, sent, nil, nil, nil)
+        return nil
+    end
+
+    local chance = Legit.Enabled and Legit.RedirectChance or Aim.RedirectChance
+    if chance < 100 and math.random() * 100 >= chance then
+        shotStats.suppressed = shotStats.suppressed + 1
+        noteShot(plan, "chance roll", origin, sent, nil, nil, nil)
+        return nil
+    end
+
+    local aim, predictedRoot, travel
+    local ok, solved, _, solvedTravel, _, _, solvedRoot = pcall(solveAim, plan, origin, os.clock())
     if ok and typeof(solved) == "Vector3" then
-        aim = solved
+        aim, predictedRoot, travel = solved, solvedRoot, solvedTravel
     elseif plan.fallback then
         aim = plan.fallback.Position
     else
+        shotStats.suppressed = shotStats.suppressed + 1
+        noteShot(plan, "solve failed", origin, sent, nil, nil, nil)
         return nil
     end
 
@@ -991,6 +1036,8 @@ local function resolveRedirect(plan, originCFrame)
         aim = humanise(origin, aim)
     end
 
+    shotStats.redirected = shotStats.redirected + 1
+    noteShot(plan, "redirected", origin, sent, aim, predictedRoot, travel)
     return CFrame.new(aim)
 end
 
@@ -1091,6 +1138,118 @@ local function buildPlan(filter, isKnife, origin, now, settings)
     return nil
 end
 
+local proofQueue = {}
+local debugLog
+local markerAim, markerReal
+
+local function makeMarker(color)
+    local part = Instance.new("Part")
+    part.Anchored = true
+    part.CanCollide = false
+    part.CanQuery = false
+    part.CanTouch = false
+    part.Locked = true
+    part.Shape = Enum.PartType.Ball
+    part.Size = Vector3.new(1.4, 1.4, 1.4)
+    part.Material = Enum.Material.Neon
+    part.Color = color
+    part.Transparency = 0.3
+    part.Name = "MM2AssistMarker"
+    part.Parent = Workspace
+    return part
+end
+
+local function clearMarkers()
+    if markerAim then markerAim:Destroy() markerAim = nil end
+    if markerReal then markerReal:Destroy() markerReal = nil end
+end
+
+local function showMarker(which, position)
+    if not Debug.Markers or not position then return end
+    if which == "aim" then
+        if not markerAim or not markerAim.Parent then
+            markerAim = makeMarker(Color3.fromRGB(255, 70, 70))
+        end
+        markerAim.Position = position
+    else
+        if not markerReal or not markerReal.Parent then
+            markerReal = makeMarker(Color3.fromRGB(90, 230, 120))
+        end
+        markerReal.Position = position
+    end
+end
+
+local function flatDistance(a, b)
+    return (Vector3.new(a.X, 0, a.Z) - Vector3.new(b.X, 0, b.Z)).Magnitude
+end
+
+local function debugTick(now)
+    if not Debug.Enabled then
+        if #shotEvents > 0 then table.clear(shotEvents) end
+        return
+    end
+
+    local drained = {}
+    for index = 1, #shotEvents do drained[index] = shotEvents[index] end
+    table.clear(shotEvents)
+
+    for _, event in ipairs(drained) do
+        local tag = event.knife and "knife" or "gun"
+        if event.reason ~= "redirected" then
+            if debugLog then
+                debugLog:Warn(("%s not redirected: %s"):format(tag, event.reason))
+            end
+        else
+            local moved = event.sent and event.aimed and (event.aimed - event.sent).Magnitude or nil
+            local lead = event.root and event.predicted and flatDistance(event.predicted, event.root) or nil
+            if debugLog then
+                debugLog:Add(("%s -> %s | moved %s | lead %s | travel %s"):format(
+                    tag,
+                    event.target or "?",
+                    moved and ("%.1f studs"):format(moved) or "n/a",
+                    lead and ("%.1f studs"):format(lead) or "n/a",
+                    event.travel and ("%.3fs"):format(event.travel) or "n/a"))
+            end
+            showMarker("aim", event.aimed)
+
+            if event.char and event.predicted and event.travel and event.travel > 0 then
+                proofQueue[#proofQueue + 1] = {
+                    dueAt = now + event.travel,
+                    char = event.char,
+                    predicted = event.predicted,
+                    lead = lead,
+                    target = event.target,
+                }
+            end
+        end
+    end
+
+    local index = 1
+    while index <= #proofQueue do
+        local proof = proofQueue[index]
+        if now < proof.dueAt then
+            index = index + 1
+        else
+            local root = proof.char and proof.char:FindFirstChild("HumanoidRootPart")
+            if root then
+                local off = flatDistance(proof.predicted, root.Position)
+                shotStats.proved = shotStats.proved + 1
+                shotStats.error = shotStats.error + off
+                showMarker("real", root.Position)
+                if debugLog then
+                    local verdict = off <= 2 and "HIT band" or (off <= 4 and "close" or "MISS")
+                    debugLog:Add(("  %s landed: predicted off by %.1f studs (lead was %s) %s"):format(
+                        proof.target or "?",
+                        off,
+                        proof.lead and ("%.1f"):format(proof.lead) or "?",
+                        verdict))
+                end
+            end
+            table.remove(proofQueue, index)
+        end
+    end
+end
+
 track(PreSimulation:Connect(function()
     if Unloading or not Aim.SilentAim then
         gunPlan, knifePlan = nil, nil
@@ -1126,6 +1285,8 @@ track(PreSimulation:Connect(function()
 
         gunPlan = buildPlan(isMurderer, false, findGunOrigin(), now, settings)
         knifePlan = buildPlan(nil, true, findKnifeOrigin(), now, settings)
+
+        debugTick(now)
     end)
 
     if not ok then
@@ -1146,9 +1307,9 @@ if hasNamecallHook then
         if self.Name == "Shoot" and self.ClassName == "RemoteEvent" then
             local parent = self.Parent
             if parent and parent.ClassName == "Tool" and parent.Name == "Gun" then
-                local origin = ...
+                local origin, sent = ...
                 if typeof(origin) == "CFrame" then
-                    local redirect = resolveRedirect(gunPlan, origin)
+                    local redirect = resolveRedirect(gunPlan, origin, sent)
                     if redirect then
                         local fire = self.FireServer
                         if typeof(fire) == "function" then
@@ -1163,9 +1324,9 @@ if hasNamecallHook then
             local events = self.Parent
             local tool = events and events.Parent
             if events and events.Name == "Events" and tool and tool.ClassName == "Tool" and tool.Name == "Knife" then
-                local handle = ...
+                local handle, sent = ...
                 if typeof(handle) == "CFrame" then
-                    local redirect = resolveRedirect(knifePlan, handle)
+                    local redirect = resolveRedirect(knifePlan, handle, sent)
                     if redirect then
                         local fire = self.FireServer
                         if typeof(fire) == "function" then
@@ -1749,6 +1910,57 @@ LegitSection:Label({
     Text = 'Silent aim still has to be on. Legit mode only changes how its shots behave - the camera never moves either way.',
 })
 
+local DebugTab = Window:Tab({ Title = 'proof', Icon = 'activity' })
+
+local ProofSection = DebugTab:Section({ Title = 'counters', Side = 'left' })
+
+ProofSection:Toggle({
+    Title = 'proof mode',
+    Desc = 'counts and logs every shot the hook sees. if shots seen stays on zero the hook is not firing at all, if seen climbs while redirected stays on zero it is finding no target, and if redirected climbs it is redirecting - the log then shows by how far',
+    Flag = 'mm2_debug',
+    Default = false,
+    Callback = function(state)
+        Debug.Enabled = state
+        if not state then clearMarkers() end
+    end,
+})
+
+ProofSection:Toggle({
+    Title = 'world markers',
+    Desc = 'red ball where the shot was actually sent, green ball where the target really was when it should have arrived. if the two sit on top of each other the prediction was right. both are set to be ignored by raycasts so they cannot affect your own aim or the hit check',
+    Flag = 'mm2_debug_markers',
+    Default = true,
+    Callback = function(state)
+        Debug.Markers = state
+        if not state then clearMarkers() end
+    end,
+})
+
+local SeenStat = ProofSection:Stat({ Title = 'shots seen', Value = '0' })
+local RedirectStat = ProofSection:Stat({ Title = 'redirected', Value = '0' })
+local SuppressStat = ProofSection:Stat({ Title = 'not redirected', Value = '0' })
+local ErrorStat = ProofSection:Stat({ Title = 'avg prediction error', Value = '-' })
+
+ProofSection:Button({
+    Title = 'reset counters',
+    Callback = function()
+        shotStats.seen = 0
+        shotStats.redirected = 0
+        shotStats.suppressed = 0
+        shotStats.proved = 0
+        shotStats.error = 0
+    end,
+})
+
+local LogSection = DebugTab:Section({ Title = 'shot log', Side = 'right' })
+
+debugLog = LogSection:Console({ Title = 'shots', Height = 260, MaxLines = 120, Timestamps = true })
+debugLog:Add('turn on proof mode, then shoot')
+
+LogSection:Label({
+    Text = 'moved is how far the shot was displaced from where you actually clicked, so any non zero value is the redirect working. lead is how far ahead of the target it aimed. the indented line that follows is measured when the shot should have arrived, comparing where it predicted the target would be against where they actually got to.',
+})
+
 local VisualTab = Window:Tab({ Title = 'visual', Icon = 'eye' })
 
 local EspSection = VisualTab:Section({ Title = 'esp', Side = 'left' })
@@ -1854,6 +2066,7 @@ SessionSection:Button({
         for plr in pairs(espObjects) do destroyEsp(plr) end
         for part in pairs(trapObjects) do destroyTrapEsp(part) end
         xrayRestoreAll()
+        clearMarkers()
 
         Centrl:Unload()
     end,
@@ -1869,6 +2082,13 @@ task.spawn(function()
         task.wait(0.4)
         pcall(function()
             AutoStat:Set(Aim.SilentAim and Aim.Predict and Aim.AutoPredict and autoSummary or 'off')
+            SeenStat:Set(tostring(shotStats.seen))
+            RedirectStat:Set(tostring(shotStats.redirected),
+                shotStats.redirected > 0 and Color3.fromRGB(126, 217, 87) or nil)
+            SuppressStat:Set(tostring(shotStats.suppressed))
+            ErrorStat:Set(shotStats.proved > 0
+                and ('%.1f studs over %d'):format(shotStats.error / shotStats.proved, shotStats.proved)
+                or '-')
             SpeedStat:Set(Aim.SilentAim and Aim.Predict and Aim.AutoPredict and speedSummary or 'off')
         end)
     end
