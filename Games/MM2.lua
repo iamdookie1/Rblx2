@@ -314,6 +314,10 @@ local BUCKET_RATE = 0.25
 local BUCKET_MIN = 4
 local MIN_SEPARATION = 30
 local MAX_SLOPE = 0.02
+local MAX_CANDIDATES = 5
+local CAST_BUDGET = 48
+local PART_ORDER_HEAD = { "Head", "UpperTorso", "Torso", "HumanoidRootPart", "LowerTorso" }
+local PART_ORDER_BODY = { "UpperTorso", "Torso", "HumanoidRootPart", "Head", "LowerTorso" }
 
 local visionParams = RaycastParams.new()
 visionParams.FilterType = Enum.RaycastFilterType.Exclude
@@ -785,12 +789,20 @@ local function speedLabel(state)
     return ('%d st/s'):format(math.floor(speed + 0.5))
 end
 
-local function aimPartFor(char, entry)
-    local preferred = Aim.AimPart
-    if Aim.AutoPredict and Aim.JumpAware and preferred == "Head" and entry and isSpamJumper(entry) then
-        preferred = "HumanoidRootPart"
+local function aimPartsFor(char, entry)
+    local order = PART_ORDER_HEAD
+    if Aim.AimPart ~= "Head" then
+        order = PART_ORDER_BODY
+    elseif Aim.AutoPredict and Aim.JumpAware and entry and isSpamJumper(entry) then
+        order = PART_ORDER_BODY
     end
-    return char:FindFirstChild(preferred) or char:FindFirstChild("HumanoidRootPart") or char:FindFirstChild("Head")
+
+    local parts = {}
+    for _, name in ipairs(order) do
+        local part = char:FindFirstChild(name)
+        if part then parts[#parts + 1] = part end
+    end
+    return parts
 end
 
 local function candidateScreenDist(part, anchor, origin)
@@ -817,7 +829,7 @@ local function isMurderer(plr)
     return role == "Murderer" and not dead
 end
 
-local function scanTarget(filterFn)
+local function scanTargets(filterFn)
     local origin = Camera.CFrame.Position
     local anchor = screenAnchor()
 
@@ -825,28 +837,29 @@ local function scanTarget(filterFn)
     for _, plr in ipairs(Players:GetPlayers()) do
         if plr ~= LocalPlayer and isAlivePlr(plr) and (not filterFn or filterFn(plr)) then
             local char = plr.Character
-            local part = char and aimPartFor(char, motion[plr.Name])
-            if part then
-                local screenDist = candidateScreenDist(part, anchor, origin)
-                if screenDist then
-                    candidates[#candidates + 1] = { plr = plr, char = char, part = part, screenDist = screenDist }
+            local parts = char and aimPartsFor(char, motion[plr.Name])
+            if parts and #parts > 0 then
+                local best = nil
+                for _, part in ipairs(parts) do
+                    local screenDist = candidateScreenDist(part, anchor, origin)
+                    if screenDist and (not best or screenDist < best) then
+                        best = screenDist
+                    end
+                end
+                if best then
+                    candidates[#candidates + 1] = {
+                        plr = plr,
+                        char = char,
+                        parts = parts,
+                        screenDist = best,
+                    }
                 end
             end
         end
     end
 
-    if #candidates == 0 then return nil, nil, nil end
-
     table.sort(candidates, function(a, b) return a.screenDist < b.screenDist end)
-
-    for _, candidate in ipairs(candidates) do
-        if clearPath(origin, candidate.part.Position, candidate.char) then
-            return candidate.plr, candidate.part, candidate.char
-        end
-    end
-
-    local nearest = candidates[1]
-    return nearest.plr, nearest.part, nearest.char
+    return candidates
 end
 
 local function onThrowingKnifeAdded(instance)
@@ -983,84 +996,97 @@ end
 local function buildPlan(filter, isKnife, origin, now, settings)
     if not origin then return nil end
 
-    local plr, part, char = scanTarget(filter)
+    local candidates = scanTargets(filter)
+    if #candidates == 0 then return nil end
+
     local slot = isKnife and "k" or "g"
 
     if Legit.Enabled then
         local lock = legitLock[slot]
         if lock and now < lock.expires then
-            local held = lock.player
-            if held and held.Parent and isAlivePlr(held) and (not filter or filter(held)) then
-                local heldChar = held.Character
-                local heldPart = heldChar and aimPartFor(heldChar, motion[held.Name])
-                if heldPart then
-                    plr, part, char = held, heldPart, heldChar
+            for index, candidate in ipairs(candidates) do
+                if candidate.plr == lock.player then
+                    table.remove(candidates, index)
+                    table.insert(candidates, 1, candidate)
+                    break
                 end
             end
         end
     end
 
-    if not plr or not part or not char then return nil end
-
-    if Legit.Enabled then
-        local lock = legitLock[slot]
-        if not lock or lock.player ~= plr or now >= lock.expires then
-            legitLock[slot] = { player = plr, expires = now + Legit.Stickiness }
-        end
-    end
-
-    local root = char:FindFirstChild("HumanoidRootPart")
-    if not root then return nil end
-
-    local plan = {
-        entry = sampleMotion(plr, root, now),
-        part = part,
-        root = root,
-        char = char,
-        hipOffset = feetOffset(char),
-        state = isKnife and KnifeLead or GunLead,
-        settings = settings,
-        isKnife = isKnife,
-        stamp = now,
-    }
-
-    if Legit.Enabled then
-        local key = slot .. plr.Name
-        local seen = legitSeen[key]
-        if not seen or now - seen.last > LEGIT_REACQUIRE then
-            legitSeen[key] = { first = now, last = now }
-            return nil
-        end
-        seen.last = now
-        if now - seen.first < Legit.ReactionTime then return nil end
-    end
-
     local guaranteed = Aim.HitCheck and not Legit.Enabled
-    local aim, base, travelTime, chosen
+    local budget = CAST_BUDGET
 
-    local shotDistance, shotPing
+    for rank, candidate in ipairs(candidates) do
+        if rank > MAX_CANDIDATES or budget <= 0 then break end
 
-    for _, scale in ipairs(LEAD_SCALES) do
-        local candidate, candidateBase, candidateTime, candidateDistance, candidatePing =
-            solveAim(plan, origin, now, scale)
-        if clearPath(origin, candidate, char)
-            and (not guaranteed or landsWithMargin(origin, candidate, char)) then
-            aim, base, travelTime, chosen = candidate, candidateBase, candidateTime, scale
-            shotDistance, shotPing = candidateDistance, candidatePing
-            break
+        local plr = candidate.plr
+        local char = candidate.char
+        local root = char:FindFirstChild("HumanoidRootPart")
+        local entry = motion[plr.Name]
+        local ready = true
+
+        if Legit.Enabled then
+            local key = slot .. plr.Name
+            local seen = legitSeen[key]
+            if not seen or now - seen.last > LEGIT_REACQUIRE then
+                legitSeen[key] = { first = now, last = now }
+                ready = false
+            else
+                seen.last = now
+                ready = now - seen.first >= Legit.ReactionTime
+            end
         end
-        if not guaranteed then break end
+
+        if root and entry and ready then
+            local plan = {
+                entry = entry,
+                root = root,
+                char = char,
+                hipOffset = feetOffset(char),
+                state = isKnife and KnifeLead or GunLead,
+                settings = settings,
+                isKnife = isKnife,
+                stamp = now,
+            }
+
+            for _, part in ipairs(candidate.parts) do
+                if budget <= 0 then break end
+                plan.part = part
+                budget = budget - 1
+
+                if clearPath(origin, part.Position, char) then
+                    for _, scale in ipairs(LEAD_SCALES) do
+                        local aim, base, travelTime, distance, ping = solveAim(plan, origin, now, scale)
+                        budget = budget - (guaranteed and 5 or 1)
+
+                        if clearPath(origin, aim, char)
+                            and (not guaranteed or landsWithMargin(origin, aim, char)) then
+                            plan.leadScale = scale
+                            plan.fallback = CFrame.new(aim)
+
+                            if Aim.AutoPredict and methodUsesDelay() and scale == 1 and distance then
+                                logLead(plan.state, entry, base, aim, travelTime, distance, ping, now)
+                            end
+
+                            if Legit.Enabled then
+                                local lock = legitLock[slot]
+                                if not lock or lock.player ~= plr or now >= lock.expires then
+                                    legitLock[slot] = { player = plr, expires = now + Legit.Stickiness }
+                                end
+                            end
+
+                            return plan
+                        end
+
+                        if not guaranteed or budget <= 0 then break end
+                    end
+                end
+            end
+        end
     end
 
-    if not aim then return nil end
-
-    plan.leadScale = chosen
-    if Aim.AutoPredict and methodUsesDelay() and chosen == 1 and shotDistance then
-        logLead(plan.state, plan.entry, base, aim, travelTime, shotDistance, shotPing, now)
-    end
-
-    plan.fallback = CFrame.new(aim)
-    return plan
+    return nil
 end
 
 track(PreSimulation:Connect(function()
@@ -1077,6 +1103,14 @@ track(PreSimulation:Connect(function()
         if Legit.Enabled then
             legitDriftX = math.clamp(legitDriftX + (math.random() * 2 - 1) * DRIFT_STEP, -1, 1)
             legitDriftY = math.clamp(legitDriftY + (math.random() * 2 - 1) * DRIFT_STEP, -1, 1)
+        end
+
+        for _, plr in ipairs(Players:GetPlayers()) do
+            if plr ~= LocalPlayer then
+                local char = plr.Character
+                local root = char and char:FindFirstChild("HumanoidRootPart")
+                if root then sampleMotion(plr, root, now) end
+            end
         end
 
         if Aim.AutoPredict then
