@@ -467,6 +467,10 @@ local function perpOf(forward)
     return Vector3.new(-forward.Z, 0, forward.X)
 end
 
+local function dotOf(a, b)
+    return a.X * b.X + a.Y * b.Y + a.Z * b.Z
+end
+
 local function fitTurnRate(entry, speed)
     local history = entry.history
     local count = history and #history or 0
@@ -498,7 +502,7 @@ local function fitTurnRate(entry, speed)
     if toStart.Magnitude < 0.001 or toEnd.Magnitude < 0.001 then return nil end
 
     local startUnit, endUnit = toStart.Unit, toEnd.Unit
-    local dot = math.clamp(startUnit:Dot(endUnit), -1, 1)
+    local dot = math.clamp(dotOf(startUnit, endUnit), -1, 1)
     local cross = startUnit.X * endUnit.Z - startUnit.Z * endUnit.X
     local omega = math.atan2(cross, dot) / span
     if math.abs(omega) < MIN_TURN_RATE then return nil end
@@ -525,7 +529,7 @@ local function predictHorizontal(entry, t)
     local fitted = fitTurnRate(entry, speed)
     local omega = math.clamp(fitted or entry.turnRate, -MAX_TURN_RATE, MAX_TURN_RATE) * steady
 
-    local tangential = math.clamp(entry.accel:Dot(forward), -MAX_TANGENTIAL, MAX_TANGENTIAL)
+    local tangential = math.clamp(dotOf(entry.accel, forward), -MAX_TANGENTIAL, MAX_TANGENTIAL)
     local horizon = t * (TRUST_FLOOR + (1 - TRUST_FLOOR) * steady)
 
     local side = perpOf(forward)
