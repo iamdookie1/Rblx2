@@ -309,6 +309,11 @@ local HIT_MARGIN = 0.6
 local LEAD_SCALES = { 1, 0.65, 0.3, 0 }
 local LEGIT_REACQUIRE = 0.4
 local DRIFT_STEP = 0.06
+local SPLIT_RATE = 0.05
+local BUCKET_RATE = 0.25
+local BUCKET_MIN = 4
+local MIN_SEPARATION = 30
+local MAX_SLOPE = 0.02
 
 local visionParams = RaycastParams.new()
 visionParams.FilterType = Enum.RaycastFilterType.Exclude
@@ -666,12 +671,20 @@ local function predictRoot(entry, base, sinceSample, travelTime)
     return Vector3.new(base.X + horizontal.X, y, base.Z + horizontal.Z)
 end
 
-local function newLeadState(seed)
-    return { delay = seed, pending = {}, verified = 0 }
+local function newLeadState(seedDelay, seedSpeed)
+    return {
+        a = seedDelay,
+        b = 1 / math.max(seedSpeed, 1),
+        pending = {},
+        verified = 0,
+        split = 0,
+        near = { d = 0, y = 0, n = 0 },
+        far = { d = 0, y = 0, n = 0 },
+    }
 end
 
-local GunLead = newLeadState(GUN_SEED_DELAY)
-local KnifeLead = newLeadState(KNIFE_SEED_DELAY)
+local GunLead = newLeadState(GUN_SEED_DELAY, Aim.BulletSpeed)
+local KnifeLead = newLeadState(KNIFE_SEED_DELAY, Aim.KnifeSpeed)
 
 local function methodUsesDelay()
     return Aim.Method == 'Delay + travel' or Aim.Method == 'Delay only'
@@ -681,15 +694,45 @@ local function methodUsesTravel()
     return Aim.Method == 'Delay + travel' or Aim.Method == 'Travel only'
 end
 
-local function travelTimeFor(state, distance, weaponSpeed, pingComponent)
+local function travelTimeFor(state, distance, pingComponent)
     local total = pingComponent
     if methodUsesDelay() then
-        total = total + state.delay
+        total = total + state.a
     end
     if methodUsesTravel() then
-        total = total + distance / math.max(weaponSpeed, 1)
+        total = total + state.b * distance
     end
     return math.min(total, MAX_TRAVEL_TIME)
+end
+
+local function learnedSpeed(state)
+    if state.b <= 1e-6 then return math.huge end
+    return 1 / state.b
+end
+
+local function observeLead(state, settings, distance, observed)
+    if state.split <= 0 then state.split = distance end
+
+    local bucket = distance < state.split and state.near or state.far
+    state.split = state.split + (distance - state.split) * SPLIT_RATE
+
+    local weight = bucket.n < 1 and 1 or BUCKET_RATE
+    bucket.d = bucket.d + (distance - bucket.d) * weight
+    bucket.y = bucket.y + (observed - bucket.y) * weight
+    bucket.n = bucket.n + 1
+
+    local near, far = state.near, state.far
+    local separation = far.d - near.d
+
+    if near.n >= BUCKET_MIN and far.n >= BUCKET_MIN and separation >= MIN_SEPARATION then
+        local slope = math.clamp((far.y - near.y) / separation, 0, MAX_SLOPE)
+        local intercept = math.clamp(near.y - slope * near.d, settings.delayMin, settings.delayMax)
+        state.b = state.b + (slope - state.b) * settings.rate
+        state.a = state.a + (intercept - state.a) * settings.rate
+    else
+        local residual = observed - (state.a + state.b * distance)
+        state.a = math.clamp(state.a + residual * settings.rate, settings.delayMin, settings.delayMax)
+    end
 end
 
 local function verifyLead(state, settings, now)
@@ -708,7 +751,8 @@ local function verifyLead(state, settings, now)
                 local predicted = Vector3.new(record.root.X, 0, record.root.Z)
                 local drift = (actual - predicted):Dot(lead.Unit)
                 local timeError = drift / math.max(record.speed, 1)
-                state.delay = math.clamp(state.delay + timeError * settings.rate, settings.delayMin, settings.delayMax)
+                local observed = math.max(record.used + timeError - record.ping, 0)
+                observeLead(state, settings, record.distance, observed)
                 state.verified = state.verified + 1
             end
             table.remove(pending, index)
@@ -716,7 +760,7 @@ local function verifyLead(state, settings, now)
     end
 end
 
-local function logLead(state, entry, base, predictedRoot, travelTime, now)
+local function logLead(state, entry, base, predictedRoot, travelTime, distance, pingComponent, now)
     local lead = Vector3.new(predictedRoot.X - base.X, 0, predictedRoot.Z - base.Z)
     if lead.Magnitude < LEARN_MIN_LEAD or #state.pending >= MAX_PENDING then return end
     table.insert(state.pending, {
@@ -725,11 +769,21 @@ local function logLead(state, entry, base, predictedRoot, travelTime, now)
         root = predictedRoot,
         lead = lead,
         speed = entry.horizontal.Magnitude,
+        used = travelTime,
+        distance = distance,
+        ping = pingComponent,
         learnable = not entry.airborne and not isSpamJumper(entry),
     })
 end
 
 local autoSummary = 'idle'
+local speedSummary = 'idle'
+
+local function speedLabel(state)
+    local speed = learnedSpeed(state)
+    if speed == math.huge or speed > 9999 then return 'instant' end
+    return ('%d st/s'):format(math.floor(speed + 0.5))
+end
 
 local function aimPartFor(char, entry)
     local preferred = Aim.AimPart
@@ -795,15 +849,11 @@ local function scanTarget(filterFn)
     return nearest.plr, nearest.part, nearest.char
 end
 
-local knifeSpeedSlider = nil
-
 local function onThrowingKnifeAdded(instance)
     local ok, speed = pcall(function() return instance:GetAttribute("ThrowSpeed") end)
     if ok and typeof(speed) == "number" and speed > 1 and speed ~= Aim.KnifeSpeed then
         Aim.KnifeSpeed = speed
-        if knifeSpeedSlider then
-            pcall(function() knifeSpeedSlider:Set(speed) end)
-        end
+        KnifeLead.b = 1 / speed
     end
 end
 
@@ -856,17 +906,18 @@ local function solveAim(plan, origin, now, leadScale)
 
     local pingComponent = Aim.UsePing and (cachedPing / 2) or 0
     local state = plan.state
-    local weaponSpeed = plan.isKnife and Aim.KnifeSpeed or Aim.BulletSpeed
     local settings = plan.settings
 
-    local travelTime = travelTimeFor(state, (partPos - origin).Magnitude, weaponSpeed, pingComponent) * leadScale
+    local distance = (partPos - origin).Magnitude
+    local travelTime = travelTimeFor(state, distance, pingComponent) * leadScale
     local predicted = predictRoot(entry, rootPos, sinceSample, travelTime)
     for _ = 2, settings.passes do
-        travelTime = travelTimeFor(state, ((predicted + offset) - origin).Magnitude, weaponSpeed, pingComponent) * leadScale
+        distance = ((predicted + offset) - origin).Magnitude
+        travelTime = travelTimeFor(state, distance, pingComponent) * leadScale
         predicted = predictRoot(entry, rootPos, sinceSample, travelTime)
     end
 
-    return predicted + offset, rootPos, travelTime
+    return predicted + offset, rootPos, travelTime, distance, pingComponent
 end
 
 local function crossOf(a, b)
@@ -987,11 +1038,15 @@ local function buildPlan(filter, isKnife, origin, now, settings)
     local guaranteed = Aim.HitCheck and not Legit.Enabled
     local aim, base, travelTime, chosen
 
+    local shotDistance, shotPing
+
     for _, scale in ipairs(LEAD_SCALES) do
-        local candidate, candidateBase, candidateTime = solveAim(plan, origin, now, scale)
+        local candidate, candidateBase, candidateTime, candidateDistance, candidatePing =
+            solveAim(plan, origin, now, scale)
         if clearPath(origin, candidate, char)
             and (not guaranteed or landsWithMargin(origin, candidate, char)) then
             aim, base, travelTime, chosen = candidate, candidateBase, candidateTime, scale
+            shotDistance, shotPing = candidateDistance, candidatePing
             break
         end
         if not guaranteed then break end
@@ -1000,8 +1055,8 @@ local function buildPlan(filter, isKnife, origin, now, settings)
     if not aim then return nil end
 
     plan.leadScale = chosen
-    if Aim.AutoPredict and methodUsesDelay() and chosen == 1 then
-        logLead(plan.state, plan.entry, base, aim, travelTime, now)
+    if Aim.AutoPredict and methodUsesDelay() and chosen == 1 and shotDistance then
+        logLead(plan.state, plan.entry, base, aim, travelTime, shotDistance, shotPing, now)
     end
 
     plan.fallback = CFrame.new(aim)
@@ -1028,7 +1083,9 @@ track(PreSimulation:Connect(function()
             verifyLead(GunLead, settings, now)
             verifyLead(KnifeLead, settings, now)
             autoSummary = ('gun %.2fs (%d)  knife %.2fs (%d)')
-                :format(GunLead.delay, GunLead.verified, KnifeLead.delay, KnifeLead.verified)
+                :format(GunLead.a, GunLead.verified, KnifeLead.a, KnifeLead.verified)
+            speedSummary = ('gun %s  knife %s')
+                :format(speedLabel(GunLead), speedLabel(KnifeLead))
         end
 
         gunPlan = buildPlan(isMurderer, false, findGunOrigin(), now, settings)
@@ -1149,18 +1206,6 @@ AimSection:Slider({
     Callback = function(value) Aim.MaxRange = value end,
 })
 
-knifeSpeedSlider = AimSection:Slider({
-    Title = 'knife speed',
-    Desc = 'starts at the real default and self-corrects the moment any knife is seen flying',
-    Min = 40,
-    Max = 300,
-    Increment = 5,
-    Default = Aim.KnifeSpeed,
-    Suffix = ' studs/s',
-    Flag = 'mm2_silent_aim_knife_speed',
-    Callback = function(value) Aim.KnifeSpeed = value end,
-})
-
 AimSection:Slider({
     Title = 'redirect chance',
     Desc = 'percent of shots that get redirected at all. the rest fire exactly where you aimed, untouched. 100 redirects every shot',
@@ -1269,19 +1314,12 @@ PredictionSection:Dropdown({
     Callback = function(value) Aim.Method = value end,
 })
 
-PredictionSection:Slider({
-    Title = 'bullet speed',
-    Desc = 'the travel component for the gun. high means the distance part barely adds anything and the learned delay does the work - a fast shot can still land late',
-    Min = 50,
-    Max = 1500,
-    Increment = 10,
-    Default = Aim.BulletSpeed,
-    Suffix = ' studs/s',
-    Flag = 'mm2_silent_aim_bullet_speed',
-    Callback = function(value) Aim.BulletSpeed = value end,
-})
-
 local AutoStat = PredictionSection:Stat({ Title = 'learned delay', Value = 'idle' })
+local SpeedStat = PredictionSection:Stat({ Title = 'learned speed', Value = 'idle' })
+
+PredictionSection:Label({
+    Text = 'Lead time is solved as a constant delay plus a per-stud travel cost, and both halves are learned from your own shots. There is no speed to set: shots are bucketed near and far, and the difference between what those two buckets needed gives the travel cost while the rest falls out as the constant. Until the buckets are far enough apart to separate the two, only the constant moves.',
+})
 
 PredictionSection:Slider({
     Title = 'manual gun lead time',
@@ -1795,6 +1833,7 @@ task.spawn(function()
         task.wait(0.4)
         pcall(function()
             AutoStat:Set(Aim.SilentAim and Aim.Predict and Aim.AutoPredict and autoSummary or 'off')
+            SpeedStat:Set(Aim.SilentAim and Aim.Predict and Aim.AutoPredict and speedSummary or 'off')
         end)
     end
 end)
