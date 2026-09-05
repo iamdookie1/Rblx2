@@ -251,7 +251,7 @@ local Aim = {
     KnifeSpeed = 96,
     JumpAware = true,
     Method = 'Delay + travel',
-    MathMethod = 'Linear',
+    MathMethod = 'Circular',
     BulletSpeed = 400,
 }
 
@@ -265,11 +265,23 @@ local AUTO_LEVELS = {
 
 local AIM_METHODS = { 'Delay + travel', 'Delay only', 'Travel only', 'Ping only' }
 local MATH_METHODS = {
+    'Circular',
+    'Circle fit',
+    'Orbit',
+    'Spiral',
+    'Arc jerk',
+    'Decay arc',
+    'Tight arc',
+    'Steady arc',
+    'Arc blend',
+    'Arc capped',
+    'Arc strafe',
+    'Reverse arc',
+    'Adaptive arc',
+    'Curve',
     'Linear',
     'Acceleration',
     'Jerk',
-    'Curve',
-    'Circular',
     'Damped',
     'Raw',
     'Average',
@@ -296,6 +308,10 @@ local JUMP_SPAM_COUNT = 3
 local SAMPLE_STALE = 0.5
 local HISTORY_LIMIT = 14
 local HISTORY_WINDOW = 0.7
+local MIN_TURN_RATE = 0.05
+local MIN_TURN_RADIUS = 2.5
+local MAX_TURN_RADIUS = 400
+local TURN_DECAY = 0.45
 
 local visionParams = RaycastParams.new()
 visionParams.FilterType = Enum.RaycastFilterType.Exclude
@@ -502,6 +518,69 @@ local function medianOf(values)
     return (values[count / 2] + values[count / 2 + 1]) * 0.5
 end
 
+local function perpOf(forward)
+    return Vector3.new(-forward.Z, 0, forward.X)
+end
+
+local function arcDisplacement(forward, speed, omega, t)
+    if math.abs(omega) < MIN_TURN_RATE or math.abs(speed) < 0.25 then
+        return forward * (speed * t)
+    end
+    local radius = speed / omega
+    local angle = omega * t
+    return forward * (radius * math.sin(angle))
+        + perpOf(forward) * (radius * (1 - math.cos(angle)))
+end
+
+local function rotateAbout(offset, angle)
+    local cos, sin = math.cos(angle), math.sin(angle)
+    return Vector3.new(
+        offset.X * cos - offset.Z * sin,
+        0,
+        offset.X * sin + offset.Z * cos)
+end
+
+local function fitCircle(entry)
+    local history = entry.history
+    local count = history and #history or 0
+    if count < 5 then return nil end
+
+    local first = history[1]
+    local middle = history[math.floor((count + 1) / 2)]
+    local last = history[count]
+    local span = last.t - first.t
+    if span < 0.12 then return nil end
+
+    local origin = last.p
+    local ax, az = first.p.X - origin.X, first.p.Z - origin.Z
+    local bx, bz = middle.p.X - origin.X, middle.p.Z - origin.Z
+
+    local d = 2 * (ax * bz - bx * az)
+    if math.abs(d) < 1e-4 then return nil end
+
+    local aSq = ax * ax + az * az
+    local bSq = bx * bx + bz * bz
+    local cx = (aSq * bz - bSq * az) / d
+    local cz = (bSq * ax - aSq * bx) / d
+
+    local radius = math.sqrt(cx * cx + cz * cz)
+    if radius < MIN_TURN_RADIUS or radius > MAX_TURN_RADIUS then return nil end
+
+    local center = Vector3.new(origin.X + cx, 0, origin.Z + cz)
+    local toStart = Vector3.new(first.p.X - center.X, 0, first.p.Z - center.Z)
+    local toEnd = Vector3.new(origin.X - center.X, 0, origin.Z - center.Z)
+    if toStart.Magnitude < 0.001 or toEnd.Magnitude < 0.001 then return nil end
+
+    local startUnit, endUnit = toStart.Unit, toEnd.Unit
+    local dot = math.clamp(startUnit:Dot(endUnit), -1, 1)
+    local cross = startUnit.X * endUnit.Z - startUnit.Z * endUnit.X
+    local swept = math.atan2(cross, dot)
+    local omega = swept / span
+    if math.abs(omega) < MIN_TURN_RATE then return nil end
+
+    return center, radius, omega, toEnd
+end
+
 LEAD_MATH.Linear = function(entry, t)
     return entry.horizontal * t
 end
@@ -542,16 +621,126 @@ LEAD_MATH.Curve = function(entry, t)
 end
 
 LEAD_MATH.Circular = function(entry, t)
+    local speed = entry.horizontal.Magnitude
+    if speed < 0.5 then return entry.horizontal * t end
+    return arcDisplacement(entry.horizontal.Unit, speed, entry.turnRate, t)
+end
+
+LEAD_MATH.Spiral = function(entry, t)
     local omega = entry.turnRate
     local speed = entry.horizontal.Magnitude
-    if math.abs(omega) < 0.05 or speed < 0.5 then
+    if math.abs(omega) < MIN_TURN_RATE or speed < 0.5 then
+        return LEAD_MATH.Acceleration(entry, t)
+    end
+
+    local forward = entry.horizontal.Unit
+    local tangential = entry.accel:Dot(forward)
+    local angle = omega * t
+    local cos, sin = math.cos(angle), math.sin(angle)
+
+    local along = speed * sin / omega
+        + tangential * ((cos - 1) / (omega * omega) + t * sin / omega)
+    local across = speed * (1 - cos) / omega
+        + tangential * (sin / (omega * omega) - t * cos / omega)
+
+    return forward * along + perpOf(forward) * across
+end
+
+LEAD_MATH['Circle fit'] = function(entry, t)
+    local center, _, omega, spoke = fitCircle(entry)
+    if not center then return LEAD_MATH.Circular(entry, t) end
+    return rotateAbout(spoke, omega * t) - spoke
+end
+
+LEAD_MATH.Orbit = function(entry, t)
+    local center, radius, omega, spoke = fitCircle(entry)
+    if not center then return LEAD_MATH.Circular(entry, t) end
+    local speed = entry.horizontal.Magnitude
+    if speed > 0.5 and radius > 0 then
+        local paced = speed / radius
+        omega = omega >= 0 and paced or -paced
+    end
+    return rotateAbout(spoke, omega * t) - spoke
+end
+
+LEAD_MATH['Decay arc'] = function(entry, t)
+    local omega = entry.turnRate
+    local speed = entry.horizontal.Magnitude
+    if math.abs(omega) < MIN_TURN_RATE or speed < 0.5 then
         return entry.horizontal * t
     end
+
     local forward = entry.horizontal.Unit
-    local side = Vector3.new(-forward.Z, 0, forward.X)
-    local radius = speed / omega
-    local angle = omega * t
-    return forward * (radius * math.sin(angle)) + side * (radius * (1 - math.cos(angle)))
+    local side = perpOf(forward)
+    local steps = 6
+    local step = t / steps
+    local displacement = Vector3.zero
+    for index = 1, steps do
+        local mid = (index - 0.5) * step
+        local heading = omega * TURN_DECAY * (1 - math.exp(-mid / TURN_DECAY))
+        displacement = displacement
+            + (forward * math.cos(heading) + side * math.sin(heading)) * (speed * step)
+    end
+    return displacement
+end
+
+LEAD_MATH['Tight arc'] = function(entry, t)
+    local speed = entry.horizontal.Magnitude
+    local omega = entry.turnRate
+    if speed < 0.5 then return entry.horizontal * t end
+    if math.abs(omega) >= MIN_TURN_RATE then
+        local radius = speed / omega
+        if math.abs(radius) < MIN_TURN_RADIUS then
+            omega = radius >= 0 and (speed / MIN_TURN_RADIUS) or -(speed / MIN_TURN_RADIUS)
+        end
+    end
+    return arcDisplacement(entry.horizontal.Unit, speed, omega, t)
+end
+
+LEAD_MATH['Steady arc'] = function(entry, t)
+    local history = entry.history
+    if not history or #history < 3 then return LEAD_MATH.Circular(entry, t) end
+    local sum = Vector3.zero
+    for _, sample in ipairs(history) do
+        sum = sum + sample.v
+    end
+    local mean = sum / #history
+    local speed = mean.Magnitude
+    if speed < 0.5 then return entry.horizontal * t end
+    return arcDisplacement(mean.Unit, speed, entry.turnRate, t)
+end
+
+LEAD_MATH['Arc blend'] = function(entry, t)
+    local steady = math.clamp(entry.steady or 1, 0, 1)
+    return (entry.horizontal * t):Lerp(LEAD_MATH.Circular(entry, t), steady)
+end
+
+LEAD_MATH['Arc capped'] = function(entry, t)
+    local speed = entry.horizontal.Magnitude
+    if speed < 0.5 then return entry.horizontal * t end
+    local ceiling = (entry.walkSpeed or 16) * 1.15
+    if speed > ceiling then speed = ceiling end
+    return arcDisplacement(entry.horizontal.Unit, speed, entry.turnRate, t)
+end
+
+LEAD_MATH['Reverse arc'] = function(entry, t)
+    local speed = entry.horizontal.Magnitude
+    if speed < 0.5 then return entry.horizontal * t end
+    return arcDisplacement(entry.horizontal.Unit, speed, -entry.turnRate, t)
+end
+
+LEAD_MATH['Arc strafe'] = function(entry, t)
+    local facing = entry.facing
+    if not facing then return LEAD_MATH.Circular(entry, t) end
+    local speed = entry.horizontal:Dot(facing)
+    if math.abs(speed) < 0.5 then return Vector3.zero end
+    return arcDisplacement(facing, speed, entry.turnRate, t)
+end
+
+LEAD_MATH['Arc jerk'] = function(entry, t)
+    local base = LEAD_MATH.Spiral(entry, t)
+    local jerk = entry.jerk or Vector3.zero
+    return base + jerk * (t * t * t / 6)
 end
 
 LEAD_MATH.Damped = function(entry, t)
@@ -656,6 +845,30 @@ LEAD_MATH.Adaptive = function(entry, t)
         return LEAD_MATH.Damped(entry, t)
     end
     return LEAD_MATH.Linear(entry, t)
+end
+
+LEAD_MATH['Adaptive arc'] = function(entry, t)
+    local steady = entry.steady or 1
+    local speed = entry.horizontal.Magnitude
+
+    if speed < 0.5 then return Vector3.zero end
+    if steady < 0.3 then return LEAD_MATH['Arc blend'](entry, t) end
+
+    local center = fitCircle(entry)
+    if center and steady > 0.55 then
+        return LEAD_MATH.Orbit(entry, t)
+    end
+
+    if math.abs(entry.accel:Dot(entry.horizontal.Unit)) > 25 then
+        return LEAD_MATH.Spiral(entry, t)
+    end
+    if t > 0.8 then
+        return LEAD_MATH['Decay arc'](entry, t)
+    end
+    if speed > (entry.walkSpeed or 16) * 1.4 then
+        return LEAD_MATH['Arc capped'](entry, t)
+    end
+    return LEAD_MATH['Tight arc'](entry, t)
 end
 
 local function horizontalLead(entry, t)
@@ -1147,9 +1360,9 @@ PredictionSection:Dropdown({
 
 PredictionSection:Dropdown({
     Title = 'math',
-    Desc = 'how the future position is worked out from their movement. linear: velocity times time, a straight line. acceleration: adds their rate of speeding up, leads harder into a build up. jerk: one order further, catches a lead that is itself still ramping. curve: steps the lead along their measured turn. circular: the exact arc for that turn rate instead of stepping it, better for long leads on someone orbiting you. damped: lead stops growing past about half a second, nobody holds a line that long. raw: the unsmoothed latest sample, twitchiest. average: mean of the last ~0.7s of samples, ignores single-frame spikes. median: middle sample of that window, throws out lag spikes entirely. displacement: where they actually got over the window divided by the time, so a strafer who ended up nowhere gets almost no lead. facing: their speed sent along the way they are looking, for someone who turns before they move. strafe: keeps the forward part of their run and cuts the side-to-side part, for a-d spammers. capped: their direction but never faster than their walkspeed, kills teleport and rubberband spikes. blend: linear and acceleration mixed by how consistent their direction has been. conservative: 60% lead, for close range where overshooting is the whole problem. aggressive: 125% lead plus acceleration, for far targets running flat out. adaptive: picks circular, acceleration, damped or linear per target from their measured turn, acceleration and steadiness',
+    Desc = 'how the future position is worked out from their movement. the arc family is listed first. circular: the exact arc for their measured turn rate, no stepping error. circle fit: fits a real circle through three of their past positions and walks them around it, so the arc comes from where they actually went rather than a smoothed turn number. orbit: same fit but paced by their current speed, for someone holding a lap around you. spiral: an arc whose speed is also changing, for a turn taken while accelerating out of it. arc jerk: spiral plus the third order term. decay arc: the turn fades out across the lead, nobody holds a constant turn for a whole second. tight arc: an arc whose radius cannot go below a real player turning circle, so a noisy turn reading cannot produce a silly tight loop. steady arc: the arc driven by the averaged window instead of the latest sample. arc blend: arc and straight line mixed by how consistent their direction has been. arc capped: the arc with speed held to their walkspeed, kills rubberband spikes. arc strafe: the arc along the way they are facing only. reverse arc: assumes they flip the turn, for jukers. adaptive arc: picks from the arc family per target. curve: the old stepped version of circular. then the straight line family - linear, acceleration, jerk, damped, raw, average, median, displacement, facing, strafe, capped, blend, conservative, aggressive, adaptive',
     Values = MATH_METHODS,
-    Default = 'Linear',
+    Default = 'Circular',
     Flag = 'mm2_silent_aim_math',
     Callback = function(value) Aim.MathMethod = value end,
 })
