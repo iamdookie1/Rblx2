@@ -256,6 +256,9 @@ local Aim = {
     HitCheck = true,
 }
 
+local GunTune = { Mult = 100, Extra = 0, Speed = 0, Auto = true }
+local KnifeTune = { Mult = 100, Extra = 0, Speed = 96, Auto = true }
+
 local Legit = {
     Enabled = false,
     RedirectChance = 65,
@@ -697,9 +700,9 @@ local function predictRoot(entry, base, sinceSample, travelTime)
     return Vector3.new(base.X + horizontal.X, y, base.Z + horizontal.Z)
 end
 
-local function newLeadState(seedSpeed)
+local function newLeadState(tune)
     return {
-        b = seedSpeed >= math.huge and 0 or (1 / math.max(seedSpeed, 1)),
+        tune = tune,
         mult = 1,
         arms = { { hit = 0, shot = 0 }, { hit = 0, shot = 0 }, { hit = 0, shot = 0 } },
         pending = {},
@@ -708,8 +711,8 @@ local function newLeadState(seedSpeed)
     }
 end
 
-local GunLead = newLeadState(math.huge)
-local KnifeLead = newLeadState(Aim.KnifeSpeed)
+local GunLead = newLeadState(GunTune)
+local KnifeLead = newLeadState(KnifeTune)
 
 local function methodUsesTravel()
     return Aim.Method == 'Delay + travel' or Aim.Method == 'Travel only'
@@ -722,19 +725,30 @@ local function armMultiplier(state, arm)
 end
 
 local function travelTimeFor(state, entry, distance, arm)
+    local tune = state.tune
     local total = 0
+
     if Aim.UsePing then
         total = total + cachedPing
     end
     total = total + (entry ~= nil and entry.repLag or 0) * 0.5
     total = total + cachedFrame
-    if methodUsesTravel() then
-        total = total + state.b * distance
+
+    if tune.Speed > 0 and methodUsesTravel() then
+        total = total + distance / tune.Speed
     end
-    return math.min(total * armMultiplier(state, arm), MAX_TRAVEL_TIME)
+    total = total + tune.Extra / 1000
+    total = total * (tune.Mult / 100)
+
+    if tune.Auto then
+        total = total * armMultiplier(state, arm)
+    end
+
+    return math.min(total, MAX_TRAVEL_TIME)
 end
 
 local function updateBandit(state)
+    if not state.tune.Auto then return end
     local arms = state.arms
     local shots = arms[1].shot + arms[2].shot + arms[3].shot
     if shots < ARM_WINDOW then return end
@@ -892,11 +906,16 @@ local function scanTargets(filterFn)
     return candidates
 end
 
+local knifeSpeedSlider = nil
+
 local function onThrowingKnifeAdded(instance)
     local ok, speed = pcall(function() return instance:GetAttribute("ThrowSpeed") end)
     if ok and typeof(speed) == "number" and speed > 1 and speed ~= Aim.KnifeSpeed then
         Aim.KnifeSpeed = speed
-        KnifeLead.b = 1 / speed
+        KnifeTune.Speed = speed
+        if knifeSpeedSlider then
+            pcall(function() knifeSpeedSlider:Set(speed) end)
+        end
     end
 end
 
@@ -1116,7 +1135,7 @@ local function buildPlan(filter, isKnife, origin, now, settings)
                 state = isKnife and KnifeLead or GunLead,
                 settings = settings,
                 isKnife = isKnife,
-                arm = math.random(1, 3),
+                arm = (isKnife and KnifeTune or GunTune).Auto and math.random(1, 3) or 2,
                 stamp = now,
             }
 
@@ -1317,8 +1336,9 @@ track(PreSimulation:Connect(function()
             verifyLead(KnifeLead, settings, now)
             autoSummary = ('gun %d/%d  knife %d/%d')
                 :format(GunLead.hits, GunLead.verified, KnifeLead.hits, KnifeLead.verified)
-            speedSummary = ('gun x%.2f  knife x%.2f')
-                :format(GunLead.mult, KnifeLead.mult)
+            speedSummary = ('gun x%.2f%s  knife x%.2f%s')
+                :format(GunLead.mult, GunTune.Auto and '' or ' off',
+                    KnifeLead.mult, KnifeTune.Auto and '' or ' off')
         end
 
         gunPlan = buildPlan(isMurderer, false, findGunOrigin(), now, settings)
@@ -1848,6 +1868,57 @@ track(Workspace.DescendantRemoving:Connect(function(inst)
     if trapObjects[inst] then destroyTrapEsp(inst) end
 end))
 
+
+local leadStats = {}
+
+for _, spec in ipairs({
+    { key = 'gun', title = 'gun', tune = GunTune, side = 'left', flag = 'mm2_gun_lead',
+      speedDefault = 0, speedMin = 0, speedMax = 1500, speedStep = 10,
+      speedDesc = 'studs per second for the distance part. 0 means instant, which is what the gun looks like - the server just casts a ray. raise it off 0 only if far shots miss while close ones land' },
+    { key = 'knife', title = 'knife', tune = KnifeTune, side = 'right', flag = 'mm2_knife_lead',
+      speedDefault = 96, speedMin = 20, speedMax = 300, speedStep = 2,
+      speedDesc = 'the thrown knife is a real projectile, so this one matters. starts at the game default and overwrites itself with the real ThrowSpeed the first time any knife is seen flying' },
+}) do
+    local section = SilentAimTab:Section({ Title = spec.title .. ' lead', Side = spec.side })
+    local tune = spec.tune
+
+    section:Toggle({
+        Title = 'auto tune',
+        Desc = 'on, this weapon trials a slightly short, normal and long lead and drifts toward whichever lands more, bounded either side of the measured value. off, the sliders below are exactly what it uses and nothing moves them',
+        Flag = spec.flag .. '_auto',
+        Default = true,
+        Callback = function(state) tune.Auto = state end,
+    })
+
+    section:Slider({
+        Title = 'lead multiplier',
+        Desc = 'scales the whole lead for this weapon only. raise it if its shots land behind a moving target, lower it if they land in front',
+        Min = 0, Max = 400, Increment = 5, Default = 100, Suffix = '%',
+        Flag = spec.flag .. '_mult',
+        Callback = function(value) tune.Mult = value end,
+    })
+
+    section:Slider({
+        Title = 'extra lead',
+        Desc = 'a flat amount added before the multiplier, for delay that does not scale with range',
+        Min = 0, Max = 500, Increment = 5, Default = 0, Suffix = ' ms',
+        Flag = spec.flag .. '_extra',
+        Callback = function(value) tune.Extra = value end,
+    })
+
+    local speedSlider = section:Slider({
+        Title = 'travel speed',
+        Desc = spec.speedDesc,
+        Min = spec.speedMin, Max = spec.speedMax, Increment = spec.speedStep,
+        Default = spec.speedDefault, Suffix = ' studs/s',
+        Flag = spec.flag .. '_speed',
+        Callback = function(value) tune.Speed = value end,
+    })
+    if spec.key == 'knife' then knifeSpeedSlider = speedSlider end
+
+    leadStats[spec.key] = section:Stat({ Title = spec.title .. ' hits / shots', Value = '0 / 0' })
+end
+
 local LegitTab = Window:Tab({ Title = 'legit', Icon = 'user-check' })
 
 local LegitSection = LegitTab:Section({ Title = 'legit mode', Side = 'left' })
@@ -2130,6 +2201,8 @@ task.spawn(function()
                 and ('%.1f studs over %d'):format(shotStats.error / shotStats.proved, shotStats.proved)
                 or '-')
             SpeedStat:Set(Aim.SilentAim and Aim.Predict and speedSummary or 'off')
+            leadStats.gun:Set(('%d / %d'):format(GunLead.hits, GunLead.verified))
+            leadStats.knife:Set(('%d / %d'):format(KnifeLead.hits, KnifeLead.verified))
         end)
     end
 end)
