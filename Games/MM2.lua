@@ -312,6 +312,10 @@ local ARC_STEPS = 6
 local PLAN_STALE = 0.25
 local TRANSPARENT_SKIPS = 8
 local HIT_MARGIN = 0.45
+local SAFE_SPOT_NAMES = { "HumanoidRootPart", "UpperTorso", "Torso", "LowerTorso" }
+local SAFE_MARGIN_STEPS = 4
+local SAFE_MARGIN_MAX = 1.5
+local SHERIFF_SAFE_BUDGET = #SAFE_SPOT_NAMES * (1 + SAFE_MARGIN_STEPS * 5)
 local LEAD_SEARCH_STEPS = 7
 local LEGIT_REACQUIRE = 0.4
 local DRIFT_STEP = 0.06
@@ -368,7 +372,10 @@ local function landsOn(origin, point, char)
     return instance ~= nil and instance:IsDescendantOf(char)
 end
 
-local function landsWithMargin(origin, point, char)
+local function landsWithinMargin(origin, point, char, margin)
+    if margin <= 0 then
+        return landsOn(origin, point, char)
+    end
     if not landsOn(origin, point, char) then return false end
 
     local direction = point - origin
@@ -379,13 +386,49 @@ local function landsWithMargin(origin, point, char)
     else
         side = side.Unit
     end
-    local lift = Vector3.new(0, HIT_MARGIN, 0)
-    side = side * HIT_MARGIN
+    local lift = Vector3.new(0, margin, 0)
+    side = side * margin
 
     return landsOn(origin, point + side, char)
         and landsOn(origin, point - side, char)
         and landsOn(origin, point + lift, char)
         and landsOn(origin, point - lift, char)
+end
+
+local function landsWithMargin(origin, point, char)
+    return landsWithinMargin(origin, point, char, HIT_MARGIN)
+end
+
+local function safestSpotOn(origin, char)
+    local best, bestMargin = nil, -1
+
+    for _, name in ipairs(SAFE_SPOT_NAMES) do
+        local part = char:FindFirstChild(name)
+        if part then
+            local point = part.Position
+            if landsOn(origin, point, char) then
+                local lo, hi = 0, SAFE_MARGIN_MAX
+                for _ = 1, SAFE_MARGIN_STEPS do
+                    local mid = (lo + hi) / 2
+                    if landsWithinMargin(origin, point, char, mid) then
+                        lo = mid
+                    else
+                        hi = mid
+                    end
+                end
+                if lo > bestMargin then
+                    best, bestMargin = point, lo
+                end
+            end
+        end
+    end
+
+    return best, bestMargin
+end
+
+local function isLocalSheriff()
+    local role = roleOf(LocalPlayer)
+    return role == "Sheriff"
 end
 
 local function screenAnchor()
@@ -1091,6 +1134,29 @@ local function buildPlan(filter, isKnife, origin, now, settings)
                 isKnife = isKnife,
                 stamp = now,
             }
+
+            if guaranteed and not isKnife and isLocalSheriff() then
+                local safePoint, safeMargin = safestSpotOn(origin, char)
+                budget = budget - SHERIFF_SAFE_BUDGET
+
+                if safePoint and safeMargin > 0 then
+                    plan.part = root
+                    plan.leadScale = 0
+                    plan.fallback = CFrame.new(safePoint)
+                    logLead(plan.state, char, (safePoint - origin).Magnitude, 0, now)
+
+                    if Legit.Enabled then
+                        local lock = legitLock[slot]
+                        if not lock or lock.player ~= plr or now >= lock.expires then
+                            legitLock[slot] = { player = plr, expires = now + Legit.Stickiness }
+                        end
+                    end
+
+                    return plan
+                end
+
+                if budget <= 0 then break end
+            end
 
             for _, part in ipairs(candidate.parts) do
                 if budget <= 0 then break end
