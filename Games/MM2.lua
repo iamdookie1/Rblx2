@@ -87,19 +87,23 @@ task.spawn(function()
     end
 end)
 
+local function isGunTool(item)
+    if not item:IsA("Tool") then return false end
+    local tagged = false
+    pcall(function() tagged = CollectionService:HasTag(item, "Weapon_Gun") end)
+    return item.Name == "Gun" or item:FindFirstChild("IsGun") ~= nil or tagged
+end
+
+local function isKnifeTool(item)
+    if not item:IsA("Tool") then return false end
+    return item.Name == "Knife" or item:FindFirstChild("KnifeClient") ~= nil or item:FindFirstChild("Stab") ~= nil
+end
+
 local function heldWeapon(char)
     if not char then return nil end
     for _, item in ipairs(char:GetChildren()) do
-        if item:IsA("Tool") then
-            local tagged = false
-            pcall(function() tagged = CollectionService:HasTag(item, "Weapon_Gun") end)
-            if item.Name == "Gun" or item:FindFirstChild("IsGun") or tagged then
-                return "Gun"
-            end
-            if item.Name == "Knife" or item:FindFirstChild("KnifeClient") or item:FindFirstChild("Stab") then
-                return "Knife"
-            end
-        end
+        if isGunTool(item) then return "Gun" end
+        if isKnifeTool(item) then return "Knife" end
     end
     return nil
 end
@@ -247,7 +251,6 @@ local Aim = {
     AutoLevel = 'Normal',
     JumpAware = true,
     RedirectChance = 100,
-    HitCheck = true,
 }
 
 local GunTune = { Extra = 0 }
@@ -290,7 +293,7 @@ local AUTO_LEVELS = {
     Best     = { smooth = 0.80, passes = 3 },
 }
 
-local MAX_TRAVEL_TIME = 2.5
+local MAX_TRAVEL_TIME = 5
 local MAX_LEAD_OFFSET = 50
 local MAX_VERTICAL_RISE = 2
 local MAX_VERTICAL_DROP = 12
@@ -311,17 +314,10 @@ local TRUST_FLOOR = 0.7
 local ARC_STEPS = 6
 local PLAN_STALE = 0.25
 local TRANSPARENT_SKIPS = 8
-local HIT_MARGIN = 0.45
-local SAFE_SPOT_NAMES = { "HumanoidRootPart", "UpperTorso", "Torso", "LowerTorso" }
-local SAFE_MARGIN_STEPS = 4
-local SAFE_MARGIN_MAX = 1.5
-local SHERIFF_SAFE_BUDGET = #SAFE_SPOT_NAMES * (1 + SAFE_MARGIN_STEPS * 5)
-local LEAD_SEARCH_STEPS = 7
 local LEGIT_REACQUIRE = 0.4
 local DRIFT_STEP = 0.06
 local HIT_WINDOW = 0.35
 local MAX_CANDIDATES = 5
-local CAST_BUDGET = 48
 local PART_ORDER_HEAD = { "Head", "UpperTorso", "Torso", "HumanoidRootPart", "LowerTorso" }
 local PART_ORDER_BODY = { "HumanoidRootPart", "UpperTorso", "Torso", "LowerTorso", "Head" }
 
@@ -363,72 +359,6 @@ local function clearPath(origin, target, char)
     return (result.Position - origin).Magnitude >= direction.Magnitude - 2
 end
 
-local function landsOn(origin, point, char)
-    local direction = point - origin
-    if direction.Magnitude < 0.1 then return false end
-    local result = weaponCast(origin, direction, nil)
-    if not result then return false end
-    local instance = result.Instance
-    return instance ~= nil and instance:IsDescendantOf(char)
-end
-
-local function landsWithinMargin(origin, point, char, margin)
-    if margin <= 0 then
-        return landsOn(origin, point, char)
-    end
-    if not landsOn(origin, point, char) then return false end
-
-    local direction = point - origin
-    local forward = direction.Unit
-    local side = Vector3.new(-forward.Z, 0, forward.X)
-    if side.Magnitude < 0.001 then
-        side = Vector3.new(1, 0, 0)
-    else
-        side = side.Unit
-    end
-    local lift = Vector3.new(0, margin, 0)
-    side = side * margin
-
-    return landsOn(origin, point + side, char)
-        and landsOn(origin, point - side, char)
-        and landsOn(origin, point + lift, char)
-        and landsOn(origin, point - lift, char)
-end
-
-local function landsWithMargin(origin, point, char)
-    return landsWithinMargin(origin, point, char, HIT_MARGIN)
-end
-
-local function safestSpotOn(origin, char)
-    local best, bestMargin = nil, -1
-
-    for _, name in ipairs(SAFE_SPOT_NAMES) do
-        local part = char:FindFirstChild(name)
-        if part then
-            local point = part.Position
-            if landsOn(origin, point, char) then
-                local lo, hi = 0, SAFE_MARGIN_MAX
-                for _ = 1, SAFE_MARGIN_STEPS do
-                    local mid = (lo + hi) / 2
-                    if landsWithinMargin(origin, point, char, mid) then
-                        lo = mid
-                    else
-                        hi = mid
-                    end
-                end
-                if lo > bestMargin then
-                    best, bestMargin = point, lo
-                end
-            end
-        end
-    end
-
-    return best, bestMargin
-end
-
-local function isLocalGunHolder()
-    return heldWeapon(LocalPlayer.Character) == "Gun"
-end
 
 local function screenAnchor()
     if Aim.FOVFollowMouse then
@@ -1045,38 +975,6 @@ local function resolveRedirect(plan, originCFrame, sentCFrame)
     return CFrame.new(aim)
 end
 
-local function verifiedLeadScale(plan, origin, char, now)
-    local zeroAim = select(1, solveAim(plan, origin, now, 0))
-    if not landsOn(origin, zeroAim, char) then
-        return nil
-    end
-
-    local bestAim, bestScale, bestTravel, bestDistance = zeroAim, 0, 0, nil
-    local lo, hi = 0, 1
-
-    for _ = 1, LEAD_SEARCH_STEPS do
-        local mid = (lo + hi) / 2
-        local aim, _, travelTime, distance = solveAim(plan, origin, now, mid)
-        if landsOn(origin, aim, char) then
-            bestAim, bestScale, bestTravel, bestDistance = aim, mid, travelTime, distance
-            lo = mid
-        else
-            hi = mid
-        end
-    end
-
-    if landsWithMargin(origin, bestAim, char) then
-        return bestAim, bestScale, bestTravel, bestDistance
-    end
-
-    if landsWithMargin(origin, zeroAim, char) then
-        local _, _, zeroTravel, zeroDistance = solveAim(plan, origin, now, 0)
-        return zeroAim, 0, zeroTravel, zeroDistance
-    end
-
-    return nil
-end
-
 local function buildPlan(filter, isKnife, origin, now, settings)
     if not origin then return nil end
 
@@ -1098,11 +996,8 @@ local function buildPlan(filter, isKnife, origin, now, settings)
         end
     end
 
-    local guaranteed = Aim.HitCheck and not Legit.Enabled
-    local budget = CAST_BUDGET
-
     for rank, candidate in ipairs(candidates) do
-        if rank > MAX_CANDIDATES or budget <= 0 then break end
+        if rank > MAX_CANDIDATES then break end
 
         local plr = candidate.plr
         local char = candidate.char
@@ -1131,73 +1026,33 @@ local function buildPlan(filter, isKnife, origin, now, settings)
                 state = isKnife and KnifeLead or GunLead,
                 settings = settings,
                 isKnife = isKnife,
+                leadScale = 1,
                 stamp = now,
             }
 
-            if guaranteed and not isKnife and isLocalGunHolder() then
-                local safePoint, safeMargin = safestSpotOn(origin, char)
-                budget = budget - SHERIFF_SAFE_BUDGET
-
-                if safePoint and safeMargin > 0 then
-                    plan.part = root
-                    plan.leadScale = 0
-                    plan.fallback = CFrame.new(safePoint)
-                    logLead(plan.state, char, (safePoint - origin).Magnitude, 0, now)
-
-                    if Legit.Enabled then
-                        local lock = legitLock[slot]
-                        if not lock or lock.player ~= plr or now >= lock.expires then
-                            legitLock[slot] = { player = plr, expires = now + Legit.Stickiness }
-                        end
-                    end
-
-                    return plan
-                end
-
-                if budget <= 0 then break end
-            end
-
             for _, part in ipairs(candidate.parts) do
-                if budget <= 0 then break end
                 plan.part = part
-                budget = budget - 1
 
-                local aim, scale, travelTime, distance
+                if clearPath(origin, part.Position, char) then
+                    local aim, _, travelTime, distance = solveAim(plan, origin, now, 1)
 
-                if guaranteed then
-                    budget = budget - 5
-                    if landsWithMargin(origin, part.Position, char) then
-                        aim, scale, travelTime, distance = verifiedLeadScale(plan, origin, char, now)
-                        budget = budget - (LEAD_SEARCH_STEPS + 6)
-                    end
-                elseif clearPath(origin, part.Position, char) then
-                    aim, _, travelTime, distance = solveAim(plan, origin, now, 1)
-                    budget = budget - 1
-                    scale = 1
-                    if not clearPath(origin, aim, char) then
-                        aim = nil
-                    end
-                end
+                    if clearPath(origin, aim, char) then
+                        plan.fallback = CFrame.new(aim)
 
-                if aim then
-                    plan.leadScale = scale
-                    plan.fallback = CFrame.new(aim)
-
-                    if distance then
-                        logLead(plan.state, char, distance, travelTime, now)
-                    end
-
-                    if Legit.Enabled then
-                        local lock = legitLock[slot]
-                        if not lock or lock.player ~= plr or now >= lock.expires then
-                            legitLock[slot] = { player = plr, expires = now + Legit.Stickiness }
+                        if distance then
+                            logLead(plan.state, char, distance, travelTime, now)
                         end
+
+                        if Legit.Enabled then
+                            local lock = legitLock[slot]
+                            if not lock or lock.player ~= plr or now >= lock.expires then
+                                legitLock[slot] = { player = plr, expires = now + Legit.Stickiness }
+                            end
+                        end
+
+                        return plan
                     end
-
-                    return plan
                 end
-
-                if budget <= 0 then break end
             end
         end
     end
@@ -1484,14 +1339,6 @@ AimSection:Slider({
     Suffix = '%',
     Flag = 'mm2_silent_aim_redirect_chance',
     Callback = function(value) Aim.RedirectChance = value end,
-})
-
-AimSection:Toggle({
-    Title = 'guaranteed hit',
-    Desc = 'before redirecting, casts the shot the same way the game does - from the real muzzle, skipping fully transparent parts, same as its own weapon raycast - and only redirects if it lands on the target with room to spare on all four sides. if the lead would miss it walks the lead back and retests, and drops the redirect rather than fire a miss. off lets it fire unverified',
-    Flag = 'mm2_silent_aim_hitcheck',
-    Default = true,
-    Callback = function(state) Aim.HitCheck = state end,
 })
 
 local FovSection = SilentAimTab:Section({ Title = 'fov', Side = 'right' })
@@ -1891,15 +1738,101 @@ track(Workspace.DescendantRemoving:Connect(function(inst)
     if trapObjects[inst] then destroyTrapEsp(inst) end
 end))
 
+local DroppedGunEsp = { Enabled = false }
+local droppedGunObjects = {}
+
+local function isDroppedGun(inst)
+    if typeof(inst) ~= "Instance" or not isGunTool(inst) then return false end
+    local parent = inst.Parent
+    return parent ~= nil and Players:GetPlayerFromCharacter(parent) == nil
+end
+
+local function destroyDroppedGunEsp(item)
+    local entry = droppedGunObjects[item]
+    if not entry then return end
+    if entry.highlight then entry.highlight:Destroy() end
+    if entry.marker then entry.marker:Destroy() end
+    droppedGunObjects[item] = nil
+end
+
+local function buildDroppedGunEsp(item)
+    if droppedGunObjects[item] then return end
+
+    local hl = Instance.new("Highlight")
+    hl.FillColor = GUN_ESP_COLOR
+    hl.OutlineColor = GUN_ESP_COLOR
+    hl.FillTransparency = 0.3
+    hl.OutlineTransparency = 0
+    hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+    hl.Parent = item
+
+    local marker = nil
+    local handle = item:FindFirstChild("Handle")
+    if handle and handle:IsA("BasePart") then
+        marker = Instance.new("Part")
+        marker.Anchored = true
+        marker.CanCollide = false
+        marker.CanQuery = false
+        marker.CanTouch = false
+        marker.Locked = true
+        marker.Shape = Enum.PartType.Ball
+        marker.Size = Vector3.new(1.6, 1.6, 1.6)
+        marker.Material = Enum.Material.Neon
+        marker.Color = GUN_ESP_COLOR
+        marker.Transparency = 0.15
+        marker.Name = "MM2AssistGunMarker"
+        marker.Parent = Workspace
+        pcall(function() marker.Position = handle.Position end)
+    end
+
+    droppedGunObjects[item] = { highlight = hl, marker = marker }
+end
+
+local function droppedGunEspRefreshAll()
+    for item in pairs(droppedGunObjects) do destroyDroppedGunEsp(item) end
+    if not DroppedGunEsp.Enabled then return end
+    for _, inst in ipairs(Workspace:GetDescendants()) do
+        if isDroppedGun(inst) then buildDroppedGunEsp(inst) end
+    end
+end
+
+local function updateDroppedGunMarkers()
+    for item, entry in pairs(droppedGunObjects) do
+        if not item.Parent or not isDroppedGun(item) then
+            destroyDroppedGunEsp(item)
+        elseif entry.marker then
+            local handle = item:FindFirstChild("Handle")
+            if handle then
+                pcall(function() entry.marker.Position = handle.Position end)
+            end
+        end
+    end
+end
+
+task.spawn(function()
+    while not Unloading do
+        task.wait(0.2)
+        if DroppedGunEsp.Enabled then pcall(updateDroppedGunMarkers) end
+    end
+end)
+
+track(Workspace.DescendantAdded:Connect(function(inst)
+    if not DroppedGunEsp.Enabled then return end
+    if isDroppedGun(inst) then buildDroppedGunEsp(inst) end
+end))
+
+track(Workspace.DescendantRemoving:Connect(function(inst)
+    if droppedGunObjects[inst] then destroyDroppedGunEsp(inst) end
+end))
 
 local GunLeadSection = SilentAimTab:Section({ Title = 'gun lead', Side = 'left' })
 
 GunLeadSection:Slider({
     Title = 'extra lead',
-    Desc = 'a flat amount added to the gun lead, on top of ping, replication lag and your own frame time. positive aims further ahead of the target. negative aims behind them - use it if shots are consistently landing in front, since it walks the point back toward where they already were instead of further into where they are going',
-    Min = -500,
-    Max = 500,
-    Increment = 5,
+    Desc = 'a flat amount added to the gun lead, on top of ping, replication lag and your own frame time. positive aims further ahead of the target. negative aims behind them - use it if shots are consistently landing in front, since it walks the point back toward where they already were instead of further into where they are going. the gun is meant to be near instant, so it will rarely need much of this range - it is wide mainly so knife-style flight-time testing does not feel capped',
+    Min = -3000,
+    Max = 3000,
+    Increment = 10,
     Default = 0,
     Suffix = ' ms',
     Flag = 'mm2_gun_lead_extra',
@@ -1913,9 +1846,9 @@ local KnifeLeadSection = SilentAimTab:Section({ Title = 'knife lead', Side = 'ri
 KnifeLeadSection:Slider({
     Title = 'extra lead',
     Desc = 'a flat amount added to the knife lead, on top of its real flight time, ping, replication lag and your own frame time. positive aims further ahead of the target. negative aims behind them, for when it is consistently overshooting to one side',
-    Min = -500,
-    Max = 500,
-    Increment = 5,
+    Min = -3000,
+    Max = 3000,
+    Increment = 10,
     Default = 0,
     Suffix = ' ms',
     Flag = 'mm2_knife_lead_extra',
@@ -1932,7 +1865,7 @@ local LegitSection = LegitTab:Section({ Title = 'legit mode', Side = 'left' })
 
 LegitSection:Toggle({
     Title = 'legit mode',
-    Desc = 'trades accuracy for looking human. overrides the silent aim redirect chance with its own and turns guaranteed hit off, since the two want opposite things',
+    Desc = 'trades accuracy for looking human. overrides the silent aim redirect chance with its own',
     Flag = 'mm2_legit',
     Default = false,
     Callback = function(state) Legit.Enabled = state end,
@@ -2177,6 +2110,16 @@ TrapSection:Toggle({
     end,
 })
 
+TrapSection:Toggle({
+    Title = 'dropped gun esp',
+    Desc = 'when a sheriff or hero dies holding the gun, it lands somewhere in the world rather than vanishing. this looks for exactly the same tool the gun is identified by everywhere else in this script - by name, its own marker child, or its tag - lying anywhere that is not inside a character, and puts a highlight and a marker ball on it. stops tracking it the moment someone actually picks it back up',
+    Flag = 'mm2_dropped_gun_esp',
+    Callback = function(state)
+        DroppedGunEsp.Enabled = state
+        droppedGunEspRefreshAll()
+    end,
+})
+
 local SessionSection = VisualTab:Section({ Title = 'session', Side = 'right' })
 
 SessionSection:Button({
@@ -2190,6 +2133,7 @@ SessionSection:Button({
 
         for plr in pairs(espObjects) do destroyEsp(plr) end
         for part in pairs(trapObjects) do destroyTrapEsp(part) end
+        for item in pairs(droppedGunObjects) do destroyDroppedGunEsp(item) end
         xrayRestoreAll()
         clearMarkers()
 
