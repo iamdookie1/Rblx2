@@ -236,7 +236,7 @@ end)
 local Aim = {
     SilentAim = false,
     WallCheck = true,
-    AimPart = "Head",
+    AimPart = "Body",
     MaxRange = 300,
     FOVEnabled = false,
     FOVRadius = 200,
@@ -329,7 +329,7 @@ local ARM_MARGIN = 0.12
 local SWEEP_STEP = 1.5
 local CAST_BUDGET = 48
 local PART_ORDER_HEAD = { "Head", "UpperTorso", "Torso", "HumanoidRootPart", "LowerTorso" }
-local PART_ORDER_BODY = { "UpperTorso", "Torso", "HumanoidRootPart", "Head", "LowerTorso" }
+local PART_ORDER_BODY = { "HumanoidRootPart", "UpperTorso", "Torso", "LowerTorso", "Head" }
 
 local visionParams = RaycastParams.new()
 visionParams.FilterType = Enum.RaycastFilterType.Exclude
@@ -822,11 +822,9 @@ local autoSummary = 'idle'
 local speedSummary = 'idle'
 
 local function aimPartsFor(char, entry)
-    local order = PART_ORDER_HEAD
-    if Aim.AimPart ~= "Head" then
-        order = PART_ORDER_BODY
-    elseif Aim.AutoPredict and Aim.JumpAware and entry and isSpamJumper(entry) then
-        order = PART_ORDER_BODY
+    local order = PART_ORDER_BODY
+    if Aim.AimPart == "Head" and not (Aim.JumpAware and entry and isSpamJumper(entry)) then
+        order = PART_ORDER_HEAD
     end
 
     local parts = {}
@@ -1014,6 +1012,7 @@ local function noteShot(plan, reason, origin, sent, aimed, predictedRoot, travel
         predicted = predictedRoot,
         travel = travel,
         scale = plan ~= nil and plan.leadScale or nil,
+        part = plan ~= nil and plan.part ~= nil and plan.part.Name or nil,
     }
 end
 
@@ -1233,9 +1232,10 @@ local function debugTick(now)
             local moved = event.sent and event.aimed and (event.aimed - event.sent).Magnitude or nil
             local lead = event.root and event.predicted and flatDistance(event.predicted, event.root) or nil
             if debugLog then
-                debugLog:Add(("%s -> %s | moved %s | lead %s | travel %s | lead scale %s"):format(
+                debugLog:Add(("%s -> %s %s | moved %s | lead %s | travel %s | lead scale %s"):format(
                     tag,
                     event.target or "?",
+                    event.part or "?",
                     moved and ("%.1f studs"):format(moved) or "n/a",
                     lead and ("%.1f studs"):format(lead) or "n/a",
                     event.travel and ("%.3fs"):format(event.travel) or "n/a",
@@ -1416,8 +1416,9 @@ AimSection:Toggle({
 
 AimSection:Dropdown({
     Title = 'aim part',
-    Values = { 'Head', 'HumanoidRootPart' },
-    Default = 'Head',
+    Desc = 'the gun one shots anywhere on the body, so body is not a compromise - it is the same kill with a wider target. the server checks the shot by casting from your gun to the point sent, so how far the prediction can be off before missing is just the width of what you aimed at: about a stud either side of the torso against about half that on the head. head is only worth it if you want the killfeed',
+    Values = { 'Body', 'Head' },
+    Default = 'Body',
     Flag = 'mm2_silent_aim_part',
     Callback = function(value) Aim.AimPart = value end,
 })
