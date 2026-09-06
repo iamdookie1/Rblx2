@@ -426,9 +426,8 @@ local function safestSpotOn(origin, char)
     return best, bestMargin
 end
 
-local function isLocalSheriff()
-    local role = roleOf(LocalPlayer)
-    return role == "Sheriff"
+local function isLocalGunHolder()
+    return heldWeapon(LocalPlayer.Character) == "Gun"
 end
 
 local function screenAnchor()
@@ -1135,7 +1134,7 @@ local function buildPlan(filter, isKnife, origin, now, settings)
                 stamp = now,
             }
 
-            if guaranteed and not isKnife and isLocalSheriff() then
+            if guaranteed and not isKnife and isLocalGunHolder() then
                 local safePoint, safeMargin = safestSpotOn(origin, char)
                 budget = budget - SHERIFF_SAFE_BUDGET
 
@@ -1573,6 +1572,7 @@ local Visual = {
     RoleEsp = false,
     ShowPerk = false,
     ShowDistance = false,
+    GunEsp = false,
 }
 
 local ROLE_COLORS = {
@@ -1586,6 +1586,7 @@ local ROLE_COLORS = {
     Runner = Color3.fromRGB(0, 200, 100),
 }
 local NEUTRAL_COLOR = Color3.fromRGB(255, 255, 255)
+local GUN_ESP_COLOR = Color3.fromRGB(0, 255, 255)
 
 local espObjects = {}
 
@@ -1644,7 +1645,7 @@ local function distanceTo(part)
 end
 
 local function updateEsp()
-    if not Visual.Esp and not Visual.RoleEsp then
+    if not Visual.Esp and not Visual.RoleEsp and not Visual.GunEsp then
         for plr in pairs(espObjects) do destroyEsp(plr) end
         return
     end
@@ -1663,18 +1664,26 @@ local function updateEsp()
 
                 if obj then
                     local role, dead = roleOf(plr)
-                    local color = (role and ROLE_COLORS[role]) or NEUTRAL_COLOR
-                    local espColor = Visual.ColorByRole and not dead and color or NEUTRAL_COLOR
+                    local hasGun = heldWeapon(char) == "Gun"
+                    local showGun = Visual.GunEsp and hasGun
 
-                    obj.Highlight.Enabled = Visual.Esp
+                    local roleColor = (role and ROLE_COLORS[role]) or NEUTRAL_COLOR
+                    local color = Visual.ColorByRole and not dead and roleColor or NEUTRAL_COLOR
+                    local espColor = showGun and GUN_ESP_COLOR or color
+
+                    obj.Highlight.Enabled = Visual.Esp or showGun
                     obj.Highlight.FillColor = espColor
                     obj.Highlight.OutlineColor = espColor
 
                     local showRole = Visual.RoleEsp and role ~= nil and not dead
-                    obj.Billboard.Enabled = showRole
-                    if showRole then
-                        local text = role
-                        if Visual.ShowPerk and role == "Murderer" then
+                    local showLabel = showRole or showGun
+                    obj.Billboard.Enabled = showLabel
+                    if showLabel then
+                        local text = showRole and role or ""
+                        if showGun then
+                            text = text == "" and "GUN" or (text .. " · GUN")
+                        end
+                        if showRole and Visual.ShowPerk and role == "Murderer" then
                             local entry = RoundData[plr.Name]
                             if entry and entry.Perk then
                                 text = text .. " (" .. tostring(entry.Perk) .. ")"
@@ -1687,7 +1696,7 @@ local function updateEsp()
                             end
                         end
                         obj.Label.Text = text
-                        obj.Label.TextColor3 = color
+                        obj.Label.TextColor3 = showGun and GUN_ESP_COLOR or color
                     end
                 end
             end
@@ -1794,17 +1803,32 @@ local TrapEsp = { Enabled = false }
 local trapObjects = {}
 
 local function isTrapVisual(inst)
-    return typeof(inst) == "Instance" and inst.Name == "TrapVisual" and inst:IsA("BasePart")
+    return typeof(inst) == "Instance" and inst:IsA("BasePart") and inst.Name == "TrapVisual"
+end
+
+local function trapPartFromSignal(inst)
+    if typeof(inst) ~= "Instance" then return nil end
+    if isTrapVisual(inst) then return inst end
+
+    if inst:IsA("ObjectValue") and inst.Name == "PlacedPlayer" then
+        local sibling = inst.Parent and inst.Parent:FindFirstChild("TrapVisual")
+        if sibling and isTrapVisual(sibling) then return sibling end
+    end
+
+    return nil
 end
 
 local function destroyTrapEsp(part)
-    local hl = trapObjects[part]
-    if hl then hl:Destroy() end
+    local entry = trapObjects[part]
+    if not entry then return end
+    if entry.highlight then entry.highlight:Destroy() end
+    if entry.marker then entry.marker:Destroy() end
     trapObjects[part] = nil
 end
 
 local function buildTrapEsp(part)
     if trapObjects[part] then return end
+
     local hl = Instance.new("Highlight")
     hl.FillColor = Color3.fromRGB(255, 170, 0)
     hl.OutlineColor = Color3.fromRGB(255, 170, 0)
@@ -1812,21 +1836,55 @@ local function buildTrapEsp(part)
     hl.OutlineTransparency = 0
     hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
     hl.Parent = part
-    trapObjects[part] = hl
+
+    local marker = Instance.new("Part")
+    marker.Anchored = true
+    marker.CanCollide = false
+    marker.CanQuery = false
+    marker.CanTouch = false
+    marker.Locked = true
+    marker.Shape = Enum.PartType.Ball
+    marker.Size = Vector3.new(2, 2, 2)
+    marker.Material = Enum.Material.Neon
+    marker.Color = Color3.fromRGB(255, 170, 0)
+    marker.Transparency = 0.15
+    marker.Name = "MM2AssistTrapMarker"
+    marker.Parent = Workspace
+    pcall(function() marker.Position = part.Position end)
+
+    trapObjects[part] = { highlight = hl, marker = marker }
 end
 
 local function trapEspRefreshAll()
     for part in pairs(trapObjects) do destroyTrapEsp(part) end
     if not TrapEsp.Enabled then return end
     for _, inst in ipairs(Workspace:GetDescendants()) do
-        if isTrapVisual(inst) then buildTrapEsp(inst) end
+        local part = trapPartFromSignal(inst)
+        if part then buildTrapEsp(part) end
     end
 end
 
-track(Workspace.DescendantAdded:Connect(function(inst)
-    if TrapEsp.Enabled and isTrapVisual(inst) then
-        buildTrapEsp(inst)
+local function updateTrapMarkers()
+    for part, entry in pairs(trapObjects) do
+        if not part.Parent then
+            destroyTrapEsp(part)
+        elseif entry.marker then
+            pcall(function() entry.marker.Position = part.Position end)
+        end
     end
+end
+
+task.spawn(function()
+    while not Unloading do
+        task.wait(0.2)
+        if TrapEsp.Enabled then pcall(updateTrapMarkers) end
+    end
+end)
+
+track(Workspace.DescendantAdded:Connect(function(inst)
+    if not TrapEsp.Enabled then return end
+    local part = trapPartFromSignal(inst)
+    if part then buildTrapEsp(part) end
 end))
 
 track(Workspace.DescendantRemoving:Connect(function(inst)
@@ -2039,6 +2097,13 @@ EspSection:Toggle({
     Callback = function(state) Visual.ColorByRole = state end,
 })
 
+EspSection:Toggle({
+    Title = 'gun esp',
+    Desc = 'highlights anyone actually holding a gun right now, in a color of its own that role esp never uses. checked directly off the weapon they are holding rather than guessed from round data, so it still catches a hero even when role detection gets that wrong. works even with esp and role esp both off',
+    Flag = 'mm2_esp_gun',
+    Callback = function(state) Visual.GunEsp = state end,
+})
+
 local RoleEspSection = VisualTab:Section({ Title = 'role esp', Side = 'right' })
 
 RoleEspSection:Toggle({
@@ -2104,7 +2169,7 @@ local TrapSection = VisualTab:Section({ Title = 'traps', Side = 'right' })
 
 TrapSection:Toggle({
     Title = 'trap esp',
-    Desc = 'highlights every placed trap',
+    Desc = 'a placed trap is invisible until it catches someone, so this looks for it directly instead of waiting for that. matches the part the trap actually uses for its position and the marker object it carries naming who placed it, then puts a highlight and a solid marker ball on it - the marker so it still shows even if the trap part itself has no visible shape of its own',
     Flag = 'mm2_trap_esp',
     Callback = function(state)
         TrapEsp.Enabled = state
