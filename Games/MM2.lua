@@ -244,20 +244,14 @@ local Aim = {
     OffScreen = false,
     Predict = true,
     UsePing = true,
-    AutoPredict = true,
     AutoLevel = 'Normal',
-    ManualLeadTimeGun = 0.05,
-    ManualLeadTimeKnife = 0.15,
-    KnifeSpeed = 96,
     JumpAware = true,
-    Method = 'Delay + travel',
-    BulletSpeed = 400,
     RedirectChance = 100,
     HitCheck = true,
 }
 
-local GunTune = { Mult = 100, Extra = 0, Speed = 0, Auto = true }
-local KnifeTune = { Mult = 100, Extra = 0, Speed = 96, Auto = true }
+local GunTune = { Extra = 0 }
+local KnifeTune = { Extra = 0, Speed = 96 }
 
 local Legit = {
     Enabled = false,
@@ -296,7 +290,6 @@ local AUTO_LEVELS = {
     Best     = { smooth = 0.80, passes = 3 },
 }
 
-local AIM_METHODS = { 'Delay + travel', 'Delay only', 'Travel only', 'Ping only' }
 local MAX_TRAVEL_TIME = 2.5
 local MAX_LEAD_OFFSET = 50
 local MAX_VERTICAL_RISE = 2
@@ -324,12 +317,6 @@ local LEGIT_REACQUIRE = 0.4
 local DRIFT_STEP = 0.06
 local HIT_WINDOW = 0.35
 local MAX_CANDIDATES = 5
-local DITHER = 0.35
-local ARM_WINDOW = 12
-local MULT_MIN = 0.4
-local MULT_MAX = 4
-local ARM_MARGIN = 0.12
-local SWEEP_STEP = 1.5
 local CAST_BUDGET = 48
 local PART_ORDER_HEAD = { "Head", "UpperTorso", "Torso", "HumanoidRootPart", "LowerTorso" }
 local PART_ORDER_BODY = { "HumanoidRootPart", "UpperTorso", "Torso", "LowerTorso", "Head" }
@@ -624,7 +611,7 @@ local function fitTurnRate(entry, speed)
 end
 
 local function predictHorizontal(entry, t)
-    if t <= 0 then return Vector3.zero end
+    if t == 0 then return Vector3.zero end
 
     local velocity = entry.horizontal
     local speed = velocity.Magnitude
@@ -663,7 +650,7 @@ local function predictHorizontal(entry, t)
 end
 
 local function predictRoot(entry, base, sinceSample, travelTime)
-    if not Aim.Predict or travelTime <= 0 then
+    if not Aim.Predict or travelTime == 0 then
         return base
     end
 
@@ -673,28 +660,24 @@ local function predictRoot(entry, base, sinceSample, travelTime)
     end
 
     local y = base.Y
-    if Aim.JumpAware then
-        if entry.airborne then
-            local g = gravity()
-            if entry.jumpLaunchV then
-                local t = entry.jumpElapsed + sinceSample + travelTime
-                y = entry.jumpFromY + entry.jumpLaunchV * t - 0.5 * g * t * t
-            else
-                y = base.Y + entry.vertical * travelTime - 0.5 * g * travelTime * travelTime
-            end
+    if entry.airborne then
+        local g = gravity()
+        if entry.jumpLaunchV then
+            local t = entry.jumpElapsed + sinceSample + travelTime
+            y = entry.jumpFromY + entry.jumpLaunchV * t - 0.5 * g * t * t
+        else
+            y = base.Y + entry.vertical * travelTime - 0.5 * g * travelTime * travelTime
         end
-    elseif entry.airborne then
-        y = base.Y + entry.vertical * travelTime
-    end
 
-    if y > base.Y + MAX_VERTICAL_RISE then
-        y = base.Y + MAX_VERTICAL_RISE
-    end
-    if y < base.Y - MAX_VERTICAL_DROP then
-        y = base.Y - MAX_VERTICAL_DROP
-    end
-    if entry.groundY and base.Y >= entry.groundY and y < entry.groundY then
-        y = entry.groundY
+        if y > base.Y + MAX_VERTICAL_RISE then
+            y = base.Y + MAX_VERTICAL_RISE
+        end
+        if y < base.Y - MAX_VERTICAL_DROP then
+            y = base.Y - MAX_VERTICAL_DROP
+        end
+        if entry.groundY and base.Y >= entry.groundY and y < entry.groundY then
+            y = entry.groundY
+        end
     end
 
     return Vector3.new(base.X + horizontal.X, y, base.Z + horizontal.Z)
@@ -703,8 +686,6 @@ end
 local function newLeadState(tune)
     return {
         tune = tune,
-        mult = 1,
-        arms = { { hit = 0, shot = 0 }, { hit = 0, shot = 0 }, { hit = 0, shot = 0 } },
         pending = {},
         verified = 0,
         hits = 0,
@@ -714,17 +695,7 @@ end
 local GunLead = newLeadState(GunTune)
 local KnifeLead = newLeadState(KnifeTune)
 
-local function methodUsesTravel()
-    return Aim.Method == 'Delay + travel' or Aim.Method == 'Travel only'
-end
-
-local function armMultiplier(state, arm)
-    if arm == 1 then return state.mult * (1 - DITHER) end
-    if arm == 3 then return state.mult * (1 + DITHER) end
-    return state.mult
-end
-
-local function travelTimeFor(state, entry, distance, arm)
+local function travelTimeFor(state, entry, distance)
     local tune = state.tune
     local total = 0
 
@@ -734,47 +705,13 @@ local function travelTimeFor(state, entry, distance, arm)
     total = total + (entry ~= nil and entry.repLag or 0) * 0.5
     total = total + cachedFrame
 
-    if tune.Speed > 0 and methodUsesTravel() then
+    if tune.Speed ~= nil and tune.Speed > 0 then
         total = total + distance / tune.Speed
     end
+
     total = total + tune.Extra / 1000
-    total = total * (tune.Mult / 100)
 
-    if tune.Auto then
-        total = total * armMultiplier(state, arm)
-    end
-
-    return math.min(total, MAX_TRAVEL_TIME)
-end
-
-local function updateBandit(state)
-    if not state.tune.Auto then return end
-    local arms = state.arms
-    local shots = arms[1].shot + arms[2].shot + arms[3].shot
-    if shots < ARM_WINDOW then return end
-
-    local landed = arms[1].hit + arms[2].hit + arms[3].hit
-
-    if landed == 0 then
-        state.mult = state.mult * SWEEP_STEP
-        if state.mult > MULT_MAX then state.mult = MULT_MIN end
-    else
-        local centre = arms[2].shot > 0 and (arms[2].hit / arms[2].shot) or -1
-        local low = arms[1].shot > 0 and (arms[1].hit / arms[1].shot) or -1
-        local high = arms[3].shot > 0 and (arms[3].hit / arms[3].shot) or -1
-
-        if low > centre + ARM_MARGIN and low >= high then
-            state.mult = state.mult * (1 - DITHER * 0.5)
-        elseif high > centre + ARM_MARGIN and high > low then
-            state.mult = state.mult * (1 + DITHER * 0.5)
-        end
-        state.mult = math.clamp(state.mult, MULT_MIN, MULT_MAX)
-    end
-
-    for index = 1, 3 do
-        arms[index].hit = 0
-        arms[index].shot = 0
-    end
+    return math.clamp(total, -MAX_TRAVEL_TIME, MAX_TRAVEL_TIME)
 end
 
 local function scoreShot(state, hit)
@@ -804,10 +741,6 @@ local function verifyLead(state, settings, now)
 
         if resolved then
             scoreShot(state, hit)
-            local arm = state.arms[record.arm or 2]
-            arm.shot = arm.shot + 1
-            if hit then arm.hit = arm.hit + 1 end
-            updateBandit(state)
             table.remove(pending, index)
         else
             index = index + 1
@@ -815,7 +748,7 @@ local function verifyLead(state, settings, now)
     end
 end
 
-local function logLead(state, char, distance, used, arm, now)
+local function logLead(state, char, distance, used, now)
     if #state.pending >= MAX_PENDING then return end
     local hum = char and char:FindFirstChildOfClass("Humanoid")
     if not hum then return end
@@ -828,12 +761,9 @@ local function logLead(state, char, distance, used, arm, now)
         health = health,
         distance = distance,
         used = used,
-        arm = arm,
     })
 end
 
-local autoSummary = 'idle'
-local speedSummary = 'idle'
 
 local function aimPartsFor(char, entry)
     local order = PART_ORDER_BODY
@@ -906,15 +836,14 @@ local function scanTargets(filterFn)
     return candidates
 end
 
-local knifeSpeedSlider = nil
+local knifeSpeedStat = nil
 
 local function onThrowingKnifeAdded(instance)
     local ok, speed = pcall(function() return instance:GetAttribute("ThrowSpeed") end)
-    if ok and typeof(speed) == "number" and speed > 1 and speed ~= Aim.KnifeSpeed then
-        Aim.KnifeSpeed = speed
+    if ok and typeof(speed) == "number" and speed > 1 and speed ~= KnifeTune.Speed then
         KnifeTune.Speed = speed
-        if knifeSpeedSlider then
-            pcall(function() knifeSpeedSlider:Set(speed) end)
+        if knifeSpeedStat then
+            pcall(function() knifeSpeedStat:Set(('%d studs/s'):format(speed)) end)
         end
     end
 end
@@ -956,29 +885,22 @@ local function solveAim(plan, origin, now, leadScale)
     end
 
     if not Aim.Predict then
-        return rootPos + offset, rootPos, 0, (partPos - origin).Magnitude, 0, rootPos
-    end
-
-    if not Aim.AutoPredict then
-        local travelTime = (plan.isKnife and Aim.ManualLeadTimeKnife or Aim.ManualLeadTimeGun) * leadScale
-        local manual = predictRoot(entry, rootPos, sinceSample, travelTime)
-        return manual + offset, rootPos, travelTime, (partPos - origin).Magnitude, 0, manual
+        return rootPos + offset, rootPos, 0, (partPos - origin).Magnitude, rootPos
     end
 
     local state = plan.state
     local settings = plan.settings
-    local arm = plan.arm or 2
 
     local distance = (partPos - origin).Magnitude
-    local travelTime = travelTimeFor(state, entry, distance, arm) * leadScale
+    local travelTime = travelTimeFor(state, entry, distance) * leadScale
     local predicted = predictRoot(entry, rootPos, sinceSample, travelTime)
     for _ = 2, settings.passes do
         distance = ((predicted + offset) - origin).Magnitude
-        travelTime = travelTimeFor(state, entry, distance, arm) * leadScale
+        travelTime = travelTimeFor(state, entry, distance) * leadScale
         predicted = predictRoot(entry, rootPos, sinceSample, travelTime)
     end
 
-    return predicted + offset, rootPos, travelTime, distance, arm, predicted
+    return predicted + offset, rootPos, travelTime, distance, predicted
 end
 
 local function crossOf(a, b)
@@ -1061,7 +983,7 @@ local function resolveRedirect(plan, originCFrame, sentCFrame)
     end
 
     local aim, predictedRoot, travel
-    local ok, solved, _, solvedTravel, _, _, solvedRoot = pcall(solveAim, plan, origin, os.clock())
+    local ok, solved, _, solvedTravel, _, solvedRoot = pcall(solveAim, plan, origin, os.clock())
     if ok and typeof(solved) == "Vector3" then
         aim, predictedRoot, travel = solved, solvedRoot, solvedTravel
     elseif plan.fallback then
@@ -1135,7 +1057,6 @@ local function buildPlan(filter, isKnife, origin, now, settings)
                 state = isKnife and KnifeLead or GunLead,
                 settings = settings,
                 isKnife = isKnife,
-                arm = (isKnife and KnifeTune or GunTune).Auto and math.random(1, 3) or 2,
                 stamp = now,
             }
 
@@ -1154,7 +1075,7 @@ local function buildPlan(filter, isKnife, origin, now, settings)
 
                 if exposed then
                     for _, scale in ipairs(LEAD_SCALES) do
-                        local aim, base, travelTime, distance, ping, predictedRoot =
+                        local aim, _, travelTime, distance =
                             solveAim(plan, origin, now, scale)
                         budget = budget - 1
 
@@ -1162,8 +1083,8 @@ local function buildPlan(filter, isKnife, origin, now, settings)
                             plan.leadScale = scale
                             plan.fallback = CFrame.new(aim)
 
-                            if Aim.AutoPredict and distance then
-                                logLead(plan.state, char, distance, travelTime, plan.arm, now)
+                            if distance then
+                                logLead(plan.state, char, distance, travelTime, now)
                             end
 
                             if Legit.Enabled then
@@ -1331,15 +1252,8 @@ track(PreSimulation:Connect(function()
             end
         end
 
-        if Aim.AutoPredict then
-            verifyLead(GunLead, settings, now)
-            verifyLead(KnifeLead, settings, now)
-            autoSummary = ('gun %d/%d  knife %d/%d')
-                :format(GunLead.hits, GunLead.verified, KnifeLead.hits, KnifeLead.verified)
-            speedSummary = ('gun x%.2f%s  knife x%.2f%s')
-                :format(GunLead.mult, GunTune.Auto and '' or ' off',
-                    KnifeLead.mult, KnifeTune.Auto and '' or ' off')
-        end
+        verifyLead(GunLead, settings, now)
+        verifyLead(KnifeLead, settings, now)
 
         gunPlan = buildPlan(isMurderer, false, findGunOrigin(), now, settings)
         knifePlan = buildPlan(nil, true, findKnifeOrigin(), now, settings)
@@ -1530,7 +1444,7 @@ PredictionSection:Toggle({
 
 PredictionSection:Toggle({
     Title = 'jump aware',
-    Desc = 'solves a jumping target as a real arc under gravity instead of extrapolating their vertical speed in a straight line, aims at their feet rather than head/torso while airborne so a slightly-off vertical read still lands, and drops head aim to torso against repeat jumpers',
+    Desc = 'the vertical aim point is always solved the same safe way regardless of this toggle - it never overshoots above where they are now by more than a couple studs, and it never undershoots the ground. this only changes where on their body it aims while they are in the air: on, it aims near their feet so a slightly-off vertical read still lands on them, and repeat jumpers get aimed at the torso instead of the head. off, it keeps aiming at the normal point even mid jump',
     Flag = 'mm2_silent_aim_jump',
     Default = true,
     Callback = function(state) Aim.JumpAware = state end,
@@ -1538,69 +1452,21 @@ PredictionSection:Toggle({
 
 PredictionSection:Toggle({
     Title = 'use ping',
-    Desc = 'adds the one-way latency estimate to lead time',
+    Desc = 'adds your measured round trip ping to the lead. off, ping contributes nothing at all - the lead is only replication lag, your own frame time, and extra lead per weapon below',
     Flag = 'mm2_silent_aim_use_ping',
     Default = true,
     Callback = function(state) Aim.UsePing = state end,
 })
 
-PredictionSection:Toggle({
-    Title = 'auto prediction',
-    Desc = 'travel time is distance / a learned speed, so lead grows with range and stays tight up close. scores its own shots against where the target ended up and corrects that learned speed live',
-    Flag = 'mm2_silent_aim_auto_predict',
-    Default = true,
-    Callback = function(state) Aim.AutoPredict = state end,
-})
-
 PredictionSection:Dropdown({
-    Title = 'auto prediction amount',
-    Desc = 'how hard the feedback loop corrects, how far the learned delay is allowed to move, how heavily velocity is smoothed, and how many passes the travel time solves for',
+    Title = 'smoothing',
+    Desc = 'how heavily raw velocity is smoothed and how many times the distance-dependent part of the lead re-solves against where that lead itself would put them. higher settles on a steadier number for someone running a straight line but reacts a little slower to a sudden turn. does not affect the extra lead sliders below, and nothing here is fitted from your shots - it only shapes how the current motion reading is filtered',
     Values = { 'Lesser', 'Normal', 'Extra', 'Advanced', 'Best' },
     Default = 'Normal',
     Flag = 'mm2_silent_aim_auto_level',
     Callback = function(value) Aim.AutoLevel = value end,
 })
 
-PredictionSection:Dropdown({
-    Title = 'method',
-    Desc = 'delay + travel: a learned constant delay plus distance/speed flight time, the full model. delay only: constant lead everywhere, ignores distance - use when the delay is what matters and range is not. travel only: distance/speed alone, lead scales with range and goes near zero up close. ping only: raw half-ping, effectively no prediction, for comparison',
-    Values = AIM_METHODS,
-    Default = 'Delay + travel',
-    Flag = 'mm2_silent_aim_method',
-    Callback = function(value) Aim.Method = value end,
-})
-
-
-local AutoStat = PredictionSection:Stat({ Title = 'hits / shots', Value = 'idle' })
-local SpeedStat = PredictionSection:Stat({ Title = 'self tuned multiplier', Value = 'idle' })
-
-PredictionSection:Label({
-    Text = 'Lead is built from measured parts: your ping when use ping is on, how often that particular target actually replicates to you, your own frame time, and real projectile travel for the knife. Each weapon then scales that by its own multiplier, tuned separately, so sighting in the gun never drags the knife off. Tuning is a three way trial - each shot uses a slightly short, normal or long lead at random, and whichever wins over the last dozen resolved shots pulls the multiplier that way. It is bounded, so a bad run drifts back rather than running away.',
-})
-
-PredictionSection:Slider({
-    Title = 'manual gun lead time',
-    Desc = 'used while auto prediction is off - flat, not distance scaled',
-    Min = 0,
-    Max = 2.5,
-    Increment = 0.05,
-    Default = Aim.ManualLeadTimeGun,
-    Suffix = 's',
-    Flag = 'mm2_silent_aim_manual_gun',
-    Callback = function(value) Aim.ManualLeadTimeGun = value end,
-})
-
-PredictionSection:Slider({
-    Title = 'manual knife lead time',
-    Desc = 'used while auto prediction is off - flat, not distance scaled',
-    Min = 0,
-    Max = 3,
-    Increment = 0.05,
-    Default = Aim.ManualLeadTimeKnife,
-    Suffix = 's',
-    Flag = 'mm2_silent_aim_manual_knife',
-    Callback = function(value) Aim.ManualLeadTimeKnife = value end,
-})
 
 local Visual = {
     Esp = false,
@@ -1869,55 +1735,39 @@ track(Workspace.DescendantRemoving:Connect(function(inst)
 end))
 
 
-local leadStats = {}
+local GunLeadSection = SilentAimTab:Section({ Title = 'gun lead', Side = 'left' })
 
-for _, spec in ipairs({
-    { key = 'gun', title = 'gun', tune = GunTune, side = 'left', flag = 'mm2_gun_lead',
-      speedDefault = 0, speedMin = 0, speedMax = 1500, speedStep = 10,
-      speedDesc = 'studs per second for the distance part. 0 means instant, which is what the gun looks like - the server just casts a ray. raise it off 0 only if far shots miss while close ones land' },
-    { key = 'knife', title = 'knife', tune = KnifeTune, side = 'right', flag = 'mm2_knife_lead',
-      speedDefault = 96, speedMin = 20, speedMax = 300, speedStep = 2,
-      speedDesc = 'the thrown knife is a real projectile, so this one matters. starts at the game default and overwrites itself with the real ThrowSpeed the first time any knife is seen flying' },
-}) do
-    local section = SilentAimTab:Section({ Title = spec.title .. ' lead', Side = spec.side })
-    local tune = spec.tune
+GunLeadSection:Slider({
+    Title = 'extra lead',
+    Desc = 'a flat amount added to the gun lead, on top of ping, replication lag and your own frame time. positive aims further ahead of the target. negative aims behind them - use it if shots are consistently landing in front, since it walks the point back toward where they already were instead of further into where they are going',
+    Min = -500,
+    Max = 500,
+    Increment = 5,
+    Default = 0,
+    Suffix = ' ms',
+    Flag = 'mm2_gun_lead_extra',
+    Callback = function(value) GunTune.Extra = value end,
+})
 
-    section:Toggle({
-        Title = 'auto tune',
-        Desc = 'on, this weapon trials a slightly short, normal and long lead and drifts toward whichever lands more, bounded either side of the measured value. off, the sliders below are exactly what it uses and nothing moves them',
-        Flag = spec.flag .. '_auto',
-        Default = true,
-        Callback = function(state) tune.Auto = state end,
-    })
+local gunLeadStat = GunLeadSection:Stat({ Title = 'gun hits / shots', Value = '0 / 0' })
 
-    section:Slider({
-        Title = 'lead multiplier',
-        Desc = 'scales the whole lead for this weapon only. raise it if its shots land behind a moving target, lower it if they land in front',
-        Min = 0, Max = 400, Increment = 5, Default = 100, Suffix = '%',
-        Flag = spec.flag .. '_mult',
-        Callback = function(value) tune.Mult = value end,
-    })
+local KnifeLeadSection = SilentAimTab:Section({ Title = 'knife lead', Side = 'right' })
 
-    section:Slider({
-        Title = 'extra lead',
-        Desc = 'a flat amount added before the multiplier, for delay that does not scale with range',
-        Min = 0, Max = 500, Increment = 5, Default = 0, Suffix = ' ms',
-        Flag = spec.flag .. '_extra',
-        Callback = function(value) tune.Extra = value end,
-    })
+KnifeLeadSection:Slider({
+    Title = 'extra lead',
+    Desc = 'a flat amount added to the knife lead, on top of its real flight time, ping, replication lag and your own frame time. positive aims further ahead of the target. negative aims behind them, for when it is consistently overshooting to one side',
+    Min = -500,
+    Max = 500,
+    Increment = 5,
+    Default = 0,
+    Suffix = ' ms',
+    Flag = 'mm2_knife_lead_extra',
+    Callback = function(value) KnifeTune.Extra = value end,
+})
 
-    local speedSlider = section:Slider({
-        Title = 'travel speed',
-        Desc = spec.speedDesc,
-        Min = spec.speedMin, Max = spec.speedMax, Increment = spec.speedStep,
-        Default = spec.speedDefault, Suffix = ' studs/s',
-        Flag = spec.flag .. '_speed',
-        Callback = function(value) tune.Speed = value end,
-    })
-    if spec.key == 'knife' then knifeSpeedSlider = speedSlider end
+knifeSpeedStat = KnifeLeadSection:Stat({ Title = 'throw speed (auto)', Value = ('%d studs/s'):format(KnifeTune.Speed) })
+local knifeLeadStat = KnifeLeadSection:Stat({ Title = 'knife hits / shots', Value = '0 / 0' })
 
-    leadStats[spec.key] = section:Stat({ Title = spec.title .. ' hits / shots', Value = '0 / 0' })
-end
 
 local LegitTab = Window:Tab({ Title = 'legit', Icon = 'user-check' })
 
@@ -2192,7 +2042,6 @@ task.spawn(function()
     while not Unloading do
         task.wait(0.4)
         pcall(function()
-            AutoStat:Set(Aim.SilentAim and Aim.Predict and Aim.AutoPredict and autoSummary or 'off')
             SeenStat:Set(tostring(shotStats.seen))
             RedirectStat:Set(tostring(shotStats.redirected),
                 shotStats.redirected > 0 and Color3.fromRGB(126, 217, 87) or nil)
@@ -2200,9 +2049,8 @@ task.spawn(function()
             ErrorStat:Set(shotStats.proved > 0
                 and ('%.1f studs over %d'):format(shotStats.error / shotStats.proved, shotStats.proved)
                 or '-')
-            SpeedStat:Set(Aim.SilentAim and Aim.Predict and speedSummary or 'off')
-            leadStats.gun:Set(('%d / %d'):format(GunLead.hits, GunLead.verified))
-            leadStats.knife:Set(('%d / %d'):format(KnifeLead.hits, KnifeLead.verified))
+            gunLeadStat:Set(('%d / %d'):format(GunLead.hits, GunLead.verified))
+            knifeLeadStat:Set(('%d / %d'):format(KnifeLead.hits, KnifeLead.verified))
         end)
     end
 end)
