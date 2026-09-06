@@ -312,7 +312,7 @@ local ARC_STEPS = 6
 local PLAN_STALE = 0.25
 local TRANSPARENT_SKIPS = 8
 local HIT_MARGIN = 0.45
-local LEAD_SCALES = { 1, 0.65, 0.3, 0 }
+local LEAD_SEARCH_STEPS = 7
 local LEGIT_REACQUIRE = 0.4
 local DRIFT_STEP = 0.06
 local HIT_WINDOW = 0.35
@@ -1003,6 +1003,38 @@ local function resolveRedirect(plan, originCFrame, sentCFrame)
     return CFrame.new(aim)
 end
 
+local function verifiedLeadScale(plan, origin, char, now)
+    local zeroAim = select(1, solveAim(plan, origin, now, 0))
+    if not landsOn(origin, zeroAim, char) then
+        return nil
+    end
+
+    local bestAim, bestScale, bestTravel, bestDistance = zeroAim, 0, 0, nil
+    local lo, hi = 0, 1
+
+    for _ = 1, LEAD_SEARCH_STEPS do
+        local mid = (lo + hi) / 2
+        local aim, _, travelTime, distance = solveAim(plan, origin, now, mid)
+        if landsOn(origin, aim, char) then
+            bestAim, bestScale, bestTravel, bestDistance = aim, mid, travelTime, distance
+            lo = mid
+        else
+            hi = mid
+        end
+    end
+
+    if landsWithMargin(origin, bestAim, char) then
+        return bestAim, bestScale, bestTravel, bestDistance
+    end
+
+    if landsWithMargin(origin, zeroAim, char) then
+        local _, _, zeroTravel, zeroDistance = solveAim(plan, origin, now, 0)
+        return zeroAim, 0, zeroTravel, zeroDistance
+    end
+
+    return nil
+end
+
 local function buildPlan(filter, isKnife, origin, now, settings)
     if not origin then return nil end
 
@@ -1065,41 +1097,42 @@ local function buildPlan(filter, isKnife, origin, now, settings)
                 plan.part = part
                 budget = budget - 1
 
-                local exposed
+                local aim, scale, travelTime, distance
+
                 if guaranteed then
                     budget = budget - 5
-                    exposed = landsWithMargin(origin, part.Position, char)
-                else
-                    exposed = clearPath(origin, part.Position, char)
-                end
-
-                if exposed then
-                    for _, scale in ipairs(LEAD_SCALES) do
-                        local aim, _, travelTime, distance =
-                            solveAim(plan, origin, now, scale)
-                        budget = budget - 1
-
-                        if clearPath(origin, aim, char) then
-                            plan.leadScale = scale
-                            plan.fallback = CFrame.new(aim)
-
-                            if distance then
-                                logLead(plan.state, char, distance, travelTime, now)
-                            end
-
-                            if Legit.Enabled then
-                                local lock = legitLock[slot]
-                                if not lock or lock.player ~= plr or now >= lock.expires then
-                                    legitLock[slot] = { player = plr, expires = now + Legit.Stickiness }
-                                end
-                            end
-
-                            return plan
-                        end
-
-                        if budget <= 0 then break end
+                    if landsWithMargin(origin, part.Position, char) then
+                        aim, scale, travelTime, distance = verifiedLeadScale(plan, origin, char, now)
+                        budget = budget - (LEAD_SEARCH_STEPS + 6)
+                    end
+                elseif clearPath(origin, part.Position, char) then
+                    aim, _, travelTime, distance = solveAim(plan, origin, now, 1)
+                    budget = budget - 1
+                    scale = 1
+                    if not clearPath(origin, aim, char) then
+                        aim = nil
                     end
                 end
+
+                if aim then
+                    plan.leadScale = scale
+                    plan.fallback = CFrame.new(aim)
+
+                    if distance then
+                        logLead(plan.state, char, distance, travelTime, now)
+                    end
+
+                    if Legit.Enabled then
+                        local lock = legitLock[slot]
+                        if not lock or lock.player ~= plr or now >= lock.expires then
+                            legitLock[slot] = { player = plr, expires = now + Legit.Stickiness }
+                        end
+                    end
+
+                    return plan
+                end
+
+                if budget <= 0 then break end
             end
         end
     end
