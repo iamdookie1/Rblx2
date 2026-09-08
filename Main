@@ -29,40 +29,54 @@ local Games = {
     -- 3008's testing place, from a PlaceId check in the game's own source.
     -- Kept alongside the public place so the hub works on both.
     [2788336572] = { Name = '3008 (test place)', Script = 'Games/3008.lua' },
+    -- Confirmed via web search against this place id: "Fling Things and
+    -- People" by Horomori, a sandbox where you grab and throw props and
+    -- other players.
+    [6961824067] = { Name = 'Fling Things and People', Script = 'Games/FlingThingsAndPeople.lua' },
 }
 
 -- The UI ships in this repo now, so the hub and everything it loads are
 -- versioned together: a change to the library lands with the scripts written
 -- against it instead of drifting in a second repo.
-local Centrl = loadstring(game:HttpGet(REPO_RAW_BASE .. 'UI/Lib2.lua'))()
+local Onyx = loadstring(game:HttpGet(REPO_RAW_BASE .. 'UI/Ui2.lua'))()
 
-local Window = Centrl:Window({
+-- Onyx has no Stat element, just a Label. This gives every Section the same
+-- Title/Value pair with a live :Set(value, color) that the rest of this file
+-- already expects, so the rest of the loader reads the same as it always has.
+local function addStat(section, cfg)
+    local title = cfg.Title
+    local label = section:Label({ Title = title .. ': ' .. tostring(cfg.Value), Color = cfg.Color })
+    local api = {}
+    function api.Set(value, color)
+        label:SetText(title .. ': ' .. tostring(value))
+        if color then label:SetColor(color) end
+    end
+    return api
+end
+
+local Window = Onyx:CreateWindow({
     Title = 'hub',
     SubTitle = 'game loader',
     Folder = 'Hub',
-    ToggleKey = Enum.KeyCode.RightShift,
+    Keybind = Enum.KeyCode.RightShift,
     Accent = Color3.fromRGB(60, 140, 255),
 })
 
--- One rail entry holding three real pages, rather than three rail entries for
--- what is one screen's worth of loader.
-local HubTab = Window:Tab({ Title = 'hub', Icon = 'gamepad-2' })
-
-local LoadPage = HubTab:Tab({ Title = 'load', Icon = 'play' })
-local GamesPage = HubTab:Tab({ Title = 'games', Icon = 'list' })
-local SessionPage = HubTab:Tab({ Title = 'session', Icon = 'info' })
+local LoadTab = Window:CreateTab({ Title = 'load', Default = true })
+local GamesTab = Window:CreateTab({ Title = 'games' })
+local SessionTab = Window:CreateTab({ Title = 'session' })
 
 --// load ---------------------------------------------------------------------
 
-local Status = LoadPage:Section({ Title = 'status', Side = 'left' })
-local Load = LoadPage:Section({ Title = 'load', Side = 'right' })
+local Status = LoadTab:CreateSection('status')
+local Load = LoadTab:CreateSection('load')
 
-local PlaceStat = Status:Stat({ Title = 'place id', Value = tostring(game.PlaceId) })
-local DetectedStat = Status:Stat({ Title = 'detected', Value = 'searching...' })
-local ScriptStat = Status:Stat({ Title = 'script', Value = '-' })
+local PlaceStat = addStat(Status, { Title = 'place id', Value = tostring(game.PlaceId) })
+local DetectedStat = addStat(Status, { Title = 'detected', Value = 'searching...' })
+local ScriptStat = addStat(Status, { Title = 'script', Value = '-' })
 
 local Log = Status:Console({ Title = 'log', Height = 110, MaxLines = 60, Timestamps = true })
-Log:Add('watching for a supported game...')
+Log:Log('watching for a supported game...')
 
 local MatchedGame = nil
 local Loaded = false
@@ -78,7 +92,7 @@ local function runScript(entry)
     end
 
     local url = REPO_RAW_BASE .. entry.Script
-    Log:Add('fetching ' .. entry.Script)
+    Log:Log('fetching ' .. entry.Script)
 
     local ok, source = pcall(game.HttpGet, game, url)
     if not ok then
@@ -96,7 +110,7 @@ local function runScript(entry)
 
     Loaded = true
     Log:Success('running ' .. entry.Name)
-    Centrl:Unload()
+    Onyx:Unload()
     loader()
 end
 
@@ -104,31 +118,30 @@ local function runMatched()
     runScript(MatchedGame)
 end
 
-Load:Buttons({
-    { Title = 'load game', Callback = runMatched },
-    {
-        Title = 'copy place id',
-        Callback = function()
-            if setclipboard then
-                setclipboard(tostring(game.PlaceId))
-                Log:Add('place id copied')
-            else
-                Log:Warn('no setclipboard in this executor')
-            end
-        end,
-    },
+Load:Button({ Title = 'load game', Callback = runMatched })
+
+Load:Button({
+    Title = 'copy place id',
+    Callback = function()
+        if setclipboard then
+            setclipboard(tostring(game.PlaceId))
+            Log:Log('place id copied')
+        else
+            Log:Warn('no setclipboard in this executor')
+        end
+    end,
 })
 
 Load:Button({
     Title = 'unload hub',
     Callback = function()
-        Centrl:Unload()
+        Onyx:Unload()
     end,
 })
 
 --// games --------------------------------------------------------------------
 
-local Supported = GamesPage:Section({ Title = 'supported games', Side = 'left' })
+local Supported = GamesTab:CreateSection('supported games')
 
 -- Sorted by name so the list is stable between sessions; pairs over a table
 -- keyed by PlaceId would shuffle it every run.
@@ -142,16 +155,14 @@ end)
 
 for _, entry in ipairs(ordered) do
     local here = entry.PlaceId == game.PlaceId
-    Supported:Stat({
+    addStat(Supported, {
         Title = entry.Name,
         Value = tostring(entry.PlaceId),
         Color = here and Color3.fromRGB(126, 217, 87) or nil,
     })
 end
 
-GamesPage:SetBadge(tostring(#ordered))
-
-local Jump = GamesPage:Section({ Title = 'open', Side = 'right' })
+local Jump = GamesTab:CreateSection('open')
 
 local jumpChoice = ordered[1] and ordered[1].Name or nil
 local jumpNames = {}
@@ -178,20 +189,18 @@ Jump:Button({
                     return
                 end
                 setclipboard(("loadstring(game:HttpGet('%s%s'))()"):format(REPO_RAW_BASE, entry.Script))
-                Log:Add('loadstring for ' .. entry.Name .. ' copied')
+                Log:Log('loadstring for ' .. entry.Name .. ' copied')
                 return
             end
         end
     end,
 })
 
-Jump:Label({
-    Text = 'The hub only runs a script when you are already in its place. Copy a loadstring here to run one by hand.',
-})
+Jump:Label('The hub only runs a script when you are already in its place. Copy a loadstring here to run one by hand.')
 
 --// session ------------------------------------------------------------------
 
-local Session = SessionPage:Section({ Title = 'session', Side = 'left' })
+local Session = SessionTab:CreateSection('session')
 
 local executor = 'unknown'
 if identifyexecutor then
@@ -201,28 +210,26 @@ if identifyexecutor then
     end
 end
 
-Session:Stat({ Title = 'executor', Value = executor })
-Session:Stat({ Title = 'player', Value = Players.LocalPlayer and Players.LocalPlayer.Name or '-' })
-Session:Stat({ Title = 'place id', Value = tostring(game.PlaceId) })
-Session:Stat({ Title = 'job id', Value = game.JobId ~= '' and game.JobId or 'studio' })
+addStat(Session, { Title = 'executor', Value = executor })
+addStat(Session, { Title = 'player', Value = Players.LocalPlayer and Players.LocalPlayer.Name or '-' })
+addStat(Session, { Title = 'place id', Value = tostring(game.PlaceId) })
+addStat(Session, { Title = 'job id', Value = game.JobId ~= '' and game.JobId or 'studio' })
 
-local Menu = SessionPage:Section({ Title = 'menu', Side = 'right' })
+local Menu = SessionTab:CreateSection('menu')
 
-Menu:Label({ Text = 'Right Shift toggles the menu. Everything under settings — accent, scale, configs — is saved per folder.' })
+Menu:Label('Right Shift toggles the menu. Everything under settings — accent, scale, configs — is saved per folder.')
 
 Menu:Button({
     Title = 'copy job id',
     Callback = function()
         if setclipboard then
             setclipboard(tostring(game.JobId))
-            Log:Add('job id copied')
+            Log:Log('job id copied')
         else
             Log:Warn('no setclipboard in this executor')
         end
     end,
 })
-
-Window:Load()
 
 -- Watch for a supported game for up to WATCH_DURATION seconds after load, then
 -- stop. PlaceId is set before this ever runs in practice, but a slow join can
@@ -233,13 +240,11 @@ task.spawn(function()
         local match = Games[game.PlaceId]
         if match then
             MatchedGame = match
-            PlaceStat:Set(tostring(game.PlaceId))
-            DetectedStat:Set(match.Name, Color3.fromRGB(126, 217, 87))
-            ScriptStat:Set(match.Script)
-            HubTab:SetBadge('1')
-            LoadPage:SetBadge('!')
+            PlaceStat.Set(tostring(game.PlaceId))
+            DetectedStat.Set(match.Name, Color3.fromRGB(126, 217, 87))
+            ScriptStat.Set(match.Script)
             Log:Success(match.Name .. ' detected')
-            Centrl:Notify({
+            Onyx:Notify({
                 Title = 'hub',
                 Content = match.Name .. ' detected. Press "load game" to run it.',
                 Type = 'success',
@@ -250,6 +255,6 @@ task.spawn(function()
         RunService.Heartbeat:Wait()
     end
 
-    DetectedStat:Set('unsupported', Color3.fromRGB(255, 96, 106))
+    DetectedStat.Set('unsupported', Color3.fromRGB(255, 96, 106))
     Log:Warn('no supported game for place ' .. tostring(game.PlaceId))
 end)
