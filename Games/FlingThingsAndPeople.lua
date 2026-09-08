@@ -137,16 +137,29 @@ local function scaleReleaseVelocity(rootPart, multiplier)
     end
     if ok and conn then conn:Disconnect() end
 
+    -- The game computes one velocity vector and applies that same vector to
+    -- every part of a thrown model - it never reads each part's own speed
+    -- back. Reading rootPart's velocity once and reusing that one vector for
+    -- every sibling matches that. Reading and scaling each part's own
+    -- velocity independently was the actual bug behind heavy things flying
+    -- while simple ones did not: a multi-part model has joints, and a joint
+    -- can already be pulling a limb's own velocity away from the vector the
+    -- game set the instant it lands, well before this even runs. Scaling
+    -- each of those independently drifted values separately amplifies
+    -- whatever a limb had already picked up on its own - which a single
+    -- rigid part, with nothing to diverge from itself, never could.
+    local ok2, baseVelocity = pcall(function() return rootPart.Velocity end)
+    if not ok2 then return end
+
+    local verticalSpeed = baseVelocity.Y
+    if verticalSpeed < -DOWN_THRESHOLD then
+        verticalSpeed = verticalSpeed * multiplier
+    end
+    local scaled = Vector3.new(baseVelocity.X * multiplier, verticalSpeed, baseVelocity.Z * multiplier)
+
     for _, part in ipairs(targets) do
         if part.Parent and not part.Anchored then
-            pcall(function()
-                local velocity = part.Velocity
-                local verticalSpeed = velocity.Y
-                if verticalSpeed < -DOWN_THRESHOLD then
-                    verticalSpeed = verticalSpeed * multiplier
-                end
-                part.Velocity = Vector3.new(velocity.X * multiplier, verticalSpeed, velocity.Z * multiplier)
-            end)
+            pcall(function() part.Velocity = scaled end)
         end
     end
 end
