@@ -66,43 +66,75 @@ local DestroyGrabLine = GrabEvents and GrabEvents:FindFirstChild("DestroyGrabLin
 local CharacterEvents = waitForPath(ReplicatedStorage, { "CharacterEvents" })
 local StruggleRemote = CharacterEvents and CharacterEvents:FindFirstChild("Struggle")
 
---// throw / drop power ---------------------------------------------------------
+--// throw / drop multiplier -----------------------------------------------------
 
 local Tune = {
     ThrowEnabled = false,
-    ThrowPower = 120,
+    ThrowMultiplier = 1.6,
     DropEnabled = false,
-    DropPower = 25,
+    DropMultiplier = 1.3,
 }
 
--- Mirrors the dump's own throw() logic for what actually gets the velocity:
--- a single part, or every BasePart of the model it belongs to when that
--- model is the grabbed thing's real parent (a ragdolled player, for
--- instance) rather than loose in Workspace.
-local function applyVelocity(part, speed)
-    if not part or not part.Parent then return end
+-- A first version of this set an absolute velocity the instant
+-- DestroyGrabLine fired. That is exactly where the game's own throw()
+-- calls DestroyGrabLine too - as its first step, before it goes on to set
+-- Velocity itself a few lines later in the same, non-yielding call. Our
+-- write landed first and the game's own write landed right after it,
+-- silently overwriting it every time - which is why throw did nothing.
+--
+-- This scales whatever velocity actually ends up on the part instead of
+-- racing to set one first: for a throw that is the game's own computed
+-- value, still pointed the same direction it chose, just faster or slower
+-- by the multiplier. A plain drop never has its own velocity write at all
+-- (throw() is the only place that sets it), so there nothing arrives to
+-- react to and this scales whatever velocity the part already carries from
+-- being dragged around on the beam - which is also "how fast they sent the
+-- thing", just without a throw behind it.
+local function scaleReleaseVelocity(rootPart, multiplier)
+    if not rootPart or not rootPart.Parent or multiplier == 1 then return end
 
-    local direction = Camera.CFrame.LookVector
-    local velocity = direction * speed
-
-    local parent = part.Parent
+    local targets = { rootPart }
+    local parent = rootPart.Parent
     if parent and parent:IsA("Model") and parent.Name ~= "Workspace" then
+        targets = {}
         for _, sibling in ipairs(parent:GetChildren()) do
-            if sibling:IsA("BasePart") and not sibling.Anchored then
-                pcall(function() sibling.Velocity = velocity end)
+            if sibling:IsA("BasePart") then
+                targets[#targets + 1] = sibling
             end
         end
-        return
     end
 
-    if not part.Anchored then
-        pcall(function() part.Velocity = velocity end)
+    local sawChange = false
+    local ok, conn = pcall(function()
+        return rootPart:GetPropertyChangedSignal("Velocity"):Connect(function()
+            sawChange = true
+        end)
+    end)
+
+    local waited = 0
+    while not sawChange and waited < 0.15 do
+        task.wait(0.03)
+        waited = waited + 0.03
+    end
+    if sawChange then
+        -- A thrown model has every sibling's Velocity set in the same
+        -- unyielding loop the game runs; one more frame lets that loop
+        -- finish before any of them are read back.
+        task.wait()
+    end
+    if ok and conn then conn:Disconnect() end
+
+    for _, part in ipairs(targets) do
+        if part.Parent and not part.Anchored then
+            pcall(function() part.Velocity = part.Velocity * multiplier end)
+        end
     end
 end
 
 -- Runs outside the namecall hook (see below), so it is free to make its own
--- method calls - :IsMouseButtonPressed and the :IsA calls inside
--- applyVelocity - without any risk to the hook's own pending dispatch.
+-- method calls - :IsMouseButtonPressed, :GetPropertyChangedSignal, the :IsA
+-- calls inside scaleReleaseVelocity - without any risk to the hook's own
+-- pending dispatch.
 local function handleRelease(released)
     if not released then return end
 
@@ -112,9 +144,9 @@ local function handleRelease(released)
     end)
 
     if throwing then
-        if Tune.ThrowEnabled then applyVelocity(released, Tune.ThrowPower) end
+        if Tune.ThrowEnabled then scaleReleaseVelocity(released, Tune.ThrowMultiplier) end
     else
-        if Tune.DropEnabled then applyVelocity(released, Tune.DropPower) end
+        if Tune.DropEnabled then scaleReleaseVelocity(released, Tune.DropMultiplier) end
     end
 end
 
@@ -213,44 +245,44 @@ local MainTab = Window:CreateTab({ Title = 'main', Default = true })
 local ThrowSection = MainTab:CreateSection('throw')
 
 ThrowSection:Toggle({
-    Title = 'custom throw power',
-    Desc = 'right click already throws whatever you are holding at whatever speed the game itself picks. this overrides that speed with the input below the moment you right click, and only while you are actually holding something - it never touches a plain drop',
+    Title = 'throw multiplier',
+    Desc = 'right click already throws whatever you are holding at whatever speed the game itself picks, in whatever direction it computed. this scales that speed by the number below instead of replacing it, so the throw is still the game\'s own - just harder. only touches an actual throw, never a plain drop',
     Flag = 'fling_throw_enabled',
     Default = false,
     Callback = function(state) Tune.ThrowEnabled = state end,
 })
 
 ThrowSection:Input({
-    Title = 'throw power (studs/s)',
-    Placeholder = tostring(Tune.ThrowPower),
-    Default = tostring(Tune.ThrowPower),
+    Title = 'throw multiplier (x)',
+    Placeholder = tostring(Tune.ThrowMultiplier),
+    Default = tostring(Tune.ThrowMultiplier),
     Numeric = true,
-    Flag = 'fling_throw_power',
+    Flag = 'fling_throw_multiplier',
     Callback = function(value)
         local number = tonumber(value)
-        if number then Tune.ThrowPower = math.max(0, number) end
+        if number then Tune.ThrowMultiplier = math.max(0, number) end
     end,
 })
 
 local DropSection = MainTab:CreateSection('drop')
 
 DropSection:Toggle({
-    Title = 'custom drop power',
-    Desc = 'left click grabs when your hands are empty, and drops without throwing when you already have something - the game applies no velocity at all on that second click. this gives that plain drop its own speed, entirely separate from throw',
+    Title = 'drop multiplier',
+    Desc = 'left click grabs when your hands are empty, and drops without throwing when you already have something - the game sets no new velocity at all on that second click, so whatever the object was carrying from being dragged around is what it keeps. this scales that leftover speed instead, so it only ever affects a plain drop, never a throw',
     Flag = 'fling_drop_enabled',
     Default = false,
     Callback = function(state) Tune.DropEnabled = state end,
 })
 
 DropSection:Input({
-    Title = 'drop power (studs/s)',
-    Placeholder = tostring(Tune.DropPower),
-    Default = tostring(Tune.DropPower),
+    Title = 'drop multiplier (x)',
+    Placeholder = tostring(Tune.DropMultiplier),
+    Default = tostring(Tune.DropMultiplier),
     Numeric = true,
-    Flag = 'fling_drop_power',
+    Flag = 'fling_drop_multiplier',
     Callback = function(value)
         local number = tonumber(value)
-        if number then Tune.DropPower = math.max(0, number) end
+        if number then Tune.DropMultiplier = math.max(0, number) end
     end,
 })
 
