@@ -90,6 +90,17 @@ local Tune = {
 -- react to and this scales whatever velocity the part already carries from
 -- being dragged around on the beam - which is also "how fast they sent the
 -- thing", just without a throw behind it.
+--
+-- The vertical part of that velocity is handled on its own rather than
+-- scaled along with everything else. A held object sags a little under
+-- gravity even sitting still, and scaling the raw vector straight through
+-- would blow that small constant sag up into a real downward launch on
+-- every release, aimed down or not. Below DOWN_THRESHOLD it is left alone
+-- entirely - only a release that was already meaningfully aimed downward
+-- gets its vertical speed scaled too, same as the direction it actually
+-- went.
+local DOWN_THRESHOLD = 3
+
 local function scaleReleaseVelocity(rootPart, multiplier)
     if not rootPart or not rootPart.Parent or multiplier == 1 then return end
 
@@ -126,7 +137,14 @@ local function scaleReleaseVelocity(rootPart, multiplier)
 
     for _, part in ipairs(targets) do
         if part.Parent and not part.Anchored then
-            pcall(function() part.Velocity = part.Velocity * multiplier end)
+            pcall(function()
+                local velocity = part.Velocity
+                local verticalSpeed = velocity.Y
+                if verticalSpeed < -DOWN_THRESHOLD then
+                    verticalSpeed = verticalSpeed * multiplier
+                end
+                part.Velocity = Vector3.new(velocity.X * multiplier, verticalSpeed, velocity.Z * multiplier)
+            end)
         end
     end
 end
