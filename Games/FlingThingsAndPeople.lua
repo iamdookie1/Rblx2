@@ -122,15 +122,17 @@ local function scaleReleaseVelocity(rootPart, multiplier)
         end)
     end)
 
-    local waited = 0
-    while not sawChange and waited < 0.15 do
-        task.wait(0.03)
-        waited = waited + 0.03
-    end
-    if sawChange then
-        -- A thrown model has every sibling's Velocity set in the same
-        -- unyielding loop the game runs; one more frame lets that loop
-        -- finish before any of them are read back.
+    -- The native throw() calls DestroyGrabLine as its first step and only
+    -- sets Velocity a few lines later in that same, non-yielding call, so
+    -- the write is not there yet the instant we get here - but every line
+    -- between those two points runs before the next frame, with nothing in
+    -- between to yield on. One frame is enough to be sure the game's own
+    -- write has landed, and it is also as little as this can possibly wait:
+    -- gravity is already curving the object's real velocity every frame it
+    -- flies, so any longer than that and what gets scaled is no longer the
+    -- angle it actually left on - which read as a scripted, off-angle
+    -- correction rather than a stronger throw, and it was one.
+    if not sawChange then
         task.wait()
     end
     if ok and conn then conn:Disconnect() end
