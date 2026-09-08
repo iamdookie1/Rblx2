@@ -253,8 +253,8 @@ local Aim = {
     RedirectChance = 100,
 }
 
-local GunTune = { Extra = 0 }
-local KnifeTune = { Extra = 0, Speed = 96 }
+local GunTune = { Extra = 0, Auto = false }
+local KnifeTune = { Extra = 0, Speed = 96, Auto = false }
 
 local Legit = {
     Enabled = false,
@@ -318,6 +318,12 @@ local LEGIT_REACQUIRE = 0.4
 local DRIFT_STEP = 0.06
 local HIT_WINDOW = 0.35
 local MAX_CANDIDATES = 5
+local DITHER = 0.35
+local ARM_WINDOW = 12
+local MULT_MIN = 0.4
+local MULT_MAX = 4
+local ARM_MARGIN = 0.12
+local SWEEP_STEP = 1.5
 local PART_ORDER_HEAD = { "Head", "UpperTorso", "Torso", "HumanoidRootPart", "LowerTorso" }
 local PART_ORDER_BODY = { "HumanoidRootPart", "UpperTorso", "Torso", "LowerTorso", "Head" }
 
@@ -658,16 +664,54 @@ end
 local function newLeadState(tune)
     return {
         tune = tune,
+        mult = 1,
+        arms = { { hit = 0, shot = 0 }, { hit = 0, shot = 0 }, { hit = 0, shot = 0 } },
         pending = {},
         verified = 0,
         hits = 0,
     }
 end
 
+local function armMultiplier(state, arm)
+    if not state.tune.Auto or arm == nil then return 1 end
+    if arm == 1 then return state.mult * (1 - DITHER) end
+    if arm == 3 then return state.mult * (1 + DITHER) end
+    return state.mult
+end
+
+local function updateBandit(state)
+    local arms = state.arms
+    local shots = arms[1].shot + arms[2].shot + arms[3].shot
+    if shots < ARM_WINDOW then return end
+
+    local landed = arms[1].hit + arms[2].hit + arms[3].hit
+
+    if landed == 0 then
+        state.mult = state.mult * SWEEP_STEP
+        if state.mult > MULT_MAX then state.mult = MULT_MIN end
+    else
+        local centre = arms[2].shot > 0 and (arms[2].hit / arms[2].shot) or -1
+        local low = arms[1].shot > 0 and (arms[1].hit / arms[1].shot) or -1
+        local high = arms[3].shot > 0 and (arms[3].hit / arms[3].shot) or -1
+
+        if low > centre + ARM_MARGIN and low >= high then
+            state.mult = state.mult * (1 - DITHER * 0.5)
+        elseif high > centre + ARM_MARGIN and high > low then
+            state.mult = state.mult * (1 + DITHER * 0.5)
+        end
+        state.mult = math.clamp(state.mult, MULT_MIN, MULT_MAX)
+    end
+
+    for index = 1, 3 do
+        arms[index].hit = 0
+        arms[index].shot = 0
+    end
+end
+
 local GunLead = newLeadState(GunTune)
 local KnifeLead = newLeadState(KnifeTune)
 
-local function travelTimeFor(state, entry, distance)
+local function travelTimeFor(state, entry, distance, arm)
     local tune = state.tune
     local total = 0
 
@@ -682,6 +726,7 @@ local function travelTimeFor(state, entry, distance)
     end
 
     total = total + tune.Extra / 1000
+    total = total * armMultiplier(state, arm)
 
     return math.clamp(total, -MAX_TRAVEL_TIME, MAX_TRAVEL_TIME)
 end
@@ -713,6 +758,12 @@ local function verifyLead(state, settings, now)
 
         if resolved then
             scoreShot(state, hit)
+            if state.tune.Auto then
+                local arm = state.arms[record.arm or 2]
+                arm.shot = arm.shot + 1
+                if hit then arm.hit = arm.hit + 1 end
+                updateBandit(state)
+            end
             table.remove(pending, index)
         else
             index = index + 1
@@ -720,7 +771,7 @@ local function verifyLead(state, settings, now)
     end
 end
 
-local function logLead(state, char, distance, used, now)
+local function logLead(state, char, distance, used, arm, now)
     if #state.pending >= MAX_PENDING then return end
     local hum = char and char:FindFirstChildOfClass("Humanoid")
     if not hum then return end
@@ -733,6 +784,7 @@ local function logLead(state, char, distance, used, now)
         health = health,
         distance = distance,
         used = used,
+        arm = arm,
     })
 end
 
@@ -863,12 +915,14 @@ local function solveAim(plan, origin, now, leadScale)
     local state = plan.state
     local settings = plan.settings
 
+    local arm = plan.arm
+
     local distance = (partPos - origin).Magnitude
-    local travelTime = travelTimeFor(state, entry, distance) * leadScale
+    local travelTime = travelTimeFor(state, entry, distance, arm) * leadScale
     local predicted = predictRoot(entry, rootPos, sinceSample, travelTime)
     for _ = 2, settings.passes do
         distance = ((predicted + offset) - origin).Magnitude
-        travelTime = travelTimeFor(state, entry, distance) * leadScale
+        travelTime = travelTimeFor(state, entry, distance, arm) * leadScale
         predicted = predictRoot(entry, rootPos, sinceSample, travelTime)
     end
 
@@ -1018,15 +1072,17 @@ local function buildPlan(filter, isKnife, origin, now, settings)
         end
 
         if root and entry and ready then
+            local state = isKnife and KnifeLead or GunLead
             local plan = {
                 entry = entry,
                 root = root,
                 char = char,
                 hipOffset = feetOffset(char),
-                state = isKnife and KnifeLead or GunLead,
+                state = state,
                 settings = settings,
                 isKnife = isKnife,
                 leadScale = 1,
+                arm = state.tune.Auto and math.random(1, 3) or nil,
                 stamp = now,
             }
 
@@ -1040,7 +1096,7 @@ local function buildPlan(filter, isKnife, origin, now, settings)
                         plan.fallback = CFrame.new(aim)
 
                         if distance then
-                            logLead(plan.state, char, distance, travelTime, now)
+                            logLead(plan.state, char, distance, travelTime, plan.arm, now)
                         end
 
                         if Legit.Enabled then
@@ -1276,141 +1332,150 @@ end
 
 local SilentAimTab = Window:Tab({ Title = 'silent aim', Icon = 'crosshair' })
 
-local AimSection = SilentAimTab:Section({ Title = 'aim', Side = 'left' })
+do
+    local AimSection = SilentAimTab:Section({ Title = 'aim', Side = 'left' })
 
-AimSection:Stat({
-    Title = 'hook api',
-    Value = hasNamecallHook and 'available' or 'missing',
-    Color = hasNamecallHook and Color3.fromRGB(126, 217, 87) or Color3.fromRGB(255, 96, 106),
-})
+    AimSection:Stat({
+        Title = 'hook api',
+        Value = hasNamecallHook and 'available' or 'missing',
+        Color = hasNamecallHook and Color3.fromRGB(126, 217, 87) or Color3.fromRGB(255, 96, 106),
+    })
 
-AimSection:Toggle({
-    Title = 'silent aim',
-    Desc = 'gun redirects only to the murderer, knife to the nearest valid target. your click, animation and the real origin stay as fired',
-    Flag = 'mm2_silent_aim',
-    Callback = function(state)
-        if state and not hasNamecallHook then
-            Centrl:Notify({
-                Title = 'mm2',
-                Content = 'hookmetamethod/getnamecallmethod not available on this executor.',
-                Type = 'error',
-                Duration = 6,
-            })
-        end
-        Aim.SilentAim = state
-    end,
-})
+    AimSection:Toggle({
+        Title = 'silent aim',
+        Desc = 'gun redirects only to the murderer, knife to the nearest valid target. your click, animation and the real origin stay as fired',
+        Flag = 'mm2_silent_aim',
+        Callback = function(state)
+            if state and not hasNamecallHook then
+                Centrl:Notify({
+                    Title = 'mm2',
+                    Content = 'hookmetamethod/getnamecallmethod not available on this executor.',
+                    Type = 'error',
+                    Duration = 6,
+                })
+            end
+            Aim.SilentAim = state
+        end,
+    })
 
-AimSection:Dropdown({
-    Title = 'aim part',
-    Desc = 'the gun one shots anywhere on the body, so body is not a compromise - it is the same kill with a wider target. the server checks the shot by casting from your gun to the point sent, so how far the prediction can be off before missing is just the width of what you aimed at: about a stud either side of the torso against about half that on the head. head is only worth it if you want the killfeed',
-    Values = { 'Body', 'Head' },
-    Default = 'Body',
-    Flag = 'mm2_silent_aim_part',
-    Callback = function(value) Aim.AimPart = value end,
-})
+    AimSection:Dropdown({
+        Title = 'aim part',
+        Desc = 'the gun one shots anywhere on the body, so body is not a compromise - it is the same kill with a wider target. the server checks the shot by casting from your gun to the point sent, so how far the prediction can be off before missing is just the width of what you aimed at: about a stud either side of the torso against about half that on the head. head is only worth it if you want the killfeed',
+        Values = { 'Body', 'Head' },
+        Default = 'Body',
+        Flag = 'mm2_silent_aim_part',
+        Callback = function(value) Aim.AimPart = value end,
+    })
 
-AimSection:Toggle({
-    Title = 'wall check',
-    Desc = 'prefers a clear camera sightline when ranking, requires one from the real muzzle before redirecting',
-    Flag = 'mm2_silent_aim_wallcheck',
-    Default = true,
-    Callback = function(state) Aim.WallCheck = state end,
-})
+    AimSection:Toggle({
+        Title = 'wall check',
+        Desc = 'prefers a clear camera sightline when ranking, requires one from the real muzzle before redirecting',
+        Flag = 'mm2_silent_aim_wallcheck',
+        Default = true,
+        Callback = function(state) Aim.WallCheck = state end,
+    })
 
-AimSection:Slider({
-    Title = 'max range',
-    Min = 25,
-    Max = 300,
-    Increment = 5,
-    Default = 300,
-    Suffix = ' studs',
-    Flag = 'mm2_silent_aim_range',
-    Callback = function(value) Aim.MaxRange = value end,
-})
+    AimSection:Slider({
+        Title = 'max range',
+        Min = 25,
+        Max = 300,
+        Increment = 5,
+        Default = 300,
+        Suffix = ' studs',
+        Flag = 'mm2_silent_aim_range',
+        Callback = function(value) Aim.MaxRange = value end,
+    })
 
-AimSection:Slider({
-    Title = 'redirect chance',
-    Desc = 'percent of shots that get redirected at all. the rest fire exactly where you aimed, untouched. 100 redirects every shot',
-    Min = 0,
-    Max = 100,
-    Increment = 1,
-    Default = 100,
-    Suffix = '%',
-    Flag = 'mm2_silent_aim_redirect_chance',
-    Callback = function(value) Aim.RedirectChance = value end,
-})
+    AimSection:Slider({
+        Title = 'redirect chance',
+        Desc = 'percent of shots that get redirected at all. the rest fire exactly where you aimed, untouched. 100 redirects every shot',
+        Min = 0,
+        Max = 100,
+        Increment = 1,
+        Default = 100,
+        Suffix = '%',
+        Flag = 'mm2_silent_aim_redirect_chance',
+        Callback = function(value) Aim.RedirectChance = value end,
+    })
+end
 
-local FovSection = SilentAimTab:Section({ Title = 'fov', Side = 'right' })
 
-FovSection:Toggle({
-    Title = 'fov limit',
-    Desc = 'off means the whole screen is fair game - anything visible can be targeted. on restricts it to the radius below',
-    Flag = 'mm2_silent_aim_fov',
-    Default = false,
-    Callback = function(state) Aim.FOVEnabled = state end,
-})
+do
+    local FovSection = SilentAimTab:Section({ Title = 'fov', Side = 'right' })
 
-FovSection:Slider({
-    Title = 'fov radius',
-    Desc = 'only used while fov limit is on',
-    Min = 20,
-    Max = 600,
-    Increment = 10,
-    Default = 200,
-    Flag = 'mm2_silent_aim_fov_radius',
-    Callback = function(value) Aim.FOVRadius = value end,
-})
+    FovSection:Toggle({
+        Title = 'fov limit',
+        Desc = 'off means the whole screen is fair game - anything visible can be targeted. on restricts it to the radius below',
+        Flag = 'mm2_silent_aim_fov',
+        Default = false,
+        Callback = function(state) Aim.FOVEnabled = state end,
+    })
 
-FovSection:Toggle({
-    Title = 'follow mouse',
-    Flag = 'mm2_silent_aim_follow_mouse',
-    Default = true,
-    Callback = function(state) Aim.FOVFollowMouse = state end,
-})
+    FovSection:Slider({
+        Title = 'fov radius',
+        Desc = 'only used while fov limit is on',
+        Min = 20,
+        Max = 600,
+        Increment = 10,
+        Default = 200,
+        Flag = 'mm2_silent_aim_fov_radius',
+        Callback = function(value) Aim.FOVRadius = value end,
+    })
 
-FovSection:Toggle({
-    Title = 'off screen targets',
-    Desc = 'also allows targets that are off screen entirely, including behind you, ranked by angle from where the camera points. on screen targets always take priority',
-    Flag = 'mm2_silent_aim_offscreen',
-    Default = false,
-    Callback = function(state) Aim.OffScreen = state end,
-})
+    FovSection:Toggle({
+        Title = 'follow mouse',
+        Flag = 'mm2_silent_aim_follow_mouse',
+        Default = true,
+        Callback = function(state) Aim.FOVFollowMouse = state end,
+    })
 
-local PredictionSection = SilentAimTab:Section({ Title = 'prediction', Side = 'right' })
+    FovSection:Toggle({
+        Title = 'off screen targets',
+        Desc = 'also allows targets that are off screen entirely, including behind you, ranked by angle from where the camera points. on screen targets always take priority',
+        Flag = 'mm2_silent_aim_offscreen',
+        Default = false,
+        Callback = function(state) Aim.OffScreen = state end,
+    })
+end
 
-PredictionSection:Toggle({
-    Title = 'predict movement',
-    Desc = 'master switch. off aims exactly where the target is right now. on, the lead is solved on the frame the shot actually fires, from the real muzzle position the game passes in, so nothing is a frame behind. the path is an arc: their turn is measured by fitting a circle through where they actually were, and when that fit holds up it is trusted for the whole lead. when it does not the arc falls back to a smoothed turn that fades out across the lead. speed is held to their walkspeed so a rubberband spike cannot throw the aim, and the whole lead shortens on someone whose direction keeps flipping',
-    Flag = 'mm2_silent_aim_predict',
-    Default = true,
-    Callback = function(state) Aim.Predict = state end,
-})
 
-PredictionSection:Toggle({
-    Title = 'jump aware',
-    Desc = 'the vertical aim point is always solved the same safe way regardless of this toggle - it never overshoots above where they are now by more than a couple studs, and it never undershoots the ground. this only changes where on their body it aims while they are in the air: on, it aims near their feet so a slightly-off vertical read still lands on them, and repeat jumpers get aimed at the torso instead of the head. off, it keeps aiming at the normal point even mid jump',
-    Flag = 'mm2_silent_aim_jump',
-    Default = true,
-    Callback = function(state) Aim.JumpAware = state end,
-})
+do
+    local PredictionSection = SilentAimTab:Section({ Title = 'prediction', Side = 'right' })
 
-PredictionSection:Toggle({
-    Title = 'use ping',
-    Desc = 'adds your measured round trip ping to the lead. off, ping contributes nothing at all - the lead is only replication lag, your own frame time, and extra lead per weapon below',
-    Flag = 'mm2_silent_aim_use_ping',
-    Default = true,
-    Callback = function(state) Aim.UsePing = state end,
-})
+    PredictionSection:Toggle({
+        Title = 'predict movement',
+        Desc = 'master switch. off aims exactly where the target is right now. on, the lead is solved on the frame the shot actually fires, from the real muzzle position the game passes in, so nothing is a frame behind. the path is an arc: their turn is measured by fitting a circle through where they actually were, and when that fit holds up it is trusted for the whole lead. when it does not the arc falls back to a smoothed turn that fades out across the lead. speed is held to their walkspeed so a rubberband spike cannot throw the aim, and the whole lead shortens on someone whose direction keeps flipping',
+        Flag = 'mm2_silent_aim_predict',
+        Default = true,
+        Callback = function(state) Aim.Predict = state end,
+    })
 
-PredictionSection:Dropdown({
-    Title = 'smoothing',
-    Desc = 'how heavily raw velocity is smoothed and how many times the distance-dependent part of the lead re-solves against where that lead itself would put them. higher settles on a steadier number for someone running a straight line but reacts a little slower to a sudden turn. does not affect the extra lead sliders below, and nothing here is fitted from your shots - it only shapes how the current motion reading is filtered',
-    Values = { 'Lesser', 'Normal', 'Extra', 'Advanced', 'Best' },
-    Default = 'Normal',
-    Flag = 'mm2_silent_aim_auto_level',
-    Callback = function(value) Aim.AutoLevel = value end,
-})
+    PredictionSection:Toggle({
+        Title = 'jump aware',
+        Desc = 'the vertical aim point is always solved the same safe way regardless of this toggle - it never overshoots above where they are now by more than a couple studs, and it never undershoots the ground. this only changes where on their body it aims while they are in the air: on, it aims near their feet so a slightly-off vertical read still lands on them, and repeat jumpers get aimed at the torso instead of the head. off, it keeps aiming at the normal point even mid jump',
+        Flag = 'mm2_silent_aim_jump',
+        Default = true,
+        Callback = function(state) Aim.JumpAware = state end,
+    })
+
+    PredictionSection:Toggle({
+        Title = 'use ping',
+        Desc = 'adds your measured round trip ping to the lead. off, ping contributes nothing at all - the lead is only replication lag, your own frame time, and extra lead per weapon below',
+        Flag = 'mm2_silent_aim_use_ping',
+        Default = true,
+        Callback = function(state) Aim.UsePing = state end,
+    })
+
+    PredictionSection:Dropdown({
+        Title = 'smoothing',
+        Desc = 'how heavily raw velocity is smoothed and how many times the distance-dependent part of the lead re-solves against where that lead itself would put them. higher settles on a steadier number for someone running a straight line but reacts a little slower to a sudden turn. does not affect the extra lead sliders below, and nothing here is fitted from your shots - it only shapes how the current motion reading is filtered',
+        Values = { 'Lesser', 'Normal', 'Extra', 'Advanced', 'Best' },
+        Default = 'Normal',
+        Flag = 'mm2_silent_aim_auto_level',
+        Callback = function(value) Aim.AutoLevel = value end,
+    })
+end
+
 
 
 local Visual = {
@@ -1825,38 +1890,65 @@ track(Workspace.DescendantRemoving:Connect(function(inst)
     if droppedGunObjects[inst] then destroyDroppedGunEsp(inst) end
 end))
 
-local GunLeadSection = SilentAimTab:Section({ Title = 'gun lead', Side = 'left' })
 
-GunLeadSection:Slider({
-    Title = 'extra lead',
-    Desc = 'a flat amount added to the gun lead, on top of ping, replication lag and your own frame time. positive aims further ahead of the target. negative aims behind them - use it if shots are consistently landing in front, since it walks the point back toward where they already were instead of further into where they are going. the gun is meant to be near instant, so it will rarely need much of this range - it is wide mainly so knife-style flight-time testing does not feel capped',
-    Min = -3000,
-    Max = 3000,
-    Increment = 10,
-    Default = 0,
-    Suffix = ' ms',
-    Flag = 'mm2_gun_lead_extra',
-    Callback = function(value) GunTune.Extra = value end,
-})
+local gunLeadStat, gunMultStat
 
-local gunLeadStat = GunLeadSection:Stat({ Title = 'gun hits / shots', Value = '0 / 0' })
+do
+    local GunLeadSection = SilentAimTab:Section({ Title = 'gun lead', Side = 'left' })
 
-local KnifeLeadSection = SilentAimTab:Section({ Title = 'knife lead', Side = 'right' })
+    GunLeadSection:Slider({
+        Title = 'extra lead',
+        Desc = 'a flat amount added to the gun lead, on top of ping, replication lag and your own frame time. positive aims further ahead of the target. negative aims behind them - use it if shots are consistently landing in front, since it walks the point back toward where they already were instead of further into where they are going. the gun is meant to be near instant, so it will rarely need much of this range - it is wide mainly so knife-style flight-time testing does not feel capped',
+        Min = -3000,
+        Max = 3000,
+        Increment = 10,
+        Default = 0,
+        Suffix = ' ms',
+        Flag = 'mm2_gun_lead_extra',
+        Callback = function(value) GunTune.Extra = value end,
+    })
 
-KnifeLeadSection:Slider({
-    Title = 'extra lead',
-    Desc = 'a flat amount added to the knife lead, on top of its real flight time, ping, replication lag and your own frame time. positive aims further ahead of the target. negative aims behind them, for when it is consistently overshooting to one side',
-    Min = -3000,
-    Max = 3000,
-    Increment = 10,
-    Default = 0,
-    Suffix = ' ms',
-    Flag = 'mm2_knife_lead_extra',
-    Callback = function(value) KnifeTune.Extra = value end,
-})
+    GunLeadSection:Toggle({
+        Title = 'auto tune',
+        Desc = 'off by default. on, the gun tries a slightly shorter or longer lead than usual on a random shot now and then, on top of whatever extra lead is set above, and nudges a multiplier toward whichever length is actually landing more - measured from the target really taking damage, not from any raycast guess. bounded between 0.4x and 4x so a bad run drifts back rather than running away, and it only ever moves after a real block of shots has resolved. leave it off if extra lead alone is already working',
+        Flag = 'mm2_gun_lead_auto',
+        Default = false,
+        Callback = function(state) GunTune.Auto = state end,
+    })
 
-knifeSpeedStat = KnifeLeadSection:Stat({ Title = 'throw speed (auto)', Value = ('%d studs/s'):format(KnifeTune.Speed) })
-local knifeLeadStat = KnifeLeadSection:Stat({ Title = 'knife hits / shots', Value = '0 / 0' })
+    gunLeadStat = GunLeadSection:Stat({ Title = 'gun hits / shots', Value = '0 / 0' })
+    gunMultStat = GunLeadSection:Stat({ Title = 'gun auto multiplier', Value = 'off' })
+end
+
+local knifeLeadStat, knifeMultStat
+
+do
+    local KnifeLeadSection = SilentAimTab:Section({ Title = 'knife lead', Side = 'right' })
+
+    KnifeLeadSection:Slider({
+        Title = 'extra lead',
+        Desc = 'a flat amount added to the knife lead, on top of its real flight time, ping, replication lag and your own frame time. positive aims further ahead of the target. negative aims behind them, for when it is consistently overshooting to one side',
+        Min = -3000,
+        Max = 3000,
+        Increment = 10,
+        Default = 0,
+        Suffix = ' ms',
+        Flag = 'mm2_knife_lead_extra',
+        Callback = function(value) KnifeTune.Extra = value end,
+    })
+
+    KnifeLeadSection:Toggle({
+        Title = 'auto tune',
+        Desc = 'off by default. same idea as the gun - tries a slightly shorter or longer knife lead now and then and nudges a multiplier toward whichever is actually landing more, measured from real damage, bounded between 0.4x and 4x. leave it off if extra lead alone is already working',
+        Flag = 'mm2_knife_lead_auto',
+        Default = false,
+        Callback = function(state) KnifeTune.Auto = state end,
+    })
+
+    knifeSpeedStat = KnifeLeadSection:Stat({ Title = 'throw speed (auto)', Value = ('%d studs/s'):format(KnifeTune.Speed) })
+    knifeLeadStat = KnifeLeadSection:Stat({ Title = 'knife hits / shots', Value = '0 / 0' })
+    knifeMultStat = KnifeLeadSection:Stat({ Title = 'knife auto multiplier', Value = 'off' })
+end
 
 
 local LegitTab = Window:Tab({ Title = 'legit', Icon = 'user-check' })
@@ -2159,6 +2251,8 @@ task.spawn(function()
                 or '-')
             gunLeadStat:Set(('%d / %d'):format(GunLead.hits, GunLead.verified))
             knifeLeadStat:Set(('%d / %d'):format(KnifeLead.hits, KnifeLead.verified))
+            gunMultStat:Set(GunTune.Auto and ('%.2fx'):format(GunLead.mult) or 'off')
+            knifeMultStat:Set(KnifeTune.Auto and ('%.2fx'):format(KnifeLead.mult) or 'off')
         end)
     end
 end)
