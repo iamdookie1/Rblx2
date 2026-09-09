@@ -179,55 +179,79 @@ local function countOwned(owned)
     return n
 end
 
-local Centrl = loadstring(game:HttpGet('https://raw.githubusercontent.com/iamdookie1/Rblx2/main/UI/Lib2.lua'))()
+local Onyx = loadstring(game:HttpGet('https://raw.githubusercontent.com/iamdookie1/Rblx2/main/UI/Ui2.lua'))()
 
-local Window = Centrl:Window({
+local function addStat(section, cfg)
+    local title = cfg.Title
+    local label = section:Label({ Title = title .. ': ' .. tostring(cfg.Value), Color = cfg.Color })
+    local api = {}
+    function api.Set(value, color)
+        label:SetText(title .. ': ' .. tostring(value))
+        if color then label:SetColor(color) end
+    end
+    return api
+end
+
+local function addProgress(section, cfg)
+    local title = cfg.Title
+    local label = section:Label({ Title = title .. ': 0%' })
+    local api = {}
+    function api.Set(percent)
+        label:SetText(('%s: %d%%'):format(title, math.floor((tonumber(percent) or 0) + 0.5)))
+    end
+    return api
+end
+
+local Window = Onyx:CreateWindow({
     Title = 'mm2',
     SubTitle = 'assist',
     Folder = 'MM2Assist',
-    ToggleKey = Enum.KeyCode.RightShift,
+    Keybind = Enum.KeyCode.RightShift,
     Accent = Color3.fromRGB(210, 45, 45),
 })
 
-local ProfileTab = Window:Tab({ Title = 'profile', Icon = 'user' })
+local CoinsStat, GemsStat, PrestigeStat, LevelStat, XPBar, WeaponsStat, PetsStat, MaterialsStat
+do
+    local ProfileTab = Window:CreateTab({ Title = 'profile' })
 
-local EconomySection = ProfileTab:Section({ Title = 'economy', Side = 'left' })
-local CoinsStat = EconomySection:Stat({ Title = 'coins', Value = '-' })
-local GemsStat = EconomySection:Stat({ Title = 'gems', Value = '-' })
-local PrestigeStat = EconomySection:Stat({ Title = 'prestige', Value = '-' })
-EconomySection:Button({ Title = 'refresh', Callback = fetchProfileData })
+    local EconomySection = ProfileTab:CreateSection('economy')
+    CoinsStat = addStat(EconomySection, { Title = 'coins', Value = '-' })
+    GemsStat = addStat(EconomySection, { Title = 'gems', Value = '-' })
+    PrestigeStat = addStat(EconomySection, { Title = 'prestige', Value = '-' })
+    EconomySection:Button({ Title = 'refresh', Callback = fetchProfileData })
 
-local LevelSection = ProfileTab:Section({ Title = 'level', Side = 'right' })
-local LevelStat = LevelSection:Stat({ Title = 'level', Value = '-' })
-local XPBar = LevelSection:Progress({ Title = 'xp to next level', Percent = true })
+    local LevelSection = ProfileTab:CreateSection('level')
+    LevelStat = addStat(LevelSection, { Title = 'level', Value = '-' })
+    XPBar = addProgress(LevelSection, { Title = 'xp to next level' })
 
-local InventorySection = ProfileTab:Section({ Title = 'inventory', Side = 'left' })
-local WeaponsStat = InventorySection:Stat({ Title = 'weapons owned', Value = '-' })
-local PetsStat = InventorySection:Stat({ Title = 'pets owned', Value = '-' })
-local MaterialsStat = InventorySection:Stat({ Title = 'materials owned', Value = '-' })
+    local InventorySection = ProfileTab:CreateSection('inventory')
+    WeaponsStat = addStat(InventorySection, { Title = 'weapons owned', Value = '-' })
+    PetsStat = addStat(InventorySection, { Title = 'pets owned', Value = '-' })
+    MaterialsStat = addStat(InventorySection, { Title = 'materials owned', Value = '-' })
+end
 
 local function refreshDashboard()
     if not ProfileData then return end
 
-    CoinsStat:Set(tostring(ProfileData.Coins or 0))
-    GemsStat:Set(tostring(ProfileData.Gems or 0))
-    PrestigeStat:Set(tostring(ProfileData.Prestige or 0))
+    CoinsStat.Set(tostring(ProfileData.Coins or 0))
+    GemsStat.Set(tostring(ProfileData.Gems or 0))
+    PrestigeStat.Set(tostring(ProfileData.Prestige or 0))
 
     local xp = ProfileData.NewXP or 0
     if LevelModule then
         local ok, level = pcall(LevelModule.GetLevel, xp)
-        if ok then LevelStat:Set(tostring(level)) end
+        if ok then LevelStat.Set(tostring(level)) end
         local ok2, progress = pcall(LevelModule.GetProgressToNextLevel, xp)
         if ok2 and typeof(progress) == "number" then
-            XPBar:Set(math.clamp(progress, 0, 1) * 100)
+            XPBar.Set(math.clamp(progress, 0, 1) * 100)
         end
     else
-        LevelStat:Set('n/a')
+        LevelStat.Set('n/a')
     end
 
-    WeaponsStat:Set(tostring(countOwned(ProfileData.Weapons and ProfileData.Weapons.Owned)))
-    PetsStat:Set(tostring(countOwned(ProfileData.Pets and ProfileData.Pets.Owned)))
-    MaterialsStat:Set(tostring(countOwned(ProfileData.Materials and ProfileData.Materials.Owned)))
+    WeaponsStat.Set(tostring(countOwned(ProfileData.Weapons and ProfileData.Weapons.Owned)))
+    PetsStat.Set(tostring(countOwned(ProfileData.Pets and ProfileData.Pets.Owned)))
+    MaterialsStat.Set(tostring(countOwned(ProfileData.Materials and ProfileData.Materials.Owned)))
 end
 
 task.spawn(function()
@@ -867,7 +891,7 @@ local function onThrowingKnifeAdded(instance)
     if ok and typeof(speed) == "number" and speed > 1 and speed ~= KnifeTune.Speed then
         KnifeTune.Speed = speed
         if knifeSpeedStat then
-            pcall(function() knifeSpeedStat:Set(('%d studs/s'):format(speed)) end)
+            pcall(function() knifeSpeedStat.Set(('%d studs/s'):format(speed)) end)
         end
     end
 end
@@ -1181,7 +1205,7 @@ local function debugTick(now)
             local moved = event.sent and event.aimed and (event.aimed - event.sent).Magnitude or nil
             local lead = event.root and event.predicted and flatDistance(event.predicted, event.root) or nil
             if debugLog then
-                debugLog:Add(("%s -> %s %s | moved %s | lead %s | travel %s | lead scale %s"):format(
+                debugLog:Log(("%s -> %s %s | moved %s | lead %s | travel %s | lead scale %s"):format(
                     tag,
                     event.target or "?",
                     event.part or "?",
@@ -1218,7 +1242,7 @@ local function debugTick(now)
                 showMarker("real", root.Position)
                 if debugLog then
                     local verdict = off <= 2 and "HIT band" or (off <= 4 and "close" or "MISS")
-                    debugLog:Add(("  %s landed: predicted off by %.1f studs (lead was %s) %s"):format(
+                    debugLog:Log(("  %s landed: predicted off by %.1f studs (lead was %s) %s"):format(
                         proof.target or "?",
                         off,
                         proof.lead and ("%.1f"):format(proof.lead) or "?",
@@ -1330,12 +1354,12 @@ if hasNamecallHook then
     originalNamecall = hookmetamethod(game, "__namecall", onNamecall)
 end
 
-local SilentAimTab = Window:Tab({ Title = 'silent aim', Icon = 'crosshair' })
+local SilentAimTab = Window:CreateTab({ Title = 'silent aim' })
 
 do
-    local AimSection = SilentAimTab:Section({ Title = 'aim', Side = 'left' })
+    local AimSection = SilentAimTab:CreateSection('aim')
 
-    AimSection:Stat({
+    addStat(AimSection, {
         Title = 'hook api',
         Value = hasNamecallHook and 'available' or 'missing',
         Color = hasNamecallHook and Color3.fromRGB(126, 217, 87) or Color3.fromRGB(255, 96, 106),
@@ -1343,11 +1367,11 @@ do
 
     AimSection:Toggle({
         Title = 'silent aim',
-        Desc = 'gun redirects only to the murderer, knife to the nearest valid target. your click, animation and the real origin stay as fired',
+        Description = 'gun redirects only to the murderer, knife to the nearest valid target. your click, animation and the real origin stay as fired',
         Flag = 'mm2_silent_aim',
         Callback = function(state)
             if state and not hasNamecallHook then
-                Centrl:Notify({
+                Onyx:Notify({
                     Title = 'mm2',
                     Content = 'hookmetamethod/getnamecallmethod not available on this executor.',
                     Type = 'error',
@@ -1360,7 +1384,7 @@ do
 
     AimSection:Dropdown({
         Title = 'aim part',
-        Desc = 'the gun one shots anywhere on the body, so body is not a compromise - it is the same kill with a wider target. the server checks the shot by casting from your gun to the point sent, so how far the prediction can be off before missing is just the width of what you aimed at: about a stud either side of the torso against about half that on the head. head is only worth it if you want the killfeed',
+        Description = 'the gun one shots anywhere on the body, so body is not a compromise - it is the same kill with a wider target. the server checks the shot by casting from your gun to the point sent, so how far the prediction can be off before missing is just the width of what you aimed at: about a stud either side of the torso against about half that on the head. head is only worth it if you want the killfeed',
         Values = { 'Body', 'Head' },
         Default = 'Body',
         Flag = 'mm2_silent_aim_part',
@@ -1369,7 +1393,7 @@ do
 
     AimSection:Toggle({
         Title = 'wall check',
-        Desc = 'prefers a clear camera sightline when ranking, requires one from the real muzzle before redirecting',
+        Description = 'prefers a clear camera sightline when ranking, requires one from the real muzzle before redirecting',
         Flag = 'mm2_silent_aim_wallcheck',
         Default = true,
         Callback = function(state) Aim.WallCheck = state end,
@@ -1388,7 +1412,7 @@ do
 
     AimSection:Slider({
         Title = 'redirect chance',
-        Desc = 'percent of shots that get redirected at all. the rest fire exactly where you aimed, untouched. 100 redirects every shot',
+        Description = 'percent of shots that get redirected at all. the rest fire exactly where you aimed, untouched. 100 redirects every shot',
         Min = 0,
         Max = 100,
         Increment = 1,
@@ -1401,11 +1425,11 @@ end
 
 
 do
-    local FovSection = SilentAimTab:Section({ Title = 'fov', Side = 'right' })
+    local FovSection = SilentAimTab:CreateSection('fov')
 
     FovSection:Toggle({
         Title = 'fov limit',
-        Desc = 'off means the whole screen is fair game - anything visible can be targeted. on restricts it to the radius below',
+        Description = 'off means the whole screen is fair game - anything visible can be targeted. on restricts it to the radius below',
         Flag = 'mm2_silent_aim_fov',
         Default = false,
         Callback = function(state) Aim.FOVEnabled = state end,
@@ -1413,7 +1437,7 @@ do
 
     FovSection:Slider({
         Title = 'fov radius',
-        Desc = 'only used while fov limit is on',
+        Description = 'only used while fov limit is on',
         Min = 20,
         Max = 600,
         Increment = 10,
@@ -1431,7 +1455,7 @@ do
 
     FovSection:Toggle({
         Title = 'off screen targets',
-        Desc = 'also allows targets that are off screen entirely, including behind you, ranked by angle from where the camera points. on screen targets always take priority',
+        Description = 'also allows targets that are off screen entirely, including behind you, ranked by angle from where the camera points. on screen targets always take priority',
         Flag = 'mm2_silent_aim_offscreen',
         Default = false,
         Callback = function(state) Aim.OffScreen = state end,
@@ -1440,11 +1464,11 @@ end
 
 
 do
-    local PredictionSection = SilentAimTab:Section({ Title = 'prediction', Side = 'right' })
+    local PredictionSection = SilentAimTab:CreateSection('prediction')
 
     PredictionSection:Toggle({
         Title = 'predict movement',
-        Desc = 'master switch. off aims exactly where the target is right now. on, the lead is solved on the frame the shot actually fires, from the real muzzle position the game passes in, so nothing is a frame behind. the path is an arc: their turn is measured by fitting a circle through where they actually were, and when that fit holds up it is trusted for the whole lead. when it does not the arc falls back to a smoothed turn that fades out across the lead. speed is held to their walkspeed so a rubberband spike cannot throw the aim, and the whole lead shortens on someone whose direction keeps flipping',
+        Description = 'master switch. off aims exactly where the target is right now. on, the lead is solved on the frame the shot actually fires, from the real muzzle position the game passes in, so nothing is a frame behind. the path is an arc: their turn is measured by fitting a circle through where they actually were, and when that fit holds up it is trusted for the whole lead. when it does not the arc falls back to a smoothed turn that fades out across the lead. speed is held to their walkspeed so a rubberband spike cannot throw the aim, and the whole lead shortens on someone whose direction keeps flipping',
         Flag = 'mm2_silent_aim_predict',
         Default = true,
         Callback = function(state) Aim.Predict = state end,
@@ -1452,7 +1476,7 @@ do
 
     PredictionSection:Toggle({
         Title = 'jump aware',
-        Desc = 'the vertical aim point is always solved the same safe way regardless of this toggle - it never overshoots above where they are now by more than a couple studs, and it never undershoots the ground. this only changes where on their body it aims while they are in the air: on, it aims near their feet so a slightly-off vertical read still lands on them, and repeat jumpers get aimed at the torso instead of the head. off, it keeps aiming at the normal point even mid jump',
+        Description = 'the vertical aim point is always solved the same safe way regardless of this toggle - it never overshoots above where they are now by more than a couple studs, and it never undershoots the ground. this only changes where on their body it aims while they are in the air: on, it aims near their feet so a slightly-off vertical read still lands on them, and repeat jumpers get aimed at the torso instead of the head. off, it keeps aiming at the normal point even mid jump',
         Flag = 'mm2_silent_aim_jump',
         Default = true,
         Callback = function(state) Aim.JumpAware = state end,
@@ -1460,7 +1484,7 @@ do
 
     PredictionSection:Toggle({
         Title = 'use ping',
-        Desc = 'adds your measured round trip ping to the lead. off, ping contributes nothing at all - the lead is only replication lag, your own frame time, and extra lead per weapon below',
+        Description = 'adds your measured round trip ping to the lead. off, ping contributes nothing at all - the lead is only replication lag, your own frame time, and extra lead per weapon below',
         Flag = 'mm2_silent_aim_use_ping',
         Default = true,
         Callback = function(state) Aim.UsePing = state end,
@@ -1468,7 +1492,7 @@ do
 
     PredictionSection:Dropdown({
         Title = 'smoothing',
-        Desc = 'how heavily raw velocity is smoothed and how many times the distance-dependent part of the lead re-solves against where that lead itself would put them. higher settles on a steadier number for someone running a straight line but reacts a little slower to a sudden turn. does not affect the extra lead sliders below, and nothing here is fitted from your shots - it only shapes how the current motion reading is filtered',
+        Description = 'how heavily raw velocity is smoothed and how many times the distance-dependent part of the lead re-solves against where that lead itself would put them. higher settles on a steadier number for someone running a straight line but reacts a little slower to a sudden turn. does not affect the extra lead sliders below, and nothing here is fitted from your shots - it only shapes how the current motion reading is filtered',
         Values = { 'Lesser', 'Normal', 'Extra', 'Advanced', 'Best' },
         Default = 'Normal',
         Flag = 'mm2_silent_aim_auto_level',
@@ -1894,11 +1918,11 @@ end))
 local gunLeadStat, gunMultStat
 
 do
-    local GunLeadSection = SilentAimTab:Section({ Title = 'gun lead', Side = 'left' })
+    local GunLeadSection = SilentAimTab:CreateSection('gun lead')
 
     GunLeadSection:Slider({
         Title = 'extra lead',
-        Desc = 'a flat amount added to the gun lead, on top of ping, replication lag and your own frame time. positive aims further ahead of the target. negative aims behind them - use it if shots are consistently landing in front, since it walks the point back toward where they already were instead of further into where they are going. the gun is meant to be near instant, so it will rarely need much of this range - it is wide mainly so knife-style flight-time testing does not feel capped',
+        Description = 'a flat amount added to the gun lead, on top of ping, replication lag and your own frame time. positive aims further ahead of the target. negative aims behind them - use it if shots are consistently landing in front, since it walks the point back toward where they already were instead of further into where they are going. the gun is meant to be near instant, so it will rarely need much of this range - it is wide mainly so knife-style flight-time testing does not feel capped',
         Min = -3000,
         Max = 3000,
         Increment = 10,
@@ -1910,24 +1934,24 @@ do
 
     GunLeadSection:Toggle({
         Title = 'auto tune',
-        Desc = 'off by default. on, the gun tries a slightly shorter or longer lead than usual on a random shot now and then, on top of whatever extra lead is set above, and nudges a multiplier toward whichever length is actually landing more - measured from the target really taking damage, not from any raycast guess. bounded between 0.4x and 4x so a bad run drifts back rather than running away, and it only ever moves after a real block of shots has resolved. leave it off if extra lead alone is already working',
+        Description = 'off by default. on, the gun tries a slightly shorter or longer lead than usual on a random shot now and then, on top of whatever extra lead is set above, and nudges a multiplier toward whichever length is actually landing more - measured from the target really taking damage, not from any raycast guess. bounded between 0.4x and 4x so a bad run drifts back rather than running away, and it only ever moves after a real block of shots has resolved. leave it off if extra lead alone is already working',
         Flag = 'mm2_gun_lead_auto',
         Default = false,
         Callback = function(state) GunTune.Auto = state end,
     })
 
-    gunLeadStat = GunLeadSection:Stat({ Title = 'gun hits / shots', Value = '0 / 0' })
-    gunMultStat = GunLeadSection:Stat({ Title = 'gun auto multiplier', Value = 'off' })
+    gunLeadStat = addStat(GunLeadSection, { Title = 'gun hits / shots', Value = '0 / 0' })
+    gunMultStat = addStat(GunLeadSection, { Title = 'gun auto multiplier', Value = 'off' })
 end
 
 local knifeLeadStat, knifeMultStat
 
 do
-    local KnifeLeadSection = SilentAimTab:Section({ Title = 'knife lead', Side = 'right' })
+    local KnifeLeadSection = SilentAimTab:CreateSection('knife lead')
 
     KnifeLeadSection:Slider({
         Title = 'extra lead',
-        Desc = 'a flat amount added to the knife lead, on top of its real flight time, ping, replication lag and your own frame time. positive aims further ahead of the target. negative aims behind them, for when it is consistently overshooting to one side',
+        Description = 'a flat amount added to the knife lead, on top of its real flight time, ping, replication lag and your own frame time. positive aims further ahead of the target. negative aims behind them, for when it is consistently overshooting to one side',
         Min = -3000,
         Max = 3000,
         Increment = 10,
@@ -1939,25 +1963,25 @@ do
 
     KnifeLeadSection:Toggle({
         Title = 'auto tune',
-        Desc = 'off by default. same idea as the gun - tries a slightly shorter or longer knife lead now and then and nudges a multiplier toward whichever is actually landing more, measured from real damage, bounded between 0.4x and 4x. leave it off if extra lead alone is already working',
+        Description = 'off by default. same idea as the gun - tries a slightly shorter or longer knife lead now and then and nudges a multiplier toward whichever is actually landing more, measured from real damage, bounded between 0.4x and 4x. leave it off if extra lead alone is already working',
         Flag = 'mm2_knife_lead_auto',
         Default = false,
         Callback = function(state) KnifeTune.Auto = state end,
     })
 
-    knifeSpeedStat = KnifeLeadSection:Stat({ Title = 'throw speed (auto)', Value = ('%d studs/s'):format(KnifeTune.Speed) })
-    knifeLeadStat = KnifeLeadSection:Stat({ Title = 'knife hits / shots', Value = '0 / 0' })
-    knifeMultStat = KnifeLeadSection:Stat({ Title = 'knife auto multiplier', Value = 'off' })
+    knifeSpeedStat = addStat(KnifeLeadSection, { Title = 'throw speed (auto)', Value = ('%d studs/s'):format(KnifeTune.Speed) })
+    knifeLeadStat = addStat(KnifeLeadSection, { Title = 'knife hits / shots', Value = '0 / 0' })
+    knifeMultStat = addStat(KnifeLeadSection, { Title = 'knife auto multiplier', Value = 'off' })
 end
 
 
-local LegitTab = Window:Tab({ Title = 'legit', Icon = 'user-check' })
+local LegitTab = Window:CreateTab({ Title = 'legit' })
 
-local LegitSection = LegitTab:Section({ Title = 'legit mode', Side = 'left' })
+local LegitSection = LegitTab:CreateSection('legit mode')
 
 LegitSection:Toggle({
     Title = 'legit mode',
-    Desc = 'trades accuracy for looking human. overrides the silent aim redirect chance with its own',
+    Description = 'trades accuracy for looking human. overrides the silent aim redirect chance with its own',
     Flag = 'mm2_legit',
     Default = false,
     Callback = function(state) Legit.Enabled = state end,
@@ -1965,7 +1989,7 @@ LegitSection:Toggle({
 
 LegitSection:Slider({
     Title = 'redirect chance',
-    Desc = 'percent of shots that get redirected while legit mode is on',
+    Description = 'percent of shots that get redirected while legit mode is on',
     Min = 0,
     Max = 100,
     Increment = 1,
@@ -1977,7 +2001,7 @@ LegitSection:Slider({
 
 LegitSection:Slider({
     Title = 'reaction time',
-    Desc = 'will not redirect onto a target until it has been the candidate this long, so it never tracks someone faster than you could have seen them. resets if they stop being the candidate for 0.4s',
+    Description = 'will not redirect onto a target until it has been the candidate this long, so it never tracks someone faster than you could have seen them. resets if they stop being the candidate for 0.4s',
     Min = 0,
     Max = 600,
     Increment = 10,
@@ -1989,7 +2013,7 @@ LegitSection:Slider({
 
 LegitSection:Slider({
     Title = 'target stickiness',
-    Desc = 'holds the current target this long before it is allowed to switch, so it does not snap between people mid fight',
+    Description = 'holds the current target this long before it is allowed to switch, so it does not snap between people mid fight',
     Min = 0,
     Max = 5,
     Increment = 0.1,
@@ -1999,11 +2023,11 @@ LegitSection:Slider({
     Callback = function(value) Legit.Stickiness = value end,
 })
 
-local LegitErrorSection = LegitTab:Section({ Title = 'aim error', Side = 'right' })
+local LegitErrorSection = LegitTab:CreateSection('aim error')
 
 LegitErrorSection:Slider({
     Title = 'aim error',
-    Desc = 'angular error added to the solved point. angular rather than fixed studs, so it opens up with range the way real aim error does',
+    Description = 'angular error added to the solved point. angular rather than fixed studs, so it opens up with range the way real aim error does',
     Min = 0,
     Max = 5,
     Increment = 0.1,
@@ -2015,7 +2039,7 @@ LegitErrorSection:Slider({
 
 LegitErrorSection:Slider({
     Title = 'error drift',
-    Desc = 'how much of that error is a slow wander versus fresh randomness each shot. human error is streaky - you are on or off for a few seconds - and pure per shot noise scatters too evenly around dead centre to look real. 0 is all jitter, 100 is all drift',
+    Description = 'how much of that error is a slow wander versus fresh randomness each shot. human error is streaky - you are on or off for a few seconds - and pure per shot noise scatters too evenly around dead centre to look real. 0 is all jitter, 100 is all drift',
     Min = 0,
     Max = 100,
     Increment = 5,
@@ -2027,7 +2051,7 @@ LegitErrorSection:Slider({
 
 LegitErrorSection:Slider({
     Title = 'miss chance',
-    Desc = 'percent of redirected shots thrown wide on purpose. this is the one that matters most - a hit rate of 100 is what gets you called, not how the shots look',
+    Description = 'percent of redirected shots thrown wide on purpose. this is the one that matters most - a hit rate of 100 is what gets you called, not how the shots look',
     Min = 0,
     Max = 100,
     Increment = 1,
@@ -2039,7 +2063,7 @@ LegitErrorSection:Slider({
 
 LegitErrorSection:Slider({
     Title = 'miss spread',
-    Desc = 'how far wide a deliberate miss goes, on top of the normal error',
+    Description = 'how far wide a deliberate miss goes, on top of the normal error',
     Min = 1,
     Max = 12,
     Increment = 0.5,
@@ -2050,16 +2074,116 @@ LegitErrorSection:Slider({
 })
 
 LegitSection:Label({
-    Text = 'Silent aim still has to be on. Legit mode only changes how its shots behave - the camera never moves either way.',
+    Title = 'Silent aim still has to be on. Legit mode only changes how its shots behave - the camera never moves either way.',
 })
 
-local DebugTab = Window:Tab({ Title = 'proof', Icon = 'activity' })
+do
+    local SpamEquip = {
+        Enabled = false,
+        ItemName = nil,
+        UnequipDelay = 0.1,
+        EquipDelay = 0.1,
+    }
 
-local ProofSection = DebugTab:Section({ Title = 'counters', Side = 'left' })
+    local function findSpamEquipTool()
+        if not SpamEquip.ItemName then return nil, false end
+        local char = LocalPlayer.Character
+        if char then
+            local tool = char:FindFirstChild(SpamEquip.ItemName)
+            if tool and tool:IsA("Tool") then return tool, true end
+        end
+        local backpack = LocalPlayer:FindFirstChild("Backpack")
+        if backpack then
+            local tool = backpack:FindFirstChild(SpamEquip.ItemName)
+            if tool and tool:IsA("Tool") then return tool, false end
+        end
+        return nil, false
+    end
+
+    local ItemsTab = Window:CreateTab({ Title = 'items' })
+    local ItemSection = ItemsTab:CreateSection('spam equip')
+    local SavedItemStat = addStat(ItemSection, { Title = 'saved item', Value = 'none' })
+
+    ItemSection:Button({
+        Title = 'save current item',
+        Callback = function()
+            local char = LocalPlayer.Character
+            local tool = char and char:FindFirstChildOfClass("Tool")
+            if not tool then
+                local backpack = LocalPlayer:FindFirstChild("Backpack")
+                tool = backpack and backpack:FindFirstChildOfClass("Tool")
+            end
+            if tool then
+                SpamEquip.ItemName = tool.Name
+                SavedItemStat.Set(tool.Name)
+            else
+                SavedItemStat.Set('none equipped')
+            end
+        end,
+    })
+
+    ItemSection:Toggle({
+        Title = 'spam equip/unequip',
+        Description = 'repeatedly equips then unequips the saved item using the delays below. re-finds the item by name in your character and backpack each cycle, so it keeps working even if the item leaves your inventory and comes back',
+        Flag = 'mm2_spam_equip',
+        Callback = function(state)
+            SpamEquip.Enabled = state
+        end,
+    })
+
+    ItemSection:Slider({
+        Title = 'delay before equip (after unequip)',
+        Min = 0,
+        Max = 2,
+        Increment = 0.05,
+        Default = SpamEquip.UnequipDelay,
+        Suffix = ' s',
+        Flag = 'mm2_spam_equip_unequip_delay',
+        Callback = function(value) SpamEquip.UnequipDelay = value end,
+    })
+
+    ItemSection:Slider({
+        Title = 'delay before unequip (after equip)',
+        Min = 0,
+        Max = 2,
+        Increment = 0.05,
+        Default = SpamEquip.EquipDelay,
+        Suffix = ' s',
+        Flag = 'mm2_spam_equip_equip_delay',
+        Callback = function(value) SpamEquip.EquipDelay = value end,
+    })
+
+    task.spawn(function()
+        while not Unloading do
+            if SpamEquip.Enabled and SpamEquip.ItemName then
+                local char = LocalPlayer.Character
+                local hum = char and char:FindFirstChildOfClass("Humanoid")
+                local tool, equipped = findSpamEquipTool()
+                if hum and tool then
+                    if equipped then
+                        hum:UnequipTools()
+                        task.wait(SpamEquip.UnequipDelay)
+                    else
+                        hum:EquipTool(tool)
+                        task.wait(SpamEquip.EquipDelay)
+                    end
+                else
+                    task.wait(0.2)
+                end
+            else
+                task.wait(0.2)
+            end
+        end
+    end)
+end
+
+local DebugTab = Window:CreateTab({ Title = 'proof' })
+
+local ProofSection = DebugTab:CreateSection('counters')
 
 ProofSection:Toggle({
     Title = 'proof mode',
-    Desc = 'counts and logs every shot the hook sees. if shots seen stays on zero the hook is not firing at all, if seen climbs while redirected stays on zero it is finding no target, and if redirected climbs it is redirecting - the log then shows by how far',
+    Description = 'counts and logs every shot the hook sees. if shots seen stays on zero the hook is not firing at all, if seen climbs while redirected stays on zero it is finding no target, and if redirected climbs it is redirecting - the log then shows by how far',
     Flag = 'mm2_debug',
     Default = false,
     Callback = function(state)
@@ -2070,7 +2194,7 @@ ProofSection:Toggle({
 
 ProofSection:Toggle({
     Title = 'world markers',
-    Desc = 'red ball where the shot was actually sent, green ball where the target really was when it should have arrived. if the two sit on top of each other the prediction was right. both are set to be ignored by raycasts so they cannot affect your own aim or the hit check',
+    Description = 'red ball where the shot was actually sent, green ball where the target really was when it should have arrived. if the two sit on top of each other the prediction was right. both are set to be ignored by raycasts so they cannot affect your own aim or the hit check',
     Flag = 'mm2_debug_markers',
     Default = true,
     Callback = function(state)
@@ -2079,10 +2203,10 @@ ProofSection:Toggle({
     end,
 })
 
-local SeenStat = ProofSection:Stat({ Title = 'shots seen', Value = '0' })
-local RedirectStat = ProofSection:Stat({ Title = 'redirected', Value = '0' })
-local SuppressStat = ProofSection:Stat({ Title = 'not redirected', Value = '0' })
-local ErrorStat = ProofSection:Stat({ Title = 'avg prediction error', Value = '-' })
+local SeenStat = addStat(ProofSection, { Title = 'shots seen', Value = '0' })
+local RedirectStat = addStat(ProofSection, { Title = 'redirected', Value = '0' })
+local SuppressStat = addStat(ProofSection, { Title = 'not redirected', Value = '0' })
+local ErrorStat = addStat(ProofSection, { Title = 'avg prediction error', Value = '-' })
 
 ProofSection:Button({
     Title = 'reset counters',
@@ -2095,45 +2219,45 @@ ProofSection:Button({
     end,
 })
 
-local LogSection = DebugTab:Section({ Title = 'shot log', Side = 'right' })
+local LogSection = DebugTab:CreateSection('shot log')
 
 debugLog = LogSection:Console({ Title = 'shots', Height = 260, MaxLines = 120, Timestamps = true })
-debugLog:Add('turn on proof mode, then shoot')
+debugLog:Log('turn on proof mode, then shoot')
 
 LogSection:Label({
-    Text = 'moved is how far the shot was displaced from where you actually clicked, so any non zero value is the redirect working. lead is how far ahead of the target it aimed. the indented line that follows is measured when the shot should have arrived, comparing where it predicted the target would be against where they actually got to.',
+    Title = 'moved is how far the shot was displaced from where you actually clicked, so any non zero value is the redirect working. lead is how far ahead of the target it aimed. the indented line that follows is measured when the shot should have arrived, comparing where it predicted the target would be against where they actually got to.',
 })
 
-local VisualTab = Window:Tab({ Title = 'visual', Icon = 'eye' })
+local VisualTab = Window:CreateTab({ Title = 'visual' })
 
-local EspSection = VisualTab:Section({ Title = 'esp', Side = 'left' })
+local EspSection = VisualTab:CreateSection('esp')
 
 EspSection:Toggle({
     Title = 'esp',
-    Desc = 'highlights every other living player',
+    Description = 'highlights every other living player',
     Flag = 'mm2_esp',
     Callback = function(state) Visual.Esp = state end,
 })
 
 EspSection:Toggle({
     Title = 'color by role',
-    Desc = 'colors the highlight by current role instead of a flat white',
+    Description = 'colors the highlight by current role instead of a flat white',
     Flag = 'mm2_esp_role_color',
     Callback = function(state) Visual.ColorByRole = state end,
 })
 
 EspSection:Toggle({
     Title = 'gun esp',
-    Desc = 'highlights anyone actually holding a gun right now, in a color of its own that role esp never uses. checked directly off the weapon they are holding rather than guessed from round data, so it still catches a hero even when role detection gets that wrong. works even with esp and role esp both off',
+    Description = 'highlights anyone actually holding a gun right now, in a color of its own that role esp never uses. checked directly off the weapon they are holding rather than guessed from round data, so it still catches a hero even when role detection gets that wrong. works even with esp and role esp both off',
     Flag = 'mm2_esp_gun',
     Callback = function(state) Visual.GunEsp = state end,
 })
 
-local RoleEspSection = VisualTab:Section({ Title = 'role esp', Side = 'right' })
+local RoleEspSection = VisualTab:CreateSection('role esp')
 
 RoleEspSection:Toggle({
     Title = 'role esp',
-    Desc = 'shows role above the head while alive and in the round, never on you. a dropped gun being picked up reads as hero the moment it is equipped',
+    Description = 'shows role above the head while alive and in the round, never on you. a dropped gun being picked up reads as hero the moment it is equipped',
     Flag = 'mm2_role_esp',
     Callback = function(state) Visual.RoleEsp = state end,
 })
@@ -2150,11 +2274,11 @@ RoleEspSection:Toggle({
     Callback = function(state) Visual.ShowDistance = state end,
 })
 
-local XraySection = VisualTab:Section({ Title = 'xray', Side = 'left' })
+local XraySection = VisualTab:CreateSection('xray')
 
 XraySection:Toggle({
     Title = 'xray',
-    Desc = 'fades opaque parts in range, leaves anything already see-through alone',
+    Description = 'fades opaque parts in range, leaves anything already see-through alone',
     Flag = 'mm2_xray',
     Callback = function(state)
         Xray.Enabled = state
@@ -2190,11 +2314,11 @@ XraySection:Slider({
     Callback = function(value) Xray.Range = value end,
 })
 
-local TrapSection = VisualTab:Section({ Title = 'traps', Side = 'right' })
+local TrapSection = VisualTab:CreateSection('traps')
 
 TrapSection:Toggle({
     Title = 'trap esp',
-    Desc = 'a placed trap is invisible until it catches someone, so this looks for it directly instead of waiting for that. matches the part the trap actually uses for its position and the marker object it carries naming who placed it, then puts a highlight and a solid marker ball on it - the marker so it still shows even if the trap part itself has no visible shape of its own',
+    Description = 'a placed trap is invisible until it catches someone, so this looks for it directly instead of waiting for that. matches the part the trap actually uses for its position and the marker object it carries naming who placed it, then puts a highlight and a solid marker ball on it - the marker so it still shows even if the trap part itself has no visible shape of its own',
     Flag = 'mm2_trap_esp',
     Callback = function(state)
         TrapEsp.Enabled = state
@@ -2204,7 +2328,7 @@ TrapSection:Toggle({
 
 TrapSection:Toggle({
     Title = 'dropped gun esp',
-    Desc = 'when a sheriff or hero dies holding the gun, it lands somewhere in the world rather than vanishing. this looks for exactly the same tool the gun is identified by everywhere else in this script - by name, its own marker child, or its tag - lying anywhere that is not inside a character, and puts a highlight and a marker ball on it. stops tracking it the moment someone actually picks it back up',
+    Description = 'when a sheriff or hero dies holding the gun, it lands somewhere in the world rather than vanishing. this looks for exactly the same tool the gun is identified by everywhere else in this script - by name, its own marker child, or its tag - lying anywhere that is not inside a character, and puts a highlight and a marker ball on it. stops tracking it the moment someone actually picks it back up',
     Flag = 'mm2_dropped_gun_esp',
     Callback = function(state)
         DroppedGunEsp.Enabled = state
@@ -2212,7 +2336,7 @@ TrapSection:Toggle({
     end,
 })
 
-local SessionSection = VisualTab:Section({ Title = 'session', Side = 'right' })
+local SessionSection = VisualTab:CreateSection('session')
 
 SessionSection:Button({
     Title = 'unload',
@@ -2229,7 +2353,7 @@ SessionSection:Button({
         xrayRestoreAll()
         clearMarkers()
 
-        Centrl:Unload()
+        Onyx:Unload()
     end,
 })
 
@@ -2242,19 +2366,18 @@ task.spawn(function()
     while not Unloading do
         task.wait(0.4)
         pcall(function()
-            SeenStat:Set(tostring(shotStats.seen))
-            RedirectStat:Set(tostring(shotStats.redirected),
+            SeenStat.Set(tostring(shotStats.seen))
+            RedirectStat.Set(tostring(shotStats.redirected),
                 shotStats.redirected > 0 and Color3.fromRGB(126, 217, 87) or nil)
-            SuppressStat:Set(tostring(shotStats.suppressed))
-            ErrorStat:Set(shotStats.proved > 0
+            SuppressStat.Set(tostring(shotStats.suppressed))
+            ErrorStat.Set(shotStats.proved > 0
                 and ('%.1f studs over %d'):format(shotStats.error / shotStats.proved, shotStats.proved)
                 or '-')
-            gunLeadStat:Set(('%d / %d'):format(GunLead.hits, GunLead.verified))
-            knifeLeadStat:Set(('%d / %d'):format(KnifeLead.hits, KnifeLead.verified))
-            gunMultStat:Set(GunTune.Auto and ('%.2fx'):format(GunLead.mult) or 'off')
-            knifeMultStat:Set(KnifeTune.Auto and ('%.2fx'):format(KnifeLead.mult) or 'off')
+            gunLeadStat.Set(('%d / %d'):format(GunLead.hits, GunLead.verified))
+            knifeLeadStat.Set(('%d / %d'):format(KnifeLead.hits, KnifeLead.verified))
+            gunMultStat.Set(GunTune.Auto and ('%.2fx'):format(GunLead.mult) or 'off')
+            knifeMultStat.Set(KnifeTune.Auto and ('%.2fx'):format(KnifeLead.mult) or 'off')
         end)
     end
 end)
 
-Window:Load()
