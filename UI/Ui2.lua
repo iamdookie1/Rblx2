@@ -49,6 +49,7 @@ local Onyx = {
 	Options     = {},          -- flag -> element object
 	Connections = {},          -- tracked RBXScriptConnections
 	Focus       = nil,         -- element currently owning the pointer
+	Ready       = false,       -- set once the calling script has built its UI
 	Teardown    = {},          -- internal cleanup run before Unload destroys the GUI
 	AccentBound = {},          -- { {Instance, propertyName}, ... }
 
@@ -391,8 +392,13 @@ local HideTooltip  -- assigned by the tooltip block below
 
 local FocusWatchers = {}  -- { { Instance = gui, Refresh = fn }, ... }
 
-local function FocusBlocked(owner)
-	return Onyx.Focus ~= nil and Onyx.Focus ~= owner
+-- Focus is hierarchical: an overlay that owns the pointer (a dialog scrim, a
+-- popout panel, the settings page) must not block the controls inside itself.
+local function FocusBlocked(owner, gui)
+	local focus = Onyx.Focus
+	if focus == nil or focus == owner then return false end
+	if gui and typeof(focus) == "Instance" and gui:IsDescendantOf(focus) then return false end
+	return true
 end
 
 local function SetFocus(owner)
@@ -430,7 +436,7 @@ local function Hoverable(gui, paint, owner)
 	local inside, down = false, false
 
 	local function refresh()
-		if FocusBlocked(owner) then
+		if FocusBlocked(owner, gui) then
 			paint("idle")
 		elseif down and inside then
 			paint("press")
@@ -859,6 +865,48 @@ local function OnyxMark(parent, size, zIndex)
 	}
 end
 
+-- A sliders/tune mark: three lanes with a knob, each lane broken either side
+-- of its knob so it reads without needing to match the background.
+local function SettingsIcon(parent, size, zIndex, color)
+	local unit = size / 16
+	local holder = New("Frame", {
+		Name = "SettingsIcon", BackgroundTransparency = 1,
+		AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5),
+		Size = UDim2.fromOffset(size, size), ZIndex = zIndex, Parent = parent,
+	})
+
+	local pieces = {}
+	local function piece(w, h, cx, cy, radius)
+		if w <= 0.5 then return end
+		local frame = New("Frame", {
+			BackgroundColor3 = color or Theme.Muted, BorderSizePixel = 0,
+			AnchorPoint = Vector2.new(0.5, 0.5),
+			Position = UDim2.fromOffset(cx * unit, cy * unit),
+			Size = UDim2.fromOffset(math.max(1, w * unit), math.max(1, h * unit)),
+			ZIndex = zIndex + 1, Parent = holder,
+		})
+		Corner(radius or 1, frame)
+		table.insert(pieces, frame)
+	end
+
+	local KNOB, GAP = 3.8, 2.7
+	for _, lane in ipairs({ { 3.5, 5 }, { 8, 10.5 }, { 12.5, 6.5 } }) do
+		local y, knobX = lane[1], lane[2]
+		piece((knobX - GAP) - 1, 1.5, (1 + knobX - GAP) / 2, y)
+		piece(15 - (knobX + GAP), 1.5, (knobX + GAP + 15) / 2, y)
+		piece(KNOB, KNOB, knobX, y, 2)
+	end
+
+	return {
+		Instance = holder,
+		SetColor = function(c, info)
+			for _, frame in ipairs(pieces) do
+				Tween(frame, { BackgroundColor3 = c }, info or EASE_SNAP)
+			end
+		end,
+	}
+end
+
 -- returns a table with Exists() once the icon is (or is not) in the unibar
 local function AttachUnibarIcon(Window)
 	local state = { Icon = nil, Dead = false }
@@ -1039,7 +1087,9 @@ end
 --  WINDOW
 -- ================================================================
 
-local ElementAPI  -- forward declaration (defined further down)
+local ElementAPI     -- forward declaration (defined further down)
+local AutoLoadScheduled = false
+local SectionFactory -- forward declaration (defined further down)
 
 function Onyx.CreateWindow(a, b)
 	local cfg = b
@@ -1183,6 +1233,30 @@ function Onyx.CreateWindow(a, b)
 		end)
 		if tip then AttachTooltip(btn, tip) end
 		return btn
+	end
+
+	local settingsBtn, settingsGlyph
+	if cfg.Settings ~= false then
+		settingsBtn = New("TextButton", {
+			Name = "Settings", BackgroundColor3 = Theme.Backdrop, BackgroundTransparency = 1,
+			AutoButtonColor = false, Text = "", Size = UDim2.fromOffset(24, 22),
+			LayoutOrder = 0, ZIndex = 6, Parent = actions,
+		})
+		Corner(5, settingsBtn)
+		settingsGlyph = SettingsIcon(settingsBtn, 15, 7, Theme.Muted)
+		Hoverable(settingsBtn, function(state)
+			if state == "idle" then
+				Tween(settingsBtn, { BackgroundTransparency = 1 }, EASE_SNAP)
+				settingsGlyph.SetColor(Window.SettingsOpen and Theme.Text or Theme.Muted)
+			else
+				Tween(settingsBtn, {
+					BackgroundTransparency = 0,
+					BackgroundColor3 = state == "press" and Theme.Active or Theme.Hover,
+				}, EASE_SNAP)
+				settingsGlyph.SetColor(Theme.Text)
+			end
+		end)
+		AttachTooltip(settingsBtn, "Settings")
 	end
 
 	local minimizeBtn = TopButton("\u{2013}", 1, "Minimize")
@@ -1726,57 +1800,7 @@ function Onyx.CreateWindow(a, b)
 		ElementAPI(Tab, page, Window)
 
 		-- a Section is just a titled container that shares the element API
-		function Tab.CreateSection(p1, p2)
-			local scfg = p2
-			if p1 ~= Tab then scfg = p1 end
-			if typeof(scfg) == "string" then scfg = { Title = scfg } end
-			scfg = scfg or {}
-
-			local holder = New("Frame", {
-				Name = "Section", BackgroundTransparency = 1,
-				Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y,
-				LayoutOrder = #page:GetChildren(), ZIndex = 5, Parent = page,
-			})
-			List(holder, 7)
-
-			local head = New("Frame", {
-				BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 16),
-				LayoutOrder = 1, ZIndex = 5, Parent = holder,
-			})
-			local headLabel = Text({
-				Parent = head, ZIndex = 6, Font = FONT_B, TextSize = 11.5,
-				Text = string.upper(tostring(scfg.Title or scfg.Name or "Section")),
-				TextColor3 = Theme.Muted, Size = UDim2.new(0, 0, 1, 0),
-				AutomaticSize = Enum.AutomaticSize.X,
-			})
-			local rule = New("Frame", {
-				BackgroundColor3 = Theme.Line, BorderSizePixel = 0,
-				AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, 0, 0.5, 1),
-				Size = UDim2.new(1, 0, 0, 1), ZIndex = 5, Parent = head,
-			})
-			headLabel:GetPropertyChangedSignal("AbsoluteSize"):Connect(function()
-				rule.Size = UDim2.new(1, -(headLabel.AbsoluteSize.X + 10), 0, 1)
-			end)
-			task.defer(function()
-				rule.Size = UDim2.new(1, -(headLabel.AbsoluteSize.X + 10), 0, 1)
-			end)
-
-			local inner = New("Frame", {
-				Name = "Items", BackgroundTransparency = 1,
-				Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y,
-				LayoutOrder = 2, ZIndex = 5, Parent = holder,
-			})
-			List(inner, 6)
-
-			local Section = { Title = scfg.Title, Instance = holder, Container = inner, Window = Window }
-			function Section.SetTitle(a, t)
-				if a ~= Section then t = a end
-				headLabel.Text = string.upper(tostring(t))
-			end
-			function Section.Destroy() holder:Destroy() end
-			ElementAPI(Section, inner, Window)
-			return Section
-		end
+		Tab.CreateSection = SectionFactory(Tab, page, Window)
 		Tab.AddSection = Tab.CreateSection
 		Tab.Section    = Tab.CreateSection
 
@@ -1799,6 +1823,261 @@ function Onyx.CreateWindow(a, b)
 		return Onyx.Notify(p1 ~= Window and p1 or p2)
 	end
 
+	----------------------------------------------------------------
+	-- settings page
+	----------------------------------------------------------------
+	--
+	--  A page rather than a tab, so it stays out of the script's own
+	--  navigation. It slides over the whole body and owns the pointer while
+	--  open, which the hierarchical focus rule lets its own controls escape.
+
+	if cfg.Settings ~= false then
+		local Page = New("Frame", {
+			Name = "SettingsPage", BackgroundColor3 = Theme.Backdrop, BorderSizePixel = 0,
+			Position = UDim2.fromScale(1, 0), Size = UDim2.fromScale(1, 1),
+			Visible = false, ZIndex = 200, Parent = Body,
+		})
+		New("TextButton", {  -- swallows clicks meant for the page, not the tabs
+			BackgroundTransparency = 1, Text = "", AutoButtonColor = false,
+			Size = UDim2.fromScale(1, 1), ZIndex = 200, Parent = Page,
+		})
+
+		local pageHead = New("Frame", {
+			Name = "Head", BackgroundTransparency = 1,
+			Size = UDim2.new(1, 0, 0, 36), ZIndex = 202, Parent = Page,
+		})
+		New("Frame", {
+			BackgroundColor3 = Theme.Line, BorderSizePixel = 0,
+			AnchorPoint = Vector2.new(0, 1), Position = UDim2.new(0, 0, 1, 0),
+			Size = UDim2.new(1, 0, 0, 1), ZIndex = 203, Parent = pageHead,
+		})
+
+		local backBtn = New("TextButton", {
+			Name = "Back", BackgroundColor3 = Theme.Backdrop, BackgroundTransparency = 1,
+			AutoButtonColor = false, Text = "", Size = UDim2.fromOffset(26, 22),
+			AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.new(0, 10, 0.5, 0),
+			ZIndex = 203, Parent = pageHead,
+		})
+		Corner(5, backBtn)
+		local backChevron = Chevron({
+			Parent = backBtn, ZIndex = 204, Size = 10, Rotation = 90,
+			AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5),
+		})
+		Hoverable(backBtn, function(state)
+			if state == "idle" then
+				Tween(backBtn, { BackgroundTransparency = 1 }, EASE_SNAP)
+				backChevron.SetColor(Theme.Muted)
+			else
+				Tween(backBtn, {
+					BackgroundTransparency = 0,
+					BackgroundColor3 = state == "press" and Theme.Active or Theme.Hover,
+				}, EASE_SNAP)
+				backChevron.SetColor(Theme.Text)
+			end
+		end)
+
+		Text({
+			Name = "Title", Parent = pageHead, ZIndex = 203, Font = FONT_B, TextSize = 13,
+			Text = "Settings", Position = UDim2.fromOffset(46, 0), Size = UDim2.new(1, -56, 1, 0),
+		})
+
+		local pageScroll = New("ScrollingFrame", {
+			Name = "Body", BackgroundTransparency = 1, BorderSizePixel = 0,
+			Position = UDim2.fromOffset(0, 36), Size = UDim2.new(1, 0, 1, -36),
+			CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y,
+			ScrollBarThickness = 3, ScrollBarImageColor3 = Theme.LineBright,
+			ScrollBarImageTransparency = 0.3,
+			ScrollingDirection = Enum.ScrollingDirection.Y,
+			ZIndex = 202, Parent = Page,
+		})
+		Padding(pageScroll, 14, 16, 14, 12)
+		List(pageScroll, 9)
+
+		local Host = {}
+		ElementAPI(Host, pageScroll, Window)
+		Host.CreateSection = SectionFactory(Host, pageScroll, Window)
+
+		Window.SettingsPage = Page
+		Window.SettingsOpen = false
+
+		function Window.SettingsSection(p1, p2)
+			local scfg = p2
+			if p1 ~= Window then scfg = p1 end
+			return Host.CreateSection(Host, scfg)
+		end
+		Window.AddSettingsSection = Window.SettingsSection
+
+		local function setSettingsOpen(state)
+			state = state and true or false
+			if Window.SettingsOpen == state then return end
+			Window.SettingsOpen = state
+			Window.CloseAllPopouts()
+
+			if state then
+				if not Window.Visible then Window.SetVisible(true) end
+				if Window.Minimized then setMinimized(false) end
+				Page.Visible = true
+				SetFocus(Page)
+				Tween(Page, { Position = UDim2.fromScale(0, 0) }, EASE_SMOOTH)
+			else
+				ClearFocus(Page)
+				Tween(Page, { Position = UDim2.fromScale(1, 0) }, EASE_OUT)
+				task.delay(0.3, function()
+					if not Window.SettingsOpen then Page.Visible = false end
+				end)
+			end
+
+			if settingsGlyph then
+				settingsGlyph.SetColor(state and Theme.Text or Theme.Muted)
+			end
+		end
+
+		function Window.OpenSettings() setSettingsOpen(true) end
+		function Window.CloseSettings() setSettingsOpen(false) end
+		function Window.ToggleSettings() setSettingsOpen(not Window.SettingsOpen) end
+
+		backBtn.MouseButton1Click:Connect(Window.CloseSettings)
+		if settingsBtn then
+			settingsBtn.MouseButton1Click:Connect(Window.ToggleSettings)
+		end
+
+		------------------------------------------------------------
+		-- built-in settings
+		------------------------------------------------------------
+		local Configs = Host.CreateSection(Host, "Configuration")
+
+		if not Onyx.HasFileIO then
+			Configs:Paragraph({
+				Title   = "No file access",
+				Content = "This executor exposes no file IO, so configs cannot be saved or loaded. Everything else on this page still works.",
+			})
+		end
+
+		local nameInput = Configs:Input({
+			Title = "Config name", Placeholder = "default",
+			Default = Onyx.Settings.Config or "default",
+			Callback = function(text)
+				Onyx.Settings.Config = (text ~= "" and text) or "default"
+				Onyx.SaveSettings()
+			end,
+		})
+
+		local configList = Configs:Dropdown({
+			Title = "Saved configs", Values = Onyx.ListConfigs(), Search = true,
+			Default = Onyx.Settings.Config,
+			Callback = function(name)
+				if name then nameInput.Set(name) end
+			end,
+		})
+
+		local function targetConfig()
+			local picked = nameInput.Get()
+			if picked == nil or picked == "" then picked = configList.Get() end
+			return picked or "default"
+		end
+
+		local function refreshList()
+			configList.SetValues(Onyx.ListConfigs())
+		end
+
+		Configs:Button({ Title = "Save", Mini = true, Callback = function()
+			local ok, err = Onyx.SaveConfig(targetConfig())
+			refreshList()
+			Onyx.Notify({
+				Title = ok and "Config saved" or "Save failed",
+				Content = ok and targetConfig() or tostring(err),
+				Type = ok and "success" or "error",
+			})
+		end })
+
+		Configs:Button({ Title = "Load", Mini = true, Callback = function()
+			local ok, err = Onyx.LoadConfig(targetConfig())
+			Onyx.Notify({
+				Title = ok and "Config loaded" or "Load failed",
+				Content = ok and targetConfig() or tostring(err),
+				Type = ok and "success" or "error",
+			})
+		end })
+
+		Configs:Button({ Title = "Delete", Mini = true, Confirm = true, Callback = function()
+			local ok, err = Onyx.DeleteConfig(targetConfig())
+			refreshList()
+			Onyx.Notify({
+				Title = ok and "Config deleted" or "Delete failed",
+				Content = ok and targetConfig() or tostring(err),
+				Type = ok and "warning" or "error",
+			})
+		end })
+
+		Configs:Button({ Title = "Refresh list", Mini = true, Callback = refreshList })
+
+		Configs:Toggle({
+			Title = "Auto save", Mini = true, Default = Onyx.Settings.AutoSave,
+			Tooltip = "Write the config whenever a value changes",
+			Callback = function(state)
+				Onyx.Settings.AutoSave = state
+				Onyx.SaveSettings()
+			end,
+		})
+
+		Configs:Toggle({
+			Title = "Auto load", Mini = true, Default = Onyx.Settings.AutoLoad,
+			Tooltip = "Restore this config the next time the script runs",
+			Callback = function(state)
+				Onyx.Settings.AutoLoad = state
+				Onyx.SaveSettings()
+			end,
+		})
+
+		local Interface = Host.CreateSection(Host, "Interface")
+
+		Interface:Colorpicker({
+			Title = "Accent", Default = Onyx.Settings.Accent or Theme.Accent,
+			Callback = function(color)
+				Onyx.SetAccent(color)
+				Onyx.Settings.Accent = color
+				Onyx.SaveSettings()
+			end,
+		})
+
+		-- rebinds only: the window's own InputBegan handler does the toggling,
+		-- so a Callback here would fire on the same press and cancel it out
+		Interface:Keybind({
+			Title = "Toggle interface", Default = Window.ToggleKey,
+			ChangedCallback = function(key) Window.ToggleKey = key end,
+		})
+
+		Interface:Dropdown({
+			Title = "Notification corner",
+			Values = { "bottom-right", "bottom-left", "bottom-center", "top-right", "top-left", "top-center" },
+			Default = Onyx.Settings.NotificationCorner,
+			Callback = function(corner)
+				if not corner then return end
+				Onyx.SetNotificationCorner(corner)
+				Onyx.Settings.NotificationCorner = corner
+				Onyx.SaveSettings()
+			end,
+		})
+
+		local Session = Host.CreateSection(Host, "Session")
+		Session:Button({
+			Title = "Unload interface", Description = "Removes every element this script created.",
+			Confirm = true, Callback = function() Onyx.Unload() end,
+		})
+	end
+
+	-- apply stored preferences to this window
+	if typeof(Onyx.Settings.Accent) == "Color3" then Onyx.SetAccent(Onyx.Settings.Accent) end
+	if Onyx.Settings.NotificationCorner then
+		Onyx.SetNotificationCorner(Onyx.Settings.NotificationCorner)
+	end
+
+	-- deferred so the calling script has finished building its elements
+	if not Onyx.Ready and not AutoLoadScheduled then
+		AutoLoadScheduled = true
+		task.defer(function() pcall(Onyx.ApplyAutoLoad) end)
+	end
+
 	table.insert(Onyx.Windows, Window)
 	return Window
 end
@@ -1816,7 +2095,10 @@ end
 
 local function SetFlag(element, value)
 	element.Value = value
-	if element.Flag then Onyx.Flags[element.Flag] = value end
+	if element.Flag then
+		Onyx.Flags[element.Flag] = value
+		if Onyx._FlagChanged then Onyx._FlagChanged() end
+	end
 end
 
 local function Fire(callback, ...)
@@ -1842,7 +2124,9 @@ local function BaseRow(parent, opts)
 		AutoButtonColor        = false,
 		Text                   = "",
 		BorderSizePixel        = 0,
-		Size                   = UDim2.new(1, 0, 0, minH),
+		-- half width minus half the 6px gutter, so two sit exactly in one row
+		Size                   = opts.Mini and UDim2.new(0.5, -3, 0, minH)
+			or UDim2.new(1, 0, 0, minH),
 		AutomaticSize          = Enum.AutomaticSize.Y,
 		LayoutOrder            = opts.LayoutOrder or 0,
 		ZIndex                 = 6,
@@ -1850,7 +2134,7 @@ local function BaseRow(parent, opts)
 	})
 	Corner(6, row)
 	local rowStroke = Stroke(row, Theme.Line)
-	Padding(row, 8, 8, 11, 10)
+	Padding(row, 8, 8, opts.Mini and 10 or 11, opts.Mini and 9 or 10)
 
 	local col = New("Frame", {
 		Name = "Text", BackgroundTransparency = 1,
@@ -1860,8 +2144,9 @@ local function BaseRow(parent, opts)
 	List(col, 2)
 
 	local titleLabel = Text({
-		Name = "Title", Parent = col, ZIndex = 7, Font = FONT_M, TextSize = 12.5,
-		Text = tostring(opts.Title or ""), Size = UDim2.new(1, 0, 0, 15),
+		Name = "Title", Parent = col, ZIndex = 7, Font = FONT_M,
+		TextSize = opts.Mini and 12 or 12.5, Text = tostring(opts.Title or ""),
+		Size = UDim2.new(1, 0, 0, 15), TextTruncate = Enum.TextTruncate.AtEnd,
 	})
 
 	local descLabel
@@ -1890,11 +2175,108 @@ local function BaseRow(parent, opts)
 	}
 end
 
+-- Builds the CreateSection function for any host that has a Slot (a tab page,
+-- the settings page). A section is a titled container sharing the element API.
+function SectionFactory(host, page, Window)
+	return function(p1, p2)
+		local scfg = p2
+		if p1 ~= host then scfg = p1 end
+		if typeof(scfg) == "string" then scfg = { Title = scfg } end
+		scfg = scfg or {}
+
+		local holder = New("Frame", {
+			Name = "Section", BackgroundTransparency = 1,
+			Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y,
+			LayoutOrder = select(2, host.Slot(false)), ZIndex = 5, Parent = page,
+		})
+		List(holder, 7)
+
+		local head = New("Frame", {
+			Name = "Head", BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 16),
+			LayoutOrder = 1, ZIndex = 5, Parent = holder,
+		})
+		local headLabel = Text({
+			Name = "Title", Parent = head, ZIndex = 6, Font = FONT_B, TextSize = 11.5,
+			Text = string.upper(tostring(scfg.Title or scfg.Name or "Section")),
+			TextColor3 = Theme.Muted, Size = UDim2.new(0, 0, 1, 0),
+			AutomaticSize = Enum.AutomaticSize.X,
+		})
+		local rule = New("Frame", {
+			BackgroundColor3 = Theme.Line, BorderSizePixel = 0,
+			AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, 0, 0.5, 1),
+			Size = UDim2.new(1, 0, 0, 1), ZIndex = 5, Parent = head,
+		})
+		local function fitRule()
+			rule.Size = UDim2.new(1, -(headLabel.AbsoluteSize.X + 10), 0, 1)
+		end
+		headLabel:GetPropertyChangedSignal("AbsoluteSize"):Connect(fitRule)
+		task.defer(fitRule)
+
+		local inner = New("Frame", {
+			Name = "Items", BackgroundTransparency = 1,
+			Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y,
+			LayoutOrder = 2, ZIndex = 5, Parent = holder,
+		})
+		List(inner, 6)
+
+		local Section = { Title = scfg.Title, Instance = holder, Container = inner, Window = Window }
+		function Section.SetTitle(a, t)
+			if a ~= Section then t = a end
+			headLabel.Text = string.upper(tostring(t))
+		end
+		function Section.SetVisible(a, v)
+			holder.Visible = (typeof(a) == "boolean" and a or v) and true or false
+		end
+		function Section.Destroy() holder:Destroy() end
+
+		ElementAPI(Section, inner, Window)
+		return Section
+	end
+end
+
 -- attaches every element constructor to `holder`, creating instances in `parent`
 function ElementAPI(holder, parent, Window)
 
 	local function order()
 		return #parent:GetChildren()
+	end
+
+	-- Mini elements are half width and pair two to a row. Anything full width
+	-- closes the open pair, so a slider between two minis keeps them apart.
+	local pairRow, pairCount = nil, 0
+
+	local function slot(mini)
+		if not mini then
+			pairRow, pairCount = nil, 0
+			return parent, order()
+		end
+
+		if not (pairRow and pairRow.Parent and pairCount < 2) then
+			pairRow = New("Frame", {
+				Name = "Pair", BackgroundTransparency = 1,
+				Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y,
+				LayoutOrder = order(), ZIndex = 6, Parent = parent,
+			})
+			New("UIListLayout", {
+				FillDirection     = Enum.FillDirection.Horizontal,
+				Padding           = UDim.new(0, 6),
+				SortOrder         = Enum.SortOrder.LayoutOrder,
+				VerticalAlignment = Enum.VerticalAlignment.Top,
+				Parent            = pairRow,
+			})
+			pairCount = 0
+		end
+
+		pairCount = pairCount + 1
+		return pairRow, pairCount
+	end
+
+	holder.Slot = slot
+
+	-- starts a fresh pair row even if the open one has a free half
+	function holder.Break()
+		pairRow, pairCount = nil, 0
+		return holder
 	end
 
 	------------------------------------------------------------------
@@ -1914,7 +2296,7 @@ function ElementAPI(holder, parent, Window)
 			TextColor3 = cfg.Color or Theme.SubText, TextWrapped = true,
 			TextYAlignment = Enum.TextYAlignment.Top,
 			Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y,
-			LayoutOrder = order(),
+			LayoutOrder = select(2, slot(false)),
 		})
 
 		local api = { Instance = label, Type = "Label" }
@@ -1966,7 +2348,7 @@ function ElementAPI(holder, parent, Window)
 		local box = New("Frame", {
 			Name = "Paragraph", BackgroundColor3 = Theme.Surface, BorderSizePixel = 0,
 			Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y,
-			LayoutOrder = order(), ZIndex = 6, Parent = parent,
+			LayoutOrder = select(2, slot(false)), ZIndex = 6, Parent = parent,
 		})
 		Corner(6, box)
 		Stroke(box, Theme.Line)
@@ -2067,7 +2449,7 @@ function ElementAPI(holder, parent, Window)
 		local box = New("Frame", {
 			Name = "Console", BackgroundColor3 = Theme.Surface, BorderSizePixel = 0,
 			Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y,
-			LayoutOrder = order(), ZIndex = 6, Parent = parent,
+			LayoutOrder = select(2, slot(false)), ZIndex = 6, Parent = parent,
 		})
 		Corner(6, box)
 		Stroke(box, Theme.Line)
@@ -2314,7 +2696,7 @@ function ElementAPI(holder, parent, Window)
 		local wrap = New("Frame", {
 			Name = "Divider", BackgroundTransparency = 1,
 			Size = UDim2.new(1, 0, 0, cfg.Title and 18 or 9),
-			LayoutOrder = order(), ZIndex = 6, Parent = parent,
+			LayoutOrder = select(2, slot(false)), ZIndex = 6, Parent = parent,
 		})
 
 		if cfg.Title then
@@ -2372,9 +2754,11 @@ function ElementAPI(holder, parent, Window)
 		if p1 ~= holder then cfg = p1 end
 		cfg = cfg or {}
 
-		local base = BaseRow(parent, {
+		local container, layoutOrder = slot(cfg.Mini)
+		local base = BaseRow(container, {
 			Name = "Button", Title = cfg.Title or cfg.Name or "Button",
-			Description = cfg.Description, SlotWidth = 22, LayoutOrder = order(),
+			Description = cfg.Description, SlotWidth = 22,
+			LayoutOrder = layoutOrder, Mini = cfg.Mini,
 		})
 		Interact(base.Row, Theme.Surface, Theme.Hover, Theme.Active)
 
@@ -2426,9 +2810,11 @@ function ElementAPI(holder, parent, Window)
 		if p1 ~= holder then cfg = p1 end
 		cfg = cfg or {}
 
-		local base = BaseRow(parent, {
+		local container, layoutOrder = slot(cfg.Mini)
+		local base = BaseRow(container, {
 			Name = "Toggle", Title = cfg.Title or cfg.Name or "Toggle",
-			Description = cfg.Description, SlotWidth = 34, LayoutOrder = order(),
+			Description = cfg.Description, SlotWidth = 34,
+			LayoutOrder = layoutOrder, Mini = cfg.Mini,
 		})
 		Interact(base.Row, Theme.Surface, Theme.Hover, Theme.Active)
 		AttachTooltip(base.Row, cfg.Tooltip)
@@ -2512,7 +2898,7 @@ function ElementAPI(holder, parent, Window)
 		local row = New("Frame", {
 			Name = "Slider", BackgroundColor3 = Theme.Surface, BorderSizePixel = 0,
 			Size = UDim2.new(1, 0, 0, 48), AutomaticSize = Enum.AutomaticSize.Y,
-			LayoutOrder = order(), ZIndex = 6, Parent = parent,
+			LayoutOrder = select(2, slot(false)), ZIndex = 6, Parent = parent,
 		})
 		Corner(6, row)
 		Stroke(row, Theme.Line)
@@ -2676,9 +3062,10 @@ function ElementAPI(holder, parent, Window)
 		cfg = cfg or {}
 
 		local width = tonumber(cfg.Width) or 148
-		local base = BaseRow(parent, {
+		local container, layoutOrder = slot(false)
+		local base = BaseRow(container, {
 			Name = "Input", Title = cfg.Title or cfg.Name or "Input",
-			Description = cfg.Description, SlotWidth = width, LayoutOrder = order(),
+			Description = cfg.Description, SlotWidth = width, LayoutOrder = layoutOrder,
 		})
 		AttachTooltip(base.Row, cfg.Tooltip)
 
@@ -2768,9 +3155,11 @@ function ElementAPI(holder, parent, Window)
 		if p1 ~= holder then cfg = p1 end
 		cfg = cfg or {}
 
-		local base = BaseRow(parent, {
+		local container, layoutOrder = slot(cfg.Mini)
+		local base = BaseRow(container, {
 			Name = "Keybind", Title = cfg.Title or cfg.Name or "Keybind",
-			Description = cfg.Description, SlotWidth = 76, LayoutOrder = order(),
+			Description = cfg.Description, SlotWidth = cfg.Mini and 64 or 76,
+			LayoutOrder = layoutOrder, Mini = cfg.Mini,
 		})
 		Interact(base.Row, Theme.Surface, Theme.Hover, Theme.Active)
 		AttachTooltip(base.Row, cfg.Tooltip)
@@ -2779,7 +3168,7 @@ function ElementAPI(holder, parent, Window)
 			BackgroundColor3 = Theme.SurfaceAlt, AutoButtonColor = false, Text = "None",
 			Font = FONT_MONO, TextSize = 11.5, TextColor3 = Theme.SubText,
 			AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, 0, 0.5, 0),
-			Size = UDim2.fromOffset(76, 24), ZIndex = 8, Parent = base.Slot,
+			Size = UDim2.new(1, 0, 0, 24), ZIndex = 8, Parent = base.Slot,
 		})
 		Corner(5, chip)
 		local chipStroke = Stroke(chip, Theme.LineBright)
@@ -2991,10 +3380,11 @@ function ElementAPI(holder, parent, Window)
 		local maxVisible  = tonumber(cfg.MaxVisible) or 6
 		local searchable  = cfg.Search and true or false
 
-		local base = BaseRow(parent, {
+		local container, layoutOrder = slot(false)
+		local base = BaseRow(container, {
 			Name = "Dropdown", Title = cfg.Title or cfg.Name or "Dropdown",
 			Description = cfg.Description, SlotWidth = tonumber(cfg.Width) or 158,
-			LayoutOrder = order(),
+			LayoutOrder = layoutOrder,
 		})
 		Interact(base.Row, Theme.Surface, Theme.Hover, Theme.Active)
 		AttachTooltip(base.Row, cfg.Tooltip)
@@ -3315,9 +3705,11 @@ function ElementAPI(holder, parent, Window)
 		local INNER    = PANEL_W - 16
 		local PANEL_H  = 8 + 106 + 8 + 10 + (useAlpha and 18 or 0) + 8 + 26 + 8
 
-		local base = BaseRow(parent, {
+		local container, layoutOrder = slot(cfg.Mini)
+		local base = BaseRow(container, {
 			Name = "Colorpicker", Title = cfg.Title or cfg.Name or "Color",
-			Description = cfg.Description, SlotWidth = 44, LayoutOrder = order(),
+			Description = cfg.Description, SlotWidth = cfg.Mini and 36 or 44,
+			LayoutOrder = layoutOrder, Mini = cfg.Mini,
 		})
 		Interact(base.Row, Theme.Surface, Theme.Hover, Theme.Active)
 		AttachTooltip(base.Row, cfg.Tooltip)
@@ -3326,7 +3718,7 @@ function ElementAPI(holder, parent, Window)
 			BackgroundColor3 = cfg.Default or cfg.Value or Color3.fromRGB(255, 255, 255),
 			AutoButtonColor = false, Text = "", BorderSizePixel = 0,
 			AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, 0, 0.5, 0),
-			Size = UDim2.fromOffset(44, 22), ZIndex = 8, Parent = base.Slot,
+			Size = UDim2.new(1, 0, 0, 22), ZIndex = 8, Parent = base.Slot,
 		})
 		Corner(5, swatch)
 		Stroke(swatch, Theme.LineBright, 0.3)
@@ -3697,6 +4089,8 @@ local HasFileIO = (typeof(writefile) == "function")
 	and (typeof(readfile) == "function")
 	and (typeof(isfile) == "function")
 
+Onyx.HasFileIO = HasFileIO
+
 local function EnsureFolder(path)
 	if typeof(isfolder) ~= "function" or typeof(makefolder) ~= "function" then return end
 	if not isfolder(path) then makefolder(path) end
@@ -3827,6 +4221,94 @@ function Onyx.ListConfigs()
 	table.sort(out)
 	return out
 end
+
+-- ================================================================
+--  SETTINGS  (the library's own preferences, not your script's flags)
+-- ================================================================
+--
+--  Stored beside the configs so choices like auto-save survive a rejoin.
+--  Kept separate from configs on purpose: a config is your script's state,
+--  these are the interface's.
+
+Onyx.Settings = {
+	AutoSave           = false,
+	AutoLoad           = false,
+	Config             = "default",
+	NotificationCorner = "bottom-right",
+	Accent             = nil,
+}
+
+local function SettingsPath()
+	return Onyx.Folder .. "/settings.json"
+end
+
+function Onyx.SaveSettings()
+	if not HasFileIO then return false, "no file IO in this environment" end
+	EnsureFolder(Onyx.Folder)
+
+	local payload = {
+		AutoSave           = Onyx.Settings.AutoSave and true or false,
+		AutoLoad           = Onyx.Settings.AutoLoad and true or false,
+		Config             = tostring(Onyx.Settings.Config or "default"),
+		NotificationCorner = tostring(Onyx.Settings.NotificationCorner or "bottom-right"),
+	}
+	if typeof(Onyx.Settings.Accent) == "Color3" then
+		payload.Accent = Serialize(Onyx.Settings.Accent)
+	end
+
+	local ok, encoded = pcall(HttpService.JSONEncode, HttpService, payload)
+	if not ok then return false, "failed to encode settings" end
+	local ok2, err = pcall(writefile, SettingsPath(), encoded)
+	if not ok2 then return false, tostring(err) end
+	return true
+end
+
+function Onyx.LoadSettings()
+	if not HasFileIO or not isfile(SettingsPath()) then return Onyx.Settings end
+
+	local ok, contents = pcall(readfile, SettingsPath())
+	if not ok then return Onyx.Settings end
+	local ok2, decoded = pcall(HttpService.JSONDecode, HttpService, contents)
+	if not ok2 or typeof(decoded) ~= "table" then return Onyx.Settings end
+
+	Onyx.Settings.AutoSave = decoded.AutoSave and true or false
+	Onyx.Settings.AutoLoad = decoded.AutoLoad and true or false
+	if decoded.Config then Onyx.Settings.Config = tostring(decoded.Config) end
+	if decoded.NotificationCorner then
+		Onyx.Settings.NotificationCorner = tostring(decoded.NotificationCorner)
+	end
+	if decoded.Accent then
+		local color = Deserialize(decoded.Accent)
+		if typeof(color) == "Color3" then Onyx.Settings.Accent = color end
+	end
+	return Onyx.Settings
+end
+
+-- Auto-save watches flag changes rather than saving on a timer, and debounces
+-- so dragging a slider writes once rather than on every step.
+local autoSaveQueued = false
+
+function Onyx._FlagChanged()
+	if not Onyx.Ready or not Onyx.Settings.AutoSave then return end
+	if autoSaveQueued then return end
+	autoSaveQueued = true
+	task.delay(1.5, function()
+		autoSaveQueued = false
+		if not Onyx.Settings.AutoSave then return end
+		Onyx.SaveConfig(Onyx.Settings.Config or "default")
+	end)
+end
+
+-- Auto-load cannot run inside CreateWindow: the elements it restores do not
+-- exist yet. Deferring puts it after the calling script has finished building
+-- the interface. A script that builds asynchronously can call it by hand.
+function Onyx.ApplyAutoLoad()
+	Onyx.Ready = true
+	if not Onyx.Settings.AutoLoad or not HasFileIO then return false end
+	return Onyx.LoadConfig(Onyx.Settings.Config or "default")
+end
+
+Onyx.LoadSettings()
 
 -- ================================================================
 --  LIFECYCLE
