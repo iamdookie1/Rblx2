@@ -279,7 +279,7 @@ local ThrowSection = MainTab:CreateSection('throw')
 
 ThrowSection:Toggle({
     Title = 'throw multiplier',
-    Desc = 'right click already throws whatever you are holding at whatever speed the game itself picks, in whatever direction it computed. this scales that speed by the number below instead of replacing it, so the throw is still the game\'s own - just harder. only touches an actual throw, never a plain drop',
+    Description = 'right click already throws whatever you are holding at whatever speed the game itself picks, in whatever direction it computed. this scales that speed by the number below instead of replacing it, so the throw is still the game\'s own - just harder. only touches an actual throw, never a plain drop',
     Flag = 'fling_throw_enabled',
     Default = false,
     Callback = function(state) Tune.ThrowEnabled = state end,
@@ -301,7 +301,7 @@ local DropSection = MainTab:CreateSection('drop')
 
 DropSection:Toggle({
     Title = 'drop multiplier',
-    Desc = 'left click grabs when your hands are empty, and drops without throwing when you already have something - the game sets no new velocity at all on that second click, so whatever the object was carrying from being dragged around is what it keeps. this scales that leftover speed instead, so it only ever affects a plain drop, never a throw',
+    Description = 'left click grabs when your hands are empty, and drops without throwing when you already have something - the game sets no new velocity at all on that second click, so whatever the object was carrying from being dragged around is what it keeps. this scales that leftover speed instead, so it only ever affects a plain drop, never a throw',
     Flag = 'fling_drop_enabled',
     Default = false,
     Callback = function(state) Tune.DropEnabled = state end,
@@ -328,7 +328,7 @@ local AntiGrabSection = MainTab:CreateSection('anti grab')
 
 AntiGrabSection:Toggle({
     Title = 'anti grab',
-    Desc = 'the game already lets you escape a grab by mashing escape, which fires the same Struggle remote every press. this just presses it for you, as fast as the rate below, the instant you are held - so a grab barely has time to register before you are already out of it',
+    Description = 'the game already lets you escape a grab by mashing escape, which fires the same Struggle remote every press. this just presses it for you, as fast as the rate below, the instant you are held - so a grab barely has time to register before you are already out of it',
     Flag = 'fling_anti_grab',
     Default = false,
     Callback = function(state) AntiGrab.Enabled = state end,
