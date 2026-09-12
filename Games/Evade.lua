@@ -1,6 +1,7 @@
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
+local Lighting = game:GetService("Lighting")
 local LocalPlayer = Players.LocalPlayer
 
 local ref = 'main'
@@ -46,6 +47,11 @@ local DEFAULT_GROUNDED_DIST = 2.9
 local DEFAULT_AIR_ACCEL = 1
 local DEFAULT_AIR_STRAFE_ACCEL = 182
 local DEFAULT_SLIDE_MAX_SPEED = 5000 / 90
+local DEFAULT_RUN_ACCEL = 1
+local DEFAULT_RUN_DEACCEL = 700
+local DEFAULT_FRICTION = 5
+local DEFAULT_SPRINT_ACCEL = 1
+local DEFAULT_WALK_SPEED_MULT = 1
 
 local Tune = {
     BaseSpeed = DEFAULT_SPEED,
@@ -57,6 +63,11 @@ local Tune = {
     GroundedDistCheck = DEFAULT_GROUNDED_DIST,
     AirAcceleration = DEFAULT_AIR_ACCEL,
     AirStrafeAcceleration = DEFAULT_AIR_STRAFE_ACCEL,
+    RunAccel = DEFAULT_RUN_ACCEL,
+    RunDeaccel = DEFAULT_RUN_DEACCEL,
+    Friction = DEFAULT_FRICTION,
+    SprintAcceleration = DEFAULT_SPRINT_ACCEL,
+    WalkSpeedMultiplier = DEFAULT_WALK_SPEED_MULT,
 
     TrimpBoostEnabled = false,
     TrimpBoostMultiplier = 1,
@@ -82,6 +93,11 @@ local function applyMovementTune(stats)
     stats.GroundedDistCheck = Tune.GroundedDistCheck
     stats.AirAcceleration = Tune.AirAcceleration
     stats.AirStrafeAcceleration = Tune.AirStrafeAcceleration
+    stats.RunAccel = Tune.RunAccel
+    stats.RunDeaccel = Tune.RunDeaccel
+    stats.Friction = Tune.Friction
+    stats.SprintAcceleration = Tune.SprintAcceleration
+    stats.WalkSpeedMultiplier = Tune.WalkSpeedMultiplier
 end
 
 local function getLocalMoveStats()
@@ -234,6 +250,22 @@ local trimpConnection = RunService.Heartbeat:Connect(function()
     end
 end)
 
+local OriginalLighting = {
+    Brightness = Lighting.Brightness,
+    ExposureCompensation = Lighting.ExposureCompensation,
+    ClockTime = Lighting.ClockTime,
+    Ambient = Lighting.Ambient,
+    OutdoorAmbient = Lighting.OutdoorAmbient,
+}
+
+local function restoreLighting()
+    Lighting.Brightness = OriginalLighting.Brightness
+    Lighting.ExposureCompensation = OriginalLighting.ExposureCompensation
+    Lighting.ClockTime = OriginalLighting.ClockTime
+    Lighting.Ambient = OriginalLighting.Ambient
+    Lighting.OutdoorAmbient = OriginalLighting.OutdoorAmbient
+end
+
 local Window = Onyx:CreateWindow({
     Title = 'evade',
     SubTitle = 'movement test',
@@ -258,7 +290,19 @@ LiveSection:Stats({
             local sprint = character and character.DataRegistry and character.DataRegistry:Get("Sprint")
             return sprint and (('%.2fx'):format(sprint)) or '-'
         end },
+        { Label = 'Air Accel (live)', Value = function()
+            local stats = getLocalMoveStats()
+            return stats and tostring(stats.AirAcceleration) or '-'
+        end },
+        { Label = 'Air Strafe (live)', Value = function()
+            local stats = getLocalMoveStats()
+            return stats and tostring(stats.AirStrafeAcceleration) or '-'
+        end },
     },
+})
+LiveSection:Paragraph({
+    Title = 'reading this',
+    Content = 'the two "(live)" values read straight from the character\'s real movement table, not from this menu\'s own copy - if a slider below is moved and the matching live value here does not change within about half a second, the setting genuinely is not applying. if it does change and the game still feels the same, the setting is applying but its effect is naturally subtle (air acceleration only changes how fast you reach your air speed cap, not the cap itself, and air strafe acceleration only kicks in when moving purely sideways with no forward/back input at all)',
 })
 
 local PresetSection = MovementTab:CreateSection('preset')
@@ -426,12 +470,70 @@ SlideSection:Slider({
     Callback = function(value) Tune.SlideMaxSpeed = value end,
 })
 
+local GroundSection = MovementTab:CreateSection('ground control')
+
+GroundSection:Slider({
+    Title = 'run acceleration',
+    Description = 'how fast you speed up from a standstill on the ground',
+    Min = 0.1,
+    Max = 20,
+    Increment = 0.1,
+    Default = DEFAULT_RUN_ACCEL,
+    Flag = 'evade_run_accel',
+    Callback = function(value) Tune.RunAccel = value end,
+})
+
+GroundSection:Slider({
+    Title = 'run deceleration',
+    Description = 'how fast you slow down on the ground when you let go of movement keys - higher stops you almost instantly, lower lets you slide to a stop',
+    Min = 50,
+    Max = 3000,
+    Increment = 50,
+    Default = DEFAULT_RUN_DEACCEL,
+    Flag = 'evade_run_deaccel',
+    Callback = function(value) Tune.RunDeaccel = value end,
+})
+
+GroundSection:Slider({
+    Title = 'friction',
+    Description = 'the ground friction constant the run and slide states both use - lower makes the ground itself feel slicker',
+    Min = 0,
+    Max = 20,
+    Increment = 0.5,
+    Default = DEFAULT_FRICTION,
+    Flag = 'evade_friction',
+    Callback = function(value) Tune.Friction = value end,
+})
+
+GroundSection:Slider({
+    Title = 'sprint ramp-up speed',
+    Description = 'how fast the sprint multiplier climbs from 1x toward the sprint cap after you start holding forward',
+    Min = 0.1,
+    Max = 10,
+    Increment = 0.1,
+    Default = DEFAULT_SPRINT_ACCEL,
+    Flag = 'evade_sprint_accel',
+    Callback = function(value) Tune.SprintAcceleration = value end,
+})
+
+GroundSection:Slider({
+    Title = 'walk speed multiplier',
+    Description = 'a baseline speed multiplier applied even while not sprinting - 1 is default, higher makes ordinary walking noticeably faster on its own',
+    Min = 0.5,
+    Max = 3,
+    Increment = 0.05,
+    Default = DEFAULT_WALK_SPEED_MULT,
+    Flag = 'evade_walk_speed_mult',
+    Callback = function(value) Tune.WalkSpeedMultiplier = value end,
+})
+
 local AirSection = MovementTab:CreateSection('air control')
 
 AirSection:Slider({
     Title = 'air acceleration',
+    Description = 'how fast you reach your air speed cap while airborne and moving with your current velocity - does not raise the cap itself',
     Min = 0.1,
-    Max = 10,
+    Max = 50,
     Increment = 0.1,
     Default = DEFAULT_AIR_ACCEL,
     Flag = 'evade_air_accel',
@@ -440,9 +542,10 @@ AirSection:Slider({
 
 AirSection:Slider({
     Title = 'air strafe acceleration',
+    Description = 'only used while holding pure sideways movement in the air with no forward/back input at all - test it that way specifically, since forward-air movement never reads this value',
     Min = 20,
-    Max = 800,
-    Increment = 10,
+    Max = 3000,
+    Increment = 20,
     Default = DEFAULT_AIR_STRAFE_ACCEL,
     Flag = 'evade_air_strafe_accel',
     Callback = function(value) Tune.AirStrafeAcceleration = value end,
@@ -458,6 +561,7 @@ local EspTune = {
     FillTransparency = 0.5,
     MaxDistance = 250,
     DistanceText = false,
+    NameText = false,
 }
 
 local espHighlights = {}
@@ -481,7 +585,7 @@ local function setHighlight(model, enabled, color)
     end
 
     local label = espLabels[model]
-    if enabled and EspTune.DistanceText then
+    if enabled and (EspTune.DistanceText or EspTune.NameText) then
         if not label then
             local billboard = Instance.new("BillboardGui")
             billboard.Name = "EvadeEspDistance"
@@ -517,19 +621,34 @@ local function clearAllHighlights()
     end
 end
 
+local PlayersFolder = waitPath(workspace, "Players")
+
+-- scans workspace.Players directly rather than only CharacterService's own
+-- tracked list - confirmed from the dump this is exactly how the game's own
+-- Fear/vignette code finds nextbots (workspace.Players:GetChildren(), then
+-- GetAttribute("Team")), so identification no longer depends on whatever
+-- CharacterService's own populate timing/filters happen to catch. Downed
+-- state still needs CharacterService (DataRegistry lives on its wrapper,
+-- not the raw model), built into a model->downed lookup once per tick
 task.spawn(function()
     while not Unloading do
         pcall(function()
-            local localCharacter = CharacterService:GetLocalCharacter()
-            local myRoot = localCharacter and localCharacter.Model and localCharacter.Model.PrimaryPart
-            local tracked = {}
+            local localCharacterModel = LocalPlayer.Character
+            local myRoot = localCharacterModel and localCharacterModel:FindFirstChild("HumanoidRootPart")
 
+            local downedByModel = {}
             for _, entry in ipairs(CharacterService:GetCharacters()) do
-                local model = entry.Model
-                if model and entry ~= localCharacter and model.PrimaryPart then
+                if entry.Model and entry.DataRegistry then
+                    downedByModel[entry.Model] = entry.DataRegistry:Get("Downed") == true
+                end
+            end
+
+            local tracked = {}
+            for _, model in ipairs(PlayersFolder:GetChildren()) do
+                if model ~= localCharacterModel and model:IsA("Model") and model.PrimaryPart then
                     tracked[model] = true
                     local isNextbot = model:GetAttribute("Team") == "Nextbot"
-                    local isDowned = entry.DataRegistry ~= nil and entry.DataRegistry:Get("Downed") == true
+                    local isDowned = downedByModel[model] == true
                     local distance = myRoot and (model.PrimaryPart.Position - myRoot.Position).Magnitude or 0
                     local inRange = distance <= EspTune.MaxDistance
                     local wantHighlight, color = false, nil
@@ -543,8 +662,16 @@ task.spawn(function()
                     end
 
                     setHighlight(model, wantHighlight, color)
-                    if wantHighlight and EspTune.DistanceText and espLabels[model] then
-                        espLabels[model].Text.Text = ('%d studs'):format(distance)
+                    if wantHighlight and espLabels[model] then
+                        local parts = {}
+                        if EspTune.NameText then
+                            local plr = Players:GetPlayerFromCharacter(model)
+                            table.insert(parts, plr and plr.Name or model.Name)
+                        end
+                        if EspTune.DistanceText then
+                            table.insert(parts, ('%d studs'):format(distance))
+                        end
+                        espLabels[model].Text.Text = table.concat(parts, ' - ')
                     end
                 end
             end
@@ -639,6 +766,14 @@ EspSettingsSection:Toggle({
     Callback = function(state) EspTune.DistanceText = state end,
 })
 
+EspSettingsSection:Toggle({
+    Title = 'name text',
+    Description = 'shows the player name (or the nextbot model name) above anything currently highlighted',
+    Flag = 'evade_esp_name_text',
+    Default = false,
+    Callback = function(state) EspTune.NameText = state end,
+})
+
 local ComfortSection = VisualsTab:CreateSection('comfort')
 
 local nextbotVignetteDefault = true
@@ -654,6 +789,70 @@ ComfortSection:Toggle({
     Default = nextbotVignetteDefault,
     Callback = function(state)
         pcall(function() UseSettings.SetSetting("NextbotVignette", state) end)
+    end,
+})
+
+local LightingSection = VisualsTab:CreateSection('lighting')
+local FullbrightEnabled = false
+local BrightnessSlider, ExposureSlider, ClockTimeSlider
+
+BrightnessSlider = LightingSection:Slider({
+    Title = 'brightness',
+    Min = 0,
+    Max = 10,
+    Increment = 0.1,
+    Default = OriginalLighting.Brightness,
+    Flag = 'evade_lighting_brightness',
+    Callback = function(value)
+        if not FullbrightEnabled then Lighting.Brightness = value end
+    end,
+})
+
+ExposureSlider = LightingSection:Slider({
+    Title = 'exposure compensation',
+    Min = -1,
+    Max = 2,
+    Increment = 0.05,
+    Default = OriginalLighting.ExposureCompensation,
+    Flag = 'evade_lighting_exposure',
+    Callback = function(value)
+        if not FullbrightEnabled then Lighting.ExposureCompensation = value end
+    end,
+})
+
+ClockTimeSlider = LightingSection:Slider({
+    Title = 'clock time',
+    Description = 'forces the time of day - 14 is the map\'s own default afternoon setting, useful for undoing a darkness special round',
+    Min = 0,
+    Max = 24,
+    Increment = 0.5,
+    Default = OriginalLighting.ClockTime,
+    Flag = 'evade_lighting_clocktime',
+    Callback = function(value)
+        if not FullbrightEnabled then Lighting.ClockTime = value end
+    end,
+})
+
+LightingSection:Toggle({
+    Title = 'fullbright',
+    Description = 'cranks brightness, exposure and ambient light to a flat maximum and locks the time to midday, overriding the sliders above while on - the fastest way to just see everything regardless of round or map',
+    Flag = 'evade_fullbright',
+    Default = false,
+    Callback = function(state)
+        FullbrightEnabled = state
+        if state then
+            Lighting.Brightness = 5
+            Lighting.ExposureCompensation = 1
+            Lighting.ClockTime = 14
+            Lighting.Ambient = Color3.fromRGB(150, 150, 150)
+            Lighting.OutdoorAmbient = Color3.fromRGB(150, 150, 150)
+        else
+            Lighting.Brightness = BrightnessSlider:Get()
+            Lighting.ExposureCompensation = ExposureSlider:Get()
+            Lighting.ClockTime = ClockTimeSlider:Get()
+            Lighting.Ambient = OriginalLighting.Ambient
+            Lighting.OutdoorAmbient = OriginalLighting.OutdoorAmbient
+        end
     end,
 })
 
@@ -997,6 +1196,7 @@ SessionSection:Button({
         Functions.Slide = originalSlide
         MovementClass.Jump = originalJump
         trimpConnection:Disconnect()
+        restoreLighting()
         clearAllHighlights()
         destroyAutoJumpPanel()
         destroyAutoRevivePanel()
@@ -1006,5 +1206,5 @@ SessionSection:Button({
 
 SessionSection:Paragraph({
     Title = 'unload',
-    Content = 'Restores the slide and jump functions to their original behavior, stops every loop, clears esp, closes the auto jump/revive panels if open, then closes the menu.',
+    Content = 'Restores the slide and jump functions to their original behavior, restores lighting, stops every loop, clears esp, closes the auto jump/revive panels if open, then closes the menu.',
 })
