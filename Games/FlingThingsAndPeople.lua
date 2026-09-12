@@ -252,7 +252,18 @@ end)
 
 --// ui ---------------------------------------------------------------------
 
-local Onyx = loadstring(game:HttpGet('https://raw.githubusercontent.com/iamdookie1/Rblx2/main/UI/Ui2.lua'))()
+local function resolveLatestRef()
+    local ref = 'main'
+    pcall(function()
+        local commit = game:GetService("HttpService"):JSONDecode(game:HttpGet('https://api.github.com/repos/iamdookie1/Rblx2/commits/main'))
+        if commit and commit.sha then
+            ref = commit.sha
+        end
+    end)
+    return ref
+end
+
+local Onyx = loadstring(game:HttpGet(('https://raw.githubusercontent.com/iamdookie1/Rblx2/%s/UI/Ui2.lua'):format(resolveLatestRef())))()
 
 local function addStat(section, cfg)
     local title = cfg.Title
