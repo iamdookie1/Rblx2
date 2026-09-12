@@ -494,12 +494,6 @@ local LEGIT_REACQUIRE = 0.4
 local DRIFT_STEP = 0.06
 local HIT_WINDOW = 0.35
 local MAX_CANDIDATES = 5
-local DITHER = 0.35
-local ARM_WINDOW = 12
-local MULT_MIN = 0.4
-local MULT_MAX = 4
-local ARM_MARGIN = 0.12
-local SWEEP_STEP = 1.5
 local PART_ORDER_HEAD = { "Head", "UpperTorso", "Torso", "HumanoidRootPart", "LowerTorso" }
 local PART_ORDER_BODY = { "HumanoidRootPart", "UpperTorso", "Torso", "LowerTorso", "Head" }
 
@@ -837,50 +831,76 @@ local function predictRoot(entry, base, sinceSample, travelTime)
     return Vector3.new(base.X + horizontal.X, y, base.Z + horizontal.Z)
 end
 
-local function newLeadState(tune)
-    return {
-        tune = tune,
-        mult = 1,
-        arms = { { hit = 0, shot = 0 }, { hit = 0, shot = 0 }, { hit = 0, shot = 0 } },
-        pending = {},
-        verified = 0,
-        hits = 0,
-    }
-end
+local newLeadState, pickArm, armMultiplier, updateBandit
+do
+    local DITHER = 0.35
+    local MIN_ARM_SAMPLES = 4
+    local MULT_MIN = 0.4
+    local MULT_MAX = 4
+    local ARM_MARGIN = 0.12
+    local SWEEP_STEP = 1.5
+    local EXPLORE_CHANCE_BASE = 0.2
+    local EXPLORE_CHANCE_MIN = 0.06
+    local EXPLORE_DECAY = 0.75
 
-local function armMultiplier(state, arm)
-    if not state.tune.Auto or arm == nil then return 1 end
-    if arm == 1 then return state.mult * (1 - DITHER) end
-    if arm == 3 then return state.mult * (1 + DITHER) end
-    return state.mult
-end
-
-local function updateBandit(state)
-    local arms = state.arms
-    local shots = arms[1].shot + arms[2].shot + arms[3].shot
-    if shots < ARM_WINDOW then return end
-
-    local landed = arms[1].hit + arms[2].hit + arms[3].hit
-
-    if landed == 0 then
-        state.mult = state.mult * SWEEP_STEP
-        if state.mult > MULT_MAX then state.mult = MULT_MIN end
-    else
-        local centre = arms[2].shot > 0 and (arms[2].hit / arms[2].shot) or -1
-        local low = arms[1].shot > 0 and (arms[1].hit / arms[1].shot) or -1
-        local high = arms[3].shot > 0 and (arms[3].hit / arms[3].shot) or -1
-
-        if low > centre + ARM_MARGIN and low >= high then
-            state.mult = state.mult * (1 - DITHER * 0.5)
-        elseif high > centre + ARM_MARGIN and high > low then
-            state.mult = state.mult * (1 + DITHER * 0.5)
-        end
-        state.mult = math.clamp(state.mult, MULT_MIN, MULT_MAX)
+    function newLeadState(tune)
+        return {
+            tune = tune,
+            mult = 1,
+            exploreChance = EXPLORE_CHANCE_BASE,
+            arms = { { hit = 0, shot = 0 }, { hit = 0, shot = 0 }, { hit = 0, shot = 0 } },
+            pending = {},
+            verified = 0,
+            hits = 0,
+        }
     end
 
-    for index = 1, 3 do
-        arms[index].hit = 0
-        arms[index].shot = 0
+    function pickArm(state)
+        if not state.tune.Auto then return nil end
+        if math.random() >= state.exploreChance then return 2 end
+        return math.random() < 0.5 and 1 or 3
+    end
+
+    function armMultiplier(state, arm)
+        if not state.tune.Auto or arm == nil then return 1 end
+        if arm == 1 then return state.mult * (1 - DITHER) end
+        if arm == 3 then return state.mult * (1 + DITHER) end
+        return state.mult
+    end
+
+    function updateBandit(state)
+        local arms = state.arms
+        if arms[1].shot < MIN_ARM_SAMPLES or arms[3].shot < MIN_ARM_SAMPLES then return end
+
+        local landed = arms[1].hit + arms[2].hit + arms[3].hit
+        local moved = false
+
+        if landed == 0 then
+            state.mult = state.mult * SWEEP_STEP
+            if state.mult > MULT_MAX then state.mult = MULT_MIN end
+            moved = true
+        else
+            local centre = arms[2].shot > 0 and (arms[2].hit / arms[2].shot) or -1
+            local low = arms[1].hit / arms[1].shot
+            local high = arms[3].hit / arms[3].shot
+
+            if low > centre + ARM_MARGIN and low >= high then
+                state.mult = state.mult * (1 - DITHER * 0.5)
+                moved = true
+            elseif high > centre + ARM_MARGIN and high > low then
+                state.mult = state.mult * (1 + DITHER * 0.5)
+                moved = true
+            end
+            state.mult = math.clamp(state.mult, MULT_MIN, MULT_MAX)
+        end
+
+        state.exploreChance = moved and EXPLORE_CHANCE_BASE
+            or math.max(EXPLORE_CHANCE_MIN, state.exploreChance * EXPLORE_DECAY)
+
+        for index = 1, 3 do
+            arms[index].hit = 0
+            arms[index].shot = 0
+        end
     end
 end
 
@@ -1258,7 +1278,7 @@ local function buildPlan(filter, isKnife, origin, now, settings)
                 settings = settings,
                 isKnife = isKnife,
                 leadScale = 1,
-                arm = state.tune.Auto and math.random(1, 3) or nil,
+                arm = pickArm(state),
                 stamp = now,
             }
 
@@ -2112,6 +2132,9 @@ do
 end
 
 
+local SeenStat, RedirectStat, SuppressStat, ErrorStat
+do
+
 local LegitTab = Window:CreateTab({ Title = 'legit' })
 
 local LegitSection = LegitTab:CreateSection('legit mode')
@@ -2458,10 +2481,10 @@ ProofSection:Toggle({
     end,
 })
 
-local SeenStat = addStat(ProofSection, { Title = 'shots seen', Value = '0' })
-local RedirectStat = addStat(ProofSection, { Title = 'redirected', Value = '0' })
-local SuppressStat = addStat(ProofSection, { Title = 'not redirected', Value = '0' })
-local ErrorStat = addStat(ProofSection, { Title = 'avg prediction error', Value = '-' })
+SeenStat = addStat(ProofSection, { Title = 'shots seen', Value = '0' })
+RedirectStat = addStat(ProofSection, { Title = 'redirected', Value = '0' })
+SuppressStat = addStat(ProofSection, { Title = 'not redirected', Value = '0' })
+ErrorStat = addStat(ProofSection, { Title = 'avg prediction error', Value = '-' })
 
 ProofSection:Button({
     Title = 'reset counters',
@@ -2614,6 +2637,8 @@ SessionSection:Paragraph({
     Title = 'unload',
     Text = 'Disconnects every hook and loop, restores every part xray touched, clears all esp, then closes the menu. The Shoot/KnifeThrown namecall hook cannot be reversed without rejoining.',
 })
+
+end
 
 task.spawn(function()
     while not Unloading do
