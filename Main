@@ -39,10 +39,27 @@ local Games = {
 -- versioned together: a change to the library lands with the scripts written
 -- against it instead of drifting in a second repo.
 --
--- raw.githubusercontent.com caches by full URL including the query string,
--- so a changing ?v= forces a real cache miss on every load instead of
--- risking a stale copy right after a push.
-local Onyx = loadstring(game:HttpGet('https://raw.githubusercontent.com/iamdookie1/Rblx2/main/UI/Ui2.lua?v=' .. tostring(tick())))()
+-- raw.githubusercontent.com's cache ignores the query string entirely
+-- (confirmed: two different ?v= values both came back x-cache: HIT), so a
+-- cache-busting query param does nothing here. A commit sha is a genuinely
+-- different URL path though, which does get its own cache entry - resolving
+-- the branch's current sha and fetching that exact commit is what actually
+-- avoids a stale copy. Falls back to the branch URL (cached up to 5 minutes
+-- per its own Cache-Control header) if the API call fails, and says so
+-- instead of failing silently.
+local ref = 'main'
+local resolved, shaOrError = pcall(function()
+    local commit = game:GetService("HttpService"):JSONDecode(game:HttpGet('https://api.github.com/repos/iamdookie1/Rblx2/commits/main'))
+    return commit.sha
+end)
+if resolved and shaOrError then
+    ref = shaOrError
+else
+    warn('[Onyx] could not resolve the latest commit, falling back to main (raw.githubusercontent.com caches that for up to 5 minutes): ' .. tostring(shaOrError))
+end
+
+local url = ('https://raw.githubusercontent.com/iamdookie1/Rblx2/%s/UI/Ui2.lua'):format(ref)
+local Onyx = loadstring(game:HttpGet(url))()
 
 -- Onyx has no Stat element, just a Label. This gives every Section the same
 -- Title/Value pair with a live :Set(value, color) that the rest of this file
