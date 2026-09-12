@@ -254,7 +254,7 @@ end)
 
 local ref = 'main'
 local resolved, shaOrError = pcall(function()
-    local commit = game:GetService("HttpService"):JSONDecode(game:HttpGet('https://api.github.com/repos/iamdookie1/Rblx2/commits/main'))
+    local commit = game:GetService("HttpService"):JSONDecode(game:HttpGet('https://api.github.com/repos/iamdookie1/Ui2/commits/main'))
     return commit.sha
 end)
 if resolved and shaOrError then
@@ -263,7 +263,7 @@ else
     warn('[Onyx] could not resolve the latest commit, falling back to main (raw.githubusercontent.com caches that for up to 5 minutes): ' .. tostring(shaOrError))
 end
 
-local url = ('https://raw.githubusercontent.com/iamdookie1/Rblx2/%s/UI/Ui2.lua'):format(ref)
+local url = ('https://raw.githubusercontent.com/iamdookie1/Ui2/%s/Ui.lua'):format(ref)
 local Onyx = loadstring(game:HttpGet(url))()
 
 local function addStat(section, cfg)
