@@ -1,5 +1,6 @@
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
 local LocalPlayer = Players.LocalPlayer
 
 local ref = 'main'
@@ -33,6 +34,8 @@ local Functions = require(FunctionsScript)
 local CharacterServiceScript = waitPath(ReplicatedStorage, "Services", "Asset", "CharacterService")
 local CharacterService = require(CharacterServiceScript)
 local GamemodesFolder = waitPath(ReplicatedStorage, "Info", "Gamemodes")
+local UseSettingsScript = waitPath(ReplicatedStorage, "Shared", "UserData", "ClientHooks", "useSettings")
+local UseSettings = require(UseSettingsScript)
 
 local DEFAULT_SPEED = 1500 / 90
 local DEFAULT_SPRINT_CAP = 2
@@ -90,10 +93,12 @@ end
 
 task.spawn(function()
     while not Unloading do
-        local stats = getLocalMoveStats()
-        if stats then
-            applyMovementTune(stats)
-        end
+        pcall(function()
+            local stats = getLocalMoveStats()
+            if stats then
+                applyMovementTune(stats)
+            end
+        end)
         task.wait(0.5)
     end
 end)
@@ -119,8 +124,9 @@ local function applyReviveOverride()
         ReviveState.PatchedCount = 0
         return
     end
+    local modules = GamemodesFolder:GetDescendants()
     local count = 0
-    for _, gamemodeModule in ipairs(GamemodesFolder:GetChildren()) do
+    for _, gamemodeModule in ipairs(modules) do
         if gamemodeModule:IsA("ModuleScript") then
             local ok, data = pcall(require, gamemodeModule)
             if ok and type(data) == "table" then
@@ -132,8 +138,12 @@ local function applyReviveOverride()
 end
 
 task.spawn(function()
+    for _ = 1, 20 do
+        if #GamemodesFolder:GetDescendants() > 0 then break end
+        task.wait(0.5)
+    end
     while not Unloading do
-        applyReviveOverride()
+        pcall(applyReviveOverride)
         task.wait(2)
     end
 end)
@@ -182,33 +192,47 @@ MovementClass.Jump = function(self, ...)
     return a, b
 end
 
-local function isCharacterPart(part)
-    local model = part.Parent
-    return model ~= nil and model:FindFirstChildOfClass("Humanoid") ~= nil
-end
+-- mirrors the native Slide state's own ground-normal raycast (it whitelists
+-- only workspace.Map.Parts, which is why standing on a slanted crate or prop
+-- never gets the native ramp treatment) - this one checks any surface, and
+-- only fires the boost the instant you leave a surface that was genuinely
+-- tilted, not on every touch, so it reads as an actual launch off a slope
+-- rather than a flat "bumped into something" speed bump
+local SLOPE_MIN_TILT = 0.3
+local SLOPE_MAX_TILT = 0.95
 
-local touchDebounce = false
-local function onLocalTouched(hit)
-    if not Tune.TrimpOnTouchEnabled or touchDebounce then return end
-    if not hit:IsA("BasePart") or isCharacterPart(hit) then return end
-    local character = CharacterService:GetLocalCharacter()
-    if not character then return end
-    touchDebounce = true
-    boostHorizontalVelocity(character.DataRegistry, Tune.TrimpBoostMultiplier)
-    task.delay(0.3, function() touchDebounce = false end)
-end
+local lastGroundNormal = nil
+local wasGrounded = false
 
-local touchConnection
-local function connectTouch(char)
-    if touchConnection then touchConnection:Disconnect() end
-    local root = char:WaitForChild("HumanoidRootPart", 5)
-    if root then
-        touchConnection = root.Touched:Connect(onLocalTouched)
+local trimpConnection = RunService.Heartbeat:Connect(function()
+    if not Tune.TrimpOnTouchEnabled then return end
+    local ok = pcall(function()
+        local character = CharacterService:GetLocalCharacter()
+        if not character or not character.Model or not character.Model.PrimaryPart then return end
+        local root = character.Model.PrimaryPart
+        local grounded = character.DataRegistry:Get("Grounded") == true
+
+        if grounded then
+            local params = RaycastParams.new()
+            params.FilterType = Enum.RaycastFilterType.Exclude
+            params.FilterDescendantsInstances = { character.Model }
+            local result = workspace:Raycast(root.Position, Vector3.new(0, -4, 0), params)
+            lastGroundNormal = result and result.Normal or nil
+        elseif wasGrounded and lastGroundNormal then
+            local tilt = lastGroundNormal:Dot(Vector3.new(0, 1, 0))
+            if tilt > SLOPE_MIN_TILT and tilt < SLOPE_MAX_TILT then
+                boostHorizontalVelocity(character.DataRegistry, Tune.TrimpBoostMultiplier)
+            end
+            lastGroundNormal = nil
+        end
+
+        wasGrounded = grounded
+    end)
+    if not ok then
+        lastGroundNormal = nil
+        wasGrounded = false
     end
-end
-
-if LocalPlayer.Character then connectTouch(LocalPlayer.Character) end
-LocalPlayer.CharacterAdded:Connect(connectTouch)
+end)
 
 local Window = Onyx:CreateWindow({
     Title = 'evade',
@@ -363,8 +387,8 @@ JumpSection:Slider({
 })
 
 JumpSection:Toggle({
-    Title = 'trimp off objects',
-    Description = 'applies the same extra boost above when you touch a prop or piece of map geometry while moving fast, not only when you jump - the same tech off crates and terrain, not just ramps',
+    Title = 'trimp off slanted objects',
+    Description = 'reads the ground normal the same way the native ramp slide does, but off any surface instead of only workspace.Map.Parts - the instant you leave a surface that was actually tilted (not flat, not a wall), it applies the trimp boost, so slanted crates and props launch you the same way a real ramp does instead of every touch giving a speed bump',
     Flag = 'evade_trimp_on_touch',
     Default = false,
     Callback = function(state) Tune.TrimpOnTouchEnabled = state end,
@@ -428,25 +452,57 @@ local EspTune = {
     Nextbot = false,
     Downed = false,
     Players = false,
+    NextbotColor = Color3.fromRGB(255, 60, 60),
+    DownedColor = Color3.fromRGB(255, 210, 60),
+    PlayersColor = Color3.fromRGB(80, 170, 255),
+    FillTransparency = 0.5,
+    MaxDistance = 250,
+    DistanceText = false,
 }
 
 local espHighlights = {}
+local espLabels = {}
 
 local function setHighlight(model, enabled, color)
     local highlight = espHighlights[model]
     if enabled then
         if not highlight then
             highlight = Instance.new("Highlight")
-            highlight.FillTransparency = 0.5
             highlight.OutlineTransparency = 0
             highlight.Parent = model
             espHighlights[model] = highlight
         end
+        highlight.FillTransparency = EspTune.FillTransparency
         highlight.FillColor = color
         highlight.OutlineColor = color
     elseif highlight then
         highlight:Destroy()
         espHighlights[model] = nil
+    end
+
+    local label = espLabels[model]
+    if enabled and EspTune.DistanceText then
+        if not label then
+            local billboard = Instance.new("BillboardGui")
+            billboard.Name = "EvadeEspDistance"
+            billboard.Size = UDim2.fromOffset(100, 20)
+            billboard.StudsOffset = Vector3.new(0, 3, 0)
+            billboard.AlwaysOnTop = true
+            billboard.Parent = model
+            local text = Instance.new("TextLabel")
+            text.BackgroundTransparency = 1
+            text.Size = UDim2.fromScale(1, 1)
+            text.Font = Enum.Font.GothamBold
+            text.TextSize = 14
+            text.TextStrokeTransparency = 0.3
+            text.Parent = billboard
+            label = { Billboard = billboard, Text = text }
+            espLabels[model] = label
+        end
+        label.Text.TextColor3 = color
+    elseif label then
+        label.Billboard:Destroy()
+        espLabels[model] = nil
     end
 end
 
@@ -455,38 +511,50 @@ local function clearAllHighlights()
         highlight:Destroy()
         espHighlights[model] = nil
     end
+    for model, label in pairs(espLabels) do
+        label.Billboard:Destroy()
+        espLabels[model] = nil
+    end
 end
 
 task.spawn(function()
     while not Unloading do
-        local localCharacter = CharacterService:GetLocalCharacter()
-        local tracked = {}
+        pcall(function()
+            local localCharacter = CharacterService:GetLocalCharacter()
+            local myRoot = localCharacter and localCharacter.Model and localCharacter.Model.PrimaryPart
+            local tracked = {}
 
-        for _, entry in ipairs(CharacterService:GetCharacters()) do
-            local model = entry.Model
-            if model and entry ~= localCharacter then
-                tracked[model] = true
-                local isNextbot = model:GetAttribute("Team") == "Nextbot"
-                local isDowned = entry.DataRegistry ~= nil and entry.DataRegistry:Get("Downed") == true
-                local wantHighlight, color = false, nil
+            for _, entry in ipairs(CharacterService:GetCharacters()) do
+                local model = entry.Model
+                if model and entry ~= localCharacter and model.PrimaryPart then
+                    tracked[model] = true
+                    local isNextbot = model:GetAttribute("Team") == "Nextbot"
+                    local isDowned = entry.DataRegistry ~= nil and entry.DataRegistry:Get("Downed") == true
+                    local distance = myRoot and (model.PrimaryPart.Position - myRoot.Position).Magnitude or 0
+                    local inRange = distance <= EspTune.MaxDistance
+                    local wantHighlight, color = false, nil
 
-                if EspTune.Downed and isDowned then
-                    wantHighlight, color = true, Color3.fromRGB(255, 210, 60)
-                elseif EspTune.Nextbot and isNextbot then
-                    wantHighlight, color = true, Color3.fromRGB(255, 60, 60)
-                elseif EspTune.Players and not isNextbot then
-                    wantHighlight, color = true, Color3.fromRGB(80, 170, 255)
+                    if inRange and EspTune.Downed and isDowned then
+                        wantHighlight, color = true, EspTune.DownedColor
+                    elseif inRange and EspTune.Nextbot and isNextbot then
+                        wantHighlight, color = true, EspTune.NextbotColor
+                    elseif inRange and EspTune.Players and not isNextbot then
+                        wantHighlight, color = true, EspTune.PlayersColor
+                    end
+
+                    setHighlight(model, wantHighlight, color)
+                    if wantHighlight and EspTune.DistanceText and espLabels[model] then
+                        espLabels[model].Text.Text = ('%d studs'):format(distance)
+                    end
                 end
-
-                setHighlight(model, wantHighlight, color)
             end
-        end
 
-        for model in pairs(espHighlights) do
-            if not tracked[model] then
-                setHighlight(model, false)
+            for model in pairs(espHighlights) do
+                if not tracked[model] then
+                    setHighlight(model, false)
+                end
             end
-        end
+        end)
 
         task.wait(0.5)
     end
@@ -503,6 +571,13 @@ EspSection:Toggle({
     Callback = function(state) EspTune.Nextbot = state end,
 })
 
+EspSection:Colorpicker({
+    Title = 'nextbot color',
+    Default = EspTune.NextbotColor,
+    Flag = 'evade_esp_nextbot_color',
+    Callback = function(color) EspTune.NextbotColor = color end,
+})
+
 EspSection:Toggle({
     Title = 'downed player esp',
     Description = 'highlights any character currently downed, regardless of team - useful for spotting revive targets',
@@ -511,12 +586,75 @@ EspSection:Toggle({
     Callback = function(state) EspTune.Downed = state end,
 })
 
+EspSection:Colorpicker({
+    Title = 'downed color',
+    Default = EspTune.DownedColor,
+    Flag = 'evade_esp_downed_color',
+    Callback = function(color) EspTune.DownedColor = color end,
+})
+
 EspSection:Toggle({
     Title = 'player esp',
     Description = 'highlights every other non-nextbot character',
     Flag = 'evade_esp_players',
     Default = false,
     Callback = function(state) EspTune.Players = state end,
+})
+
+EspSection:Colorpicker({
+    Title = 'player color',
+    Default = EspTune.PlayersColor,
+    Flag = 'evade_esp_players_color',
+    Callback = function(color) EspTune.PlayersColor = color end,
+})
+
+local EspSettingsSection = VisualsTab:CreateSection('esp settings')
+
+EspSettingsSection:Slider({
+    Title = 'fill transparency',
+    Min = 0,
+    Max = 1,
+    Increment = 0.05,
+    Default = EspTune.FillTransparency,
+    Flag = 'evade_esp_fill_transparency',
+    Callback = function(value) EspTune.FillTransparency = value end,
+})
+
+EspSettingsSection:Slider({
+    Title = 'max distance',
+    Min = 20,
+    Max = 1000,
+    Increment = 10,
+    Default = EspTune.MaxDistance,
+    Suffix = ' studs',
+    Flag = 'evade_esp_max_distance',
+    Callback = function(value) EspTune.MaxDistance = value end,
+})
+
+EspSettingsSection:Toggle({
+    Title = 'distance text',
+    Description = 'shows the live distance above anything currently highlighted',
+    Flag = 'evade_esp_distance_text',
+    Default = false,
+    Callback = function(state) EspTune.DistanceText = state end,
+})
+
+local ComfortSection = VisualsTab:CreateSection('comfort')
+
+local nextbotVignetteDefault = true
+pcall(function()
+    local current = UseSettings.Get("NextbotVignette")
+    if current ~= nil then nextbotVignetteDefault = current end
+end)
+
+ComfortSection:Toggle({
+    Title = 'nextbot vignette',
+    Description = 'the game\'s own accessibility setting for the darkened-vision effect a nearby nextbot causes - this just flips it through the real settings system (Shared.UserData.ClientHooks.useSettings), same as toggling it in the game\'s own settings menu, so it is not a client-only hack',
+    Flag = 'evade_nextbot_vignette',
+    Default = nextbotVignetteDefault,
+    Callback = function(state)
+        pcall(function() UseSettings.SetSetting("NextbotVignette", state) end)
+    end,
 })
 
 local ReviveTab = Window:CreateTab({ Title = 'revive' })
@@ -561,53 +699,173 @@ ReviveSection:Button({
     Callback = applyReviveOverride,
 })
 
-local MINI_WINDOW_ACCENT = Color3.fromRGB(210, 45, 45)
+local function getFloatingGuiParent()
+    local target
+    local ok = pcall(function()
+        if typeof(gethui) == "function" then target = gethui() end
+    end)
+    if not ok or not target then
+        local ok2 = pcall(function()
+            local coreGui = game:GetService("CoreGui")
+            local probe = Instance.new("ScreenGui")
+            probe.Parent = coreGui
+            probe:Destroy()
+            target = coreGui
+        end)
+        if not ok2 then target = nil end
+    end
+    if not target then
+        target = LocalPlayer:FindFirstChildOfClass("PlayerGui") or LocalPlayer:WaitForChild("PlayerGui")
+    end
+    return target
+end
 
-local AutoJumpWindow
+local floatingPanelOffset = 0
+
+-- a compact draggable pill instead of a full Onyx window - just a label and
+-- a switch, no topbar/rail/settings overhead. drag tracks the exact
+-- InputObject that pressed it (not a global InputChanged listener), so a
+-- second finger moving elsewhere on screen - a touch joystick, say - can
+-- never drag it by mistake
+local function createFloatingPanel(title, onToggle)
+    local screenGui = Instance.new("ScreenGui")
+    screenGui.Name = "EvadeFloating_" .. title:gsub("%s+", "")
+    screenGui.ResetOnSpawn = false
+    screenGui.IgnoreGuiInset = true
+    screenGui.DisplayOrder = 9999
+    screenGui.Parent = getFloatingGuiParent()
+
+    local frame = Instance.new("Frame")
+    frame.Name = "Panel"
+    frame.Size = UDim2.fromOffset(150, 40)
+    frame.Position = UDim2.fromOffset(16, 160 + floatingPanelOffset)
+    frame.BackgroundColor3 = Color3.fromRGB(24, 24, 27)
+    frame.BorderSizePixel = 0
+    frame.Parent = screenGui
+    floatingPanelOffset = floatingPanelOffset + 48
+
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 8)
+    corner.Parent = frame
+
+    local stroke = Instance.new("UIStroke")
+    stroke.Color = Color3.fromRGB(255, 255, 255)
+    stroke.Transparency = 0.85
+    stroke.Parent = frame
+
+    local label = Instance.new("TextLabel")
+    label.BackgroundTransparency = 1
+    label.Size = UDim2.new(1, -54, 1, 0)
+    label.Position = UDim2.fromOffset(10, 0)
+    label.Font = Enum.Font.GothamBold
+    label.TextSize = 13
+    label.TextColor3 = Color3.fromRGB(230, 230, 235)
+    label.TextXAlignment = Enum.TextXAlignment.Left
+    label.TextTruncate = Enum.TextTruncate.AtEnd
+    label.Text = title
+    label.Parent = frame
+
+    local button = Instance.new("TextButton")
+    button.Name = "Toggle"
+    button.AutoButtonColor = false
+    button.Text = ""
+    button.Size = UDim2.fromOffset(34, 20)
+    button.Position = UDim2.new(1, -44, 0.5, -10)
+    button.BackgroundColor3 = Color3.fromRGB(60, 60, 66)
+    button.Parent = frame
+
+    local buttonCorner = Instance.new("UICorner")
+    buttonCorner.CornerRadius = UDim.new(1, 0)
+    buttonCorner.Parent = button
+
+    local knob = Instance.new("Frame")
+    knob.Size = UDim2.fromOffset(16, 16)
+    knob.Position = UDim2.fromOffset(2, 2)
+    knob.BackgroundColor3 = Color3.fromRGB(230, 230, 235)
+    knob.BorderSizePixel = 0
+    knob.Parent = button
+
+    local knobCorner = Instance.new("UICorner")
+    knobCorner.CornerRadius = UDim.new(1, 0)
+    knobCorner.Parent = knob
+
+    local active = false
+    local function render()
+        if active then
+            button.BackgroundColor3 = Color3.fromRGB(210, 45, 45)
+            knob.Position = UDim2.fromOffset(16, 2)
+        else
+            button.BackgroundColor3 = Color3.fromRGB(60, 60, 66)
+            knob.Position = UDim2.fromOffset(2, 2)
+        end
+    end
+    render()
+
+    local moved = false
+    frame.InputBegan:Connect(function(input)
+        if input.UserInputType ~= Enum.UserInputType.MouseButton1
+            and input.UserInputType ~= Enum.UserInputType.Touch then return end
+        moved = false
+        local startInput = input.Position
+        local startPos = frame.Position
+        local conn
+        conn = input.Changed:Connect(function()
+            if input.UserInputState == Enum.UserInputState.End then
+                conn:Disconnect()
+                return
+            end
+            local delta = input.Position - startInput
+            if math.abs(delta.X) + math.abs(delta.Y) > 8 then moved = true end
+            frame.Position = UDim2.new(
+                startPos.X.Scale, startPos.X.Offset + delta.X,
+                startPos.Y.Scale, startPos.Y.Offset + delta.Y
+            )
+        end)
+    end)
+
+    button.MouseButton1Click:Connect(function()
+        if moved then return end
+        active = not active
+        render()
+        onToggle(active)
+    end)
+
+    return {
+        Destroy = function() screenGui:Destroy() end,
+    }
+end
+
+local AutoJumpPanel
 local AutoJumpActive = false
 local AutoJumpInterval = 0.15
 
-local function destroyAutoJumpWindow()
-    if AutoJumpWindow then
-        AutoJumpWindow:Destroy()
-        AutoJumpWindow = nil
+local function destroyAutoJumpPanel()
+    if AutoJumpPanel then
+        AutoJumpPanel.Destroy()
+        AutoJumpPanel = nil
     end
     AutoJumpActive = false
 end
 
-local function buildAutoJumpWindow()
-    destroyAutoJumpWindow()
-    AutoJumpWindow = Onyx:CreateWindow({
-        Title = 'auto jump',
-        Size = UDim2.fromOffset(220, 130),
-        MinSize = Vector2.new(160, 100),
-        Resizable = true,
-        Settings = false,
-        ShowUserInfo = false,
-        Accent = MINI_WINDOW_ACCENT,
-    })
-    local tab = AutoJumpWindow:CreateTab({ Title = 'jump' })
-    local section = tab:CreateSection('auto jump')
-    section:Toggle({
-        Title = 'active',
-        Callback = function(state) AutoJumpActive = state end,
-    })
+local function buildAutoJumpPanel()
+    destroyAutoJumpPanel()
+    AutoJumpPanel = createFloatingPanel('auto jump', function(state) AutoJumpActive = state end)
 end
 
 task.spawn(function()
     while not Unloading do
         if AutoJumpActive then
-            local character = CharacterService:GetLocalCharacter()
-            local movement = character and character.Movement
-            if movement then
-                pcall(function() movement:JumpReact() end)
-            end
+            pcall(function()
+                local character = CharacterService:GetLocalCharacter()
+                local movement = character and character.Movement
+                if movement then movement:JumpReact() end
+            end)
         end
         task.wait(AutoJumpInterval)
     end
 end)
 
-local AutoReviveWindow
+local AutoRevivePanel
 local AutoReviveActive = false
 local AutoReviveRange = 8
 local reviveHolding = false
@@ -641,35 +899,21 @@ local function releaseReviveHold()
     end
 end
 
-local function destroyAutoReviveWindow()
-    if AutoReviveWindow then
-        AutoReviveWindow:Destroy()
-        AutoReviveWindow = nil
+local function destroyAutoRevivePanel()
+    if AutoRevivePanel then
+        AutoRevivePanel.Destroy()
+        AutoRevivePanel = nil
     end
     AutoReviveActive = false
     releaseReviveHold()
 end
 
-local function buildAutoReviveWindow()
-    destroyAutoReviveWindow()
-    AutoReviveWindow = Onyx:CreateWindow({
-        Title = 'auto revive',
-        Size = UDim2.fromOffset(220, 130),
-        MinSize = Vector2.new(160, 100),
-        Resizable = true,
-        Settings = false,
-        ShowUserInfo = false,
-        Accent = MINI_WINDOW_ACCENT,
-    })
-    local tab = AutoReviveWindow:CreateTab({ Title = 'revive' })
-    local section = tab:CreateSection('auto revive')
-    section:Toggle({
-        Title = 'active',
-        Callback = function(state)
-            AutoReviveActive = state
-            if not state then releaseReviveHold() end
-        end,
-    })
+local function buildAutoRevivePanel()
+    destroyAutoRevivePanel()
+    AutoRevivePanel = createFloatingPanel('auto revive', function(state)
+        AutoReviveActive = state
+        if not state then releaseReviveHold() end
+    end)
 end
 
 -- calls the same Character:KeyUsed({Key="Interact", Down=...}) path the
@@ -679,18 +923,20 @@ end
 -- fires the tool's real activation) - not a guessed remote call
 task.spawn(function()
     while not Unloading do
-        if AutoReviveActive then
-            local character = CharacterService:GetLocalCharacter()
-            local target = character and findDownedTeammateInRange()
-            if target and not reviveHolding then
-                reviveHolding = true
-                pcall(function() character:KeyUsed({ Key = "Interact", Down = true }) end)
-            elseif not target and reviveHolding then
+        pcall(function()
+            if AutoReviveActive then
+                local character = CharacterService:GetLocalCharacter()
+                local target = character and findDownedTeammateInRange()
+                if target and not reviveHolding then
+                    reviveHolding = true
+                    character:KeyUsed({ Key = "Interact", Down = true })
+                elseif not target and reviveHolding then
+                    releaseReviveHold()
+                end
+            elseif reviveHolding then
                 releaseReviveHold()
             end
-        elseif reviveHolding then
-            releaseReviveHold()
-        end
+        end)
         task.wait(0.2)
     end
 end)
@@ -700,11 +946,11 @@ local AutoSection = ExtraTab:CreateSection('automation')
 
 AutoSection:Toggle({
     Title = 'auto jump panel',
-    Description = 'shows a small resizable window with its own on/off switch, so auto jump can be started or stopped without opening this menu',
+    Description = 'shows a small draggable pill with its own on/off switch, so auto jump can be started or stopped without opening this menu',
     Flag = 'evade_auto_jump_panel',
     Default = false,
     Callback = function(state)
-        if state then buildAutoJumpWindow() else destroyAutoJumpWindow() end
+        if state then buildAutoJumpPanel() else destroyAutoJumpPanel() end
     end,
 })
 
@@ -721,11 +967,11 @@ AutoSection:Slider({
 
 AutoSection:Toggle({
     Title = 'auto revive panel',
-    Description = 'shows a small resizable window with its own on/off switch. while active, automatically holds interact on the nearest downed teammate in range - the same input path a real keypress uses, just triggered by range instead of a key',
+    Description = 'shows a small draggable pill with its own on/off switch. while active, automatically holds interact on the nearest downed teammate in range - the same input path a real keypress uses, just triggered by range instead of a key',
     Flag = 'evade_auto_revive_panel',
     Default = false,
     Callback = function(state)
-        if state then buildAutoReviveWindow() else destroyAutoReviveWindow() end
+        if state then buildAutoRevivePanel() else destroyAutoRevivePanel() end
     end,
 })
 
@@ -750,10 +996,10 @@ SessionSection:Button({
         Unloading = true
         Functions.Slide = originalSlide
         MovementClass.Jump = originalJump
-        if touchConnection then touchConnection:Disconnect() end
+        trimpConnection:Disconnect()
         clearAllHighlights()
-        destroyAutoJumpWindow()
-        destroyAutoReviveWindow()
+        destroyAutoJumpPanel()
+        destroyAutoRevivePanel()
         Onyx:Unload()
     end,
 })
