@@ -252,10 +252,15 @@ end)
 
 --// ui ---------------------------------------------------------------------
 
+local function cacheBust(url)
+    local separator = url:find('?') and '&' or '?'
+    return url .. separator .. '_=' .. tostring(math.random(0, 2147483647)) .. tostring(os.clock())
+end
+
 local function resolveLatestRef()
     local ref = 'main'
     pcall(function()
-        local commit = game:GetService("HttpService"):JSONDecode(game:HttpGet('https://api.github.com/repos/iamdookie1/Rblx2/commits/main'))
+        local commit = game:GetService("HttpService"):JSONDecode(game:HttpGet(cacheBust('https://api.github.com/repos/iamdookie1/Rblx2/commits/main')))
         if commit and commit.sha then
             ref = commit.sha
         end
@@ -263,7 +268,7 @@ local function resolveLatestRef()
     return ref
 end
 
-local Onyx = loadstring(game:HttpGet(('https://raw.githubusercontent.com/iamdookie1/Rblx2/%s/UI/Ui2.lua'):format(resolveLatestRef())))()
+local Onyx = loadstring(game:HttpGet(cacheBust(('https://raw.githubusercontent.com/iamdookie1/Rblx2/%s/UI/Ui2.lua'):format(resolveLatestRef()))))()
 
 local function addStat(section, cfg)
     local title = cfg.Title
