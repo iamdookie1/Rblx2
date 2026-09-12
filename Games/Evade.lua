@@ -57,6 +57,7 @@ local Tune = {
 
     TrimpBoostEnabled = false,
     TrimpBoostMultiplier = 1,
+    TrimpOnTouchEnabled = false,
 
     SlideOverrideEnabled = false,
     SlideMultiplier = 1,
@@ -97,28 +98,45 @@ task.spawn(function()
     end
 end)
 
+local ReviveState = { PatchedCount = 0 }
+
 local function deepPatchReviveTime(tbl, value, seen)
+    local count = 0
     for key, value2 in pairs(tbl) do
         if key == "ReviveTime" then
             tbl[key] = value
+            count = count + 1
         elseif type(value2) == "table" and not seen[value2] then
             seen[value2] = true
-            deepPatchReviveTime(value2, value, seen)
+            count = count + deepPatchReviveTime(value2, value, seen)
         end
     end
+    return count
 end
 
 local function applyReviveOverride()
-    if not Tune.ReviveOverrideEnabled then return end
+    if not Tune.ReviveOverrideEnabled then
+        ReviveState.PatchedCount = 0
+        return
+    end
+    local count = 0
     for _, gamemodeModule in ipairs(GamemodesFolder:GetChildren()) do
         if gamemodeModule:IsA("ModuleScript") then
             local ok, data = pcall(require, gamemodeModule)
             if ok and type(data) == "table" then
-                deepPatchReviveTime(data, Tune.ReviveTime, { [data] = true })
+                count = count + deepPatchReviveTime(data, Tune.ReviveTime, { [data] = true })
             end
         end
     end
+    ReviveState.PatchedCount = count
 end
+
+task.spawn(function()
+    while not Unloading do
+        applyReviveOverride()
+        task.wait(2)
+    end
+end)
 
 -- restored on unload; scoped to only our own character's slide so other
 -- players/nextbots simulated client-side keep their native slide feel
@@ -142,6 +160,16 @@ Functions.Slide = function(dt, moveConfig, dataRegistry, character, moveStats)
     return mover, terms
 end
 
+local function boostHorizontalVelocity(dataRegistry, multiplier)
+    local velocity = dataRegistry:Get("Velocity")
+    if not velocity then return end
+    local horizontal = Vector3.new(velocity.X, 0, velocity.Z)
+    if horizontal.Magnitude > 1 then
+        local boosted = horizontal * multiplier
+        dataRegistry:Set("Velocity", Vector3.new(boosted.X, velocity.Y, boosted.Z))
+    end
+end
+
 -- same restore-on-unload contract as Slide; scoped by comparing the live
 -- character model rather than a captured reference so it survives respawns
 local originalJump = MovementClass.Jump
@@ -149,17 +177,38 @@ MovementClass.Jump = function(self, ...)
     local boost = Tune.TrimpBoostEnabled and self.Character == LocalPlayer.Character
     local a, b = originalJump(self, ...)
     if boost then
-        local velocity = self.DataRegistry:Get("Velocity")
-        if velocity then
-            local horizontal = Vector3.new(velocity.X, 0, velocity.Z)
-            if horizontal.Magnitude > 1 then
-                local boosted = horizontal * Tune.TrimpBoostMultiplier
-                self.DataRegistry:Set("Velocity", Vector3.new(boosted.X, velocity.Y, boosted.Z))
-            end
-        end
+        boostHorizontalVelocity(self.DataRegistry, Tune.TrimpBoostMultiplier)
     end
     return a, b
 end
+
+local function isCharacterPart(part)
+    local model = part.Parent
+    return model ~= nil and model:FindFirstChildOfClass("Humanoid") ~= nil
+end
+
+local touchDebounce = false
+local function onLocalTouched(hit)
+    if not Tune.TrimpOnTouchEnabled or touchDebounce then return end
+    if not hit:IsA("BasePart") or isCharacterPart(hit) then return end
+    local character = CharacterService:GetLocalCharacter()
+    if not character then return end
+    touchDebounce = true
+    boostHorizontalVelocity(character.DataRegistry, Tune.TrimpBoostMultiplier)
+    task.delay(0.3, function() touchDebounce = false end)
+end
+
+local touchConnection
+local function connectTouch(char)
+    if touchConnection then touchConnection:Disconnect() end
+    local root = char:WaitForChild("HumanoidRootPart", 5)
+    if root then
+        touchConnection = root.Touched:Connect(onLocalTouched)
+    end
+end
+
+if LocalPlayer.Character then connectTouch(LocalPlayer.Character) end
+LocalPlayer.CharacterAdded:Connect(connectTouch)
 
 local Window = Onyx:CreateWindow({
     Title = 'evade',
@@ -313,6 +362,14 @@ JumpSection:Slider({
     Callback = function(value) Tune.TrimpBoostMultiplier = value end,
 })
 
+JumpSection:Toggle({
+    Title = 'trimp off objects',
+    Description = 'applies the same extra boost above when you touch a prop or piece of map geometry while moving fast, not only when you jump - the same tech off crates and terrain, not just ramps',
+    Flag = 'evade_trimp_on_touch',
+    Default = false,
+    Callback = function(state) Tune.TrimpOnTouchEnabled = state end,
+})
+
 local SlideSection = MovementTab:CreateSection('slide')
 
 SlideSection:Toggle({
@@ -367,22 +424,126 @@ AirSection:Slider({
     Callback = function(value) Tune.AirStrafeAcceleration = value end,
 })
 
+local EspTune = {
+    Nextbot = false,
+    Downed = false,
+    Players = false,
+}
+
+local espHighlights = {}
+
+local function setHighlight(model, enabled, color)
+    local highlight = espHighlights[model]
+    if enabled then
+        if not highlight then
+            highlight = Instance.new("Highlight")
+            highlight.FillTransparency = 0.5
+            highlight.OutlineTransparency = 0
+            highlight.Parent = model
+            espHighlights[model] = highlight
+        end
+        highlight.FillColor = color
+        highlight.OutlineColor = color
+    elseif highlight then
+        highlight:Destroy()
+        espHighlights[model] = nil
+    end
+end
+
+local function clearAllHighlights()
+    for model, highlight in pairs(espHighlights) do
+        highlight:Destroy()
+        espHighlights[model] = nil
+    end
+end
+
+task.spawn(function()
+    while not Unloading do
+        local localCharacter = CharacterService:GetLocalCharacter()
+        local tracked = {}
+
+        for _, entry in ipairs(CharacterService:GetCharacters()) do
+            local model = entry.Model
+            if model and entry ~= localCharacter then
+                tracked[model] = true
+                local isNextbot = model:GetAttribute("Team") == "Nextbot"
+                local isDowned = entry.DataRegistry ~= nil and entry.DataRegistry:Get("Downed") == true
+                local wantHighlight, color = false, nil
+
+                if EspTune.Downed and isDowned then
+                    wantHighlight, color = true, Color3.fromRGB(255, 210, 60)
+                elseif EspTune.Nextbot and isNextbot then
+                    wantHighlight, color = true, Color3.fromRGB(255, 60, 60)
+                elseif EspTune.Players and not isNextbot then
+                    wantHighlight, color = true, Color3.fromRGB(80, 170, 255)
+                end
+
+                setHighlight(model, wantHighlight, color)
+            end
+        end
+
+        for model in pairs(espHighlights) do
+            if not tracked[model] then
+                setHighlight(model, false)
+            end
+        end
+
+        task.wait(0.5)
+    end
+end)
+
+local VisualsTab = Window:CreateTab({ Title = 'visuals' })
+local EspSection = VisualsTab:CreateSection('esp')
+
+EspSection:Toggle({
+    Title = 'nextbot esp',
+    Description = 'highlights every character on the Nextbot team',
+    Flag = 'evade_esp_nextbot',
+    Default = false,
+    Callback = function(state) EspTune.Nextbot = state end,
+})
+
+EspSection:Toggle({
+    Title = 'downed player esp',
+    Description = 'highlights any character currently downed, regardless of team - useful for spotting revive targets',
+    Flag = 'evade_esp_downed',
+    Default = false,
+    Callback = function(state) EspTune.Downed = state end,
+})
+
+EspSection:Toggle({
+    Title = 'player esp',
+    Description = 'highlights every other non-nextbot character',
+    Flag = 'evade_esp_players',
+    Default = false,
+    Callback = function(state) EspTune.Players = state end,
+})
+
 local ReviveTab = Window:CreateTab({ Title = 'revive' })
 local ReviveSection = ReviveTab:CreateSection('manual revive')
 
+ReviveSection:Stats({
+    Columns = 1,
+    Items = {
+        { Label = 'patched configs', Value = function()
+            return Tune.ReviveOverrideEnabled and tostring(ReviveState.PatchedCount) or 'off'
+        end },
+    },
+})
+
 ReviveSection:Toggle({
-    Title = 'override revive time',
-    Description = 'patches every gamemode\'s revive-hold duration to the value below. this is a client-side data edit - if the server independently times the hold, this will only change what you see locally, not what actually completes it',
+    Title = 'instant revive',
+    Description = 'patches every gamemode\'s revive-hold duration to the value below (0 by default) and keeps reapplying it every couple seconds. this is a client-side data edit - if the server independently times the hold, this only changes what you see locally, not what actually completes it. the stat above shows how many configs it actually found and patched',
     Flag = 'evade_revive_override',
     Default = false,
     Callback = function(state)
         Tune.ReviveOverrideEnabled = state
-        if state then applyReviveOverride() end
+        applyReviveOverride()
     end,
 })
 
 ReviveSection:Slider({
-    Title = 'revive time',
+    Title = 'custom revive time (advanced)',
     Min = 0,
     Max = 1.4,
     Increment = 0.1,
@@ -400,6 +561,185 @@ ReviveSection:Button({
     Callback = applyReviveOverride,
 })
 
+local MINI_WINDOW_ACCENT = Color3.fromRGB(210, 45, 45)
+
+local AutoJumpWindow
+local AutoJumpActive = false
+local AutoJumpInterval = 0.15
+
+local function destroyAutoJumpWindow()
+    if AutoJumpWindow then
+        AutoJumpWindow:Destroy()
+        AutoJumpWindow = nil
+    end
+    AutoJumpActive = false
+end
+
+local function buildAutoJumpWindow()
+    destroyAutoJumpWindow()
+    AutoJumpWindow = Onyx:CreateWindow({
+        Title = 'auto jump',
+        Size = UDim2.fromOffset(220, 130),
+        MinSize = Vector2.new(160, 100),
+        Resizable = true,
+        Settings = false,
+        ShowUserInfo = false,
+        Accent = MINI_WINDOW_ACCENT,
+    })
+    local tab = AutoJumpWindow:CreateTab({ Title = 'jump' })
+    local section = tab:CreateSection('auto jump')
+    section:Toggle({
+        Title = 'active',
+        Callback = function(state) AutoJumpActive = state end,
+    })
+end
+
+task.spawn(function()
+    while not Unloading do
+        if AutoJumpActive then
+            local character = CharacterService:GetLocalCharacter()
+            local movement = character and character.Movement
+            if movement then
+                pcall(function() movement:JumpReact() end)
+            end
+        end
+        task.wait(AutoJumpInterval)
+    end
+end)
+
+local AutoReviveWindow
+local AutoReviveActive = false
+local AutoReviveRange = 8
+local reviveHolding = false
+
+local function findDownedTeammateInRange()
+    local localCharacter = CharacterService:GetLocalCharacter()
+    if not localCharacter or not localCharacter.Model or not localCharacter.Model.PrimaryPart then
+        return nil
+    end
+    local myTeam = localCharacter.Model:GetAttribute("Team")
+    local myPosition = localCharacter.Model.PrimaryPart.Position
+    for _, entry in ipairs(CharacterService:GetCharacters()) do
+        if entry ~= localCharacter and entry.Model and entry.Model.PrimaryPart
+            and myTeam ~= nil and entry.Model:GetAttribute("Team") == myTeam
+            and entry.DataRegistry and entry.DataRegistry:Get("Downed") == true then
+            local distance = (entry.Model.PrimaryPart.Position - myPosition).Magnitude
+            if distance <= AutoReviveRange then
+                return entry
+            end
+        end
+    end
+    return nil
+end
+
+local function releaseReviveHold()
+    if not reviveHolding then return end
+    reviveHolding = false
+    local character = CharacterService:GetLocalCharacter()
+    if character then
+        pcall(function() character:KeyUsed({ Key = "Interact", Down = false }) end)
+    end
+end
+
+local function destroyAutoReviveWindow()
+    if AutoReviveWindow then
+        AutoReviveWindow:Destroy()
+        AutoReviveWindow = nil
+    end
+    AutoReviveActive = false
+    releaseReviveHold()
+end
+
+local function buildAutoReviveWindow()
+    destroyAutoReviveWindow()
+    AutoReviveWindow = Onyx:CreateWindow({
+        Title = 'auto revive',
+        Size = UDim2.fromOffset(220, 130),
+        MinSize = Vector2.new(160, 100),
+        Resizable = true,
+        Settings = false,
+        ShowUserInfo = false,
+        Accent = MINI_WINDOW_ACCENT,
+    })
+    local tab = AutoReviveWindow:CreateTab({ Title = 'revive' })
+    local section = tab:CreateSection('auto revive')
+    section:Toggle({
+        Title = 'active',
+        Callback = function(state)
+            AutoReviveActive = state
+            if not state then releaseReviveHold() end
+        end,
+    })
+end
+
+-- calls the same Character:KeyUsed({Key="Interact", Down=...}) path the
+-- game's own input handler calls on a real keypress (confirmed from the
+-- dump: KeybindService binds E to the "Interact" action, and Character:
+-- KeyUsed forwards it to ToolProfile:KeyPhraseUsed, which resolves and
+-- fires the tool's real activation) - not a guessed remote call
+task.spawn(function()
+    while not Unloading do
+        if AutoReviveActive then
+            local character = CharacterService:GetLocalCharacter()
+            local target = character and findDownedTeammateInRange()
+            if target and not reviveHolding then
+                reviveHolding = true
+                pcall(function() character:KeyUsed({ Key = "Interact", Down = true }) end)
+            elseif not target and reviveHolding then
+                releaseReviveHold()
+            end
+        elseif reviveHolding then
+            releaseReviveHold()
+        end
+        task.wait(0.2)
+    end
+end)
+
+local ExtraTab = Window:CreateTab({ Title = 'extra' })
+local AutoSection = ExtraTab:CreateSection('automation')
+
+AutoSection:Toggle({
+    Title = 'auto jump panel',
+    Description = 'shows a small resizable window with its own on/off switch, so auto jump can be started or stopped without opening this menu',
+    Flag = 'evade_auto_jump_panel',
+    Default = false,
+    Callback = function(state)
+        if state then buildAutoJumpWindow() else destroyAutoJumpWindow() end
+    end,
+})
+
+AutoSection:Slider({
+    Title = 'auto jump interval',
+    Min = 0.05,
+    Max = 1,
+    Increment = 0.05,
+    Default = AutoJumpInterval,
+    Suffix = ' s',
+    Flag = 'evade_auto_jump_interval',
+    Callback = function(value) AutoJumpInterval = value end,
+})
+
+AutoSection:Toggle({
+    Title = 'auto revive panel',
+    Description = 'shows a small resizable window with its own on/off switch. while active, automatically holds interact on the nearest downed teammate in range - the same input path a real keypress uses, just triggered by range instead of a key',
+    Flag = 'evade_auto_revive_panel',
+    Default = false,
+    Callback = function(state)
+        if state then buildAutoReviveWindow() else destroyAutoReviveWindow() end
+    end,
+})
+
+AutoSection:Slider({
+    Title = 'auto revive range',
+    Min = 3,
+    Max = 20,
+    Increment = 1,
+    Default = AutoReviveRange,
+    Suffix = ' studs',
+    Flag = 'evade_auto_revive_range',
+    Callback = function(value) AutoReviveRange = value end,
+})
+
 local SessionTab = Window:CreateTab({ Title = 'session' })
 local SessionSection = SessionTab:CreateSection('session')
 
@@ -410,11 +750,15 @@ SessionSection:Button({
         Unloading = true
         Functions.Slide = originalSlide
         MovementClass.Jump = originalJump
+        if touchConnection then touchConnection:Disconnect() end
+        clearAllHighlights()
+        destroyAutoJumpWindow()
+        destroyAutoReviveWindow()
         Onyx:Unload()
     end,
 })
 
 SessionSection:Paragraph({
     Title = 'unload',
-    Content = 'Restores the slide and jump functions to their original behavior, stops the movement-stat loop, then closes the menu.',
+    Content = 'Restores the slide and jump functions to their original behavior, stops every loop, clears esp, closes the auto jump/revive panels if open, then closes the menu.',
 })
