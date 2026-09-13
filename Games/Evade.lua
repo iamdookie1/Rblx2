@@ -1190,13 +1190,6 @@ task.spawn(function()
     end
 end)
 
-local AutoRevivePanel
-local AutoReviveElement
-local AutoReviveActive = false
-local AutoReviveRange = 8
-local reviveHolding = false
-local reviveHeldSince = 0
-
 local RELEASE_RANGE_MARGIN = 2
 local MIN_HOLD_TIME = 0.3
 
@@ -1223,86 +1216,110 @@ end
 -- calls character.ToolProfile:KeyPhraseUsed directly instead of the broader
 -- Character:KeyUsed, which also fans this same "Interact" event out to
 -- Camera/Movement/Actions/Animations - none of which have anything to do
--- with reviving, but any of which could react to a simulated Interact key
--- in ways unrelated to revive (this is almost certainly what was described
--- as auto revive interfering with other downed-related actions and their
--- ui). ToolProfile is the only one that owns the revive task at all
+-- with reviving or carrying, but any of which could react to a simulated
+-- Interact key in unrelated ways. ToolProfile is the only one that owns
+-- whichever downed-teammate task actually resolves from pressing it
 local function sendInteract(character, down)
     if not character or not character.ToolProfile then return end
     pcall(function() character.ToolProfile:KeyPhraseUsed({ Key = "Interact", Down = down }) end)
 end
 
-local function releaseReviveHold()
-    if not reviveHolding then return end
-    reviveHolding = false
-    sendInteract(CharacterService:GetLocalCharacter(), false)
-end
+-- revive and carry both turned out to run through this exact same
+-- mechanism: holding Interact on a nearby downed teammate, with the game
+-- itself resolving which of the two tasks that actually triggers - no
+-- separate carry keybind or remote exists anywhere in the dump. so both
+-- "features" below are really the same automation instantiated twice,
+-- each with its own toggle, panel, range and hold state, since the two are
+-- still meant to be controlled independently even though they do the same
+-- thing under the hood
+local function createDownedInteractAutomation(panelTitle, defaultRange)
+    local automation = {
+        Panel = nil,
+        Element = nil,
+        Active = false,
+        Range = defaultRange,
+        Holding = false,
+        HeldSince = 0,
+        SuppressPanelSync = false,
+    }
 
--- same panel-persistence contract as auto jump: turning the feature off
--- FROM THE PANEL must never remove the panel, only the main toggle does
-local suppressRevivePanelSync = false
-local function setAutoReviveActive(state, fromPanel)
-    AutoReviveActive = state
-    if not state then releaseReviveHold() end
-
-    if fromPanel then
-        if AutoReviveElement then
-            suppressRevivePanelSync = true
-            AutoReviveElement:Set(state)
-            suppressRevivePanelSync = false
-        end
-        return
+    local function releaseHold()
+        if not automation.Holding then return end
+        automation.Holding = false
+        sendInteract(CharacterService:GetLocalCharacter(), false)
     end
+    automation.ReleaseHold = releaseHold
 
-    if suppressRevivePanelSync then return end
+    -- same panel-persistence contract as auto jump: turning the feature off
+    -- FROM THE PANEL must never remove the panel, only the main toggle does
+    local function setActive(state, fromPanel)
+        automation.Active = state
+        if not state then releaseHold() end
 
-    if state then
-        if AutoRevivePanel then
-            AutoRevivePanel.SetActive(true)
-        else
-            AutoRevivePanel = createFloatingPanel('auto revive', true, function(panelState)
-                setAutoReviveActive(panelState, true)
-            end)
-        end
-    elseif AutoRevivePanel then
-        AutoRevivePanel.Destroy()
-        AutoRevivePanel = nil
-    end
-end
-
--- acquiring a hold uses the configured range, releasing needs the target to
--- drift RELEASE_RANGE_MARGIN studs further out than that, and a hold can't
--- end before MIN_HOLD_TIME regardless - without this, a teammate sitting
--- right at the edge of the range during ordinary movement jitter flickered
--- in and out of range many times a second, which meant rapid real
--- press/release events reaching the actual revive task - reported as this
--- messing up the revive ui and other downed-related actions, which lines up
--- exactly with spamming a real interact key that fast would also do
-task.spawn(function()
-    while not Unloading do
-        pcall(function()
-            if AutoReviveActive then
-                local character = CharacterService:GetLocalCharacter()
-                if reviveHolding then
-                    local target = character and findDownedTeammate(AutoReviveRange + RELEASE_RANGE_MARGIN)
-                    if not target and (os.clock() - reviveHeldSince) >= MIN_HOLD_TIME then
-                        releaseReviveHold()
-                    end
-                else
-                    local target = character and findDownedTeammate(AutoReviveRange)
-                    if target then
-                        reviveHolding = true
-                        reviveHeldSince = os.clock()
-                        sendInteract(character, true)
-                    end
-                end
-            elseif reviveHolding then
-                releaseReviveHold()
+        if fromPanel then
+            if automation.Element then
+                automation.SuppressPanelSync = true
+                automation.Element:Set(state)
+                automation.SuppressPanelSync = false
             end
-        end)
-        task.wait(0.2)
+            return
+        end
+
+        if automation.SuppressPanelSync then return end
+
+        if state then
+            if automation.Panel then
+                automation.Panel.SetActive(true)
+            else
+                automation.Panel = createFloatingPanel(panelTitle, true, function(panelState)
+                    setActive(panelState, true)
+                end)
+            end
+        elseif automation.Panel then
+            automation.Panel.Destroy()
+            automation.Panel = nil
+        end
     end
-end)
+    automation.SetActive = setActive
+
+    -- acquiring a hold uses the configured range, releasing needs the
+    -- target to drift RELEASE_RANGE_MARGIN studs further out than that, and
+    -- a hold can't end before MIN_HOLD_TIME regardless - without this, a
+    -- teammate sitting right at the edge of the range during ordinary
+    -- movement jitter flickered in and out many times a second, meaning
+    -- rapid real press/release events reaching the actual task - which is
+    -- exactly what spamming the real key that fast would also do
+    task.spawn(function()
+        while not Unloading do
+            pcall(function()
+                if automation.Active then
+                    local character = CharacterService:GetLocalCharacter()
+                    if automation.Holding then
+                        local target = character and findDownedTeammate(automation.Range + RELEASE_RANGE_MARGIN)
+                        if not target and (os.clock() - automation.HeldSince) >= MIN_HOLD_TIME then
+                            releaseHold()
+                        end
+                    else
+                        local target = character and findDownedTeammate(automation.Range)
+                        if target then
+                            automation.Holding = true
+                            automation.HeldSince = os.clock()
+                            sendInteract(character, true)
+                        end
+                    end
+                elseif automation.Holding then
+                    releaseHold()
+                end
+            end)
+            task.wait(0.2)
+        end
+    end)
+
+    return automation
+end
+
+local AutoRevive = createDownedInteractAutomation('auto revive', 8)
+local AutoCarry = createDownedInteractAutomation('auto carry', 8)
 
 local ExtraTab = Window:CreateTab({ Title = 'extra' })
 local AutoSection = ExtraTab:CreateSection('automation')
@@ -1326,12 +1343,12 @@ AutoSection:Slider({
     Callback = function(value) AutoJumpInterval = value end,
 })
 
-AutoReviveElement = AutoSection:Toggle({
+AutoRevive.Element = AutoSection:Toggle({
     Title = 'auto revive',
     Description = 'automatically holds interact on the nearest downed teammate in range - the same input path a real keypress uses, just triggered by range instead of a key. also opens a small draggable pill with its own switch, synced with this one either direction',
     Flag = 'evade_auto_revive',
     Default = false,
-    Callback = function(state) setAutoReviveActive(state, false) end,
+    Callback = function(state) AutoRevive.SetActive(state, false) end,
 })
 
 AutoSection:Slider({
@@ -1339,10 +1356,29 @@ AutoSection:Slider({
     Min = 3,
     Max = 20,
     Increment = 1,
-    Default = AutoReviveRange,
+    Default = AutoRevive.Range,
     Suffix = ' studs',
     Flag = 'evade_auto_revive_range',
-    Callback = function(value) AutoReviveRange = value end,
+    Callback = function(value) AutoRevive.Range = value end,
+})
+
+AutoCarry.Element = AutoSection:Toggle({
+    Title = 'auto carry',
+    Description = 'checked directly in the game\'s own code: carrying and reviving a downed teammate turned out to go through the exact same interact-on-a-downed-teammate mechanism, with the game itself deciding which one actually happens - so this is functionally the same automation as auto revive above, just controlled separately in case you want one running without the other',
+    Flag = 'evade_auto_carry',
+    Default = false,
+    Callback = function(state) AutoCarry.SetActive(state, false) end,
+})
+
+AutoSection:Slider({
+    Title = 'auto carry range',
+    Min = 3,
+    Max = 20,
+    Increment = 1,
+    Default = AutoCarry.Range,
+    Suffix = ' studs',
+    Flag = 'evade_auto_carry_range',
+    Callback = function(value) AutoCarry.Range = value end,
 })
 
 local UtilitySection = ExtraTab:CreateSection('utility')
@@ -1426,6 +1462,8 @@ local function resetAllOptions()
         evade_auto_jump_interval = 0.15,
         evade_auto_revive = false,
         evade_auto_revive_range = 8,
+        evade_auto_carry = false,
+        evade_auto_carry_range = 8,
     }
 
     for flag, value in pairs(defaults) do
@@ -1452,7 +1490,8 @@ SessionSection:Button({
         restoreLighting()
         clearAllHighlights()
         setAutoJumpActive(false, false)
-        setAutoReviveActive(false, false)
+        AutoRevive.SetActive(false, false)
+        AutoCarry.SetActive(false, false)
         Onyx:Unload()
     end,
 })
