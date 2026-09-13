@@ -77,6 +77,11 @@ local Tune = {
     ObjectTrimpMultiplier = 1,
     ObjectTrimpMinSpeed = 20,
     WallrunJumpBoost = 1,
+    EdgeTrimpEnabled = false,
+    EdgeTrimpMinSpeed = 25,
+    EdgeLookahead = 4,
+    SpiderHopEnabled = false,
+    TrickCooldown = 0.15,
 
     SlideOverrideEnabled = false,
     SlideMultiplier = 1,
@@ -314,6 +319,73 @@ local trimpConnection = RunService.Heartbeat:Connect(function()
         lastGroundWasObject = false
         wasGrounded = false
     end
+end)
+
+-- edge trimp and spider hop are both timing tricks rather than new mechanics:
+-- neither adds anything the game doesn't already do, they just press jump on
+-- the one frame that gets the most out of the game's own Jump. Which is why
+-- both go through Movement:AttemptJump() - the exact call a real keypress
+-- ends up at - rather than writing velocity directly
+local lastTrickJumpAt = -math.huge
+
+local function trickJump(movement, label)
+    local now = os.clock()
+    if (now - lastTrickJumpAt) < Tune.TrickCooldown then return false end
+    lastTrickJumpAt = now
+    movement:AttemptJump()
+    logEvent(label)
+    return true
+end
+
+local tricksConnection = RunService.Heartbeat:Connect(function()
+    if not (Tune.EdgeTrimpEnabled or Tune.SpiderHopEnabled) then return end
+    pcall(function()
+        local character = CharacterService:GetLocalCharacter()
+        if not character or not character.Movement then return end
+        local model = character.Model
+        local root = model and model.PrimaryPart
+        if not root then return end
+        local movement = character.Movement
+        local registry = character.DataRegistry
+
+        -- spider hop: a wallrun already ends in a jump that kicks you along
+        -- the wall, so re-entering a wallrun and jumping again immediately
+        -- chains those kicks up the same wall. Wallrun itself needs you
+        -- airborne, uncrouched, not carrying and above 20 relative speed, so
+        -- this only ever engages off a real run-up - it cannot make a wall
+        -- climbable from a standstill
+        if Tune.SpiderHopEnabled then
+            local state = movement.State
+            if state == "WallrunLeft" or state == "WallrunRight" then
+                trickJump(movement, 'spider hop: chained off ' .. state)
+                return
+            end
+        end
+
+        -- edge trimp: the native trimp in Jump converts your run speed into
+        -- forward speed, and it pays out most on the last frame you are still
+        -- grounded. Rather than guessing that frame by feel, this looks a
+        -- short way ahead along the direction you are actually moving and
+        -- jumps once there is no longer ground under that point
+        if Tune.EdgeTrimpEnabled then
+            if registry:Get("Grounded") ~= true then return end
+            local velocity = registry:Get("Velocity")
+            if not velocity then return end
+            local horizontal = Vector3.new(velocity.X, 0, velocity.Z)
+            local studs = horizontal.Magnitude / 90
+            if studs < Tune.EdgeTrimpMinSpeed then return end
+
+            local params = RaycastParams.new()
+            params.FilterType = Enum.RaycastFilterType.Exclude
+            params.FilterDescendantsInstances = { model }
+            -- the lookahead scales with how fast you are going, so the jump
+            -- lands at the same distance from the edge at any speed
+            local ahead = root.Position + horizontal.Unit * (Tune.EdgeLookahead * math.max(studs / 40, 0.5))
+            if not workspace:Raycast(ahead, Vector3.new(0, -6, 0), params) then
+                trickJump(movement, ('edge trimp at %d studs/s'):format(studs))
+            end
+        end
+    end)
 end)
 
 local OriginalLighting = {
@@ -574,6 +646,66 @@ TrimpSection:Slider({
     Suffix = ' studs/s',
     Flag = 'evade_object_trimp_min_speed',
     Callback = function(value) Tune.ObjectTrimpMinSpeed = value end,
+})
+
+local TricksSection = MovementTab:CreateSection({ Title = 'tricks', Collapsible = true })
+
+TricksSection:Toggle({
+    Title = 'edge trimp',
+    Description = 'jumps for you on the last frame before you run off a ledge. the game\'s own trimp converts run speed into forward speed on a jump and pays out most right at an edge - this just hits that frame every time instead of by feel. it presses jump through the same call a real keypress does, so nothing here happens that you could not do by hand',
+    Flag = 'evade_edge_trimp',
+    Default = false,
+    Mini = true,
+    Callback = function(state) Tune.EdgeTrimpEnabled = state end,
+})
+
+TricksSection:Toggle({
+    Title = 'spider hop',
+    Description = 'jumps the instant you enter a wallrun, which chains the wall kick over and over up the same wall. wallrun needs you airborne, uncrouched, not carrying and over 20 relative speed, so this still needs a real run-up to start - it will not climb a wall from standing',
+    Flag = 'evade_spider_hop',
+    Default = false,
+    Mini = true,
+    Callback = function(state) Tune.SpiderHopEnabled = state end,
+})
+
+TricksSection:Divider('edge')
+
+TricksSection:Slider({
+    Title = 'edge trimp min speed',
+    Description = 'below this you are not moving fast enough for a trimp to be worth anything, so it stays out of the way while walking around',
+    Min = 0,
+    Max = 80,
+    Increment = 1,
+    Default = 25,
+    Suffix = ' studs/s',
+    Flag = 'evade_edge_trimp_min_speed',
+    Callback = function(value) Tune.EdgeTrimpMinSpeed = value end,
+})
+
+TricksSection:Slider({
+    Title = 'edge lookahead',
+    Description = 'how far ahead of you it checks for missing ground. scaled by your speed so the jump fires the same distance from the edge whether you are running or sliding - raise it if it jumps too late, lower it if it jumps at nothing',
+    Min = 1,
+    Max = 12,
+    Increment = 0.5,
+    Default = 4,
+    Suffix = ' studs',
+    Flag = 'evade_edge_lookahead',
+    Callback = function(value) Tune.EdgeLookahead = value end,
+})
+
+TricksSection:Divider('shared')
+
+TricksSection:Slider({
+    Title = 'trick cooldown',
+    Description = 'minimum gap between two automatic jumps from either trick, so one ledge or one wall cannot fire a jump every single frame',
+    Min = 0.05,
+    Max = 1,
+    Increment = 0.05,
+    Default = 0.15,
+    Suffix = ' s',
+    Flag = 'evade_trick_cooldown',
+    Callback = function(value) Tune.TrickCooldown = value end,
 })
 
 local SlideSection = MovementTab:CreateSection({ Title = 'slide', Collapsible = true })
@@ -1982,6 +2114,11 @@ local function resetAllOptions()
         evade_object_trimp_mult = 1,
         evade_object_trimp_min_speed = 20,
         evade_wallrun_jump_boost = 1,
+        evade_edge_trimp = false,
+        evade_edge_trimp_min_speed = 25,
+        evade_edge_lookahead = 4,
+        evade_spider_hop = false,
+        evade_trick_cooldown = 0.15,
         evade_slide_override = false,
         evade_slide_mult = 1,
         evade_slide_max_speed = DEFAULT_SLIDE_MAX_SPEED,
@@ -2074,6 +2211,7 @@ SessionSection:Button({
         Functions.Slide = originalSlide
         MovementClass.Jump = originalJump
         trimpConnection:Disconnect()
+        tricksConnection:Disconnect()
         tracerConnection:Disconnect()
         restoreLighting()
         clearAllHighlights()
