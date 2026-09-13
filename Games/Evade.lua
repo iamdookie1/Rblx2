@@ -1135,15 +1135,36 @@ local AutoJumpElement
 local AutoJumpActive = false
 local AutoJumpInterval = 0.15
 
+-- the panel is quick access to flip the feature on/off without reopening
+-- this menu, so turning it off FROM THE PANEL must never remove the panel
+-- itself - only the main toggle (fromPanel == false) installs/uninstalls
+-- it. syncing the main toggle's own visual after a panel click still fires
+-- that toggle's callback though (Onyx's :Set always does), so the suppress
+-- flag stops that echoed call from re-running the install/uninstall logic
+local suppressJumpPanelSync = false
 local function setAutoJumpActive(state, fromPanel)
     AutoJumpActive = state
-    if not fromPanel and AutoJumpPanel then AutoJumpPanel.SetActive(state) end
-    if state and not AutoJumpPanel then
-        AutoJumpPanel = createFloatingPanel('auto jump', true, function(panelState)
-            setAutoJumpActive(panelState, true)
-            if AutoJumpElement then AutoJumpElement:Set(panelState) end
-        end)
-    elseif not state and AutoJumpPanel then
+
+    if fromPanel then
+        if AutoJumpElement then
+            suppressJumpPanelSync = true
+            AutoJumpElement:Set(state)
+            suppressJumpPanelSync = false
+        end
+        return
+    end
+
+    if suppressJumpPanelSync then return end
+
+    if state then
+        if AutoJumpPanel then
+            AutoJumpPanel.SetActive(true)
+        else
+            AutoJumpPanel = createFloatingPanel('auto jump', true, function(panelState)
+                setAutoJumpActive(panelState, true)
+            end)
+        end
+    elseif AutoJumpPanel then
         AutoJumpPanel.Destroy()
         AutoJumpPanel = nil
     end
@@ -1217,16 +1238,33 @@ local function releaseReviveHold()
     sendInteract(CharacterService:GetLocalCharacter(), false)
 end
 
+-- same panel-persistence contract as auto jump: turning the feature off
+-- FROM THE PANEL must never remove the panel, only the main toggle does
+local suppressRevivePanelSync = false
 local function setAutoReviveActive(state, fromPanel)
     AutoReviveActive = state
     if not state then releaseReviveHold() end
-    if not fromPanel and AutoRevivePanel then AutoRevivePanel.SetActive(state) end
-    if state and not AutoRevivePanel then
-        AutoRevivePanel = createFloatingPanel('auto revive', true, function(panelState)
-            setAutoReviveActive(panelState, true)
-            if AutoReviveElement then AutoReviveElement:Set(panelState) end
-        end)
-    elseif not state and AutoRevivePanel then
+
+    if fromPanel then
+        if AutoReviveElement then
+            suppressRevivePanelSync = true
+            AutoReviveElement:Set(state)
+            suppressRevivePanelSync = false
+        end
+        return
+    end
+
+    if suppressRevivePanelSync then return end
+
+    if state then
+        if AutoRevivePanel then
+            AutoRevivePanel.SetActive(true)
+        else
+            AutoRevivePanel = createFloatingPanel('auto revive', true, function(panelState)
+                setAutoReviveActive(panelState, true)
+            end)
+        end
+    elseif AutoRevivePanel then
         AutoRevivePanel.Destroy()
         AutoRevivePanel = nil
     end
