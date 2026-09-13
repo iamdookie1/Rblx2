@@ -75,6 +75,8 @@ local Tune = {
     JumpTrimpMultiplier = 1,
     ObjectTrimpEnabled = false,
     ObjectTrimpMultiplier = 1,
+    ObjectTrimpMinSpeed = 20,
+    WallrunJumpBoost = 1,
 
     SlideOverrideEnabled = false,
     SlideMultiplier = 1,
@@ -189,43 +191,92 @@ Functions.Slide = function(dt, moveConfig, dataRegistry, character, moveStats)
     return mover, terms
 end
 
-local function boostHorizontalVelocity(dataRegistry, multiplier)
+local EventLog = { Sink = nil }
+local function logEvent(...)
+    if EventLog.Sink then pcall(EventLog.Sink, ...) end
+end
+
+-- minSpeedStuds gates the boost on how fast you were actually moving, in
+-- real studs/s rather than the engine's internal units (x90), so a slider
+-- reads in the same terms as the speed stat everywhere else
+local function boostHorizontalVelocity(dataRegistry, multiplier, minSpeedStuds)
     local velocity = dataRegistry:Get("Velocity")
-    if not velocity then return end
+    if not velocity then return false end
     local horizontal = Vector3.new(velocity.X, 0, velocity.Z)
-    if horizontal.Magnitude > 1 then
-        local boosted = horizontal * multiplier
-        dataRegistry:Set("Velocity", Vector3.new(boosted.X, velocity.Y, boosted.Z))
-    end
+    local studs = horizontal.Magnitude / 90
+    if studs < (minSpeedStuds or 0.01) then return false end
+    local boosted = horizontal * multiplier
+    dataRegistry:Set("Velocity", Vector3.new(boosted.X, velocity.Y, boosted.Z))
+    return true, studs
 end
 
 -- same restore-on-unload contract as Slide; scoped by comparing the live
--- character model rather than a captured reference so it survives respawns
+-- character model rather than a captured reference so it survives respawns.
+-- the timestamp is recorded for EVERY local jump, not only boosted ones,
+-- because object trimp below needs to know a jump happened at all
+local lastJumpAt = -math.huge
 local originalJump = MovementClass.Jump
 MovementClass.Jump = function(self, ...)
-    local boost = Tune.JumpTrimpEnabled and self.Character == LocalPlayer.Character
+    local isLocal = self.Character == LocalPlayer.Character
+    -- read before the call, since the original Jump is what ends the wallrun
+    local wallrunState = isLocal and (self.State == "WallrunLeft" or self.State == "WallrunRight")
     local a, b = originalJump(self, ...)
-    if boost then
-        boostHorizontalVelocity(self.DataRegistry, Tune.JumpTrimpMultiplier)
+    if isLocal then
+        lastJumpAt = os.clock()
+        if Tune.JumpTrimpEnabled then
+            local fired, studs = boostHorizontalVelocity(self.DataRegistry, Tune.JumpTrimpMultiplier)
+            if fired then logEvent(("jump trimp %.2fx at %d studs/s"):format(Tune.JumpTrimpMultiplier, studs)) end
+        end
+        -- jumping off a wall natively adds WallrunDir * 90 * 30 to velocity;
+        -- this tops that same kick up rather than replacing it, so a boost of
+        -- 1 leaves the game's own number exactly as it was
+        if wallrunState and Tune.WallrunJumpBoost > 1 then
+            pcall(function()
+                local direction = self.DataRegistry:Get("WallrunDir")
+                if not direction then return end
+                local extra = direction * 90 * 30 * (Tune.WallrunJumpBoost - 1)
+                self.DataRegistry:Set("Velocity", self.DataRegistry:Get("Velocity") + extra)
+                logEvent(("wallrun jump %.2fx"):format(Tune.WallrunJumpBoost))
+            end)
+        end
     end
     return a, b
 end
 
 -- the native Slide state only reads slope off workspace.Map.Parts (its own
 -- raycast is whitelisted to exactly that), so a crate or prop never gets
--- ramp treatment no matter how it's shaped. object trimp used to require
--- reading a tilted surface normal to fire, but trimping off an object isn't
--- actually about geometric slope - it can happen leaving a perfectly flat
--- crate too - so this now fires off leaving ANY grounded surface that
--- wasn't part of that native whitelist, tilted or not
+-- ramp treatment no matter how it's shaped - that whitelist is what this
+-- extends to everything else.
+--
+-- the catch: leaving the ground is leaving the ground, and a jump is the
+-- most common way to do it, so this used to fire on every jump off a prop
+-- and was just a worse duplicate of jump trimp. it now ignores any liftoff
+-- within JUMP_EXCLUSION_WINDOW of a real jump, leaving only the case it was
+-- ever meant for - running or being launched off an object without jumping.
+-- the speed gate and cooldown stop the remaining edge cases (stepping off a
+-- kerb at walking pace, or one ledge re-firing every few frames)
 local MapPartsContainer
 do
     local mapFolder = workspace:WaitForChild("Map", 10)
     MapPartsContainer = mapFolder and mapFolder:WaitForChild("Parts", 10)
 end
 
+local JUMP_EXCLUSION_WINDOW = 0.25
+local OBJECT_TRIMP_COOLDOWN = 0.4
+
 local lastGroundWasObject = false
 local wasGrounded = false
+local lastObjectTrimpAt = -math.huge
+
+-- the handler below skips its own bookkeeping entirely while the feature is
+-- off, so those two flags are whatever they were when it was last turned off.
+-- Without clearing them, switching it back on mid-air could see a stale
+-- "was grounded on an object" and fire a trimp that nothing actually caused
+local function resetObjectTrimpState()
+    lastGroundWasObject = false
+    wasGrounded = false
+    lastObjectTrimpAt = -math.huge
+end
 
 local trimpConnection = RunService.Heartbeat:Connect(function()
     if not Tune.ObjectTrimpEnabled then return end
@@ -243,7 +294,17 @@ local trimpConnection = RunService.Heartbeat:Connect(function()
             lastGroundWasObject = result ~= nil
                 and not (MapPartsContainer and result.Instance:IsDescendantOf(MapPartsContainer))
         elseif wasGrounded and lastGroundWasObject then
-            boostHorizontalVelocity(character.DataRegistry, Tune.ObjectTrimpMultiplier)
+            local now = os.clock()
+            local jumped = (now - lastJumpAt) < JUMP_EXCLUSION_WINDOW
+            local cooling = (now - lastObjectTrimpAt) < OBJECT_TRIMP_COOLDOWN
+            if not jumped and not cooling then
+                local fired, studs = boostHorizontalVelocity(
+                    character.DataRegistry, Tune.ObjectTrimpMultiplier, Tune.ObjectTrimpMinSpeed)
+                if fired then
+                    lastObjectTrimpAt = now
+                    logEvent(("object trimp %.2fx at %d studs/s"):format(Tune.ObjectTrimpMultiplier, studs))
+                end
+            end
             lastGroundWasObject = false
         end
 
@@ -261,6 +322,9 @@ local OriginalLighting = {
     ClockTime = Lighting.ClockTime,
     Ambient = Lighting.Ambient,
     OutdoorAmbient = Lighting.OutdoorAmbient,
+    FogEnd = Lighting.FogEnd,
+    FogStart = Lighting.FogStart,
+    GlobalShadows = Lighting.GlobalShadows,
 }
 
 local function restoreLighting()
@@ -269,6 +333,20 @@ local function restoreLighting()
     Lighting.ClockTime = OriginalLighting.ClockTime
     Lighting.Ambient = OriginalLighting.Ambient
     Lighting.OutdoorAmbient = OriginalLighting.OutdoorAmbient
+    Lighting.FogEnd = OriginalLighting.FogEnd
+    Lighting.FogStart = OriginalLighting.FogStart
+    Lighting.GlobalShadows = OriginalLighting.GlobalShadows
+    -- the no-fog toggle stashes each Atmosphere's own density on the instance
+    -- itself, so this restores whatever was there rather than a guessed value
+    for _, item in ipairs(Lighting:GetChildren()) do
+        if item:IsA("Atmosphere") then
+            local stored = item:GetAttribute("EvadeDensity")
+            if stored then
+                item.Density = stored
+                item:SetAttribute("EvadeDensity", nil)
+            end
+        end
+    end
 end
 
 local Window = Onyx:CreateWindow({
@@ -305,13 +383,17 @@ LiveSection:Stats({
         end },
     },
 })
-LiveSection:Paragraph({
+-- shown at the bottom of the tab in its own collapsed section rather than
+-- here: it is a read-once explainer, and sitting between the two stat blocks
+-- it pushed everything actually worth watching off the first screen
+local ReadingParagraph = {
     Title = 'reading this',
     Content = 'the two "(live)" values read straight from the character\'s real movement table, not from this menu\'s own copy - if a slider below is moved and the matching live value here does not change within about half a second, the setting genuinely is not applying. if it does change and the game still feels the same, the setting is applying but its effect is naturally subtle (air acceleration only changes how fast you reach your air speed cap, not the cap itself, and air strafe acceleration only kicks in when moving purely sideways with no forward/back input at all)',
-})
+}
 
-local RoundSection = MovementTab:CreateSection('round info')
-RoundSection:Stats({
+LiveSection:Divider()
+
+LiveSection:Stats({
     Columns = 2,
     Items = {
         { Label = 'gamemode', Value = function()
@@ -325,10 +407,10 @@ RoundSection:Stats({
     },
 })
 
-local PresetSection = MovementTab:CreateSection('preset')
+local SpeedSection = MovementTab:CreateSection('speed & sprint')
 local BaseSpeedSlider, SprintCapSlider, JumpHeightSlider, JumpMultSlider
 
-PresetSection:Segmented({
+SpeedSection:Segmented({
     Title = 'quick preset',
     Values = { 'Default', 'Speedy', 'Extreme' },
     Default = 'Default',
@@ -352,7 +434,7 @@ PresetSection:Segmented({
     end,
 })
 
-local SpeedSection = MovementTab:CreateSection('speed & sprint')
+SpeedSection:Divider('by hand')
 
 BaseSpeedSlider = SpeedSection:Slider({
     Title = 'base speed',
@@ -376,7 +458,7 @@ SprintCapSlider = SpeedSection:Slider({
     Callback = function(value) Tune.SprintCap = value end,
 })
 
-local JumpSection = MovementTab:CreateSection('jump & trimp')
+local JumpSection = MovementTab:CreateSection('jump')
 
 JumpHeightSlider = JumpSection:Slider({
     Title = 'jump height',
@@ -391,7 +473,7 @@ JumpHeightSlider = JumpSection:Slider({
 
 JumpMultSlider = JumpSection:Slider({
     Title = 'jump speed multiplier',
-    Description = 'the native trimp boost - how much of your run/slide speed converts into a jump forward when you jump while looking where you are moving',
+    Description = 'the native trimp - how much of your run/slide speed converts into a jump forward when you jump while looking where you are moving',
     Min = 0.5,
     Max = 6,
     Increment = 0.05,
@@ -412,14 +494,6 @@ JumpSection:Slider({
     Callback = function(value) Tune.JumpCap = value end,
 })
 
-JumpSection:Toggle({
-    Title = 'bunny hop',
-    Description = 'off natively - lets jumping repeatedly skip the run-up friction that normally caps your speed',
-    Flag = 'evade_bhop',
-    Default = false,
-    Callback = function(state) Tune.BhopEnabled = state end,
-})
-
 JumpSection:Slider({
     Title = 'grounded check distance',
     Description = 'how far below your feet still counts as grounded - higher forgives small gaps and ramps',
@@ -433,14 +507,39 @@ JumpSection:Slider({
 })
 
 JumpSection:Toggle({
-    Title = 'jump trimp boost',
-    Description = 'multiplies whatever horizontal speed a jump already leaves you with, on top of the jump speed multiplier above - a second, separate boost stacked on top of the native trimp, tested purely through jumping',
+    Title = 'bunny hop',
+    Description = 'off natively - lets jumping repeatedly skip the run-up friction that normally caps your speed',
+    Flag = 'evade_bhop',
+    Default = false,
+    Callback = function(state) Tune.BhopEnabled = state end,
+})
+
+local TrimpSection = MovementTab:CreateSection({ Title = 'trimp', Collapsible = true })
+
+TrimpSection:Toggle({
+    Title = 'jump trimp',
+    Description = 'multiplies the horizontal speed a jump already leaves you with, stacked on top of the native jump speed multiplier',
     Flag = 'evade_jump_trimp_enabled',
     Default = false,
+    Mini = true,
     Callback = function(state) Tune.JumpTrimpEnabled = state end,
 })
 
-JumpSection:Slider({
+TrimpSection:Toggle({
+    Title = 'object trimp',
+    Description = 'same boost, but for leaving an object rather than jumping',
+    Flag = 'evade_object_trimp_enabled',
+    Default = false,
+    Mini = true,
+    Callback = function(state)
+        Tune.ObjectTrimpEnabled = state
+        resetObjectTrimpState()
+    end,
+})
+
+TrimpSection:Divider('jump')
+
+TrimpSection:Slider({
     Title = 'jump trimp multiplier',
     Min = 1,
     Max = 4,
@@ -451,16 +550,11 @@ JumpSection:Slider({
     Callback = function(value) Tune.JumpTrimpMultiplier = value end,
 })
 
-JumpSection:Toggle({
-    Title = 'object trimp boost',
-    Description = 'boosts your horizontal speed the instant you leave any grounded surface that is not part of workspace.Map.Parts - the exact whitelist the native ramp slide uses, which is why props and crates never get ramp treatment on their own. this fires on any such surface, flat or tilted, since trimping off an object is not really about slope angle - independent from the jump trimp boost above, with its own multiplier below',
-    Flag = 'evade_object_trimp_enabled',
-    Default = false,
-    Callback = function(state) Tune.ObjectTrimpEnabled = state end,
-})
+TrimpSection:Divider('object')
 
-JumpSection:Slider({
+TrimpSection:Slider({
     Title = 'object trimp multiplier',
+    Description = 'fires when you leave a surface that is not part of workspace.Map.Parts - the exact whitelist the native ramp slide uses, which is why props and crates never get ramp treatment on their own. jumps are deliberately excluded: leaving the ground by jumping off a crate is what jump trimp above is for, and firing on both made this a worse duplicate of it. what is left is the case it was meant for - running or being launched off an object without jumping',
     Min = 1,
     Max = 4,
     Increment = 0.05,
@@ -470,7 +564,19 @@ JumpSection:Slider({
     Callback = function(value) Tune.ObjectTrimpMultiplier = value end,
 })
 
-local SlideSection = MovementTab:CreateSection('slide')
+TrimpSection:Slider({
+    Title = 'object trimp min speed',
+    Description = 'how fast you have to actually be moving for an object trimp to fire at all - stops stepping off a kerb at walking pace from counting',
+    Min = 0,
+    Max = 80,
+    Increment = 1,
+    Default = 20,
+    Suffix = ' studs/s',
+    Flag = 'evade_object_trimp_min_speed',
+    Callback = function(value) Tune.ObjectTrimpMinSpeed = value end,
+})
+
+local SlideSection = MovementTab:CreateSection({ Title = 'slide', Collapsible = true })
 
 SlideSection:Toggle({
     Title = 'override slide',
@@ -502,7 +608,7 @@ SlideSection:Slider({
     Callback = function(value) Tune.SlideMaxSpeed = value end,
 })
 
-local GroundSection = MovementTab:CreateSection('ground control')
+local GroundSection = MovementTab:CreateSection({ Title = 'ground control', Collapsible = true, Collapsed = true })
 
 GroundSection:Slider({
     Title = 'run acceleration',
@@ -559,7 +665,7 @@ GroundSection:Slider({
     Callback = function(value) Tune.WalkSpeedMultiplier = value end,
 })
 
-local AirSection = MovementTab:CreateSection('air control')
+local AirSection = MovementTab:CreateSection({ Title = 'air control', Collapsible = true, Collapsed = true })
 
 AirSection:Slider({
     Title = 'air acceleration',
@@ -583,6 +689,23 @@ AirSection:Slider({
     Callback = function(value) Tune.AirStrafeAcceleration = value end,
 })
 
+AirSection:Divider('wallrun')
+
+AirSection:Slider({
+    Title = 'wallrun jump boost',
+    Description = 'jumping off a wallrun natively adds a fixed kick along the wall direction. this scales that kick - 1x is the game\'s own number untouched. wallrunning itself needs you to be airborne, not crouching, not carrying, and moving faster than 20 relative speed, which is why it only ever triggers off a decent run-up',
+    Min = 1,
+    Max = 4,
+    Increment = 0.05,
+    Default = 1,
+    Suffix = 'x',
+    Flag = 'evade_wallrun_jump_boost',
+    Callback = function(value) Tune.WallrunJumpBoost = value end,
+})
+
+MovementTab:CreateSection({ Title = 'notes', Collapsible = true, Collapsed = true })
+    :Paragraph(ReadingParagraph)
+
 local EspTune = {
     Nextbot = false,
     Downed = false,
@@ -591,9 +714,13 @@ local EspTune = {
     DownedColor = Color3.fromRGB(255, 210, 60),
     PlayersColor = Color3.fromRGB(80, 170, 255),
     FillTransparency = 0.5,
+    OutlineTransparency = 0,
     MaxDistance = 250,
     DistanceText = false,
     NameText = false,
+    ThroughWalls = true,
+    Tracers = false,
+    Refresh = 0.5,
 }
 
 local espHighlights = {}
@@ -604,10 +731,16 @@ local function setHighlight(model, enabled, color)
     if enabled then
         if not highlight then
             highlight = Instance.new("Highlight")
-            highlight.OutlineTransparency = 0
             highlight.Parent = model
             espHighlights[model] = highlight
         end
+        -- AlwaysOnTop draws the highlight over whatever is in front of it;
+        -- Occluded only draws it when the model is actually visible, which is
+        -- what "see through walls: off" should mean
+        highlight.DepthMode = EspTune.ThroughWalls
+            and Enum.HighlightDepthMode.AlwaysOnTop
+            or Enum.HighlightDepthMode.Occluded
+        highlight.OutlineTransparency = EspTune.OutlineTransparency
         highlight.FillTransparency = EspTune.FillTransparency
         highlight.FillColor = color
         highlight.OutlineColor = color
@@ -642,6 +775,34 @@ local function setHighlight(model, enabled, color)
     end
 end
 
+-- tracers are the one esp feature that can't be done with a Highlight, since
+-- they're a screen-space line rather than something parented to the model.
+-- Drawing is an executor extension rather than a Roblox API, so everything
+-- here is guarded - if the executor doesn't provide it the tracer toggle just
+-- reports that instead of erroring the whole esp loop
+local okDrawing, DrawingApi = pcall(function() return Drawing end)
+if not okDrawing then DrawingApi = nil end
+local espTracers = {}
+local espTargets = {}
+
+local function setTracer(model, enabled, color)
+    local tracer = espTracers[model]
+    if enabled and DrawingApi then
+        if not tracer then
+            local ok, line = pcall(function() return DrawingApi.new("Line") end)
+            if not ok or not line then return end
+            line.Thickness = 1
+            line.Transparency = 1
+            tracer = line
+            espTracers[model] = tracer
+        end
+        tracer.Color = color
+    elseif tracer then
+        pcall(function() tracer:Remove() end)
+        espTracers[model] = nil
+    end
+end
+
 local function clearAllHighlights()
     for model, highlight in pairs(espHighlights) do
         highlight:Destroy()
@@ -651,7 +812,36 @@ local function clearAllHighlights()
         label.Billboard:Destroy()
         espLabels[model] = nil
     end
+    for model in pairs(espTracers) do
+        setTracer(model, false)
+    end
+    table.clear(espTargets)
 end
+
+-- separate from the scan loop below on purpose: the scan runs a few times a
+-- second (plenty for deciding what to highlight) but a tracer has to follow
+-- the target every frame or it visibly lags behind it
+local tracerConnection = RunService.RenderStepped:Connect(function()
+    if not next(espTracers) then return end
+    pcall(function()
+        local camera = workspace.CurrentCamera
+        if not camera then return end
+        local origin = Vector2.new(camera.ViewportSize.X / 2, camera.ViewportSize.Y)
+        for model, tracer in pairs(espTracers) do
+            local root = model.PrimaryPart
+            if EspTune.Tracers and root and root.Parent then
+                local point, onScreen = camera:WorldToViewportPoint(root.Position)
+                tracer.Visible = onScreen
+                if onScreen then
+                    tracer.From = origin
+                    tracer.To = Vector2.new(point.X, point.Y)
+                end
+            else
+                tracer.Visible = false
+            end
+        end
+    end)
+end)
 
 local PlayersFolder = waitPath(workspace, "Players")
 
@@ -694,6 +884,8 @@ task.spawn(function()
                     end
 
                     setHighlight(model, wantHighlight, color)
+                    setTracer(model, wantHighlight and EspTune.Tracers, color)
+                    espTargets[model] = wantHighlight and distance or nil
                     if wantHighlight and espLabels[model] then
                         local parts = {}
                         if EspTune.NameText then
@@ -713,224 +905,344 @@ task.spawn(function()
                     setHighlight(model, false)
                 end
             end
+            for model in pairs(espTracers) do
+                if not tracked[model] then
+                    setTracer(model, false)
+                    espTargets[model] = nil
+                end
+            end
         end)
 
-        task.wait(0.5)
+        task.wait(EspTune.Refresh)
     end
 end)
 
 local VisualsTab = Window:CreateTab({ Title = 'visuals' })
-local EspSection = VisualsTab:CreateSection('esp')
 
-EspSection:Toggle({
-    Title = 'nextbot esp',
-    Description = 'highlights every character on the Nextbot team',
-    Flag = 'evade_esp_nextbot',
-    Default = false,
-    Callback = function(state) EspTune.Nextbot = state end,
-})
+-- every one of these is a real setting read straight out of the game's own
+-- settings config (Shared.UserData.Settings.Config) and written back through
+-- its own hook (ClientHooks.useSettings), which fires the same server remote
+-- the in-game settings menu does. Held in one table rather than a local per
+-- key so adding another confirmed setting doesn't cost a top-level local
+local SettingDefaults = {}
 
-EspSection:Colorpicker({
-    Title = 'nextbot color',
-    Default = EspTune.NextbotColor,
-    Flag = 'evade_esp_nextbot_color',
-    Callback = function(color) EspTune.NextbotColor = color end,
-})
-
-EspSection:Toggle({
-    Title = 'downed player esp',
-    Description = 'highlights any character currently downed, regardless of team - useful for spotting revive targets',
-    Flag = 'evade_esp_downed',
-    Default = false,
-    Callback = function(state) EspTune.Downed = state end,
-})
-
-EspSection:Colorpicker({
-    Title = 'downed color',
-    Default = EspTune.DownedColor,
-    Flag = 'evade_esp_downed_color',
-    Callback = function(color) EspTune.DownedColor = color end,
-})
-
-EspSection:Toggle({
-    Title = 'player esp',
-    Description = 'highlights every other non-nextbot character',
-    Flag = 'evade_esp_players',
-    Default = false,
-    Callback = function(state) EspTune.Players = state end,
-})
-
-EspSection:Colorpicker({
-    Title = 'player color',
-    Default = EspTune.PlayersColor,
-    Flag = 'evade_esp_players_color',
-    Callback = function(color) EspTune.PlayersColor = color end,
-})
-
-local EspSettingsSection = VisualsTab:CreateSection('esp settings')
-
-EspSettingsSection:Slider({
-    Title = 'fill transparency',
-    Min = 0,
-    Max = 1,
-    Increment = 0.05,
-    Default = EspTune.FillTransparency,
-    Flag = 'evade_esp_fill_transparency',
-    Callback = function(value) EspTune.FillTransparency = value end,
-})
-
-EspSettingsSection:Slider({
-    Title = 'max distance',
-    Min = 20,
-    Max = 1000,
-    Increment = 10,
-    Default = EspTune.MaxDistance,
-    Suffix = ' studs',
-    Flag = 'evade_esp_max_distance',
-    Callback = function(value) EspTune.MaxDistance = value end,
-})
-
-EspSettingsSection:Toggle({
-    Title = 'distance text',
-    Description = 'shows the live distance above anything currently highlighted',
-    Flag = 'evade_esp_distance_text',
-    Default = false,
-    Callback = function(state) EspTune.DistanceText = state end,
-})
-
-EspSettingsSection:Toggle({
-    Title = 'name text',
-    Description = 'shows the player name (or the nextbot model name) above anything currently highlighted',
-    Flag = 'evade_esp_name_text',
-    Default = false,
-    Callback = function(state) EspTune.NameText = state end,
-})
-
-local ComfortSection = VisualsTab:CreateSection('comfort')
-
-local nextbotVignetteDefault = true
-pcall(function()
-    local current = UseSettings.Get("NextbotVignette")
-    if current ~= nil then nextbotVignetteDefault = current end
-end)
-
-ComfortSection:Toggle({
-    Title = 'nextbot vignette',
-    Description = 'the game\'s own accessibility setting for the darkened-vision effect a nearby nextbot causes - this just flips it through the real settings system (Shared.UserData.ClientHooks.useSettings), same as toggling it in the game\'s own settings menu, so it is not a client-only hack',
-    Flag = 'evade_nextbot_vignette',
-    Default = nextbotVignetteDefault,
-    Callback = function(state)
-        pcall(function() UseSettings.SetSetting("NextbotVignette", state) end)
-    end,
-})
-
--- there is no separate camera-shake setting - checked the real settings
--- config (Shared.UserData.Settings.Config) and nextbot camera shake and the
--- vignette darkening are driven by the same Enabled flag on the same Fear
--- service, so the toggle above already covers both. these are the other
--- real, confirmed settings from that same config, exposed the same
--- legitimate way rather than a client-only hack
 local function getSettingDefault(key, fallback)
     local ok, value = pcall(function() return UseSettings.Get(key) end)
-    if ok and value ~= nil then return value end
-    return fallback
+    local resolved = (ok and value ~= nil) and value or fallback
+    SettingDefaults[key] = resolved
+    return resolved
 end
 
 local function setSetting(key, value)
     pcall(function() UseSettings.SetSetting(key, value) end)
 end
 
-local originalFov = getSettingDefault("FOV", 70)
-local originalLowGraphics = getSettingDefault("LowGraphics", false)
-local originalMapShadows = getSettingDefault("MapShadows", true)
-local originalViewbob = getSettingDefault("Viewbob", true)
-local originalPovScroll = getSettingDefault("POVScroll", true)
+do
+    local EspSection = VisualsTab:CreateSection('esp')
 
-ComfortSection:Slider({
-    Title = 'field of view',
-    Min = 70,
-    Max = 100,
-    Increment = 1,
-    Default = originalFov,
-    Flag = 'evade_setting_fov',
-    Callback = function(value) setSetting("FOV", value) end,
-})
+    -- each highlight toggle sits directly beside its own colour rather than
+    -- all three toggles then all three colours, so a row reads as one thing
+    EspSection:Toggle({
+        Title = 'nextbot esp',
+        Description = 'highlights every character on the Nextbot team',
+        Flag = 'evade_esp_nextbot',
+        Default = false,
+        Mini = true,
+        Callback = function(state) EspTune.Nextbot = state end,
+    })
 
-ComfortSection:Toggle({
-    Title = 'low graphics',
-    Flag = 'evade_setting_low_graphics',
-    Default = originalLowGraphics,
-    Callback = function(state) setSetting("LowGraphics", state) end,
-})
+    EspSection:Colorpicker({
+        Title = 'nextbot color',
+        Default = EspTune.NextbotColor,
+        Flag = 'evade_esp_nextbot_color',
+        Mini = true,
+        Callback = function(color) EspTune.NextbotColor = color end,
+    })
 
-ComfortSection:Toggle({
-    Title = 'map shadows',
-    Flag = 'evade_setting_map_shadows',
-    Default = originalMapShadows,
-    Callback = function(state) setSetting("MapShadows", state) end,
-})
+    EspSection:Divider()
 
-ComfortSection:Toggle({
-    Title = 'view bob',
-    Flag = 'evade_setting_viewbob',
-    Default = originalViewbob,
-    Callback = function(state) setSetting("Viewbob", state) end,
-})
+    EspSection:Toggle({
+        Title = 'downed esp',
+        Description = 'highlights any character currently downed, regardless of team - useful for spotting revive targets',
+        Flag = 'evade_esp_downed',
+        Default = false,
+        Mini = true,
+        Callback = function(state) EspTune.Downed = state end,
+    })
 
-ComfortSection:Toggle({
-    Title = 'scroll to change pov',
-    Flag = 'evade_setting_pov_scroll',
-    Default = originalPovScroll,
-    Callback = function(state) setSetting("POVScroll", state) end,
-})
+    EspSection:Colorpicker({
+        Title = 'downed color',
+        Default = EspTune.DownedColor,
+        Flag = 'evade_esp_downed_color',
+        Mini = true,
+        Callback = function(color) EspTune.DownedColor = color end,
+    })
 
-local LightingSection = VisualsTab:CreateSection('lighting')
+    EspSection:Divider()
+
+    EspSection:Toggle({
+        Title = 'player esp',
+        Description = 'highlights every other non-nextbot character',
+        Flag = 'evade_esp_players',
+        Default = false,
+        Mini = true,
+        Callback = function(state) EspTune.Players = state end,
+    })
+
+    EspSection:Colorpicker({
+        Title = 'player color',
+        Default = EspTune.PlayersColor,
+        Flag = 'evade_esp_players_color',
+        Mini = true,
+        Callback = function(color) EspTune.PlayersColor = color end,
+    })
+
+    local EspSettingsSection = VisualsTab:CreateSection({ Title = 'esp settings', Collapsible = true })
+
+    EspSettingsSection:Toggle({
+        Title = 'see through walls',
+        Description = 'off makes a highlight only draw when the target is actually in line of sight, which is a far better read of whether something can really see you',
+        Flag = 'evade_esp_through_walls',
+        Default = EspTune.ThroughWalls,
+        Mini = true,
+        Callback = function(state) EspTune.ThroughWalls = state end,
+    })
+
+    EspSettingsSection:Toggle({
+        Title = 'tracers',
+        Description = 'draws a line from the bottom of your screen to each highlighted target - needs an executor that provides the Drawing api',
+        Flag = 'evade_esp_tracers',
+        Default = false,
+        Mini = true,
+        Callback = function(state)
+            EspTune.Tracers = state
+            if state and not DrawingApi then
+                Onyx:Notify({
+                    Title = 'tracers',
+                    Content = 'this executor has no Drawing api, so tracers cannot be drawn. Highlights still work.',
+                    Type = 'warning',
+                    Duration = 6,
+                })
+            end
+        end,
+    })
+
+    EspSettingsSection:Toggle({
+        Title = 'distance text',
+        Description = 'shows the live distance above anything currently highlighted',
+        Flag = 'evade_esp_distance_text',
+        Default = false,
+        Mini = true,
+        Callback = function(state) EspTune.DistanceText = state end,
+    })
+
+    EspSettingsSection:Toggle({
+        Title = 'name text',
+        Description = 'shows the player name (or the nextbot model name) above anything currently highlighted',
+        Flag = 'evade_esp_name_text',
+        Default = false,
+        Mini = true,
+        Callback = function(state) EspTune.NameText = state end,
+    })
+
+    EspSettingsSection:Divider('appearance')
+
+    EspSettingsSection:Slider({
+        Title = 'fill transparency',
+        Min = 0,
+        Max = 1,
+        Increment = 0.05,
+        Default = EspTune.FillTransparency,
+        Flag = 'evade_esp_fill_transparency',
+        Callback = function(value) EspTune.FillTransparency = value end,
+    })
+
+    EspSettingsSection:Slider({
+        Title = 'outline transparency',
+        Min = 0,
+        Max = 1,
+        Increment = 0.05,
+        Default = EspTune.OutlineTransparency,
+        Flag = 'evade_esp_outline_transparency',
+        Callback = function(value) EspTune.OutlineTransparency = value end,
+    })
+
+    EspSettingsSection:Slider({
+        Title = 'max distance',
+        Min = 20,
+        Max = 1000,
+        Increment = 10,
+        Default = EspTune.MaxDistance,
+        Suffix = ' studs',
+        Flag = 'evade_esp_max_distance',
+        Callback = function(value) EspTune.MaxDistance = value end,
+    })
+
+    EspSettingsSection:Slider({
+        Title = 'refresh rate',
+        Description = 'how often the scan re-decides what to highlight. Lower reacts faster to a nextbot spawning or someone going down, at the cost of running more often',
+        Min = 0.1,
+        Max = 2,
+        Increment = 0.1,
+        Default = EspTune.Refresh,
+        Suffix = 's',
+        Flag = 'evade_esp_refresh',
+        Callback = function(value) EspTune.Refresh = value end,
+    })
+end
+
+local nextbotVignetteDefault = getSettingDefault("NextbotVignette", true)
+
+do
+    local ComfortSection = VisualsTab:CreateSection('comfort')
+
+    ComfortSection:Slider({
+        Title = 'field of view',
+        Min = 70,
+        Max = 100,
+        Increment = 1,
+        Default = getSettingDefault("FOV", 70),
+        Flag = 'evade_setting_fov',
+        Callback = function(value) setSetting("FOV", value) end,
+    })
+
+    ComfortSection:Divider('toggles')
+
+    -- there is no separate camera-shake setting - nextbot camera shake and the
+    -- vignette darkening are driven by the same Enabled flag on the same Fear
+    -- service, so this one toggle already covers both
+    ComfortSection:Toggle({
+        Title = 'nextbot vignette',
+        Description = 'the game\'s own accessibility setting for the darkened-vision-and-shake effect a nearby nextbot causes',
+        Flag = 'evade_nextbot_vignette',
+        Default = nextbotVignetteDefault,
+        Mini = true,
+        Callback = function(state) setSetting("NextbotVignette", state) end,
+    })
+
+    ComfortSection:Toggle({
+        Title = 'view bob',
+        Flag = 'evade_setting_viewbob',
+        Default = getSettingDefault("Viewbob", true),
+        Mini = true,
+        Callback = function(state) setSetting("Viewbob", state) end,
+    })
+
+    ComfortSection:Toggle({
+        Title = 'low graphics',
+        Flag = 'evade_setting_low_graphics',
+        Default = getSettingDefault("LowGraphics", false),
+        Mini = true,
+        Callback = function(state) setSetting("LowGraphics", state) end,
+    })
+
+    ComfortSection:Toggle({
+        Title = 'map shadows',
+        Flag = 'evade_setting_map_shadows',
+        Default = getSettingDefault("MapShadows", true),
+        Mini = true,
+        Callback = function(state) setSetting("MapShadows", state) end,
+    })
+
+    ComfortSection:Toggle({
+        Title = 'scroll to change pov',
+        Flag = 'evade_setting_pov_scroll',
+        Default = getSettingDefault("POVScroll", true),
+        Mini = true,
+        Callback = function(state) setSetting("POVScroll", state) end,
+    })
+
+    ComfortSection:Toggle({
+        Title = 'sprint viewmodel',
+        Description = 'the arms-down sprint pose. Off keeps the normal viewmodel while sprinting, which leaves more of the screen readable',
+        Flag = 'evade_setting_sprint_viewmodel',
+        Default = getSettingDefault("SprintViewmodel", true),
+        Mini = true,
+        Callback = function(state) setSetting("SprintViewmodel", state) end,
+    })
+
+    ComfortSection:Toggle({
+        Title = 'legacy camera',
+        Flag = 'evade_setting_legacy_camera',
+        Default = getSettingDefault("LegacyCamera", false),
+        Mini = true,
+        Callback = function(state) setSetting("LegacyCamera", state) end,
+    })
+
+    ComfortSection:Toggle({
+        Title = 'r15 characters',
+        Flag = 'evade_setting_r15',
+        Default = getSettingDefault("R15Enabled", true),
+        Mini = true,
+        Callback = function(state) setSetting("R15Enabled", state) end,
+    })
+
+    local GameplaySection = VisualsTab:CreateSection({ Title = 'gameplay settings', Collapsible = true, Collapsed = true })
+
+    GameplaySection:Toggle({
+        Title = 'ragdolls',
+        Description = 'the ragdoll that plays when someone goes down. Off is noticeably lighter on a busy round',
+        Flag = 'evade_setting_ragdolls',
+        Default = getSettingDefault("Ragdolls", true),
+        Mini = true,
+        Callback = function(state) setSetting("Ragdolls", state) end,
+    })
+
+    GameplaySection:Toggle({
+        Title = 'animated tags',
+        Flag = 'evade_setting_animated_tags',
+        Default = getSettingDefault("AnimatedTags", true),
+        Mini = true,
+        Callback = function(state) setSetting("AnimatedTags", state) end,
+    })
+
+    GameplaySection:Toggle({
+        Title = 'can be carried',
+        Description = 'the game\'s own opt-out for other players picking you up when you are down',
+        Flag = 'evade_setting_can_be_carried',
+        Default = getSettingDefault("CanBeCarried", true),
+        Mini = true,
+        Callback = function(state) setSetting("CanBeCarried", state) end,
+    })
+
+    local AudioSection = VisualsTab:CreateSection({ Title = 'audio', Collapsible = true, Collapsed = true })
+
+    -- all seven volume keys the settings config actually defines, each a
+    -- number 0-100 defaulting to 100
+    local volumes = {
+        { Key = 'GameMusicVolume', Title = 'game music', Flag = 'evade_volume_game_music' },
+        { Key = 'LobbyMusicVolume', Title = 'lobby music', Flag = 'evade_volume_lobby_music' },
+        { Key = 'NextbotVolume', Title = 'nextbots', Flag = 'evade_volume_nextbot' },
+        { Key = 'BoomboxVolume', Title = 'boomboxes', Flag = 'evade_volume_boombox' },
+        { Key = 'EmoteVolume', Title = 'emotes', Flag = 'evade_volume_emote' },
+        { Key = 'CarryVolume', Title = 'carrying', Flag = 'evade_volume_carry' },
+        { Key = 'VoiceChatVolume', Title = 'voice chat', Flag = 'evade_volume_voice_chat' },
+    }
+
+    for _, entry in ipairs(volumes) do
+        AudioSection:Slider({
+            Title = entry.Title,
+            Min = 0,
+            Max = 100,
+            Increment = 1,
+            Default = getSettingDefault(entry.Key, 100),
+            Suffix = '%',
+            Flag = entry.Flag,
+            Callback = function(value) setSetting(entry.Key, value) end,
+        })
+    end
+end
+
 local FullbrightEnabled = false
-local BrightnessSlider, ExposureSlider, ClockTimeSlider
+local setFullbright
 
-BrightnessSlider = LightingSection:Slider({
-    Title = 'brightness',
-    Min = 0,
-    Max = 10,
-    Increment = 0.1,
-    Default = OriginalLighting.Brightness,
-    Flag = 'evade_lighting_brightness',
-    Callback = function(value)
-        if not FullbrightEnabled then Lighting.Brightness = value end
-    end,
-})
+do
+    local LightingSection = VisualsTab:CreateSection('lighting')
+    local BrightnessSlider, ExposureSlider, ClockTimeSlider
 
-ExposureSlider = LightingSection:Slider({
-    Title = 'exposure compensation',
-    Min = -1,
-    Max = 2,
-    Increment = 0.05,
-    Default = OriginalLighting.ExposureCompensation,
-    Flag = 'evade_lighting_exposure',
-    Callback = function(value)
-        if not FullbrightEnabled then Lighting.ExposureCompensation = value end
-    end,
-})
-
-ClockTimeSlider = LightingSection:Slider({
-    Title = 'clock time',
-    Description = 'forces the time of day - 14 is the map\'s own default afternoon setting, useful for undoing a darkness special round',
-    Min = 0,
-    Max = 24,
-    Increment = 0.5,
-    Default = OriginalLighting.ClockTime,
-    Flag = 'evade_lighting_clocktime',
-    Callback = function(value)
-        if not FullbrightEnabled then Lighting.ClockTime = value end
-    end,
-})
-
-LightingSection:Toggle({
-    Title = 'fullbright',
-    Description = 'cranks brightness, exposure and ambient light to a flat maximum and locks the time to midday, overriding the sliders above while on - the fastest way to just see everything regardless of round or map',
-    Flag = 'evade_fullbright',
-    Default = false,
-    Callback = function(state)
+    -- the two one-click switches first, since those are what actually gets
+    -- used mid-round; the by-hand sliders sit under a divider below them
+    function setFullbright(state)
         FullbrightEnabled = state
         if state then
             Lighting.Brightness = 5
@@ -938,15 +1250,95 @@ LightingSection:Toggle({
             Lighting.ClockTime = 14
             Lighting.Ambient = Color3.fromRGB(150, 150, 150)
             Lighting.OutdoorAmbient = Color3.fromRGB(150, 150, 150)
+            Lighting.GlobalShadows = false
         else
             Lighting.Brightness = BrightnessSlider:Get()
             Lighting.ExposureCompensation = ExposureSlider:Get()
             Lighting.ClockTime = ClockTimeSlider:Get()
             Lighting.Ambient = OriginalLighting.Ambient
             Lighting.OutdoorAmbient = OriginalLighting.OutdoorAmbient
+            Lighting.GlobalShadows = OriginalLighting.GlobalShadows
         end
-    end,
-})
+    end
+
+    LightingSection:Toggle({
+        Title = 'fullbright',
+        Description = 'cranks brightness, exposure and ambient light to a flat maximum, drops shadows and locks the time to midday, overriding the sliders below while on - the fastest way to just see everything regardless of round or map',
+        Flag = 'evade_fullbright',
+        Default = false,
+        Mini = true,
+        Callback = function(state) setFullbright(state) end,
+    })
+
+    LightingSection:Toggle({
+        Title = 'no fog',
+        Description = 'pushes the fog wall out past the far end of any map - some maps and special rounds lean on fog hard enough that you cannot see a nextbot until it is already on you',
+        Flag = 'evade_no_fog',
+        Default = false,
+        Mini = true,
+        Callback = function(state)
+            if state then
+                Lighting.FogStart = 0
+                Lighting.FogEnd = 100000
+            else
+                Lighting.FogStart = OriginalLighting.FogStart
+                Lighting.FogEnd = OriginalLighting.FogEnd
+            end
+            for _, item in ipairs(Lighting:GetChildren()) do
+                if item:IsA("Atmosphere") then
+                    if state then
+                        if item:GetAttribute("EvadeDensity") == nil then
+                            item:SetAttribute("EvadeDensity", item.Density)
+                        end
+                        item.Density = 0
+                    else
+                        local stored = item:GetAttribute("EvadeDensity")
+                        if stored then item.Density = stored end
+                    end
+                end
+            end
+        end,
+    })
+
+    LightingSection:Divider('by hand')
+
+    BrightnessSlider = LightingSection:Slider({
+        Title = 'brightness',
+        Min = 0,
+        Max = 10,
+        Increment = 0.1,
+        Default = OriginalLighting.Brightness,
+        Flag = 'evade_lighting_brightness',
+        Callback = function(value)
+            if not FullbrightEnabled then Lighting.Brightness = value end
+        end,
+    })
+
+    ExposureSlider = LightingSection:Slider({
+        Title = 'exposure compensation',
+        Min = -1,
+        Max = 2,
+        Increment = 0.05,
+        Default = OriginalLighting.ExposureCompensation,
+        Flag = 'evade_lighting_exposure',
+        Callback = function(value)
+            if not FullbrightEnabled then Lighting.ExposureCompensation = value end
+        end,
+    })
+
+    ClockTimeSlider = LightingSection:Slider({
+        Title = 'clock time',
+        Description = 'forces the time of day - 14 is the map\'s own default afternoon setting, useful for undoing a darkness special round',
+        Min = 0,
+        Max = 24,
+        Increment = 0.5,
+        Default = OriginalLighting.ClockTime,
+        Flag = 'evade_lighting_clocktime',
+        Callback = function(value)
+            if not FullbrightEnabled then Lighting.ClockTime = value end
+        end,
+    })
+end
 
 local ReviveTab = Window:CreateTab({ Title = 'revive' })
 local ReviveSection = ReviveTab:CreateSection('manual revive')
@@ -1247,6 +1639,7 @@ local function createDownedInteractAutomation(panelTitle, defaultRange)
         if not automation.Holding then return end
         automation.Holding = false
         sendInteract(CharacterService:GetLocalCharacter(), false)
+        logEvent(panelTitle .. ': released after ' .. ('%.1fs'):format(os.clock() - automation.HeldSince))
     end
     automation.ReleaseHold = releaseHold
 
@@ -1305,6 +1698,7 @@ local function createDownedInteractAutomation(panelTitle, defaultRange)
                             automation.Holding = true
                             automation.HeldSince = os.clock()
                             sendInteract(character, true)
+                            logEvent(panelTitle .. ': holding interact on a downed teammate')
                         end
                     end
                 elseif automation.Holding then
@@ -1322,83 +1716,248 @@ local AutoRevive = createDownedInteractAutomation('auto revive', 8)
 local AutoCarry = createDownedInteractAutomation('auto carry', 8)
 
 local ExtraTab = Window:CreateTab({ Title = 'extra' })
-local AutoSection = ExtraTab:CreateSection('automation')
 
-AutoJumpElement = AutoSection:Toggle({
-    Title = 'auto jump',
-    Description = 'jumps on an interval for as long as this is on. also opens a small draggable pill with its own switch, so it can be stopped without reopening this menu - the two stay in sync either direction',
-    Flag = 'evade_auto_jump',
-    Default = false,
-    Callback = function(state) setAutoJumpActive(state, false) end,
-})
+local function doUnstuck()
+    pcall(function()
+        local character = CharacterService:GetLocalCharacter()
+        local root = character and character.Model and character.Model.PrimaryPart
+        if not root then return end
+        root.CFrame = root.CFrame + Vector3.new(0, 6, 0)
+        root.AssemblyLinearVelocity = Vector3.new()
+        if character.DataRegistry then
+            character.DataRegistry:Set("Velocity", Vector3.new())
+        end
+        logEvent('unstuck')
+    end)
+end
 
-AutoSection:Slider({
-    Title = 'auto jump interval',
-    Min = 0.05,
-    Max = 1,
-    Increment = 0.05,
-    Default = AutoJumpInterval,
-    Suffix = ' s',
-    Flag = 'evade_auto_jump_interval',
-    Callback = function(value) AutoJumpInterval = value end,
-})
+do
+    -- each automation now reads as its own block - the switch, then the range
+    -- or interval that switch actually uses, then a rule off to the next one.
+    -- Previously all three switches ran together above all three sliders,
+    -- which made it easy to drag the wrong slider
+    local AutoSection = ExtraTab:CreateSection('automation')
 
-AutoRevive.Element = AutoSection:Toggle({
-    Title = 'auto revive',
-    Description = 'automatically holds interact on the nearest downed teammate in range - the same input path a real keypress uses, just triggered by range instead of a key. also opens a small draggable pill with its own switch, synced with this one either direction',
-    Flag = 'evade_auto_revive',
-    Default = false,
-    Callback = function(state) AutoRevive.SetActive(state, false) end,
-})
+    AutoJumpElement = AutoSection:Toggle({
+        Title = 'auto jump',
+        Description = 'jumps on an interval for as long as this is on. also opens a small draggable pill with its own switch, so it can be stopped without reopening this menu - the two stay in sync either direction',
+        Flag = 'evade_auto_jump',
+        Default = false,
+        Callback = function(state) setAutoJumpActive(state, false) end,
+    })
 
-AutoSection:Slider({
-    Title = 'auto revive range',
-    Min = 3,
-    Max = 20,
-    Increment = 1,
-    Default = AutoRevive.Range,
-    Suffix = ' studs',
-    Flag = 'evade_auto_revive_range',
-    Callback = function(value) AutoRevive.Range = value end,
-})
+    AutoSection:Slider({
+        Title = 'auto jump interval',
+        Min = 0.05,
+        Max = 1,
+        Increment = 0.05,
+        Default = AutoJumpInterval,
+        Suffix = ' s',
+        Flag = 'evade_auto_jump_interval',
+        Callback = function(value) AutoJumpInterval = value end,
+    })
 
-AutoCarry.Element = AutoSection:Toggle({
-    Title = 'auto carry',
-    Description = 'checked directly in the game\'s own code: carrying and reviving a downed teammate turned out to go through the exact same interact-on-a-downed-teammate mechanism, with the game itself deciding which one actually happens - so this is functionally the same automation as auto revive above, just controlled separately in case you want one running without the other',
-    Flag = 'evade_auto_carry',
-    Default = false,
-    Callback = function(state) AutoCarry.SetActive(state, false) end,
-})
+    AutoSection:Divider()
 
-AutoSection:Slider({
-    Title = 'auto carry range',
-    Min = 3,
-    Max = 20,
-    Increment = 1,
-    Default = AutoCarry.Range,
-    Suffix = ' studs',
-    Flag = 'evade_auto_carry_range',
-    Callback = function(value) AutoCarry.Range = value end,
-})
+    AutoRevive.Element = AutoSection:Toggle({
+        Title = 'auto revive',
+        Description = 'automatically holds interact on the nearest downed teammate in range - the same input path a real keypress uses, just triggered by range instead of a key. also opens a small draggable pill with its own switch, synced with this one either direction',
+        Flag = 'evade_auto_revive',
+        Default = false,
+        Callback = function(state) AutoRevive.SetActive(state, false) end,
+    })
 
-local UtilitySection = ExtraTab:CreateSection('utility')
+    AutoSection:Slider({
+        Title = 'auto revive range',
+        Min = 3,
+        Max = 20,
+        Increment = 1,
+        Default = AutoRevive.Range,
+        Suffix = ' studs',
+        Flag = 'evade_auto_revive_range',
+        Callback = function(value) AutoRevive.Range = value end,
+    })
 
-UtilitySection:Button({
-    Title = 'unstuck',
-    Description = 'nudges you straight up a few studs and zeroes your velocity - for when movement testing wedges you into geometry',
-    Callback = function()
-        pcall(function()
+    AutoSection:Divider()
+
+    AutoCarry.Element = AutoSection:Toggle({
+        Title = 'auto carry',
+        Description = 'checked directly in the game\'s own code: carrying and reviving a downed teammate turned out to go through the exact same interact-on-a-downed-teammate mechanism, with the game itself deciding which one actually happens - so this is functionally the same automation as auto revive above, just controlled separately in case you want one running without the other',
+        Flag = 'evade_auto_carry',
+        Default = false,
+        Callback = function(state) AutoCarry.SetActive(state, false) end,
+    })
+
+    AutoSection:Slider({
+        Title = 'auto carry range',
+        Min = 3,
+        Max = 20,
+        Increment = 1,
+        Default = AutoCarry.Range,
+        Suffix = ' studs',
+        Flag = 'evade_auto_carry_range',
+        Callback = function(value) AutoCarry.Range = value end,
+    })
+end
+
+do
+    -- Mode 'Always' fires the callback once per press rather than tracking its
+    -- own on/off, so the real state stays owned by the toggle it drives -
+    -- flipping through SetFlag keeps the menu switch, the floating pill and
+    -- the key all showing the same thing
+    local HotkeySection = ExtraTab:CreateSection({ Title = 'hotkeys', Collapsible = true })
+
+    local function flipFlag(flag)
+        return function()
+            pcall(function() Onyx:SetFlag(flag, not Onyx:GetFlag(flag)) end)
+        end
+    end
+
+    -- defaults picked against the game's own keybind list (Jump/Sprint/Crouch/
+    -- Interact/Reload/Melee/Emote/Whistle/ThirdPerson/VIPMenu/Special/Menu/
+    -- Deployables/Flashlight/Perk1-4/Queue) so none of these steal a real bind
+    local binds = {
+        { Title = 'toggle auto jump', Default = Enum.KeyCode.J, Flag = 'evade_key_auto_jump',
+          Callback = flipFlag('evade_auto_jump') },
+        { Title = 'toggle auto revive', Default = Enum.KeyCode.K, Flag = 'evade_key_auto_revive',
+          Callback = flipFlag('evade_auto_revive') },
+        { Title = 'toggle auto carry', Default = Enum.KeyCode.L, Flag = 'evade_key_auto_carry',
+          Callback = flipFlag('evade_auto_carry') },
+        { Title = 'toggle fullbright', Default = Enum.KeyCode.I, Flag = 'evade_key_fullbright',
+          Callback = flipFlag('evade_fullbright') },
+        { Title = 'unstuck', Default = Enum.KeyCode.U, Flag = 'evade_key_unstuck',
+          Callback = doUnstuck },
+    }
+
+    for _, bind in ipairs(binds) do
+        HotkeySection:Keybind({
+            Title = bind.Title,
+            Mode = 'Always',
+            Default = bind.Default,
+            Flag = bind.Flag,
+            Mini = true,
+            Callback = bind.Callback,
+        })
+    end
+
+    HotkeySection:Divider()
+
+    -- one key for all three highlight toggles at once, since in practice they
+    -- get turned on and off together
+    HotkeySection:Keybind({
+        Title = 'toggle all esp',
+        Description = 'flips nextbot, downed and player esp together, using whichever state the nextbot toggle is currently in',
+        Mode = 'Always',
+        Default = Enum.KeyCode.P,
+        Flag = 'evade_key_esp',
+        Callback = function()
+            pcall(function()
+                local target = not Onyx:GetFlag('evade_esp_nextbot')
+                Onyx:SetFlag('evade_esp_nextbot', target)
+                Onyx:SetFlag('evade_esp_downed', target)
+                Onyx:SetFlag('evade_esp_players', target)
+            end)
+        end,
+    })
+end
+
+do
+    local UtilitySection = ExtraTab:CreateSection('utility')
+
+    UtilitySection:Button({
+        Title = 'unstuck',
+        Description = 'nudges you straight up a few studs and zeroes your velocity - for when movement testing wedges you into geometry',
+        Mini = true,
+        Callback = doUnstuck,
+    })
+
+    UtilitySection:Button({
+        Title = 'kill velocity',
+        Description = 'zeroes your velocity in place without moving you - the quickest way to stop dead after a slide or trimp test without waiting out the deceleration',
+        Mini = true,
+        Callback = function()
+            pcall(function()
+                local character = CharacterService:GetLocalCharacter()
+                if not character then return end
+                if character.Model and character.Model.PrimaryPart then
+                    character.Model.PrimaryPart.AssemblyLinearVelocity = Vector3.new()
+                end
+                if character.DataRegistry then
+                    character.DataRegistry:Set("Velocity", Vector3.new())
+                end
+                logEvent('velocity zeroed')
+            end)
+        end,
+    })
+
+    UtilitySection:Button({
+        Title = 'copy position',
+        Description = 'copies your current position as a Vector3.new(...) line, for noting down where a particular jump or trimp was tested from',
+        Mini = true,
+        Callback = function()
             local character = CharacterService:GetLocalCharacter()
             local root = character and character.Model and character.Model.PrimaryPart
             if not root then return end
-            root.CFrame = root.CFrame + Vector3.new(0, 6, 0)
-            root.AssemblyLinearVelocity = Vector3.new()
-            if character.DataRegistry then
-                character.DataRegistry:Set("Velocity", Vector3.new())
+            local text = ('Vector3.new(%.1f, %.1f, %.1f)'):format(
+                root.Position.X, root.Position.Y, root.Position.Z)
+            if setclipboard then
+                setclipboard(text)
+                logEvent('copied ' .. text)
+            else
+                logEvent('no setclipboard in this executor - ' .. text)
             end
-        end)
-    end,
-})
+        end,
+    })
+
+    UtilitySection:Button({
+        Title = 'copy job id',
+        Description = 'copies this server\'s job id, for getting back into the same server after a rejoin',
+        Mini = true,
+        Callback = function()
+            if setclipboard then
+                setclipboard(tostring(game.JobId))
+                logEvent('job id copied')
+            else
+                logEvent('no setclipboard in this executor')
+            end
+        end,
+    })
+
+    UtilitySection:Divider()
+
+    UtilitySection:Button({
+        Title = 'rejoin server',
+        Description = 'teleports you back into this same place - this drops you out of the current round, so it asks first',
+        Confirm = true,
+        Callback = function()
+            pcall(function()
+                game:GetService("TeleportService"):Teleport(game.PlaceId, LocalPlayer)
+            end)
+        end,
+    })
+end
+
+do
+    -- a running record of what the script itself actually did, which is the
+    -- only way to tell a trimp that fired from one that was skipped by the
+    -- min-speed or cooldown gates
+    local LogSection = ExtraTab:CreateSection({ Title = 'event log', Collapsible = true })
+
+    local LogConsole = LogSection:Console({
+        Title = 'events',
+        Height = 130,
+        MaxLines = 80,
+        Timestamps = true,
+    })
+
+    -- the console carries its own COPY and CLEAR actions in its header, so
+    -- there's nothing to add here beyond pointing logEvent at it
+    EventLog.Sink = function(text)
+        LogConsole:Log(tostring(text))
+    end
+
+    logEvent('loaded')
+end
 
 local SessionTab = Window:CreateTab({ Title = 'session' })
 local SessionSection = SessionTab:CreateSection('session')
@@ -1421,6 +1980,8 @@ local function resetAllOptions()
         evade_jump_trimp_mult = 1,
         evade_object_trimp_enabled = false,
         evade_object_trimp_mult = 1,
+        evade_object_trimp_min_speed = 20,
+        evade_wallrun_jump_boost = 1,
         evade_slide_override = false,
         evade_slide_mult = 1,
         evade_slide_max_speed = DEFAULT_SLIDE_MAX_SPEED,
@@ -1439,21 +2000,40 @@ local function resetAllOptions()
         evade_esp_players = false,
         evade_esp_players_color = Color3.fromRGB(80, 170, 255),
         evade_esp_fill_transparency = 0.5,
+        evade_esp_outline_transparency = 0,
         evade_esp_max_distance = 250,
         evade_esp_distance_text = false,
         evade_esp_name_text = false,
+        evade_esp_through_walls = true,
+        evade_esp_tracers = false,
+        evade_esp_refresh = 0.5,
 
-        evade_nextbot_vignette = nextbotVignetteDefault,
-        evade_setting_fov = originalFov,
-        evade_setting_low_graphics = originalLowGraphics,
-        evade_setting_map_shadows = originalMapShadows,
-        evade_setting_viewbob = originalViewbob,
-        evade_setting_pov_scroll = originalPovScroll,
+        evade_nextbot_vignette = SettingDefaults.NextbotVignette,
+        evade_setting_fov = SettingDefaults.FOV,
+        evade_setting_low_graphics = SettingDefaults.LowGraphics,
+        evade_setting_map_shadows = SettingDefaults.MapShadows,
+        evade_setting_viewbob = SettingDefaults.Viewbob,
+        evade_setting_pov_scroll = SettingDefaults.POVScroll,
+        evade_setting_sprint_viewmodel = SettingDefaults.SprintViewmodel,
+        evade_setting_legacy_camera = SettingDefaults.LegacyCamera,
+        evade_setting_r15 = SettingDefaults.R15Enabled,
+        evade_setting_ragdolls = SettingDefaults.Ragdolls,
+        evade_setting_animated_tags = SettingDefaults.AnimatedTags,
+        evade_setting_can_be_carried = SettingDefaults.CanBeCarried,
+
+        evade_volume_game_music = SettingDefaults.GameMusicVolume,
+        evade_volume_lobby_music = SettingDefaults.LobbyMusicVolume,
+        evade_volume_nextbot = SettingDefaults.NextbotVolume,
+        evade_volume_boombox = SettingDefaults.BoomboxVolume,
+        evade_volume_emote = SettingDefaults.EmoteVolume,
+        evade_volume_carry = SettingDefaults.CarryVolume,
+        evade_volume_voice_chat = SettingDefaults.VoiceChatVolume,
 
         evade_lighting_brightness = OriginalLighting.Brightness,
         evade_lighting_exposure = OriginalLighting.ExposureCompensation,
         evade_lighting_clocktime = OriginalLighting.ClockTime,
         evade_fullbright = false,
+        evade_no_fog = false,
 
         evade_revive_override = false,
         evade_revive_time = 0,
@@ -1464,6 +2044,13 @@ local function resetAllOptions()
         evade_auto_revive_range = 8,
         evade_auto_carry = false,
         evade_auto_carry_range = 8,
+
+        evade_key_auto_jump = Enum.KeyCode.J,
+        evade_key_auto_revive = Enum.KeyCode.K,
+        evade_key_auto_carry = Enum.KeyCode.L,
+        evade_key_fullbright = Enum.KeyCode.I,
+        evade_key_unstuck = Enum.KeyCode.U,
+        evade_key_esp = Enum.KeyCode.P,
     }
 
     for flag, value in pairs(defaults) do
@@ -1487,6 +2074,7 @@ SessionSection:Button({
         Functions.Slide = originalSlide
         MovementClass.Jump = originalJump
         trimpConnection:Disconnect()
+        tracerConnection:Disconnect()
         restoreLighting()
         clearAllHighlights()
         setAutoJumpActive(false, false)
