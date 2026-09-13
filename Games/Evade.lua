@@ -648,6 +648,55 @@ TrimpSection:Slider({
     Callback = function(value) Tune.ObjectTrimpMinSpeed = value end,
 })
 
+-- Character.State.Update applies PrimaryPart.Size = RootSizeGoal * Size every
+-- time a state change sets a new RootSizeGoal, where Size is a plain number on
+-- the character. Writing that number is therefore the game's own scaling hook
+-- rather than a fight with it - setting PrimaryPart.Size directly just gets
+-- overwritten on the next state change.
+--
+-- worth being precise about what this is and is not: BasePart.Size does not
+-- replicate from a client, so the server's copy of your hitbox is unchanged.
+-- It moves your LOCAL collision box, which is real for movement - your own
+-- client simulates your movement, and the resulting CFrame is what replicates
+-- - but it does nothing about damage, which the server decides against its
+-- own copy.
+local RootSizeMultiplier = 1
+
+local function applyRootSize(multiplier)
+    RootSizeMultiplier = multiplier
+    pcall(function()
+        local character = CharacterService:GetLocalCharacter()
+        if not character then return end
+        -- never write it if the game isn't holding a number there: the
+        -- multiply happens inside the game's own Update, so a wrong type
+        -- would error in there and take the whole movement step with it
+        if type(character.Size) ~= "number" then return end
+        character.Size = multiplier
+        -- Size is only read when a state change queues a resize, so queue one
+        -- rather than waiting for the next jump or slide to apply it
+        if character.RootSizeGoal == nil then
+            character.RootSizeGoal = Vector3.new(2, 4, 2)
+        end
+    end)
+end
+
+-- reapply after a respawn, since the character object is rebuilt with the
+-- game's own default
+task.spawn(function()
+    while not Unloading do
+        pcall(function()
+            if RootSizeMultiplier ~= 1 then
+                local character = CharacterService:GetLocalCharacter()
+                if character and type(character.Size) == "number"
+                    and math.abs(character.Size - RootSizeMultiplier) > 0.001 then
+                    applyRootSize(RootSizeMultiplier)
+                end
+            end
+        end)
+        task.wait(1)
+    end
+end)
+
 local TricksSection = MovementTab:CreateSection({ Title = 'tricks', Collapsible = true })
 
 TricksSection:Toggle({
@@ -692,6 +741,20 @@ TricksSection:Slider({
     Suffix = ' studs',
     Flag = 'evade_edge_lookahead',
     Callback = function(value) Tune.EdgeLookahead = value end,
+})
+
+TricksSection:Divider('hitbox')
+
+TricksSection:Slider({
+    Title = 'root size',
+    Description = 'scales your own collision box through the game\'s own Character.Size, which its state code multiplies the per-state root size by. This is LOCAL ONLY - part sizes do not replicate from a client, so the server\'s copy of your hitbox is untouched and this does nothing about nextbot damage, which the server decides. What it does change is your own collision against the map, since your client simulates your movement: smaller fits through tighter gaps, larger catches on more. Expect it to feel odd away from 1x',
+    Min = 0.3,
+    Max = 2,
+    Increment = 0.05,
+    Default = 1,
+    Suffix = 'x',
+    Flag = 'evade_root_size',
+    Callback = function(value) applyRootSize(value) end,
 })
 
 TricksSection:Divider('shared')
@@ -1714,72 +1777,79 @@ task.spawn(function()
     end
 end)
 
-local RELEASE_RANGE_MARGIN = 2
-local MIN_HOLD_TIME = 0.3
+-- the previous version of this was built on a wrong reading of the game and
+-- could never have worked. It called ToolProfile:KeyPhraseUsed with
+-- Key = "Interact", on the assumption that reviving and carrying a downed
+-- teammate both resolve out of a tool task. They do not. Neither one goes
+-- through ToolProfile at all:
+--
+--   Services.Asset.InteractionService.InteractionTypes defines a "Revive"
+--   interaction type covering downed players, with Distance = 8 and two
+--   separate interactions on it -
+--     Revive: Keybind "Interact" (E), Length = "ReviveLength"
+--     Carry:  Keybind "Melee"    (Q), Cooldown = 1, no Length
+--
+-- so carry is Q, not E, and the two are genuinely different actions rather
+-- than one mechanism the game resolves between. (Tool.Tasks.Types.Revive is
+-- a third thing again - the revive consumable, which checks inventory
+-- ownership server-side. That is the one that lives on ToolProfile.)
+--
+-- the entry point that actually drives both is InteractionService:KeyUsed,
+-- which reads .Active / .ActiveChildren - the interactable the service has
+-- already picked - and fires the matching interaction. Revive, having a
+-- Length, only needs ONE press: KeyUsed records a start time and the
+-- service's own Heartbeat calls Activate once ReviveLength has elapsed. So
+-- there is no hold to simulate and no release to time, which is the whole
+-- press/release/hysteresis machine that used to be here.
+local InteractionService = require(waitPath(ReplicatedStorage, "Services", "Asset", "InteractionService"))
+local InteractionTypes = require(waitPath(ReplicatedStorage, "Services", "Asset", "InteractionService", "InteractionTypes"))
 
-local function findDownedTeammate(maxRange)
-    local localCharacter = CharacterService:GetLocalCharacter()
-    if not localCharacter or not localCharacter.Model or not localCharacter.Model.PrimaryPart then
-        return nil
-    end
-    local myTeam = localCharacter.Model:GetAttribute("Team")
-    local myPosition = localCharacter.Model.PrimaryPart.Position
-    for _, entry in ipairs(CharacterService:GetCharacters()) do
-        if entry ~= localCharacter and entry.Model and entry.Model.PrimaryPart
-            and myTeam ~= nil and entry.Model:GetAttribute("Team") == myTeam
-            and entry.DataRegistry and entry.DataRegistry:Get("Downed") == true then
-            local distance = (entry.Model.PrimaryPart.Position - myPosition).Magnitude
-            if distance <= maxRange then
-                return entry
-            end
+-- resolves an interaction by NAME against whatever the service currently has
+-- active, and hands back the keybind that interaction is really bound to
+-- rather than assuming one. ActiveChildren is already filtered by the
+-- service for that target's own requirements - CanBeCarried, equipped tool,
+-- and so on - so anything it lists is genuinely available right now
+local function findActiveInteraction(name)
+    local active = InteractionService.Active
+    local children = InteractionService.ActiveChildren
+    if not (active and children) then return nil end
+    local typeInfo = InteractionTypes[active.Type]
+    local list = typeInfo and typeInfo.Interactions
+    if not list then return nil end
+    for _, index in ipairs(children) do
+        local entry = list[index]
+        if entry and entry.Name == name then
+            return entry, active
         end
     end
     return nil
 end
 
--- calls character.ToolProfile:KeyPhraseUsed directly instead of the broader
--- Character:KeyUsed, which also fans this same "Interact" event out to
--- Camera/Movement/Actions/Animations - none of which have anything to do
--- with reviving or carrying, but any of which could react to a simulated
--- Interact key in unrelated ways. ToolProfile is the only one that owns
--- whichever downed-teammate task actually resolves from pressing it
-local function sendInteract(character, down)
-    if not character or not character.ToolProfile then return end
-    pcall(function() character.ToolProfile:KeyPhraseUsed({ Key = "Interact", Down = down }) end)
+local function activeDistance(active)
+    local localCharacter = CharacterService:GetLocalCharacter()
+    local root = localCharacter and localCharacter.Model and localCharacter.Model.PrimaryPart
+    local asset = active and active.Asset
+    if not (root and asset and asset.PrimaryPart) then return nil end
+    return (asset.PrimaryPart.Position - root.Position).Magnitude
 end
 
--- revive and carry both turned out to run through this exact same
--- mechanism: holding Interact on a nearby downed teammate, with the game
--- itself resolving which of the two tasks that actually triggers - no
--- separate carry keybind or remote exists anywhere in the dump. so both
--- "features" below are really the same automation instantiated twice,
--- each with its own toggle, panel, range and hold state, since the two are
--- still meant to be controlled independently even though they do the same
--- thing under the hood
-local function createDownedInteractAutomation(panelTitle, defaultRange)
+-- both automations are the same shape: watch for the named interaction to
+-- become available, then press its own key once. Repeats are harmless - a
+-- revive already in progress is guarded by the service's own Started flag,
+-- and carry carries a 1 second cooldown the service enforces itself
+local function createInteractionAutomation(panelTitle, interactionName, defaultRange)
     local automation = {
         Panel = nil,
         Element = nil,
         Active = false,
         Range = defaultRange,
-        Holding = false,
-        HeldSince = 0,
         SuppressPanelSync = false,
     }
-
-    local function releaseHold()
-        if not automation.Holding then return end
-        automation.Holding = false
-        sendInteract(CharacterService:GetLocalCharacter(), false)
-        logEvent(panelTitle .. ': released after ' .. ('%.1fs'):format(os.clock() - automation.HeldSince))
-    end
-    automation.ReleaseHold = releaseHold
 
     -- same panel-persistence contract as auto jump: turning the feature off
     -- FROM THE PANEL must never remove the panel, only the main toggle does
     local function setActive(state, fromPanel)
         automation.Active = state
-        if not state then releaseHold() end
 
         if fromPanel then
             if automation.Element then
@@ -1807,45 +1877,30 @@ local function createDownedInteractAutomation(panelTitle, defaultRange)
     end
     automation.SetActive = setActive
 
-    -- acquiring a hold uses the configured range, releasing needs the
-    -- target to drift RELEASE_RANGE_MARGIN studs further out than that, and
-    -- a hold can't end before MIN_HOLD_TIME regardless - without this, a
-    -- teammate sitting right at the edge of the range during ordinary
-    -- movement jitter flickered in and out many times a second, meaning
-    -- rapid real press/release events reaching the actual task - which is
-    -- exactly what spamming the real key that fast would also do
     task.spawn(function()
         while not Unloading do
             pcall(function()
-                if automation.Active then
-                    local character = CharacterService:GetLocalCharacter()
-                    if automation.Holding then
-                        local target = character and findDownedTeammate(automation.Range + RELEASE_RANGE_MARGIN)
-                        if not target and (os.clock() - automation.HeldSince) >= MIN_HOLD_TIME then
-                            releaseHold()
-                        end
-                    else
-                        local target = character and findDownedTeammate(automation.Range)
-                        if target then
-                            automation.Holding = true
-                            automation.HeldSince = os.clock()
-                            sendInteract(character, true)
-                            logEvent(panelTitle .. ': holding interact on a downed teammate')
-                        end
-                    end
-                elseif automation.Holding then
-                    releaseHold()
-                end
+                if not automation.Active then return end
+                local entry, active = findActiveInteraction(interactionName)
+                if not entry then return end
+                -- the service's own range is 8 studs and this cannot extend
+                -- it, only tighten it, so a lower slider just makes the
+                -- automation more conservative than pressing the key yourself
+                local distance = activeDistance(active)
+                if distance and distance > automation.Range then return end
+                InteractionService:KeyUsed({ Keybind = entry.Keybind, Down = true })
+                logEvent(('%s: pressed %s at %d studs'):format(
+                    panelTitle, tostring(entry.KeybindName or entry.Keybind), distance or 0))
             end)
-            task.wait(0.2)
+            task.wait(0.15)
         end
     end)
 
     return automation
 end
 
-local AutoRevive = createDownedInteractAutomation('auto revive', 8)
-local AutoCarry = createDownedInteractAutomation('auto carry', 8)
+local AutoRevive = createInteractionAutomation('auto revive', 'Revive', 8)
+local AutoCarry = createInteractionAutomation('auto carry', 'Carry', 8)
 
 local ExtraTab = Window:CreateTab({ Title = 'extra' })
 
@@ -1868,6 +1923,44 @@ do
     -- or interval that switch actually uses, then a rule off to the next one.
     -- Previously all three switches ran together above all three sliders,
     -- which made it easy to drag the wrong slider
+    -- this is the readout that makes the two automations below debuggable at
+    -- all: they can only ever fire on what InteractionService has already
+    -- picked, so if 'offer' stays none while standing over a downed teammate,
+    -- the game is not offering the interaction and no amount of retrying will
+    -- change that
+    local InteractSection = ExtraTab:CreateSection('interact target')
+
+    InteractSection:Stats({
+        Columns = 2,
+        Items = {
+            { Label = 'type', Value = function()
+                local active = InteractionService.Active
+                return (active and active.Type) and tostring(active.Type) or 'none'
+            end },
+            { Label = 'distance', Value = function()
+                local distance = activeDistance(InteractionService.Active)
+                return distance and (('%.1f studs'):format(distance)) or '-'
+            end },
+            { Label = 'offers', Value = function()
+                local active = InteractionService.Active
+                local children = InteractionService.ActiveChildren
+                if not (active and children) then return 'none' end
+                local typeInfo = InteractionTypes[active.Type]
+                local list = typeInfo and typeInfo.Interactions
+                if not list then return 'none' end
+                local names = {}
+                for _, index in ipairs(children) do
+                    local entry = list[index]
+                    if entry then
+                        table.insert(names, ('%s (%s)'):format(
+                            tostring(entry.Name), tostring(entry.KeybindName or entry.Keybind)))
+                    end
+                end
+                return #names > 0 and table.concat(names, ', ') or 'none'
+            end },
+        },
+    })
+
     local AutoSection = ExtraTab:CreateSection('automation')
 
     AutoJumpElement = AutoSection:Toggle({
@@ -1893,7 +1986,7 @@ do
 
     AutoRevive.Element = AutoSection:Toggle({
         Title = 'auto revive',
-        Description = 'automatically holds interact on the nearest downed teammate in range - the same input path a real keypress uses, just triggered by range instead of a key. also opens a small draggable pill with its own switch, synced with this one either direction',
+        Description = 'presses E on a downed teammate the moment the game itself offers the revive, through InteractionService:KeyUsed - the exact call a real keypress ends at. Revive has a length, so one press is all it takes: the game finishes it on its own timer. also opens a small draggable pill with its own switch, synced with this one either direction',
         Flag = 'evade_auto_revive',
         Default = false,
         Callback = function(state) AutoRevive.SetActive(state, false) end,
@@ -1901,8 +1994,9 @@ do
 
     AutoSection:Slider({
         Title = 'auto revive range',
-        Min = 3,
-        Max = 20,
+        Description = 'the game offers the revive within 8 studs and nothing here can extend that - lower this only to make the automation more conservative than pressing E yourself',
+        Min = 1,
+        Max = 8,
         Increment = 1,
         Default = AutoRevive.Range,
         Suffix = ' studs',
@@ -1914,7 +2008,7 @@ do
 
     AutoCarry.Element = AutoSection:Toggle({
         Title = 'auto carry',
-        Description = 'checked directly in the game\'s own code: carrying and reviving a downed teammate turned out to go through the exact same interact-on-a-downed-teammate mechanism, with the game itself deciding which one actually happens - so this is functionally the same automation as auto revive above, just controlled separately in case you want one running without the other',
+        Description = 'carry is a separate interaction bound to Melee (Q), not Interact (E) - that mix-up is why this did nothing before. It presses Q the moment the game offers the carry, which it only does when the target has CanBeCarried on and you are not holding a grapple. The game enforces its own 1 second cooldown on it',
         Flag = 'evade_auto_carry',
         Default = false,
         Callback = function(state) AutoCarry.SetActive(state, false) end,
@@ -1922,8 +2016,9 @@ do
 
     AutoSection:Slider({
         Title = 'auto carry range',
-        Min = 3,
-        Max = 20,
+        Description = 'same 8 stud ceiling as revive, set by the game - this only tightens it',
+        Min = 1,
+        Max = 8,
         Increment = 1,
         Default = AutoCarry.Range,
         Suffix = ' studs',
@@ -2119,6 +2214,7 @@ local function resetAllOptions()
         evade_edge_lookahead = 4,
         evade_spider_hop = false,
         evade_trick_cooldown = 0.15,
+        evade_root_size = 1,
         evade_slide_override = false,
         evade_slide_mult = 1,
         evade_slide_max_speed = DEFAULT_SLIDE_MAX_SPEED,
