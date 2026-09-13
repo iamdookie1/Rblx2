@@ -312,6 +312,7 @@ PresetSection:Segmented({
     Title = 'quick preset',
     Values = { 'Default', 'Speedy', 'Extreme' },
     Default = 'Default',
+    Flag = 'evade_movement_preset',
     Callback = function(value)
         local presets = {
             Default = { Speed = DEFAULT_SPEED, Sprint = DEFAULT_SPRINT_CAP, Jump = DEFAULT_JUMP_HEIGHT, JumpMult = DEFAULT_JUMP_SPEED_MULT },
@@ -1187,6 +1188,74 @@ AutoSection:Slider({
 
 local SessionTab = Window:CreateTab({ Title = 'session' })
 local SessionSection = SessionTab:CreateSection('session')
+
+-- goes through every flagged element via Onyx:SetFlag rather than holding a
+-- reference to each slider/toggle individually - SetFlag both updates the
+-- element's own visual state and fires its callback, so this converges to
+-- the same end result regardless of what order the flags happen to reset in
+local function resetAllOptions()
+    local defaults = {
+        evade_movement_preset = 'Default',
+        evade_base_speed = DEFAULT_SPEED,
+        evade_sprint_cap = DEFAULT_SPRINT_CAP,
+        evade_jump_height = DEFAULT_JUMP_HEIGHT,
+        evade_jump_speed_mult = DEFAULT_JUMP_SPEED_MULT,
+        evade_jump_cap = DEFAULT_JUMP_CAP,
+        evade_bhop = false,
+        evade_grounded_dist = DEFAULT_GROUNDED_DIST,
+        evade_trimp_boost_enabled = false,
+        evade_trimp_boost_mult = 1,
+        evade_trimp_on_touch = false,
+        evade_slide_override = false,
+        evade_slide_mult = 1,
+        evade_slide_max_speed = DEFAULT_SLIDE_MAX_SPEED,
+        evade_run_accel = DEFAULT_RUN_ACCEL,
+        evade_run_deaccel = DEFAULT_RUN_DEACCEL,
+        evade_friction = DEFAULT_FRICTION,
+        evade_sprint_accel = DEFAULT_SPRINT_ACCEL,
+        evade_walk_speed_mult = DEFAULT_WALK_SPEED_MULT,
+        evade_air_accel = DEFAULT_AIR_ACCEL,
+        evade_air_strafe_accel = DEFAULT_AIR_STRAFE_ACCEL,
+
+        evade_esp_nextbot = false,
+        evade_esp_nextbot_color = Color3.fromRGB(255, 60, 60),
+        evade_esp_downed = false,
+        evade_esp_downed_color = Color3.fromRGB(255, 210, 60),
+        evade_esp_players = false,
+        evade_esp_players_color = Color3.fromRGB(80, 170, 255),
+        evade_esp_fill_transparency = 0.5,
+        evade_esp_max_distance = 250,
+        evade_esp_distance_text = false,
+        evade_esp_name_text = false,
+
+        evade_nextbot_vignette = nextbotVignetteDefault,
+
+        evade_lighting_brightness = OriginalLighting.Brightness,
+        evade_lighting_exposure = OriginalLighting.ExposureCompensation,
+        evade_lighting_clocktime = OriginalLighting.ClockTime,
+        evade_fullbright = false,
+
+        evade_revive_override = false,
+        evade_revive_time = 0,
+
+        evade_auto_jump_panel = false,
+        evade_auto_jump_interval = 0.15,
+        evade_auto_revive_panel = false,
+        evade_auto_revive_range = 8,
+    }
+
+    for flag, value in pairs(defaults) do
+        pcall(function() Onyx:SetFlag(flag, value) end)
+    end
+    clearAllHighlights()
+end
+
+SessionSection:Button({
+    Title = 'reset all options',
+    Description = 'sets every setting on every tab back to its original default - in case testing gets away from you and you just want a clean slate without rejoining',
+    Confirm = true,
+    Callback = resetAllOptions,
+})
 
 SessionSection:Button({
     Title = 'unload',
