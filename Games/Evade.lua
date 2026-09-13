@@ -37,6 +37,8 @@ local CharacterService = require(CharacterServiceScript)
 local GamemodesFolder = waitPath(ReplicatedStorage, "Info", "Gamemodes")
 local UseSettingsScript = waitPath(ReplicatedStorage, "Shared", "UserData", "ClientHooks", "useSettings")
 local UseSettings = require(UseSettingsScript)
+local ServerStateRegistryScript = waitPath(ReplicatedStorage, "Services", "Data", "ServerStateRegistryService")
+local ServerStateRegistry = require(ServerStateRegistryScript)
 
 local DEFAULT_SPEED = 1500 / 90
 local DEFAULT_SPRINT_CAP = 2
@@ -69,9 +71,10 @@ local Tune = {
     SprintAcceleration = DEFAULT_SPRINT_ACCEL,
     WalkSpeedMultiplier = DEFAULT_WALK_SPEED_MULT,
 
-    TrimpBoostEnabled = false,
-    TrimpBoostMultiplier = 1,
-    TrimpOnTouchEnabled = false,
+    JumpTrimpEnabled = false,
+    JumpTrimpMultiplier = 1,
+    ObjectTrimpEnabled = false,
+    ObjectTrimpMultiplier = 1,
 
     SlideOverrideEnabled = false,
     SlideMultiplier = 1,
@@ -200,28 +203,32 @@ end
 -- character model rather than a captured reference so it survives respawns
 local originalJump = MovementClass.Jump
 MovementClass.Jump = function(self, ...)
-    local boost = Tune.TrimpBoostEnabled and self.Character == LocalPlayer.Character
+    local boost = Tune.JumpTrimpEnabled and self.Character == LocalPlayer.Character
     local a, b = originalJump(self, ...)
     if boost then
-        boostHorizontalVelocity(self.DataRegistry, Tune.TrimpBoostMultiplier)
+        boostHorizontalVelocity(self.DataRegistry, Tune.JumpTrimpMultiplier)
     end
     return a, b
 end
 
--- mirrors the native Slide state's own ground-normal raycast (it whitelists
--- only workspace.Map.Parts, which is why standing on a slanted crate or prop
--- never gets the native ramp treatment) - this one checks any surface, and
--- only fires the boost the instant you leave a surface that was genuinely
--- tilted, not on every touch, so it reads as an actual launch off a slope
--- rather than a flat "bumped into something" speed bump
-local SLOPE_MIN_TILT = 0.3
-local SLOPE_MAX_TILT = 0.95
+-- the native Slide state only reads slope off workspace.Map.Parts (its own
+-- raycast is whitelisted to exactly that), so a crate or prop never gets
+-- ramp treatment no matter how it's shaped. object trimp used to require
+-- reading a tilted surface normal to fire, but trimping off an object isn't
+-- actually about geometric slope - it can happen leaving a perfectly flat
+-- crate too - so this now fires off leaving ANY grounded surface that
+-- wasn't part of that native whitelist, tilted or not
+local MapPartsContainer
+do
+    local mapFolder = workspace:WaitForChild("Map", 10)
+    MapPartsContainer = mapFolder and mapFolder:WaitForChild("Parts", 10)
+end
 
-local lastGroundNormal = nil
+local lastGroundWasObject = false
 local wasGrounded = false
 
 local trimpConnection = RunService.Heartbeat:Connect(function()
-    if not Tune.TrimpOnTouchEnabled then return end
+    if not Tune.ObjectTrimpEnabled then return end
     local ok = pcall(function()
         local character = CharacterService:GetLocalCharacter()
         if not character or not character.Model or not character.Model.PrimaryPart then return end
@@ -233,19 +240,17 @@ local trimpConnection = RunService.Heartbeat:Connect(function()
             params.FilterType = Enum.RaycastFilterType.Exclude
             params.FilterDescendantsInstances = { character.Model }
             local result = workspace:Raycast(root.Position, Vector3.new(0, -4, 0), params)
-            lastGroundNormal = result and result.Normal or nil
-        elseif wasGrounded and lastGroundNormal then
-            local tilt = lastGroundNormal:Dot(Vector3.new(0, 1, 0))
-            if tilt > SLOPE_MIN_TILT and tilt < SLOPE_MAX_TILT then
-                boostHorizontalVelocity(character.DataRegistry, Tune.TrimpBoostMultiplier)
-            end
-            lastGroundNormal = nil
+            lastGroundWasObject = result ~= nil
+                and not (MapPartsContainer and result.Instance:IsDescendantOf(MapPartsContainer))
+        elseif wasGrounded and lastGroundWasObject then
+            boostHorizontalVelocity(character.DataRegistry, Tune.ObjectTrimpMultiplier)
+            lastGroundWasObject = false
         end
 
         wasGrounded = grounded
     end)
     if not ok then
-        lastGroundNormal = nil
+        lastGroundWasObject = false
         wasGrounded = false
     end
 end)
@@ -303,6 +308,21 @@ LiveSection:Stats({
 LiveSection:Paragraph({
     Title = 'reading this',
     Content = 'the two "(live)" values read straight from the character\'s real movement table, not from this menu\'s own copy - if a slider below is moved and the matching live value here does not change within about half a second, the setting genuinely is not applying. if it does change and the game still feels the same, the setting is applying but its effect is naturally subtle (air acceleration only changes how fast you reach your air speed cap, not the cap itself, and air strafe acceleration only kicks in when moving purely sideways with no forward/back input at all)',
+})
+
+local RoundSection = MovementTab:CreateSection('round info')
+RoundSection:Stats({
+    Columns = 2,
+    Items = {
+        { Label = 'gamemode', Value = function()
+            local ok, value = pcall(function() return ServerStateRegistry:Get("Gamemode") end)
+            return (ok and value) and tostring(value) or '-'
+        end },
+        { Label = 'special round', Value = function()
+            local ok, value = pcall(function() return ServerStateRegistry:Get("SpecialRound") end)
+            return (ok and value) and tostring(value) or 'none'
+        end },
+    },
 })
 
 local PresetSection = MovementTab:CreateSection('preset')
@@ -413,30 +433,41 @@ JumpSection:Slider({
 })
 
 JumpSection:Toggle({
-    Title = 'extra trimp boost',
-    Description = 'multiplies whatever horizontal speed a jump already leaves you with, on top of the jump speed multiplier above - a second, separate boost to test against the native one',
-    Flag = 'evade_trimp_boost_enabled',
+    Title = 'jump trimp boost',
+    Description = 'multiplies whatever horizontal speed a jump already leaves you with, on top of the jump speed multiplier above - a second, separate boost stacked on top of the native trimp, tested purely through jumping',
+    Flag = 'evade_jump_trimp_enabled',
     Default = false,
-    Callback = function(state) Tune.TrimpBoostEnabled = state end,
+    Callback = function(state) Tune.JumpTrimpEnabled = state end,
 })
 
 JumpSection:Slider({
-    Title = 'extra trimp boost multiplier',
+    Title = 'jump trimp multiplier',
     Min = 1,
     Max = 4,
     Increment = 0.05,
     Default = 1,
     Suffix = 'x',
-    Flag = 'evade_trimp_boost_mult',
-    Callback = function(value) Tune.TrimpBoostMultiplier = value end,
+    Flag = 'evade_jump_trimp_mult',
+    Callback = function(value) Tune.JumpTrimpMultiplier = value end,
 })
 
 JumpSection:Toggle({
-    Title = 'trimp off slanted objects',
-    Description = 'reads the ground normal the same way the native ramp slide does, but off any surface instead of only workspace.Map.Parts - the instant you leave a surface that was actually tilted (not flat, not a wall), it applies the trimp boost, so slanted crates and props launch you the same way a real ramp does instead of every touch giving a speed bump',
-    Flag = 'evade_trimp_on_touch',
+    Title = 'object trimp boost',
+    Description = 'boosts your horizontal speed the instant you leave any grounded surface that is not part of workspace.Map.Parts - the exact whitelist the native ramp slide uses, which is why props and crates never get ramp treatment on their own. this fires on any such surface, flat or tilted, since trimping off an object is not really about slope angle - independent from the jump trimp boost above, with its own multiplier below',
+    Flag = 'evade_object_trimp_enabled',
     Default = false,
-    Callback = function(state) Tune.TrimpOnTouchEnabled = state end,
+    Callback = function(state) Tune.ObjectTrimpEnabled = state end,
+})
+
+JumpSection:Slider({
+    Title = 'object trimp multiplier',
+    Min = 1,
+    Max = 4,
+    Increment = 0.05,
+    Default = 1,
+    Suffix = 'x',
+    Flag = 'evade_object_trimp_mult',
+    Callback = function(value) Tune.ObjectTrimpMultiplier = value end,
 })
 
 local SlideSection = MovementTab:CreateSection('slide')
@@ -793,6 +824,66 @@ ComfortSection:Toggle({
     end,
 })
 
+-- there is no separate camera-shake setting - checked the real settings
+-- config (Shared.UserData.Settings.Config) and nextbot camera shake and the
+-- vignette darkening are driven by the same Enabled flag on the same Fear
+-- service, so the toggle above already covers both. these are the other
+-- real, confirmed settings from that same config, exposed the same
+-- legitimate way rather than a client-only hack
+local function getSettingDefault(key, fallback)
+    local ok, value = pcall(function() return UseSettings.Get(key) end)
+    if ok and value ~= nil then return value end
+    return fallback
+end
+
+local function setSetting(key, value)
+    pcall(function() UseSettings.SetSetting(key, value) end)
+end
+
+local originalFov = getSettingDefault("FOV", 70)
+local originalLowGraphics = getSettingDefault("LowGraphics", false)
+local originalMapShadows = getSettingDefault("MapShadows", true)
+local originalViewbob = getSettingDefault("Viewbob", true)
+local originalPovScroll = getSettingDefault("POVScroll", true)
+
+ComfortSection:Slider({
+    Title = 'field of view',
+    Min = 70,
+    Max = 100,
+    Increment = 1,
+    Default = originalFov,
+    Flag = 'evade_setting_fov',
+    Callback = function(value) setSetting("FOV", value) end,
+})
+
+ComfortSection:Toggle({
+    Title = 'low graphics',
+    Flag = 'evade_setting_low_graphics',
+    Default = originalLowGraphics,
+    Callback = function(state) setSetting("LowGraphics", state) end,
+})
+
+ComfortSection:Toggle({
+    Title = 'map shadows',
+    Flag = 'evade_setting_map_shadows',
+    Default = originalMapShadows,
+    Callback = function(state) setSetting("MapShadows", state) end,
+})
+
+ComfortSection:Toggle({
+    Title = 'view bob',
+    Flag = 'evade_setting_viewbob',
+    Default = originalViewbob,
+    Callback = function(state) setSetting("Viewbob", state) end,
+})
+
+ComfortSection:Toggle({
+    Title = 'scroll to change pov',
+    Flag = 'evade_setting_pov_scroll',
+    Default = originalPovScroll,
+    Callback = function(state) setSetting("POVScroll", state) end,
+})
+
 local LightingSection = VisualsTab:CreateSection('lighting')
 local FullbrightEnabled = false
 local BrightnessSlider, ExposureSlider, ClockTimeSlider
@@ -927,7 +1018,7 @@ local floatingPanelOffset = 0
 -- InputObject that pressed it (not a global InputChanged listener), so a
 -- second finger moving elsewhere on screen - a touch joystick, say - can
 -- never drag it by mistake
-local function createFloatingPanel(title, onToggle)
+local function createFloatingPanel(title, initialActive, onToggle)
     local screenGui = Instance.new("ScreenGui")
     screenGui.Name = "EvadeFloating_" .. title:gsub("%s+", "")
     screenGui.ResetOnSpawn = false
@@ -989,7 +1080,7 @@ local function createFloatingPanel(title, onToggle)
     knobCorner.CornerRadius = UDim.new(1, 0)
     knobCorner.Parent = knob
 
-    local active = false
+    local active = initialActive
     local function render()
         if active then
             button.BackgroundColor3 = Color3.fromRGB(210, 45, 45)
@@ -1031,34 +1122,47 @@ local function createFloatingPanel(title, onToggle)
     end)
 
     return {
+        SetActive = function(state)
+            active = state
+            render()
+        end,
         Destroy = function() screenGui:Destroy() end,
     }
 end
 
 local AutoJumpPanel
+local AutoJumpElement
 local AutoJumpActive = false
 local AutoJumpInterval = 0.15
 
-local function destroyAutoJumpPanel()
-    if AutoJumpPanel then
+local function setAutoJumpActive(state, fromPanel)
+    AutoJumpActive = state
+    if not fromPanel and AutoJumpPanel then AutoJumpPanel.SetActive(state) end
+    if state and not AutoJumpPanel then
+        AutoJumpPanel = createFloatingPanel('auto jump', true, function(panelState)
+            setAutoJumpActive(panelState, true)
+            if AutoJumpElement then AutoJumpElement:Set(panelState) end
+        end)
+    elseif not state and AutoJumpPanel then
         AutoJumpPanel.Destroy()
         AutoJumpPanel = nil
     end
-    AutoJumpActive = false
 end
 
-local function buildAutoJumpPanel()
-    destroyAutoJumpPanel()
-    AutoJumpPanel = createFloatingPanel('auto jump', function(state) AutoJumpActive = state end)
-end
-
+-- AttemptJump() is a plain, single, non-blocking jump attempt.
+-- JumpReact() (what a real key-down calls) is NOT: it sets JumpHeldDown and
+-- then yields on Heartbeat in a loop until something calls it again with a
+-- matching release, exactly like holding a key down and letting go. calling
+-- it here with no release ever coming left this coroutine permanently
+-- parked inside that wait after the first jump - which is why "auto jump"
+-- jumped once and then simply stopped
 task.spawn(function()
     while not Unloading do
         if AutoJumpActive then
             pcall(function()
                 local character = CharacterService:GetLocalCharacter()
                 local movement = character and character.Movement
-                if movement then movement:JumpReact() end
+                if movement then movement:AttemptJump() end
             end)
         end
         task.wait(AutoJumpInterval)
@@ -1066,11 +1170,16 @@ task.spawn(function()
 end)
 
 local AutoRevivePanel
+local AutoReviveElement
 local AutoReviveActive = false
 local AutoReviveRange = 8
 local reviveHolding = false
+local reviveHeldSince = 0
 
-local function findDownedTeammateInRange()
+local RELEASE_RANGE_MARGIN = 2
+local MIN_HOLD_TIME = 0.3
+
+local function findDownedTeammate(maxRange)
     local localCharacter = CharacterService:GetLocalCharacter()
     if not localCharacter or not localCharacter.Model or not localCharacter.Model.PrimaryPart then
         return nil
@@ -1082,7 +1191,7 @@ local function findDownedTeammateInRange()
             and myTeam ~= nil and entry.Model:GetAttribute("Team") == myTeam
             and entry.DataRegistry and entry.DataRegistry:Get("Downed") == true then
             local distance = (entry.Model.PrimaryPart.Position - myPosition).Magnitude
-            if distance <= AutoReviveRange then
+            if distance <= maxRange then
                 return entry
             end
         end
@@ -1090,48 +1199,64 @@ local function findDownedTeammateInRange()
     return nil
 end
 
+-- calls character.ToolProfile:KeyPhraseUsed directly instead of the broader
+-- Character:KeyUsed, which also fans this same "Interact" event out to
+-- Camera/Movement/Actions/Animations - none of which have anything to do
+-- with reviving, but any of which could react to a simulated Interact key
+-- in ways unrelated to revive (this is almost certainly what was described
+-- as auto revive interfering with other downed-related actions and their
+-- ui). ToolProfile is the only one that owns the revive task at all
+local function sendInteract(character, down)
+    if not character or not character.ToolProfile then return end
+    pcall(function() character.ToolProfile:KeyPhraseUsed({ Key = "Interact", Down = down }) end)
+end
+
 local function releaseReviveHold()
     if not reviveHolding then return end
     reviveHolding = false
-    local character = CharacterService:GetLocalCharacter()
-    if character then
-        pcall(function() character:KeyUsed({ Key = "Interact", Down = false }) end)
-    end
+    sendInteract(CharacterService:GetLocalCharacter(), false)
 end
 
-local function destroyAutoRevivePanel()
-    if AutoRevivePanel then
+local function setAutoReviveActive(state, fromPanel)
+    AutoReviveActive = state
+    if not state then releaseReviveHold() end
+    if not fromPanel and AutoRevivePanel then AutoRevivePanel.SetActive(state) end
+    if state and not AutoRevivePanel then
+        AutoRevivePanel = createFloatingPanel('auto revive', true, function(panelState)
+            setAutoReviveActive(panelState, true)
+            if AutoReviveElement then AutoReviveElement:Set(panelState) end
+        end)
+    elseif not state and AutoRevivePanel then
         AutoRevivePanel.Destroy()
         AutoRevivePanel = nil
     end
-    AutoReviveActive = false
-    releaseReviveHold()
 end
 
-local function buildAutoRevivePanel()
-    destroyAutoRevivePanel()
-    AutoRevivePanel = createFloatingPanel('auto revive', function(state)
-        AutoReviveActive = state
-        if not state then releaseReviveHold() end
-    end)
-end
-
--- calls the same Character:KeyUsed({Key="Interact", Down=...}) path the
--- game's own input handler calls on a real keypress (confirmed from the
--- dump: KeybindService binds E to the "Interact" action, and Character:
--- KeyUsed forwards it to ToolProfile:KeyPhraseUsed, which resolves and
--- fires the tool's real activation) - not a guessed remote call
+-- acquiring a hold uses the configured range, releasing needs the target to
+-- drift RELEASE_RANGE_MARGIN studs further out than that, and a hold can't
+-- end before MIN_HOLD_TIME regardless - without this, a teammate sitting
+-- right at the edge of the range during ordinary movement jitter flickered
+-- in and out of range many times a second, which meant rapid real
+-- press/release events reaching the actual revive task - reported as this
+-- messing up the revive ui and other downed-related actions, which lines up
+-- exactly with spamming a real interact key that fast would also do
 task.spawn(function()
     while not Unloading do
         pcall(function()
             if AutoReviveActive then
                 local character = CharacterService:GetLocalCharacter()
-                local target = character and findDownedTeammateInRange()
-                if target and not reviveHolding then
-                    reviveHolding = true
-                    character:KeyUsed({ Key = "Interact", Down = true })
-                elseif not target and reviveHolding then
-                    releaseReviveHold()
+                if reviveHolding then
+                    local target = character and findDownedTeammate(AutoReviveRange + RELEASE_RANGE_MARGIN)
+                    if not target and (os.clock() - reviveHeldSince) >= MIN_HOLD_TIME then
+                        releaseReviveHold()
+                    end
+                else
+                    local target = character and findDownedTeammate(AutoReviveRange)
+                    if target then
+                        reviveHolding = true
+                        reviveHeldSince = os.clock()
+                        sendInteract(character, true)
+                    end
                 end
             elseif reviveHolding then
                 releaseReviveHold()
@@ -1144,14 +1269,12 @@ end)
 local ExtraTab = Window:CreateTab({ Title = 'extra' })
 local AutoSection = ExtraTab:CreateSection('automation')
 
-AutoSection:Toggle({
-    Title = 'auto jump panel',
-    Description = 'shows a small draggable pill with its own on/off switch, so auto jump can be started or stopped without opening this menu',
-    Flag = 'evade_auto_jump_panel',
+AutoJumpElement = AutoSection:Toggle({
+    Title = 'auto jump',
+    Description = 'jumps on an interval for as long as this is on. also opens a small draggable pill with its own switch, so it can be stopped without reopening this menu - the two stay in sync either direction',
+    Flag = 'evade_auto_jump',
     Default = false,
-    Callback = function(state)
-        if state then buildAutoJumpPanel() else destroyAutoJumpPanel() end
-    end,
+    Callback = function(state) setAutoJumpActive(state, false) end,
 })
 
 AutoSection:Slider({
@@ -1165,14 +1288,12 @@ AutoSection:Slider({
     Callback = function(value) AutoJumpInterval = value end,
 })
 
-AutoSection:Toggle({
-    Title = 'auto revive panel',
-    Description = 'shows a small draggable pill with its own on/off switch. while active, automatically holds interact on the nearest downed teammate in range - the same input path a real keypress uses, just triggered by range instead of a key',
-    Flag = 'evade_auto_revive_panel',
+AutoReviveElement = AutoSection:Toggle({
+    Title = 'auto revive',
+    Description = 'automatically holds interact on the nearest downed teammate in range - the same input path a real keypress uses, just triggered by range instead of a key. also opens a small draggable pill with its own switch, synced with this one either direction',
+    Flag = 'evade_auto_revive',
     Default = false,
-    Callback = function(state)
-        if state then buildAutoRevivePanel() else destroyAutoRevivePanel() end
-    end,
+    Callback = function(state) setAutoReviveActive(state, false) end,
 })
 
 AutoSection:Slider({
@@ -1184,6 +1305,25 @@ AutoSection:Slider({
     Suffix = ' studs',
     Flag = 'evade_auto_revive_range',
     Callback = function(value) AutoReviveRange = value end,
+})
+
+local UtilitySection = ExtraTab:CreateSection('utility')
+
+UtilitySection:Button({
+    Title = 'unstuck',
+    Description = 'nudges you straight up a few studs and zeroes your velocity - for when movement testing wedges you into geometry',
+    Callback = function()
+        pcall(function()
+            local character = CharacterService:GetLocalCharacter()
+            local root = character and character.Model and character.Model.PrimaryPart
+            if not root then return end
+            root.CFrame = root.CFrame + Vector3.new(0, 6, 0)
+            root.AssemblyLinearVelocity = Vector3.new()
+            if character.DataRegistry then
+                character.DataRegistry:Set("Velocity", Vector3.new())
+            end
+        end)
+    end,
 })
 
 local SessionTab = Window:CreateTab({ Title = 'session' })
@@ -1203,9 +1343,10 @@ local function resetAllOptions()
         evade_jump_cap = DEFAULT_JUMP_CAP,
         evade_bhop = false,
         evade_grounded_dist = DEFAULT_GROUNDED_DIST,
-        evade_trimp_boost_enabled = false,
-        evade_trimp_boost_mult = 1,
-        evade_trimp_on_touch = false,
+        evade_jump_trimp_enabled = false,
+        evade_jump_trimp_mult = 1,
+        evade_object_trimp_enabled = false,
+        evade_object_trimp_mult = 1,
         evade_slide_override = false,
         evade_slide_mult = 1,
         evade_slide_max_speed = DEFAULT_SLIDE_MAX_SPEED,
@@ -1229,6 +1370,11 @@ local function resetAllOptions()
         evade_esp_name_text = false,
 
         evade_nextbot_vignette = nextbotVignetteDefault,
+        evade_setting_fov = originalFov,
+        evade_setting_low_graphics = originalLowGraphics,
+        evade_setting_map_shadows = originalMapShadows,
+        evade_setting_viewbob = originalViewbob,
+        evade_setting_pov_scroll = originalPovScroll,
 
         evade_lighting_brightness = OriginalLighting.Brightness,
         evade_lighting_exposure = OriginalLighting.ExposureCompensation,
@@ -1238,9 +1384,9 @@ local function resetAllOptions()
         evade_revive_override = false,
         evade_revive_time = 0,
 
-        evade_auto_jump_panel = false,
+        evade_auto_jump = false,
         evade_auto_jump_interval = 0.15,
-        evade_auto_revive_panel = false,
+        evade_auto_revive = false,
         evade_auto_revive_range = 8,
     }
 
@@ -1267,8 +1413,8 @@ SessionSection:Button({
         trimpConnection:Disconnect()
         restoreLighting()
         clearAllHighlights()
-        destroyAutoJumpPanel()
-        destroyAutoRevivePanel()
+        setAutoJumpActive(false, false)
+        setAutoReviveActive(false, false)
         Onyx:Unload()
     end,
 })
