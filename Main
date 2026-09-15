@@ -34,10 +34,6 @@ local Games = {
     -- other players.
     [6961824067] = { Name = 'Fling Things and People', Script = 'Games/FlingThingsAndPeople.lua' },
     [9872472334] = { Name = 'Evade', Script = 'Games/Evade.lua' },
-    -- real title unconfirmed from its dump - identified only by a "Wand"
-    -- tool in every player's Backpack (Fire remote, Ammo/ClipSize/Clips)
-    -- and a berezaa's Tycoon Kit structure (Potions/Staffs shop)
-    [281489669] = { Name = 'Wand', Script = 'Games/Wand.lua' },
 }
 
 -- Loads Onyx straight from its own repo rather than a vendored copy, since
