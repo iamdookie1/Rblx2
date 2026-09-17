@@ -63,6 +63,10 @@ local Combat = {
     Speed = 100,
     Size = 1.5,
     Damage = 15,
+
+    SkipForceField = true,
+    AuraMode = "All in range",
+    AuraLimit = 3,
 }
 
 local Predict = {
@@ -71,6 +75,20 @@ local Predict = {
     Scale = 1.2,
     Gravity = true,
     Iterations = 2,
+}
+
+-- Silent aim rides your own trigger instead of pulling it for you: the shot
+-- you fire by hand is caught on its way out and re-pointed. Auto shoot fires
+-- on a timer whether you click or not; this never fires a shot you did not.
+local Silent = {
+    Enabled = false,
+    Mode = "Direction",
+    Chance = 100,
+    Part = "Follow aim part",
+    Priority = "Crosshair",
+    FovLimit = true,
+    FovRadius = 300,
+    Standoff = 6,
 }
 
 local Burst = {
@@ -85,19 +103,27 @@ local Burst = {
     Spin = 2,
     Spread = 1,
     Chaos = 0,
+    Chunk = 20,
+    Lead = false,
 }
 
 local Esp = {
     Enabled = false,
     Boxes = true,
+    BoxFilled = false,
+    Thickness = 1,
     Names = true,
+    TextSize = 13,
     Health = true,
     Distance = true,
     Tracers = false,
+    TracerFrom = "Bottom",
     TeamColor = false,
     TeamCheck = true,
     Color = Color3.fromRGB(255, 60, 60),
+    FillTransparency = 0.75,
     Range = 1000,
+    BoxWidth = 0.55,
 }
 
 local Visual = {
@@ -121,7 +147,7 @@ local Move = {
     NoFallDamage = false,
 }
 
-local Stats = { shots = 0, bursts = 0 }
+local Stats = { shots = 0, bursts = 0, redirected = 0 }
 
 local lockedTarget = nil
 local selectedPlayer = "None"
@@ -200,26 +226,59 @@ end
 local PART_NAMES = {
     Head = { "Head", "UpperTorso", "HumanoidRootPart" },
     Torso = { "HumanoidRootPart", "UpperTorso", "Torso" },
+    Legs = { "LeftLowerLeg", "RightLowerLeg", "LeftFoot", "RightFoot", "Left Leg", "Right Leg", "HumanoidRootPart" },
+    Arms = { "LeftLowerArm", "RightLowerArm", "LeftHand", "RightHand", "Left Arm", "Right Arm", "UpperTorso" },
 }
 
-local function aimPart(char)
-    if Combat.Part == "Closest" then
+local PART_MODES = { "Head", "Torso", "Legs", "Arms", "Closest", "Furthest", "Random", "Lowest on screen" }
+
+local function bodyParts(char)
+    local parts = {}
+    for _, part in ipairs(char:GetChildren()) do
+        if part:IsA("BasePart") then parts[#parts + 1] = part end
+    end
+    return parts
+end
+
+local function aimPart(char, override)
+    local mode = override or Combat.Part
+    local fallback = char:FindFirstChild("HumanoidRootPart")
+
+    if mode == "Closest" or mode == "Furthest" then
         local origin = Camera.CFrame.Position
-        local best, bestDist = nil, math.huge
-        for _, part in ipairs(char:GetChildren()) do
-            if part:IsA("BasePart") then
-                local d = (part.Position - origin).Magnitude
-                if d < bestDist then best, bestDist = part, d end
+        local want = mode == "Closest"
+        local best, bestDist = nil, want and math.huge or -1
+        for _, part in ipairs(bodyParts(char)) do
+            local d = (part.Position - origin).Magnitude
+            if (want and d < bestDist) or (not want and d > bestDist) then
+                best, bestDist = part, d
             end
         end
-        return best or char:FindFirstChild("HumanoidRootPart")
+        return best or fallback
     end
 
-    for _, name in ipairs(PART_NAMES[Combat.Part] or PART_NAMES.Torso) do
+    if mode == "Random" then
+        local parts = bodyParts(char)
+        if #parts == 0 then return fallback end
+        return parts[math.random(1, #parts)]
+    end
+
+    -- the part sitting nearest the bottom of the screen, which on a target
+    -- peeking over cover is the bit actually exposed
+    if mode == "Lowest on screen" then
+        local best, bestY = nil, -math.huge
+        for _, part in ipairs(bodyParts(char)) do
+            local screen, visible = Camera:WorldToViewportPoint(part.Position)
+            if visible and screen.Y > bestY then best, bestY = part, screen.Y end
+        end
+        return best or fallback
+    end
+
+    for _, name in ipairs(PART_NAMES[mode] or PART_NAMES.Torso) do
         local part = char:FindFirstChild(name)
         if part then return part end
     end
-    return char:FindFirstChild("HumanoidRootPart")
+    return fallback
 end
 
 local function velocityOf(root)
@@ -260,56 +319,81 @@ end
 
 --// targeting ----------------------------------------------------------------
 
-local function validTarget(plr, range)
+local PRIORITY_MODES = {
+    "Distance", "Crosshair", "Lowest health", "Highest health", "Threat", "Random",
+}
+
+local function validTarget(plr, range, partOverride, fovRadius)
     if plr == LocalPlayer then return false end
     if sameTeam(plr) then return false end
 
     local ok, char = alive(plr)
     if not ok then return false end
-    if hasForceField(char) then return false end
+    if Combat.SkipForceField and hasForceField(char) then return false end
 
     local root = myRoot()
     if not root then return false end
 
-    local part = aimPart(char)
+    local part = aimPart(char, partOverride)
     if not part then return false end
 
     if (part.Position - root.Position).Magnitude > (range or Combat.Range) then return false end
-    if Combat.FovLimit then
+
+    if fovRadius then
+        local dist = onScreenDistance(part.Position)
+        if not dist or dist > fovRadius then return false end
+    elseif Combat.FovLimit then
         local dist = onScreenDistance(part.Position)
         if not dist or dist > Combat.FovRadius then return false end
     end
+
     if blocked(root.Position, part.Position, char) then return false end
 
     return true, char, part
 end
 
-local function scoreOf(char, part, root)
-    if Combat.Priority == "Health" then
-        local hum = char:FindFirstChildOfClass("Humanoid")
+local function scoreOf(char, part, root, mode)
+    mode = mode or Combat.Priority
+    local hum = char:FindFirstChildOfClass("Humanoid")
+
+    if mode == "Lowest health" then
         return hum and hum.Health or math.huge
     end
-    if Combat.Priority == "Crosshair" then
+    if mode == "Highest health" then
+        return hum and -hum.Health or math.huge
+    end
+    if mode == "Crosshair" then
         return onScreenDistance(part.Position) or math.huge
     end
+    if mode == "Random" then
+        return math.random()
+    end
+
+    -- close and hurt ranks above far and healthy; negated so lower still wins
+    if mode == "Threat" then
+        local distance = math.max(1, (part.Position - root.Position).Magnitude)
+        local ratio = (hum and hum.MaxHealth > 0) and (hum.Health / hum.MaxHealth) or 1
+        return distance * (ratio + 0.1)
+    end
+
     return (part.Position - root.Position).Magnitude
 end
 
-local function pickTarget(range)
+local function pickTarget(range, partOverride, fovRadius, priority)
     local root = myRoot()
     if not root then return nil end
 
     if Combat.TargetLock and lockedTarget then
-        local ok, char, part = validTarget(lockedTarget, range)
+        local ok, char, part = validTarget(lockedTarget, range, partOverride, fovRadius)
         if ok then return lockedTarget, char, part end
         lockedTarget = nil
     end
 
     local best, bestChar, bestPart, bestScore = nil, nil, nil, math.huge
     for _, plr in ipairs(Players:GetPlayers()) do
-        local ok, char, part = validTarget(plr, range)
+        local ok, char, part = validTarget(plr, range, partOverride, fovRadius)
         if ok then
-            local score = scoreOf(char, part, root)
+            local score = scoreOf(char, part, root, priority)
             if score < bestScore then
                 best, bestChar, bestPart, bestScore = plr, char, part, score
             end
@@ -348,6 +432,116 @@ local function shootAt(char, part)
     return fire(root.Position, leadPosition(char, part))
 end
 
+--// silent aim --------------------------------------------------------------
+--
+-- Auto shoot pulls the trigger for you on a timer. This does the opposite: it
+-- never fires anything on its own, it only rewrites the CFrame of a shot you
+-- fired yourself, on its way to the server. Your click, your rate of fire and
+-- your animation all stay exactly as they were - only where the projectile
+-- ends up changes.
+
+local SILENT_MODES = { "Direction", "Origin lock", "Point blank" }
+local PLAN_STALE = 0.25
+
+local hasNamecallHook = typeof(hookmetamethod) == "function" and typeof(getnamecallmethod) == "function"
+
+local silentPlan = nil
+
+local function buildSilentPlan()
+    if not Silent.Enabled then
+        silentPlan = nil
+        return
+    end
+
+    local partOverride = Silent.Part ~= "Follow aim part" and Silent.Part or nil
+    local fov = Silent.FovLimit and Silent.FovRadius or nil
+    local _, char, part = pickTarget(nil, partOverride, fov, Silent.Priority)
+
+    if not char or not part then
+        silentPlan = nil
+        return
+    end
+
+    silentPlan = {
+        char = char,
+        part = part,
+        aim = leadPosition(char, part),
+        stamp = os.clock(),
+    }
+end
+
+-- Returns the CFrame to send instead, or nil to let the shot through untouched.
+local function solveSilent(sent)
+    local plan = silentPlan
+    if not plan then return nil end
+    if os.clock() - plan.stamp > PLAN_STALE then return nil end
+    if Silent.Chance < 100 and math.random() * 100 >= Silent.Chance then return nil end
+
+    -- Re-solve against where they are right now rather than trusting the plan's
+    -- stored point, which is already a frame of lead out of date.
+    local ok, aim = pcall(leadPosition, plan.char, plan.part)
+    if not ok or typeof(aim) ~= "Vector3" then aim = plan.aim end
+
+    local origin = sent.Position
+
+    if Silent.Mode == "Origin lock" then
+        local root = myRoot()
+        if root then origin = root.Position end
+    elseif Silent.Mode == "Point blank" then
+        -- Spawn the projectile just short of them, so there is no flight time
+        -- left to dodge. Loudest of the three, and the hardest to miss with.
+        local direction = aim - sent.Position
+        if direction.Magnitude > Silent.Standoff then
+            origin = aim - direction.Unit * Silent.Standoff
+        end
+    end
+
+    if (aim - origin).Magnitude < 0.05 then return nil end
+
+    Stats.redirected = Stats.redirected + 1
+    return CFrame.lookAt(origin, aim)
+end
+
+if hasNamecallHook then
+    local originalNamecall
+
+    local function onNamecall(self, ...)
+        if Unloading
+            or not Silent.Enabled
+            or typeof(self) ~= "Instance"
+            or getnamecallmethod() ~= "FireServer"
+        then
+            return originalNamecall(self, ...)
+        end
+
+        local parent = self.Parent
+        if self.Name == "Fire" and parent and parent.Name == "Wand" then
+            local sent = ...
+            if typeof(sent) == "CFrame" then
+                local redirect = solveSilent(sent)
+                if redirect then
+                    local args = table.pack(...)
+                    args[1] = redirect
+                    return originalNamecall(self, table.unpack(args, 1, args.n))
+                end
+            end
+        end
+
+        return originalNamecall(self, ...)
+    end
+
+    if typeof(newcclosure) == "function" then
+        onNamecall = newcclosure(onNamecall)
+    end
+
+    originalNamecall = hookmetamethod(game, "__namecall", onNamecall)
+end
+
+track(RunService.Heartbeat:Connect(function()
+    if Unloading then return end
+    pcall(buildSilentPlan)
+end))
+
 --// pattern engine -----------------------------------------------------------
 --
 -- The old script carried twenty-odd tables of near-identical knobs and never
@@ -356,7 +550,6 @@ end
 -- costs a few lines instead of a hundred.
 
 local TAU = math.pi * 2
-local BURST_CHUNK = 20
 
 local function jitter(amount)
     if amount <= 0 then return Vector3.zero end
@@ -504,6 +697,102 @@ pattern("Storm", function(ctx, i, n, cfg)
     return origin, aim
 end)
 
+pattern("Wall", function(ctx, i, n, cfg)
+    -- a flat grid standing upright across the look direction
+    local columns = math.max(1, math.ceil(math.sqrt(n * (cfg.Radius * 2) / math.max(1, cfg.Height))))
+    local rows = math.max(1, math.ceil(n / columns))
+    local col = (i - 1) % columns
+    local row = math.floor((i - 1) / columns)
+
+    local x = columns > 1 and ((col / (columns - 1)) - 0.5) * cfg.Radius * 2 or 0
+    local y = rows > 1 and (row / (rows - 1)) * cfg.Height or cfg.Height * 0.5
+
+    local base = ctx.centre + ctx.look * cfg.Radius
+    local origin = base + ctx.right * x + Vector3.new(0, y, 0)
+    return origin, origin + ctx.look * 8
+end)
+
+pattern("Dome", function(ctx, i, n, cfg)
+    -- upper half of a sphere, firing inward at the centre
+    local t = (i - 0.5) / n
+    local y = 1 - t
+    local r = math.sqrt(math.max(0, 1 - y * y))
+    local angle = i * 2.399963 + ctx.clock * cfg.Spin
+    local origin = ctx.centre + Vector3.new(math.cos(angle) * r * cfg.Radius, y * cfg.Height, math.sin(angle) * r * cfg.Radius)
+    return origin, ctx.centre
+end)
+
+pattern("Sphere", function(ctx, i, n, cfg)
+    local t = (i - 0.5) / n
+    local y = 1 - t * 2
+    local r = math.sqrt(math.max(0, 1 - y * y))
+    local angle = i * 2.399963 + ctx.clock * cfg.Spin
+    local dir = Vector3.new(math.cos(angle) * r, y, math.sin(angle) * r)
+    return ctx.centre + dir * cfg.Radius, ctx.centre
+end)
+
+pattern("Cross", function(ctx, i, n, cfg)
+    local arms = math.max(2, math.floor(cfg.Layers + 1) * 2)
+    local arm = (i - 1) % arms
+    local step = math.floor((i - 1) / arms)
+    local perArm = math.max(1, math.ceil(n / arms))
+    local t = perArm > 1 and (step / (perArm - 1)) or 1
+    local angle = (arm / arms) * TAU + ctx.clock * cfg.Spin
+    local origin = ctx.centre
+        + Vector3.new(math.cos(angle) * cfg.Radius * t, cfg.Height * 0.5, math.sin(angle) * cfg.Radius * t)
+    return origin, ctx.centre + Vector3.new(0, cfg.Height * 0.5, 0)
+end)
+
+pattern("Star", function(ctx, i, n, cfg)
+    local points = math.max(3, math.floor(cfg.Layers + 2))
+    local t = (i - 1) / math.max(1, n)
+    local angle = t * TAU * points + ctx.clock * cfg.Spin
+    -- alternating long and short radius is what makes the points
+    local reach = ((i % 2 == 0) and 0.45 or 1) * cfg.Radius
+    local origin = ctx.centre + Vector3.new(math.cos(angle) * reach, cfg.Height, math.sin(angle) * reach)
+    return origin, ctx.centre
+end)
+
+pattern("Snake", function(ctx, i, n, cfg)
+    local t = (i - 1) / math.max(1, n - 1)
+    local wave = math.sin(t * TAU * cfg.Spread + ctx.clock * cfg.Spin)
+    local along = ctx.look * (t * cfg.Radius * 2)
+    local offset = ctx.right * (wave * cfg.Radius * 0.5)
+        + Vector3.new(0, math.cos(t * TAU * cfg.Spread) * cfg.Height * 0.25, 0)
+    return ctx.centre + along + offset, ctx.centre + along + ctx.look * 6
+end)
+
+pattern("Pillars", function(ctx, i, n, cfg)
+    local columns = math.max(1, math.floor(cfg.Layers + 3))
+    local col = (i - 1) % columns
+    local step = math.floor((i - 1) / columns)
+    local perCol = math.max(1, math.ceil(n / columns))
+    local angle = (col / columns) * TAU + ctx.clock * cfg.Spin
+    local height = perCol > 1 and (step / (perCol - 1)) * cfg.Height or cfg.Height * 0.5
+    local origin = ctx.centre + Vector3.new(math.cos(angle) * cfg.Radius, height, math.sin(angle) * cfg.Radius)
+    return origin, ctx.centre + Vector3.new(0, height, 0)
+end)
+
+pattern("Rings", function(ctx, i, n, cfg)
+    local rings = math.max(1, math.floor(cfg.Layers + 1))
+    local ring = (i - 1) % rings
+    local step = math.floor((i - 1) / rings)
+    local perRing = math.max(1, math.ceil(n / rings))
+    local angle = (step / perRing) * TAU + ctx.clock * cfg.Spin * (ring % 2 == 0 and 1 or -1)
+    local radius = cfg.Radius * ((ring + 1) / rings)
+    local origin = ctx.centre + Vector3.new(math.cos(angle) * radius, cfg.Height, math.sin(angle) * radius)
+    return origin, ctx.centre + Vector3.new(0, cfg.Height, 0)
+end)
+
+pattern("Lance", function(ctx, i, n, cfg)
+    -- a straight line of bullets along the look direction, for range
+    local t = (i - 1) / math.max(1, n - 1)
+    local along = ctx.look * (t * cfg.Radius * 2)
+    local spin = ctx.clock * cfg.Spin + t * TAU * cfg.Spread
+    local offset = (ctx.right * math.cos(spin) + ctx.up * math.sin(spin)) * (cfg.Height * 0.1)
+    return ctx.centre + along + offset, ctx.centre + along + ctx.look * 10
+end)
+
 local function burstContext()
     local root = myRoot()
     if not root then return nil end
@@ -516,8 +805,12 @@ local function burstContext()
     if Burst.Anchor == "Look ahead" then
         centre = centre + flat * Burst.Radius
     elseif Burst.Anchor == "Target" then
-        local _, _, part = pickTarget()
-        if part then centre = part.Position end
+        local _, char, part = pickTarget()
+        if part then
+            centre = (Burst.Lead and char) and leadPosition(char, part) or part.Position
+        end
+    elseif Burst.Anchor == "Camera" then
+        centre = Camera.CFrame.Position
     end
 
     local right = flat:Cross(Vector3.yAxis)
@@ -558,7 +851,7 @@ local function runBurst()
 
         -- a 200 bullet burst is 200 remote calls; firing them all in one frame
         -- stutters the client, so hand the frame back every so often
-        if i % BURST_CHUNK == 0 then task.wait() end
+        if i % math.max(1, math.floor(Burst.Chunk)) == 0 then task.wait() end
     end
 
     Stats.bursts = Stats.bursts + 1
@@ -586,9 +879,33 @@ task.spawn(function()
             pcall(function()
                 local root = myRoot()
                 if not root then return end
+
+                local found = {}
                 for _, plr in ipairs(Players:GetPlayers()) do
                     local ok, char, part = validTarget(plr, Combat.AuraRange)
-                    if ok then shootAt(char, part) end
+                    if ok then
+                        found[#found + 1] = {
+                            char = char,
+                            part = part,
+                            score = scoreOf(char, part, root),
+                        }
+                    end
+                end
+
+                if #found == 0 then return end
+
+                if Combat.AuraMode == "Single best" then
+                    table.sort(found, function(a, b) return a.score < b.score end)
+                    shootAt(found[1].char, found[1].part)
+                elseif Combat.AuraMode == "Nearest few" then
+                    table.sort(found, function(a, b) return a.score < b.score end)
+                    for i = 1, math.min(#found, math.floor(Combat.AuraLimit)) do
+                        shootAt(found[i].char, found[i].part)
+                    end
+                else
+                    for _, entry in ipairs(found) do
+                        shootAt(entry.char, entry.part)
+                    end
                 end
             end)
             task.wait(math.max(0.05, Combat.Delay))
@@ -833,13 +1150,16 @@ track(RunService.RenderStepped:Connect(function()
                             hideEntry(entry)
                         else
                             local height = math.abs(botPos.Y - topPos.Y)
-                            local width = height * 0.55
+                            local width = height * Esp.BoxWidth
                             local left = topPos.X - width / 2
                             local colour = espColorFor(plr)
 
                             if entry.box then
                                 entry.box.Visible = Esp.Boxes
                                 entry.box.Color = colour
+                                entry.box.Thickness = Esp.Thickness
+                                entry.box.Filled = Esp.BoxFilled
+                                entry.box.Transparency = Esp.BoxFilled and (1 - Esp.FillTransparency) or 1
                                 entry.box.Size = Vector2.new(width, height)
                                 entry.box.Position = Vector2.new(left, topPos.Y)
                             end
@@ -851,28 +1171,42 @@ track(RunService.RenderStepped:Connect(function()
                                 if Esp.Distance then
                                     text = text .. (Esp.Names and " " or "") .. ("[%d]"):format(distance)
                                 end
+                                entry.name.Size = Esp.TextSize
                                 entry.name.Text = text
-                                entry.name.Position = Vector2.new(topPos.X, topPos.Y - 16)
+                                entry.name.Position = Vector2.new(topPos.X, topPos.Y - Esp.TextSize - 3)
                             end
 
                             local ratio = hum and hum.MaxHealth > 0 and (hum.Health / hum.MaxHealth) or 0
                             if entry.healthBack then
                                 entry.healthBack.Visible = Esp.Health
+                                entry.healthBack.Thickness = Esp.Thickness + 1
                                 entry.healthBack.Color = Color3.new(0, 0, 0)
                                 entry.healthBack.From = Vector2.new(left - 4, topPos.Y)
                                 entry.healthBack.To = Vector2.new(left - 4, topPos.Y + height)
                             end
                             if entry.health then
                                 entry.health.Visible = Esp.Health
+                                entry.health.Thickness = Esp.Thickness
                                 entry.health.Color = Color3.fromRGB(80, 230, 110):Lerp(Color3.fromRGB(230, 70, 70), 1 - ratio)
                                 entry.health.From = Vector2.new(left - 4, topPos.Y + height)
                                 entry.health.To = Vector2.new(left - 4, topPos.Y + height - height * ratio)
                             end
 
                             if entry.tracer then
+                                local viewport = Camera.ViewportSize
+                                local from
+                                if Esp.TracerFrom == "Centre" then
+                                    from = Vector2.new(viewport.X / 2, viewport.Y / 2)
+                                elseif Esp.TracerFrom == "Mouse" then
+                                    from = UserInputService:GetMouseLocation()
+                                else
+                                    from = Vector2.new(viewport.X / 2, viewport.Y)
+                                end
+
                                 entry.tracer.Visible = Esp.Tracers
                                 entry.tracer.Color = colour
-                                entry.tracer.From = Vector2.new(Camera.ViewportSize.X / 2, Camera.ViewportSize.Y)
+                                entry.tracer.Thickness = Esp.Thickness
+                                entry.tracer.From = from
                                 entry.tracer.To = Vector2.new(topPos.X, topPos.Y + height)
                             end
                         end
@@ -925,7 +1259,7 @@ AimBox:AddSlider("ShootDelay", {
     Text = "Shoot delay",
     Default = 0.05,
     Min = 0,
-    Max = 1,
+    Max = 10,
     Rounding = 3,
     Suffix = "s",
     Callback = function(v) Combat.Delay = v end,
@@ -933,16 +1267,17 @@ AimBox:AddSlider("ShootDelay", {
 
 AimBox:AddDropdown("AimPart", {
     Text = "Aim part",
-    Values = { "Head", "Torso", "Closest" },
+    Values = PART_MODES,
     Default = "Head",
+    Tooltip = "Lowest on screen picks whichever bit of them is poking out of cover",
     Callback = function(v) Combat.Part = v end,
 })
 
 AimBox:AddDropdown("Priority", {
     Text = "Priority",
-    Values = { "Distance", "Crosshair", "Health" },
+    Values = PRIORITY_MODES,
     Default = "Distance",
-    Tooltip = "How the valid targets get ranked",
+    Tooltip = "How the valid targets get ranked. Threat weighs close and hurt above far and healthy",
     Callback = function(v) Combat.Priority = v end,
 })
 
@@ -950,7 +1285,7 @@ AimBox:AddSlider("Range", {
     Text = "Range",
     Default = 500,
     Min = 50,
-    Max = 2000,
+    Max = 25000,
     Rounding = 0,
     Suffix = " studs",
     Callback = function(v) Combat.Range = v end,
@@ -981,6 +1316,13 @@ FilterBox:AddToggle("WallCheck", {
     Callback = function(v) Combat.WallCheck = v end,
 })
 
+FilterBox:AddToggle("SkipForceField", {
+    Text = "Skip shielded targets",
+    Tooltip = "Ignores anyone currently carrying a ForceField, since those shots do nothing",
+    Default = true,
+    Callback = function(v) Combat.SkipForceField = v end,
+})
+
 FilterBox:AddToggle("FovLimit", {
     Text = "FOV limit",
     Default = false,
@@ -992,7 +1334,7 @@ FovDep:AddSlider("FovRadius", {
     Text = "FOV radius",
     Default = 500,
     Min = 50,
-    Max = 1000,
+    Max = 4000,
     Rounding = 0,
     Suffix = "px",
     Callback = function(v) Combat.FovRadius = v end,
@@ -1013,7 +1355,7 @@ PredictDep:AddSlider("PredictTime", {
     Text = "Base lead",
     Default = 0.165,
     Min = 0,
-    Max = 1,
+    Max = 10,
     Rounding = 3,
     Suffix = "s",
     Tooltip = "Added on top of the distance-based flight time",
@@ -1024,7 +1366,7 @@ PredictDep:AddSlider("PredictScale", {
     Text = "Lead scale",
     Default = 1.2,
     Min = 0.1,
-    Max = 3,
+    Max = 25,
     Rounding = 2,
     Suffix = "x",
     Callback = function(v) Predict.Scale = v end,
@@ -1034,7 +1376,7 @@ PredictDep:AddSlider("PredictIterations", {
     Text = "Solve passes",
     Default = 2,
     Min = 1,
-    Max = 5,
+    Max = 16,
     Rounding = 0,
     Tooltip = "How many times the flight time re-solves against its own answer",
     Callback = function(v) Predict.Iterations = v end,
@@ -1048,6 +1390,90 @@ PredictDep:AddToggle("PredictGravity", {
 
 PredictDep:SetupDependencies({ { Toggles.Predict, true } })
 
+local SilentBox = Tabs.Combat:AddRightGroupbox("Silent aim", "eye-off")
+
+SilentBox:AddLabel(
+    "Rides your own trigger. It never fires a shot for you - it re-points the ones you fire by hand, so your click and rate of fire stay yours.",
+    true
+)
+
+if not hasNamecallHook then
+    SilentBox:AddLabel("This executor has no hookmetamethod/getnamecallmethod, so silent aim cannot run here.", true)
+end
+
+SilentBox:AddToggle("SilentAim", {
+    Text = "Silent aim",
+    Default = false,
+    Disabled = not hasNamecallHook,
+    Callback = function(v) Silent.Enabled = v end,
+})
+
+local SilentDep = SilentBox:AddDependencyBox()
+
+SilentDep:AddDropdown("SilentMode", {
+    Text = "Mode",
+    Values = SILENT_MODES,
+    Default = "Direction",
+    Tooltip = "Direction keeps your muzzle and only turns the shot. Origin lock re-spawns it at your root. Point blank spawns it next to them",
+    Callback = function(v) Silent.Mode = v end,
+})
+
+SilentDep:AddDropdown("SilentPart", {
+    Text = "Aim part",
+    Values = { "Follow aim part", "Head", "Torso", "Legs", "Arms", "Closest", "Random", "Lowest on screen" },
+    Default = "Follow aim part",
+    Callback = function(v) Silent.Part = v end,
+})
+
+SilentDep:AddDropdown("SilentPriority", {
+    Text = "Priority",
+    Values = PRIORITY_MODES,
+    Default = "Crosshair",
+    Tooltip = "Crosshair takes whoever you are already pointing nearest to",
+    Callback = function(v) Silent.Priority = v end,
+})
+
+SilentDep:AddSlider("SilentChance", {
+    Text = "Redirect chance",
+    Default = 100,
+    Min = 0,
+    Max = 100,
+    Rounding = 0,
+    Suffix = "%",
+    Tooltip = "The rest of your shots go exactly where you aimed, untouched",
+    Callback = function(v) Silent.Chance = v end,
+})
+
+SilentDep:AddToggle("SilentFov", {
+    Text = "FOV limit",
+    Default = true,
+    Tooltip = "Only redirects onto someone already near your crosshair",
+    Callback = function(v) Silent.FovLimit = v end,
+})
+
+SilentDep:AddSlider("SilentFovRadius", {
+    Text = "FOV radius",
+    Default = 300,
+    Min = 10,
+    Max = 4000,
+    Rounding = 0,
+    Suffix = "px",
+    Callback = function(v) Silent.FovRadius = v end,
+})
+
+SilentDep:AddSlider("SilentStandoff", {
+    Text = "Point blank standoff",
+    Default = 6,
+    Min = 0.5,
+    Max = 200,
+    Rounding = 1,
+    Suffix = " studs",
+    Tooltip = "How far short of them Point blank spawns the projectile",
+    Callback = function(v) Silent.Standoff = v end,
+})
+
+SilentDep:SetupDependencies({ { Toggles.SilentAim, true } })
+
 local ExtraBox = Tabs.Combat:AddRightGroupbox("Extras", "zap")
 
 ExtraBox:AddToggle("KillAura", {
@@ -1058,11 +1484,29 @@ ExtraBox:AddToggle("KillAura", {
 })
 
 local AuraDep = ExtraBox:AddDependencyBox()
+
+AuraDep:AddDropdown("AuraMode", {
+    Text = "Aura mode",
+    Values = { "All in range", "Nearest few", "Single best" },
+    Default = "All in range",
+    Tooltip = "All in range is the loudest; single best is one shot at the top-ranked target",
+    Callback = function(v) Combat.AuraMode = v end,
+})
+
+AuraDep:AddSlider("AuraLimit", {
+    Text = "Nearest few count",
+    Default = 3,
+    Min = 1,
+    Max = 32,
+    Rounding = 0,
+    Callback = function(v) Combat.AuraLimit = v end,
+})
+
 AuraDep:AddSlider("AuraRange", {
     Text = "Aura range",
     Default = 30,
     Min = 5,
-    Max = 200,
+    Max = 5000,
     Rounding = 0,
     Suffix = " studs",
     Callback = function(v) Combat.AuraRange = v end,
@@ -1081,7 +1525,7 @@ TriggerDep:AddSlider("TriggerDelay", {
     Text = "Trigger delay",
     Default = 100,
     Min = 0,
-    Max = 500,
+    Max = 5000,
     Rounding = 0,
     Suffix = "ms",
     Callback = function(v) Combat.TriggerDelay = v / 1000 end,
@@ -1095,7 +1539,7 @@ RemoteBox:AddSlider("ProjSpeed", {
     Text = "Speed",
     Default = 100,
     Min = 10,
-    Max = 500,
+    Max = 10000,
     Rounding = 0,
     Callback = function(v) Combat.Speed = v end,
 })
@@ -1104,7 +1548,7 @@ RemoteBox:AddSlider("ProjSize", {
     Text = "Size",
     Default = 1.5,
     Min = 0.1,
-    Max = 10,
+    Max = 250,
     Rounding = 2,
     Callback = function(v) Combat.Size = v end,
 })
@@ -1113,7 +1557,7 @@ RemoteBox:AddSlider("ProjDamage", {
     Text = "Damage",
     Default = 15,
     Min = 1,
-    Max = 100,
+    Max = 10000,
     Rounding = 0,
     Callback = function(v) Combat.Damage = v end,
 })
@@ -1137,7 +1581,7 @@ BurstBox:AddDropdown("BurstPattern", {
 
 BurstBox:AddDropdown("BurstAnchor", {
     Text = "Anchor",
-    Values = { "Self", "Look ahead", "Target" },
+    Values = { "Self", "Look ahead", "Target", "Camera" },
     Default = "Self",
     Tooltip = "Where the shape is built around",
     Callback = function(v) Burst.Anchor = v end,
@@ -1147,7 +1591,7 @@ BurstBox:AddSlider("BurstBullets", {
     Text = "Bullets per burst",
     Default = 12,
     Min = 1,
-    Max = 200,
+    Max = 1000,
     Rounding = 0,
     Callback = function(v) Burst.Bullets = v end,
 })
@@ -1156,7 +1600,7 @@ BurstBox:AddSlider("BurstDelay", {
     Text = "Burst delay",
     Default = 0.08,
     Min = 0.02,
-    Max = 1,
+    Max = 10,
     Rounding = 3,
     Suffix = "s",
     Callback = function(v) Burst.Delay = v end,
@@ -1169,7 +1613,7 @@ ShapeBox:AddSlider("BurstRadius", {
     Text = "Radius",
     Default = 12,
     Min = 1,
-    Max = 60,
+    Max = 500,
     Rounding = 1,
     Suffix = " studs",
     Callback = function(v) Burst.Radius = v end,
@@ -1179,7 +1623,7 @@ ShapeBox:AddSlider("BurstHeight", {
     Text = "Height",
     Default = 8,
     Min = 0,
-    Max = 80,
+    Max = 500,
     Rounding = 1,
     Suffix = " studs",
     Callback = function(v) Burst.Height = v end,
@@ -1189,7 +1633,7 @@ ShapeBox:AddSlider("BurstLayers", {
     Text = "Layers / arms",
     Default = 1,
     Min = 1,
-    Max = 8,
+    Max = 64,
     Rounding = 0,
     Callback = function(v) Burst.Layers = v end,
 })
@@ -1198,7 +1642,7 @@ ShapeBox:AddSlider("BurstSpin", {
     Text = "Spin",
     Default = 2,
     Min = 0,
-    Max = 10,
+    Max = 100,
     Rounding = 1,
     Tooltip = "How fast the shape rotates over time",
     Callback = function(v) Burst.Spin = v end,
@@ -1208,7 +1652,7 @@ ShapeBox:AddSlider("BurstSpread", {
     Text = "Spread / turns",
     Default = 1,
     Min = 0.1,
-    Max = 6,
+    Max = 64,
     Rounding = 2,
     Callback = function(v) Burst.Spread = v end,
 })
@@ -1217,20 +1661,40 @@ ShapeBox:AddSlider("BurstChaos", {
     Text = "Chaos",
     Default = 0,
     Min = 0,
-    Max = 10,
+    Max = 100,
     Rounding = 1,
     Tooltip = "Random offset added to every bullet",
     Callback = function(v) Burst.Chaos = v end,
 })
 
+ShapeBox:AddSlider("BurstChunk", {
+    Text = "Shots per frame",
+    Default = 20,
+    Min = 1,
+    Max = 200,
+    Rounding = 0,
+    Tooltip = "How many go out before the burst hands the frame back. Lower is smoother, higher lands the shape faster",
+    Callback = function(v) Burst.Chunk = v end,
+})
+
+ShapeBox:AddToggle("BurstLead", {
+    Text = "Lead the anchor",
+    Default = false,
+    Tooltip = "On the Target anchor, builds the shape around where they are heading instead of where they are",
+    Callback = function(v) Burst.Lead = v end,
+})
+
 local BurstStatBox = Tabs.Patterns:AddLeftGroupbox("Stats", "chart-line")
 local ShotsLabel = BurstStatBox:AddLabel("Shots fired: 0")
 local BurstsLabel = BurstStatBox:AddLabel("Bursts: 0")
+local RedirectLabel = BurstStatBox:AddLabel("Shots redirected: 0")
+BurstStatBox:AddLabel("Redirected counts your own shots that silent aim re-pointed, so it stays on zero unless silent aim is doing something.", true)
 BurstStatBox:AddButton({
     Text = "Reset counters",
     Func = function()
         Stats.shots = 0
         Stats.bursts = 0
+        Stats.redirected = 0
     end,
 })
 
@@ -1259,11 +1723,61 @@ EspDep:AddToggle("EspTracers", { Text = "Tracers", Default = false, Callback = f
 EspDep:AddToggle("EspTeamCheck", { Text = "Hide teammates", Default = true, Callback = function(v) Esp.TeamCheck = v end })
 EspDep:AddToggle("EspTeamColor", { Text = "Use team colour", Default = false, Callback = function(v) Esp.TeamColor = v end })
 
+EspDep:AddDropdown("EspTracerFrom", {
+    Text = "Tracers from",
+    Values = { "Bottom", "Centre", "Mouse" },
+    Default = "Bottom",
+    Callback = function(v) Esp.TracerFrom = v end,
+})
+
+EspDep:AddToggle("EspBoxFilled", {
+    Text = "Fill boxes",
+    Default = false,
+    Callback = function(v) Esp.BoxFilled = v end,
+})
+
+EspDep:AddSlider("EspFill", {
+    Text = "Fill opacity",
+    Default = 0.75,
+    Min = 0,
+    Max = 1,
+    Rounding = 2,
+    Callback = function(v) Esp.FillTransparency = v end,
+})
+
+EspDep:AddSlider("EspThickness", {
+    Text = "Line thickness",
+    Default = 1,
+    Min = 1,
+    Max = 12,
+    Rounding = 0,
+    Callback = function(v) Esp.Thickness = v end,
+})
+
+EspDep:AddSlider("EspTextSize", {
+    Text = "Text size",
+    Default = 13,
+    Min = 8,
+    Max = 48,
+    Rounding = 0,
+    Callback = function(v) Esp.TextSize = v end,
+})
+
+EspDep:AddSlider("EspBoxWidth", {
+    Text = "Box width",
+    Default = 0.55,
+    Min = 0.1,
+    Max = 2,
+    Rounding = 2,
+    Tooltip = "Width as a share of the box height",
+    Callback = function(v) Esp.BoxWidth = v end,
+})
+
 EspDep:AddSlider("EspRange", {
     Text = "Range",
     Default = 1000,
     Min = 50,
-    Max = 5000,
+    Max = 100000,
     Rounding = 0,
     Suffix = " studs",
     Callback = function(v) Esp.Range = v end,
@@ -1316,7 +1830,7 @@ end })
 
 local SpeedDep = MoveBox:AddDependencyBox()
 SpeedDep:AddSlider("SpeedValue", {
-    Text = "Speed", Default = 16, Min = 16, Max = 250, Rounding = 0,
+    Text = "Speed", Default = 16, Min = 16, Max = 5000, Rounding = 0,
     Callback = function(v) Move.SpeedValue = v end,
 })
 SpeedDep:SetupDependencies({ { Toggles.SpeedToggle, true } })
@@ -1334,7 +1848,7 @@ end })
 
 local JumpDep = MoveBox:AddDependencyBox()
 JumpDep:AddSlider("JumpValue", {
-    Text = "Jump power", Default = 50, Min = 50, Max = 400, Rounding = 0,
+    Text = "Jump power", Default = 50, Min = 50, Max = 5000, Rounding = 0,
     Callback = function(v) Move.JumpValue = v end,
 })
 JumpDep:SetupDependencies({ { Toggles.JumpToggle, true } })
@@ -1346,7 +1860,7 @@ end })
 
 local GravityDep = MoveBox:AddDependencyBox()
 GravityDep:AddSlider("GravityValue", {
-    Text = "Gravity", Default = 196.2, Min = 0, Max = 400, Rounding = 1,
+    Text = "Gravity", Default = 196.2, Min = 0, Max = 2000, Rounding = 1,
     Callback = function(v)
         Move.GravityValue = v
         if Move.Gravity then Workspace.Gravity = v end
@@ -1363,7 +1877,7 @@ end })
 
 local FlyDep = UtilBox:AddDependencyBox()
 FlyDep:AddSlider("FlySpeed", {
-    Text = "Fly speed", Default = 60, Min = 10, Max = 400, Rounding = 0,
+    Text = "Fly speed", Default = 60, Min = 10, Max = 5000, Rounding = 0,
     Callback = function(v) Move.FlySpeed = v end,
 })
 FlyDep:SetupDependencies({ { Toggles.Fly, true } })
@@ -1447,6 +1961,7 @@ task.spawn(function()
     while not Unloading do
         pcall(function()
             ShotsLabel:SetText("Shots fired: " .. tostring(Stats.shots))
+            RedirectLabel:SetText("Shots redirected: " .. tostring(Stats.redirected))
             BurstsLabel:SetText("Bursts: " .. tostring(Stats.bursts))
         end)
         task.wait(0.5)
