@@ -510,6 +510,73 @@ function Choice.valueOf(set, value)
     return set.value[Choice.pick(set, value)]
 end
 
+-- the advanced tab's own option sets, kept on Choice so they resolve through
+-- the same pick/valueOf guard as everything else
+Choice.Adv = {
+    Solver = {
+        default = 'Ensemble',
+        order = { 'Ensemble', 'Best single', 'Top two', 'Fixed circle', 'Fixed arc' },
+    },
+
+    -- how an ensemble turns four running error scores into four weights
+    -- sharper weightings collapse toward simply picking the winner, which is
+    -- what you want when one model is clearly right; the soft ones only pay
+    -- off when two models are genuinely within noise of each other
+    Weighting = {
+        default = 'Inverse square',
+        order = { 'Equal', 'Inverse error', 'Softmax', 'Inverse square', 'Inverse fourth' },
+    },
+
+    -- how much of the running signed residual gets subtracted back out
+    Bias = {
+        default = 'Normal',
+        order = { 'Off', 'Light', 'Normal', 'Aggressive', 'Full' },
+        value = { ['Off'] = 0, ['Light'] = 0.3, ['Normal'] = 0.6, ['Aggressive'] = 0.85, ['Full'] = 1 },
+    },
+
+    -- how close two passes must land before the lead solve calls it settled
+    Converge = {
+        default = 'Tight',
+        order = { 'Fixed', 'Loose', 'Tight', 'Exhaustive' },
+        value = { ['Fixed'] = nil, ['Loose'] = 0.25, ['Tight'] = 0.05, ['Exhaustive'] = 0.01 },
+    },
+
+    -- how many samples of their motion the backtest gets to replay over
+    Depth = {
+        default = 'Long',
+        order = { 'Short', 'Normal', 'Long', 'Maximum' },
+        value = {
+            ['Short']   = { limit = 16, window = 0.4 },
+            ['Normal']  = { limit = 28, window = 0.7 },
+            ['Long']    = { limit = 40, window = 0.9 },
+            ['Maximum'] = { limit = 64, window = 1.4 },
+        },
+    },
+
+    -- the lead length the models are scored at. weapon match tracks the real
+    -- travel time, so the scoring horizon follows the shot it is scoring for
+    Horizon = {
+        default = 'Weapon match',
+        order = { 'Snap', 'Short', 'Weapon match', 'Long', 'Very long' },
+        value = { ['Snap'] = 0.1, ['Short'] = 0.15, ['Weapon match'] = -1, ['Long'] = 0.3, ['Very long'] = 0.45 },
+    },
+
+    -- how fast a scoring round moves a model's running error
+    Reaction = {
+        default = 'Normal',
+        order = { 'Instant', 'Fast', 'Normal', 'Slow', 'Glacial' },
+        value = { ['Instant'] = 0.8, ['Fast'] = 0.45, ['Normal'] = 0.25, ['Slow'] = 0.12, ['Glacial'] = 0.05 },
+    },
+
+    -- a model scoring worse than this multiple of the best is dropped from the
+    -- blend entirely rather than dragging the average toward its own answer
+    Guard = {
+        default = 'Normal',
+        order = { 'Off', 'Light', 'Normal', 'Strict' },
+        value = { ['Off'] = math.huge, ['Light'] = 6, ['Normal'] = 3, ['Strict'] = 1.8 },
+    },
+}
+
 local Aim = {
     Enabled = false,
 
@@ -552,6 +619,38 @@ local Adapt = {
     Fit = 14,        -- newest samples the circle is fitted through
     HeadRange = 60,  -- past this, auto aim part drops the head
     HeadSpeed = 10,  -- and past this speed too
+
+    Epsilon = 0.05,  -- keeps an inverse-error weight finite at zero error
+    MaxPasses = 12,  -- ceiling on the converging lead solve
+    Temp = 0.25,     -- softmax temperature, as a share of the best error
+    MinHeading = 0.5, -- speed below which there is no heading to resolve bias in
+}
+
+-- the advanced tab. when Enabled, these take over from the normal silent aim
+-- tab for everything about how the shot is solved. what still comes from that
+-- tab is listed in Advanced.Passthrough below - the target side of things,
+-- which advanced has no better answer for
+local Advanced = {
+    Enabled = false,
+    Perfection = false,
+
+    Solver = 'Ensemble',
+    Weighting = 'Inverse error',
+    Bias = 'Normal',
+    Converge = 'Tight',
+
+    Depth = 'Long',
+    Horizon = 'Weapon match',
+    Reaction = 'Normal',
+    Guard = 'Normal',
+    Smoothing = 'Balanced',
+    Part = 'Auto',
+    Air = 'Safe',
+    Ping = 'Full',
+    Lead = 'Auto',
+
+    Passthrough = 'range, gun and knife targets, priority, wall check, fov and search',
+    ui = {},
 }
 
 local cachedPing = 0.08
@@ -588,7 +687,27 @@ local PART_ORDER_HEAD = { "Head", "UpperTorso", "Torso", "HumanoidRootPart", "Lo
 local PART_ORDER_BODY = { "HumanoidRootPart", "UpperTorso", "Torso", "LowerTorso", "Head" }
 
 local function filterSettings()
+    if Advanced.Enabled then
+        return Choice.valueOf(Choice.Filter, Advanced.Smoothing)
+    end
     return Choice.valueOf(Choice.Filter, Aim.Filter)
+end
+
+-- the scoring horizon. weapon match follows the travel time the solver last
+-- actually produced, so the models are scored over the lead they are being
+-- asked to cover rather than a fixed guess at it
+function Adapt.horizon()
+    if not Advanced.Enabled then return Adapt.Target end
+    local want = Choice.valueOf(Choice.Adv.Horizon, Advanced.Horizon) or Adapt.Target
+    if want and want > 0 then return want end
+    return math.clamp(Adapt.lastTravel or Adapt.Target, Adapt.MinAge, Adapt.MaxAge)
+end
+
+function Adapt.depth()
+    if not Advanced.Enabled then return HISTORY_LIMIT, HISTORY_WINDOW end
+    local set = Choice.valueOf(Choice.Adv.Depth, Advanced.Depth)
+    if not set then return HISTORY_LIMIT, HISTORY_WINDOW end
+    return set.limit, set.window
 end
 
 local visionParams = RaycastParams.new()
@@ -786,7 +905,7 @@ local function backtest(entry, actual, now)
         local age = now - history[index].t
         if age < Adapt.MinAge then break end
         if age <= Adapt.MaxAge then
-            local gap = math.abs(age - Adapt.Target)
+            local gap = math.abs(age - Adapt.horizon())
             if gap < bestGap then snap, bestGap = history[index], gap end
         end
     end
@@ -795,13 +914,43 @@ local function backtest(entry, actual, now)
     entry.backtestAt = now
     local dt = now - snap.t
 
+    local blend = Advanced.Enabled
+        and (Choice.valueOf(Choice.Adv.Reaction, Advanced.Reaction) or Adapt.Blend)
+        or Adapt.Blend
+
     for _, name in ipairs(Adapt.Models) do
         local missed = flatDistance(snap.p + modelStep(name, snap, dt), actual)
         local previous = entry.scores[name]
-        entry.scores[name] = previous and (previous + (missed - previous) * Adapt.Blend) or missed
+        entry.scores[name] = previous and (previous + (missed - previous) * blend) or missed
     end
 
     entry.scored = entry.scored + 1
+
+    -- Replay whatever the solver would actually have sent for this snapshot and
+    -- keep the signed miss, so the correction is measured against the real
+    -- answer rather than against whichever single model happened to win.
+    if Advanced.Enabled and Advanced.Bias ~= 'Off' and entry.scored >= Adapt.Samples then
+        local heading = snap.horizontal
+        if heading and heading.Magnitude >= Adapt.MinHeading then
+            local ok, step = pcall(Adapt.step, entry, dt, snap)
+            if ok and typeof(step) == "Vector3" then
+                local residual = actual - (snap.p + step)
+
+                -- split along and across the heading they had at the time, so
+                -- the average survives them turning
+                local forward = heading.Unit
+                local side = perpOf(forward)
+                local along = dotOf(residual, forward)
+                local across = dotOf(residual, side)
+
+                entry.biasAlong = entry.biasAlong
+                    and entry.biasAlong + (along - entry.biasAlong) * blend or along
+                entry.biasAcross = entry.biasAcross
+                    and entry.biasAcross + (across - entry.biasAcross) * blend or across
+                entry.biasSpan = dt
+            end
+        end
+    end
     if entry.scored < Adapt.Samples then return end
 
     local best, bestError = nil, math.huge
@@ -826,10 +975,126 @@ local function backtest(entry, actual, now)
 end
 
 local function chooseModel(entry)
+    if Advanced.Enabled then
+        local solver = Advanced.Solver
+        if solver == 'Fixed circle' then return 'Circle' end
+        if solver == 'Fixed arc' then return 'Arc' end
+        -- Ensemble / Best single / Top two all resolve per shot inside
+        -- Adapt.step; the name returned here is only what gets reported
+        if not entry or entry.scored < Adapt.Samples then return 'Arc' end
+        return solver == 'Best single' and (entry.best or 'Arc') or solver
+    end
+
     local mode = Aim.Math
     if mode ~= 'Adaptive' then return mode end
     if not entry or entry.scored < Adapt.Samples then return 'Arc' end
     return entry.best or 'Arc'
+end
+
+-- Argmax throws away three quarters of what the backtest learned. This blends
+-- every model that is still in contention, weighted by how wrong it has been,
+-- so the ones that disagree partly cancel instead of one of them simply losing.
+-- entry holds the scores that decide the weights; state is the motion the
+-- models are stepped from. They are the same thing for a live shot, but the
+-- backtest has to replay from a *snapshot* while still weighting by what the
+-- entry has learned, so the two are separate arguments.
+function Adapt.step(entry, t, state)
+    state = state or entry
+
+    local best, bestError = nil, math.huge
+    for _, name in ipairs(Adapt.Models) do
+        local score = entry.scores[name]
+        if score and score < bestError then best, bestError = name, score end
+    end
+    if not best then return modelStep('Arc', state, t) end
+
+    local solver = Advanced.Solver
+    if solver == 'Best single' then return modelStep(best, state, t) end
+
+    -- Top two keeps the winner and the runner up and drops the rest
+    local secondError = math.huge
+    if solver == 'Top two' then
+        for _, name in ipairs(Adapt.Models) do
+            local score = entry.scores[name]
+            if score and name ~= best and score < secondError then secondError = score end
+        end
+    end
+
+    local guard = Choice.valueOf(Choice.Adv.Guard, Advanced.Guard)
+    local weighting = Advanced.Weighting
+    local cutoff = bestError * guard + Adapt.Epsilon
+
+    local blended, total = Vector3.zero, 0
+    for _, name in ipairs(Adapt.Models) do
+        local score = entry.scores[name]
+        local weight = 0
+
+        if score and score <= cutoff then
+            if solver == 'Top two' and name ~= best and score > secondError then
+                weight = 0
+            elseif weighting == 'Equal' then
+                weight = 1
+            elseif weighting == 'Softmax' then
+                weight = math.exp(-(score - bestError) / (bestError * Adapt.Temp + Adapt.Epsilon))
+            elseif weighting == 'Inverse square' then
+                local inv = 1 / (score + Adapt.Epsilon)
+                weight = inv * inv
+            elseif weighting == 'Inverse fourth' then
+                local inv = 1 / (score + Adapt.Epsilon)
+                inv = inv * inv
+                weight = inv * inv
+            else
+                weight = 1 / (score + Adapt.Epsilon)
+            end
+        end
+
+        if weight > 0 then
+            blended = blended + modelStep(name, state, t) * weight
+            total = total + weight
+        end
+    end
+
+    if total <= 0 then return modelStep(best, state, t) end
+    return blended / total
+end
+
+-- The models are wrong in a direction, not just by an amount. Tracking the
+-- signed residual and subtracting it back out is what corrects a lead that is
+-- consistently short or consistently long, which no amount of picking between
+-- models will ever fix on its own.
+function Adapt.correct(entry, t)
+    if not Advanced.Enabled or Advanced.Bias == 'Off' then return Vector3.zero end
+    if entry.biasAlong == nil or entry.scored < Adapt.Samples then return Vector3.zero end
+
+    local share = Choice.valueOf(Choice.Adv.Bias, Advanced.Bias) or 0
+    if share <= 0 then return Vector3.zero end
+
+    -- the residual was measured over one scoring horizon, so it scales with
+    -- however much lead this particular shot is actually asking for
+    local measured = entry.biasSpan or Adapt.Target
+    if measured <= 0 then return Vector3.zero end
+
+    -- Rebuilt in the heading they have *now*. The bias is stored as along-track
+    -- and cross-track, never as a world vector: a lead that is consistently
+    -- short is short along their direction of travel whichever way that points,
+    -- and averaging that in world space just smears it into nothing on anyone
+    -- who is turning.
+    local heading = entry.horizontal
+    if not heading or heading.Magnitude < Adapt.MinHeading then return Vector3.zero end
+
+    -- A running average of past misses is only worth anything on someone whose
+    -- motion is consistent enough for the past to say something about the next
+    -- fraction of a second. On a target flipping direction every few frames it
+    -- is stale noise, so it fades out with how steady they actually are.
+    local forward = heading.Unit
+    local side = perpOf(forward)
+    local scale = (t / measured) * share * math.clamp(entry.steady or 1, 0, 1)
+
+    local scaled = (forward * entry.biasAlong + side * entry.biasAcross) * scale
+    if scaled.Magnitude > MAX_LEAD_OFFSET then
+        scaled = scaled.Unit * MAX_LEAD_OFFSET
+    end
+    return scaled
 end
 
 local motion = {}
@@ -891,6 +1156,9 @@ local function sampleMotion(plr, root, now)
             scores = {},
             scored = 0,
             best = 'Arc',
+            biasAlong = nil,
+            biasAcross = nil,
+            biasSpan = nil,
             backtestAt = 0,
             groundY = position.Y,
             airborne = airborne,
@@ -940,7 +1208,8 @@ local function sampleMotion(plr, root, now)
             walkSpeed = entry.walkSpeed,
         }
         table.insert(entry.history, snapshot)
-        while #entry.history > HISTORY_LIMIT or (entry.history[1] and now - entry.history[1].t > HISTORY_WINDOW) do
+        local depthLimit, depthWindow = Adapt.depth()
+        while #entry.history > depthLimit or (entry.history[1] and now - entry.history[1].t > depthWindow) do
             table.remove(entry.history, 1)
         end
 
@@ -1011,13 +1280,25 @@ local function predictRoot(entry, base, sinceSample, travelTime, mode)
         return base
     end
 
-    local horizontal = modelStep(mode, entry, travelTime)
+    -- advanced blends the models and then corrects the blend's own running
+    -- bias; the normal path is the single picked model, unchanged
+    local horizontal
+    if Advanced.Enabled and entry.scored >= Adapt.Samples
+        and Advanced.Solver ~= 'Fixed circle' and Advanced.Solver ~= 'Fixed arc'
+    then
+        horizontal = Adapt.step(entry, travelTime) + Adapt.correct(entry, travelTime)
+    else
+        horizontal = modelStep(mode, entry, travelTime)
+    end
+
     if horizontal.Magnitude > MAX_LEAD_OFFSET then
         horizontal = horizontal.Unit * MAX_LEAD_OFFSET
     end
 
+    local airMode = Advanced.Enabled and Advanced.Air or Aim.Air
+
     local y = base.Y
-    if entry.airborne and Aim.Air ~= 'Off' then
+    if entry.airborne and airMode ~= 'Off' then
         local g = gravity()
         if entry.jumpLaunchV then
             local t = entry.jumpElapsed + sinceSample + travelTime
@@ -1118,7 +1399,10 @@ local KnifeLead = newLeadState(KnifeTune)
 
 local function travelTimeFor(state, entry, distance, arm)
     local tune = state.tune
-    local total = cachedPing * Aim.PingScale
+    local pingScale = Advanced.Enabled
+        and (Choice.valueOf(Choice.Ping, Advanced.Ping) or 1)
+        or Aim.PingScale
+    local total = cachedPing * pingScale
 
     total = total + (entry ~= nil and entry.repLag or 0) * 0.5
     total = total + cachedFrame
@@ -1127,8 +1411,18 @@ local function travelTimeFor(state, entry, distance, arm)
         total = total + distance / tune.Speed
     end
 
-    total = total + tune.Extra / 1000
-    total = total * armMultiplier(state, arm)
+    -- advanced drives both weapons from its own lead dropdown rather than the
+    -- two separate ones on the normal tab
+    if Advanced.Enabled then
+        local profile = Choice.valueOf(Choice.Lead, Advanced.Lead)
+        if profile then
+            total = total + profile.extra / 1000
+            if profile.auto then total = total * armMultiplier(state, arm) end
+        end
+    else
+        total = total + tune.Extra / 1000
+        total = total * armMultiplier(state, arm)
+    end
 
     return math.clamp(total, -MAX_TRAVEL_TIME, MAX_TRAVEL_TIME)
 end
@@ -1193,7 +1487,8 @@ end
 -- head is worth its smaller hitbox only when the shot is easy anyway: close,
 -- not sprinting, not mid jump. anything else takes the far wider torso
 local function autoAimPart(char, entry)
-    if Aim.Air ~= 'Off' and entry and (entry.airborne or isSpamJumper(entry)) then return 'Body' end
+    local airMode = Advanced.Enabled and Advanced.Air or Aim.Air
+    if airMode ~= 'Off' and entry and (entry.airborne or isSpamJumper(entry)) then return 'Body' end
     if entry and entry.horizontal.Magnitude > Adapt.HeadSpeed then return 'Body' end
 
     local root = char:FindFirstChild("HumanoidRootPart")
@@ -1203,11 +1498,12 @@ local function autoAimPart(char, entry)
 end
 
 local function aimPartsFor(char, entry)
-    local choice = Aim.AimPart
+    local airMode = Advanced.Enabled and Advanced.Air or Aim.Air
+    local choice = Advanced.Enabled and Advanced.Part or Aim.AimPart
     if choice == 'Auto' then choice = autoAimPart(char, entry) end
 
     local order = PART_ORDER_BODY
-    if choice == 'Head' and not (Aim.Air == 'Safe' and entry and isSpamJumper(entry)) then
+    if choice == 'Head' and not (airMode == 'Safe' and entry and isSpamJumper(entry)) then
         order = PART_ORDER_HEAD
     end
 
@@ -1351,8 +1647,9 @@ local function solveAim(plan, origin, now)
     if sinceSample < 0 then sinceSample = 0 end
     if sinceSample > SAMPLE_STALE then sinceSample = SAMPLE_STALE end
 
+    local airMode = Advanced.Enabled and Advanced.Air or Aim.Air
     local offset = partPos - rootPos
-    if entry.airborne and (Aim.Air == 'Feet' or Aim.Air == 'Safe') then
+    if entry.airborne and (airMode == 'Feet' or airMode == 'Safe') then
         offset = Vector3.new(offset.X, -plan.hipOffset, offset.Z)
     end
 
@@ -1368,11 +1665,32 @@ local function solveAim(plan, origin, now)
     local distance = (partPos - origin).Magnitude
     local travelTime = travelTimeFor(state, entry, distance, arm)
     local predicted = predictRoot(entry, rootPos, sinceSample, travelTime, mode)
-    for _ = 2, passes do
-        distance = ((predicted + offset) - origin).Magnitude
-        travelTime = travelTimeFor(state, entry, distance, arm)
-        predicted = predictRoot(entry, rootPos, sinceSample, travelTime, mode)
+
+    -- A fixed pass count stops wherever it happens to be. Converging runs the
+    -- lead against its own answer until the point stops moving, so the distance
+    -- the travel time is solved from is the distance the shot actually covers.
+    local tolerance = Advanced.Enabled
+        and Choice.Adv.Converge.value[Choice.pick(Choice.Adv.Converge, Advanced.Converge)]
+        or nil
+
+    if tolerance then
+        for _ = 2, Adapt.MaxPasses do
+            local previous = predicted
+            distance = ((predicted + offset) - origin).Magnitude
+            travelTime = travelTimeFor(state, entry, distance, arm)
+            predicted = predictRoot(entry, rootPos, sinceSample, travelTime, mode)
+            if (predicted - previous).Magnitude <= tolerance then break end
+        end
+    else
+        for _ = 2, passes do
+            distance = ((predicted + offset) - origin).Magnitude
+            travelTime = travelTimeFor(state, entry, distance, arm)
+            predicted = predictRoot(entry, rootPos, sinceSample, travelTime, mode)
+        end
     end
+
+    -- what the weapon-match scoring horizon follows
+    Adapt.lastTravel = travelTime
 
     return predicted + offset, rootPos, travelTime, distance, predicted, mode
 end
@@ -1414,7 +1732,10 @@ local function resolveRedirect(plan, originCFrame, sentCFrame)
         return nil
     end
 
-    if Aim.ShotChance < 100 and math.random() * 100 >= Aim.ShotChance then
+    -- advanced is going for accuracy, so it redirects every shot regardless of
+    -- what the normal tab's shot filter is set to
+    local chance = Advanced.Enabled and 100 or Aim.ShotChance
+    if chance < 100 and math.random() * 100 >= chance then
         shotStats.suppressed = shotStats.suppressed + 1
         noteShot(plan, "chance roll", origin, sent, nil, nil, nil, nil)
         return nil
@@ -2325,6 +2646,183 @@ do
 end
 
 
+do
+    local AdvancedTab = Window:CreateTab({ Title = 'advanced' })
+
+    local OverrideSection = AdvancedTab:CreateSection('override')
+
+    OverrideSection:Toggle({
+        Title = 'advanced mode',
+        Description = 'takes over how the shot is solved and ignores the silent aim tab',
+        Flag = 'mm2_adv',
+        Default = false,
+        Callback = function(state) Advanced.Enabled = state end,
+    })
+
+    OverrideSection:Paragraph({
+        Title = 'what this ignores',
+        Content = 'while advanced mode is on, the silent aim tab stops deciding anything about the solve. aim part, prediction maths, motion filter, air handling, ping, both lead dropdowns and the shot filter all come from this tab instead, and every shot gets redirected regardless of what the shot filter says. what still comes from the silent aim tab is the target side of things, which advanced has no better answer for: ' .. Advanced.Passthrough,
+    })
+
+    OverrideSection:Toggle({
+        Title = 'perfection',
+        Description = 'sets the four solver dropdowns below to their most accurate combination',
+        Flag = 'mm2_adv_perfection',
+        Default = false,
+        Callback = function(state)
+            Advanced.Perfection = state
+            if not state then return end
+            -- drive the dropdowns rather than bypassing them, so the switch is
+            -- visible and every part of it stays adjustable afterwards
+            for key, value in pairs({
+                Solver = 'Ensemble',
+                Weighting = 'Inverse fourth',
+                Bias = 'Aggressive',
+                Converge = 'Exhaustive',
+            }) do
+                local element = Advanced.ui[key]
+                if element then pcall(function() element:Set(value) end) end
+            end
+        end,
+    })
+
+    OverrideSection:Paragraph({
+        Title = 'what perfection actually does',
+        Content = 'three things the normal tab never does. it blends all four solvers weighted by how wrong each has been instead of picking one and throwing the other three away, so where they disagree the errors partly cancel. it tracks the signed miss of that blend - the direction it is wrong in, not just the amount - and subtracts it back out, which is the only thing here that fixes a lead that is consistently short or consistently long. and it re-solves the lead against its own answer until the point stops moving rather than stopping after a fixed number of passes, so the distance the travel time is worked out from is the distance the shot really covers',
+    })
+
+    local SolverSection = AdvancedTab:CreateSection('solver')
+
+    Advanced.ui.Solver = SolverSection:Dropdown({
+        Title = 'solver',
+        Description = 'ensemble blends every model still in contention; best single is the old argmax',
+        Values = Choice.Adv.Solver.order,
+        Default = Choice.Adv.Solver.default,
+        Flag = 'mm2_adv_solver',
+        Callback = function(value) Advanced.Solver = Choice.pick(Choice.Adv.Solver, value) end,
+    })
+
+    Advanced.ui.Weighting = SolverSection:Dropdown({
+        Title = 'weighting',
+        Description = 'how a running error score becomes a share of the blend',
+        Values = Choice.Adv.Weighting.order,
+        Default = Choice.Adv.Weighting.default,
+        Flag = 'mm2_adv_weighting',
+        Callback = function(value) Advanced.Weighting = Choice.pick(Choice.Adv.Weighting, value) end,
+    })
+
+    Advanced.ui.Bias = SolverSection:Dropdown({
+        Title = 'bias correction',
+        Description = 'how much of the running signed miss gets subtracted back out',
+        Values = Choice.Adv.Bias.order,
+        Default = Choice.Adv.Bias.default,
+        Flag = 'mm2_adv_bias',
+        Callback = function(value) Advanced.Bias = Choice.pick(Choice.Adv.Bias, value) end,
+    })
+
+    Advanced.ui.Converge = SolverSection:Dropdown({
+        Title = 'convergence',
+        Description = 'how close two passes must land before the lead solve calls it settled',
+        Values = Choice.Adv.Converge.order,
+        Default = Choice.Adv.Converge.default,
+        Flag = 'mm2_adv_converge',
+        Callback = function(value) Advanced.Converge = Choice.pick(Choice.Adv.Converge, value) end,
+    })
+
+    Advanced.ui.Guard = SolverSection:Dropdown({
+        Title = 'outlier guard',
+        Description = 'a model scoring worse than this multiple of the best is dropped from the blend',
+        Values = Choice.Adv.Guard.order,
+        Default = Choice.Adv.Guard.default,
+        Flag = 'mm2_adv_guard',
+        Callback = function(value) Advanced.Guard = Choice.pick(Choice.Adv.Guard, value) end,
+    })
+
+    local SamplingSection = AdvancedTab:CreateSection('sampling')
+
+    SamplingSection:Dropdown({
+        Title = 'history depth',
+        Description = 'how much of their past motion the replay gets to work with',
+        Values = Choice.Adv.Depth.order,
+        Default = Choice.Adv.Depth.default,
+        Flag = 'mm2_adv_depth',
+        Callback = function(value) Advanced.Depth = Choice.pick(Choice.Adv.Depth, value) end,
+    })
+
+    SamplingSection:Dropdown({
+        Title = 'scoring horizon',
+        Description = 'the lead length the models are scored at. weapon match follows the real travel time',
+        Values = Choice.Adv.Horizon.order,
+        Default = Choice.Adv.Horizon.default,
+        Flag = 'mm2_adv_horizon',
+        Callback = function(value) Advanced.Horizon = Choice.pick(Choice.Adv.Horizon, value) end,
+    })
+
+    SamplingSection:Dropdown({
+        Title = 'reaction',
+        Description = 'how fast one scoring round moves a model running error',
+        Values = Choice.Adv.Reaction.order,
+        Default = Choice.Adv.Reaction.default,
+        Flag = 'mm2_adv_reaction',
+        Callback = function(value) Advanced.Reaction = Choice.pick(Choice.Adv.Reaction, value) end,
+    })
+
+    SamplingSection:Dropdown({
+        Title = 'motion filter',
+        Description = 'replaces the silent aim tab filter while advanced mode is on',
+        Values = Choice.Filter.order,
+        Default = Choice.Filter.default,
+        Flag = 'mm2_adv_filter',
+        Callback = function(value) Advanced.Smoothing = Choice.pick(Choice.Filter, value) end,
+    })
+
+    local ShotSection = AdvancedTab:CreateSection('shot')
+
+    ShotSection:Dropdown({
+        Title = 'aim part',
+        Values = Choice.Part.order,
+        Default = Choice.Part.default,
+        Flag = 'mm2_adv_part',
+        Callback = function(value) Advanced.Part = Choice.pick(Choice.Part, value) end,
+    })
+
+    ShotSection:Dropdown({
+        Title = 'air handling',
+        Values = Choice.Air.order,
+        Default = Choice.Air.default,
+        Flag = 'mm2_adv_air',
+        Callback = function(value) Advanced.Air = Choice.pick(Choice.Air, value) end,
+    })
+
+    ShotSection:Dropdown({
+        Title = 'ping',
+        Values = Choice.Ping.order,
+        Default = Choice.Ping.default,
+        Flag = 'mm2_adv_ping',
+        Callback = function(value) Advanced.Ping = Choice.pick(Choice.Ping, value) end,
+    })
+
+    ShotSection:Dropdown({
+        Title = 'lead',
+        Description = 'drives both weapons from one dropdown instead of the two on the silent aim tab',
+        Values = Choice.Lead.order,
+        Default = Choice.Lead.default,
+        Flag = 'mm2_adv_lead',
+        Callback = function(value) Advanced.Lead = Choice.pick(Choice.Lead, value) end,
+    })
+
+    local ReadoutSection = AdvancedTab:CreateSection('readout')
+
+    Advanced.ui.state = addStat(ReadoutSection, { Title = 'advanced mode', Value = 'off' })
+    Advanced.ui.weights = addStat(ReadoutSection, { Title = 'model weights', Value = '-' })
+    Advanced.ui.biasStat = addStat(ReadoutSection, { Title = 'bias correction', Value = '-' })
+
+    ReadoutSection:Label({
+        Title = 'Weights are the live blend for whoever the gun is currently solving, best first. Bias correction is how far the blend has been missing by and in which direction, which is the number it is subtracting back out.',
+    })
+end
+
+
 local SeenStat, RedirectStat, SuppressStat, ErrorStat
 do
 
@@ -2754,7 +3252,71 @@ task.spawn(function()
             knifeLeadStat.Set(('%d / %d'):format(KnifeLead.hits, KnifeLead.verified))
             gunMultStat.Set(GunTune.Auto and ('%.2fx'):format(GunLead.mult) or 'off')
             knifeMultStat.Set(KnifeTune.Auto and ('%.2fx'):format(KnifeLead.mult) or 'off')
-            solverStat.Set(Aim.Math == 'Adaptive' and lastModelUsed or Aim.Math)
+            solverStat.Set(Advanced.Enabled and ('advanced: ' .. Advanced.Solver)
+                or (Aim.Math == 'Adaptive' and lastModelUsed or Aim.Math))
+
+            if not Advanced.Enabled then
+                Advanced.ui.state.Set('off')
+                Advanced.ui.weights.Set('-')
+                Advanced.ui.biasStat.Set('-')
+            else
+                Advanced.ui.state.Set(Advanced.Perfection and 'perfection' or 'on',
+                    Color3.fromRGB(126, 217, 87))
+
+                local entry = gunPlan and gunPlan.entry or knifePlan and knifePlan.entry
+                if not entry or entry.scored < Adapt.Samples then
+                    Advanced.ui.weights.Set('learning')
+                    Advanced.ui.biasStat.Set('learning')
+                else
+                    -- same weighting the blend itself uses, shown as percentages
+                    local rows, total = {}, 0
+                    local bestError = math.huge
+                    for _, name in ipairs(Adapt.Models) do
+                        local score = entry.scores[name]
+                        if score and score < bestError then bestError = score end
+                    end
+                    local cutoff = bestError * (Choice.valueOf(Choice.Adv.Guard, Advanced.Guard) or 3)
+                        + Adapt.Epsilon
+
+                    for _, name in ipairs(Adapt.Models) do
+                        local score = entry.scores[name]
+                        local weight = 0
+                        if score and score <= cutoff then
+                            if Advanced.Weighting == 'Equal' then
+                                weight = 1
+                            elseif Advanced.Weighting == 'Softmax' then
+                                weight = math.exp(-(score - bestError) / (bestError + Adapt.Epsilon))
+                            elseif Advanced.Weighting == 'Inverse square' then
+                                local inv = 1 / (score + Adapt.Epsilon)
+                                weight = inv * inv
+                            else
+                                weight = 1 / (score + Adapt.Epsilon)
+                            end
+                        end
+                        total = total + weight
+                        rows[#rows + 1] = { name = name, weight = weight }
+                    end
+
+                    table.sort(rows, function(a, b) return a.weight > b.weight end)
+
+                    local shown = {}
+                    for _, row in ipairs(rows) do
+                        if row.weight > 0 and total > 0 then
+                            shown[#shown + 1] = ('%s %d%%'):format(
+                                row.name:sub(1, 4), math.floor(row.weight / total * 100 + 0.5))
+                        end
+                    end
+                    Advanced.ui.weights.Set(#shown > 0 and table.concat(shown, '  ') or '-')
+
+                    if Advanced.Bias == "Off" or entry.biasAlong == nil then
+                        Advanced.ui.biasStat.Set('off')
+                    else
+                        local share = Choice.valueOf(Choice.Adv.Bias, Advanced.Bias) or 0
+                        Advanced.ui.biasStat.Set(('%+.2f along %+.2f across at %d%%'):format(
+                            entry.biasAlong, entry.biasAcross, math.floor(share * 100 + 0.5)))
+                    end
+                end
+            end
         end)
     end
 end)
