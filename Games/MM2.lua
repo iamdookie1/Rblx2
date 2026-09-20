@@ -535,13 +535,31 @@ Choice.Fling = {
         value = { ['Touch'] = 6, ['Close'] = 10, ['Medium'] = 16, ['Wide'] = 28 },
     },
 
-    -- how long the claim stays live before it is taken back. one frame is the
-    -- least visible; longer is more reliable if a single step is not enough for
-    -- the claim to replicate and resolve
-    Hold = {
-        default = 'One frame',
-        order = { 'One frame', 'Two frames', 'Four frames', 'Continuous' },
-        value = { ['One frame'] = 1, ['Two frames'] = 2, ['Four frames'] = 4, ['Continuous'] = math.huge },
+    -- Angular is the one that actually transfers. A spin claim puts an enormous
+    -- velocity on the *surface* of your assembly, which is what the contact
+    -- resolves against; a linear claim mostly just launches you, because your
+    -- own centre of mass is what it moves. Angular only is the default for
+    -- that reason, and it is also the only mode that leaves you able to walk,
+    -- since your walking *is* linear velocity and nothing here touches it.
+    Claim = {
+        default = 'Angular only',
+        order = { 'Angular only', 'Angular + lift', 'Both', 'Linear only' },
+        value = {
+            ['Angular only']  = { angular = true, linear = false, lift = false },
+            ['Angular + lift'] = { angular = true, linear = false, lift = true },
+            ['Both']          = { angular = true, linear = true,  lift = true },
+            ['Linear only']   = { angular = false, linear = true,  lift = true },
+        },
+    },
+
+    -- How far your own character is allowed to move in one step before it gets
+    -- put back. Walking at 16 studs a second covers about a quarter of a stud
+    -- per frame, so anything here is orders of magnitude above normal movement
+    -- and only ever catches a claim that threw you.
+    Leash = {
+        default = 'Normal',
+        order = { 'Tight', 'Normal', 'Loose', 'Off' },
+        value = { ['Tight'] = 8, ['Normal'] = 20, ['Loose'] = 60, ['Off'] = math.huge },
     },
 
     Targets = {
@@ -641,7 +659,9 @@ local Aim = {
 local GunTune = { Extra = 0, Auto = Choice.Lead.value[Choice.Lead.default].auto }
 local KnifeTune = { Extra = 0, Speed = 96, Auto = Choice.Lead.value[Choice.Lead.default].auto }
 
-local Debug = {
+-- global on purpose: cold enough that a hash lookup costs nothing, and
+-- reachable from a console without going through the MM2 table below
+Debug = {
     Enabled = false,
     Markers = true,
 }
@@ -2065,19 +2085,18 @@ end
 -- your own character visibly moves. No teleport, because walking into someone
 -- already provides the contact a teleport exists to manufacture.
 
-local Fling = {
+Fling = {
     Enabled = false,
     Power = Choice.Fling.Power.default,
     Reach = Choice.Fling.Reach.default,
-    Hold = Choice.Fling.Hold.default,
+    Claim = Choice.Fling.Claim.default,
+    Leash = Choice.Fling.Leash.default,
     Targets = Choice.Fling.Targets.default,
-    Spin = true,
     Upright = true,
 
     armed = false,
-    inReach = false,
-    held = 0,
-    savedCF = nil,
+    tookLinear = false,
+    savedPos = nil,
     hits = 0,
 }
 
@@ -2109,40 +2128,54 @@ function Fling.myRoot()
 end
 
 -- AssemblyLinearVelocity is the current name; the old one is kept as a fallback
--- so this still works on an older client
+-- so this still works on an older client. Either argument may be nil, and a nil
+-- one is left strictly alone - that is what lets Angular only leave your own
+-- walking velocity untouched instead of stamping over it every frame.
 function Fling.setVelocity(root, linear, angular)
-    pcall(function() root.AssemblyLinearVelocity = linear end)
-    pcall(function() root.Velocity = linear end)
+    if linear then
+        pcall(function() root.AssemblyLinearVelocity = linear end)
+        pcall(function() root.Velocity = linear end)
+    end
     if angular then
         pcall(function() root.AssemblyAngularVelocity = angular end)
         pcall(function() root.RotVelocity = angular end)
     end
 end
 
--- The saved CFrame belongs to one character. Restoring it onto a fresh one
--- after a respawn would drop you back where you died, so it is only ever
--- applied to the character it was taken from.
-function Fling.restore(root)
-    if Fling.savedCF and Fling.savedChar == LocalPlayer.Character then
-        pcall(function() root.CFrame = Fling.savedCF end)
-    end
-    Fling.savedCF = nil
-    Fling.savedChar = nil
+-- The leash, which replaces the old hard position pin. That pin restored your
+-- CFrame every single frame, which also undid the walking you did during that
+-- step - it was an anchor, not a walk fling. This only intervenes when you have
+-- moved further in one step than any amount of walking could explain, and it
+-- keeps the facing you currently have rather than the one you had a step ago,
+-- so ordinary movement passes straight through untouched.
+function Fling.leash(root)
+    if not Fling.savedPos or Fling.savedChar ~= LocalPlayer.Character then return end
+
+    local limit = Choice.valueOf(Choice.Fling.Leash, Fling.Leash)
+    if limit == math.huge then return end
+
+    local drift = (root.Position - Fling.savedPos).Magnitude
+    if drift <= limit then return end
+
+    pcall(function()
+        root.CFrame = CFrame.new(Fling.savedPos) * (root.CFrame - root.CFrame.Position)
+    end)
 end
 
 function Fling.reset()
     Fling.armed = false
-    Fling.inReach = false
-    Fling.held = 0
 
     local root = Fling.myRoot()
     if root then
-        Fling.setVelocity(root, Vector3.zero, Vector3.zero)
-        Fling.restore(root)
-    else
-        Fling.savedCF = nil
-        Fling.savedChar = nil
+        -- only put linear back if this script was the thing that took it; the
+        -- rest of the time that value is your own movement and is not ours
+        Fling.setVelocity(root, Fling.tookLinear and Vector3.zero or nil, Vector3.zero)
+        Fling.leash(root)
     end
+
+    Fling.tookLinear = false
+    Fling.savedPos = nil
+    Fling.savedChar = nil
 end
 
 -- before the step: claim the momentum
@@ -2152,51 +2185,61 @@ track(PreSimulation:Connect(function()
     local ok = pcall(function()
         local root = Fling.myRoot()
         if not root then
-            Fling.armed, Fling.inReach = false, false
+            Fling.armed = false
             return
         end
 
         local reach = Choice.valueOf(Choice.Fling.Reach, Fling.Reach)
-        Fling.inReach = Fling.inRange(root, reach)
-        if not Fling.inReach then return end
-
-        if not Fling.armed then
-            Fling.savedCF = root.CFrame
-            Fling.savedChar = LocalPlayer.Character
-            Fling.held = 0
-            Fling.hits = Fling.hits + 1
+        if not Fling.inRange(root, reach) then
+            Fling.armed = false
+            return
         end
+
+        if not Fling.armed then Fling.hits = Fling.hits + 1 end
         Fling.armed = true
-        Fling.held = Fling.held + 1
+        Fling.savedPos = root.Position
+        Fling.savedChar = LocalPlayer.Character
 
         local power = Choice.valueOf(Choice.Fling.Power, Fling.Power)
-        local linear = Vector3.new(power.linear, power.linear * power.lift, power.linear)
+        local claim = Choice.valueOf(Choice.Fling.Claim, Fling.Claim)
+
+        local linear = nil
+        if claim.linear then
+            linear = Vector3.new(power.linear, power.linear * power.lift, power.linear)
+        elseif claim.lift then
+            -- lift without a full linear claim: keep whatever you are doing
+            -- horizontally and only add upward, so you still walk normally
+            local current = root.AssemblyLinearVelocity
+            linear = Vector3.new(current.X, power.linear * power.lift, current.Z)
+        end
+        Fling.tookLinear = linear ~= nil
+
         Fling.setVelocity(root, linear,
-            Fling.Spin and Vector3.new(power.angular, power.angular, power.angular) or nil)
+            claim.angular and Vector3.new(power.angular, power.angular, power.angular) or nil)
     end)
 
     if not ok then Fling.reset() end
 end))
 
--- after it: take the claim back and stand yourself back up
+-- after it: take the claim back. this runs every frame the claim was made,
+-- never conditionally - leaving a claim live across frames is what threw you
+-- into the void and killed you
 track(RunService.Heartbeat:Connect(function()
-    if Unloading then return end
-    if not Fling.armed then return end
+    if Unloading or not Fling.armed then return end
 
     if not Fling.Enabled then
         Fling.reset()
         return
     end
 
-    local hold = Choice.valueOf(Choice.Fling.Hold, Fling.Hold)
-    if Fling.inReach and Fling.held < hold then return end
-
     local ok = pcall(function()
         local root, hum = Fling.myRoot()
         if not root then return end
 
-        Fling.setVelocity(root, Vector3.zero, Vector3.zero)
-        Fling.restore(root)
+        -- angular is always ours, so it always goes back to zero. linear is
+        -- only ours if we took it, and otherwise it is your own walking
+        Fling.setVelocity(root, Fling.tookLinear and Vector3.zero or nil, Vector3.zero)
+        Fling.leash(root)
 
         -- a big angular claim throws the humanoid into a falling state, which is
         -- what renders as the spin; putting it straight back into Running each
@@ -2206,10 +2249,7 @@ track(RunService.Heartbeat:Connect(function()
         end
     end)
 
-    Fling.armed = false
-    Fling.held = 0
-    Fling.savedCF = nil
-    Fling.savedChar = nil
+    Fling.tookLinear = false
     if not ok then Fling.reset() end
 end))
 
@@ -2389,7 +2429,9 @@ do
 end
 
 
-local Visual = {
+-- global on purpose: cold enough that a hash lookup costs nothing, and
+-- reachable from a console without going through the MM2 table below
+Visual = {
     Esp = false,
     ColorByRole = false,
     RoleEsp = false,
@@ -2539,7 +2581,9 @@ track(Players.PlayerRemoving:Connect(function(plr)
     motion[plr.Name] = nil
 end))
 
-local Xray = {
+-- global on purpose: cold enough that a hash lookup costs nothing, and
+-- reachable from a console without going through the MM2 table below
+Xray = {
     Enabled = false,
     Transparency = 0.5,
     Range = 100,
@@ -2617,7 +2661,9 @@ task.spawn(function()
     end
 end)
 
-local TrapEsp = { Enabled = false }
+-- global on purpose: cold enough that a hash lookup costs nothing, and
+-- reachable from a console without going through the MM2 table below
+TrapEsp = { Enabled = false }
 local trapObjects = {}
 
 local function isTrapVisual(inst)
@@ -2709,7 +2755,9 @@ track(Workspace.DescendantRemoving:Connect(function(inst)
     if trapObjects[inst] then destroyTrapEsp(inst) end
 end))
 
-local DroppedGunEsp = { Enabled = false }
+-- global on purpose: cold enough that a hash lookup costs nothing, and
+-- reachable from a console without going through the MM2 table below
+DroppedGunEsp = { Enabled = false }
 local droppedGunObjects = {}
 
 local function isDroppedGun(inst)
@@ -3065,20 +3113,21 @@ do
     local TuningSection = FlingTab:CreateSection('tuning')
 
     TuningSection:Dropdown({
-        Title = 'hold',
-        Description = 'how long the claim stays live before it is taken back',
-        Values = Choice.Fling.Hold.order,
-        Default = Choice.Fling.Hold.default,
-        Flag = 'mm2_fling_hold',
-        Callback = function(value) Fling.Hold = Choice.pick(Choice.Fling.Hold, value) end,
+        Title = 'claim',
+        Description = 'angular only is the one that transfers, and the only one that leaves you able to walk',
+        Values = Choice.Fling.Claim.order,
+        Default = Choice.Fling.Claim.default,
+        Flag = 'mm2_fling_claim',
+        Callback = function(value) Fling.Claim = Choice.pick(Choice.Fling.Claim, value) end,
     })
 
-    TuningSection:Toggle({
-        Title = 'angular',
-        Description = 'also claims spin. lands harder, and is the part most likely to show',
-        Flag = 'mm2_fling_spin',
-        Default = true,
-        Callback = function(state) Fling.Spin = state end,
+    TuningSection:Dropdown({
+        Title = 'leash',
+        Description = 'how far you may move in one step before you are put back. this is what stops you being thrown',
+        Values = Choice.Fling.Leash.order,
+        Default = Choice.Fling.Leash.default,
+        Flag = 'mm2_fling_leash',
+        Callback = function(value) Fling.Leash = Choice.pick(Choice.Fling.Leash, value) end,
     })
 
     TuningSection:Toggle({
@@ -3100,17 +3149,22 @@ do
 
     NotesSection:Paragraph({
         Title = 'how it works',
-        Content = 'your client owns your own character physics, so whatever velocity it reports is taken as true. the claim is made before the physics step, where it takes part in resolving whatever contact you are already standing in, and taken back straight after with your position restored. the momentum lands on them and nothing about your own character visibly moves. the usual fling scripts teleport onto the target and spin because they are reaching someone across the map; walking into them supplies that contact for free, so neither is needed',
+        Content = 'your client owns your own character physics, so whatever velocity it reports is taken as true. the claim is made before the physics step, where it takes part in resolving whatever contact you are already standing in, and taken straight back after. a spin claim is what actually transfers: it puts an enormous velocity on the surface of your assembly, which is what the contact resolves against. a linear claim mostly just moves your own centre of mass, which is to say it launches you rather than them',
     })
 
     NotesSection:Paragraph({
-        Title = 'if it is not landing',
-        Content = 'the claim may not be surviving a single step. try hold on two or four frames, then continuous, before reaching for more power - a longer hold is far more likely to be the fix than a bigger number, and it stays less visible than absurd power does. wide reach also helps when contact itself is the problem rather than the claim',
+        Title = 'why angular only is the default',
+        Content = 'two reasons, and both came out of testing. it is the only claim that reliably transfers, and it is the only one that leaves you able to walk - your walking is linear velocity, so any mode that claims linear is writing over your own movement every frame and pinning you in place. angular never touches linear at all, which is why you keep full control of your character while it runs',
+    })
+
+    NotesSection:Paragraph({
+        Title = 'the leash',
+        Content = 'a spin claim can still throw you, because ground friction turns spin into travel. the leash is the backstop: move further in one step than any amount of walking could explain and you get put back, keeping the direction you are currently facing. walking covers about a quarter of a stud per frame, so normal movement passes through untouched and only a claim that threw you ever gets caught. turn it off and you are relying on nothing going wrong',
     })
 
     NotesSection:Paragraph({
         Title = 'what this cannot do',
-        Content = 'if the game puts players in a collision group that stops them touching each other there is no contact to exploit and no amount of power helps. your own screen stays clean either way, but other clients see the state you replicate, so a large claim can still read as jitter on their end - angular is the part most likely to show, and turning it off is the first thing to try if you are being noticed',
+        Content = 'if the game puts players in a collision group that stops them touching each other there is no contact to exploit and no amount of power helps. your own screen stays clean either way, but other clients see the state you replicate, so a large claim can still read as jitter on their end. if you are being noticed, drop the power before anything else',
     })
 end
 
@@ -3623,3 +3677,43 @@ task.spawn(function()
     end
 end)
 
+
+--// external access ----------------------------------------------------------
+--
+-- One table holding the live config, so anything here can be driven from a
+-- console without editing the script. These are the same tables the script
+-- reads, not copies, so a write takes effect on the next frame exactly as
+-- moving the dropdown would: MM2.Fling.Power = 'Absurd' is the dropdown.
+--
+-- Visual, Xray, Debug, TrapEsp, DroppedGunEsp are plain globals as well, since
+-- they are read rarely enough that a hash lookup costs nothing. Aim, Advanced,
+-- Choice and Adapt stay local and are only reachable through here, because
+-- those sit in the per-frame solver - Choice alone is read over a hundred
+-- times a frame, and a global is a hash lookup every single time.
+do
+    local env = _G
+    local ok, shared = pcall(function() return getgenv() end)
+    if ok and type(shared) == "table" then env = shared end
+
+    env.MM2 = {
+        Aim = Aim,
+        Advanced = Advanced,
+        Fling = Fling,
+        Visual = Visual,
+        Xray = Xray,
+        Debug = Debug,
+
+        Choice = Choice,
+        Adapt = Adapt,
+
+        Stats = shotStats,
+        GunLead = GunLead,
+        KnifeLead = KnifeLead,
+
+        -- every dropdown value is validated on the way in, so a typo through
+        -- here falls back to that option's default rather than wedging the
+        -- solver on a name nothing handles
+        Pick = Choice.pick,
+        ValueOf = Choice.valueOf,
+    }
+end
