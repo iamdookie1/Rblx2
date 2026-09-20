@@ -510,6 +510,46 @@ function Choice.valueOf(set, value)
     return set.value[Choice.pick(set, value)]
 end
 
+-- walk fling. the teleport and the spin in the usual fling scripts are only the
+-- delivery: they exist to reach someone across the map and to keep the solver
+-- from settling. walking supplies the contact for free, so all that is left to
+-- supply is the momentum - claimed before the physics step and taken back after
+Choice.Fling = {
+    Power = {
+        default = 'Normal',
+        order = { 'Gentle', 'Normal', 'Strong', 'Extreme', 'Absurd' },
+        -- lift multiplies the vertical component, which is what sends them up
+        -- rather than skidding along the floor
+        value = {
+            ['Gentle']  = { linear = 1e4, angular = 1e5, lift = 2 },
+            ['Normal']  = { linear = 1e6, angular = 1e7, lift = 5 },
+            ['Strong']  = { linear = 1e7, angular = 1e8, lift = 8 },
+            ['Extreme'] = { linear = 9e7, angular = 9e8, lift = 10 },
+            ['Absurd']  = { linear = 9e9, angular = 9e9, lift = 10 },
+        },
+    },
+
+    Reach = {
+        default = 'Touch',
+        order = { 'Touch', 'Close', 'Medium', 'Wide' },
+        value = { ['Touch'] = 6, ['Close'] = 10, ['Medium'] = 16, ['Wide'] = 28 },
+    },
+
+    -- how long the claim stays live before it is taken back. one frame is the
+    -- least visible; longer is more reliable if a single step is not enough for
+    -- the claim to replicate and resolve
+    Hold = {
+        default = 'One frame',
+        order = { 'One frame', 'Two frames', 'Four frames', 'Continuous' },
+        value = { ['One frame'] = 1, ['Two frames'] = 2, ['Four frames'] = 4, ['Continuous'] = math.huge },
+    },
+
+    Targets = {
+        default = 'Anyone',
+        order = { 'Anyone', 'Murderer only', 'Armed only' },
+    },
+}
+
 -- the advanced tab's own option sets, kept on Choice so they resolve through
 -- the same pick/valueOf guard as everything else
 Choice.Adv = {
@@ -2016,6 +2056,163 @@ if hasNamecallHook then
     originalNamecall = hookmetamethod(game, "__namecall", onNamecall)
 end
 
+--// walk fling ---------------------------------------------------------------
+--
+-- Your client owns your character's physics, so whatever velocity it reports is
+-- taken as true. The claim is made before the physics step, where it takes part
+-- in resolving any contact you are already standing in, and taken back after it
+-- with your position restored - so the momentum lands on them and nothing about
+-- your own character visibly moves. No teleport, because walking into someone
+-- already provides the contact a teleport exists to manufacture.
+
+local Fling = {
+    Enabled = false,
+    Power = Choice.Fling.Power.default,
+    Reach = Choice.Fling.Reach.default,
+    Hold = Choice.Fling.Hold.default,
+    Targets = Choice.Fling.Targets.default,
+    Spin = true,
+    Upright = true,
+
+    armed = false,
+    inReach = false,
+    held = 0,
+    savedCF = nil,
+    hits = 0,
+}
+
+function Fling.allowed(plr)
+    if plr == LocalPlayer or not isAlivePlr(plr) then return false end
+    local mode = Fling.Targets
+    if mode == 'Murderer only' then return isMurderer(plr) end
+    if mode == 'Armed only' then return heldWeapon(plr.Character) ~= nil end
+    return true
+end
+
+function Fling.inRange(root, reach)
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if Fling.allowed(plr) then
+            local char = plr.Character
+            local theirRoot = char and char:FindFirstChild("HumanoidRootPart")
+            if theirRoot and (theirRoot.Position - root.Position).Magnitude <= reach then
+                return true
+            end
+        end
+    end
+    return false
+end
+
+function Fling.myRoot()
+    local char = LocalPlayer.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    return hum and hum.RootPart, hum
+end
+
+-- AssemblyLinearVelocity is the current name; the old one is kept as a fallback
+-- so this still works on an older client
+function Fling.setVelocity(root, linear, angular)
+    pcall(function() root.AssemblyLinearVelocity = linear end)
+    pcall(function() root.Velocity = linear end)
+    if angular then
+        pcall(function() root.AssemblyAngularVelocity = angular end)
+        pcall(function() root.RotVelocity = angular end)
+    end
+end
+
+-- The saved CFrame belongs to one character. Restoring it onto a fresh one
+-- after a respawn would drop you back where you died, so it is only ever
+-- applied to the character it was taken from.
+function Fling.restore(root)
+    if Fling.savedCF and Fling.savedChar == LocalPlayer.Character then
+        pcall(function() root.CFrame = Fling.savedCF end)
+    end
+    Fling.savedCF = nil
+    Fling.savedChar = nil
+end
+
+function Fling.reset()
+    Fling.armed = false
+    Fling.inReach = false
+    Fling.held = 0
+
+    local root = Fling.myRoot()
+    if root then
+        Fling.setVelocity(root, Vector3.zero, Vector3.zero)
+        Fling.restore(root)
+    else
+        Fling.savedCF = nil
+        Fling.savedChar = nil
+    end
+end
+
+-- before the step: claim the momentum
+track(PreSimulation:Connect(function()
+    if Unloading or not Fling.Enabled then return end
+
+    local ok = pcall(function()
+        local root = Fling.myRoot()
+        if not root then
+            Fling.armed, Fling.inReach = false, false
+            return
+        end
+
+        local reach = Choice.valueOf(Choice.Fling.Reach, Fling.Reach)
+        Fling.inReach = Fling.inRange(root, reach)
+        if not Fling.inReach then return end
+
+        if not Fling.armed then
+            Fling.savedCF = root.CFrame
+            Fling.savedChar = LocalPlayer.Character
+            Fling.held = 0
+            Fling.hits = Fling.hits + 1
+        end
+        Fling.armed = true
+        Fling.held = Fling.held + 1
+
+        local power = Choice.valueOf(Choice.Fling.Power, Fling.Power)
+        local linear = Vector3.new(power.linear, power.linear * power.lift, power.linear)
+        Fling.setVelocity(root, linear,
+            Fling.Spin and Vector3.new(power.angular, power.angular, power.angular) or nil)
+    end)
+
+    if not ok then Fling.reset() end
+end))
+
+-- after it: take the claim back and stand yourself back up
+track(RunService.Heartbeat:Connect(function()
+    if Unloading then return end
+    if not Fling.armed then return end
+
+    if not Fling.Enabled then
+        Fling.reset()
+        return
+    end
+
+    local hold = Choice.valueOf(Choice.Fling.Hold, Fling.Hold)
+    if Fling.inReach and Fling.held < hold then return end
+
+    local ok = pcall(function()
+        local root, hum = Fling.myRoot()
+        if not root then return end
+
+        Fling.setVelocity(root, Vector3.zero, Vector3.zero)
+        Fling.restore(root)
+
+        -- a big angular claim throws the humanoid into a falling state, which is
+        -- what renders as the spin; putting it straight back into Running each
+        -- frame is what keeps it looking like walking
+        if Fling.Upright and hum then
+            pcall(function() hum:ChangeState(Enum.HumanoidStateType.Running) end)
+        end
+    end)
+
+    Fling.armed = false
+    Fling.held = 0
+    Fling.savedCF = nil
+    Fling.savedChar = nil
+    if not ok then Fling.reset() end
+end))
+
 local SilentAimTab = Window:CreateTab({ Title = 'silent aim' })
 
 local solverStat
@@ -2823,6 +3020,101 @@ do
 end
 
 
+do
+    local FlingTab = Window:CreateTab({ Title = 'fling' })
+
+    local FlingSection = FlingTab:CreateSection('walk fling')
+
+    FlingSection:Toggle({
+        Title = 'walk fling',
+        Description = 'no teleport and no spin - walk into someone and they go',
+        Flag = 'mm2_fling',
+        Default = false,
+        Callback = function(state)
+            Fling.Enabled = state
+            if not state then Fling.reset() end
+        end,
+    })
+
+    FlingSection:Dropdown({
+        Title = 'power',
+        Description = 'how much momentum gets claimed. gentle is a shove, absurd is orbit',
+        Values = Choice.Fling.Power.order,
+        Default = Choice.Fling.Power.default,
+        Flag = 'mm2_fling_power',
+        Callback = function(value) Fling.Power = Choice.pick(Choice.Fling.Power, value) end,
+    })
+
+    FlingSection:Dropdown({
+        Title = 'reach',
+        Description = 'how close they have to be before it arms. touch is the least obvious',
+        Values = Choice.Fling.Reach.order,
+        Default = Choice.Fling.Reach.default,
+        Flag = 'mm2_fling_reach',
+        Callback = function(value) Fling.Reach = Choice.pick(Choice.Fling.Reach, value) end,
+    })
+
+    FlingSection:Dropdown({
+        Title = 'targets',
+        Values = Choice.Fling.Targets.order,
+        Default = Choice.Fling.Targets.default,
+        Flag = 'mm2_fling_targets',
+        Callback = function(value) Fling.Targets = Choice.pick(Choice.Fling.Targets, value) end,
+    })
+
+    local TuningSection = FlingTab:CreateSection('tuning')
+
+    TuningSection:Dropdown({
+        Title = 'hold',
+        Description = 'how long the claim stays live before it is taken back',
+        Values = Choice.Fling.Hold.order,
+        Default = Choice.Fling.Hold.default,
+        Flag = 'mm2_fling_hold',
+        Callback = function(value) Fling.Hold = Choice.pick(Choice.Fling.Hold, value) end,
+    })
+
+    TuningSection:Toggle({
+        Title = 'angular',
+        Description = 'also claims spin. lands harder, and is the part most likely to show',
+        Flag = 'mm2_fling_spin',
+        Default = true,
+        Callback = function(state) Fling.Spin = state end,
+    })
+
+    TuningSection:Toggle({
+        Title = 'stay upright',
+        Description = 'puts the humanoid straight back into running each frame, so it reads as walking',
+        Flag = 'mm2_fling_upright',
+        Default = true,
+        Callback = function(state) Fling.Upright = state end,
+    })
+
+    Fling.ui = addStat(TuningSection, { Title = 'contacts armed', Value = '0' })
+
+    TuningSection:Button({
+        Title = 'reset counter',
+        Callback = function() Fling.hits = 0 end,
+    })
+
+    local NotesSection = FlingTab:CreateSection('notes')
+
+    NotesSection:Paragraph({
+        Title = 'how it works',
+        Content = 'your client owns your own character physics, so whatever velocity it reports is taken as true. the claim is made before the physics step, where it takes part in resolving whatever contact you are already standing in, and taken back straight after with your position restored. the momentum lands on them and nothing about your own character visibly moves. the usual fling scripts teleport onto the target and spin because they are reaching someone across the map; walking into them supplies that contact for free, so neither is needed',
+    })
+
+    NotesSection:Paragraph({
+        Title = 'if it is not landing',
+        Content = 'the claim may not be surviving a single step. try hold on two or four frames, then continuous, before reaching for more power - a longer hold is far more likely to be the fix than a bigger number, and it stays less visible than absurd power does. wide reach also helps when contact itself is the problem rather than the claim',
+    })
+
+    NotesSection:Paragraph({
+        Title = 'what this cannot do',
+        Content = 'if the game puts players in a collision group that stops them touching each other there is no contact to exploit and no amount of power helps. your own screen stays clean either way, but other clients see the state you replicate, so a large claim can still read as jitter on their end - angular is the part most likely to show, and turning it off is the first thing to try if you are being noticed',
+    })
+end
+
+
 local SeenStat, RedirectStat, SuppressStat, ErrorStat
 do
 
@@ -3209,6 +3501,11 @@ local SessionSection = VisualTab:CreateSection('session')
 SessionSection:Button({
     Title = 'unload',
     Callback = function()
+        -- put the character back before anything is disconnected, so unloading
+        -- mid fling cannot leave you holding a claim nothing is going to revert
+        Fling.Enabled = false
+        pcall(Fling.reset)
+
         Unloading = true
 
         for _, connection in ipairs(Connections) do
@@ -3254,6 +3551,11 @@ task.spawn(function()
             knifeMultStat.Set(KnifeTune.Auto and ('%.2fx'):format(KnifeLead.mult) or 'off')
             solverStat.Set(Advanced.Enabled and ('advanced: ' .. Advanced.Solver)
                 or (Aim.Math == 'Adaptive' and lastModelUsed or Aim.Math))
+
+            if Fling.ui then
+                Fling.ui.Set(tostring(Fling.hits),
+                    Fling.Enabled and Fling.armed and Color3.fromRGB(126, 217, 87) or nil)
+            end
 
             if not Advanced.Enabled then
                 Advanced.ui.state.Set('off')
