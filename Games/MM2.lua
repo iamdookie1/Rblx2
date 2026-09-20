@@ -566,6 +566,39 @@ Choice.Fling = {
         default = 'Anyone',
         order = { 'Anyone', 'Murderer only', 'Armed only' },
     },
+
+    -- how wide the circle is when it orbits someone. kept at or under six
+    -- studs so it stays a contact rather than a lunge across the room
+    Orbit = {
+        default = 'Four',
+        order = { 'Two', 'Three', 'Four', 'Five', 'Six' },
+        value = { ['Two'] = 2, ['Three'] = 3, ['Four'] = 4, ['Five'] = 5, ['Six'] = 6 },
+    },
+
+    -- how long to keep circling before giving up and going home, so a target
+    -- that simply cannot be flung does not strand you next to them
+    Patience = {
+        default = 'Normal',
+        order = { 'Brief', 'Normal', 'Stubborn' },
+        value = { ['Brief'] = 1, ['Normal'] = 2.5, ['Stubborn'] = 5 },
+    },
+
+    -- what counts as abnormal motion on your own character. walking is 16 and
+    -- a jump peaks near 50, so even strict leaves ordinary movement alone
+    Guard = {
+        default = 'Normal',
+        order = { 'Strict', 'Normal', 'Loose' },
+        value = {
+            ['Strict'] = { linear = 120, angular = 25 },
+            ['Normal'] = { linear = 250, angular = 60 },
+            ['Loose']  = { linear = 600, angular = 150 },
+        },
+    },
+
+    Grab = {
+        default = 'Fire touch',
+        order = { 'Fire touch', 'Teleport' },
+    },
 }
 
 -- the advanced tab's own option sets, kept on Choice so they resolve through
@@ -2087,18 +2120,31 @@ end
 
 Fling = {
     Enabled = false,
+    OnTouch = true,
+    Passive = false,
     Power = Choice.Fling.Power.default,
     Reach = Choice.Fling.Reach.default,
     Claim = Choice.Fling.Claim.default,
     Leash = Choice.Fling.Leash.default,
     Targets = Choice.Fling.Targets.default,
+    Orbit = Choice.Fling.Orbit.default,
+    Patience = Choice.Fling.Patience.default,
     Upright = true,
 
     armed = false,
+    busy = false,
     tookLinear = false,
     savedPos = nil,
     hits = 0,
+    flung = 0,
+    cooldown = {},
 }
+
+-- A flung player picks up a velocity nothing in normal play produces, and
+-- leaves the spot they were standing in. Either is enough to call it done.
+Fling.FLUNG_SPEED = 120
+Fling.FLUNG_DISTANCE = 18
+Fling.RETOUCH = 1.5
 
 function Fling.allowed(plr)
     if plr == LocalPlayer or not isAlivePlr(plr) then return false end
@@ -2178,9 +2224,216 @@ function Fling.reset()
     Fling.savedChar = nil
 end
 
+--// anti fling ---------------------------------------------------------------
+--
+-- Every fling, whichever script threw it, has to reach your character through
+-- one of two doors: a velocity written straight onto your root, or a mover
+-- instance parented into your character to push it. This watches both, and
+-- puts you back where you were standing the last time your motion looked
+-- ordinary. It stands down while this script is flinging, so the two never
+-- fight over the same root part.
+
+AntiFling = {
+    Enabled = false,
+    Guard = Choice.Fling.Guard.default,
+    blocked = 0,
+    home = nil,
+    homeChar = nil,
+}
+
+-- the instance classes a fling can be delivered through
+AntiFling.MOVERS = {
+    BodyVelocity = true, BodyAngularVelocity = true, BodyForce = true,
+    BodyThrust = true, BodyPosition = true, BodyGyro = true,
+    LinearVelocity = true, AngularVelocity = true, VectorForce = true,
+    AlignPosition = true, AlignOrientation = true, Torque = true,
+}
+
+function AntiFling.tick()
+    if Unloading or not AntiFling.Enabled then return end
+    -- ours is not an attack, so leave it alone
+    if Fling.busy or Fling.armed then return end
+
+    local root, hum = Fling.myRoot()
+    local char = LocalPlayer.Character
+    if not root or not char then return end
+
+    local caught = false
+
+    for _, inst in ipairs(char:GetDescendants()) do
+        if AntiFling.MOVERS[inst.ClassName] then
+            pcall(function() inst:Destroy() end)
+            caught = true
+        end
+    end
+
+    local guard = Choice.valueOf(Choice.Fling.Guard, AntiFling.Guard)
+    local linear = root.AssemblyLinearVelocity
+    local angular = root.AssemblyAngularVelocity
+
+    if linear.Magnitude > guard.linear or angular.Magnitude > guard.angular then
+        caught = true
+    end
+
+    if caught then
+        Fling.setVelocity(root, Vector3.zero, Vector3.zero)
+        if AntiFling.home and AntiFling.homeChar == char then
+            pcall(function() root.CFrame = AntiFling.home end)
+        end
+        if hum then
+            pcall(function()
+                hum.PlatformStand = false
+                hum:ChangeState(Enum.HumanoidStateType.GettingUp)
+            end)
+        end
+        AntiFling.blocked = AntiFling.blocked + 1
+    else
+        -- only remember a position reached under your own power
+        AntiFling.home = root.CFrame
+        AntiFling.homeChar = char
+    end
+end
+
+track(RunService.Heartbeat:Connect(AntiFling.tick))
+
+-- Circling someone at close range, spinning, until they go. This is the active
+-- half: the passive claim above only fires while you happen to be touching
+-- somebody, whereas this holds contact deliberately for as long as it takes.
+-- It still never teleports onto them - it orbits at arm's length and puts you
+-- back where you started the moment they are gone.
+function Fling.orbit(char, why)
+    if Fling.busy or Unloading then return false end
+
+    local theirRoot = char and char:FindFirstChild("HumanoidRootPart")
+    if not theirRoot then return false end
+
+    local root = Fling.myRoot()
+    if not root then return false end
+
+    Fling.busy = true
+    Fling.hits = Fling.hits + 1
+
+    task.spawn(function()
+        local ok = pcall(function()
+            local home = root.CFrame
+            local homeChar = LocalPlayer.Character
+            local startPos = theirRoot.Position
+
+            local radius = Choice.valueOf(Choice.Fling.Orbit, Fling.Orbit)
+            local patience = Choice.valueOf(Choice.Fling.Patience, Fling.Patience)
+            local power = Choice.valueOf(Choice.Fling.Power, Fling.Power)
+            local spin = Vector3.new(power.angular, power.angular, power.angular)
+
+            local deadline = os.clock() + patience
+            local angle = 0
+            local landed = false
+
+            while os.clock() < deadline do
+                if Unloading or not Fling.Enabled then break end
+                if LocalPlayer.Character ~= homeChar then break end
+                if not theirRoot.Parent or not root.Parent then break end
+
+                -- a full turn roughly every third of a second, so every side of
+                -- them gets a contact from a different direction
+                angle = angle + 0.35
+                root.CFrame = CFrame.new(
+                    theirRoot.Position + Vector3.new(math.cos(angle) * radius, 0, math.sin(angle) * radius))
+                Fling.setVelocity(root, nil, spin)
+
+                local moving = theirRoot.AssemblyLinearVelocity.Magnitude
+                if moving > Fling.FLUNG_SPEED
+                    or (theirRoot.Position - startPos).Magnitude > Fling.FLUNG_DISTANCE
+                then
+                    landed = true
+                    break
+                end
+
+                task.wait()
+            end
+
+            if landed then Fling.flung = Fling.flung + 1 end
+
+            -- home again, whatever happened
+            Fling.setVelocity(root, Vector3.zero, Vector3.zero)
+            if LocalPlayer.Character == homeChar and root.Parent then
+                root.CFrame = home
+                local _, hum = Fling.myRoot()
+                if hum then
+                    pcall(function() hum:ChangeState(Enum.HumanoidStateType.GettingUp) end)
+                end
+            end
+        end)
+
+        Fling.busy = false
+        if not ok then Fling.reset() end
+    end)
+
+    return true
+end
+
+-- Anyone whose part brushes one of ours gets orbited, once, then goes on a
+-- short cooldown - Touched fires many times a second against a single body and
+-- re-entering for every one of them would just restart the routine forever.
+function Fling.onTouched(hit)
+    if not Fling.Enabled or not Fling.OnTouch or Fling.busy or Unloading then return end
+    if typeof(hit) ~= "Instance" then return end
+
+    local char = hit.Parent
+    local plr = char and Players:GetPlayerFromCharacter(char)
+    if not plr or plr == LocalPlayer or not Fling.allowed(plr) then return end
+
+    local now = os.clock()
+    if (Fling.cooldown[plr] or 0) > now then return end
+    Fling.cooldown[plr] = now + Fling.RETOUCH
+
+    Fling.orbit(char, 'touched')
+end
+
+function Fling.watchCharacter(char)
+    if not char then return end
+    for _, part in ipairs(char:GetDescendants()) do
+        if part:IsA("BasePart") then
+            track(part.Touched:Connect(Fling.onTouched))
+        end
+    end
+    track(char.DescendantAdded:Connect(function(inst)
+        if inst:IsA("BasePart") then
+            track(inst.Touched:Connect(Fling.onTouched))
+        end
+    end))
+end
+
+-- the two buttons. sheriff also matches hero, since a hero is whoever picked
+-- the gun up after the sheriff died and is the same threat
+function Fling.byRole(wanted)
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr ~= LocalPlayer and isAlivePlr(plr) then
+            local role = roleOf(plr)
+            local match = role == wanted or (wanted == 'Sheriff' and role == 'Hero')
+            if match and Fling.orbit(plr.Character, wanted) then
+                return plr.Name
+            end
+        end
+    end
+    return nil
+end
+
+task.spawn(function()
+    if LocalPlayer.Character then Fling.watchCharacter(LocalPlayer.Character) end
+end)
+track(LocalPlayer.CharacterAdded:Connect(function(char)
+    Fling.busy = false
+    table.clear(Fling.cooldown)
+    task.spawn(Fling.watchCharacter, char)
+end))
+
+track(Players.PlayerRemoving:Connect(function(plr)
+    Fling.cooldown[plr] = nil
+end))
+
 -- before the step: claim the momentum
 track(PreSimulation:Connect(function()
-    if Unloading or not Fling.Enabled then return end
+    if Unloading or not Fling.Enabled or not Fling.Passive or Fling.busy then return end
 
     local ok = pcall(function()
         local root = Fling.myRoot()
@@ -2227,7 +2480,7 @@ end))
 track(RunService.Heartbeat:Connect(function()
     if Unloading or not Fling.armed then return end
 
-    if not Fling.Enabled then
+    if not Fling.Enabled or Fling.busy then
         Fling.reset()
         return
     end
@@ -2760,10 +3013,52 @@ end))
 DroppedGunEsp = { Enabled = false }
 local droppedGunObjects = {}
 
+-- The gun on the floor is not always a Tool. In the map it turns up as a
+-- GunDrop model sitting under the map folder, which the tool check alone never
+-- matched - that is why gun esp was finding nothing once the sheriff died.
 local function isDroppedGun(inst)
-    if typeof(inst) ~= "Instance" or not isGunTool(inst) then return false end
+    if typeof(inst) ~= "Instance" then return false end
+
     local parent = inst.Parent
-    return parent ~= nil and Players:GetPlayerFromCharacter(parent) == nil
+    if parent == nil then return false end
+    if Players:GetPlayerFromCharacter(parent) ~= nil then return false end
+
+    if isGunTool(inst) then return true end
+
+    if inst:IsA("Model") or inst:IsA("BasePart") or inst:IsA("Folder") then
+        local name = inst.Name:lower()
+        if name:find("gundrop") or name == "droppedgun" then
+            -- a GunDrop model holds parts that may also carry the name; only
+            -- the outermost one is the drop, so anything nested inside one
+            -- already covered is skipped
+            local ancestor = parent
+            while ancestor and ancestor ~= Workspace do
+                local up = ancestor.Name:lower()
+                if up:find("gundrop") or up == "droppedgun" then return false end
+                ancestor = ancestor.Parent
+            end
+            return true
+        end
+    end
+
+    return false
+end
+
+-- Highlight needs geometry to adorn. A GunDrop can be a model with no
+-- PrimaryPart, or a folder, neither of which shows anything on its own, so
+-- this digs out something that will actually render.
+local function gunAdornee(item)
+    if item:IsA("BasePart") then return item, item end
+
+    if item:IsA("Model") then
+        local part = item.PrimaryPart or item:FindFirstChildWhichIsA("BasePart", true)
+        if part then return item, part end
+        return nil, nil
+    end
+
+    local part = item:FindFirstChildWhichIsA("BasePart", true)
+    if part then return part, part end
+    return nil, nil
 end
 
 local function destroyDroppedGunEsp(item)
@@ -2777,16 +3072,22 @@ end
 local function buildDroppedGunEsp(item)
     if droppedGunObjects[item] then return end
 
+    local adornee, anchorPart = gunAdornee(item)
+    if not adornee then return end
+
     local hl = Instance.new("Highlight")
     hl.FillColor = GUN_ESP_COLOR
     hl.OutlineColor = GUN_ESP_COLOR
     hl.FillTransparency = 0.3
     hl.OutlineTransparency = 0
     hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
-    hl.Parent = item
+    -- adorned explicitly rather than by parenting, so it still shows when the
+    -- drop is a folder or a model that cannot be adorned by itself
+    hl.Adornee = adornee
+    hl.Parent = adornee
 
     local marker = nil
-    local handle = item:FindFirstChild("Handle")
+    local handle = item:FindFirstChild("Handle") or anchorPart
     if handle and handle:IsA("BasePart") then
         marker = Instance.new("Part")
         marker.Anchored = true
@@ -2820,7 +3121,7 @@ local function updateDroppedGunMarkers()
         if not item.Parent or not isDroppedGun(item) then
             destroyDroppedGunEsp(item)
         elseif entry.marker then
-            local handle = item:FindFirstChild("Handle")
+            local handle = item:FindFirstChild("Handle") or select(2, gunAdornee(item))
             if handle then
                 pcall(function() entry.marker.Position = handle.Position end)
             end
@@ -2835,12 +3136,111 @@ task.spawn(function()
     end
 end)
 
-track(Workspace.DescendantAdded:Connect(function(inst)
-    if not DroppedGunEsp.Enabled then return end
-    if isDroppedGun(inst) then buildDroppedGunEsp(inst) end
-end))
+--// auto grab gun ------------------------------------------------------------
+--
+-- The drop is tracked whether or not esp is on, because grabbing needs to know
+-- where the gun is regardless of whether you are being shown it.
+
+AutoGun = {
+    Enabled = false,
+    Method = Choice.Fling.Grab.default,
+    Range = 250,
+    grabs = 0,
+    drops = {},
+    lastTry = 0,
+}
+
+-- firetouchinterest needs a part the game is actually listening for contact on.
+-- A TouchTransmitter is the child Roblox creates when something connects
+-- Touched, so a part carrying one is the part the pickup is wired to.
+function AutoGun.touchPart(item)
+    if item:IsA("BasePart") and item:FindFirstChildOfClass("TouchTransmitter") then
+        return item
+    end
+
+    for _, inst in ipairs(item:GetDescendants()) do
+        if inst:IsA("BasePart") and inst:FindFirstChildOfClass("TouchTransmitter") then
+            return inst
+        end
+    end
+
+    -- nothing is advertising a listener, so fall back to any geometry and let
+    -- the touch land where it may
+    return select(2, gunAdornee(item))
+end
+
+function AutoGun.grab(item)
+    if Unloading or not item or not item.Parent then return false end
+
+    local root = Fling.myRoot()
+    if not root then return false end
+
+    local part = AutoGun.touchPart(item)
+    if not part then return false end
+
+    if (part.Position - root.Position).Magnitude > AutoGun.Range then return false end
+
+    if AutoGun.Method == 'Teleport' then
+        local home = root.CFrame
+        local homeChar = LocalPlayer.Character
+        task.spawn(function()
+            pcall(function()
+                root.CFrame = CFrame.new(part.Position)
+                task.wait(0.2)
+                if LocalPlayer.Character == homeChar and root.Parent then
+                    root.CFrame = home
+                end
+            end)
+        end)
+        AutoGun.grabs = AutoGun.grabs + 1
+        return true
+    end
+
+    if typeof(firetouchinterest) ~= "function" then return false end
+
+    -- 0 opens the contact and 1 closes it; the pair together is one touch
+    local ok = pcall(function()
+        firetouchinterest(root, part, 0)
+        task.wait()
+        firetouchinterest(root, part, 1)
+    end)
+    if ok then AutoGun.grabs = AutoGun.grabs + 1 end
+    return ok
+end
+
+task.spawn(function()
+    while not Unloading do
+        task.wait(0.4)
+        if AutoGun.Enabled and heldWeapon(LocalPlayer.Character) ~= "Gun" then
+            pcall(function()
+                for item in pairs(AutoGun.drops) do
+                    if item.Parent and isDroppedGun(item) then
+                        if AutoGun.grab(item) then break end
+                    else
+                        AutoGun.drops[item] = nil
+                    end
+                end
+            end)
+        end
+    end
+end)
+
+local function noteGunDrop(inst)
+    if not isDroppedGun(inst) then return end
+    AutoGun.drops[inst] = true
+    if DroppedGunEsp.Enabled then buildDroppedGunEsp(inst) end
+end
+
+task.spawn(function()
+    for _, inst in ipairs(Workspace:GetDescendants()) do
+        if isDroppedGun(inst) then AutoGun.drops[inst] = true end
+    end
+end)
+
+track(Workspace.DescendantAdded:Connect(noteGunDrop))
 
 track(Workspace.DescendantRemoving:Connect(function(inst)
+    AutoGun.drops[inst] = nil
     if droppedGunObjects[inst] then destroyDroppedGunEsp(inst) end
 end))
 
@@ -3074,13 +3474,60 @@ do
     local FlingSection = FlingTab:CreateSection('walk fling')
 
     FlingSection:Toggle({
-        Title = 'walk fling',
-        Description = 'no teleport and no spin - walk into someone and they go',
+        Title = 'fling if touched',
+        Description = 'anyone who touches you gets circled at close range until they go, then you are put back',
         Flag = 'mm2_fling',
         Default = false,
         Callback = function(state)
             Fling.Enabled = state
             if not state then Fling.reset() end
+        end,
+    })
+
+    FlingSection:Toggle({
+        Title = 'on contact',
+        Description = 'what triggers it. off leaves the buttons below as the only way to start one',
+        Flag = 'mm2_fling_touch',
+        Default = true,
+        Callback = function(state) Fling.OnTouch = state end,
+    })
+
+    FlingSection:Toggle({
+        Title = 'passive claim',
+        Description = 'the older behaviour - claims momentum every frame anyone is in reach, without circling',
+        Flag = 'mm2_fling_passive',
+        Default = false,
+        Callback = function(state)
+            Fling.Passive = state
+            if not state then Fling.reset() end
+        end,
+    })
+
+    FlingSection:Button({
+        Title = 'fling murderer',
+        Description = 'starts a run on whoever is holding the knife right now',
+        Callback = function()
+            local name = Fling.byRole('Murderer')
+            Onyx:Notify({
+                Title = 'fling',
+                Content = name and ('going for ' .. name) or 'no living murderer found',
+                Type = name and 'success' or 'warning',
+                Duration = 3,
+            })
+        end,
+    })
+
+    FlingSection:Button({
+        Title = 'fling sheriff',
+        Description = 'matches the hero too, since a hero is whoever picked the gun up',
+        Callback = function()
+            local name = Fling.byRole('Sheriff')
+            Onyx:Notify({
+                Title = 'fling',
+                Content = name and ('going for ' .. name) or 'no living sheriff or hero found',
+                Type = name and 'success' or 'warning',
+                Duration = 3,
+            })
         end,
     })
 
@@ -3108,6 +3555,57 @@ do
         Default = Choice.Fling.Targets.default,
         Flag = 'mm2_fling_targets',
         Callback = function(value) Fling.Targets = Choice.pick(Choice.Fling.Targets, value) end,
+    })
+
+    local OrbitSection = FlingTab:CreateSection('orbit')
+
+    OrbitSection:Dropdown({
+        Title = 'orbit radius',
+        Description = 'how wide the circle is. it stays a contact rather than a lunge',
+        Values = Choice.Fling.Orbit.order,
+        Default = Choice.Fling.Orbit.default,
+        Flag = 'mm2_fling_orbit',
+        Callback = function(value) Fling.Orbit = Choice.pick(Choice.Fling.Orbit, value) end,
+    })
+
+    OrbitSection:Dropdown({
+        Title = 'patience',
+        Description = 'how long to keep circling before giving up, so an unflingable target does not strand you',
+        Values = Choice.Fling.Patience.order,
+        Default = Choice.Fling.Patience.default,
+        Flag = 'mm2_fling_patience',
+        Callback = function(value) Fling.Patience = Choice.pick(Choice.Fling.Patience, value) end,
+    })
+
+    Fling.ui2 = addStat(OrbitSection, { Title = 'flung', Value = '0' })
+
+    local GuardSection = FlingTab:CreateSection('anti fling')
+
+    GuardSection:Toggle({
+        Title = 'anti fling',
+        Description = 'catches anything trying to throw you and puts you back where you were standing',
+        Flag = 'mm2_antifling',
+        Default = false,
+        Callback = function(state)
+            AntiFling.Enabled = state
+            AntiFling.home = nil
+            AntiFling.homeChar = nil
+        end,
+    })
+
+    GuardSection:Dropdown({
+        Title = 'sensitivity',
+        Description = 'what counts as abnormal motion. walking is 16 and a jump peaks near 50, so even strict leaves normal movement alone',
+        Values = Choice.Fling.Guard.order,
+        Default = Choice.Fling.Guard.default,
+        Flag = 'mm2_antifling_guard',
+        Callback = function(value) AntiFling.Guard = Choice.pick(Choice.Fling.Guard, value) end,
+    })
+
+    AntiFling.ui = addStat(GuardSection, { Title = 'blocked', Value = '0' })
+
+    GuardSection:Label({
+        Title = 'Watches both doors a fling can come through: a velocity written straight onto your root, and a mover instance parented into your character. It stands down while this script is flinging, so the two never fight over the same part.',
     })
 
     local TuningSection = FlingTab:CreateSection('tuning')
@@ -3543,11 +4041,43 @@ TrapSection:Toggle({
 
 TrapSection:Toggle({
     Title = 'dropped gun esp',
+    Description = 'finds the GunDrop in the map, not just a loose Gun tool',
     Flag = 'mm2_dropped_gun_esp',
     Callback = function(state)
         DroppedGunEsp.Enabled = state
         droppedGunEspRefreshAll()
     end,
+})
+
+local GunSection = VisualTab:CreateSection('gun pickup')
+
+GunSection:Toggle({
+    Title = 'auto grab gun',
+    Description = 'picks the dropped gun up on its own, but only while you are not already holding one',
+    Flag = 'mm2_auto_gun',
+    Callback = function(state) AutoGun.Enabled = state end,
+})
+
+GunSection:Dropdown({
+    Title = 'method',
+    Description = 'fire touch fakes the contact where you stand; teleport goes there and comes straight back',
+    Values = Choice.Fling.Grab.order,
+    Default = Choice.Fling.Grab.default,
+    Flag = 'mm2_auto_gun_method',
+    Callback = function(value) AutoGun.Method = Choice.pick(Choice.Fling.Grab, value) end,
+})
+
+AutoGun.ui = addStat(GunSection, {
+    Title = 'firetouchinterest',
+    Value = typeof(firetouchinterest) == "function" and 'available' or 'missing',
+    Color = typeof(firetouchinterest) == "function"
+        and Color3.fromRGB(126, 217, 87) or Color3.fromRGB(255, 96, 106),
+})
+
+AutoGun.ui2 = addStat(GunSection, { Title = 'drops tracked', Value = '0' })
+
+GunSection:Label({
+    Title = 'Fire touch looks for the part inside the drop that the game is actually listening for contact on, and fakes a touch against it without moving you. Where the executor has no firetouchinterest, use teleport instead.',
 })
 
 local SessionSection = VisualTab:CreateSection('session')
@@ -3558,6 +4088,10 @@ SessionSection:Button({
         -- put the character back before anything is disconnected, so unloading
         -- mid fling cannot leave you holding a claim nothing is going to revert
         Fling.Enabled = false
+        Fling.OnTouch = false
+        Fling.Passive = false
+        AntiFling.Enabled = false
+        AutoGun.Enabled = false
         pcall(Fling.reset)
 
         Unloading = true
@@ -3608,7 +4142,21 @@ task.spawn(function()
 
             if Fling.ui then
                 Fling.ui.Set(tostring(Fling.hits),
-                    Fling.Enabled and Fling.armed and Color3.fromRGB(126, 217, 87) or nil)
+                    Fling.Enabled and (Fling.armed or Fling.busy)
+                        and Color3.fromRGB(126, 217, 87) or nil)
+            end
+            if Fling.ui2 then
+                Fling.ui2.Set(tostring(Fling.flung),
+                    Fling.flung > 0 and Color3.fromRGB(126, 217, 87) or nil)
+            end
+            if AntiFling.ui then
+                AntiFling.ui.Set(tostring(AntiFling.blocked),
+                    AntiFling.blocked > 0 and Color3.fromRGB(255, 196, 87) or nil)
+            end
+            if AutoGun.ui2 then
+                local n = 0
+                for _ in pairs(AutoGun.drops) do n = n + 1 end
+                AutoGun.ui2.Set(tostring(n), n > 0 and Color3.fromRGB(126, 217, 87) or nil)
             end
 
             if not Advanced.Enabled then
