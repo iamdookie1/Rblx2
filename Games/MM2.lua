@@ -567,6 +567,16 @@ Choice.Fling = {
         order = { 'Anyone', 'Murderer only', 'Armed only' },
     },
 
+    -- Overlap is the one that actually works. It puts your root inside theirs
+    -- and alternates above and below them a frame apart, so every frame is a
+    -- fresh interpenetration the solver has to resolve, from a direction that
+    -- keeps changing. Orbit circles at arm's length instead - quieter to watch
+    -- and much weaker, kept only because it does not put you inside anybody.
+    Style = {
+        default = 'Overlap',
+        order = { 'Overlap', 'Orbit' },
+    },
+
     -- how wide the circle is when it orbits someone. kept at or under six
     -- studs so it stays a contact rather than a lunge across the room
     Orbit = {
@@ -2127,9 +2137,11 @@ Fling = {
     Claim = Choice.Fling.Claim.default,
     Leash = Choice.Fling.Leash.default,
     Targets = Choice.Fling.Targets.default,
+    Style = Choice.Fling.Style.default,
     Orbit = Choice.Fling.Orbit.default,
     Patience = Choice.Fling.Patience.default,
     Upright = true,
+    savedHeight = nil,
 
     armed = false,
     busy = false,
@@ -2145,6 +2157,7 @@ Fling = {
 Fling.FLUNG_SPEED = 120
 Fling.FLUNG_DISTANCE = 18
 Fling.RETOUCH = 1.5
+Fling.GUARD_NAME = "MM2FlingGuard"
 
 function Fling.allowed(plr)
     if plr == LocalPlayer or not isAlivePlr(plr) then return false end
@@ -2211,6 +2224,26 @@ end
 function Fling.reset()
     Fling.armed = false
 
+    -- a guard left behind would pin you at a standstill forever, and a
+    -- FallenPartsDestroyHeight left at NaN would stay that way for the session,
+    -- so both come off here as well as at the end of a normal run
+    local char = LocalPlayer.Character
+    if char then
+        local stale = char:FindFirstChild("HumanoidRootPart")
+        stale = stale and stale:FindFirstChild(Fling.GUARD_NAME)
+        if stale then pcall(function() stale:Destroy() end) end
+
+        local hum = char:FindFirstChildOfClass("Humanoid")
+        if hum then
+            pcall(function() hum:SetStateEnabled(Enum.HumanoidStateType.Seated, true) end)
+        end
+    end
+
+    if Fling.savedHeight then
+        pcall(function() Workspace.FallenPartsDestroyHeight = Fling.savedHeight end)
+        Fling.savedHeight = nil
+    end
+
     local root = Fling.myRoot()
     if root then
         -- only put linear back if this script was the thing that took it; the
@@ -2261,7 +2294,9 @@ function AntiFling.tick()
     local caught = false
 
     for _, inst in ipairs(char:GetDescendants()) do
-        if AntiFling.MOVERS[inst.ClassName] then
+        -- never eat our own self-protection guard, which is the one mover in
+        -- here that is holding you still rather than throwing you
+        if AntiFling.MOVERS[inst.ClassName] and inst.Name ~= Fling.GUARD_NAME then
             pcall(function() inst:Destroy() end)
             caught = true
         end
@@ -2296,6 +2331,81 @@ end
 
 track(RunService.Heartbeat:Connect(AntiFling.tick))
 
+-- Claiming a velocity that enormous would throw you as hard as it throws them.
+-- A BodyVelocity pinned at zero with effectively unlimited force cancels your
+-- own motion continuously, while the claim still registers for the contact -
+-- that asymmetry is the whole reason they go and you do not. The seated state
+-- would zero the claim outright, and FallenPartsDestroyHeight is pushed to NaN
+-- because every comparison against NaN is false, so nothing of yours gets
+-- deleted for being briefly somewhere absurd.
+function Fling.protect(root, hum)
+    local guard = Instance.new("BodyVelocity")
+    guard.Name = Fling.GUARD_NAME
+    guard.Velocity = Vector3.zero
+    guard.MaxForce = Vector3.new(9e9, 9e9, 9e9)
+    guard.Parent = root
+
+    if hum then
+        pcall(function() hum:SetStateEnabled(Enum.HumanoidStateType.Seated, false) end)
+    end
+
+    Fling.savedHeight = Workspace.FallenPartsDestroyHeight
+    pcall(function() Workspace.FallenPartsDestroyHeight = 0 / 0 end)
+
+    return guard
+end
+
+function Fling.unprotect(guard, hum)
+    if guard then pcall(function() guard:Destroy() end) end
+    if hum then
+        pcall(function() hum:SetStateEnabled(Enum.HumanoidStateType.Seated, true) end)
+    end
+    if Fling.savedHeight then
+        pcall(function() Workspace.FallenPartsDestroyHeight = Fling.savedHeight end)
+        Fling.savedHeight = nil
+    end
+end
+
+-- One CFrame write does not bring you home. The step right after it can move
+-- you again, the other limbs are still carrying their own velocity, and a
+-- ragdolled humanoid will not stand up on its own. So this keeps putting you
+-- back, zeroing every part rather than only the root, until you are actually
+-- there - which is the difference between landing where you started and
+-- carrying on into the void.
+function Fling.goHome(home, homeChar)
+    if not home or not homeChar then return end
+
+    local deadline = os.clock() + 3
+    repeat
+        if Unloading then break end
+        if LocalPlayer.Character ~= homeChar then break end
+
+        pcall(function()
+            for _, part in ipairs(homeChar:GetDescendants()) do
+                if part:IsA("BasePart") then
+                    part.Velocity = Vector3.zero
+                    part.RotVelocity = Vector3.zero
+                end
+            end
+
+            local root = homeChar:FindFirstChild("HumanoidRootPart")
+            if root then root.CFrame = home end
+
+            local hum = homeChar:FindFirstChildOfClass("Humanoid")
+            if hum then
+                hum.PlatformStand = false
+                hum:ChangeState(Enum.HumanoidStateType.GettingUp)
+            end
+        end)
+
+        task.wait()
+
+        local root = homeChar:FindFirstChild("HumanoidRootPart")
+        if not root then break end
+        if (root.Position - home.Position).Magnitude < 6 then break end
+    until os.clock() > deadline
+end
+
 -- Circling someone at close range, spinning, until they go. This is the active
 -- half: the passive claim above only fires while you happen to be touching
 -- somebody, whereas this holds contact deliberately for as long as it takes.
@@ -2314,34 +2424,54 @@ function Fling.orbit(char, why)
     Fling.hits = Fling.hits + 1
 
     task.spawn(function()
-        local ok = pcall(function()
-            local home = root.CFrame
-            local homeChar = LocalPlayer.Character
-            local startPos = theirRoot.Position
+        local home = root.CFrame
+        local homeChar = LocalPlayer.Character
+        local guard, hum
 
+        local ok = pcall(function()
+            hum = homeChar and homeChar:FindFirstChildOfClass("Humanoid")
+            guard = Fling.protect(root, hum)
+
+            local startPos = theirRoot.Position
+            local style = Choice.pick(Choice.Fling.Style, Fling.Style)
             local radius = Choice.valueOf(Choice.Fling.Orbit, Fling.Orbit)
             local patience = Choice.valueOf(Choice.Fling.Patience, Fling.Patience)
             local power = Choice.valueOf(Choice.Fling.Power, Fling.Power)
+
+            local linear = Vector3.new(power.linear, power.linear * power.lift, power.linear)
             local spin = Vector3.new(power.angular, power.angular, power.angular)
 
             local deadline = os.clock() + patience
-            local angle = 0
-            local landed = false
+            local angle, flip, landed = 0, 1, false
 
             while os.clock() < deadline do
                 if Unloading or not Fling.Enabled then break end
                 if LocalPlayer.Character ~= homeChar then break end
                 if not theirRoot.Parent or not root.Parent then break end
 
-                -- a full turn roughly every third of a second, so every side of
-                -- them gets a contact from a different direction
+                local theirHum = char:FindFirstChildOfClass("Humanoid")
                 angle = angle + 0.35
-                root.CFrame = CFrame.new(
-                    theirRoot.Position + Vector3.new(math.cos(angle) * radius, 0, math.sin(angle) * radius))
-                Fling.setVelocity(root, nil, spin)
 
-                local moving = theirRoot.AssemblyLinearVelocity.Magnitude
-                if moving > Fling.FLUNG_SPEED
+                if style == 'Orbit' then
+                    root.CFrame = CFrame.new(theirRoot.Position
+                        + Vector3.new(math.cos(angle) * radius, 0, math.sin(angle) * radius))
+                    Fling.setVelocity(root, nil, spin)
+                else
+                    -- sit inside them, a stud and a half above then below, and
+                    -- drift with wherever they are running so a moving target
+                    -- does not simply walk out of the overlap
+                    local drift = Vector3.zero
+                    if theirHum then
+                        drift = theirHum.MoveDirection * math.min(theirHum.WalkSpeed, 24) * 0.08
+                    end
+
+                    flip = -flip
+                    root.CFrame = CFrame.new(theirRoot.Position + drift + Vector3.new(0, 1.5 * flip, 0))
+                        * CFrame.Angles(math.rad(angle * 40), 0, 0)
+                    Fling.setVelocity(root, linear, spin)
+                end
+
+                if theirRoot.AssemblyLinearVelocity.Magnitude > Fling.FLUNG_SPEED
                     or (theirRoot.Position - startPos).Magnitude > Fling.FLUNG_DISTANCE
                 then
                     landed = true
@@ -2352,16 +2482,15 @@ function Fling.orbit(char, why)
             end
 
             if landed then Fling.flung = Fling.flung + 1 end
+        end)
 
-            -- home again, whatever happened
-            Fling.setVelocity(root, Vector3.zero, Vector3.zero)
-            if LocalPlayer.Character == homeChar and root.Parent then
-                root.CFrame = home
-                local _, hum = Fling.myRoot()
-                if hum then
-                    pcall(function() hum:ChangeState(Enum.HumanoidStateType.GettingUp) end)
-                end
-            end
+        -- teardown runs whatever happened above, including a thrown error, so
+        -- a failure part way through can never strand you mid claim
+        pcall(function()
+            local live = homeChar and homeChar:FindFirstChild("HumanoidRootPart")
+            if live then Fling.setVelocity(live, Vector3.zero, Vector3.zero) end
+            Fling.unprotect(guard, hum)
+            Fling.goHome(home, homeChar)
         end)
 
         Fling.busy = false
@@ -3560,8 +3689,17 @@ do
     local OrbitSection = FlingTab:CreateSection('orbit')
 
     OrbitSection:Dropdown({
+        Title = 'style',
+        Description = 'overlap sits inside them and alternates above and below; orbit circles at arm\'s length and is much weaker',
+        Values = Choice.Fling.Style.order,
+        Default = Choice.Fling.Style.default,
+        Flag = 'mm2_fling_style',
+        Callback = function(value) Fling.Style = Choice.pick(Choice.Fling.Style, value) end,
+    })
+
+    OrbitSection:Dropdown({
         Title = 'orbit radius',
-        Description = 'how wide the circle is. it stays a contact rather than a lunge',
+        Description = 'orbit style only. overlap ignores it and sits inside them instead',
         Values = Choice.Fling.Orbit.order,
         Default = Choice.Fling.Orbit.default,
         Flag = 'mm2_fling_orbit',
