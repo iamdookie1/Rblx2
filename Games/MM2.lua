@@ -616,7 +616,7 @@ Choice.Fling = {
 Choice.Adv = {
     Solver = {
         default = 'Ensemble',
-        order = { 'Ensemble', 'Best single', 'Top two', 'Fixed circle', 'Fixed arc' },
+        order = { 'Ensemble', 'Best single', 'Top two', 'Fixed circle', 'Fixed arc', 'Coverage' },
     },
 
     -- how an ensemble turns four running error scores into four weights
@@ -626,6 +626,29 @@ Choice.Adv = {
     Weighting = {
         default = 'Inverse square',
         order = { 'Equal', 'Inverse error', 'Softmax', 'Inverse square', 'Inverse fourth' },
+    },
+
+    -- Coverage's own knob, unused by anything else. Ensemble narrows in on
+    -- one target the more it watches them; Coverage never watches anyone; it
+    -- widens or narrows this frame's fan by how consistent their recent
+    -- turn-rate readings have actually been (see Adapt.confidence). base and
+    -- floor are turn-rate units (rad/s) at the outermost ray, rays is how
+    -- many rings either side of the centre guess. fitBoost is how much of
+    -- the remaining gap toward full confidence a *confirmed* fitted turn can
+    -- close on top of whatever consistency alone already gives it, scaled by
+    -- that same consistency - a fitted circle already passed fitTurnRate's
+    -- own sanity checks, but that fit is only three points, so it backs up a
+    -- reading that already looked consistent far more than it rescues one
+    -- that did not
+    Spread = {
+        default = 'Balanced',
+        order = { 'Tight', 'Balanced', 'Wide', 'Maximum' },
+        value = {
+            ['Tight']    = { rays = 1, base = 0.9, fitBoost = 0.70, floor = 0.03 },
+            ['Balanced'] = { rays = 2, base = 1.4, fitBoost = 0.60, floor = 0.04 },
+            ['Wide']     = { rays = 2, base = 2.2, fitBoost = 0.50, floor = 0.06 },
+            ['Maximum']  = { rays = 3, base = 3.0, fitBoost = 0.40, floor = 0.08 },
+        },
     },
 
     -- how much of the running signed residual gets subtracted back out
@@ -723,10 +746,27 @@ local Adapt = {
     HeadRange = 60,  -- past this, auto aim part drops the head
     HeadSpeed = 10,  -- and past this speed too
 
+    -- turnRate variance (rad/s squared) over the Fit window at which coverage's
+    -- read of "how consistent has their turning actually been" has decayed to
+    -- 1/e. tuned empirically against synthetic jink/strafe replays, not a
+    -- physical constant - lower makes coverage's fan more trigger-happy about
+    -- widening from ordinary noise, higher makes it trust a shakier reading
+    VarianceScale = 0.05,
+
     Epsilon = 0.05,  -- keeps an inverse-error weight finite at zero error
     MaxPasses = 12,  -- ceiling on the converging lead solve
     Temp = 0.25,     -- softmax temperature, as a share of the best error
     MinHeading = 0.5, -- speed below which there is no heading to resolve bias in
+
+    -- Coverage's fan weights: a Pascal's-triangle row per ray count, normalised
+    -- to sum to 1. Symmetric and centre-heavy by construction, which is the
+    -- whole point - the middle ray (the centre guess) always outweighs any one
+    -- edge ray, but the edges are never zero either
+    FAN_KERNEL = {
+        [1] = { 1 / 4, 2 / 4, 1 / 4 },
+        [2] = { 1 / 16, 4 / 16, 6 / 16, 4 / 16, 1 / 16 },
+        [3] = { 1 / 64, 6 / 64, 15 / 64, 20 / 64, 15 / 64, 6 / 64, 1 / 64 },
+    },
 }
 
 -- the advanced tab. when Enabled, these take over from the normal silent aim
@@ -736,8 +776,10 @@ local Adapt = {
 local Advanced = {
     Enabled = false,
     Perfection = false,
+    Perfection2 = false,
 
     Solver = 'Ensemble',
+    Spread = 'Balanced',
     Weighting = 'Inverse error',
     Bias = 'Normal',
     Converge = 'Tight',
@@ -1082,6 +1124,7 @@ local function chooseModel(entry)
         local solver = Advanced.Solver
         if solver == 'Fixed circle' then return 'Circle' end
         if solver == 'Fixed arc' then return 'Arc' end
+        if solver == 'Coverage' then return 'Coverage' end
         -- Ensemble / Best single / Top two all resolve per shot inside
         -- Adapt.step; the name returned here is only what gets reported
         if not entry or entry.scored < Adapt.Samples then return 'Arc' end
@@ -1198,6 +1241,128 @@ function Adapt.correct(entry, t)
         scaled = scaled.Unit * MAX_LEAD_OFFSET
     end
     return scaled
+end
+
+-- how much to trust the current turn reading, shared by coverage's solve and
+-- its own UI readout so the two can never quietly drift apart.
+--
+-- entry.steady is a frame-to-frame dot product between consecutive velocity
+-- directions, which stays near 1 for basically any continuous movement at
+-- sample rate - Roblox interpolates remote parts, so a target can look silky
+-- smooth frame to frame while still swapping which way it is turning every
+-- few tenths of a second. what actually says whether the current turn is a
+-- good bet going forward is whether *it itself* has held steady over the
+-- recent window fitTurnRate already looks through, so this reads that
+-- directly out of the same history: low variance in the recent turnRate
+-- samples means the reading has been consistent, high variance means it has
+-- been swinging around and should not be trusted far.
+--
+-- a fit only closes part of the remaining gap toward full confidence, and
+-- only in proportion to consistency itself - fitTurnRate is a 3 point
+-- geometric fit (first/middle/last of the window), not a regression, so it
+-- can return a "clean" circle through noisy data just because those three
+-- points happen to land close to one. a fit found on top of an
+-- already-consistent reading is real corroboration; a fit found on top of an
+-- erratic one is more likely coincidence and should not rescue confidence
+-- on its own.
+function Adapt.confidence(entry, spread)
+    local history = entry.history
+    local count = history and #history or 0
+    local consistency = 1
+
+    if count >= 4 then
+        local from = math.max(1, count - Adapt.Fit + 1)
+        local sum, n = 0, 0
+        for i = from, count do
+            sum = sum + history[i].turnRate
+            n = n + 1
+        end
+        local mean = sum / n
+
+        local variance = 0
+        for i = from, count do
+            local d = history[i].turnRate - mean
+            variance = variance + d * d
+        end
+        variance = variance / n
+
+        consistency = math.exp(-variance / Adapt.VarianceScale)
+    end
+
+    local boost = spread.fitBoost * consistency
+    local confidence = entry.fit and (consistency + (1 - consistency) * boost) or consistency
+    return confidence, consistency
+end
+
+-- Perfection v2. Ensemble gets better at one target the longer it watches
+-- them - useful, but it starts every fresh target as a blind guess and needs
+-- Adapt.Samples rounds of backtesting before it trusts anything. This never
+-- watches anyone. It has no score history and no running bias to warm up; it
+-- reasons from exactly what this frame's motion reading says and nothing else,
+-- so it is exactly as good on the first sample as the hundredth.
+--
+-- what it actually does: rather than committing to the one heading the
+-- smoothed turn rate currently implies, it re-solves that same arc integral
+-- - the same maths modelStep already runs for Arc and Circle - at several
+-- headings fanned out either side of it, then blends the results by a fixed
+-- symmetric kernel (Pascal's-triangle weights, so the centre guess always
+-- carries the most weight and the edges the least). The aim point that comes
+-- out is the one that stays closest across that whole spread, not the one
+-- that is exactly right if the centre guess is exactly right and exactly
+-- wrong the moment they turn harder or softer than expected.
+--
+-- how wide the fan opens is the "how accurate is the guess" half of this -
+-- see Adapt.confidence above. a real fit plus a turn reading that has held
+-- consistent over the last several samples (not just this instant)
+-- has real evidence behind it. neither, and the fan stays as wide as the
+-- Spread dropdown allows, because the centre guess is little better than a
+-- shrug.
+function Adapt.coverage(entry, t)
+    local velocity = entry.horizontal
+    if not velocity or t <= 0 then return Vector3.zero end
+
+    local speed = velocity.Magnitude
+    if speed < 0.5 then return Vector3.zero end
+
+    local ceiling = (entry.walkSpeed or 16) * SPEED_CEILING
+    if speed > ceiling then speed = ceiling end
+
+    local forward = velocity.Unit
+    local side = perpOf(forward)
+    local tangential = math.clamp(dotOf(entry.accel or Vector3.zero, forward), -MAX_TANGENTIAL, MAX_TANGENTIAL)
+
+    local fitted = entry.fit
+    local steady = math.clamp(entry.steady or 1, 0, 1)
+    local center = math.clamp(fitted or entry.turnRate or 0, -MAX_TURN_RATE, MAX_TURN_RATE) * steady
+
+    local spread = Choice.valueOf(Choice.Adv.Spread, Advanced.Spread)
+    local confidence = Adapt.confidence(entry, spread)
+    local step = math.max(spread.floor, spread.base * (1 - confidence))
+
+    local kernel = Adapt.FAN_KERNEL[spread.rays]
+    local half = spread.rays
+    local subStep = t / ARC_STEPS
+    local blended = Vector3.zero
+
+    for i = 1, #kernel do
+        local omega = math.clamp(center + (i - 1 - half) * step, -MAX_TURN_RATE, MAX_TURN_RATE)
+        local rayDisp = Vector3.zero
+
+        for s = 1, ARC_STEPS do
+            local mid = (s - 0.5) * subStep
+            -- same rule modelStep uses: a fitted circle is trusted to hold for
+            -- the whole lead, a raw turn rate is only trusted near-term and
+            -- fades toward straight across the tail of it
+            local heading = fitted and (omega * mid)
+                or (omega * TURN_DECAY * (1 - math.exp(-mid / TURN_DECAY)))
+            local moving = math.clamp(speed + tangential * mid, 0, ceiling)
+            rayDisp = rayDisp + (forward * math.cos(heading) + side * math.sin(heading)) * (moving * subStep)
+        end
+
+        blended = blended + rayDisp * kernel[i]
+    end
+
+    return blended
 end
 
 local motion = {}
@@ -1384,9 +1549,12 @@ local function predictRoot(entry, base, sinceSample, travelTime, mode)
     end
 
     -- advanced blends the models and then corrects the blend's own running
-    -- bias; the normal path is the single picked model, unchanged
+    -- bias; coverage skips both, since it has no history to blend by score or
+    -- to correct a bias from; the normal path is the single picked model
     local horizontal
-    if Advanced.Enabled and entry.scored >= Adapt.Samples
+    if Advanced.Enabled and Advanced.Solver == 'Coverage' then
+        horizontal = Adapt.coverage(entry, travelTime)
+    elseif Advanced.Enabled and entry.scored >= Adapt.Samples
         and Advanced.Solver ~= 'Fixed circle' and Advanced.Solver ~= 'Fixed arc'
     then
         horizontal = Adapt.step(entry, travelTime) + Adapt.correct(entry, travelTime)
@@ -3465,6 +3633,30 @@ do
         Content = 'three things the normal tab never does. it blends all four solvers weighted by how wrong each has been instead of picking one and throwing the other three away, so where they disagree the errors partly cancel. it tracks the signed miss of that blend - the direction it is wrong in, not just the amount - and subtracts it back out, which is the only thing here that fixes a lead that is consistently short or consistently long. and it re-solves the lead against its own answer until the point stops moving rather than stopping after a fixed number of passes, so the distance the travel time is worked out from is the distance the shot really covers',
     })
 
+    OverrideSection:Toggle({
+        Title = 'perfection v2',
+        Description = 'a second preset, and a different idea entirely - nothing here is learned, so there is no warm-up on a fresh target',
+        Flag = 'mm2_adv_perfection2',
+        Default = false,
+        Callback = function(state)
+            Advanced.Perfection2 = state
+            if not state then return end
+            for key, value in pairs({
+                Solver = 'Coverage',
+                Spread = 'Wide',
+                Converge = 'Exhaustive',
+            }) do
+                local element = Advanced.ui[key]
+                if element then pcall(function() element:Set(value) end) end
+            end
+        end,
+    })
+
+    OverrideSection:Paragraph({
+        Title = 'what perfection v2 actually does',
+        Content = 'perfection watches a target for a moment and learns which solver has been right about them. v2 never watches anyone - it has no score history and no running bias, so it is exactly as good on the first shot at someone as the hundredth. instead it takes the same turn the arc and circle solvers already ride and re-solves it several times at headings fanned out either side of that guess, then blends the results by a fixed centre-heavy weighting rather than committing to the one path. how wide that fan opens is set by the spread dropdown below, but it never opens wider than it has to: it reads how much their turn rate has actually varied over the last several samples, not just whether this one instant looks smooth, so a target holding one turn narrows it and a target whose turning keeps swinging around widens it. a fitted circle through their real recent path backs that up further, but only as much as the recent samples already earned - a clean fit on top of an erratic reading does not get to fake confidence that is not there',
+    })
+
     local SolverSection = AdvancedTab:CreateSection('solver')
 
     Advanced.ui.Solver = SolverSection:Dropdown({
@@ -3478,16 +3670,25 @@ do
 
     Advanced.ui.Weighting = SolverSection:Dropdown({
         Title = 'weighting',
-        Description = 'how a running error score becomes a share of the blend',
+        Description = 'how a running error score becomes a share of the blend. ensemble family only, coverage ignores this',
         Values = Choice.Adv.Weighting.order,
         Default = Choice.Adv.Weighting.default,
         Flag = 'mm2_adv_weighting',
         Callback = function(value) Advanced.Weighting = Choice.pick(Choice.Adv.Weighting, value) end,
     })
 
+    Advanced.ui.Spread = SolverSection:Dropdown({
+        Title = 'coverage spread',
+        Description = 'how wide the fan opens when their recent turning has not been consistent. coverage solver only',
+        Values = Choice.Adv.Spread.order,
+        Default = Choice.Adv.Spread.default,
+        Flag = 'mm2_adv_spread',
+        Callback = function(value) Advanced.Spread = Choice.pick(Choice.Adv.Spread, value) end,
+    })
+
     Advanced.ui.Bias = SolverSection:Dropdown({
         Title = 'bias correction',
-        Description = 'how much of the running signed miss gets subtracted back out',
+        Description = 'how much of the running signed miss gets subtracted back out. ensemble family only, coverage ignores this',
         Values = Choice.Adv.Bias.order,
         Default = Choice.Adv.Bias.default,
         Flag = 'mm2_adv_bias',
@@ -4301,6 +4502,26 @@ task.spawn(function()
                 Advanced.ui.state.Set('off')
                 Advanced.ui.weights.Set('-')
                 Advanced.ui.biasStat.Set('-')
+            elseif Advanced.Solver == 'Coverage' then
+                Advanced.ui.state.Set(Advanced.Perfection2 and 'perfection v2' or 'coverage',
+                    Color3.fromRGB(126, 217, 87))
+
+                -- nothing here is a running score, so there is no warm-up to
+                -- report - this is a live read of the fan this instant, not
+                -- an average building up over time
+                local entry = gunPlan and gunPlan.entry or knifePlan and knifePlan.entry
+                if not entry or not entry.horizontal or entry.horizontal.Magnitude < 0.5 then
+                    Advanced.ui.weights.Set('no moving target')
+                else
+                    local spread = Choice.valueOf(Choice.Adv.Spread, Advanced.Spread)
+                    local confidence, consistency = Adapt.confidence(entry, spread)
+                    local halfRate = math.max(spread.floor, spread.base * (1 - confidence)) * spread.rays
+                    Advanced.ui.weights.Set(('fit %s  consistent %d%%  fan +-%d deg/s'):format(
+                        entry.fit and 'yes' or 'no',
+                        math.floor(consistency * 100 + 0.5),
+                        math.floor(math.deg(halfRate) + 0.5)))
+                end
+                Advanced.ui.biasStat.Set('n/a (model-free)')
             else
                 Advanced.ui.state.Set(Advanced.Perfection and 'perfection' or 'on',
                     Color3.fromRGB(126, 217, 87))
