@@ -45,8 +45,31 @@ print(SEP)
 
 local hasDecompile = typeof(decompile) == "function"
 local hasBytecode = typeof(getscriptbytecode) == "function"
-print(("decompile()          %s"):format(hasDecompile and "present" or "MISSING"))
-print(("getscriptbytecode()  %s"):format(hasBytecode and "present" or "missing"))
+local hasFunctionBytecode = typeof(getfunctionbytecode) == "function"
+local hasDumpBytecode = typeof(dumpbytecode) == "function"
+print(("decompile()            %s"):format(hasDecompile and "present" or "MISSING"))
+print(("getscriptbytecode()    %s"):format(hasBytecode and "present" or "missing"))
+print(("getfunctionbytecode()  %s"):format(hasFunctionBytecode and "present" or "missing"))
+print(("dumpbytecode()         %s"):format(hasDumpBytecode and "present" or "missing"))
+
+-- getfunctionbytecode/dumpbytecode work on a raw closure rather than a script
+-- instance, so this needs no game dependency at all - it exercises the same
+-- bytecode-capture layer against code with nothing to protect, defined right
+-- here in this running script
+if hasFunctionBytecode or hasDumpBytecode then
+    local function canaryClosure(a, b) return a + b end
+    print("")
+    if hasFunctionBytecode then
+        local ok, bc = pcall(getfunctionbytecode, canaryClosure)
+        print(("getfunctionbytecode on a local closure: %s"):format(
+            (ok and typeof(bc) == "string") and (#bc .. " bytes") or ("failed (" .. tostring(bc) .. ")")))
+    end
+    if hasDumpBytecode then
+        local ok, bc = pcall(dumpbytecode, canaryClosure)
+        print(("dumpbytecode on a local closure: %s"):format(
+            (ok and typeof(bc) == "string") and (#bc .. " bytes") or ("failed (" .. tostring(bc) .. ")")))
+    end
+end
 
 if not hasDecompile then
     print("\nVERDICT: decompile() doesn't exist on this executor at all - that's the")
@@ -105,6 +128,19 @@ local function check(name, fn)
     return ok and value ~= nil
 end
 
+-- for a check that has to look in more than one namespace (crypt.base64encode
+-- vs a bare base64_encode): trying the first option can itself error if that
+-- whole namespace table doesn't exist, which would otherwise hide a fallback
+-- in a namespace that does. Each option gets its own pcall so one missing
+-- table can't mask another.
+local function anyOf(...)
+    for _, thunk in ipairs({ ... }) do
+        local ok, value = pcall(thunk)
+        if ok and value ~= nil then return value end
+    end
+    return nil
+end
+
 local Categories = {
     {
         "Cache", {
@@ -140,8 +176,22 @@ local Categories = {
     },
     {
         "Crypt", {
-            { "crypt.base64encode", function() return crypt.base64encode or crypt.base64.encode end },
-            { "crypt.base64decode", function() return crypt.base64decode or crypt.base64.decode end },
+            { "base64 encode (crypt.base64encode/base64_encode)", function()
+                return anyOf(
+                    function() return crypt.base64encode end,
+                    function() return crypt.base64.encode end,
+                    function() return base64_encode end,
+                    function() return base64.encode end
+                )
+            end },
+            { "base64 decode (crypt.base64decode/base64_decode)", function()
+                return anyOf(
+                    function() return crypt.base64decode end,
+                    function() return crypt.base64.decode end,
+                    function() return base64_decode end,
+                    function() return base64.decode end
+                )
+            end },
             { "crypt.encrypt", function() return crypt.encrypt end },
             { "crypt.decrypt", function() return crypt.decrypt end },
             { "crypt.generatebytes", function() return crypt.generatebytes end },
@@ -206,8 +256,10 @@ local Categories = {
             { "gethui", function() return gethui end },
             { "getinstances", function() return getinstances end },
             { "getnilinstances", function() return getnilinstances end },
+            { "getproperty", function() return getproperty end },
             { "isscriptable", function() return isscriptable end },
             { "sethiddenproperty", function() return sethiddenproperty end },
+            { "setproperty", function() return setproperty end },
             { "setscriptable", function() return setscriptable end },
         },
     },
@@ -229,6 +281,8 @@ local Categories = {
             { "gethwid/get_hwid", function() return gethwid or get_hwid end },
             { "lz4compress", function() return lz4compress end },
             { "lz4decompress", function() return lz4decompress end },
+            { "zstdcompress", function() return zstdcompress end },
+            { "zstddecompress", function() return zstddecompress end },
             { "messagebox", function() return messagebox end },
             { "queue_on_teleport", function() return queue_on_teleport end },
             { "request/http_request", function() return request or http_request end },
@@ -239,6 +293,8 @@ local Categories = {
     {
         "Scripts", {
             { "decompile", function() return decompile end },
+            { "dumpbytecode", function() return dumpbytecode end },
+            { "getfunctionbytecode", function() return getfunctionbytecode end },
             { "getgc", function() return getgc end },
             { "getgenv", function() return getgenv end },
             { "getloadedmodules", function() return getloadedmodules end },
@@ -249,6 +305,7 @@ local Categories = {
             { "getscripthash", function() return getscripthash end },
             { "getscripts", function() return getscripts end },
             { "getsenv", function() return getsenv end },
+            { "gettenv", function() return gettenv end },
         },
     },
     {
