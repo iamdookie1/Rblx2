@@ -38,6 +38,8 @@ local Games = {
     -- the machine this was added on (roblox.com is unreachable there), so the
     -- name is taken from the script's own header and may want correcting.
     [281489669] = { Name = 'Wand', Script = 'Games/Wand.lua' },
+    -- The in-game place of 100 Days on Chunk!, from two of its own dumps.
+    [84159479861691] = { Name = '100 Days on Chunk!', Script = 'Games/Chunk.lua' },
 }
 
 -- Loads Onyx straight from its own repo rather than a vendored copy, since
