@@ -802,7 +802,15 @@ Debug = {
 }
 
 local Adapt = {
-    Models = { 'Circle', 'Arc', 'Projected', 'Linear' },
+    -- velocity rides the speed the game itself replicates for them, which
+    -- turns the instant they do; center is the middle of where they have been
+    -- lately, which is where someone spamming left and right keeps coming back
+    -- to. the backtest scores them like the rest, so each only earns weight
+    -- on the people it actually predicts
+    Models = { 'Circle', 'Arc', 'Projected', 'Linear', 'Velocity', 'Center' },
+    CenterWindow = 0.6, -- seconds of their path the center is taken over
+    PeakFade = 0.93,    -- share of the worst recent miss kept each scoring round
+    ChangeWindow = 4,   -- seconds of starts, stops and turns counted toward how often they change
     MinAge = 0.1,    -- youngest snapshot worth replaying against
     MaxAge = 0.5,    -- older than this and the replay says nothing useful
     Target = 0.2,    -- and the age it aims for, near a real shot's lead
@@ -872,12 +880,25 @@ Trigger = {
     GunTargets = Choice.Trigger.GunTargets.default,
     ThrowRange = Choice.Trigger.ThrowRange.default,
 
+    -- sure shots only: fire only once the shot would land within this many
+    -- studs of the body (or the head) with at least these odds of them not
+    -- changing what they are doing before it does
+    Sure = false,
+    SureBody = 1,
+    SureHead = 0.5,
+    SureOdds = 0.9,
+
     -- how long a target may drop out of sight before it counts as lost, and
     -- how long a gun activation has to show up at the hook as a real shot
     Grace = 0.15,
     Confirm = 0.35,
     Retry = 0.25,
     Misfires = 3,
+
+    -- the trigger bot's own plans, and the plan each of its shots was fired
+    -- on, which the hook puts that shot on
+    plans = {},
+    claims = {},
 
     gun = { held = false, readyAt = 0, target = nil, seenAt = 0, lastSeen = 0, nextAt = 0, shotAt = 0, status = 'off' },
     knife = { held = false, readyAt = 0, target = nil, seenAt = 0, lastSeen = 0, nextAt = 0, shotAt = 0, status = 'off' },
@@ -1096,6 +1117,22 @@ end
 local function modelStep(mode, state, t)
     if t <= 0 or mode == 'Off' then return Vector3.zero end
 
+    -- back to the middle of where they have been lately, however long the lead
+    if mode == 'Center' then
+        return state.center or Vector3.zero
+    end
+
+    -- straight on at the velocity the game replicates for them, which has no
+    -- smoothing lag behind a turn the way the measured one does
+    if mode == 'Velocity' then
+        local reported = state.netVel
+        if not reported then return Vector3.zero end
+        local speed = reported.Magnitude
+        if speed < 0.5 then return Vector3.zero end
+        local ceiling = (state.walkSpeed or 16) * SPEED_CEILING
+        return reported.Unit * (math.min(speed, ceiling) * t)
+    end
+
     local velocity = state.horizontal
     if not velocity then return Vector3.zero end
 
@@ -1190,6 +1227,10 @@ local function backtest(entry, actual, now)
 
     entry.scored = entry.scored + 1
 
+    -- and how far off the solver a real shot uses has been, which is what the
+    -- trigger bot's sure shots are measured against
+    if Adapt.scoreSolve then Adapt.scoreSolve(entry, snap, dt, actual, blend) end
+
     -- Replay whatever the solver would actually have sent for this snapshot and
     -- keep the signed miss, so the correction is measured against the real
     -- answer rather than against whichever single model happened to win.
@@ -1253,6 +1294,30 @@ local function chooseModel(entry)
     if mode ~= 'Adaptive' then return mode end
     if not entry or entry.scored < Adapt.Samples then return 'Arc' end
     return entry.best or 'Arc'
+end
+
+-- Replays the solver a real shot would use from the backtest's snapshot and
+-- keeps its running miss: the blend when advanced mode blends, otherwise the
+-- one model picked. That miss, scaled to a shot's lead, is how sure a shot is.
+function Adapt.scoreSolve(entry, snap, dt, actual, blend)
+    local step
+    if Advanced.Enabled and entry.scored >= Adapt.Samples
+        and Advanced.Solver ~= 'Fixed circle' and Advanced.Solver ~= 'Fixed arc'
+    then
+        local ok, blended = pcall(Adapt.step, entry, dt, snap)
+        step = ok and blended or nil
+    else
+        step = modelStep(chooseModel(entry), snap, dt)
+    end
+    if typeof(step) ~= "Vector3" then return end
+    local missed = flatDistance(snap.p + step, actual)
+    entry.solveError = entry.solveError and (entry.solveError + (missed - entry.solveError) * blend) or missed
+    -- the worst recent miss, fading, since a shot that has to land cannot go
+    -- by the average: someone spamming left and right is dead on half the
+    -- time and nowhere near the rest
+    entry.solvePeak = math.max(missed, (entry.solvePeak or missed) * Adapt.PeakFade)
+    entry.solveSpan = dt
+    entry.solveRounds = (entry.solveRounds or 0) + 1
 end
 
 -- The blend's weights, one per model, written into out. The solve and the
@@ -1450,6 +1515,8 @@ local function sampleMotion(plr, root, now)
             jumpFromY = position.Y,
             jumpLaunchV = nil,
             jumpElapsed = 0,
+            changes = {},
+            firstSeen = now,
         }
         motion[name] = entry
         return entry
@@ -1481,6 +1548,10 @@ local function sampleMotion(plr, root, now)
             entry.steady = entry.steady + (1 - entry.steady) * 0.1
         end
 
+        -- the velocity the game replicates for them, flat
+        local okVelocity, reported = pcall(function() return root.AssemblyLinearVelocity end)
+        entry.netVel = okVelocity and typeof(reported) == "Vector3" and Vector3.new(reported.X, 0, reported.Z) or nil
+
         local snapshot = {
             p = position,
             t = now,
@@ -1489,11 +1560,40 @@ local function sampleMotion(plr, root, now)
             turnRate = entry.turnRate,
             steady = entry.steady,
             walkSpeed = entry.walkSpeed,
+            netVel = entry.netVel,
         }
         table.insert(entry.history, snapshot)
         local depthLimit, depthWindow = Adapt.depth()
         while #entry.history > depthLimit or (entry.history[1] and now - entry.history[1].t > depthWindow) do
             table.remove(entry.history, 1)
+        end
+
+        -- the middle of where they have been over the center window, from here
+        local sumX, sumZ, counted = 0, 0, 0
+        for index = #entry.history, 1, -1 do
+            local past = entry.history[index]
+            if now - past.t > Adapt.CenterWindow then break end
+            sumX, sumZ, counted = sumX + past.p.X, sumZ + past.p.Z, counted + 1
+        end
+        entry.center = Vector3.new(sumX / counted - position.X, 0, sumZ / counted - position.Z)
+        snapshot.center = entry.center
+
+        -- every start, stop and sharp turn, so the trigger bot knows how often
+        -- this one changes what they are doing
+        if now - (entry.changeCheck or 0) >= 0.1 then
+            local moving = (entry.netVel and entry.netVel.Magnitude > 0.5) and entry.netVel or entry.horizontal
+            local was = entry.lastMoving or moving
+            local changed = (was.Magnitude > 4) ~= (moving.Magnitude > 4)
+                or (moving.Magnitude > 4 and was.Magnitude > 4 and was.Unit:Dot(moving.Unit) < 0.82)
+            local last = entry.changes[#entry.changes]
+            if changed and (not last or now - last > 0.15) then
+                entry.changes[#entry.changes + 1] = now
+            end
+            entry.lastMoving = moving
+            entry.changeCheck = now
+        end
+        while entry.changes[1] and now - entry.changes[1] > Adapt.ChangeWindow do
+            table.remove(entry.changes, 1)
         end
 
         -- fitted once per sample rather than once per solve pass, so every lead
@@ -1509,6 +1609,10 @@ local function sampleMotion(plr, root, now)
         entry.vertical = 0
         entry.steady = 1
         entry.fit = nil
+        entry.center = nil
+        entry.netVel = nil
+        entry.solveError = nil
+        entry.solveRounds = 0
         table.clear(entry.history)
     end
 
@@ -1556,6 +1660,34 @@ end
 
 local function isSpamJumper(entry)
     return #entry.jumps >= JUMP_SPAM_COUNT
+end
+
+-- How far from them a shot solved now could land, in studs, and the odds
+-- they keep doing what they are doing until it lands. Someone standing still
+-- lands wherever they stand; anyone moving is the worst recent miss of the
+-- solver the shot uses, scaled from the lead it was measured over to this
+-- shot's, plus the guesswork of someone in the air and of updates that arrive
+-- for them in steps. The odds come from how often they have started, stopped
+-- or turned lately (counted generously while there is little to go on).
+-- Nothing learned yet is no answer.
+function Adapt.spread(entry, travel)
+    if not entry then return math.huge, 0 end
+    travel = math.max(travel or 0, 0)
+    local seen = math.min(Adapt.ChangeWindow, (entry.time or 0) - (entry.firstSeen or entry.time or 0))
+    local rate = (#(entry.changes or {}) + 1) / (seen + 1)
+    local odds = math.exp(-rate * travel)
+
+    local speed = entry.horizontal.Magnitude
+    local miss
+    if speed < 0.5 and (entry.center == nil or entry.center.Magnitude < 0.3) then
+        miss = 0.1
+    elseif (entry.solveRounds or 0) < Adapt.Samples or not entry.solvePeak then
+        return math.huge, odds
+    else
+        miss = entry.solvePeak * (travel / math.max(entry.solveSpan or Adapt.Target, 0.05))
+    end
+    if entry.airborne or isSpamJumper(entry) then miss = miss + 1.5 end
+    return miss + speed * math.max(0, (entry.repLag or 0) - cachedFrame), odds
 end
 
 local function predictRoot(entry, base, sinceSample, travelTime, mode)
@@ -1886,13 +2018,15 @@ local function priorityScore(candidate, char)
     return (heldWeapon(char) ~= nil and 0 or 1e6) + candidate.screenDist
 end
 
-local function scanTargets(isKnife)
+-- allow, when given, replaces the silent aim tab's own target filter: the
+-- trigger bot hunts with its own
+local function scanTargets(isKnife, allow)
     local origin = Camera.CFrame.Position
     local anchor = screenAnchor()
 
     local candidates = {}
     for _, plr in ipairs(Players:GetPlayers()) do
-        if plr ~= LocalPlayer and isAlivePlr(plr) and allowedTarget(plr, isKnife) then
+        if plr ~= LocalPlayer and isAlivePlr(plr) and (allow or allowedTarget)(plr, isKnife) then
             local char = plr.Character
             local parts = char and aimPartsFor(char, motion[plr.Name])
             if parts and #parts > 0 then
@@ -2062,8 +2196,10 @@ local function resolveRedirect(plan, originCFrame, sentCFrame)
     end
 
     -- the auto lead arm is chosen here, per real shot, and only a shot that
-    -- actually got solved and sent is logged for it
+    -- actually got solved and sent is logged for it. a sure shot from the
+    -- trigger bot is not the place to try a longer or shorter lead
     plan.arm = pickArm(plan.state)
+    if plan.sure and plan.arm then plan.arm = 2 end
 
     local aim, predictedRoot, travel, model
     local ok, solved, _, solvedTravel, solvedDistance, solvedRoot, solvedModel = pcall(solveAim, plan, origin, now)
@@ -2084,10 +2220,13 @@ local function resolveRedirect(plan, originCFrame, sentCFrame)
     return CFrame.new(aim)
 end
 
-local function buildPlan(isKnife, origin, now)
+-- ahead, for the trigger bot at 0 ms, also takes someone still behind cover
+-- whose solved point - where the lead says the shot will find them - is out
+-- in the open, and marks the plan so
+local function buildPlan(isKnife, origin, now, allow, ahead)
     if not origin then return nil end
 
-    local candidates = scanTargets(isKnife)
+    local candidates = scanTargets(isKnife, allow)
     if #candidates == 0 then return nil end
 
     for rank, candidate in ipairs(candidates) do
@@ -2116,14 +2255,24 @@ local function buildPlan(isKnife, origin, now)
             for _, part in ipairs(candidate.parts) do
                 plan.part = part
 
-                if clearPath(origin, part.Position, char) then
-                    local aim, _, _, _, _, model = solveAim(plan, origin, now)
+                local open = clearPath(origin, part.Position, char)
+                if open or ahead then
+                    local aim, _, travel, _, _, model = solveAim(plan, origin, now)
 
                     -- strict also demands the solved point be reachable, loose
-                    -- only asks that the target is not behind a wall right now
-                    if Aim.WallCheck ~= 'Strict' or clearPath(origin, aim, char) then
+                    -- only asks that the target is not behind a wall right now.
+                    -- a plan made ahead needs its solved point properly clear
+                    local usable
+                    if open then
+                        usable = Aim.WallCheck ~= 'Strict' or clearPath(origin, aim, char)
+                    else
+                        usable = Trigger.clear(origin, aim, char)
+                    end
+                    if usable then
                         plan.fallback = CFrame.new(aim)
                         plan.model = model
+                        plan.travel = travel
+                        plan.ahead = not open
                         return plan
                     end
                 end
@@ -2251,8 +2400,13 @@ end
 -- weapon comes out, then again from the moment a target is first seen after
 -- that - so drawing on someone already standing in front of you takes two
 -- reactions, the way it would for anyone. It only ever uses a weapon already
--- in your hands; nothing here equips anything. Targets come from the same plan
--- silent aim builds, so it fires at exactly who silent aim would redirect onto.
+-- in your hands; nothing here equips anything.
+--
+-- It and silent aim work off one solve. The trigger bot builds its plans with
+-- the same solver, only hunting with its own target filter, and every shot it
+-- fires carries the plan it was fired on to the hook, which puts that shot on
+-- that plan - so the shot lands where the trigger bot decided to fire, on the
+-- person it decided to fire at, even with silent aim itself switched off.
 
 function Trigger.delay()
     local base = math.max(0, tonumber(Trigger.Reaction) or 0) / 1000
@@ -2274,11 +2428,11 @@ function Trigger.gunMethod()
 end
 
 -- whether a shot goes where the solve says rather than wherever the mouse
--- happens to be: a throw is always sent at the solved point, and the gun is
--- when silent aim is redirecting it or it goes straight out by remote
+-- happens to be: a throw is always sent at the solved point, and so is any
+-- gun shot the hook can put on its plan, or one sent straight by remote
 function Trigger.aimed(which)
     if which == 'Knife' then return true end
-    return (Aim.Enabled and Trigger.hooked) or Trigger.gunMethod() == 'Remote'
+    return Trigger.hooked or Trigger.gunMethod() == 'Remote'
 end
 
 -- a clear line from the weapon whatever the silent aim wall check is set to:
@@ -2287,6 +2441,48 @@ function Trigger.clear(origin, point, char)
     local direction = point - origin
     local result = weaponCast(origin, direction, { char })
     return not result or (result.Position - origin).Magnitude >= direction.Magnitude - 2
+end
+
+-- 0 ms is past instant: the trigger bot then fires on the prediction itself,
+-- including at someone still stepping out from behind cover
+function Trigger.ahead()
+    return (tonumber(Trigger.Reaction) or 0) <= 0
+end
+
+-- The trigger bot's own plans, from the same solver silent aim uses. The gun
+-- set to murderer only hunts the murderer whoever silent aim is locked on to,
+-- so an innocent by your crosshair never hides the murderer from it.
+function Trigger.buildPlans(now, char)
+    local plans = Trigger.plans
+    plans.Gun, plans.Knife = nil, nil
+    local ahead = Trigger.ahead()
+    if Trigger.Gun and char and char:FindFirstChild("Gun") then
+        local murdererOnly = Choice.pick(Choice.Trigger.GunTargets, Trigger.GunTargets) == 'Murderer only'
+        if not murdererOnly and not ahead then
+            plans.Gun = gunPlan
+        else
+            plans.Gun = buildPlan(false, findGunOrigin(), now, murdererOnly and isMurderer or nil, ahead)
+        end
+    end
+    if Trigger.Throw and char and char:FindFirstChild("Knife") then
+        plans.Knife = ahead and buildPlan(true, findKnifeOrigin(), now, nil, true) or knifePlan
+    end
+end
+
+-- a shot the trigger bot is about to fire, and the plan it is for
+function Trigger.claim(which, plan, now)
+    plan.claimedUntil = now + Trigger.Confirm
+    Trigger.claims[which] = plan
+end
+
+-- the plan the shot leaving right now was fired on, if the trigger bot fired
+-- it; used once, so a shot of your own afterwards goes back to silent aim
+function Trigger.claimed(which)
+    local plan = Trigger.claims[which]
+    if not plan then return nil end
+    Trigger.claims[which] = nil
+    if os.clock() > (plan.claimedUntil or 0) then return nil end
+    return plan
 end
 
 function Trigger.sees(which, plan, origin, now)
@@ -2304,15 +2500,18 @@ function Trigger.sees(which, plan, origin, now)
         if (plan.part.Position - origin).Magnitude > reach then return false end
     end
 
-    -- them, and the point the shot will actually be sent at, both in the open
-    if not Trigger.clear(origin, plan.part.Position, plan.char) then return false end
+    -- them, and the point the shot will actually be sent at, both in the
+    -- open. a plan made ahead only needs the point: they are still stepping
+    -- out, and the shot is for where they will be
+    if not plan.ahead and not Trigger.clear(origin, plan.part.Position, plan.char) then return false end
     if not Trigger.clear(origin, plan.fallback.Position, plan.char) then return false end
 
-    -- a gun fired through its own script with nothing redirecting it goes
-    -- where you point, so then only a target under the mouse counts
+    -- a gun fired through its own script with nothing to put it on its plan
+    -- goes where you point, so then only a target under the mouse counts
     local mode = Choice.pick(Choice.Trigger.Sees, Trigger.Sees)
     if not Trigger.aimed(which) then mode = 'On crosshair' end
     if mode == 'Visible' then return true end
+    if plan.ahead then return false end
 
     local mouse = UserInputService:GetMouseLocation()
     if mode == 'Near crosshair' then
@@ -2326,8 +2525,22 @@ function Trigger.sees(which, plan, origin, now)
     return hit ~= nil and hit.Instance ~= nil and hit.Instance:IsDescendantOf(plan.char)
 end
 
+-- Sure shots only: whether the shot would land now, and if not, what it is
+-- waiting on. Returns true, or false and the reason.
+function Trigger.sure(plan)
+    local spread, odds = Adapt.spread(plan.entry, plan.travel)
+    local limit = plan.part and plan.part.Name == "Head" and Trigger.SureHead or Trigger.SureBody
+    if plan.ahead then return false, 'waiting to see them for a sure shot' end
+    if spread == math.huge then return false, 'learning how ' .. plan.char.Name .. ' moves' end
+    if spread > limit or odds < Trigger.SureOdds then
+        return false, ('waiting for a sure shot (%.1f st, %d%%)'):format(spread, math.floor(odds * 100 + 0.5))
+    end
+    return true
+end
+
 function Trigger.fireGun(tool, plan, now)
     Trigger.forceUntil = now + Trigger.Confirm
+    Trigger.claim('Gun', plan, now)
     if Trigger.gunMethod() == 'Remote' then
         local shoot = tool:FindFirstChild("Shoot")
         local char = LocalPlayer.Character
@@ -2345,6 +2558,7 @@ function Trigger.throwKnife(tool, plan, now)
     local handle = tool:FindFirstChild("Handle")
     if not thrown or not handle then return false end
     Trigger.forceUntil = now + Trigger.Confirm
+    Trigger.claim('Knife', plan, now)
     return (pcall(function() thrown:FireServer(handle.CFrame, plan.fallback) end))
 end
 
@@ -2400,12 +2614,8 @@ function Trigger.run(which, s, now)
         return
     end
 
-    local plan, origin
-    if which == 'Gun' then
-        plan, origin = gunPlan, findGunOrigin()
-    else
-        plan, origin = knifePlan, findKnifeOrigin()
-    end
+    local plan = Trigger.plans[which]
+    local origin = which == 'Gun' and findGunOrigin() or findKnifeOrigin()
 
     if not origin or not Trigger.sees(which, plan, origin, now) then
         -- a split second out of sight is not losing them
@@ -2430,7 +2640,19 @@ function Trigger.run(which, s, now)
         return
     end
 
-    s.status = 'firing at ' .. plan.char.Name
+    -- the shot waits for the moment it cannot miss, and goes out on the
+    -- learned centre of the lead rather than one of its trial lengths
+    plan.sure = false
+    if Trigger.Sure then
+        local ok, reason = Trigger.sure(plan)
+        if not ok then
+            s.status = reason
+            return
+        end
+        plan.sure = true
+    end
+
+    s.status = (plan.ahead and 'firing ahead at ' or plan.sure and 'sure shot at ' or 'firing at ') .. plan.char.Name
     if which == 'Gun' then
         if not Trigger.fireGun(tool, plan, now) then
             s.nextAt = now + Trigger.Retry
@@ -2452,6 +2674,7 @@ end
 
 function Trigger.step(now)
     Trigger.confirm(now)
+    Trigger.buildPlans(now, LocalPlayer.Character)
     Trigger.run('Gun', Trigger.gun, now)
     Trigger.run('Knife', Trigger.knife, now)
 end
@@ -2506,8 +2729,9 @@ if hasNamecallHook then
     local originalNamecall
     local trigger = Trigger
 
-    -- silent aim redirects here; the trigger bot only needs to know a shot
-    -- really left, which is what confirms one it asked the gun to fire
+    -- silent aim redirects here, and so does every shot the trigger bot
+    -- fires: that one goes on the plan it was fired on, silent aim on or off.
+    -- seeing a shot leave is also what confirms one it asked the gun to fire
     local function onNamecall(self, ...)
         if Unloading or not (Aim.Enabled or trigger.Gun or trigger.Throw)
             or typeof(self) ~= "Instance" or getnamecallmethod() ~= "FireServer"
@@ -2520,8 +2744,9 @@ if hasNamecallHook then
             if parent and parent.ClassName == "Tool" and parent.Name == "Gun" then
                 trigger.sawGun = os.clock()
                 local origin, sent = ...
-                if Aim.Enabled and typeof(origin) == "CFrame" then
-                    local redirect = resolveRedirect(gunPlan, origin, sent)
+                local claimed = trigger.claimed('Gun')
+                if (Aim.Enabled or claimed) and typeof(origin) == "CFrame" then
+                    local redirect = resolveRedirect(claimed or gunPlan, origin, sent)
                     if redirect then
                         local fire = self.FireServer
                         if typeof(fire) == "function" then
@@ -2538,8 +2763,9 @@ if hasNamecallHook then
             if events and events.Name == "Events" and tool and tool.ClassName == "Tool" and tool.Name == "Knife" then
                 trigger.sawKnife = os.clock()
                 local handle, sent = ...
-                if Aim.Enabled and typeof(handle) == "CFrame" then
-                    local redirect = resolveRedirect(knifePlan, handle, sent)
+                local claimed = trigger.claimed('Knife')
+                if (Aim.Enabled or claimed) and typeof(handle) == "CFrame" then
+                    local redirect = resolveRedirect(claimed or knifePlan, handle, sent)
                     if redirect then
                         local fire = self.FireServer
                         if typeof(fire) == "function" then
@@ -3921,7 +4147,7 @@ do
 
     OverrideSection:Paragraph({
         Title = 'what perfection actually does',
-        Content = 'two halves: how far ahead, and where. how far ahead is the lead time, built from what the shot really has to cover - your whole round trip read from the game network stats, the replication buffer other players are drawn behind by, a frame of your own and, for the knife, its measured flight time - with the auto lead only fine tuning that from shots that really landed. the old version counted about half your ping and nothing for the buffer, and its auto multiplier was scoring every frame a target sat on screen as a missed shot and sweeping itself between 0.4x and 4x, so it spent half its time leading far too little. where is the path: all four solvers blended by how wrong each has been, the blend own signed miss subtracted back out, and the lead re-solved until the point stops moving. the lead line in the readout shows every part of the lead the last solve used',
+        Content = 'two halves: how far ahead, and where. how far ahead is the lead time, built from what the shot really has to cover - your whole round trip read from the game network stats, the replication buffer other players are drawn behind by, a frame of your own and, for the knife, its measured flight time - with the auto lead only fine tuning that from shots that really landed. the old version counted about half your ping and nothing for the buffer, and its auto multiplier was scoring every frame a target sat on screen as a missed shot and sweeping itself between 0.4x and 4x, so it spent half its time leading far too little. where is the path: all six solvers blended by how wrong each has been, the blend own signed miss subtracted back out, and the lead re-solved until the point stops moving. two of the six read what the other four could not: velocity rides the speed the game itself replicates for each player, which turns the instant they do instead of lagging a smoothed estimate, and center aims at the middle of where they have been lately, which is where someone spamming left and right keeps coming back to. each only gets weight on the people it actually predicts. the lead line in the readout shows every part of the lead the last solve used',
     })
 
     local SolverSection = AdvancedTab:CreateSection('solver')
@@ -4124,7 +4350,7 @@ do
 
     section:Slider({
         Title = 'reaction time',
-        Description = 'waited once after the weapon comes out, and again once a target is first seen after that',
+        Description = 'waited once after the weapon comes out, and again once a target is first seen after that. 0 goes past instant: it fires on the prediction itself, the moment the shot would land on them, even as they are still stepping out from behind cover',
         Min = 0,
         Max = 1000,
         Increment = 10,
@@ -4161,6 +4387,14 @@ do
         Callback = function(value) Trigger.Sees = Choice.pick(Choice.Trigger.Sees, value) end,
     })
 
+    section:Toggle({
+        Title = 'sure shots only',
+        Description = "holds fire until the shot will land: they are standing still or moving the way the prediction has been getting right, the shot would land within a stud of them (half one on the head), on the ground, and they have not been changing direction enough to do it before it lands. strafers never count. the readout shows what it is waiting on",
+        Flag = 'mm2_tb_sure',
+        Default = false,
+        Callback = function(state) Trigger.Sure = state end,
+    })
+
     section = TriggerTab:CreateSection('readout')
 
     Trigger.ui = {
@@ -4171,7 +4405,7 @@ do
     }
 
     section:Label({
-        Title = 'Targets come from silent aim: gun and knife targets, priority, range and fov on the silent aim tab all apply here too. With silent aim off, a gun fired through its own script shoots where you point, so it only fires with your mouse on them.',
+        Title = 'The trigger bot and silent aim share one solve. It picks targets the way silent aim does (priority, range, fov and knife targets from the silent aim tab), except the gun on murderer only always hunts the murderer, whoever silent aim is locked on to. Every shot it fires is put on the exact point it decided to fire at, even with silent aim switched off.',
     })
 end
 
