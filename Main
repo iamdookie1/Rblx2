@@ -38,6 +38,12 @@ local Games = {
     -- the machine this was added on (roblox.com is unreachable there), so the
     -- name is taken from the script's own header and may want correcting.
     [281489669] = { Name = 'Wand', Script = 'Games/Wand.lua' },
+    -- Dodge or Die, plus its pro (20+ wins, faster balls) and beginner (under
+    -- 3 wins) servers. All three place ids come from the game's own
+    -- ServerModeConfig module.
+    [131794278839305] = { Name = 'Dodge or Die', Script = 'Games/DodgeOrDie.lua' },
+    [71180183562074] = { Name = 'Dodge or Die (pro)', Script = 'Games/DodgeOrDie.lua' },
+    [137582789522487] = { Name = 'Dodge or Die (beginner)', Script = 'Games/DodgeOrDie.lua' },
 }
 
 -- Loads Onyx straight from its own repo rather than a vendored copy, since
