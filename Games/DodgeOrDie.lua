@@ -176,7 +176,14 @@ local Watched = {}
 
 local function addBall(part)
     if Balls[part] or not part:IsA("BasePart") then return end
-    Balls[part] = { last = part.Position, lastAt = os.clock(), onMe = false }
+    Balls[part] = {
+        last = part.Position,
+        lastAt = os.clock(),
+        onMe = false,
+        -- a practice ball lives on your own client, so it reacts to you the
+        -- instant you move; a round's ball only once the server has seen it
+        practice = part.Parent ~= nil and part.Parent.Name == "PracticeBalls",
+    }
 end
 
 local function dropBall(part)
@@ -284,52 +291,90 @@ end
 --// prediction ----------------------------------------------------------------
 
 local HORIZON = 0.7
-local STEP = 1 / 120
--- how long a ball can sit on you without knocking you out before it counts
--- as stuck (a shield, an orb, a death effect) rather than as a hit coming in
-local STUCK_AFTER = 0.25
+local FRAME = 1 / 60
+-- how long a ball can stay on you before auto dodge stops dashing at it
+local STUCK_AFTER = 0.06
 
--- Earliest time a ball flying straight on at its relative velocity touches
--- you, or nil if it misses within the horizon.
-local function straightContact(rel, w, reach)
-    local gap = bodyGap(rel) - reach
-    if gap <= 0 then return 0 end
-    if gap > w.Magnitude * HORIZON then return nil end
-    local t = STEP
-    while t <= HORIZON do
-        if bodyGap(rel + w * t) <= reach then return t end
-        t = t + STEP
-    end
-    return nil
+-- How a dash carries you: the game sets you off at its dash speed, then your
+-- humanoid drags you back down to walking pace, roughly exponentially.
+local DASH_TAU = 0.08
+
+local function slideAt(speed, t)
+    return speed * DASH_TAU * (1 - math.exp(-t / DASH_TAU))
 end
 
--- How sharply a ball has been turning, in radians a second: a smoothed rate
--- with a slowly fading peak, so one noisy frame does not stick. Until a ball
--- has been watched turning it counts as agile.
-local AGILE = 12
+-- How hard a ball has been seen to change its velocity (studs a second, per
+-- second) and how fast it has gone: a smoothed value with a slowly fading
+-- peak, so one noisy frame does not stick. A ball not watched yet counts as a
+-- strong one.
+local STRONG = 600
+-- the most a single frame's change is believed: replicated velocities jump
+local STRONGEST = 4000
 
-local function updateTurnRate(state, vel, now)
+local function updateMotion(state, vel, now)
     local prev, prevAt = state.prevVel, state.prevAt
     state.prevVel, state.prevAt = vel, now
-    if not prev then return end
+    if not prev then
+        state.top = vel.Magnitude
+        return
+    end
     local dt = now - prevAt
-    if dt <= 1e-3 or vel.Magnitude < 5 or prev.Magnitude < 5 then return end
-    local rate = math.acos(math.clamp(prev.Unit:Dot(vel.Unit), -1, 1)) / dt
-    state.turnEma = (state.turnEma or 0) + (rate - (state.turnEma or 0)) * 0.3
-    state.turnPeak = math.max(state.turnEma, (state.turnPeak or AGILE) - 2 * dt)
+    if dt <= 1e-3 then return end
+    state.top = math.max(vel.Magnitude, (state.top or 0) - 10 * dt)
+    local accel = math.min((vel - prev).Magnitude / dt, STRONGEST)
+    state.accEma = (state.accEma or 0) + (accel - (state.accEma or 0)) * 0.3
+    state.accPeak = math.max(state.accEma, (state.accPeak or STRONG) - 300 * dt)
 end
 
--- A ball chasing you bends toward you, so a straight line undersells it. It
--- still has to come round to face you first, and a ball flying past you
--- needs a while to do that.
-local function chaseContact(rel, w, reach, turnRate)
-    local gap = bodyGap(rel) - reach
-    if gap <= 0 then return 0 end
-    local dist = rel.Magnitude
-    local speed = w.Magnitude
-    if dist < 1e-3 or speed < 2 then return nil end
-    local facing = math.clamp(-rel:Dot(w) / (dist * speed), -1, 1)
-    return gap / speed + math.acos(facing) / math.max(turnRate, 2)
+-- Where you will be, relative to where you are: you keep walking the way you
+-- are, and any speed on top of that (a dash, a knock) dies away.
+local function yourPath(humanoid, velocity)
+    local walk = Vector3.zero
+    local ok, dir = pcall(function() return humanoid.MoveDirection end)
+    if ok and typeof(dir) == "Vector3" then walk = flat(dir) * (humanoid.WalkSpeed or 16) end
+    local extra = flat(velocity) - walk
+    return function(t)
+        return walk * t + extra * (DASH_TAU * (1 - math.exp(-t / DASH_TAU)))
+    end
+end
+
+-- Flies a ball forward against where you will be and returns the closest it
+-- comes to your body and when it first touches you. It keeps flying the way
+-- it is going until it can react to you (never, for a ball chasing someone
+-- else; once the server has seen you move, for a round's ball; at once, for a
+-- practice ball), then steers at where it sees you as hard as it has been seen
+-- to steer. With later set, how close it gets counts for less the further off
+-- it is, since there will be another dash by then.
+local function flyBall(ball, path, horizon, stopAtTouch, later)
+    local pos, vel = ball.rel, ball.vel
+    if pos.Magnitude > (math.max(ball.top, vel.Magnitude) + 20) * horizon + 10 then
+        return math.huge, nil
+    end
+    local steer = ball.accel * FRAME
+    local closest, touch = math.huge, nil
+    local t = 0
+    while t <= horizon do
+        local gap = bodyGap(pos - path(t)) - ball.reach
+        local counted = gap + (later or 0) * t
+        if counted < closest then closest = counted end
+        if gap <= 0 and not touch then
+            touch = t
+            if stopAtTouch then break end
+        end
+        if t >= ball.lag then
+            local want = path(t - ball.lag) - pos
+            local dist = want.Magnitude
+            if dist > 1e-3 then
+                local change = want * (ball.top / dist) - vel
+                local size = change.Magnitude
+                if size > steer then change = change * (steer / size) end
+                vel = vel + change
+            end
+        end
+        pos = pos + vel * FRAME
+        t = t + FRAME
+    end
+    return closest, touch
 end
 
 -- Works out, for every ball, who it is after and how soon it would reach you.
@@ -341,6 +386,7 @@ local function scan(now)
         for _, state in pairs(Balls) do
             state.tti = nil
             state.onMe = false
+            state.fly = nil
         end
         return ctx
     end
@@ -348,46 +394,54 @@ local function scan(now)
 
     ctx.char, ctx.root, ctx.humanoid, ctx.pos = char, root, humanoid, root.Position
     local mine = root:FindFirstChild("RootAttachment")
-    -- your own motion only counts at a discount: a dash or a turn sheds speed
-    -- far faster than a straight line assumes
     local v = root.AssemblyLinearVelocity
-    local myVel = Vector3.new(v.X * 0.6, 0, v.Z * 0.6)
+    local path = yourPath(humanoid, v)
 
     for part, state in pairs(Balls) do
         if part.Parent == nil then
             Balls[part] = nil
         else
             state.vel = ballVelocity(part, state, now)
-            updateTurnRate(state, state.vel, now)
+            updateMotion(state, state.vel, now)
             state.fake = part.Name == "Fake Ball"
             state.target = ballTarget(part)
             state.onMe = mine ~= nil and state.target == mine
+            state.lag = state.practice and 0 or Dodge.reactTime()
             local rel = part.Position - ctx.pos
-            local w = state.vel - myVel
             local reach = ballReach(part)
-            -- A ball resting on you cannot be dodged and is no danger right
-            -- now; dashing at it would only spin you round and round. It is
-            -- left alone until it has moved well off you.
+            state.fly = {
+                rel = rel,
+                vel = state.vel,
+                reach = reach,
+                -- only a ball chasing you bends after you
+                lag = state.onMe and state.lag or math.huge,
+                -- a practice ball starts from rest, so it gets some speed in hand
+                top = math.max(state.top or 0, state.vel.Magnitude, state.practice and 50 or 0),
+                accel = state.accPeak or STRONG,
+            }
+
+            -- Once a ball has landed on you it has already hit. If you are still
+            -- here it cannot hurt you (an orb, a shield, the practice ball,
+            -- which just rides along on you), and dashing at it would only spin
+            -- you round and round, so it is left alone until it has moved well
+            -- off you.
             local gap = bodyGap(rel) - reach
-            if gap <= 0.5 then
+            if gap <= 0 then
                 state.touching = state.touching or now
                 if now - state.touching > STUCK_AFTER then state.stuck = true end
             else
                 state.touching = nil
-                if gap > 4 then state.stuck = false end
-            end
-            local tti = straightContact(rel, w, reach)
-            if state.onMe then
-                ctx.onMe = ctx.onMe + 1
-                -- Straight after a dash the ball is still steering at where the
-                -- server last saw you, so for about a round trip its heading
-                -- is the whole story; only after that can it bend after you.
-                if not state.dodgedAt or now - state.dodgedAt > Dodge.reactTime() then
-                    local chase = chaseContact(rel, w, reach, state.turnPeak or AGILE)
-                    if chase and (not tti or chase < tti) then tti = chase end
+                if state.stuck and gap > 4 then
+                    state.stuck = false
+                    -- riding on you it only ever copied your own moves
+                    state.accEma, state.accPeak = nil, nil
                 end
             end
+            if state.stuck and state.onMe then ctx.stuck = (ctx.stuck or 0) + 1 end
+
+            local _, tti = flyBall(state.fly, path, HORIZON, true)
             state.tti = tti
+            if state.onMe then ctx.onMe = ctx.onMe + 1 end
             ctx.count = ctx.count + 1
             -- a new chase gets a fresh timing roll
             if state.onMe ~= state.wasOnMe then state.jitter = nil end
@@ -573,9 +627,6 @@ end))
 
 --// where to dash -------------------------------------------------------------
 
--- How a dash moves you: the game sets you off at its dash speed, then your
--- humanoid drags you back down to walking pace, roughly exponentially.
-local DASH_TAU = 0.08
 local PLAN_HORIZON = 0.35
 local DIRECTIONS = 16
 
@@ -607,38 +658,29 @@ function Dash.speed(char, humanoid)
     return speed
 end
 
-local function slideAt(speed, t)
-    return speed * DASH_TAU * (1 - math.exp(-t / DASH_TAU))
-end
-
--- every ball that could get near you in the next moment
-local function nearbyBalls(ctx)
+-- every ball worth planning around: stuck ones and ignored fakes are not
+local function nearbyBalls()
     local list = {}
     for part, state in pairs(Balls) do
-        if part.Parent and state.vel and not (state.fake and Dodge.IgnoreFake) then
-            local rel = part.Position - ctx.pos
-            if rel.Magnitude < state.vel.Magnitude * PLAN_HORIZON + 20 then
-                list[#list + 1] = { rel = rel, vel = state.vel, reach = ballReach(part) }
-            end
+        if part.Parent and state.fly and not state.stuck and not (state.fake and Dodge.IgnoreFake) then
+            list[#list + 1] = state.fly
         end
     end
     return list
 end
 
 -- The closest any of those balls gets to your body over the next moment if
--- you dash along dir now. You slide out and slow down, stopping short of a
--- wall, and each ball keeps flying the way it is going: on your screen it
--- cannot react to the dash that soon.
+-- you dash along dir now: you slide out and slow down, stopping short of a
+-- wall, while each ball flies on and steers after you the way flyBall has it.
+-- The next split second counts most; a catch further off gets another dash.
+local LATER = 4
+
 local function clearance(dir, speed, limit, balls)
+    local path = function(t) return dir * math.min(slideAt(speed, t), limit) end
     local worst = math.huge
     for _, ball in ipairs(balls) do
-        local t = 0
-        while t <= PLAN_HORIZON do
-            local slide = math.min(slideAt(speed, t), limit)
-            local gap = bodyGap(ball.rel + ball.vel * t - dir * slide) - ball.reach
-            if gap < worst then worst = gap end
-            t = t + 1 / 60
-        end
+        local closest = flyBall(ball, path, PLAN_HORIZON, false, LATER)
+        if closest < worst then worst = closest end
     end
     return worst
 end
@@ -691,7 +733,7 @@ local function planDash(ctx)
     local look = flat(root.CFrame.LookVector)
     look = look.Magnitude > 1e-3 and look.Unit or Vector3.new(0, 0, -1)
     local speed = Dash.speed(ctx.char, ctx.humanoid)
-    local balls = nearbyBalls(ctx)
+    local balls = nearbyBalls()
     local centre = arenaCentre()
     local toCentre = centre and flat(centre - ctx.pos)
     toCentre = (toCentre and toCentre.Magnitude > 8) and toCentre.Unit or nil
@@ -780,9 +822,28 @@ function Dodge.clearTime(reach, speed)
     return -DASH_TAU * math.log(1 - need / full)
 end
 
+-- When to dash, as time before impact. If the ball cannot react before you
+-- are clear, as late as that allows. If it can (a practice ball reacts at
+-- once), the moment that leaves the most room once its bending after you is
+-- counted: earlier gives it longer to bend, later gives your dash less time.
+function Dodge.lead(state, reach, speed)
+    local clear = Dodge.clearTime(reach, speed)
+    local lag = state.lag or 0
+    if lag >= clear + 0.04 then return clear + 0.04 end
+    local accel = state.accPeak or STRONG
+    local best, bestRoom = clear, -math.huge
+    for i = 2, 30 do
+        local lead = i / 100
+        local bend = math.max(lead - lag, 0)
+        local room = slideAt(speed, lead) - 0.5 * accel * bend * bend
+        if room > bestRoom + 0.05 then best, bestRoom = lead, room end
+    end
+    return best
+end
+
 function Dodge.window(ctx)
     if Dodge.AutoTiming and ctx and ctx.threat then
-        return Dodge.clearTime(ballReach(ctx.threat), Dash.speed(ctx.char, ctx.humanoid)) + 0.04
+        return Dodge.lead(Balls[ctx.threat], ballReach(ctx.threat), Dash.speed(ctx.char, ctx.humanoid))
     end
     return Dodge.At / 1000
 end
@@ -793,7 +854,9 @@ local function dodge(ctx, now, dt)
         return
     end
     if not ctx.threat then
-        if ctx.count > 0 then
+        if ctx.stuck then
+            Dodge.status = "a ball is on you, waiting for it to move off"
+        elseif ctx.count > 0 then
             Dodge.status = ("watching %d ball%s"):format(ctx.count, ctx.count == 1 and "" or "s")
         else
             Dodge.status = "no balls"
@@ -844,7 +907,6 @@ local function dodge(ctx, now, dt)
     Dodge.holdUntil = now + 0.08
     Dodge.dashes = Dodge.dashes + 1
     state.jitter = nil
-    state.dodgedAt = now
     Dodge.action = ("dashed %s %d ms before impact"):format(plan.side:lower(), math.floor(ctx.tti * 1000 + 0.5))
 end
 
