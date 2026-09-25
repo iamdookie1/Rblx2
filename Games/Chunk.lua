@@ -1,5 +1,5 @@
 --// 100 Days on Chunk! -- auto farm, fast swing, kill aura, survival helpers,
---// loot, movement, teleports and esp.
+--// loot, anti hit, anti fall, movement, teleports and esp.
 --
 -- What the game's own client scripts show:
 --  * Gathering is GatherHit:FireServer() and a tool swing is MouseClick:FireServer(),
@@ -8,11 +8,21 @@
 --    itself fires them on a loop at the tool's cooldown while you hold click,
 --    and only while the server has the tool Enabled: the server times swings,
 --    so sending more of them than the cooldown allows does nothing.
---  * Resources are models under GeneratedChunks.<chunk>.Resources carrying
---    ResourceType (Tree / Rock), Health and Depleted. Axes cut trees, pickaxes
---    break rocks.
+--  * Every resource is a model tagged GatherResource carrying ResourceType
+--    (Tree / Rock, or Cage for the beast's cage), AssetName, Health and
+--    Depleted. Most sit under GeneratedChunks.<chunk>.Resources, but snow
+--    chunks grow Frozen Cubes (AssetName Freeze) as structures and the pharaoh
+--    drops Ancient Tombs, so only the tag finds them all. Axes cut trees,
+--    pickaxes break rocks; which rocks a pickaxe is good enough for is the
+--    server's secret, so the farm learns it from swings that do nothing.
 --  * Enemies (Workspace.Enemies) and animals (Workspace.Animals) keep their
---    health on a Humanoid named Humanoid2.
+--    health on a Humanoid named Humanoid2, but an enemy is dead as soon as its
+--    EnemyActionAnimation says "Dead", whatever that health says, and one with
+--    SpawnReady false is still climbing out of the ground.
+--  * Enemy swings show up as EnemyActionAnimation "Attack" / "Attack2" (or the
+--    EnemyAnimation remote for proxied enemies), and everything thrown or
+--    dropped is announced through EnemyPresentation before it lands: where,
+--    and at what server time.
 --  * Food is the player's Food attribute; eating is Eat:FireServer(foodTool)
 --    with a tool that has a Food attribute in your hands. Bandages are tools
 --    with a HealAmount that heal while UseItem:FireServer(tool) is held.
@@ -29,6 +39,7 @@ local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local CollectionService = game:GetService("CollectionService")
 local Workspace = workspace
 
 local LocalPlayer = Players.LocalPlayer
@@ -107,6 +118,8 @@ local Remotes = {
     UseItem = remote("UseItem"),
     RepairBuild = remote("RepairBuild"),
     ClaimFreeRevive = remote("ClaimFreeRevive"),
+    EnemyPresentation = remote("EnemyPresentation"),
+    EnemyAnimation = remote("EnemyAnimation"),
 }
 
 -- The numbers the game plays by, read from its own GameConfig. The fallbacks
@@ -151,6 +164,7 @@ local Farm = {
     Radius = 200,
     OresFirst = true,
     AtNight = false,
+    MoveOn = true,
 
     target = nil,
     skip = {},
@@ -159,6 +173,13 @@ local Farm = {
     faceLearned = false,
     status = "off",
     broken = 0,
+    -- what the server showed about each kind of resource: the strongest tool
+    -- that did nothing to it, the weakest that broke it, and misses so far
+    cant = {},
+    cantTool = {},
+    can = {},
+    fails = {},
+    damaged = setmetatable({}, { __mode = "k" }),
 }
 
 local Swing = {
@@ -211,6 +232,9 @@ local Loot = {
     collected = 0,
 }
 local Night = { Base = false, Warn = true }
+local Dodge = { Enabled = false, Melee = true, Ranged = true, threats = {}, seen = setmetatable({}, { __mode = "k" }), dodged = 0 }
+local Fall = { Enabled = false, safe = nil, saves = 0 }
+local Cages = { Enabled = false, broken = 0 }
 
 local Move = {
     Speed = false,
@@ -285,6 +309,12 @@ local function roundTrip()
     local ok, ping = pcall(function() return LocalPlayer:GetNetworkPing() end)
     if ok and type(ping) == "number" and ping > 0 then return math.min(ping * 2, 0.6) end
     return 0.15
+end
+
+-- the server's clock, which the day, the night and every enemy attack run on
+local function serverTime()
+    local ok, now = pcall(function() return Workspace:GetServerTimeNow() end)
+    return ok and now or os.time()
 end
 
 --// tools -------------------------------------------------------------------------
@@ -461,27 +491,40 @@ end
 local Resources = {}
 local RaycastIgnore = {}
 
--- every tree and rock the game has loaded around you
+local function resourceAlive(model)
+    return model.Parent ~= nil and model:GetAttribute("Depleted") ~= true
+        and (tonumber(model:GetAttribute("Health")) or 1) > 0
+end
+
+-- Every resource the game has loaded around you: all it tags GatherResource
+-- (Frozen Cubes and tombs live outside the resource folders), plus the
+-- resource folders in case a tag is ever missing.
 local function scanResources()
-    local list = {}
-    local ignore = {}
-    local function take(folder)
-        ignore[#ignore + 1] = folder
-        for _, model in ipairs(folder:GetChildren()) do
-            local kind = model:GetAttribute("ResourceType")
-            if kind == "Tree" or kind == "Rock" then list[#list + 1] = model end
+    local list, seen, ignore = {}, {}, {}
+    local function take(model, folder)
+        if seen[model] then return end
+        seen[model] = true
+        if model:IsA("Model") and model:GetAttribute("ResourceType") ~= nil then
+            list[#list + 1] = model
+            -- rays and landing spots look straight through resources
+            if not folder then ignore[#ignore + 1] = model end
         end
+    end
+    local function takeFolder(folder)
+        if not folder then return end
+        ignore[#ignore + 1] = folder
+        for _, model in ipairs(folder:GetChildren()) do take(model, folder) end
     end
     local chunks = Workspace:FindFirstChild("GeneratedChunks")
     if chunks then
-        for _, chunk in ipairs(chunks:GetChildren()) do
-            local folder = chunk:FindFirstChild("Resources")
-            if folder then take(folder) end
-        end
+        for _, chunk in ipairs(chunks:GetChildren()) do takeFolder(chunk:FindFirstChild("Resources")) end
     end
-    local loose = Workspace:FindFirstChild("Resources")
-    if loose then take(loose) end
-    for _, name in ipairs({ "Enemies", "Animals", "WorldItemDrops" }) do
+    takeFolder(Workspace:FindFirstChild("Resources"))
+    local ok, tagged = pcall(function() return CollectionService:GetTagged("GatherResource") end)
+    if ok and type(tagged) == "table" then
+        for _, model in ipairs(tagged) do take(model, nil) end
+    end
+    for _, name in ipairs({ "Enemies", "Animals", "WorldItemDrops", "LocalResourceAnimations", "ClientEnemyPresentation", "ClientEnemyAppearances" }) do
         local folder = Workspace:FindFirstChild(name)
         if folder then ignore[#ignore + 1] = folder end
     end
@@ -497,17 +540,23 @@ local function scanResources()
     for model, untilTime in pairs(Aura.skip) do
         if untilTime <= now or not model.Parent then Aura.skip[model] = nil end
     end
+    -- anything you took a chunk out of that is gone now counts as broken
+    for model in pairs(Farm.damaged) do
+        if not resourceAlive(model) then
+            Farm.damaged[model] = nil
+            Farm.broken = Farm.broken + 1
+        end
+    end
 end
 
 local function resourcePoint(model)
-    local hitbox = model:FindFirstChild("Hitbox")
+    local hitbox = model:FindFirstChild("Hitbox", true)
     if hitbox and hitbox:IsA("BasePart") then return hitbox.Position end
     return pivotOf(model)
 end
 
-local function resourceAlive(model)
-    return model.Parent ~= nil and model:GetAttribute("Depleted") ~= true
-        and (tonumber(model:GetAttribute("Health")) or 1) > 0
+local function assetOf(model)
+    return model:GetAttribute("AssetName") or model.Name
 end
 
 local rayParams = RaycastParams.new()
@@ -525,14 +574,24 @@ local function floorBelow(point, above, depth, ignore)
     return hit and hit.Position.Y or nil
 end
 
--- A spot gap studs short of a point, on your side of it and standing on the
--- ground (trees, balls of leaves and creatures do not count as ground).
+-- A spot gap studs from a point, standing on the ground (trees, balls of
+-- leaves and creatures do not count as ground): your side of it first, then
+-- the others, so something on the edge of an island never has you standing
+-- on thin air. Ground just under the point comes before any further down.
 local function spotNear(point, root, hum, gap)
     local away = flat(root.Position - point)
-    away = away.Magnitude > 0.1 and away.Unit or Vector3.new(1, 0, 0)
-    local base = point + away * gap
-    local floor = floorBelow(base, 8, 60)
-    if floor then return Vector3.new(base.X, floor + standHeight(root, hum) + 0.3, base.Z) end
+    local start = away.Magnitude > 0.1 and math.atan2(away.Z, away.X) or 0
+    local height = standHeight(root, hum) + 0.3
+    for _, depth in ipairs({ 20, 60 }) do
+        for i = 0, 7 do
+            local turn = math.ceil(i / 2) * (i % 2 == 0 and 1 or -1)
+            local angle = start + turn * math.pi / 4
+            local base = point + Vector3.new(math.cos(angle), 0, math.sin(angle)) * gap
+            local floor = floorBelow(base, 8, depth)
+            if floor then return Vector3.new(base.X, floor + height, base.Z) end
+        end
+    end
+    local base = point + Vector3.new(math.cos(start), 0, math.sin(start)) * gap
     return Vector3.new(base.X, math.max(root.Position.Y, point.Y), base.Z)
 end
 
@@ -578,9 +637,18 @@ end
 local function enemiesFolder() return Workspace:FindFirstChild("Enemies") end
 local function animalsFolder() return Workspace:FindFirstChild("Animals") end
 
+-- Alive the way the game itself decides it: health left on Humanoid2 and not
+-- playing its death, since a dead enemy can still show health while it falls.
 local function creatureAlive(model)
     local hum2 = model:FindFirstChild("Humanoid2")
-    return hum2 ~= nil and hum2:IsA("Humanoid") and hum2.Health > 0, hum2
+    if not hum2 or not hum2:IsA("Humanoid") or hum2.Health <= 0 then return false, hum2 end
+    return model:GetAttribute("EnemyActionAnimation") ~= "Dead", hum2
+end
+
+-- alive and done spawning in, so a hit on it can count
+local function creatureReady(model)
+    local alive, hum2 = creatureAlive(model)
+    return alive and model:GetAttribute("SpawnReady") ~= false, hum2
 end
 
 local function creatureRoot(model)
@@ -640,13 +708,23 @@ end
 
 --// auto farm ------------------------------------------------------------------------------
 
+-- the game's own names for what it grows, for messages
+local DISPLAY_NAMES = {
+    Freeze = "Frozen Cube", DropTomb = "Ancient Tomb", DiamondOre = "Diamond Ore", GoldOre = "Gold Ore",
+    IronOre = "Iron Ore", CoalOre = "Coal Ore", DesertStone = "Desert Stone",
+}
+
+local function displayName(asset)
+    return DISPLAY_NAMES[asset] or asset
+end
+
+-- trees and rocks the chosen way; cages are left to the cage breaker
 local function wantKind(model)
     local kind = model:GetAttribute("ResourceType")
+    if kind ~= "Tree" and kind ~= "Rock" then return false end
     if Farm.Kinds == "trees" then return kind == "Tree" end
     if Farm.Kinds == "rocks" then return kind == "Rock" end
-    if Farm.Kinds == "ores only" then
-        return kind == "Rock" and ORE_VALUE[model:GetAttribute("AssetName") or model.Name] ~= nil
-    end
+    if Farm.Kinds == "ores only" then return kind == "Rock" and ORE_VALUE[assetOf(model)] ~= nil end
     return true
 end
 
@@ -655,22 +733,43 @@ local function gatherReach()
     return Config.GATHER_DISTANCE - 2.5
 end
 
+-- your axes and pickaxes, strongest first, gathered once a frame
+local function farmKit()
+    return { Tree = gatherToolsFor("Tree"), Rock = gatherToolsFor("Rock"), byAsset = {} }
+end
+
+-- The tools that can take a resource on, strongest first, leaving out any
+-- that resources of its kind have already shrugged off; nil when none can.
+local function farmTools(kit, model)
+    local asset = assetOf(model)
+    local cached = kit.byAsset[asset]
+    if cached ~= nil then return cached or nil end
+    local list = kit[model:GetAttribute("ResourceType")] or {}
+    local cant = Farm.cant[asset]
+    if cant then
+        local kept = {}
+        for _, tool in ipairs(list) do
+            if toolRank(tool) > cant then kept[#kept + 1] = tool end
+        end
+        list = kept
+    end
+    kit.byAsset[asset] = list[1] and list or false
+    return list[1] and list or nil
+end
+
 -- the nearest living resource you have a tool for, ores pulled forward when
 -- ores come first
-local function farmTarget(root, tools, now)
+local function farmTarget(root, kit, now)
     local best, bestScore
     for _, model in ipairs(Resources) do
-        if resourceAlive(model) and wantKind(model) and tools[model:GetAttribute("ResourceType")]
-            and not ((Farm.skip[model] or 0) > now) then
+        if resourceAlive(model) and wantKind(model) and not ((Farm.skip[model] or 0) > now) and farmTools(kit, model) then
             local point = resourcePoint(model)
             if point then
                 local d = flatDistance(point, root.Position)
                 local reach = Farm.Move == "don't move" and gatherReach() or Farm.Radius
                 if d <= reach then
                     local score = d
-                    if Farm.OresFirst then
-                        score = score - (ORE_VALUE[model:GetAttribute("AssetName") or model.Name] or 0) * 60
-                    end
+                    if Farm.OresFirst then score = score - (ORE_VALUE[assetOf(model)] or 0) * 60 end
                     if not bestScore or score < bestScore then best, bestScore = model, score end
                 end
             end
@@ -703,16 +802,32 @@ local function checkProgress(state, health, now, mode)
     return nil
 end
 
+-- A resource that took nothing from a tool swung in reach and facing it, and
+-- that twice for the same kind of resource: the tool is not good enough for
+-- that kind, unless one no stronger has broken one before. The farm then
+-- leaves that kind alone until you carry something stronger.
+local function learnMiss(model, tool)
+    local asset = assetOf(model)
+    local rank = toolRank(tool)
+    local key = asset .. "|" .. rank
+    Farm.fails[key] = (Farm.fails[key] or 0) + 1
+    if Farm.fails[key] >= 2 and (Farm.can[asset] or math.huge) > rank and (Farm.cant[asset] or -1) < rank then
+        Farm.cant[asset] = rank
+        Farm.cantTool[asset] = tool.Name
+        notify('farm', ('your %s does nothing to %s, so those are left alone until you carry something stronger'):format(tool.Name, displayName(asset)), 'warning', 6)
+    end
+end
+
 local function farmStep(now, dt, char, root, hum)
     if not Farm.Enabled then
         Farm.status = "off"
         return false
     end
+    -- the swing that breaks the last one is still on its way to the server
+    if now < (Farm.moveOnAt or 0) then return true end
 
-    local tools = { Tree = gatherToolsFor("Tree"), Rock = gatherToolsFor("Rock") }
-    if not tools.Tree[1] then tools.Tree = nil end
-    if not tools.Rock[1] then tools.Rock = nil end
-    if not tools.Tree and not tools.Rock then
+    local kit = farmKit()
+    if not kit.Tree[1] and not kit.Rock[1] then
         Farm.status = "no axe or pickaxe"
         return false
     end
@@ -721,14 +836,13 @@ local function farmStep(now, dt, char, root, hum)
     -- the radius, so a closer tree never pulls you off one half chopped
     local target = Farm.target
     local keep = target and resourceAlive(target) and not ((Farm.skip[target] or 0) > now)
-        and tools[target:GetAttribute("ResourceType")] ~= nil and wantKind(target)
+        and farmTools(kit, target) ~= nil and wantKind(target)
     if keep then
         local point = resourcePoint(target)
         keep = point ~= nil and flatDistance(point, root.Position) <= math.max(Farm.Radius, gatherReach())
     end
     if not keep then
-        if target and not resourceAlive(target) then Farm.broken = Farm.broken + 1 end
-        target = farmTarget(root, tools, now)
+        target = farmTarget(root, kit, now)
         Farm.target = target
         Farm.lastHealth = nil
         Farm.swings = 0
@@ -740,11 +854,11 @@ local function farmStep(now, dt, char, root, hum)
         return false
     end
 
-    local candidates = tools[target:GetAttribute("ResourceType")]
+    local candidates = farmTools(kit, target)
     local point = resourcePoint(target)
     if not point then return false end
 
-    local name = target:GetAttribute("AssetName") or target.Name
+    local name = displayName(assetOf(target))
     if flatDistance(point, root.Position) > gatherReach() then
         if Farm.Move == "don't move" then
             Farm.target = nil
@@ -759,17 +873,32 @@ local function farmStep(now, dt, char, root, hum)
 
     if Farm.Face == "always" or (Farm.Face == "auto" and Farm.faceLearned) then face(root, point) end
 
+    local health = tonumber(target:GetAttribute("Health")) or 0
     local tool = pickSwing(candidates, "gather", now)
     if tool then
         swingWith(tool, "gather", hum, now, candidates)
         Farm.swings = (Farm.swings or 0) + 1
+        -- the strongest tool's swing that breaks it: head for the next one
+        -- while it lands, instead of waiting to see it go
+        local stats = Config.GATHER_TOOL_STATS[tool.Name]
+        local damage = stats and tonumber(stats.damage)
+        if Farm.MoveOn and tool == candidates[1] and damage and health <= damage and Farm.Move ~= "don't move" then
+            Farm.damaged[target] = true
+            Farm.skip[target] = now + 2
+            Farm.moveOnAt = now + 0.12
+        end
     elseif not contains(candidates, heldTool(char)) then
         equip(candidates[1], hum)
     end
 
-    local health = tonumber(target:GetAttribute("Health")) or 0
+    if Farm.lastHealth and health < Farm.lastHealth then
+        Farm.damaged[target] = true
+        local asset = assetOf(target)
+        Farm.can[asset] = math.min(Farm.can[asset] or math.huge, toolRank(candidates[1]))
+    end
     local verdict = checkProgress(Farm, health, now, Farm.Face)
     if verdict == "skip" then
+        learnMiss(target, candidates[1])
         Farm.skip[target] = now + 20
         Farm.target = nil
     end
@@ -785,8 +914,8 @@ local function auraTarget(root, limit, now)
     local best, bestScore
     local function scan(folder)
         for _, model in ipairs(folder:GetChildren()) do
-            local alive, hum2 = creatureAlive(model)
-            local part = alive and creatureRoot(model)
+            local ready, hum2 = creatureReady(model)
+            local part = ready and creatureRoot(model)
             if part and not ((Aura.skip[model] or 0) > now) then
                 local d = (part.Position - root.Position).Magnitude
                 if d <= limit then
@@ -846,8 +975,9 @@ local function auraStep(now, dt, char, root, hum)
     if target then
         local alive, hum2 = creatureAlive(target)
         if not alive or not target.Parent then
-            -- it died, or it vanished after taking damage from you
-            local dealt = hum2 and hum2.Health <= 0
+            -- it died (its health ran out or it is playing its death), or it
+            -- vanished after taking damage from you
+            local dealt = (hum2 and hum2.Health <= 0) or target:GetAttribute("EnemyActionAnimation") == "Dead"
                 or (not target.Parent and Aura.lastHealth and Aura.maxHealth and Aura.lastHealth < Aura.maxHealth)
             if dealt then Aura.kills = Aura.kills + 1 end
             target = nil
@@ -870,8 +1000,10 @@ local function auraStep(now, dt, char, root, hum)
     if not target then
         Aura.status = "nothing in range"
         if Aura.home then
-            -- back to where the fight pulled you from, unless night is taking you home anyway
-            if Aura.Return and not (Night.Base and isNight()) and (Aura.home - root.Position).Magnitude > 6 then
+            -- back to where the fight pulled you from, unless night is taking
+            -- you home anyway; always when the fight left you over thin air
+            local stranded = not floorBelow(root.Position, 2, 20)
+            if (stranded or (Aura.Return and not (Night.Base and isNight()))) and (Aura.home - root.Position).Magnitude > 6 then
                 root.CFrame = CFrame.new(Aura.home) * (root.CFrame - root.CFrame.Position)
                 root.AssemblyLinearVelocity = Vector3.zero
             end
@@ -916,7 +1048,7 @@ local function auraStep(now, dt, char, root, hum)
 
     local health = hum2 and hum2.Health or 0
     Aura.maxHealth = hum2 and hum2.MaxHealth or nil
-    if health <= 0 then
+    if not creatureAlive(target) then
         Aura.kills = Aura.kills + 1
         Aura.target = nil
     elseif checkProgress(Aura, health, now, Aura.Stick and "always" or Aura.Face) == "skip" then
@@ -926,6 +1058,258 @@ local function auraStep(now, dt, char, root, hum)
     end
     local distance = (part.Position - root.Position).Magnitude
     Aura.status = ("%s %d hp · %d st"):format(target.Name, math.floor(health + 0.5), math.floor(distance + 0.5))
+    return true
+end
+
+--// anti hit --------------------------------------------------------------------------------
+-- Enemy swings and everything thrown or dropped at you are announced before
+-- they land. Anti hit steps you just clear of them, onto solid ground, and
+-- keeps you there until they have landed.
+
+-- how long after an enemy starts a swing its blow can still land
+local MELEE_WINDOW = 0.9
+
+local function addThreat(center, radius, landsAt, source)
+    Dodge.threats[#Dodge.threats + 1] = { center = center, radius = radius, to = landsAt, source = source }
+end
+
+-- a swing reaches as far as the enemy's own attack distance
+local function addSwing(model, startedAt)
+    local reach = tonumber(model:GetAttribute("AttackDistance")) or 6
+    addThreat(nil, reach + 2, startedAt + MELEE_WINDOW, model)
+end
+
+if Remotes.EnemyPresentation then
+    track(Remotes.EnemyPresentation.OnClientEvent:Connect(function(action, ...)
+        if not Dodge.Enabled or not Dodge.Ranged then return end
+        local a = table.pack(...)
+        local now = serverTime()
+        if action == "ThrowProjectile" then
+            -- (what, from, where it lands, flight time, thrown at)
+            local flight = tonumber(a[4])
+            if typeof(a[3]) == "Vector3" and flight then addThreat(a[3], 7, (tonumber(a[5]) or now) + flight + 0.15) end
+        elseif action == "CageFall" then
+            -- (id, from, where it lands, fall time, dropped at)
+            local fall = tonumber(a[4])
+            if typeof(a[3]) == "CFrame" and fall then addThreat(a[3].Position, 9, (tonumber(a[5]) or now) + fall + 0.3) end
+        elseif action == "TombFall" then
+            -- (id, from, where it lands, delay, fall time, dropped at)
+            local fall = tonumber(a[5])
+            if typeof(a[3]) == "CFrame" and fall then
+                addThreat(a[3].Position, 9, (tonumber(a[6]) or now) + (tonumber(a[4]) or 0) + fall + 0.3)
+            end
+        elseif action == "SpearLaunch" then
+            -- (id, from, where it lands, flight time, thrown at)
+            local flight = tonumber(a[4])
+            if typeof(a[3]) == "Vector3" and flight then addThreat(a[3], 6, (tonumber(a[5]) or now) + flight + 0.15) end
+        elseif action == "ThunderStrike" then
+            -- (where, delay, how long it lingers)
+            local delay = tonumber(a[2])
+            if typeof(a[1]) == "Vector3" and delay then addThreat(a[1], 8, now + delay + 0.3) end
+        end
+    end))
+end
+
+if Remotes.EnemyAnimation then
+    track(Remotes.EnemyAnimation.OnClientEvent:Connect(function(model, action, startedAt)
+        if Dodge.Enabled and Dodge.Melee and (action == "Attack" or action == "Attack2") and typeof(model) == "Instance" then
+            addSwing(model, tonumber(startedAt) or serverTime())
+        end
+    end))
+end
+
+-- swings by enemies close by, read off their attributes as they start
+local function watchSwings(root, now)
+    local enemies = enemiesFolder()
+    if not enemies then return end
+    for _, model in ipairs(enemies:GetChildren()) do
+        local part = creatureRoot(model)
+        if part and (part.Position - root.Position).Magnitude < 30 then
+            local sequence = model:GetAttribute("EnemyActionSequence")
+            if sequence ~= nil and sequence ~= Dodge.seen[model] then
+                local first = Dodge.seen[model] == nil
+                Dodge.seen[model] = sequence
+                local action = model:GetAttribute("EnemyActionAnimation")
+                local startedAt = tonumber(model:GetAttribute("EnemyActionStartedAt")) or now
+                if (action == "Attack" or action == "Attack2") and (not first or now - startedAt < MELEE_WINDOW) then
+                    addSwing(model, startedAt)
+                end
+            end
+        end
+    end
+end
+
+-- where a threat is right now, or nil when it cannot reach you: a swing
+-- only reaches what is in front of the enemy swinging it
+local function threatAt(threat, root)
+    local model = threat.source
+    if not model then return threat.center end
+    if not model.Parent or not creatureAlive(model) then return nil end
+    local part = creatureRoot(model)
+    if not part then return nil end
+    local to = flat(root.Position - part.Position)
+    local look = flat(part.CFrame.LookVector)
+    if to.Magnitude > 0.1 and look.Magnitude > 0.1 and look.Unit:Dot(to.Unit) < -0.3 then return nil end
+    return part.Position
+end
+
+-- The nearest spot on solid ground clear of every danger, trying straight
+-- out from them first.
+local function safeSpot(root, hum, dangers)
+    local middle, reach = Vector3.zero, 0
+    for _, d in ipairs(dangers) do
+        middle = middle + d.center
+        reach = math.max(reach, d.radius + 2.5)
+    end
+    middle = middle / #dangers
+    local away = flat(root.Position - middle)
+    local start = away.Magnitude > 0.1 and math.atan2(away.Z, away.X) or 0
+    local height = standHeight(root, hum)
+    local best, bestCost
+    for i = 0, 11 do
+        local turn = math.ceil(i / 2) * (i % 2 == 0 and 1 or -1)
+        local angle = start + turn * math.pi / 6
+        local spot = middle + Vector3.new(math.cos(angle), 0, math.sin(angle)) * reach
+        local clear = true
+        for _, d in ipairs(dangers) do
+            if flatDistance(spot, d.center) < d.radius + 2 then clear = false end
+        end
+        local floor = clear and floorBelow(Vector3.new(spot.X, root.Position.Y, spot.Z), 6, 14)
+        if floor and bodyFits(Vector3.new(spot.X, floor, spot.Z), RaycastIgnore) then
+            local stand = Vector3.new(spot.X, floor + height, spot.Z)
+            local cost = (stand - root.Position).Magnitude
+            if not bestCost or cost < bestCost then best, bestCost = stand, cost end
+        end
+    end
+    return best
+end
+
+-- Steps out of whatever is about to land on you. Says "ranged" while it is
+-- waiting out something thrown or dropped, when nothing else may move you,
+-- and "melee" while it is waiting out a swing, when only the kill aura may
+-- (it keeps you behind enemies, out of their swings).
+local function dodgeStep(now, char, root, hum)
+    if not Dodge.Enabled then
+        if Dodge.threats[1] then table.clear(Dodge.threats) end
+        return nil
+    end
+    local t = serverTime()
+    if Dodge.Melee then watchSwings(root, t) end
+    local dangers
+    for i = #Dodge.threats, 1, -1 do
+        local threat = Dodge.threats[i]
+        if t > threat.to then
+            table.remove(Dodge.threats, i)
+        else
+            local center = threatAt(threat, root)
+            if center and flatDistance(center, root.Position) < threat.radius and math.abs(center.Y - root.Position.Y) < threat.radius + 4 then
+                dangers = dangers or {}
+                dangers[#dangers + 1] = { center = center, radius = threat.radius, to = threat.to, threat = threat }
+            end
+        end
+    end
+    if dangers then
+        local spot = safeSpot(root, hum, dangers)
+        if spot then
+            root.CFrame = CFrame.new(spot) * (root.CFrame - root.CFrame.Position)
+            root.AssemblyLinearVelocity = Vector3.zero
+        end
+        for _, d in ipairs(dangers) do
+            if not d.threat.dodged then
+                d.threat.dodged = true
+                Dodge.dodged = Dodge.dodged + 1
+            end
+            if d.threat.source then
+                Dodge.meleeUntil = math.max(Dodge.meleeUntil or 0, d.to)
+            else
+                Dodge.rangedUntil = math.max(Dodge.rangedUntil or 0, d.to)
+            end
+        end
+    end
+    if t < (Dodge.rangedUntil or 0) then return "ranged" end
+    if t < (Dodge.meleeUntil or 0) then return "melee" end
+    return nil
+end
+
+--// anti fall -------------------------------------------------------------------------------
+
+-- Remembers the last ground you stood on, and puts you straight back on it
+-- when you drop off an edge with nothing below, or have already fallen far.
+local function fallStep(now, char, root, hum)
+    if not Fall.Enabled or Move.Fly then return false end
+    local velocity = root.AssemblyLinearVelocity
+    if hum.FloorMaterial ~= Enum.Material.Air and math.abs(velocity.Y) < 8 then
+        Fall.safe = root.Position
+        return false
+    end
+    local safe = Fall.safe
+    if not safe or now < (Fall.nextSave or 0) then return false end
+    local lost = root.Position.Y < safe.Y - 60
+    if not lost and velocity.Y < -30 then lost = floorBelow(root.Position, 0, 250) == nil end
+    if not lost then return false end
+    root.CFrame = CFrame.new(safe + Vector3.new(0, 0.5, 0)) * (root.CFrame - root.CFrame.Position)
+    root.AssemblyLinearVelocity = Vector3.zero
+    Fall.saves = Fall.saves + 1
+    Fall.nextSave = now + 0.5
+    return true
+end
+
+--// cages -----------------------------------------------------------------------------------
+-- The beast drops a cage on someone: a resource of type Cage that has to be
+-- broken to let them out.
+
+local function nearestCage(root, limit)
+    local best, bestD
+    for _, model in ipairs(Resources) do
+        if model:GetAttribute("ResourceType") == "Cage" and resourceAlive(model) then
+            local point = resourcePoint(model)
+            local d = point and flatDistance(point, root.Position)
+            if d and d <= limit and (not bestD or d < bestD) then best, bestD = model, d end
+        end
+    end
+    return best
+end
+
+local function cageStep(now, dt, char, root, hum)
+    if not Cages.Enabled then return false end
+    local cage = nearestCage(root, 80)
+    if cage ~= Cages.target then
+        if Cages.target and not resourceAlive(Cages.target) then Cages.broken = Cages.broken + 1 end
+        Cages.target = cage
+        Cages.useless = {}
+        Cages.lastHealth = nil
+        Cages.swings = 0
+        Cages.progressAt = now
+    end
+    if not cage then return false end
+    -- whatever breaks it: gather tools first, then swords, dropping any that do nothing
+    local tools = toolsWhere(function(tool)
+        return (tool:GetAttribute("GatherTool") == true or tool:GetAttribute("Sword") == true) and not Cages.useless[tool]
+    end)
+    if not tools[1] then
+        Cages.useless = {}
+        return false
+    end
+    local point = resourcePoint(cage)
+    if flatDistance(point, root.Position) > gatherReach() then
+        goTo(spotNear(point, root, hum, 3), "teleport", root, hum, dt, now, Cages)
+    end
+    if now < (Cages.settleUntil or 0) then return true end
+    local tool = tools[1]
+    if now >= (Swing.readyAt[tool] or 0) then
+        swingWith(tool, tool:GetAttribute("GatherTool") == true and "gather" or "attack", hum, now, { tool })
+        Cages.swings = Cages.swings + 1
+    end
+    local health = tonumber(cage:GetAttribute("Health")) or 0
+    if Cages.lastHealth and health < Cages.lastHealth then
+        Cages.progressAt = now
+        Cages.swings = 0
+    elseif Cages.swings >= 3 and now - Cages.progressAt > 1.5 then
+        Cages.useless[tool] = true
+        Cages.swings = 0
+        Cages.progressAt = now
+    end
+    Cages.lastHealth = health
     return true
 end
 
@@ -1355,11 +1739,13 @@ end
 track(LocalPlayer.CharacterAdded:Connect(function()
     Aura.home, Aura.target, Farm.target = nil, nil, nil
     Heal.tool, Heal.previous = nil, nil
+    Fall.safe, Cages.target = nil, nil
 end))
 
--- One job drives your character each frame, in this order: healing, eating,
--- then the kill aura, repairs, the night, loot, and farming. Each hands over
--- the moment it has nothing to do.
+-- One job drives your character each frame, in this order: catching a fall,
+-- getting out of the way of attacks, healing, eating, breaking cages, the
+-- kill aura, repairs, the night, loot, and farming. Each hands over the
+-- moment it has nothing to do.
 local lastStep = os.clock()
 local nextScan = 0
 local lastError
@@ -1377,9 +1763,15 @@ track(RunService.Heartbeat:Connect(function()
             nextScan = now + 1
             scanResources()
         end
+        if fallStep(now, char, root, hum) then return end
+        local dodging = dodgeStep(now, char, root, hum)
+        if dodging == "ranged" then return end
         if healStep(now, char, root, hum) then return end
         if eatStep(now, char, root, hum) then return end
+        if cageStep(now, dt, char, root, hum) then return end
         if auraStep(now, dt, char, root, hum) then return end
+        -- out of reach of a swing, nothing but the kill aura moves you back in
+        if dodging then return end
         if repairStep(now, dt, char, root, hum) then return end
         if nightStep(now, dt, char, root, hum) then return end
         if lootStep(now, dt, char, root, hum) then return end
@@ -1632,9 +2024,9 @@ local function espRefresh()
         for _, model in ipairs(Resources) do
             local name = model:GetAttribute("AssetName") or model.Name
             if ORE_VALUE[name] and resourceAlive(model) then
-                local adornee = model:FindFirstChild("Hitbox") or model.PrimaryPart or model:FindFirstChildWhichIsA("BasePart")
+                local adornee = model:FindFirstChild("Hitbox", true) or model.PrimaryPart or model:FindFirstChildWhichIsA("BasePart", true)
                 local point = resourcePoint(model)
-                if adornee and point then espShow(model, adornee, name .. "\n" .. distanceText(point), COLORS.ore, false) end
+                if adornee and point then espShow(model, adornee, displayName(name) .. "\n" .. distanceText(point), COLORS.ore, false) end
             end
         end
     end
@@ -1694,10 +2086,6 @@ local function clock(seconds)
     return ("%d:%02d"):format(math.floor(seconds / 60), seconds % 60)
 end
 
-local function serverNow()
-    local ok, now = pcall(function() return Workspace:GetServerTimeNow() end)
-    return ok and now or os.time()
-end
 
 local function hudRefresh()
     local state = dayState()
@@ -1706,7 +2094,7 @@ local function hudRefresh()
     if state then
         local day = state:GetAttribute("Day") or 0
         local phase = state:GetAttribute("Phase") or "?"
-        local left = (tonumber(state:GetAttribute("PhaseEndsAt")) or 0) - serverNow()
+        local left = (tonumber(state:GetAttribute("PhaseEndsAt")) or 0) - serverTime()
         head = ("Day %s · %s · %s left"):format(tostring(day), tostring(phase):lower(), clock(left))
         if state:GetAttribute("BloodMoon") then head = head .. " · blood moon" end
         if state:GetAttribute("Thunderstorm") then head = head .. " · storm" elseif state:GetAttribute("Rain") then head = head .. " · rain" end
@@ -1775,6 +2163,15 @@ track(RunService.RenderStepped:Connect(function()
             facing = Farm.faceLearned and "facing targets (swings needed it)" or "not turning you yet"
         end
         Readout.facing.Set(facing)
+        local cant = {}
+        for asset, toolName in pairs(Farm.cantTool) do
+            cant[#cant + 1] = ("%s (%s is not enough)"):format(displayName(asset), toolName)
+        end
+        table.sort(cant)
+        Readout.cant.Set(cant[1] and table.concat(cant, ", ") or "nothing so far")
+        Readout.dodged.Set(Dodge.dodged)
+        Readout.saves.Set(Fall.saves)
+        Readout.cages.Set(Cages.broken)
     end
 end))
 
@@ -1921,6 +2318,14 @@ do
         Callback = function(state) Swing.Manual = state end,
     })
 
+    section:Toggle({
+        Title = 'move on during the last hit',
+        Description = 'as the swing that breaks a resource goes out, heads for the next one instead of waiting to see it break, so the next swing is ready the moment the cooldown ends',
+        Flag = 'chunk_farm_move_on',
+        Default = true,
+        Callback = function(state) Farm.MoveOn = state end,
+    })
+
     section:Label({
         Title = 'Keep the old axes and pickaxes you replaced: tool swap needs two or more of a kind. Watch damage per second below; if tool swap is no higher than on cooldown, this server times every swing per player and nothing on your side can beat it.',
     })
@@ -1932,6 +2337,18 @@ do
     Readout.landed = addStat(section, { Title = 'hits landing', Value = 0 })
     Readout.dps = addStat(section, { Title = 'damage per second', Value = 0 })
     Readout.facing = addStat(section, { Title = 'facing', Value = '-' })
+    Readout.cant = addStat(section, { Title = "won't break", Value = 'nothing so far' })
+
+    section:Button({
+        Title = "forget what won't break",
+        Description = 'lets the farm try everything again, say after the server changed its mind',
+        Callback = function()
+            table.clear(Farm.cant)
+            table.clear(Farm.cantTool)
+            table.clear(Farm.fails)
+            table.clear(Farm.can)
+        end,
+    })
 end
 
 do
@@ -2189,6 +2606,61 @@ do
 
     section = LootTab:CreateSection('readout')
     Readout.loot = addStat(section, { Title = 'looted', Value = '-' })
+end
+
+do
+    local ExtraTab = Window:CreateTab({ Title = 'extra' })
+    local section = ExtraTab:CreateSection('anti hit')
+
+    section:Toggle({
+        Title = 'anti hit',
+        Description = 'steps you out of the way of enemy swings, thrown things, spears, lightning and the cages and tombs bosses drop, onto solid ground, then carries on',
+        Flag = 'chunk_dodge',
+        Default = false,
+        Callback = function(state) Dodge.Enabled = state end,
+    })
+
+    section:Toggle({
+        Title = 'dodge swings',
+        Description = 'only when you are in front of the enemy swinging, so standing behind one with the kill aura keeps you fighting',
+        Flag = 'chunk_dodge_melee',
+        Default = true,
+        Callback = function(state) Dodge.Melee = state end,
+    })
+
+    section:Toggle({
+        Title = 'dodge thrown and dropped things',
+        Description = 'rocks, spears, lightning, the beast cage and the pharaoh tomb, from where and when the game says they land',
+        Flag = 'chunk_dodge_ranged',
+        Default = true,
+        Callback = function(state) Dodge.Ranged = state end,
+    })
+
+    Readout.dodged = addStat(section, { Title = 'dodged', Value = 0 })
+
+    section = ExtraTab:CreateSection('anti fall')
+
+    section:Toggle({
+        Title = 'anti fall',
+        Description = 'if you go off an edge with nothing below, puts you straight back on the last ground you stood on',
+        Flag = 'chunk_anti_fall',
+        Default = false,
+        Callback = function(state) Fall.Enabled = state end,
+    })
+
+    Readout.saves = addStat(section, { Title = 'saved', Value = 0 })
+
+    section = ExtraTab:CreateSection('cages')
+
+    section:Toggle({
+        Title = 'break cages',
+        Description = "breaks the beast's cage when it drops on you or a teammate within 80 studs, with whatever tool it takes",
+        Flag = 'chunk_cages',
+        Default = false,
+        Callback = function(state) Cages.Enabled = state end,
+    })
+
+    Readout.cages = addStat(section, { Title = 'cages broken', Value = 0 })
 end
 
 do
