@@ -108,6 +108,7 @@ local Dodge = {
     ping = 0.12,
     pingAt = -math.huge,
     holdUntil = -math.huge,
+    refusals = 0,
     dashes = 0,
     status = "off",
     action = nil,
@@ -284,6 +285,9 @@ end
 
 local HORIZON = 0.7
 local STEP = 1 / 120
+-- how long a ball can sit on you without knocking you out before it counts
+-- as stuck (a shield, an orb, a death effect) rather than as a hit coming in
+local STUCK_AFTER = 0.25
 
 -- Earliest time a ball flying straight on at its relative velocity touches
 -- you, or nil if it misses within the horizon.
@@ -361,6 +365,17 @@ local function scan(now)
             local rel = part.Position - ctx.pos
             local w = state.vel - myVel
             local reach = ballReach(part)
+            -- A ball resting on you cannot be dodged and is no danger right
+            -- now; dashing at it would only spin you round and round. It is
+            -- left alone until it has moved well off you.
+            local gap = bodyGap(rel) - reach
+            if gap <= 0.5 then
+                state.touching = state.touching or now
+                if now - state.touching > STUCK_AFTER then state.stuck = true end
+            else
+                state.touching = nil
+                if gap > 4 then state.stuck = false end
+            end
             local tti = straightContact(rel, w, reach)
             if state.onMe then
                 ctx.onMe = ctx.onMe + 1
@@ -377,7 +392,8 @@ local function scan(now)
             -- a new chase gets a fresh timing roll
             if state.onMe ~= state.wasOnMe then state.jitter = nil end
             state.wasOnMe = state.onMe
-            local counts = (state.onMe or Dodge.Stray) and not (state.fake and Dodge.IgnoreFake)
+            local counts = (state.onMe or Dodge.Stray) and not state.stuck
+                and not (state.fake and Dodge.IgnoreFake)
             if tti and counts and (not ctx.tti or tti < ctx.tti) then
                 ctx.threat, ctx.tti = part, tti
             end
@@ -721,12 +737,28 @@ end
 
 --// dodge ---------------------------------------------------------------------
 
-local BLOCKING_TAGS = { "Downed", "HumanShield", "FreezeTagFrozen" }
+-- Auto dodge keeps its hands off whenever the game's own dash would refuse,
+-- and whenever turning you round could fling a limp body about.
+local BLOCKING_TAGS = { Downed = "downed", HumanShield = "held as a shield", FreezeTagFrozen = "frozen" }
 
-local function dashBlocked(char)
-    for _, tag in ipairs(BLOCKING_TAGS) do
-        if CollectionService:HasTag(char, tag) then return tag end
+local LIMP_STATES = {}
+for _, name in ipairs({ "Dead", "Physics", "Ragdoll", "Seated", "PlatformStanding", "FallingDown", "GettingUp" }) do
+    local ok, item = pcall(function() return Enum.HumanoidStateType[name] end)
+    if ok and item then LIMP_STATES[item] = true end
+end
+
+local function dashBlocked(ctx)
+    local char = ctx.char
+    for tag, why in pairs(BLOCKING_TAGS) do
+        if CollectionService:HasTag(char, tag) then return why end
     end
+    -- DashHandler only dashes in a round or in the lobby
+    if not CollectionService:HasTag(char, "Playing") and not CollectionService:HasTag(char, "Lobby") then
+        return "not in a round"
+    end
+    if char:GetAttribute("Ragdolled") == true or ctx.root.Anchored then return "ragdolled" end
+    local ok, state = pcall(function() return ctx.humanoid:GetState() end)
+    if ok and LIMP_STATES[state] then return "knocked over" end
     return nil
 end
 
@@ -770,10 +802,10 @@ local function dodge(ctx, now, dt)
     end
 
     local state = Balls[ctx.threat]
-    local blocked = dashBlocked(ctx.char)
+    local blocked = dashBlocked(ctx)
     Dodge.status = ("%s · %.2fs"):format(state.onMe and "ball on you" or "stray ball", ctx.tti)
     if blocked then
-        Dodge.status = Dodge.status .. " · can't dash (" .. blocked:lower() .. ")"
+        Dodge.status = Dodge.status .. " · can't dash (" .. blocked .. ")"
         return
     end
     if not state.jitter then
@@ -792,17 +824,23 @@ local function dodge(ctx, now, dt)
         Dodge.status = why
         return
     end
+    local root = ctx.root
+    local facingBefore = root.CFrame
     if plan.facing then
-        local pos = ctx.root.Position
-        ctx.root.CFrame = CFrame.lookAt(pos, pos + plan.facing)
+        local pos = root.Position
+        root.CFrame = CFrame.lookAt(pos, pos + plan.facing)
     end
-    local ok, err = Dash.fire(plan.side, ctx.root)
+    local ok, err = Dash.fire(plan.side, root)
     if not ok then
+        -- no dash went out, so the turn is undone, and each refusal in a row
+        -- waits twice as long before the next try
+        if plan.facing then root.CFrame = facingBefore end
+        Dodge.refusals = Dodge.refusals + 1
+        Dodge.holdUntil = now + math.min(0.05 * 2 ^ Dodge.refusals, 1)
         Dodge.status = err or "dash failed"
-        -- a refusal is not asked again every single frame
-        Dodge.holdUntil = now + 0.06
         return
     end
+    Dodge.refusals = 0
     Dodge.holdUntil = now + 0.08
     Dodge.dashes = Dodge.dashes + 1
     state.jitter = nil
@@ -952,7 +990,9 @@ function Esp.paint(part, state, obj, from)
         local dist = from and (part.Position - from).Magnitude or 0
         local speed = state.vel and state.vel.Magnitude or 0
         text = ("%s\n%d st · %d st/s"):format(text, math.floor(dist + 0.5), math.floor(speed + 0.5))
-        if state.tti and state.tti < 3 then
+        if state.stuck then
+            text = text .. " · stuck"
+        elseif state.tti and state.tti < 3 then
             text = text .. (" · %.2fs"):format(state.tti)
         end
     end
@@ -1153,7 +1193,7 @@ track(PreRender:Connect(function()
     local onMe, soonest = 0, nil
     for part, state in pairs(Balls) do
         if part.Parent and state.vel then
-            if state.onMe then
+            if state.onMe and not state.stuck then
                 onMe = onMe + 1
                 if state.tti and (not soonest or state.tti < soonest) then soonest = state.tti end
             end
