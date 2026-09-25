@@ -5,18 +5,25 @@
 --  * Gathering is GatherHit:FireServer() and a tool swing is MouseClick:FireServer(),
 --    both with no arguments at all. The server works out what you hit; the one
 --    rule the client knows is GameConfig.GATHER_DISTANCE (12 studs). The game
---    itself fires them on a loop at the tool's cooldown while you hold click.
+--    itself fires them on a loop at the tool's cooldown while you hold click,
+--    and only while the server has the tool Enabled: the server times swings,
+--    so sending more of them than the cooldown allows does nothing.
 --  * Resources are models under GeneratedChunks.<chunk>.Resources carrying
 --    ResourceType (Tree / Rock), Health and Depleted. Axes cut trees, pickaxes
 --    break rocks.
 --  * Enemies (Workspace.Enemies) and animals (Workspace.Animals) keep their
 --    health on a Humanoid named Humanoid2.
 --  * Food is the player's Food attribute; eating is Eat:FireServer(foodTool)
---    with a tool that has a Food attribute in your hands.
+--    with a tool that has a Food attribute in your hands. Bandages are tools
+--    with a HealAmount that heal while UseItem:FireServer(tool) is held.
 --  * Builds sit in Workspace.Builds with a BuildHumanoid, and
 --    RepairBuild:InvokeServer(build) mends one while a Repair Hammer is held.
 --  * The death screen revives through ClaimFreeRevive: free once, then saved
 --    credits with "Saved".
+--  * Loot from crates and resources goes straight into your inventory; the
+--    items that fly at you are only an effect. Crates are hold prompts marked
+--    Crate, often inside barns, towers and wells. Items players drop lie in
+--    Workspace.WorldItemDrops.
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -97,6 +104,7 @@ local Remotes = {
     GatherHit = remote("GatherHit"),
     MouseClick = remote("MouseClick"),
     Eat = remote("Eat"),
+    UseItem = remote("UseItem"),
     RepairBuild = remote("RepairBuild"),
     ClaimFreeRevive = remote("ClaimFreeRevive"),
 }
@@ -155,20 +163,30 @@ local Farm = {
 
 local Swing = {
     Fast = false,
-    Every = 0.15,
+    Mode = "tool swap",
+    Every = 0.1,
     Manual = true,
     count = 0,
+    readyAt = setmetatable({}, { __mode = "k" }),
+    firedAt = setmetatable({}, { __mode = "k" }),
+    turns = 0,
+    damage = {},
 }
 
 local Aura = {
     Enabled = false,
+    Stick = true,
+    Spot = "behind",
+    Distance = 3,
+    StickRange = 80,
     Range = 12,
+    Priority = "nearest",
     Animals = false,
     Face = "auto",
-    Hunt = false,
-    HuntRange = 60,
     AutoSword = true,
+    Return = true,
 
+    skip = {},
     swings = 0,
     progressAt = 0,
     faceLearned = false,
@@ -177,9 +195,21 @@ local Aura = {
 }
 
 local Food = { Enabled = false, Below = 40, eaten = 0 }
+local Heal = { Enabled = false, Below = 50, used = 0 }
 local Repair = { Enabled = false, Travel = false, Range = 60, done = 0 }
 local Revive = { Enabled = false, UseSaved = true }
-local Loot = { Crates = false, Drops = false, Range = 80, Travel = true, visits = {} }
+local Loot = {
+    Crates = false,
+    Drops = false,
+    Travel = true,
+    Range = 120,
+    LeaveCrafter = true,
+    tries = setmetatable({}, { __mode = "k" }),
+    skip = setmetatable({}, { __mode = "k" }),
+    visits = setmetatable({}, { __mode = "k" }),
+    opened = 0,
+    collected = 0,
+}
 local Night = { Base = false, Warn = true }
 
 local Move = {
@@ -206,6 +236,9 @@ local Misc = { AntiAfk = true }
 local FARM_KINDS = { 'trees and rocks', 'trees', 'rocks', 'ores only' }
 local MOVE_MODES = { 'teleport', 'glide', 'walk', "don't move" }
 local FACE_MODES = { 'auto', 'always', 'never' }
+local SWING_MODES = { 'tool swap', 'on cooldown', 'spam' }
+local STICK_SPOTS = { 'behind', 'above', 'circle' }
+local PRIORITIES = { 'nearest', 'weakest', 'strongest' }
 
 --// helpers -------------------------------------------------------------------
 
@@ -239,6 +272,11 @@ local function face(root, point)
     local look = flat(point - pos)
     if look.Magnitude < 0.1 then return end
     root.CFrame = CFrame.lookAt(pos, pos + look)
+end
+
+-- how high your root part sits above the floor you stand on
+local function standHeight(root, hum)
+    return (hum.HipHeight > 0 and hum.HipHeight or 2) + root.Size.Y / 2
 end
 
 -- One round trip: a teleport has to reach the server before a swing from the
@@ -281,29 +319,32 @@ local function allTools()
     return list
 end
 
--- the strongest tool that passes test: gather tools by the game's own damage
--- numbers, anything else by the material in its name
-local function bestTool(test)
-    local best, bestRank
+-- gather tools rank by the game's own damage numbers, anything else by the
+-- material in its name
+local function toolRank(tool)
+    local stats = Config.GATHER_TOOL_STATS[tool.Name]
+    return (stats and tonumber(stats.damage)) or tierOf(tool)
+end
+
+-- every tool that passes test, strongest first
+local function toolsWhere(test)
+    local list = {}
     for _, tool in ipairs(allTools()) do
-        if test(tool) then
-            local stats = Config.GATHER_TOOL_STATS[tool.Name]
-            local rank = (stats and tonumber(stats.damage)) or tierOf(tool)
-            if not bestRank or rank > bestRank then best, bestRank = tool, rank end
-        end
+        if test(tool) then list[#list + 1] = tool end
     end
-    return best
+    table.sort(list, function(a, b) return toolRank(a) > toolRank(b) end)
+    return list
 end
 
-local function gatherToolFor(kind)
+local function gatherToolsFor(kind)
     if kind == "Tree" then
-        return bestTool(function(tool) return tool:GetAttribute("GatherTool") == true and isAxe(tool) end)
+        return toolsWhere(function(tool) return tool:GetAttribute("GatherTool") == true and isAxe(tool) end)
     end
-    return bestTool(function(tool) return tool:GetAttribute("GatherTool") == true and isPickaxe(tool) end)
+    return toolsWhere(function(tool) return tool:GetAttribute("GatherTool") == true and isPickaxe(tool) end)
 end
 
-local function swordTool()
-    return bestTool(function(tool) return tool:GetAttribute("Sword") == true end)
+local function swordTools()
+    return toolsWhere(function(tool) return tool:GetAttribute("Sword") == true end)
 end
 
 local function heldTool(char)
@@ -316,19 +357,66 @@ local function equip(tool, hum)
     return tool
 end
 
+local function contains(list, value)
+    for _, item in ipairs(list) do
+        if item == value then return true end
+    end
+    return false
+end
+
 --// swinging --------------------------------------------------------------------------
 
--- the gap between swings: the fast swing slider when that is on, otherwise
--- the same wait the game's own loops use
-local function swingGap(tool, kind)
-    if Swing.Fast then return Swing.Every end
+-- a little past the server's cooldown, so a swing that reaches it a touch
+-- quicker than the last one is not thrown away
+local COOLDOWN_MARGIN = 0.04
+
+-- the server's wait between swings of a tool, as the game's own loops read it
+local function toolCooldown(tool, kind)
     if kind == "gather" then
         local stats = Config.GATHER_TOOL_STATS[tool.Name]
         local gap = (stats and tonumber(stats.cooldown)) or tonumber(tool:GetAttribute("SwingCooldown")) or 0.6
         if isAxe(tool) and LocalPlayer:GetAttribute("EquippedClass") == "Lumberjack" then gap = gap * 0.9 end
-        return math.max(0.05, gap) + 0.08
+        return math.max(0.05, gap)
     end
-    return math.max(0.05, tonumber(tool:GetAttribute("AttackCooldown")) or 0.5) + 0.08
+    return math.max(0.05, tonumber(tool:GetAttribute("AttackCooldown")) or 0.5)
+end
+
+-- How long after a swing a tool may swing again: the game's own wait
+-- normally, just the cooldown with fast swing, the slider in spam mode.
+local function gapAfter(tool, kind)
+    if not Swing.Fast then return toolCooldown(tool, kind) + 0.08 end
+    if Swing.Mode == "spam" then return Swing.Every end
+    return toolCooldown(tool, kind) + COOLDOWN_MARGIN
+end
+
+local function swapping(candidates)
+    return Swing.Fast and Swing.Mode == "tool swap" and #candidates > 1
+end
+
+-- The tool to swing right now out of candidates (strongest first), or nil
+-- while none is ready. The strongest always swings the moment its cooldown
+-- ends. With tool swap the rest take turns in the gaps, one per slot of the
+-- strongest one's cooldown, and only in the first half of a slot: a server
+-- that times each tool on its own takes every one of those swings, and one
+-- that times you as a whole throws them away, as none comes late enough to
+-- land in place of the strongest tool's own swing.
+local function pickSwing(candidates, kind, now)
+    local best = candidates[1]
+    if not best then return nil end
+    if now >= (Swing.readyAt[best] or 0) then return best end
+    local anchor = Swing.firedAt[best]
+    if not swapping(candidates) or not anchor then return nil end
+    local slot = gapAfter(best, kind) / #candidates
+    local turn = math.floor((now - anchor) / slot)
+    if turn < 1 or turn >= #candidates or turn <= Swing.turns or now - anchor - turn * slot >= slot / 2 then return nil end
+    for i = 2, #candidates do
+        local tool = candidates[i]
+        if now >= (Swing.readyAt[tool] or 0) then
+            Swing.turns = turn
+            return tool
+        end
+    end
+    return nil
 end
 
 -- exactly what holding click sends: the tool activates, a gather tool sends
@@ -340,6 +428,32 @@ local function swing(tool, kind)
         Remotes.MouseClick:FireServer()
     end
     Swing.count = Swing.count + 1
+end
+
+local function swingWith(tool, kind, hum, now, candidates)
+    equip(tool, hum)
+    swing(tool, kind)
+    Swing.readyAt[tool] = now + gapAfter(tool, kind)
+    if tool == candidates[1] then
+        Swing.firedAt[tool] = now
+        Swing.turns = 0
+    end
+end
+
+-- damage you have done in the last ten seconds, for the damage per second readout
+local function noteDamage(now, amount)
+    local log = Swing.damage
+    log[#log + 1] = { at = now, amount = amount }
+    while log[1] and now - log[1].at > 10 do table.remove(log, 1) end
+end
+
+local function damageRate(now)
+    local log = Swing.damage
+    while log[1] and now - log[1].at > 10 do table.remove(log, 1) end
+    if not log[1] then return 0 end
+    local total = 0
+    for i = 1, #log do total = total + log[i].amount end
+    return total / math.max(now - log[1].at, 2)
 end
 
 --// world -------------------------------------------------------------------------------
@@ -380,6 +494,9 @@ local function scanResources()
     for model, untilTime in pairs(Farm.skip) do
         if untilTime <= now or not model.Parent then Farm.skip[model] = nil end
     end
+    for model, untilTime in pairs(Aura.skip) do
+        if untilTime <= now or not model.Parent then Aura.skip[model] = nil end
+    end
 end
 
 local function resourcePoint(model)
@@ -397,17 +514,40 @@ local rayParams = RaycastParams.new()
 rayParams.FilterType = Enum.RaycastFilterType.Exclude
 rayParams.IgnoreWater = true
 
+local overlapParams = OverlapParams.new()
+overlapParams.FilterType = Enum.RaycastFilterType.Exclude
+
+-- The floor under a point, looked for from a little above it so a roof or a
+-- tree top overhead is never mistaken for the ground.
+local function floorBelow(point, above, depth, ignore)
+    rayParams.FilterDescendantsInstances = ignore or RaycastIgnore
+    local hit = Workspace:Raycast(point + Vector3.new(0, above, 0), Vector3.new(0, -(above + depth), 0), rayParams)
+    return hit and hit.Position.Y or nil
+end
+
 -- A spot gap studs short of a point, on your side of it and standing on the
 -- ground (trees, balls of leaves and creatures do not count as ground).
 local function spotNear(point, root, hum, gap)
     local away = flat(root.Position - point)
     away = away.Magnitude > 0.1 and away.Unit or Vector3.new(1, 0, 0)
     local base = point + away * gap
-    rayParams.FilterDescendantsInstances = RaycastIgnore
-    local hit = Workspace:Raycast(Vector3.new(base.X, point.Y + 40, base.Z), Vector3.new(0, -140, 0), rayParams)
-    local height = (hum.HipHeight > 0 and hum.HipHeight or 2) + root.Size.Y / 2 + 0.3
-    if hit then return Vector3.new(base.X, hit.Position.Y + height, base.Z) end
+    local floor = floorBelow(base, 8, 60)
+    if floor then return Vector3.new(base.X, floor + standHeight(root, hum) + 0.3, base.Z) end
     return Vector3.new(base.X, math.max(root.Position.Y, point.Y), base.Z)
+end
+
+-- whether a body standing on the floor at feet fits there with nothing solid
+-- in the way
+local function bodyFits(feet, ignore)
+    overlapParams.FilterDescendantsInstances = ignore
+    local ok, parts = pcall(function()
+        return Workspace:GetPartBoundsInBox(CFrame.new(feet + Vector3.new(0, 2.7, 0)), Vector3.new(2, 4.6, 2), overlapParams)
+    end)
+    if not ok or type(parts) ~= "table" then return true end
+    for _, part in ipairs(parts) do
+        if part.CanCollide then return false end
+    end
+    return true
 end
 
 -- Gets you to a spot the chosen way. Returns true once you are there (a
@@ -485,6 +625,19 @@ local function basePoint(from)
     return nil
 end
 
+-- every chunk crafter in the world
+local function chunkCrafters()
+    local list = {}
+    local chunks = Workspace:FindFirstChild("GeneratedChunks")
+    if chunks then
+        for _, chunk in ipairs(chunks:GetChildren()) do
+            local crafter = chunk:FindFirstChild("ChunkCrafting")
+            if crafter then list[#list + 1] = crafter end
+        end
+    end
+    return list
+end
+
 --// auto farm ------------------------------------------------------------------------------
 
 local function wantKind(model)
@@ -531,6 +684,7 @@ end
 -- landing; a target that still will not take damage is passed over.
 local function checkProgress(state, health, now, mode)
     if state.lastHealth and health < state.lastHealth then
+        noteDamage(now, state.lastHealth - health)
         state.progressAt = now
         state.misses = 0
         state.landed = (state.landed or 0) + 1
@@ -539,8 +693,10 @@ local function checkProgress(state, health, now, mode)
         state.misses = (state.misses or 0) + 1
         if mode == "auto" and not state.faceLearned then
             state.faceLearned = true
+            state.lastHealth = health
             return "face"
         end
+        state.lastHealth = health
         return "skip"
     end
     state.lastHealth = health
@@ -553,7 +709,9 @@ local function farmStep(now, dt, char, root, hum)
         return false
     end
 
-    local tools = { Tree = gatherToolFor("Tree"), Rock = gatherToolFor("Rock") }
+    local tools = { Tree = gatherToolsFor("Tree"), Rock = gatherToolsFor("Rock") }
+    if not tools.Tree[1] then tools.Tree = nil end
+    if not tools.Rock[1] then tools.Rock = nil end
     if not tools.Tree and not tools.Rock then
         Farm.status = "no axe or pickaxe"
         return false
@@ -582,10 +740,9 @@ local function farmStep(now, dt, char, root, hum)
         return false
     end
 
-    local kind = target:GetAttribute("ResourceType")
-    local tool = equip(tools[kind], hum)
+    local candidates = tools[target:GetAttribute("ResourceType")]
     local point = resourcePoint(target)
-    if not tool or not point then return false end
+    if not point then return false end
 
     local name = target:GetAttribute("AssetName") or target.Name
     if flatDistance(point, root.Position) > gatherReach() then
@@ -594,6 +751,7 @@ local function farmStep(now, dt, char, root, hum)
             return false
         end
         Farm.status = ("going to %s"):format(name)
+        equip(candidates[1], hum)
         local spot = spotNear(point, root, hum, 4.5)
         if not goTo(spot, Farm.Move, root, hum, dt, now, Farm) then return true end
     end
@@ -601,10 +759,12 @@ local function farmStep(now, dt, char, root, hum)
 
     if Farm.Face == "always" or (Farm.Face == "auto" and Farm.faceLearned) then face(root, point) end
 
-    if now >= (Farm.nextSwing or 0) then
-        Farm.nextSwing = now + swingGap(tool, "gather")
-        swing(tool, "gather")
+    local tool = pickSwing(candidates, "gather", now)
+    if tool then
+        swingWith(tool, "gather", hum, now, candidates)
         Farm.swings = (Farm.swings or 0) + 1
+    elseif not contains(candidates, heldTool(char)) then
+        equip(candidates[1], hum)
     end
 
     local health = tonumber(target:GetAttribute("Health")) or 0
@@ -620,16 +780,24 @@ end
 
 --// kill aura -------------------------------------------------------------------------------
 
-local function auraTarget(root)
-    local best, bestD
-    local limit = Aura.Hunt and math.max(Aura.HuntRange, Aura.Range) or Aura.Range
+-- the enemy to fight out of everything within limit, picked the chosen way
+local function auraTarget(root, limit, now)
+    local best, bestScore
     local function scan(folder)
         for _, model in ipairs(folder:GetChildren()) do
-            local alive = creatureAlive(model)
+            local alive, hum2 = creatureAlive(model)
             local part = alive and creatureRoot(model)
-            if part then
+            if part and not ((Aura.skip[model] or 0) > now) then
                 local d = (part.Position - root.Position).Magnitude
-                if d <= limit and (not bestD or d < bestD) then best, bestD = model, d end
+                if d <= limit then
+                    local score = d
+                    if Aura.Priority == "weakest" then
+                        score = hum2.Health + d * 0.01
+                    elseif Aura.Priority == "strongest" then
+                        score = -hum2.MaxHealth + d * 0.01
+                    end
+                    if not bestScore or score < bestScore then best, bestScore = model, score end
+                end
             end
         end
     end
@@ -639,58 +807,124 @@ local function auraTarget(root)
         local animals = animalsFolder()
         if animals then scan(animals) end
     end
-    return best, bestD
+    return best
+end
+
+-- Where to stand against a target, redone every frame: behind its back, over
+-- its head, or circling it, always facing it and at the height of the floor
+-- under that spot rather than its hip height.
+local function stickFrame(part, root, hum, now)
+    local center = part.Position
+    local look = flat(part.CFrame.LookVector)
+    look = look.Magnitude > 0.1 and look.Unit or Vector3.new(0, 0, -1)
+    if Aura.Spot == "above" then
+        local spot = center + Vector3.new(0, Aura.Distance + 2.5, 0)
+        return CFrame.lookAt(spot, spot + look)
+    end
+    local spot
+    if Aura.Spot == "circle" then
+        local angle = now * 3
+        spot = center + Vector3.new(math.cos(angle), 0, math.sin(angle)) * Aura.Distance
+    else
+        spot = center - look * Aura.Distance
+    end
+    local floor = floorBelow(spot, 4, 12)
+    if floor then spot = Vector3.new(spot.X, floor + standHeight(root, hum), spot.Z) end
+    return CFrame.lookAt(spot, Vector3.new(center.X, spot.Y, center.Z))
 end
 
 local function auraStep(now, dt, char, root, hum)
     if not Aura.Enabled then
         Aura.status = "off"
-        return false
-    end
-    local target, distance = auraTarget(root)
-    if not target then
-        Aura.status = "nothing in range"
         Aura.target = nil
+        Aura.home = nil
         return false
     end
-    local tool = Aura.AutoSword and swordTool() or heldTool(char)
-    if not tool then
-        Aura.status = "no sword"
-        return false
-    end
-    equip(tool, hum)
 
-    if target ~= Aura.target then
+    local reach = Aura.Stick and math.max(Aura.StickRange, Aura.Range) or Aura.Range
+    local target = Aura.target
+    if target then
+        local alive, hum2 = creatureAlive(target)
+        if not alive or not target.Parent then
+            -- it died, or it vanished after taking damage from you
+            local dealt = hum2 and hum2.Health <= 0
+                or (not target.Parent and Aura.lastHealth and Aura.maxHealth and Aura.lastHealth < Aura.maxHealth)
+            if dealt then Aura.kills = Aura.kills + 1 end
+            target = nil
+        elseif (Aura.skip[target] or 0) > now then
+            target = nil
+        else
+            local part = creatureRoot(target)
+            if not part or (part.Position - root.Position).Magnitude > reach + 10 then target = nil end
+        end
+    end
+    if not target then
+        target = auraTarget(root, reach, now)
         Aura.target = target
         Aura.lastHealth = nil
         Aura.swings = 0
         Aura.progressAt = now
+        Aura.readyAt = now
     end
+
+    if not target then
+        Aura.status = "nothing in range"
+        if Aura.home then
+            -- back to where the fight pulled you from, unless night is taking you home anyway
+            if Aura.Return and not (Night.Base and isNight()) and (Aura.home - root.Position).Magnitude > 6 then
+                root.CFrame = CFrame.new(Aura.home) * (root.CFrame - root.CFrame.Position)
+                root.AssemblyLinearVelocity = Vector3.zero
+            end
+            Aura.home = nil
+        end
+        return false
+    end
+
+    local candidates = Aura.AutoSword and swordTools() or {}
+    if not candidates[1] then
+        local held = heldTool(char)
+        if held then candidates = { held } end
+    end
+    if not candidates[1] then
+        Aura.status = "no sword"
+        return false
+    end
+    if not contains(candidates, heldTool(char)) then equip(candidates[1], hum) end
 
     local part = creatureRoot(target)
-    if distance > Aura.Range then
-        local spot = spotNear(part.Position, root, hum, 3)
-        if not goTo(spot, "teleport", root, hum, dt, now, Aura) then return true end
+    local _, hum2 = creatureAlive(target)
+    if Aura.Stick then
+        if not Aura.home then Aura.home = root.Position end
+        -- every frame, so it never gets to turn round and face you
+        root.CFrame = stickFrame(part, root, hum, now)
+        root.AssemblyLinearVelocity = Vector3.zero
+    elseif Aura.Face == "always" or (Aura.Face == "auto" and Aura.faceLearned) then
+        face(root, part.Position)
     end
-    if now < (Aura.settleUntil or 0) then return true end
 
-    if Aura.Face == "always" or (Aura.Face == "auto" and Aura.faceLearned) then face(root, part.Position) end
+    -- the first swing waits for your new position to reach the server
+    if Aura.Stick and now < Aura.readyAt + roundTrip() then
+        Aura.status = ("moving onto %s"):format(target.Name)
+        return true
+    end
 
-    if now >= (Aura.nextSwing or 0) then
-        Aura.nextSwing = now + swingGap(tool, "attack")
-        swing(tool, "attack")
+    local tool = pickSwing(candidates, "attack", now)
+    if tool then
+        swingWith(tool, "attack", hum, now, candidates)
         Aura.swings = (Aura.swings or 0) + 1
     end
 
-    local _, hum2 = creatureAlive(target)
     local health = hum2 and hum2.Health or 0
+    Aura.maxHealth = hum2 and hum2.MaxHealth or nil
     if health <= 0 then
         Aura.kills = Aura.kills + 1
         Aura.target = nil
-    elseif checkProgress(Aura, health, now, Aura.Face) == "skip" then
-        -- nothing lands on it from here; the next one gets a turn
+    elseif checkProgress(Aura, health, now, Aura.Stick and "always" or Aura.Face) == "skip" then
+        -- nothing lands on it; leave it be for a while so the next one gets a turn
+        Aura.skip[target] = now + 10
         Aura.target = nil
     end
+    local distance = (part.Position - root.Position).Magnitude
     Aura.status = ("%s %d hp · %d st"):format(target.Name, math.floor(health + 0.5), math.floor(distance + 0.5))
     return true
 end
@@ -738,10 +972,44 @@ local function eatStep(now, char, root, hum)
     return true
 end
 
-local function hammerFor(totem)
-    return bestTool(function(tool)
-        return tool:GetAttribute("RepairTool") == true and (tool:GetAttribute("TotemRepairTool") == true) == totem
+-- Bandages heal while they are held and used, the way holding click with one
+-- does. It stops once you are full, after six seconds, or if you get hit.
+local function healStep(now, char, root, hum)
+    if not Heal.Enabled or not Remotes.UseItem then return false end
+    if Heal.tool then
+        local done = hum.Health >= hum.MaxHealth * 0.98 or now >= Heal.stopAt
+            or Heal.tool.Parent ~= char or hum.Health < Heal.lowest - 1
+        Heal.lowest = math.min(Heal.lowest, hum.Health)
+        if not done then return true end
+        Remotes.UseItem:FireServer(nil)
+        if Heal.previous and Heal.previous ~= Heal.tool and Heal.previous.Parent then equip(Heal.previous, hum) end
+        Heal.tool, Heal.previous = nil, nil
+        Heal.nextTry = now + 1.5
+        return false
+    end
+    if hum.Health / hum.MaxHealth * 100 >= Heal.Below or now < (Heal.nextTry or 0) then return false end
+    local bandage = toolsWhere(function(tool) return tonumber(tool:GetAttribute("HealAmount")) ~= nil end)[1]
+    if not bandage then
+        Heal.nextTry = now + 5
+        return false
+    end
+    Heal.previous = heldTool(char)
+    equip(bandage, hum)
+    Heal.tool = bandage
+    Heal.stopAt = now + 6
+    Heal.lowest = hum.Health
+    task.delay(0.12, function()
+        if Unloaded or Heal.tool ~= bandage then return end
+        Remotes.UseItem:FireServer(bandage)
+        Heal.used = Heal.used + 1
     end)
+    return true
+end
+
+local function hammerFor(totem)
+    return toolsWhere(function(tool)
+        return tool:GetAttribute("RepairTool") == true and (tool:GetAttribute("TotemRepairTool") == true) == totem
+    end)[1]
 end
 
 -- the nearest build of yours that is damaged, as the game's own repair hammer
@@ -835,27 +1103,118 @@ track(Workspace.DescendantAdded:Connect(function(inst)
     if inst:IsA("ProximityPrompt") then task.defer(noteCrate, inst) end
 end))
 
+local function promptPart(prompt)
+    local parent = prompt.Parent
+    if parent and parent:IsA("Attachment") then parent = parent.Parent end
+    if parent and parent:IsA("BasePart") then return parent end
+    if parent and parent:IsA("Model") then return parent.PrimaryPart or parent:FindFirstChildWhichIsA("BasePart", true) end
+    return nil
+end
+
 local function promptPoint(prompt)
     local parent = prompt.Parent
     if parent and parent:IsA("Attachment") then return parent.WorldPosition end
     return parent and pivotOf(parent) or nil
 end
 
-local function nearestCrate(root)
+-- Presses a prompt: the executor's fireproximityprompt skipping the hold,
+-- or failing that the prompt's own input with the hold taken out. With hold
+-- it holds for the prompt's full time instead, for a server that times it
+-- (that waits, so only from a thread that can).
+local function firePrompt(prompt, hold)
+    if typeof(fireproximityprompt) == "function" and pcall(fireproximityprompt, prompt, 1, not hold) then
+        return true
+    end
+    return (pcall(function()
+        if hold then
+            prompt:InputHoldBegin()
+            task.wait(prompt.HoldDuration + 0.05)
+            prompt:InputHoldEnd()
+            return
+        end
+        local duration, sight = prompt.HoldDuration, prompt.RequiresLineOfSight
+        prompt.HoldDuration = 0
+        prompt.RequiresLineOfSight = false
+        prompt:InputHoldBegin()
+        prompt:InputHoldEnd()
+        prompt.HoldDuration = duration
+        prompt.RequiresLineOfSight = sight
+    end))
+end
+
+-- The crate a prompt opens: the nearest model over the prompt when it is
+-- crate sized, otherwise the part the prompt sits on. Gives its middle, its
+-- size and the thing itself.
+local function crateBox(prompt)
+    local node = prompt.Parent
+    while node and node ~= Workspace do
+        if node:IsA("Model") then
+            local ok, cf, size = pcall(function() return node:GetBoundingBox() end)
+            if ok and cf and size and size.X <= 16 and size.Y <= 16 and size.Z <= 16 then
+                return cf.Position, size, node
+            end
+            break
+        end
+        node = node.Parent
+    end
+    local part = promptPart(prompt)
+    if part then return part.Position, part.Size, part end
+    local point = promptPoint(prompt)
+    if point then return point, Vector3.new(2, 2, 2), nil end
+    return nil
+end
+
+-- Somewhere to stand right beside a crate, on the same floor it sits on: the
+-- side facing you first, then the other sides, then the top of the crate. The
+-- floor is looked for from just above the crate's own bottom, so the roof of
+-- the barn or tower it is in never counts.
+local function crateSpot(prompt, root, hum)
+    local center, size, crate = crateBox(prompt)
+    if not center then return nil end
+    local bottom = center.Y - size.Y / 2
+    local height = standHeight(root, hum)
+    local ignore = { LocalPlayer.Character }
+    if crate then ignore[#ignore + 1] = crate end
+    for _, inst in ipairs(RaycastIgnore) do ignore[#ignore + 1] = inst end
+    local away = flat(root.Position - center)
+    local start = away.Magnitude > 0.1 and math.atan2(away.Z, away.X) or 0
+    local gap = math.max(size.X, size.Z) / 2 + 1.8
+    for i = 0, 7 do
+        local turn = math.ceil(i / 2) * (i % 2 == 0 and 1 or -1)
+        local angle = start + turn * math.pi / 4
+        local side = center + Vector3.new(math.cos(angle), 0, math.sin(angle)) * gap
+        local floor = floorBelow(Vector3.new(side.X, bottom, side.Z), 2.5, 3.5, ignore)
+        if floor and math.abs(floor - bottom) <= 2 and bodyFits(Vector3.new(side.X, floor, side.Z), ignore) then
+            return Vector3.new(side.X, floor + height, side.Z), center
+        end
+    end
+    return Vector3.new(center.X, center.Y + size.Y / 2 + height, center.Z), center
+end
+
+local function nearestCrate(root, now, limit)
     local best, bestD
     for prompt in pairs(Crates) do
         if not prompt.Parent or prompt:GetAttribute("Crate") ~= true then
             Crates[prompt] = nil
-        elseif prompt.Enabled then
+        elseif prompt.Enabled and not ((Loot.skip[prompt] or 0) > now) then
             local point = promptPoint(prompt)
             local d = point and (point - root.Position).Magnitude
-            if d and d <= Loot.Range and (not bestD or d < bestD) then best, bestD = prompt, d end
+            if d and d <= (limit or Loot.Range) and (not bestD or d < bestD) then best, bestD = prompt, d end
         end
     end
     return best, bestD
 end
 
-local function nearestDrop(root)
+-- players drop materials by a chunk crafter on purpose to craft a chunk
+local function byCrafter(point)
+    for _, crafter in ipairs(chunkCrafters()) do
+        local at = pivotOf(crafter)
+        if at and (at - point).Magnitude <= 16 then return true end
+    end
+    return false
+end
+
+local function nearestDrop(root, limit)
     local folder = Workspace:FindFirstChild("WorldItemDrops")
     if not folder then return nil end
     local best, bestD
@@ -863,38 +1222,88 @@ local function nearestDrop(root)
         local point = pivotOf(drop)
         local d = point and (point - root.Position).Magnitude
         -- one the game will not hand over after a few visits is left where it is
-        if d and d <= Loot.Range and d > 3 and (Loot.visits[drop] or 0) < 4 and (not bestD or d < bestD) then
+        if d and d <= limit and (Loot.visits[drop] or 0) < 4 and (not bestD or d < bestD)
+            and not (Loot.LeaveCrafter and byCrafter(point)) then
             best, bestD = drop, d
         end
     end
     return best, bestD
 end
 
+-- Picks a dropped item up whichever way it wants: its prompt, a click
+-- detector, or touching it.
+local function collectDrop(drop, root)
+    local parts = {}
+    if drop:IsA("BasePart") then parts[1] = drop end
+    for _, inst in ipairs(drop:GetDescendants()) do
+        if inst:IsA("ProximityPrompt") then
+            if inst.Enabled then firePrompt(inst) end
+        elseif inst:IsA("ClickDetector") then
+            if typeof(fireclickdetector) == "function" then pcall(fireclickdetector, inst) end
+        elseif inst:IsA("BasePart") then
+            parts[#parts + 1] = inst
+        end
+    end
+    if typeof(firetouchinterest) == "function" then
+        for i = 1, math.min(#parts, 4) do
+            pcall(firetouchinterest, root, parts[i], 0)
+            pcall(firetouchinterest, root, parts[i], 1)
+        end
+    end
+end
+
 local function lootStep(now, dt, char, root, hum)
     if now < (Loot.busyUntil or 0) then return true end
-    if Loot.Crates and typeof(fireproximityprompt) == "function" then
-        local prompt, distance = nearestCrate(root)
+    if Loot.Crates then
+        local prompt = nearestCrate(root, now, Loot.Travel and Loot.Range or 9)
         if prompt then
-            local point = promptPoint(prompt)
-            local reach = math.max(prompt.MaxActivationDistance - 2, 4)
-            if distance > reach then
-                if not Loot.Travel then return false end
-                goTo(spotNear(point, root, hum, 3), "teleport", root, hum, dt, now, Loot)
+            local reach = math.max(math.min(prompt.MaxActivationDistance, 12) - 2, 4)
+            local tries = (Loot.tries[prompt] or 0) + 1
+            Loot.tries[prompt] = tries
+            if tries > 3 then
+                -- three goes and it is still shut: something is off with it, come back later
+                Loot.tries[prompt] = 0
+                Loot.skip[prompt] = now + 30
+                return false
             end
-            Loot.busyUntil = now + math.max(prompt.HoldDuration, 0) + roundTrip() + 0.2
+            if (promptPoint(prompt) - root.Position).Magnitude > reach then
+                local spot, center = crateSpot(prompt, root, hum)
+                if not spot then return false end
+                root.CFrame = CFrame.lookAt(spot, Vector3.new(center.X, spot.Y, center.Z))
+                root.AssemblyLinearVelocity = Vector3.zero
+            end
+            -- the last go holds for the full time, in case this server times the hold
+            local hold = tries == 3
+            Loot.busyUntil = now + roundTrip() + 0.35 + (hold and prompt.HoldDuration or 0)
             task.delay(roundTrip(), function()
-                if Unloaded or not prompt.Parent then return end
-                pcall(fireproximityprompt, prompt, 1, true)
+                if Unloaded or not prompt.Parent or not prompt.Enabled then return end
+                firePrompt(prompt, hold)
+                task.delay(0.3, function()
+                    if not prompt.Parent or not prompt.Enabled then Loot.opened = Loot.opened + 1 end
+                end)
             end)
             return true
         end
     end
-    if Loot.Drops and Loot.Travel then
-        local drop = nearestDrop(root)
+    if Loot.Drops then
+        local drop = nearestDrop(root, Loot.Travel and Loot.Range or 8)
         if drop then
+            local point = pivotOf(drop)
             Loot.visits[drop] = (Loot.visits[drop] or 0) + 1
-            goTo(pivotOf(drop) + Vector3.new(0, 3, 0), "teleport", root, hum, dt, now, Loot)
-            Loot.busyUntil = now + 0.25
+            if (point - root.Position).Magnitude > 3 then
+                -- stand right on it so touching it counts too
+                root.CFrame = CFrame.new(point + Vector3.new(0, standHeight(root, hum) - 0.5, 0)) * (root.CFrame - root.CFrame.Position)
+                root.AssemblyLinearVelocity = Vector3.zero
+            end
+            Loot.busyUntil = now + roundTrip() + 0.3
+            task.delay(roundTrip(), function()
+                if Unloaded or not drop.Parent then return end
+                local _, liveRoot = myCharacter()
+                if liveRoot then collectDrop(drop, liveRoot) end
+                task.delay(0.4, function()
+                    if not drop.Parent then Loot.collected = Loot.collected + 1 end
+                end)
+            end)
             return true
         end
     end
@@ -916,23 +1325,41 @@ track(UserInputService.InputEnded:Connect(function(input)
     Holding[input] = nil
 end))
 
--- while you hold click with a tool out, fast swing sends the same swing the
--- game does, just as often as the slider says
-local function manualStep(now, char)
+-- While you hold click with a tool out, fast swing sends the same swing the
+-- game does as soon as the server will take it, swapping between every tool
+-- of the same kind in tool swap mode.
+local function manualStep(now, char, hum)
     if not Swing.Fast or not Swing.Manual or next(Holding) == nil then return end
-    local tool = heldTool(char)
-    if not tool or now < (Swing.nextManual or 0) then return end
-    local gather = tool:GetAttribute("GatherTool") == true
-    if not gather and not tool:GetAttribute("ToolClick") then return end
-    Swing.nextManual = now + Swing.Every
-    swing(tool, gather and "gather" or "attack")
+    local held = heldTool(char)
+    if not held then return end
+    local kind, candidates
+    if held:GetAttribute("GatherTool") == true then
+        kind = "gather"
+        if Swing.Mode == "tool swap" and (isPickaxe(held) or isAxe(held)) then
+            candidates = gatherToolsFor(isPickaxe(held) and "Rock" or "Tree")
+        end
+    elseif held:GetAttribute("ToolClick") then
+        kind = "attack"
+        if Swing.Mode == "tool swap" and held:GetAttribute("Sword") == true then candidates = swordTools() end
+    else
+        return
+    end
+    if not candidates or not candidates[1] then candidates = { held } end
+    local tool = pickSwing(candidates, kind, now)
+    if tool then swingWith(tool, kind, hum, now, candidates) end
 end
 
 --// driver ----------------------------------------------------------------------------------
 
--- One job drives your character each frame, in this order: eating, then the
--- kill aura, repairs, the night, loot, and farming. Each hands over the moment
--- it has nothing to do.
+-- a new body starts every job afresh, so nothing drags you back to where you died
+track(LocalPlayer.CharacterAdded:Connect(function()
+    Aura.home, Aura.target, Farm.target = nil, nil, nil
+    Heal.tool, Heal.previous = nil, nil
+end))
+
+-- One job drives your character each frame, in this order: healing, eating,
+-- then the kill aura, repairs, the night, loot, and farming. Each hands over
+-- the moment it has nothing to do.
 local lastStep = os.clock()
 local nextScan = 0
 local lastError
@@ -950,13 +1377,14 @@ track(RunService.Heartbeat:Connect(function()
             nextScan = now + 1
             scanResources()
         end
+        if healStep(now, char, root, hum) then return end
         if eatStep(now, char, root, hum) then return end
         if auraStep(now, dt, char, root, hum) then return end
         if repairStep(now, dt, char, root, hum) then return end
         if nightStep(now, dt, char, root, hum) then return end
         if lootStep(now, dt, char, root, hum) then return end
         if farmStep(now, dt, char, root, hum) then return end
-        manualStep(now, char)
+        manualStep(now, char, hum)
     end)
     if not ok and err ~= lastError then
         lastError = err
@@ -1039,14 +1467,15 @@ end))
 
 --// teleports -------------------------------------------------------------------------------
 
-local function teleportTo(point, label)
+-- point is where the thing is; exact means point is already where you stand
+local function teleportTo(point, label, exact)
     local char, root, hum = myCharacter()
     if not char then return end
     if not point then
         notify('teleport', 'could not find ' .. label, 'warning', 3)
         return
     end
-    root.CFrame = CFrame.new(spotNear(point, root, hum, 4))
+    root.CFrame = CFrame.new(exact and point or spotNear(point, root, hum, 4))
     root.AssemblyLinearVelocity = Vector3.zero
 end
 
@@ -1090,16 +1519,27 @@ local TeleportPlaces = {
             function(inst) return inst:IsA("Model") and inst.Parent and inst.Parent.Name == "Builds" and inst.Name:find("Chest", 1, true) ~= nil end)
     end,
     ['loot crate'] = function()
-        local _, root = myCharacter()
+        local _, root, hum = myCharacter()
         if not root then return nil end
-        local saved = Loot.Range
-        Loot.Range = math.huge
-        local prompt = nearestCrate(root)
-        Loot.Range = saved
-        return prompt and promptPoint(prompt)
+        local prompt = nearestCrate(root, os.clock(), math.huge)
+        if not prompt then return nil end
+        return (crateSpot(prompt, root, hum)), true
+    end,
+    ['best ore'] = function()
+        local _, root = myCharacter()
+        local best, bestScore
+        for _, model in ipairs(Resources) do
+            local value = ORE_VALUE[model:GetAttribute("AssetName") or model.Name]
+            local point = value and resourceAlive(model) and resourcePoint(model)
+            if point and root then
+                local score = (point - root.Position).Magnitude - value * 200
+                if not bestScore or score < bestScore then best, bestScore = point, score end
+            end
+        end
+        return best
     end,
 }
-local TELEPORT_ORDER = { 'base', 'crafting table', 'chunk crafter', 'chunk forger', 'chest', 'loot crate' }
+local TELEPORT_ORDER = { 'base', 'crafting table', 'chunk crafter', 'chunk forger', 'chest', 'loot crate', 'best ore' }
 
 --// esp ---------------------------------------------------------------------------------------
 
@@ -1201,8 +1641,7 @@ local function espRefresh()
 
     if Esp.Crates then
         for prompt in pairs(Crates) do
-            local parent = prompt.Parent
-            local adornee = parent and (parent:IsA("BasePart") and parent or parent:FindFirstChildWhichIsA("BasePart", true))
+            local adornee = promptPart(prompt)
             local point = promptPoint(prompt)
             if adornee and point and prompt.Enabled then espShow(prompt, adornee, "crate\n" .. distanceText(point), COLORS.crate, false) end
         end
@@ -1325,8 +1764,10 @@ track(RunService.RenderStepped:Connect(function()
         Readout.broken.Set(Farm.broken)
         Readout.swings.Set(Swing.count)
         Readout.landed.Set(Farm.landed or 0)
+        Readout.dps.Set(("%.1f"):format(damageRate(now)))
         Readout.aura.Set(Aura.Enabled and Aura.status or "off")
         Readout.kills.Set(Aura.kills)
+        Readout.loot.Set(("%d crates opened, %d drops picked up"):format(Loot.opened, Loot.collected))
         local facing = "not turning you"
         if Farm.Face == "always" then
             facing = "facing targets"
@@ -1355,6 +1796,7 @@ local function unload()
     Unloaded = true
     Farm.Enabled = false
     Aura.Enabled = false
+    if Heal.tool and Remotes.UseItem then pcall(function() Remotes.UseItem:FireServer(nil) end) end
     for _, connection in ipairs(Connections) do
         pcall(function() connection:Disconnect() end)
     end
@@ -1447,18 +1889,27 @@ do
 
     section:Toggle({
         Title = 'fast swing',
-        Description = 'swings as often as the slider says instead of waiting out the tool cooldown. works for auto farm, kill aura and your own clicks',
-        Flag = 'chunk_fast_swing',
+        Description = 'faster swings for auto farm, kill aura and your own clicks. the server times swings itself, so this works by swinging the moment it allows and by swapping tools',
+        Flag = 'chunk_fast_swing2',
         Default = false,
         Callback = function(state) Swing.Fast = state end,
     })
 
+    section:Dropdown({
+        Title = 'how',
+        Description = 'tool swap rotates every axe, pickaxe or sword you carry so each one swings on its own cooldown. on cooldown swings your best tool the instant its cooldown ends. spam sends at the slider speed',
+        Values = SWING_MODES,
+        Default = Swing.Mode,
+        Flag = 'chunk_swing_mode',
+        Callback = function(value) Swing.Mode = value end,
+    })
+
     section:Slider({
-        Title = 'swing every',
-        Description = 'the game waits about 0.5 to 0.6 s between swings',
-        Min = 0.05, Max = 1, Increment = 0.01, Suffix = ' s',
+        Title = 'spam every',
+        Description = 'only used by spam',
+        Min = 0.02, Max = 1, Increment = 0.01, Suffix = ' s',
         Default = Swing.Every,
-        Flag = 'chunk_swing_every',
+        Flag = 'chunk_swing_every2',
         Callback = function(value) Swing.Every = tonumber(value) or Swing.Every end,
     })
 
@@ -1470,14 +1921,16 @@ do
         Callback = function(state) Swing.Manual = state end,
     })
 
-    section = FarmTab:CreateSection('readout')
     section:Label({
-        Title = 'If hits landing stops keeping up with swings sent once fast swing is on, the server is holding you to its own cooldown and a faster setting will not help.',
+        Title = 'Keep the old axes and pickaxes you replaced: tool swap needs two or more of a kind. Watch damage per second below; if tool swap is no higher than on cooldown, this server times every swing per player and nothing on your side can beat it.',
     })
+
+    section = FarmTab:CreateSection('readout')
     Readout.farm = addStat(section, { Title = 'farming', Value = 'off' })
     Readout.broken = addStat(section, { Title = 'broken', Value = 0 })
     Readout.swings = addStat(section, { Title = 'swings sent', Value = 0 })
     Readout.landed = addStat(section, { Title = 'hits landing', Value = 0 })
+    Readout.dps = addStat(section, { Title = 'damage per second', Value = 0 })
     Readout.facing = addStat(section, { Title = 'facing', Value = '-' })
 end
 
@@ -1487,14 +1940,50 @@ do
 
     section:Toggle({
         Title = 'kill aura',
-        Description = 'swings your best sword at the nearest enemy in range. it takes over from farming while anything is close',
+        Description = 'fights the nearest enemy with your best sword. it takes over from farming while anything is close',
         Flag = 'chunk_aura',
         Default = false,
         Callback = function(state) Aura.Enabled = state end,
     })
 
+    section:Toggle({
+        Title = 'tp behind them',
+        Description = 'teleports you behind your target every frame while you fight it, so it never gets to turn round and hit you',
+        Flag = 'chunk_aura_stick',
+        Default = true,
+        Callback = function(state) Aura.Stick = state end,
+    })
+
+    section:Dropdown({
+        Title = 'stand',
+        Description = 'behind its back, hovering over its head, or circling it',
+        Values = STICK_SPOTS,
+        Default = Aura.Spot,
+        Flag = 'chunk_aura_spot',
+        Callback = function(value) Aura.Spot = value end,
+    })
+
     section:Slider({
-        Title = 'range',
+        Title = 'distance',
+        Description = 'how far behind it you stand. raise it for big bosses',
+        Min = 1, Max = 10, Increment = 0.5, Suffix = ' st',
+        Default = Aura.Distance,
+        Flag = 'chunk_aura_distance',
+        Callback = function(value) Aura.Distance = tonumber(value) or Aura.Distance end,
+    })
+
+    section:Slider({
+        Title = 'tp range',
+        Description = 'how far away an enemy can be for tp behind to go after it',
+        Min = 20, Max = 300, Increment = 10, Suffix = ' st',
+        Default = Aura.StickRange,
+        Flag = 'chunk_aura_stick_range',
+        Callback = function(value) Aura.StickRange = tonumber(value) or Aura.StickRange end,
+    })
+
+    section:Slider({
+        Title = 'swing range',
+        Description = 'with tp behind off, only enemies this close get hit and you stay where you are',
         Min = 4, Max = 30, Increment = 1, Suffix = ' st',
         Default = Aura.Range,
         Flag = 'chunk_aura_range',
@@ -1502,12 +1991,29 @@ do
     })
 
     section:Dropdown({
+        Title = 'target',
+        Description = 'nearest first, the weakest first to thin a crowd, or the one with the most health first for bosses',
+        Values = PRIORITIES,
+        Default = Aura.Priority,
+        Flag = 'chunk_aura_priority',
+        Callback = function(value) Aura.Priority = value end,
+    })
+
+    section:Dropdown({
         Title = 'face target',
-        Description = 'auto only turns you to face enemies if swings stop landing',
+        Description = 'with tp behind off: auto only turns you to face enemies if swings stop landing',
         Values = FACE_MODES,
         Default = Aura.Face,
         Flag = 'chunk_aura_face',
         Callback = function(value) Aura.Face = value end,
+    })
+
+    section:Toggle({
+        Title = 'go back after fights',
+        Description = 'puts you back where you were once nothing is left to fight',
+        Flag = 'chunk_aura_return',
+        Default = true,
+        Callback = function(state) Aura.Return = state end,
     })
 
     section:Toggle({
@@ -1526,22 +2032,6 @@ do
         Callback = function(state) Aura.AutoSword = state end,
     })
 
-    section:Toggle({
-        Title = 'teleport to enemies',
-        Description = 'goes after enemies further out than the range, up to the hunt range',
-        Flag = 'chunk_aura_hunt',
-        Default = false,
-        Callback = function(state) Aura.Hunt = state end,
-    })
-
-    section:Slider({
-        Title = 'hunt range',
-        Min = 20, Max = 300, Increment = 10, Suffix = ' st',
-        Default = Aura.HuntRange,
-        Flag = 'chunk_aura_hunt_range',
-        Callback = function(value) Aura.HuntRange = tonumber(value) or Aura.HuntRange end,
-    })
-
     section = CombatTab:CreateSection('readout')
     Readout.aura = addStat(section, { Title = 'fighting', Value = 'off' })
     Readout.kills = addStat(section, { Title = 'kills', Value = 0 })
@@ -1549,7 +2039,7 @@ end
 
 do
     local SurvivalTab = Window:CreateTab({ Title = 'survival' })
-    local section = SurvivalTab:CreateSection('food')
+    local section = SurvivalTab:CreateSection('food and health')
 
     section:Toggle({
         Title = 'auto eat',
@@ -1565,6 +2055,22 @@ do
         Default = Food.Below,
         Flag = 'chunk_eat_below',
         Callback = function(value) Food.Below = tonumber(value) or Food.Below end,
+    })
+
+    section:Toggle({
+        Title = 'auto bandage',
+        Description = 'heals you with a bandage when your health drops below the line, then puts your tool back',
+        Flag = 'chunk_heal',
+        Default = false,
+        Callback = function(state) Heal.Enabled = state end,
+    })
+
+    section:Slider({
+        Title = 'bandage below',
+        Min = 10, Max = 90, Increment = 5, Suffix = '%',
+        Default = Heal.Below,
+        Flag = 'chunk_heal_below',
+        Callback = function(value) Heal.Below = tonumber(value) or Heal.Below end,
     })
 
     section = SurvivalTab:CreateSection('base')
@@ -1643,8 +2149,7 @@ do
 
     section:Toggle({
         Title = 'open crates',
-        Description = typeof(fireproximityprompt) == "function" and 'opens loot crates within the loot range'
-            or 'opens loot crates within the loot range (needs fireproximityprompt, which this executor does not have)',
+        Description = 'lands right beside each crate, on the floor it sits on, and opens it without the hold. what is inside goes straight into your inventory',
         Flag = 'chunk_crates',
         Default = false,
         Callback = function(state) Loot.Crates = state end,
@@ -1652,7 +2157,7 @@ do
 
     section:Toggle({
         Title = 'collect drops',
-        Description = 'teleports onto dropped items within the loot range so they get picked up',
+        Description = 'picks up items lying on the ground: stands on each one and uses its prompt or touches it, whichever the game wants',
         Flag = 'chunk_drops',
         Default = false,
         Callback = function(state) Loot.Drops = state end,
@@ -1660,7 +2165,7 @@ do
 
     section:Toggle({
         Title = 'teleport to loot',
-        Description = 'off only opens crates already within reach',
+        Description = 'off only opens and picks up what is already within reach',
         Flag = 'chunk_loot_travel',
         Default = true,
         Callback = function(state) Loot.Travel = state end,
@@ -1670,9 +2175,20 @@ do
         Title = 'loot range',
         Min = 10, Max = 500, Increment = 10, Suffix = ' st',
         Default = Loot.Range,
-        Flag = 'chunk_loot_range',
+        Flag = 'chunk_loot_range2',
         Callback = function(value) Loot.Range = tonumber(value) or Loot.Range end,
     })
+
+    section:Toggle({
+        Title = 'leave drops at the chunk crafter',
+        Description = 'materials dropped by a chunk crafter are there to craft a chunk, so they are left alone',
+        Flag = 'chunk_loot_crafter',
+        Default = true,
+        Callback = function(state) Loot.LeaveCrafter = state end,
+    })
+
+    section = LootTab:CreateSection('readout')
+    Readout.loot = addStat(section, { Title = 'looted', Value = '-' })
 end
 
 do
@@ -1735,7 +2251,10 @@ do
     for _, place in ipairs(TELEPORT_ORDER) do
         section:Button({
             Title = 'teleport to ' .. place,
-            Callback = function() teleportTo(TeleportPlaces[place](), place) end,
+            Callback = function()
+                local point, exact = TeleportPlaces[place]()
+                teleportTo(point, place, exact)
+            end,
         })
     end
 end
