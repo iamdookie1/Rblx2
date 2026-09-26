@@ -670,29 +670,15 @@ local function canBurst(char)
         and not (info and info:GetAttribute("Burst"))
 end
 
-local COLOR_GOOD = Color3.fromRGB(126, 217, 87)
-local COLOR_WARN = Color3.fromRGB(255, 196, 87)
-local COLOR_BAD = Color3.fromRGB(255, 96, 106)
-
--- `openness` is how good the state is *for whoever is attacking this
--- character*: 1 wide open, -1 untouchable, 0 neither. The caller flips it for
--- our own row, so a stun on us reads red and a stun on them reads green
--- without needing two copies of the same list.
 local function describeState(char)
-    if not char then return 'none', 0 end
-    if char:GetAttribute('Dead') then return 'dead', 0 end
-    if isRagdolled(char) then return 'ragdolled', 1 end
-    if hasState(char, 'Stun') then return 'stunned', 1 end
-    if hasState(char, 'IFrame') then return 'i-frames', -1 end
-    if hasState(char, 'Block') then return 'blocking', -1 end
-    if hasState(char, 'InSkill') then return 'in a skill', -1 end
-    return 'free', 0
-end
-
-local function openColor(openness)
-    if openness > 0 then return COLOR_GOOD end
-    if openness < 0 then return COLOR_BAD end
-    return nil
+    if not char then return 'none' end
+    if char:GetAttribute('Dead') then return 'dead' end
+    if isRagdolled(char) then return 'ragdolled' end
+    if hasState(char, 'Stun') then return 'stunned' end
+    if hasState(char, 'IFrame') then return 'i-frames' end
+    if hasState(char, 'Block') then return 'blocking' end
+    if hasState(char, 'InSkill') then return 'in a skill' end
+    return 'free'
 end
 
 -- Cooldowns. `ReadyAt` is an absolute server timestamp on the move instance;
@@ -1624,7 +1610,7 @@ local function buildEsp(char)
 end
 
 local function paintEsp(char, entry)
-    local label, openness = describeState(char)
+    local label = describeState(char)
     entry.name.Text = char.Name
     entry.name.Visible = true
 
@@ -2348,26 +2334,46 @@ end)
 
 --// UI -----------------------------------------------------------------------
 
-local Centrl = loadstring(game:HttpGet('https://raw.githubusercontent.com/iamdookie1/Rblx2/main/UI/Lib2.lua'))()
+-- Void (VoidUI), loaded straight from the library repo. Resolving the latest
+-- commit first means a fresh copy every load instead of the up-to-5-minute raw
+-- cache; if the API call is blocked it falls back to the main branch.
+local Void
+do
+    local ref = 'main'
+    local resolved, shaOrError = pcall(function()
+        local commit = game:GetService('HttpService'):JSONDecode(game:HttpGet('https://api.github.com/repos/iamdookie1/Ui2/commits/main'))
+        return commit.sha
+    end)
+    if resolved and shaOrError then
+        ref = shaOrError
+    else
+        warn('[Void] could not resolve the latest commit, falling back to main (raw.githubusercontent.com caches that for up to 5 minutes): ' .. tostring(shaOrError))
+    end
 
-local Window = Centrl:Window({
+    local url = ('https://raw.githubusercontent.com/iamdookie1/Ui2/%s/VoidUI.lua'):format(ref)
+    Void = loadstring(game:HttpGet(url))()
+end
+
+local Window = Void:CreateWindow({
     Title = 'itadori',
     SubTitle = 'combat',
-    Folder = 'AutoBlackFlash',
-    ToggleKey = Enum.KeyCode.RightShift,
-    Accent = Color3.fromRGB(180, 60, 255),
+    Keybind = Enum.KeyCode.RightShift,
+    Scope = 'game',
+    Status = 'ready',
+    StartOpen = true,
+    Opener = 'Topbar',
 })
 
-local MainTab = Window:Tab({ Title = 'Main', Icon = 'zap' })
+pcall(function() Void:SetAccent(Color3.fromRGB(180, 60, 255)) end)
 
-local FlashTab = MainTab:Tab({ Title = 'black flash', Icon = 'zap' })
-local IntelTab = MainTab:Tab({ Title = 'intel', Icon = 'radar' })
-local OverlayTab = MainTab:Tab({ Title = 'overlay', Icon = 'eye' })
-local TargetTab = MainTab:Tab({ Title = 'target', Icon = 'crosshair' })
+local FlashTab = Window:CreateTab('black flash')
+local IntelTab = Window:CreateTab('intel')
+local OverlayTab = Window:CreateTab('overlay')
+local TargetTab = Window:CreateTab('target')
 
---// Main > black flash -------------------------------------------------------
+--// black flash -------------------------------------------------------------
 
-local Flash = FlashTab:Section({ Title = 'auto black flash', Side = 'left' })
+local Flash = FlashTab:CreateSection('auto black flash')
 
 Flash:Toggle({
     Title = 'enabled',
@@ -2387,7 +2393,7 @@ Flash:Slider({
     Callback = function(v) Config.Chance = v end,
 })
 
-local FlashSection_Tune = FlashTab:Section({ Title = 'timing under lag', Side = 'left' })
+local FlashSection_Tune = FlashTab:CreateSection('timing under lag')
 
 FlashSection_Tune:Toggle({
     Title = 'ping compensation',
@@ -2407,31 +2413,31 @@ local FlashPing = FlashSection_Tune:Stat({ Title = 'ping', Value = '-' })
 local FlashRate = FlashSection_Tune:Stat({ Title = 'landed', Value = '0 / 0' })
 local FlashOffset = FlashSection_Tune:Stat({ Title = 'best lead', Value = 'learning' })
 
-local FlashInfo = FlashTab:Section({ Title = 'timing', Side = 'right' })
+local FlashInfo = FlashTab:CreateSection('timing')
 
 FlashInfo:Paragraph({
     Title = 'fists 1-3',
-    Text = 'Black flash fires 0.212s after the animation starts, via DivergentFistService.Activated. Chance applies here only.',
+    Content = 'Black flash fires 0.212s after the animation starts, via DivergentFistService.Activated. Chance applies here only.',
 })
 
 FlashInfo:Paragraph({
     Title = 'fist 4',
-    Text = 'No black flash. Fires ItadoriService.RightActivated 0.4s into the animation, every time.',
+    Content = 'No black flash. Fires ItadoriService.RightActivated 0.4s into the animation, every time.',
 })
 
 FlashInfo:Paragraph({
     Title = 'why it drifts when you lag',
-    Text = 'Two reasons. A timer counts wall-clock seconds but the swing is an animation, so a dropped frame delays the swing without delaying the timer and the fire lands somewhere the punch has not reached. And the server judges the window against when it receives the fire, so ping puts every attempt late by that much however well the client timed it.',
+    Content = 'Two reasons. A timer counts wall-clock seconds but the swing is an animation, so a dropped frame delays the swing without delaying the timer and the fire lands somewhere the punch has not reached. And the server judges the window against when it receives the fire, so ping puts every attempt late by that much however well the client timed it.',
 })
 
 FlashInfo:Paragraph({
     Title = 'what it does about it',
-    Text = 'The trigger watches the animation\'s own clock instead of sleeping, so a hitch moves both together, and fires early by your measured ping. Auto tune handles the rest: it tries small leads either side of that and keeps whichever lands most often, judged by ItadoriService announcing BlackFlashHit rather than a plain Hit. A punch that misses entirely is left out of the tally, since it says nothing about timing.',
+    Content = 'The trigger watches the animation\'s own clock instead of sleeping, so a hitch moves both together, and fires early by your measured ping. Auto tune handles the rest: it tries small leads either side of that and keeps whichever lands most often, judged by ItadoriService announcing BlackFlashHit rather than a plain Hit. A punch that misses entirely is left out of the tally, since it says nothing about timing.',
 })
 
---// Main > intel -------------------------------------------------------------
+--// intel -------------------------------------------------------------------
 
-local IntelSection = IntelTab:Section({ Title = 'move feed', Side = 'left' })
+local IntelSection = IntelTab:CreateSection('move feed')
 
 IntelSection:Toggle({
     Title = 'enabled',
@@ -2469,12 +2475,12 @@ IntelSection:Toggle({
 
 IntelSection:Paragraph({
     Title = 'why this exists',
-    Text = 'Chase turned out to announce through the same per-moveset RE.Effects path as everything else - as "(Moveset).Chase" - so it was never actually invisible to the feed the way this used to assume. Two real bugs were found and fixed instead: a service whose Effects remote replicated in a beat late than the rest of that service could stay permanently unhooked, and a move blamed for a hit farther away than its reach had ever been measured - true of any ranged move before its first sample - got no blame at all, which meant it could never earn that first sample either. Both are fixed now. This toggle still logs two things worth knowing if something is still missed: an Info state nothing else in the script recognises (tagged (new)), and a "[no actor]" line when an Effects announcement fires but no character could be identified in its arguments - the shape a thrown projectile\'s own announcement is likely to have, since it names the ball rather than whoever threw it.',
+    Content = 'Chase turned out to announce through the same per-moveset RE.Effects path as everything else - as "(Moveset).Chase" - so it was never actually invisible to the feed the way this used to assume. Two real bugs were found and fixed instead: a service whose Effects remote replicated in a beat late than the rest of that service could stay permanently unhooked, and a move blamed for a hit farther away than its reach had ever been measured - true of any ranged move before its first sample - got no blame at all, which meant it could never earn that first sample either. Both are fixed now. This toggle still logs two things worth knowing if something is still missed: an Info state nothing else in the script recognises (tagged (new)), and a "[no actor]" line when an Effects announcement fires but no character could be identified in its arguments - the shape a thrown projectile\'s own announcement is likely to have, since it names the ball rather than whoever threw it.',
 })
 
 IntelSection:Paragraph({
     Title = 'm1s',
-    Text = 'Basic attacks are detected. They go out as <Moveset>Service.Activated and come back as that service\'s Effects "Swing" / "Swing2" - the fist whoosh and arm flash that play as the swing starts, before contact - so they show as Itadori, Gojo and so on. Swing2 carries which hit of the chain it is, shown as m1 to m4, and hit four is usually the finisher or launch. A chain collapses to one log line but every swing still counts as a threat.',
+    Content = 'Basic attacks are detected. They go out as <Moveset>Service.Activated and come back as that service\'s Effects "Swing" / "Swing2" - the fist whoosh and arm flash that play as the swing starts, before contact - so they show as Itadori, Gojo and so on. Swing2 carries which hit of the chain it is, shown as m1 to m4, and hit four is usually the finisher or launch. A chain collapses to one log line but every swing still counts as a threat.',
 })
 
 IntelSection:Slider({
@@ -2492,22 +2498,22 @@ local FeedLog = IntelSection:Console({
     Title = 'announcements',
     Height = 150,
     MaxLines = 80,
-    Timestamps = true,
 })
 
 feedSink = function(text, kind)
+    -- Void's console keeps no clock, so each line carries the time it came in
+    local now = os.date('*t')
+    local line = ('%02d:%02d:%02d  %s'):format(now.hour, now.min, now.sec, text)
     if kind == 'success' then
-        FeedLog:Success(text)
+        FeedLog:Good(line)
     elseif kind == 'warn' then
-        FeedLog:Warn(text)
-    elseif kind == 'info' then
-        FeedLog:Info(text)
+        FeedLog:Bad(line)
     else
-        FeedLog:Add(text)
+        FeedLog:Append(line)
     end
 end
 
-local TimingSection = IntelTab:Section({ Title = 'learned timings', Side = 'right' })
+local TimingSection = IntelTab:CreateSection('learned timings')
 
 local HookedStat = TimingSection:Stat({ Title = 'services hooked', Value = '0' })
 local SampleStat = TimingSection:Stat({ Title = 'samples', Value = '0' })
@@ -2534,14 +2540,14 @@ local function refreshTimings()
     end)
     TimingLog:Clear()
     if #rows == 0 then
-        TimingLog:Add('nothing measured yet - take a few hits')
+        TimingLog:Append('nothing measured yet - take a few hits')
     end
     for _, row in ipairs(rows) do
         local e = row.entry
         local tag = e.ragdoll > 0.5 and ' rag' or ''
         local known = learnedReach(row.key)
         local reach = known and ('%4.0fst'):format(known) or '   -  '
-        TimingLog:Add(('%-24s %5.2fs %5.2fs %s (%d)%s')
+        TimingLog:Append(('%-24s %5.2fs %5.2fs %s (%d)%s')
             :format(row.key:sub(1, 24), e.lead, e.dur, reach, e.n, tag))
     end
     MoveStat:Set(tostring(#rows))
@@ -2549,27 +2555,25 @@ local function refreshTimings()
     HookedStat:Set(tostring(Intel.Hooked))
 end
 
-TimingSection:Buttons({
-    { Title = 'refresh', Callback = refreshTimings },
-    { Title = 'clear feed', Callback = function() FeedLog:Clear() end },
-    {
-        Title = 'reset table',
-        Callback = function()
-            Intel.Timing = {}
-            Intel.Samples = 0
-            refreshTimings()
-        end,
-    },
+TimingSection:Button({ Title = 'refresh', Half = true, Callback = refreshTimings })
+TimingSection:Button({ Title = 'clear feed', Half = true, Callback = function() FeedLog:Clear() end })
+TimingSection:Button({
+    Title = 'reset table',
+    Callback = function()
+        Intel.Timing = {}
+        Intel.Samples = 0
+        refreshTimings()
+    end,
 })
 
 TimingSection:Paragraph({
     Title = 'what these numbers are',
-    Text = 'lead is how long between a move announcing itself and a stun actually landing - the reaction budget. stun is how long that stun lasted. reach is the furthest that move has ever connected from, which is how a ranged attack gets recognised as one without ever being told. None of the three is sent by the server; all are measured here, so a row with n=2 is a guess and a row with n=40 is not. Attribution blames the nearest recent announcement, so a crowded fight adds noise.',
+    Content = 'lead is how long between a move announcing itself and a stun actually landing - the reaction budget. stun is how long that stun lasted. reach is the furthest that move has ever connected from, which is how a ranged attack gets recognised as one without ever being told. None of the three is sent by the server; all are measured here, so a row with n=2 is a guess and a row with n=40 is not. Attribution blames the nearest recent announcement, so a crowded fight adds noise.',
 })
 
---// Main > overlay -----------------------------------------------------------
+--// overlay -----------------------------------------------------------------
 
-local OverlaySection = OverlayTab:Section({ Title = 'above players', Side = 'left' })
+local OverlaySection = OverlayTab:CreateSection('above players')
 
 OverlaySection:Toggle({
     Title = 'enabled',
@@ -2642,36 +2646,36 @@ OverlaySection:Toggle({
     Callback = function(state) EspConfig.ShowDistance = state end,
 })
 
-local OverlayNotes = OverlayTab:Section({ Title = 'reading it', Side = 'right' })
+local OverlayNotes = OverlayTab:CreateSection('reading it')
 
 OverlayNotes:Paragraph({
     Title = 'what is on the tag',
-    Text = 'Name, then state, then whatever move that player just started, then the evade bar. The move line comes off the same announcement feed the counter tab reacts to, so if a name appears there it means the script saw the move start - it is not reading an animation.',
+    Content = 'Name, then state, then whatever move that player just started, then the evade bar. The move line comes off the same announcement feed the counter tab reacts to, so if a name appears there it means the script saw the move start - it is not reading an animation.',
 })
 
 OverlayNotes:Paragraph({
     Title = 'unblockable moves',
-    Text = 'A move the tally has marked unblockable is named in red on the tag and in the feed as it starts. That verdict comes from watching guards across the whole server, so it usually arrives before you have personally been caught by it.',
+    Content = 'A move the tally has marked unblockable is named in red on the tag and in the feed as it starts. That verdict comes from watching guards across the whole server, so it usually arrives before you have personally been caught by it.',
 })
 
 OverlayNotes:Paragraph({
     Title = 'stun countdown',
-    Text = 'How long until they can act again. The server never sends a stun length, so this is the learned duration for whatever hit them, counted down from when the stun appeared - a prediction, and only as good as the sample count on the intel tab. With no measurement for that move it shows how long the stun has run instead, which at least is a fact. Ragdoll has no clock of its own and just reads ragdoll.',
+    Content = 'How long until they can act again. The server never sends a stun length, so this is the learned duration for whatever hit them, counted down from when the stun appeared - a prediction, and only as good as the sample count on the intel tab. With no measurement for that move it shows how long the stun has run instead, which at least is a fact. Ragdoll has no clock of its own and just reads ragdoll.',
 })
 
 OverlayNotes:Paragraph({
     Title = 'colours',
-    Text = 'Green state means they are open - stunned or ragdolled. Red means do not bother - i-frames. Amber is blocking or mid-skill. The evade bar turns red at full, which is the point they can dash straight out of a ragdoll.',
+    Content = 'Green state means they are open - stunned or ragdolled. Red means do not bother - i-frames. Amber is blocking or mid-skill. The evade bar turns red at full, which is the point they can dash straight out of a ragdoll.',
 })
 
 OverlayNotes:Paragraph({
     Title = 'needs the feed',
-    Text = 'Turning this on turns the move feed on too, since the move line has nothing to show otherwise. State and evade are live attribute reads and work either way.',
+    Content = 'Turning this on turns the move feed on too, since the move line has nothing to show otherwise. State and evade are live attribute reads and work either way.',
 })
 
---// Main > target ------------------------------------------------------------
+--// target ------------------------------------------------------------------
 
-local TargetSection = TargetTab:Section({ Title = 'punish window', Side = 'left' })
+local TargetSection = TargetTab:CreateSection('punish window')
 
 local TName = TargetSection:Stat({ Title = 'target', Value = '-' })
 local TDist = TargetSection:Stat({ Title = 'distance', Value = '-' })
@@ -2680,26 +2684,22 @@ local TBurst = TargetSection:Stat({ Title = 'burst', Value = '-' })
 local TStun = TargetSection:Stat({ Title = 'stun left', Value = '-' })
 local TEvade = TargetSection:Progress({
     Title = 'evade meter',
-    Min = 0,
-    Max = 50,
     Default = 0,
-    ShowMax = true,
+    Max = 50,
 })
 
 TargetSection:Paragraph({
     Title = 'reading it',
-    Text = 'Evade fills to 50; at full the target can dash straight out of a ragdoll. burst ready means they can break your combo and get i-frames on the way out. Both are replicated attributes, so these are live reads rather than estimates.',
+    Content = 'Evade fills to 50; at full the target can dash straight out of a ragdoll. burst ready means they can break your combo and get i-frames on the way out. Both are replicated attributes, so these are live reads rather than estimates.',
 })
 
-local SelfSection = TargetTab:Section({ Title = 'self', Side = 'right' })
+local SelfSection = TargetTab:CreateSection('self')
 
 local SState = SelfSection:Stat({ Title = 'state', Value = '-' })
 local SEvade = SelfSection:Progress({
     Title = 'evade meter',
-    Min = 0,
-    Max = 50,
     Default = 0,
-    ShowMax = true,
+    Max = 50,
 })
 local SManji = SelfSection:Stat({ Title = 'manji kick', Value = '-' })
 local SBurst = SelfSection:Stat({ Title = 'burst', Value = '-' })
@@ -2732,9 +2732,9 @@ end
 
 --// Counter ------------------------------------------------------------------
 
-local CounterTab = Window:Tab({ Title = 'counter', Icon = 'shield' })
+local CounterTab = Window:CreateTab('counter')
 
-local ManjiSection = CounterTab:Section({ Title = 'auto manji kick', Side = 'left' })
+local ManjiSection = CounterTab:CreateSection('auto manji kick')
 
 ManjiSection:Toggle({
     Title = 'enabled',
@@ -2748,10 +2748,9 @@ ManjiSection:Toggle({
                 hookAllServices()
                 watchCharacters()
             end
-            Centrl:Notify({
+            Void:Notify({
                 Title = 'counter',
                 Content = 'Move feed turned on - auto manji has nothing to react to without it.',
-                Type = 'info',
                 Duration = 5,
             })
         end
@@ -2771,6 +2770,7 @@ ManjiSection:Slider({
     Min = 0.1,
     Max = 1.5,
     Increment = 0.05,
+    Rounding = 2,
     Default = 0.5,
     Suffix = 's',
     Callback = function(v) ManjiConfig.Window = v end,
@@ -2782,6 +2782,7 @@ ManjiSection:Slider({
     Min = 0,
     Max = 0.4,
     Increment = 0.01,
+    Rounding = 2,
     Default = 0.08,
     Suffix = 's',
     Callback = function(v) ManjiConfig.Reaction = v end,
@@ -2862,6 +2863,7 @@ ManjiSection:Slider({
     Min = 0.05,
     Max = 1,
     Increment = 0.05,
+    Rounding = 2,
     Default = 0.35,
     Suffix = 's',
     Callback = function(v) ManjiConfig.AssumeLead = v end,
@@ -2871,7 +2873,7 @@ local ManjiStatus = ManjiSection:Stat({ Title = 'status', Value = 'idle' })
 local ManjiCount = ManjiSection:Stat({ Title = 'thrown / skipped', Value = '0 / 0' })
 local ManjiWindow = ManjiSection:Stat({ Title = 'window in use', Value = 'set' })
 
-local BlockSection = CounterTab:Section({ Title = 'auto block', Side = 'right' })
+local BlockSection = CounterTab:CreateSection('auto block')
 
 BlockSection:Toggle({
     Title = 'enabled',
@@ -2885,10 +2887,9 @@ BlockSection:Toggle({
                 hookAllServices()
                 watchCharacters()
             end
-            Centrl:Notify({
+            Void:Notify({
                 Title = 'counter',
                 Content = 'Move feed turned on - auto block has nothing to react to without it.',
-                Type = 'info',
                 Duration = 5,
             })
         end
@@ -2912,6 +2913,7 @@ BlockSection:Slider({
     Min = 0.1,
     Max = 2,
     Increment = 0.05,
+    Rounding = 2,
     Default = 0.45,
     Suffix = 's',
     Callback = function(v) BlockConfig.Hold = v end,
@@ -2923,6 +2925,7 @@ BlockSection:Slider({
     Min = 0.1,
     Max = 2,
     Increment = 0.05,
+    Rounding = 2,
     Default = 0.9,
     Suffix = 's',
     Callback = function(v) BlockConfig.LookAhead = v end,
@@ -2934,6 +2937,7 @@ BlockSection:Slider({
     Min = 0.2,
     Max = 3,
     Increment = 0.05,
+    Rounding = 2,
     Default = 1.2,
     Suffix = 's',
     Callback = function(v) BlockConfig.Sustain = v end,
@@ -3003,6 +3007,7 @@ BlockSection:Slider({
     Min = 0.05,
     Max = 1,
     Increment = 0.05,
+    Rounding = 2,
     Default = 0.35,
     Suffix = 's',
     Callback = function(v) BlockConfig.AssumeLead = v end,
@@ -3011,7 +3016,7 @@ BlockSection:Slider({
 local BlockStatus = BlockSection:Stat({ Title = 'status', Value = 'idle' })
 local BlockCount = BlockSection:Stat({ Title = 'blocked / skipped', Value = '0 / 0' })
 
-local OutcomeSection = CounterTab:Section({ Title = 'what actually worked', Side = 'right' })
+local OutcomeSection = CounterTab:CreateSection('what actually worked')
 
 local OutcomeLog = OutcomeSection:Console({
     Title = 'move  /  blocked  /  pierced  /  countered',
@@ -3030,72 +3035,71 @@ local function refreshOutcomes()
     table.sort(rows, function(a, b) return a.total > b.total end)
     OutcomeLog:Clear()
     if #rows == 0 then
-        OutcomeLog:Add('nothing tried yet - block or counter something')
+        OutcomeLog:Append('nothing tried yet - block or counter something')
     end
     for _, row in ipairs(rows) do
         local e = row.entry
         local named = blockVerdict(row.key)
         local verdict = named == 'unknown' and '' or ('  ' .. named)
-        OutcomeLog:Add(('%-24s %d/%d  %d/%d%s'):format(
+        OutcomeLog:Append(('%-24s %d/%d  %d/%d%s'):format(
             row.key:sub(1, 24), e.blocked, e.blocked + e.pierced,
             e.countered, e.countered + e.whiffed, verdict))
     end
 end
 
-OutcomeSection:Buttons({
-    { Title = 'refresh', Callback = refreshOutcomes },
-    {
-        Title = 'reset',
-        Callback = function()
-            Outcomes.Moves = {}
-            table.clear(Outcomes.Throws)
-            refreshOutcomes()
-        end,
-    },
+OutcomeSection:Button({ Title = 'refresh', Half = true, Callback = refreshOutcomes })
+OutcomeSection:Button({
+    Title = 'reset',
+    Half = true,
+    Callback = function()
+        Outcomes.Moves = {}
+        table.clear(Outcomes.Throws)
+        refreshOutcomes()
+    end,
 })
 
 OutcomeSection:Paragraph({
     Title = 'where these come from',
-    Text = 'Every guard anyone on the server puts up is a sample, not just ours. BlockService announces a block absorbing a hit for whoever blocked it, and Info is readable on everyone, so blocked and pierced are counted across the whole lobby. That is the difference between classifying a move the first time somebody else eats it and never classifying it until we personally tried. countered still comes from a ManjiKick Hit naming us. All of it is server broadcast, so these are observations - but they describe what happened at that angle and range, not a property of the move.',
+    Content = 'Every guard anyone on the server puts up is a sample, not just ours. BlockService announces a block absorbing a hit for whoever blocked it, and Info is readable on everyone, so blocked and pierced are counted across the whole lobby. That is the difference between classifying a move the first time somebody else eats it and never classifying it until we personally tried. countered still comes from a ManjiKick Hit naming us. All of it is server broadcast, so these are observations - but they describe what happened at that angle and range, not a property of the move.',
 })
 
 OutcomeSection:Paragraph({
     Title = 'the verdicts',
-    Text = 'unknown means fewer than three attempts have been seen and it will not refuse to block on that basis. unblockable means under a third of guards survived it, and auto block stops offering itself up - though it still tries occasionally, so a wrong call can correct itself. blockable means over two thirds held. The same function decides the label and the behaviour, so they cannot disagree.',
+    Content = 'unknown means fewer than three attempts have been seen and it will not refuse to block on that basis. unblockable means under a third of guards survived it, and auto block stops offering itself up - though it still tries occasionally, so a wrong call can correct itself. blockable means over two thirds held. The same function decides the label and the behaviour, so they cannot disagree.',
 })
 
-local CounterNotes = CounterTab:Section({ Title = 'what this can and cannot know', Side = 'left' })
+local CounterNotes = CounterTab:CreateSection('what this can and cannot know')
 
 CounterNotes:Paragraph({
     Title = 'not readable',
-    Text = 'Whether an attack is blockable, whether it is 360-blockable, and its attack type - which is what decides whether a counter catches it - all live in server scripts. No client can read them. So neither toggle knows whether a given attack is actually counterable or blockable.',
+    Content = 'Whether an attack is blockable, whether it is 360-blockable, and its attack type - which is what decides whether a counter catches it - all live in server scripts. No client can read them. So neither toggle knows whether a given attack is actually counterable or blockable.',
 })
 
 CounterNotes:Paragraph({
     Title = 'what it gates on instead',
-    Text = 'Manji gates on timing: it only goes out when the hit is due inside the counter window, so it is not spent on something landing after the counter expires. Block deliberately does not - attacks come in chains, and a guard that goes up late for the first hit still stops the next three, so missing a window is no reason to stand there unguarded. It gates on the attack being inside your facing cone instead, because a block facing the wrong way gets broken anyway and one that snaps to a hit from behind is the obvious tell.',
+    Content = 'Manji gates on timing: it only goes out when the hit is due inside the counter window, so it is not spent on something landing after the counter expires. Block deliberately does not - attacks come in chains, and a guard that goes up late for the first hit still stops the next three, so missing a window is no reason to stand there unguarded. It gates on the attack being inside your facing cone instead, because a block facing the wrong way gets broken anyway and one that snaps to a hit from behind is the obvious tell.',
 })
 
 CounterNotes:Paragraph({
     Title = 'ranged attacks',
-    Text = 'Reach is measured, not set. Every sample records how far away the attacker was, and a move\'s reach is the second furthest it has connected from over its last two dozen samples - second, not furthest, so one mis-blamed sample cannot decide it. Until a move has four samples the slider stands in, and it is set short on purpose: assume melee and let evidence extend it, never the other way round.',
+    Content = 'Reach is measured, not set. Every sample records how far away the attacker was, and a move\'s reach is the second furthest it has connected from over its last two dozen samples - second, not furthest, so one mis-blamed sample cannot decide it. Until a move has four samples the slider stands in, and it is set short on purpose: assume melee and let evidence extend it, never the other way round.',
 })
 
 CounterNotes:Paragraph({
     Title = 'facing',
-    Text = 'The attacker always has to be pointed roughly this way - the cone just widens up close, where a swing can still turn into you, and tightens at range where it cannot. Somebody with their back to you fails at any distance.',
+    Content = 'The attacker always has to be pointed roughly this way - the cone just widens up close, where a swing can still turn into you, and tightens at range where it cannot. Somebody with their back to you fails at any distance.',
 })
 
 CounterNotes:Paragraph({
     Title = 'untested',
-    Text = 'None of this has been run in-game yet. The remotes and attributes are read straight from the dump, but the reaction and window defaults are starting points, not measurements.',
+    Content = 'None of this has been run in-game yet. The remotes and attributes are read straight from the dump, but the reaction and window defaults are starting points, not measurements.',
 })
 
 --// Dash ---------------------------------------------------------------------
 
-local DashTab = Window:Tab({ Title = 'dash', Icon = 'wind' })
+local DashTab = Window:CreateTab('dash')
 
-local DashSection = DashTab:Section({ Title = 'dash cooldown', Side = 'left' })
+local DashSection = DashTab:CreateSection('dash cooldown')
 
 DashSection:Toggle({
     Title = 'enabled',
@@ -3113,12 +3117,13 @@ DashSection:Slider({
     Min = 0,
     Max = 2,
     Increment = 0.05,
+    Rounding = 2,
     Default = 0.5,
     Suffix = 's',
     Callback = function(v) DashConfig.Cooldown = v end,
 })
 
-local DashModSection = DashTab:Section({ Title = 'dash manipulation', Side = 'left' })
+local DashModSection = DashTab:CreateSection('dash manipulation')
 
 DashModSection:Toggle({
     Title = 'enabled',
@@ -3140,6 +3145,7 @@ DashModSection:Slider({
     Min = 0.25,
     Max = 5,
     Increment = 0.05,
+    Rounding = 2,
     Default = 1.6,
     Suffix = 'x',
     Callback = function(v) DashMod.Multiplier = v end,
@@ -3161,38 +3167,39 @@ DashModSection:Slider({
     Min = 0.25,
     Max = 5,
     Increment = 0.05,
+    Rounding = 2,
     Default = 1.6,
     Suffix = 'x',
     Callback = function(v) DashMod.FrontMultiplier = v end,
 })
 
-local DashModNotes = DashTab:Section({ Title = 'how it works', Side = 'right' })
+local DashModNotes = DashTab:CreateSection('how it works')
 
 DashModNotes:Paragraph({
     Title = 'distance',
-    Text = 'The dash is built on the client: a BodyVelocity in your Torso for 0.4s at 200 studs/s times a multiplier, which the game reads off Info.DashMultiplier every dash. Setting that value is the whole trick - no hooking, and the game keeps its own animation, dust trail and decay curve. It applies to back, left and right.',
+    Content = 'The dash is built on the client: a BodyVelocity in your Torso for 0.4s at 200 studs/s times a multiplier, which the game reads off Info.DashMultiplier every dash. Setting that value is the whole trick - no hooking, and the game keeps its own animation, dust trail and decay curve. It applies to back, left and right.',
 })
 
 DashModNotes:Paragraph({
     Title = 'front dash',
-    Text = 'Front is normally not a dash at all. It routes to a Chase - a server-side lunge toward your target - which never touches the movement code and cannot be scaled from here. The toggle makes front take the movement path instead, which is a real dash in the direction you are facing and does scale. It stops being a gap-closer onto a target, so it is off by default.',
+    Content = 'Front is normally not a dash at all. It routes to a Chase - a server-side lunge toward your target - which never touches the movement code and cannot be scaled from here. The toggle makes front take the movement path instead, which is a real dash in the direction you are facing and does scale. It stops being a gap-closer onto a target, so it is off by default.',
 })
 
 DashModNotes:Paragraph({
     Title = 'limits',
-    Text = 'Multiplier scales speed, not duration - the 0.4s window is fixed by a Debris timer, so very high values travel far in the same time rather than for longer. Server-side movement validation is not something the dump shows, so treat large numbers as untested.',
+    Content = 'Multiplier scales speed, not duration - the 0.4s window is fixed by a Debris timer, so very high values travel far in the same time rather than for longer. Server-side movement validation is not something the dump shows, so treat large numbers as untested.',
 })
 
-local DashInfo = DashTab:Section({ Title = 'behavior', Side = 'right' })
+local DashInfo = DashTab:CreateSection('behavior')
 
 DashInfo:Paragraph({
     Title = 'back / left / right',
-    Text = 'These dashes use the cooldown set above instead of the game default (normally 2s, or 0.3s+charges on some movesets).',
+    Content = 'These dashes use the cooldown set above instead of the game default (normally 2s, or 0.3s+charges on some movesets).',
 })
 
 DashInfo:Paragraph({
     Title = 'front',
-    Text = 'Untouched. Front dash is actually a separate chase/lunge ability and keeps its original cooldown and behavior.',
+    Content = 'Untouched. Front dash is actually a separate chase/lunge ability and keeps its original cooldown and behavior.',
 })
 
 --// Live readouts ------------------------------------------------------------
@@ -3204,45 +3211,38 @@ statusSink = function()
     BlockCount:Set(BlockConfig.Attempts .. ' / ' .. BlockConfig.Skipped)
 end
 
-Window:Load()
-
 task.spawn(function()
     local lastTimingRefresh = 0
     while true do
         task.wait(0.2)
 
         local mine = ownCharacter()
-        local label, openness = describeState(mine)
-        -- Negated: a state that leaves us open is bad news on our own row.
-        SState:Set(label, openColor(-openness))
+        SState:Set(describeState(mine))
         SEvade:Set(evadeMeter(mine))
-        SBurst:Set(canBurst(mine) and 'ready' or 'spent',
-            canBurst(mine) and COLOR_GOOD or nil)
+        SBurst:Set(canBurst(mine) and 'ready' or 'spent')
 
         local move = manjiMove()
         if not move then
-            SManji:Set('not equipped', COLOR_BAD)
+            SManji:Set('not equipped')
         else
             local left = cooldownLeft(move)
             if left > 0 then
-                SManji:Set(('%.1fs'):format(left), COLOR_WARN)
+                SManji:Set(('%.1fs'):format(left))
             else
-                SManji:Set('ready', COLOR_GOOD)
+                SManji:Set('ready')
             end
         end
 
         local target = currentTarget()
         if target then
-            local tLabel, tOpenness = describeState(target)
             TName:Set(target.Name)
             TDist:Set(('%.0f st'):format(distanceTo(target)))
-            TState:Set(tLabel, openColor(tOpenness))
+            TState:Set(describeState(target))
             TEvade:Set(evadeMeter(target))
-            TBurst:Set(canBurst(target) and 'ready' or 'spent',
-                canBurst(target) and COLOR_BAD or COLOR_GOOD)
+            TBurst:Set(canBurst(target) and 'ready' or 'spent')
             local left, note = stunRemaining(target)
             if left then
-                TStun:Set(('%.1fs'):format(left), left > 0.4 and COLOR_GOOD or COLOR_WARN)
+                TStun:Set(('%.1fs'):format(left))
             else
                 TStun:Set(note or '-')
             end
@@ -3274,7 +3274,7 @@ task.spawn(function()
             end
             if best then
                 FlashOffset:Set(('%+.0f ms  %d%% (n=%d)')
-                    :format(best * 1000, math.floor(bestRate * 100), bestN), COLOR_GOOD)
+                    :format(best * 1000, math.floor(bestRate * 100), bestN))
             else
                 FlashOffset:Set('learning')
             end
@@ -3283,7 +3283,7 @@ task.spawn(function()
         if ManjiConfig.AutoWindow then
             local learned, hits, misses = learnedWindow()
             if learned then
-                ManjiWindow:Set(('%.2fs learned (%d/%d)'):format(learned, hits, hits + misses), COLOR_GOOD)
+                ManjiWindow:Set(('%.2fs learned (%d/%d)'):format(learned, hits, hits + misses))
             else
                 ManjiWindow:Set(('%.2fs set (%d hits so far)'):format(ManjiConfig.Window, hits or 0))
             end
