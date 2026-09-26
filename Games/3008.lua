@@ -1496,7 +1496,7 @@ local Window = Void:CreateWindow({
     Scope = 'game',
     Status = 'ready',
     StartOpen = true,
-    MobileButton = true,
+    Opener = 'Topbar',
 })
 
 pcall(function() Void:SetAccent(Color3.fromRGB(255, 190, 60)) end)
