@@ -1,5 +1,5 @@
 --// 3008 -------------------------------------------------------------------------
--- Built against a script dump of the live game.
+-- Built against a script dump of the live game (place 2.75).
 --
 -- Nearly everything the client asks the server to do goes through two remotes
 -- that live on your own character:
@@ -18,42 +18,33 @@
 --   Action:InvokeServer("Whistle")
 --   Event :FireServer  ("FallDamage",        data)
 --   Event :FireServer  ("DecreaseStat",      {Stats = {Energy = n}})
+--   Event :FireServer  ("KillMe",            {})
+--   Communication:FireServer("Respawn",      {})
 --
--- Three shared sources decide what this script believes about the world, and
--- reading them beats any table we could hardcode:
---
---   ReplicatedStorage.Modules.Item      : get(name) -> item definition, so
---                                         food, healing and harmful items are
---                                         the game's own classification
+-- Shared sources this script reads instead of hardcoding:
+--   ReplicatedStorage.Modules.Item      : get(name) -> item definition, so food,
+--                                         healing and harmful items are the
+--                                         game's own classification.
 --   ReplicatedStorage.Remotes.Communication
---                                       : OnClientEvent("ShowWhistle",
---                                         {Player, Position}) - every whistle
---                                         in the server, with its exact spot
+--                                       : OnClientEvent - ShowWhistle carries
+--                                         every whistle with its exact spot;
+--                                         BombWarning fires 10 s before a bomb.
+--   ReplicatedStorage.Remotes.OnState   : OnClientEvent - Bear5Event and
+--                                         Bear5PrimeEvent announce a BEAR 5.
+--   ReplicatedStorage.Remotes.Frozen    : OnClientEvent - your freezing level.
 --   CollectionService tags              : "Item" makes a model grabbable,
---                                         "Storable" and "Interactable" decide
---                                         which action E runs on it
+--                                         "Storable"/"Interactable" decide the
+--                                         action E runs on it.
 --
 -- The client's own PickupSystem lives at
 --   Players.LocalPlayer.PlayerScripts.source.client.Building (ModuleScript)
 -- and require is cached per instance, so requiring it returns the same table
--- the game is using. That is where the LIVE carry distance lives.
+-- the game uses. That is where the LIVE carry distance lives.
 --
--- Player attributes:
---   LocalPlayer:GetAttribute("ScrollDistance")   - CEILING for carry distance,
---                                                  not the distance itself
---   LocalPlayer:GetAttribute("IsHolding")        - server owned, the honest
---                                                  answer to "am I holding
---                                                  something right now"
---   LocalPlayer:GetAttribute("MaxInventorySpace")- server owned, read for the
---                                                  "n/m items" text
---   Humanoid   :GetAttribute("Hunger")           - read only, server owned
---
--- The moderator panel's one lever, aimed at ourselves in the server tab:
---   Remotes.Vip:FireServer("UpdatePlayerProperties",
---       {Properties = {...}, ToPlayer = player})
---
--- Where the server is authoritative, the UI says so instead of shipping a
--- toggle that only lies to your own HUD.
+-- Everything here is LOCAL PLAYER ONLY. Nothing acts on other players, and
+-- nothing tries to defeat a server permission check. Where a value is owned by
+-- the server (Health, Hunger, inventory space), the UI says so plainly rather
+-- than pretending a local write is real - see the "local stats" tab.
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -120,6 +111,9 @@ local Main = {
 
     AutoUnstick = false,
     UnstickAfter = 3,
+
+    AutoRespawn = false,
+    RespawnDelay = 1,
 }
 
 -- Another player's whistle is broadcast to every client as
@@ -155,19 +149,39 @@ local Player = {
     GrabKey = Enum.KeyCode.V,
 }
 
+-- LOCAL, self only. These are honest about server authority in the UI: the two
+-- gates are client-side checks the game reads on this client, so pinning them
+-- true genuinely unblocks your own pickup/interact. Health, Hunger and
+-- inventory space are owned by the server, so writing them here only changes
+-- your own HUD until the next replication - the UI says exactly that.
+local Localx = {
+    PickupGate = false,
+    InteractGate = false,
+}
+
+-- Survival alerts, purely local readers of the game's own broadcasts.
+local Alerts = {
+    Bomb = true,
+    Bear = true,
+    Freezing = true,
+    FreezeLevel = 0,
+    LastBomb = 0,
+    LastBear = '-',
+}
+
 local Visual = {
     Employees = false,
     Items = false,
     PlayersEsp = false,
-    Method = "Highlight",
+    Method = "Marker",
     Transparency = 0.5,
     ShowNames = true,
     ShowDistance = true,
     ItemFilter = "Food",
     MaxEspDistance = 1500,
-    -- 0 means no cap at all. The old build had no visible count limit but the
-    -- Highlight method silently hit the engine's ~31-instance ceiling, which
-    -- is what made item ESP look broken in a shop full of pizza.
+    -- 0 means no cap at all. The Highlight method silently hits the engine's
+    -- ~31-instance ceiling, which is what made item ESP look broken in a shop
+    -- full of pizza, so it falls back to markers past that.
     MaxEspCount = 150,
 
     Fullbright = false,
@@ -189,11 +203,11 @@ local SpecialEmployees = {
     ["King"] = true, ["Harold"] = true, ["Hubert"] = true, ["Dave"] = true,
     ["Ben"] = true, ["MrEgg"] = true, ["ChickenNugget"] = true,
     ["Snowball"] = true, ["Abomination Employee"] = true, ["EnergyOrb"] = true,
+    ["Elf"] = true,
 }
 
 -- Only used if ReplicatedStorage.Modules.Item cannot be reached. The real
--- classification comes from the game's own item definitions below, which is
--- why this list no longer decides anything on its own.
+-- classification comes from the game's own item definitions below.
 local FallbackFood = {
     Pizza = true, Burger = true, Cookie = true, Hotdog = true, Chips = true,
     Lemon = true, ["Lemon Slice"] = true, Banana = true, Water = true,
@@ -306,10 +320,16 @@ local function invokeAction(name, payload)
     return a, b
 end
 
+local function fireEvent(name, payload)
+    local _, event = getSystem()
+    if not event then return false end
+    return pcall(function() event:FireServer(name, payload) end)
+end
+
 --// Namecall hook: energy + fall damage -------------------------------------------
 -- Both of these are the client volunteering something to the server. Dropping
--- the call is the whole exploit - there is nothing to spoof, just something
--- not to say.
+-- the call is the whole thing - there is nothing to spoof, just something not
+-- to say. Both signatures are confirmed against the current dump.
 local HAS_NAMECALL = typeof(hookmetamethod) == "function" and typeof(getnamecallmethod) == "function"
 
 if HAS_NAMECALL then
@@ -363,9 +383,9 @@ end))
 --
 -- So raising the attribute alone changes nothing until you physically scroll -
 -- and on a phone there is no scroll wheel at all, so it could never take
--- effect. The module is a plain ModuleScript under PlayerScripts, and require
--- is cached per instance, so requiring it here hands back the exact same table
--- the game is using. Setting the live value directly is the actual fix; the
+-- effect. Building is a plain ModuleScript under PlayerScripts and require is
+-- cached per instance, so requiring it here hands back the exact same table the
+-- game is using. Setting the live value directly is the actual fix; the
 -- attribute still gets raised so scrolling cannot clamp it back down.
 local PickupSystem
 pcall(function()
@@ -419,71 +439,44 @@ local function isHolding()
     return LocalPlayer:GetAttribute("IsHolding") == true
 end
 
---// Player properties (Remotes.Vip) ------------------------------------------------
--- The in-game moderator panel changes another player's stats by firing one
--- remote:
---
---   Remotes.Vip:FireServer("UpdatePlayerProperties", {
---       Properties = { Health = n, MaxHealth = n, MaxInventorySpace = n, ... },
---       ToPlayer   = player,
---   })
---
--- Its God button is literally SetStat(stat, 1/0), which writes infinity into
--- both the stat and its Max - that is why god mode makes the health bar render
--- strangely, the bar is drawing a fraction with an infinite denominator.
---
--- Whether the server checks your rank before applying this is its business,
--- not something the client can see. So rather than promise anything, every
--- write below is followed by a read of the attribute it was supposed to
--- change, and the UI reports what actually happened.
-local VipRemote
-pcall(function()
-    local remotes = ReplicatedStorage:WaitForChild("Remotes", 15)
-    VipRemote = remotes and remotes:WaitForChild("Vip", 15)
+--// Local stats (self only) --------------------------------------------------------
+-- The two pickup/interact gates are client-side checks the game reads on THIS
+-- client (Building.CanPickUp / CanInteract read the attribute before the client
+-- will even send the remote), so pinning them true genuinely unblocks your own
+-- actions. Everything else here is server-owned and the write only reaches your
+-- own HUD - the UI paragraph spells out which is which.
+spawnLoop(function()
+    while not Unloading do
+        task.wait(0.25)
+        if Localx.PickupGate then
+            pcall(function() LocalPlayer:SetAttribute("CanPickUp", true) end)
+        end
+        if Localx.InteractGate then
+            pcall(function() LocalPlayer:SetAttribute("CanInteract", true) end)
+        end
+    end
 end)
 
-local Admin = {
-    LastResult = 'not tried',
-    LastAt = 0,
-}
-
-local function setProperties(properties, toPlayer)
-    if not VipRemote then return false end
-    local target = toPlayer or LocalPlayer
-    local ok = pcall(function()
-        VipRemote:FireServer("UpdatePlayerProperties", {
-            Properties = properties,
-            ToPlayer = target,
-        })
+local function setLocalHealth(value)
+    local hum = getHumanoid()
+    if not hum then return false end
+    return pcall(function()
+        if value == math.huge or value > hum.MaxHealth then hum.MaxHealth = value end
+        hum.Health = value
     end)
-    return ok
 end
 
--- Fires the write, then waits for the value it was meant to produce to show up.
--- A remote the server ignores is silent, so the only honest test is whether the
--- thing changed.
-local function setPropertiesAndVerify(properties, check, label)
-    if not VipRemote then
-        Admin.LastResult = 'Remotes.Vip not found'
-        Admin.LastAt = os.clock()
-        return false, Admin.LastResult
-    end
+local function setLocalHunger(value)
+    local hum = getHumanoid()
+    if not hum then return false end
+    return pcall(function()
+        hum:SetAttribute("MaxHunger", math.max(value, hum:GetAttribute("MaxHunger") or value))
+        hum:SetAttribute("Hunger", value)
+    end)
+end
 
-    setProperties(properties)
-
-    local deadline = os.clock() + 1.5
-    while os.clock() < deadline do
-        if check() then
-            Admin.LastResult = label .. ': applied'
-            Admin.LastAt = os.clock()
-            return true, Admin.LastResult
-        end
-        task.wait(0.1)
-    end
-
-    Admin.LastResult = label .. ': server refused'
-    Admin.LastAt = os.clock()
-    return false, Admin.LastResult
+local function setLocalInventory(value)
+    return pcall(function() LocalPlayer:SetAttribute("MaxInventorySpace", value) end)
 end
 
 --// Teleporting -------------------------------------------------------------------
@@ -506,6 +499,44 @@ local function requestStreamAround(position)
     end)
 end
 
+--// Respawn / reset ---------------------------------------------------------------
+-- The death screen respawns by firing Remotes.Communication "Respawn", and the
+-- reset bind fires System.Event "KillMe". Both are the client asking for its own
+-- character - self only, no permission involved.
+local CommunicationRemote
+pcall(function()
+    local remotes = ReplicatedStorage:WaitForChild("Remotes", 15)
+    CommunicationRemote = remotes and remotes:WaitForChild("Communication", 15)
+end)
+
+local function respawnNow()
+    if not CommunicationRemote then return false end
+    return pcall(function() CommunicationRemote:FireServer("Respawn", {}) end)
+end
+
+local function killMe()
+    return fireEvent("KillMe", {})
+end
+
+spawnLoop(function()
+    local waitingSince = nil
+    while not Unloading do
+        task.wait(0.5)
+        if Main.AutoRespawn then
+            local hum = getHumanoid()
+            if hum and hum.Health <= 0 then
+                waitingSince = waitingSince or os.clock()
+                if os.clock() - waitingSince >= Main.RespawnDelay then
+                    respawnNow()
+                    waitingSince = nil
+                end
+            else
+                waitingSince = nil
+            end
+        end
+    end
+end)
+
 --// Whistle ---------------------------------------------------------------------------
 -- Your own whistle is a plain Action call. The client wraps it in a 15 second
 -- cooldown held in a local upvalue, so calling the remote directly is not gated
@@ -527,17 +558,6 @@ spawnLoop(function()
             end
         end
     end
-end)
-
--- Everyone else's whistle arrives on Remotes.Communication as
--- ("ShowWhistle", { Player = plr, Position = Vector3 }). The game only uses it
--- to draw a marker; the position in it is the exact spot they whistled from,
--- which is all a teleport needs. It fires even while they are streamed out, so
--- this reaches people the sweep would have to hunt for.
-local CommunicationRemote
-pcall(function()
-    local remotes = ReplicatedStorage:WaitForChild("Remotes", 15)
-    CommunicationRemote = remotes and remotes:WaitForChild("Communication", 15)
 end)
 
 local function onWhistleHeard(who, position)
@@ -570,13 +590,66 @@ local function onWhistleHeard(who, position)
     end
 end
 
+-- One handler for every Communication broadcast we care about: the whistle
+-- positions we teleport to, and the bomb warning we surface as an alert.
 if CommunicationRemote then
     track(CommunicationRemote.OnClientEvent:Connect(function(name, payload)
         if Unloading then return end
+        if name == "BombWarning" then
+            if Alerts.Bomb then
+                Alerts.LastBomb = os.clock()
+                notify('A bomb will fall in 10 seconds - get to cover.', 'error', 8)
+            end
+            return
+        end
         if name ~= "ShowWhistle" or typeof(payload) ~= "table" then return end
         local position = payload.Position
         if typeof(position) ~= "Vector3" then return end
         onWhistleHeard(payload.Player, position)
+    end))
+end
+
+--// Survival alerts (OnState, Frozen) ---------------------------------------------
+-- OnState carries the BEAR 5 intro (Bear5Event / Bear5PrimeEvent). Frozen
+-- carries your freezing level, either a boolean or a 0-100 number. Both are the
+-- game telling this client something; reading them is a local alert, nothing
+-- more.
+local StateRemote, FrozenRemote
+pcall(function()
+    local remotes = ReplicatedStorage:WaitForChild("Remotes", 15)
+    StateRemote = remotes and remotes:FindFirstChild("OnState")
+    FrozenRemote = remotes and remotes:FindFirstChild("Frozen")
+end)
+
+if StateRemote then
+    track(StateRemote.OnClientEvent:Connect(function(name)
+        if Unloading or not Alerts.Bear then return end
+        if name == "Bear5Event" then
+            Alerts.LastBear = 'BEAR 5'
+            notify('BEAR 5 is coming - hide and stay still.', 'error', 8)
+        elseif name == "Bear5PrimeEvent" then
+            Alerts.LastBear = 'BEAR 5 PRIME'
+            notify('BEAR 5 PRIME is coming - hide now.', 'error', 8)
+        end
+    end))
+end
+
+if FrozenRemote then
+    track(FrozenRemote.OnClientEvent:Connect(function(value)
+        if Unloading then return end
+        local level
+        if typeof(value) == "number" then
+            level = value
+        elseif typeof(value) == "boolean" then
+            level = value and 100 or 0
+        else
+            level = Alerts.FreezeLevel
+        end
+        local was = Alerts.FreezeLevel
+        Alerts.FreezeLevel = level
+        if Alerts.Freezing and level > 0 and was <= 0 then
+            notify('You are freezing - find warmth or a fire.', 'warning', 6)
+        end
     end))
 end
 
@@ -656,12 +729,11 @@ end
 -- Pickup puts the item in your HANDS. The server attaches the real model to
 -- you, and the client's own Pickup() then sets up everything that makes that
 -- state survivable: SetHoldingModel, a ghost clone under the camera, the
--- Heartbeat render loop that positions it, and the raycast filter that stops
--- you shooting rays at your own item. Calling the remote directly does the
--- first half and none of the second, so the server thinks you are holding
--- something the client has never heard of: the real parts ride along colliding
--- with you, and the game's Drop reads GetHoldingModel(), finds nil, and
--- refuses. That is a stuck item you cannot walk away from or put down.
+-- Heartbeat render loop that positions it, and the raycast filter. Calling the
+-- remote directly does the first half and none of the second, so the server
+-- thinks you are holding something the client has never heard of: the real
+-- parts ride along colliding with you, and the game's Drop reads
+-- GetHoldingModel(), finds nil, and refuses. That is a stuck item.
 --
 -- So: automation uses Store and never Pickup.
 local function storeModel(model)
@@ -670,10 +742,6 @@ end
 
 local function interactModel(model)
     return invokeAction("Interact", { Model = model })
-end
-
-local function pickupModel(model)
-    return invokeAction("Pickup", { Model = model })
 end
 
 -- Drop carries a client-supplied EndCFrame: the client decides where the held
@@ -1401,22 +1469,44 @@ local function setCeilingHidden(state)
 end
 
 --// UI ---------------------------------------------------------------------------------
-local Centrl = loadstring(game:HttpGet('https://raw.githubusercontent.com/iamdookie1/Rblx2/main/UI/Lib2.lua'))()
+-- Void (VoidUI), loaded straight from the library repo. Resolving the latest
+-- commit first means a fresh copy every load instead of the up-to-5-minute raw
+-- cache; if the API call is blocked it falls back to the main branch.
+local Void
+do
+    local ref = 'main'
+    local resolved, shaOrError = pcall(function()
+        local commit = game:GetService("HttpService"):JSONDecode(game:HttpGet('https://api.github.com/repos/iamdookie1/Ui2/commits/main'))
+        return commit.sha
+    end)
+    if resolved and shaOrError then
+        ref = shaOrError
+    else
+        warn('[Void] could not resolve the latest commit, falling back to main (raw.githubusercontent.com caches that for up to 5 minutes): ' .. tostring(shaOrError))
+    end
 
-local Window = Centrl:Window({
+    local url = ('https://raw.githubusercontent.com/iamdookie1/Ui2/%s/VoidUI.lua'):format(ref)
+    Void = loadstring(game:HttpGet(url))()
+end
+
+local Window = Void:CreateWindow({
     Title = '3008',
     SubTitle = 'assist',
-    Folder = '3008Assist',
-    ToggleKey = Enum.KeyCode.RightShift,
-    Accent = Color3.fromRGB(255, 190, 60),
+    Keybind = Enum.KeyCode.RightShift,
+    Scope = 'game',
+    Status = 'ready',
+    StartOpen = true,
+    MobileButton = true,
 })
 
+pcall(function() Void:SetAccent(Color3.fromRGB(255, 190, 60)) end)
+
 function notify(content, kind, duration)
-    Centrl:Notify({
+    Void:Notify({
         Title = '3008',
         Content = content,
-        Type = kind or 'success',
         Duration = duration or 5,
+        Warn = kind == 'warning' or kind == 'error',
     })
 end
 
@@ -1425,9 +1515,9 @@ if not Physical then
 end
 
 --// Main tab
-local MainTab = Window:Tab({ Title = 'main', Icon = 'crosshair' })
+local MainTab = Window:CreateTab('main')
 
-local LootSection = MainTab:Section({ Title = 'looting', Side = 'left' })
+local LootSection = MainTab:CreateSection('looting')
 
 LootSection:Toggle({
     Title = 'auto collect',
@@ -1472,20 +1562,20 @@ LootSection:Button({
 
 LootSection:Paragraph({
     Title = 'store, not pickup',
-    Text = 'Collecting fires Store, which is what E does on a Storable item and puts it straight in the bag. It never fires Pickup, which puts the item in your hands - a hold created by a remote alone leaves the client with no idea it happened, and that is what welded a medkit to somebody. There is a force drop button on the player tab if anything ever does get stuck.',
+    Content = 'Collecting fires Store, which is what E does on a Storable item and puts it straight in the bag. It never fires Pickup, which puts the item in your hands - a hold created by a remote alone leaves the client with no idea it happened, and that is what welded a medkit to somebody. There is a force drop button on the player tab if anything ever does get stuck.',
 })
 
 LootSection:Paragraph({
     Title = 'what counts as food',
-    Text = 'Read straight out of ReplicatedStorage.Modules.Item rather than a name list, so it follows the game exactly. That includes knowing Glass Shard is filed as edible with a negative health regen - auto collect skips it unless you asked for everything, and auto eat will never touch it.',
+    Content = 'Read straight out of ReplicatedStorage.Modules.Item rather than a name list, so it follows the game exactly. That includes knowing Glass Shard is filed as edible with a negative health regen - auto collect skips it unless you asked for everything, and auto eat will never touch it.',
 })
 
 LootSection:Paragraph({
     Title = 'range is the experiment',
-    Text = 'Store takes a model reference and the range check is client side, so this asks for items you are not looking at. If the server checks distance it simply refuses - raise the radius until it starts failing and you have found the real limit.',
+    Content = 'Store takes a model reference and the range check is client side, so this asks for items you are not looking at. If the server checks distance it simply refuses - raise the radius until it starts failing and you have found the real limit.',
 })
 
-local ActionSection = MainTab:Section({ Title = 'actions', Side = 'right' })
+local ActionSection = MainTab:CreateSection('actions')
 
 ActionSection:Toggle({
     Title = 'auto eat when hungry',
@@ -1550,12 +1640,12 @@ ActionSection:Button({
 })
 
 ActionSection:Paragraph({
-    Title = 'why health and hunger have no toggle',
-    Text = 'Both are server-owned in this game: the client only ever reads them to draw the bars. Pinning them would make your HUD lie while you still starve, so eating and medkits are automated instead. Energy is different - the client decides whether you can sprint, which is why infinite energy is real.',
+    Title = 'eating is the real heal',
+    Content = 'Health and hunger are owned by the server: the client only reads them to draw the bars. So auto eat and auto heal spend the biggest restore in your bag rather than pretending to pin a number the server would just overwrite. Energy is different - the client decides whether you can sprint, which is why infinite energy on the player tab is real.',
 })
 
 --// Whistle section
-local WhistleSection = MainTab:Section({ Title = 'whistle', Side = 'right' })
+local WhistleSection = MainTab:CreateSection('whistle')
 
 WhistleSection:Button({
     Title = 'whistle now',
@@ -1588,7 +1678,7 @@ local whistleHeard = WhistleSection:Stat({ Title = 'last whistle', Value = 'none
 local whistleDropdown = WhistleSection:Dropdown({
     Title = 'teleport when this player whistles',
     Flag = 'tv_whistle_target',
-    Options = { 'anyone' },
+    Values = { 'anyone' },
     Default = 'anyone',
     Callback = function(v) Whistle.Target = v end,
 })
@@ -1600,7 +1690,7 @@ WhistleSection:Button({
         for _, plr in ipairs(Players:GetPlayers()) do
             if plr ~= LocalPlayer then names[#names + 1] = plr.Name end
         end
-        pcall(function() whistleDropdown:SetOptions(names) end)
+        pcall(function() whistleDropdown:SetValues(names) end)
     end,
 })
 
@@ -1688,14 +1778,14 @@ WhistleSection:Button({
 
 WhistleSection:Paragraph({
     Title = 'how this hears them',
-    Text = 'Every whistle is broadcast to all clients on Remotes.Communication as ShowWhistle with the whistler and the exact world position it came from - the game only uses it to draw the marker on your screen. Reading that same event means no guessing and no configuration, and it reaches people who are streamed out, which is exactly who the sweep struggles with.',
+    Content = 'Every whistle is broadcast to all clients on Remotes.Communication as ShowWhistle with the whistler and the exact world position it came from - the game only uses it to draw the marker on your screen. Reading that same event means no guessing and no configuration, and it reaches people who are streamed out, which is exactly who the sweep struggles with.',
 })
 
 --// Player tab
-local PlayerTab = Window:Tab({ Title = 'player', Icon = 'user' })
-local StatsSection = PlayerTab:Section({ Title = 'stats', Side = 'left' })
+local PlayerTab = Window:CreateTab('player')
+local DefenseSection = PlayerTab:CreateSection('defense')
 
-StatsSection:Toggle({
+DefenseSection:Toggle({
     Title = 'infinite energy',
     Flag = 'tv_inf_energy',
     Default = false,
@@ -1707,7 +1797,7 @@ StatsSection:Toggle({
     end,
 })
 
-StatsSection:Toggle({
+DefenseSection:Toggle({
     Title = 'no fall damage',
     Flag = 'tv_no_fall',
     Default = false,
@@ -1719,12 +1809,12 @@ StatsSection:Toggle({
     end,
 })
 
-StatsSection:Paragraph({
+DefenseSection:Paragraph({
     Title = 'how these work',
-    Text = 'Your client volunteers both of these. It calculates its own fall damage and asks the server to apply it, and it spends its own energy when sliding. Blocking those two calls is the entire trick - nothing is being faked.',
+    Content = 'Your client volunteers both of these. It calculates its own fall damage and asks the server to apply it, and it spends its own energy when sliding. Blocking those two calls is the entire trick - nothing is being faked, so these are the defensive options that actually hold.',
 })
 
-local MoveSection = PlayerTab:Section({ Title = 'movement', Side = 'right' })
+local MoveSection = PlayerTab:CreateSection('movement')
 
 MoveSection:Toggle({
     Title = 'walkspeed',
@@ -1818,10 +1908,10 @@ MoveSection:Toggle({
 
 MoveSection:Paragraph({
     Title = 'flying on a phone',
-    Text = 'No extra buttons get drawn - the normal joystick steers and the camera decides height. Push forward with the camera tilted up and you climb, tilt down and you dive, exactly like walking does. The jump button becomes a straight climb while fly is on. Keyboards are untouched: WASD, space and shift work as they always did.',
+    Content = 'No extra buttons get drawn - the normal joystick steers and the camera decides height. Push forward with the camera tilted up and you climb, tilt down and you dive, exactly like walking does. The jump button becomes a straight climb while fly is on. Keyboards are untouched: WASD, space and shift work as they always did.',
 })
 
-local ReachSection = PlayerTab:Section({ Title = 'reach', Side = 'left' })
+local ReachSection = PlayerTab:CreateSection('reach')
 
 ReachSection:Toggle({
     Title = 'extended item reach',
@@ -1849,7 +1939,7 @@ ReachSection:Slider({
 
 local reachLive = ReachSection:Stat({ Title = 'carry distance now', Value = '-' })
 local reachCeiling = ReachSection:Stat({ Title = 'ceiling (attribute)', Value = '-' })
-local reachModule = ReachSection:Stat({
+ReachSection:Stat({
     Title = 'PickupSystem',
     Value = PickupSystem and 'hooked' or 'not found',
 })
@@ -1895,15 +1985,15 @@ ReachSection:Toggle({
 
 ReachSection:Paragraph({
     Title = 'why the attribute alone did nothing',
-    Text = 'There are two numbers. The live carry distance is a module upvalue inside the client\'s Building module that starts at 8, and the render loop reads it every frame to place the held item. The ScrollDistance attribute is only the CEILING that the mouse wheel clamps against. Raising the ceiling changes nothing until you physically scroll - and on a phone there is no wheel, so it could never take effect. Building is a plain ModuleScript and require is cached per instance, so this now sets the live value on the same table the game is using. The carry distance stat above is read straight back out of it.',
+    Content = 'There are two numbers. The live carry distance is a module upvalue inside the client\'s Building module that starts at 8, and the render loop reads it every frame to place the held item. The ScrollDistance attribute is only the CEILING that the mouse wheel clamps against. Raising the ceiling changes nothing until you physically scroll - and on a phone there is no wheel, so it could never take effect. Building is a plain ModuleScript and require is cached per instance, so this now sets the live value on the same table the game is using. The carry distance stat above is read straight back out of it.',
 })
 
 ReachSection:Paragraph({
     Title = 'taking things at range',
-    Text = 'Carry range and take range are different numbers. Taking is a fixed 10 stud raycast baked into GetModelAtCrosshair, so this casts the same ray at your reach distance and fires Store or Interact on what it hits - the same calls E makes. It deliberately never fires Pickup: a hold set up by a remote alone is the thing that welds an item to you.',
+    Content = 'Carry range and take range are different numbers. Taking is a fixed 10 stud raycast baked into GetModelAtCrosshair, so this casts the same ray at your reach distance and fires Store or Interact on what it hits - the same calls E makes. It deliberately never fires Pickup: a hold set up by a remote alone is the thing that welds an item to you.',
 })
 
-local HoldSection = PlayerTab:Section({ Title = 'holding', Side = 'right' })
+local HoldSection = PlayerTab:CreateSection('holding')
 
 local holdStat = HoldSection:Stat({ Title = 'server says holding', Value = 'no' })
 local holdSync = HoldSection:Stat({ Title = 'client tracking it', Value = '-' })
@@ -1963,12 +2053,140 @@ HoldSection:Slider({
 
 HoldSection:Paragraph({
     Title = 'what got the medkit stuck',
-    Text = 'Auto collect used to fire Pickup and then Store. Pickup puts the item in your hands, and the game\'s own Pickup function is what makes that survivable - it records the held model, spawns the ghost you actually see, starts the render loop and fixes the raycast filter. Firing the remote alone did none of that, so the server had you holding something the client had never heard of: the real parts rode along colliding with you, and Drop refused because it looks up a held model that was never set. Auto collect now fires Store only, which is what E does and involves no hold at all. The button above is the way out if anything else leaves you stuck.',
+    Content = 'Auto collect used to fire Pickup and then Store. Pickup puts the item in your hands, and the game\'s own Pickup function is what makes that survivable - it records the held model, spawns the ghost you actually see, starts the render loop and fixes the raycast filter. Firing the remote alone did none of that, so the server had you holding something the client had never heard of. Auto collect now fires Store only, which is what E does and involves no hold at all. The button above is the way out if anything else leaves you stuck.',
+})
+
+local RespawnSection = PlayerTab:CreateSection('respawn')
+
+RespawnSection:Toggle({
+    Title = 'auto respawn on death',
+    Flag = 'tv_auto_respawn',
+    Default = false,
+    Callback = function(v) Main.AutoRespawn = v end,
+})
+
+RespawnSection:Slider({
+    Title = 'respawn after',
+    Flag = 'tv_respawn_delay',
+    Min = 0,
+    Max = 10,
+    Increment = 1,
+    Default = 1,
+    Suffix = 's',
+    Callback = function(v) Main.RespawnDelay = v end,
+})
+
+RespawnSection:Button({
+    Title = 'respawn now',
+    Callback = function()
+        local ok = respawnNow()
+        notify(ok and 'Asked the server to respawn you.' or 'Respawn remote not found.', ok and 'success' or 'warning')
+    end,
+})
+
+RespawnSection:Button({
+    Title = 'reset character',
+    Confirm = true,
+    ConfirmText = 'This kills your character so it respawns.',
+    Callback = function()
+        local ok = killMe()
+        notify(ok and 'Reset sent.' or 'No System.Event to reset with.', ok and 'success' or 'warning')
+    end,
+})
+
+RespawnSection:Paragraph({
+    Title = 'both are your own request',
+    Content = 'Respawn fires the same Remotes.Communication "Respawn" the death screen button fires, and reset fires the "KillMe" your reset bind fires. Both only ask the server for your own character - nothing here touches anyone else.',
+})
+
+--// Local stats tab (self only, no Vip)
+local StatsTab = Window:CreateTab('local stats')
+local GateSection = StatsTab:CreateSection('client gates')
+
+GateSection:Toggle({
+    Title = 'always allow pickup',
+    Flag = 'tv_gate_pickup',
+    Default = false,
+    Callback = function(v) Localx.PickupGate = v end,
+})
+
+GateSection:Toggle({
+    Title = 'always allow interact',
+    Flag = 'tv_gate_interact',
+    Default = false,
+    Callback = function(v) Localx.InteractGate = v end,
+})
+
+GateSection:Paragraph({
+    Title = 'these two are real',
+    Content = 'CanPickUp and CanInteract are attributes the client reads on your own player before it will even send the pickup or interact remote (Building.CanPickUp / CanInteract). Pinning them true here unblocks your own actions when the game would otherwise stop you - it is a local gate, so it needs no rank. The server still validates the action it receives, so this opens the door, it does not force anything through it.',
+})
+
+local ValueSection = StatsTab:CreateSection('local values')
+
+ValueSection:Input({
+    Title = 'inventory space shown',
+    Flag = 'tv_inv_space',
+    Default = '100',
+    Placeholder = '100',
+    Callback = function(text)
+        local wanted = tonumber(text)
+        if not wanted or wanted < 1 then
+            notify('Inventory space needs to be a number of slots.', 'warning')
+            return
+        end
+        local ok = setLocalInventory(math.floor(wanted))
+        notify(ok and ('Inventory HUD set to ' .. math.floor(wanted) .. ' slots.') or 'Could not set it.', ok and 'success' or 'warning')
+    end,
+})
+
+ValueSection:Button({
+    Title = 'top up hunger bar',
+    Callback = function()
+        local hum = getHumanoid()
+        local max = hum and hum:GetAttribute("MaxHunger") or 100
+        local ok = setLocalHunger(max)
+        notify(ok and 'Hunger bar filled locally.' or 'No character.', ok and 'success' or 'warning')
+    end,
+})
+
+ValueSection:Button({
+    Title = 'top up health bar',
+    Callback = function()
+        local hum = getHumanoid()
+        local max = hum and hum.MaxHealth or 100
+        local ok = setLocalHealth(max)
+        notify(ok and 'Health bar filled locally.' or 'No character.', ok and 'success' or 'warning')
+    end,
+})
+
+local invStat = ValueSection:Stat({ Title = 'inventory', Value = '-' })
+local hungerStat = ValueSection:Stat({ Title = 'hunger', Value = '-' })
+local healthStat = ValueSection:Stat({ Title = 'health', Value = '-' })
+
+spawnLoop(function()
+    while not Unloading do
+        task.wait(0.5)
+        local hum = getHumanoid()
+        local max = LocalPlayer:GetAttribute("MaxInventorySpace")
+        local used = #inventoryToolNames()
+        pcall(function() invStat:Set(('%d / %s'):format(used, max and tostring(max) or '?')) end)
+        if hum then
+            local hunger = hum:GetAttribute("Hunger")
+            pcall(function() hungerStat:Set(hunger and ('%d / %s'):format(math.floor(hunger), tostring(math.floor(hum:GetAttribute("MaxHunger") or 100))) or '-') end)
+            pcall(function() healthStat:Set(('%d / %d'):format(math.floor(hum.Health), math.floor(hum.MaxHealth))) end)
+        end
+    end
+end)
+
+ValueSection:Paragraph({
+    Title = 'these three are HUD only',
+    Content = 'Health, hunger and inventory space are owned by the server: it decides the real values and sends them down, so a local write changes only your own bars until the next update, and the bag-full refusal on Store still comes from the server. They are here because they are local and self-only as asked, but do not mistake them for protection. The options that actually change what happens to you are on the player tab: infinite energy, no fall damage, and auto eat / auto heal for real health and hunger.',
 })
 
 --// Visual tab
-local VisualTab = Window:Tab({ Title = 'visual', Icon = 'eye' })
-local EspSection = VisualTab:Section({ Title = 'esp', Side = 'left' })
+local VisualTab = Window:CreateTab('visual')
+local EspSection = VisualTab:CreateSection('esp')
 
 EspSection:Toggle({
     Title = 'employee esp',
@@ -1994,7 +2212,7 @@ EspSection:Toggle({
 EspSection:Dropdown({
     Title = 'item filter',
     Flag = 'tv_item_filter',
-    Options = ItemFilters,
+    Values = ItemFilters,
     Default = 'Food',
     Callback = function(v) Visual.ItemFilter = v end,
 })
@@ -2002,7 +2220,7 @@ EspSection:Dropdown({
 EspSection:Dropdown({
     Title = 'method',
     Flag = 'tv_esp_method',
-    Options = { 'Marker', 'Highlight', 'Box' },
+    Values = { 'Marker', 'Highlight', 'Box' },
     Default = 'Marker',
     Callback = function(v) Visual.Method = v end,
 })
@@ -2022,7 +2240,7 @@ spawnLoop(function()
     end
 end)
 
-local EspConfigSection = VisualTab:Section({ Title = 'esp config', Side = 'right' })
+local EspConfigSection = VisualTab:CreateSection('esp config')
 
 EspConfigSection:Toggle({
     Title = 'names',
@@ -2044,6 +2262,7 @@ EspConfigSection:Slider({
     Min = 0,
     Max = 1,
     Increment = 0.05,
+    Rounding = 2,
     Default = 0.5,
     Callback = function(v) Visual.Transparency = v end,
 })
@@ -2079,20 +2298,20 @@ EspConfigSection:Input({
 
 EspConfigSection:Paragraph({
     Title = 'why item esp was empty',
-    Text = 'Highlight is the default in most hubs and Roblox quietly stops rendering past about 31 live Highlight instances - in a shop holding a hundred pizzas the item highlights simply never drew. Marker is the new default: a dot and a label per entry with no engine ceiling. Highlight still works and is capped at the nearest 30 on purpose; anything past that falls back to a marker instead of vanishing.',
+    Content = 'Highlight is the default in most hubs and Roblox quietly stops rendering past about 31 live Highlight instances - in a shop holding a hundred pizzas the item highlights simply never drew. Marker is the default here: a dot and a label per entry with no engine ceiling. Highlight still works and is capped at the nearest 30 on purpose; anything past that falls back to a marker instead of vanishing.',
 })
 
 EspConfigSection:Paragraph({
     Title = 'streamed out items',
-    Text = 'A distant item model still exists but carries no parts at all, so there is nothing to adorn to. Those entries get an invisible anchor driven from the model pivot, which is why items now show up well before you can see them. Adornees point at the model while the instances themselves live under the camera, so nothing dies when a chunk streams out.',
+    Content = 'A distant item model still exists but carries no parts at all, so there is nothing to adorn to. Those entries get an invisible anchor driven from the model pivot, which is why items now show up well before you can see them. Adornees point at the model while the instances themselves live under the camera, so nothing dies when a chunk streams out.',
 })
 
 EspConfigSection:Paragraph({
     Title = 'colours',
-    Text = 'Named specials (BEAR 5, BEAR 5 PRIME, Jim Scary, King, Harold, Hubert, Dave, Ben, MrEgg, ChickenNugget, Snowball, Abomination) draw red so they never get mistaken for an ordinary employee, which draws orange. Items are yellow, players blue.',
+    Content = 'Named specials (BEAR 5, BEAR 5 PRIME, Jim Scary, King, Harold, Hubert, Dave, Ben, MrEgg, ChickenNugget, Snowball, Abomination, Elf) draw red so they never get mistaken for an ordinary employee, which draws orange. Items are yellow, players blue.',
 })
 
-local WorldSection = VisualTab:Section({ Title = 'world', Side = 'left' })
+local WorldSection = VisualTab:CreateSection('world')
 
 WorldSection:Toggle({
     Title = 'fullbright',
@@ -2126,14 +2345,67 @@ WorldSection:Toggle({
 
 WorldSection:Paragraph({
     Title = 'hide ceiling',
-    Text = 'Local only - it changes your view and nothing else, nobody else sees through anything. Newly streamed chunks come back solid, so toggle it again after moving a long way.',
+    Content = 'Local only - it changes your view and nothing else, nobody else sees through anything. Newly streamed chunks come back solid, so toggle it again after moving a long way.',
+})
+
+--// Alerts tab
+local AlertTab = Window:CreateTab('alerts')
+local AlertSection = AlertTab:CreateSection('survival warnings')
+
+AlertSection:Toggle({
+    Title = 'bomb warning',
+    Flag = 'tv_alert_bomb',
+    Default = true,
+    Callback = function(v) Alerts.Bomb = v end,
+})
+
+AlertSection:Toggle({
+    Title = 'BEAR 5 warning',
+    Flag = 'tv_alert_bear',
+    Default = true,
+    Callback = function(v) Alerts.Bear = v end,
+})
+
+AlertSection:Toggle({
+    Title = 'freezing warning',
+    Flag = 'tv_alert_freeze',
+    Default = true,
+    Callback = function(v) Alerts.Freezing = v end,
+})
+
+local freezeStat = AlertSection:Stat({ Title = 'freezing', Value = FrozenRemote and 'ok' or 'no remote' })
+local bearStat = AlertSection:Stat({ Title = 'last BEAR 5', Value = StateRemote and 'none yet' or 'no remote' })
+local bombStat = AlertSection:Stat({ Title = 'last bomb', Value = CommunicationRemote and 'none yet' or 'no remote' })
+
+spawnLoop(function()
+    while not Unloading do
+        task.wait(0.5)
+        pcall(function()
+            if FrozenRemote then
+                freezeStat:Set(Alerts.FreezeLevel > 0 and ('%d%%'):format(math.floor(Alerts.FreezeLevel)) or 'ok')
+            end
+        end)
+        pcall(function()
+            if StateRemote and Alerts.LastBear ~= '-' then bearStat:Set(Alerts.LastBear) end
+        end)
+        pcall(function()
+            if CommunicationRemote and Alerts.LastBomb > 0 then
+                bombStat:Set(('%ds ago'):format(math.floor(os.clock() - Alerts.LastBomb)))
+            end
+        end)
+    end
+end)
+
+AlertSection:Paragraph({
+    Title = 'these just read the game',
+    Content = 'The game already tells your client when a bomb is 10 seconds out (Communication BombWarning), when a BEAR 5 or BEAR 5 PRIME is arriving (OnState), and how frozen you are (Frozen). These toggles surface those as a notification and a readout - nothing is sent, they only listen, so they are as reliable as the game\'s own warnings.',
 })
 
 --// Settings tab
-local SettingsTab = Window:Tab({ Title = 'settings', Icon = 'settings' })
-local DiagSection = SettingsTab:Section({ Title = 'diagnostics', Side = 'left' })
+local SettingsTab = Window:CreateTab('settings')
+local DiagSection = SettingsTab:CreateSection('diagnostics')
 
-local systemLabel = DiagSection:Label({ Title = 'System remotes: checking' })
+local systemLabel = DiagSection:Label('System remotes: checking')
 
 spawnLoop(function()
     while not Unloading do
@@ -2147,181 +2419,25 @@ spawnLoop(function()
         else
             systemText = 'System remotes: missing'
         end
-        pcall(function() systemLabel:Set(systemText) end)
+        pcall(function() systemLabel:SetText(systemText) end)
     end
 end)
 
-local invStat = DiagSection:Stat({ Title = 'inventory', Value = '-' })
-local itemModuleStat = DiagSection:Stat({ Title = 'item definitions', Value = ItemModule and 'loaded' or 'unavailable' })
-local whistleRemoteStat = DiagSection:Stat({ Title = 'whistle broadcast', Value = CommunicationRemote and 'connected' or 'not found' })
+DiagSection:Stat({ Title = 'item definitions', Value = ItemModule and 'loaded' or 'unavailable' })
+DiagSection:Stat({ Title = 'whistle broadcast', Value = CommunicationRemote and 'connected' or 'not found' })
+DiagSection:Stat({ Title = 'state / freezing', Value = (StateRemote and FrozenRemote) and 'connected' or 'partial' })
 
-spawnLoop(function()
-    while not Unloading do
-        task.wait(1)
-        local max = LocalPlayer:GetAttribute("MaxInventorySpace")
-        local used = 0
-        for _, name in ipairs(inventoryToolNames()) do
-            if name then used = used + 1 end
-        end
-        pcall(function() invStat:Set(('%d / %s'):format(used, max and tostring(max) or '?')) end)
-    end
-end)
-
---// Server properties tab
-local AdminTab = Window:Tab({ Title = 'server', Icon = 'shield' })
-local PropSection = AdminTab:Section({ Title = 'player properties', Side = 'left' })
-
-local adminStat = PropSection:Stat({
-    Title = 'Remotes.Vip',
-    Value = VipRemote and 'found' or 'not found',
-})
-local adminResult = PropSection:Stat({ Title = 'last write', Value = 'not tried' })
-
-spawnLoop(function()
-    while not Unloading do
-        task.wait(0.5)
-        pcall(function() adminResult:Set(Admin.LastResult) end)
-    end
-end)
-
-local function humanoidMaxHealth()
-    local hum = getHumanoid()
-    return hum and hum.MaxHealth or 0
-end
-
-PropSection:Button({
-    Title = 'god mode (infinite health)',
-    Callback = function()
-        spawnLoop(function()
-            local ok, detail = setPropertiesAndVerify(
-                { Health = math.huge, MaxHealth = math.huge },
-                function() return humanoidMaxHealth() == math.huge end,
-                'god'
-            )
-            notify(detail, ok and 'success' or 'error', 7)
-            if ok then
-                notify('Health bar will render oddly - it is drawing a fraction over infinity.', 'warning', 7)
-            end
-        end)
-    end,
+DiagSection:Paragraph({
+    Title = 'local player only',
+    Content = 'Everything in this script acts on you and only you. There is no server-properties tab any more: the things that used to live there were the moderator panel\'s remote, which needs a rank the server checks. The versions that can work without a rank are the local ones - the client gates and the HUD values on the local stats tab, plus energy, no fall damage and reach - so those are what shipped.',
 })
 
-PropSection:Button({
-    Title = 'restore health to 100',
-    Callback = function()
-        spawnLoop(function()
-            local ok, detail = setPropertiesAndVerify(
-                { Health = 100, MaxHealth = 100 },
-                function() return humanoidMaxHealth() == 100 end,
-                'health reset'
-            )
-            notify(detail, ok and 'success' or 'error', 6)
-        end)
-    end,
-})
-
-PropSection:Button({
-    Title = 'infinite hunger + energy',
-    Callback = function()
-        spawnLoop(function()
-            local ok, detail = setPropertiesAndVerify(
-                {
-                    Hunger = math.huge, MaxHunger = math.huge,
-                    Energy = math.huge, MaxEnergy = math.huge,
-                },
-                function()
-                    local hum = getHumanoid()
-                    return hum ~= nil and hum:GetAttribute("MaxHunger") == math.huge
-                end,
-                'hunger + energy'
-            )
-            notify(detail, ok and 'success' or 'error', 6)
-        end)
-    end,
-})
-
-PropSection:Input({
-    Title = 'max inventory space',
-    Flag = 'tv_inv_space',
-    Default = '100',
-    Placeholder = '100',
-    Callback = function(text)
-        local wanted = tonumber(text)
-        if not wanted or wanted < 1 then
-            notify('Inventory space needs to be a number of slots.', 'warning')
-            return
-        end
-        wanted = math.floor(wanted)
-        spawnLoop(function()
-            local ok, detail = setPropertiesAndVerify(
-                { MaxInventorySpace = wanted },
-                function() return LocalPlayer:GetAttribute("MaxInventorySpace") == wanted end,
-                'inventory space'
-            )
-            notify(detail, ok and 'success' or 'error', 6)
-        end)
-    end,
-})
-
-PropSection:Input({
-    Title = 'carry distance (server side)',
-    Flag = 'tv_server_scroll',
-    Default = '100',
-    Placeholder = '100',
-    Callback = function(text)
-        local wanted = tonumber(text)
-        if not wanted or wanted < 2 then
-            notify('Carry distance needs to be a number of studs.', 'warning')
-            return
-        end
-        spawnLoop(function()
-            local ok, detail = setPropertiesAndVerify(
-                { ScrollDistance = wanted },
-                function() return LocalPlayer:GetAttribute("ScrollDistance") == wanted end,
-                'carry distance'
-            )
-            notify(detail, ok and 'success' or 'error', 6)
-        end)
-    end,
-})
-
-local TogglesSection = AdminTab:Section({ Title = 'flags', Side = 'right' })
-
-local function propertyToggle(title, flag, attribute)
-    TogglesSection:Button({
-        Title = title,
-        Callback = function()
-            spawnLoop(function()
-                local wanted = not (LocalPlayer:GetAttribute(attribute) == true)
-                local ok, detail = setPropertiesAndVerify(
-                    { [attribute] = wanted },
-                    function() return LocalPlayer:GetAttribute(attribute) == wanted end,
-                    attribute
-                )
-                notify(detail .. (ok and (' -> ' .. tostring(wanted)) or ''), ok and 'success' or 'error', 6)
-            end)
-        end,
-    })
-end
-
-propertyToggle('toggle CanPickUp', 'tv_can_pickup', 'CanPickUp')
-propertyToggle('toggle CanInteract', 'tv_can_interact', 'CanInteract')
-propertyToggle('toggle AlwaysAnchor', 'tv_always_anchor', 'AlwaysAnchor')
-
-TogglesSection:Paragraph({
-    Title = 'how this works',
-    Text = 'The in-game moderator panel changes a player by firing one remote: Remotes.Vip UpdatePlayerProperties with a Properties table and a ToPlayer. Its God button is literally SetStat(stat, 1/0), writing infinity into the stat and its Max, which is exactly why god mode makes the health bar draw strangely. These buttons send the same payload aimed at you.',
-})
-
-TogglesSection:Paragraph({
-    Title = 'whether it lands is the server\'s call',
-    Text = 'Nothing here can promise a result. If the server checks your rank first, the remote is simply ignored and you get no error - so every button reads back the attribute it was supposed to change and the last write line above says applied or server refused. That is the real answer, not a toggle flipping green.',
-})
-
-local ControlSection = SettingsTab:Section({ Title = 'control', Side = 'right' })
+local ControlSection = SettingsTab:CreateSection('control')
 
 ControlSection:Button({
     Title = 'unload',
+    Confirm = true,
+    ConfirmText = 'Turns everything off and closes the menu.',
     Callback = function()
         Unloading = true
 
@@ -2336,6 +2452,7 @@ ControlSection:Button({
         restoreReach()
         Whistle.Follow = false
         Main.AutoWhistle = false
+        Main.AutoRespawn = false
         applyFullbright(false)
         applyNoFog(false)
         setCeilingHidden(false)
@@ -2346,15 +2463,13 @@ ControlSection:Button({
             hum.JumpPower = 50
         end
 
-        Centrl:Unload()
+        Void:Unload()
     end,
 })
 
 ControlSection:Paragraph({
     Title = 'unload',
-    Text = 'Disconnects every loop and hook, clears ESP, restores lighting, collisions and your walkspeed. The namecall hook itself cannot be removed without rejoining, but it goes inert once unloaded.',
+    Content = 'Disconnects every loop and hook, clears ESP, restores lighting, collisions and your walkspeed. The namecall hook itself cannot be removed without rejoining, but it goes inert once unloaded.',
 })
-
-Window:Load()
 
 notify('Loaded. RightShift toggles the menu.', 'success', 5)
