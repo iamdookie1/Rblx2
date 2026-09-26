@@ -835,6 +835,24 @@ local Adapt = {
 
     -- reused by every blend so a solve does not build a fresh table per pass
     scratch = {},
+
+    -- perfection. benched over eight kinds of movement, the solve that lands
+    -- most is the single best model by a slow running score with a light
+    -- share of its drift taken back out - and the one setting worth choosing
+    -- per player is that share, which is the part that depends on how they
+    -- move: someone spamming a and d wants more of it back, someone running
+    -- straight wants none. so every scoring round replays each share from the
+    -- same snapshot, and each player is shot with whichever has landed on
+    -- them most often. the rest was benched per player too and gained nothing
+    -- over one setting for everyone, so it is not chosen per player
+    TuneShares = { 0, 0.3, 0.6, 0.85 }, -- off, light, normal, aggressive
+    TuneDefault = 2,   -- light, until a player's own pick is trusted
+    TuneRate = 0.05,   -- how fast a round moves perfection's model scores and drift (glacial)
+    TuneHit = 1,       -- studs a replayed shot may miss by and still count as landing
+    TuneScore = 0.04,  -- how fast a round moves each share's running miss rate
+    TuneRounds = 12,   -- rounds before a player's own pick replaces the default
+    TuneMargin = 0.05, -- share of the held miss rate a challenger must beat it by
+    disp = {},         -- each model's step for the snapshot being scored
 }
 
 -- the advanced tab. when Enabled, these take over from the normal silent aim
@@ -1219,13 +1237,20 @@ local function backtest(entry, actual, now)
         and (Choice.valueOf(Choice.Adv.Reaction, Advanced.Reaction) or Adapt.Blend)
         or Adapt.Blend
 
+    -- each model's step is kept, so perfection's tuner below can replay every
+    -- combination from the same steps instead of stepping the models again
+    local disp = Adapt.disp
     for _, name in ipairs(Adapt.Models) do
-        local missed = flatDistance(snap.p + modelStep(name, snap, dt), actual)
+        local step = modelStep(name, snap, dt)
+        disp[name] = step
+        local missed = flatDistance(snap.p + step, actual)
         local previous = entry.scores[name]
         entry.scores[name] = previous and (previous + (missed - previous) * blend) or missed
     end
 
     entry.scored = entry.scored + 1
+
+    if Advanced.Enabled and Advanced.Perfection then Adapt.tuneRound(entry, snap, dt, actual) end
 
     -- and how far off the solver a real shot uses has been, which is what the
     -- trigger bot's sure shots are measured against
@@ -1234,7 +1259,9 @@ local function backtest(entry, actual, now)
     -- Replay whatever the solver would actually have sent for this snapshot and
     -- keep the signed miss, so the correction is measured against the real
     -- answer rather than against whichever single model happened to win.
-    if Advanced.Enabled and Advanced.Bias ~= 'Off' and entry.scored >= Adapt.Samples then
+    -- Perfection measures a drift per combination of its own, so this one is
+    -- only kept while it is off.
+    if Advanced.Enabled and not Advanced.Perfection and Advanced.Bias ~= 'Off' and entry.scored >= Adapt.Samples then
         local heading = snap.horizontal
         if heading and heading.Magnitude >= Adapt.MinHeading then
             local ok, step = pcall(Adapt.step, entry, dt, snap)
@@ -1281,7 +1308,7 @@ end
 
 local function chooseModel(entry)
     if Advanced.Enabled then
-        local solver = Advanced.Solver
+        local solver = Advanced.Perfection and 'Ensemble' or Advanced.Solver
         if solver == 'Fixed circle' then return 'Circle' end
         if solver == 'Fixed arc' then return 'Arc' end
         -- Ensemble / Best single / Top two all resolve per shot inside
@@ -1300,17 +1327,23 @@ end
 -- keeps its running miss: the blend when advanced mode blends, otherwise the
 -- one model picked. That miss, scaled to a shot's lead, is how sure a shot is.
 function Adapt.scoreSolve(entry, snap, dt, actual, blend)
-    local step
-    if Advanced.Enabled and entry.scored >= Adapt.Samples
-        and Advanced.Solver ~= 'Fixed circle' and Advanced.Solver ~= 'Fixed arc'
-    then
-        local ok, blended = pcall(Adapt.step, entry, dt, snap)
-        step = ok and blended or nil
+    local missed
+    local tune = entry.tune
+    if Adapt.tuned(entry) and tune.pickMiss and entry.scored >= Adapt.Samples then
+        -- perfection already replayed its pick this round, drift correction
+        -- included, which is exactly the solve a shot at this player uses
+        missed = tune.pickMiss
     else
-        step = modelStep(chooseModel(entry), snap, dt)
+        local step
+        if Adapt.blending() and entry.scored >= Adapt.Samples then
+            local ok, blended = pcall(Adapt.step, entry, dt, snap)
+            step = ok and blended or nil
+        else
+            step = modelStep(chooseModel(entry), snap, dt)
+        end
+        if typeof(step) ~= "Vector3" then return end
+        missed = flatDistance(snap.p + step, actual)
     end
-    if typeof(step) ~= "Vector3" then return end
-    local missed = flatDistance(snap.p + step, actual)
     entry.solveError = entry.solveError and (entry.solveError + (missed - entry.solveError) * blend) or missed
     -- the worst recent miss, fading, since a shot that has to land cannot go
     -- by the average: someone spamming left and right is dead on half the
@@ -1324,31 +1357,39 @@ end
 -- advanced tab's readout both go through this, so the readout shows exactly
 -- the blend the shot used rather than its own copy of the maths drifting from
 -- it. Returns the total weight and the single best model.
+--
+-- A player perfection is shooting is weighed by perfection's own model scores,
+-- as the single best model.
 function Adapt.weights(entry, out)
-    local best, bestError = nil, math.huge
-    for _, name in ipairs(Adapt.Models) do
-        local score = entry.scores[name]
-        if score and score < bestError then best, bestError = name, score end
+    local scores, weighting, solver, guard
+    local tuned = Adapt.tuned(entry)
+    if tuned then
+        scores, weighting, solver, guard = tuned.scores, 'Inverse fourth', 'Best single', math.huge
+    else
+        scores, weighting, solver = entry.scores, Advanced.Weighting, Advanced.Solver
+        guard = Choice.valueOf(Choice.Adv.Guard, Advanced.Guard)
     end
 
-    local solver = Advanced.Solver
+    local best, bestError = nil, math.huge
+    for _, name in ipairs(Adapt.Models) do
+        local score = scores[name]
+        if score and score < bestError then best, bestError = name, score end
+    end
 
     -- Top two keeps the winner and the runner up and drops the rest
     local secondError = math.huge
     if solver == 'Top two' then
         for _, name in ipairs(Adapt.Models) do
-            local score = entry.scores[name]
+            local score = scores[name]
             if score and name ~= best and score < secondError then secondError = score end
         end
     end
 
-    local guard = Choice.valueOf(Choice.Adv.Guard, Advanced.Guard)
-    local weighting = Advanced.Weighting
     local cutoff = bestError * guard + Adapt.Epsilon
     local total = 0
 
     for _, name in ipairs(Adapt.Models) do
-        local score = entry.scores[name]
+        local score = scores[name]
         local weight = 0
 
         if not best then
@@ -1411,16 +1452,26 @@ end
 -- consistently short or consistently long, which no amount of picking between
 -- models will ever fix on its own.
 function Adapt.correct(entry, t)
-    if not Advanced.Enabled or Advanced.Bias == 'Off' then return Vector3.zero end
-    if entry.biasAlong == nil or entry.scored < Adapt.Samples then return Vector3.zero end
+    if not Advanced.Enabled or entry.scored < Adapt.Samples then return Vector3.zero end
 
-    local share = Choice.valueOf(Choice.Adv.Bias, Advanced.Bias) or 0
-    if share <= 0 then return Vector3.zero end
-
-    -- the residual was measured over one scoring horizon, so it scales with
-    -- however much lead this particular shot is actually asking for
-    local measured = entry.biasSpan or Adapt.Target
-    if measured <= 0 then return Vector3.zero end
+    -- a player perfection is shooting gets the drift perfection measured on
+    -- them, taken back out at the share that has landed on them most; anyone
+    -- else gets the bias correction dropdown's
+    local share, along, across, measured
+    local tuned = Adapt.tuned(entry)
+    if tuned then
+        share = Adapt.TuneShares[tuned.pick]
+        along, across = tuned.along, tuned.across
+        measured = tuned.span or Adapt.Target
+    else
+        if Advanced.Bias == 'Off' then return Vector3.zero end
+        share = Choice.valueOf(Choice.Adv.Bias, Advanced.Bias) or 0
+        along, across = entry.biasAlong, entry.biasAcross
+        -- the residual was measured over one scoring horizon, so it scales
+        -- with however much lead this particular shot is actually asking for
+        measured = entry.biasSpan or Adapt.Target
+    end
+    if along == nil or share <= 0 or measured <= 0 then return Vector3.zero end
 
     -- Rebuilt in the heading they have *now*. The bias is stored as along-track
     -- and cross-track, never as a world vector: a lead that is consistently
@@ -1438,11 +1489,117 @@ function Adapt.correct(entry, t)
     local side = perpOf(forward)
     local scale = (t / measured) * share * math.clamp(entry.steady or 1, 0, 1)
 
-    local scaled = (forward * entry.biasAlong + side * entry.biasAcross) * scale
+    local scaled = (forward * along + side * across) * scale
     if scaled.Magnitude > MAX_LEAD_OFFSET then
         scaled = scaled.Unit * MAX_LEAD_OFFSET
     end
     return scaled
+end
+
+-- Whether the solve blends at all: advanced mode, and a solver that blends.
+-- Perfection always does, whatever the solver dropdown says.
+function Adapt.blending()
+    return Advanced.Enabled and (Advanced.Perfection
+        or (Advanced.Solver ~= 'Fixed circle' and Advanced.Solver ~= 'Fixed arc'))
+end
+
+-- Perfection's state for this player, or nil while perfection is off or has
+-- not scored them yet. Until a player has been watched for Adapt.TuneRounds it
+-- holds the default share, the one that landed most across everything tested.
+function Adapt.tuned(entry)
+    if not (Advanced.Enabled and Advanced.Perfection) then return nil end
+    local tune = entry and entry.tune
+    if not tune or tune.rounds < 1 then return nil end
+    return tune
+end
+
+-- One scoring round of perfection for one player. Its own model scores pick
+-- the single best model, and each share of its own measured drift is replayed
+-- on top of that from the snapshot, with what was known *before* this round,
+-- and counted as landed or not against where they really went. Only then does
+-- it learn from the round. Predicting before learning keeps it honest: each
+-- share's record is how it would really have done, not how well it fits data
+-- it has already seen.
+function Adapt.tuneRound(entry, snap, dt, actual)
+    local tune = entry.tune
+    if not tune then
+        tune = { rounds = 0, scores = {}, loss = {}, pick = Adapt.TuneDefault }
+        entry.tune = tune
+    end
+
+    local disp = Adapt.disp
+    local scores = tune.scores
+    local forget = Adapt.TuneRate
+
+    if tune.rounds > 0 then
+        local best, bestError = nil, math.huge
+        for _, name in ipairs(Adapt.Models) do
+            local score = scores[name]
+            if score and score < bestError then best, bestError = name, score end
+        end
+        local base = snap.p + (best and disp[best] or disp.Arc)
+
+        local heading = snap.horizontal
+        if heading and heading.Magnitude >= Adapt.MinHeading then
+            local forward = heading.Unit
+            local side = perpOf(forward)
+            -- the drift was measured over the last round's lead, so it scales
+            -- to this one's the same way a live shot scales it
+            local drift = tune.along and (forward * tune.along + side * tune.across)
+                * (dt / math.max(tune.span or dt, 0.01) * math.clamp(snap.steady or 1, 0, 1))
+
+            for index, share in ipairs(Adapt.TuneShares) do
+                local aimed = base
+                if drift and share > 0 then
+                    local shift = drift * share
+                    if shift.Magnitude > MAX_LEAD_OFFSET then shift = shift.Unit * MAX_LEAD_OFFSET end
+                    aimed = base + shift
+                end
+                local missed = flatDistance(aimed, actual)
+                if index == tune.pick then tune.pickMiss = missed end
+                local failed = missed > Adapt.TuneHit and 1 or 0
+                local held = tune.loss[index]
+                tune.loss[index] = held and (held + (failed - held) * Adapt.TuneScore) or failed
+            end
+
+            -- then the drift learns from the round, split along and across
+            -- the heading they had at the time
+            local residual = actual - base
+            local along, across = dotOf(residual, forward), dotOf(residual, side)
+            tune.along = tune.along and (tune.along + (along - tune.along) * forget) or along
+            tune.across = tune.across and (tune.across + (across - tune.across) * forget) or across
+        else
+            -- with no heading there is no drift to take out, so every share
+            -- would land the same and the round says nothing about them
+            tune.pickMiss = flatDistance(base, actual)
+        end
+    end
+
+    -- and each model's running miss, at perfection's own slow rate
+    for _, name in ipairs(Adapt.Models) do
+        local missed = flatDistance(snap.p + disp[name], actual)
+        local held = scores[name]
+        scores[name] = held and (held + (missed - held) * forget) or missed
+    end
+
+    tune.span = dt
+    tune.rounds = tune.rounds + 1
+
+    -- hand over only when a challenger is clearly ahead, as the model pick
+    -- does, so two shares within noise of each other do not flicker
+    if tune.rounds >= Adapt.TuneRounds then
+        local best, bestLoss = nil, math.huge
+        for index = 1, #Adapt.TuneShares do
+            local loss = tune.loss[index]
+            if loss and loss < bestLoss then best, bestLoss = index, loss end
+        end
+        local held = tune.loss[tune.pick]
+        if best and best ~= tune.pick
+            and (held == nil or bestLoss + Adapt.Floor < held * (1 - Adapt.TuneMargin))
+        then
+            tune.pick = best
+        end
+    end
 end
 
 local motion = {}
@@ -1698,9 +1855,7 @@ local function predictRoot(entry, base, sinceSample, travelTime, mode)
     -- advanced blends the models and then corrects the blend's own running
     -- bias; the normal path is the single picked model, unchanged
     local horizontal
-    if Advanced.Enabled and entry.scored >= Adapt.Samples
-        and Advanced.Solver ~= 'Fixed circle' and Advanced.Solver ~= 'Fixed arc'
-    then
+    if Adapt.blending() and entry.scored >= Adapt.Samples then
         horizontal = Adapt.step(entry, travelTime) + Adapt.correct(entry, travelTime)
     else
         horizontal = modelStep(mode, entry, travelTime)
@@ -2122,7 +2277,8 @@ local function solveAim(plan, origin, now)
     -- lead against its own answer until the point stops moving, so the distance
     -- the travel time is solved from is the distance the shot actually covers.
     local tolerance = Advanced.Enabled
-        and Choice.Adv.Converge.value[Choice.pick(Choice.Adv.Converge, Advanced.Converge)]
+        and Choice.Adv.Converge.value[Choice.pick(Choice.Adv.Converge,
+            Advanced.Perfection and 'Exhaustive' or Advanced.Converge)]
         or nil
 
     if tolerance then
@@ -4120,34 +4276,24 @@ do
 
     OverrideSection:Toggle({
         Title = 'perfection',
-        Description = 'turns advanced mode on and sets the lead and the solver to their most accurate combination',
+        Description = 'the solve that landed most in testing, with its drift correction tuned to each player from what has landed on them',
         Flag = 'mm2_adv_perfection',
         Default = false,
         Callback = function(state)
             Advanced.Perfection = state
-            if not state then return end
-            -- drive the dropdowns rather than bypassing them, so the switch is
-            -- visible and every part of it stays adjustable afterwards
-            for key, value in pairs({
-                Enabled = true,
-                Solver = 'Ensemble',
-                Weighting = 'Inverse fourth',
-                Bias = 'Aggressive',
-                Converge = 'Exhaustive',
-                Horizon = 'Weapon match',
-                Ping = 'Full',
-                Buffer = 'Normal',
-                Lead = 'Auto',
-            }) do
-                local element = Advanced.ui[key]
-                if element then pcall(function() element:Set(value) end) end
+            -- perfection lives inside advanced mode, so switching it on switches
+            -- that on too, through its toggle so the switch is visible. nothing
+            -- else is written: what perfection picks it picks per player at solve
+            -- time, so it can never overwrite a dropdown a loaded config set
+            if state and Advanced.ui.Enabled then
+                pcall(function() Advanced.ui.Enabled:Set(true) end)
             end
         end,
     })
 
     OverrideSection:Paragraph({
         Title = 'what perfection actually does',
-        Content = 'two halves: how far ahead, and where. how far ahead is the lead time, built from what the shot really has to cover - your whole round trip read from the game network stats, the replication buffer other players are drawn behind by, a frame of your own and, for the knife, its measured flight time - with the auto lead only fine tuning that from shots that really landed. the old version counted about half your ping and nothing for the buffer, and its auto multiplier was scoring every frame a target sat on screen as a missed shot and sweeping itself between 0.4x and 4x, so it spent half its time leading far too little. where is the path: all six solvers blended by how wrong each has been, the blend own signed miss subtracted back out, and the lead re-solved until the point stops moving. two of the six read what the other four could not: velocity rides the speed the game itself replicates for each player, which turns the instant they do instead of lagging a smoothed estimate, and center aims at the middle of where they have been lately, which is where someone spamming left and right keeps coming back to. each only gets weight on the people it actually predicts. the lead line in the readout shows every part of the lead the last solve used',
+        Content = 'benched across eight kinds of movement - running, strafing, jittering, zigzagging, stop and go, circling and players who switch between them - the solve that lands most is the single best model by a slow running score, with a light share of its own drift taken back out. that is where perfection starts for everyone. the one setting worth choosing per player is that share, because it depends on how they move: someone spamming a and d wants more of it back, someone running straight wants none. so every scoring round perfection replays that moment of the player with each share - off, light, normal and aggressive - and counts whether each would have landed, before learning from the round, so the record is how each would really have done. after about a second of watching, that player is shot with whichever share has landed on them most, and it only switches when another is clearly ahead. convergence runs at exhaustive, since a tighter lead solve is never less exact. while perfection is on it decides the solver, weighting, outlier guard, bias correction, reaction and convergence; history depth, scoring horizon, motion filter and the whole shot section still come from this tab. the readout shows the share picked for whoever is being solved and how often it has landed on them',
     })
 
     local SolverSection = AdvancedTab:CreateSection('solver')
@@ -4283,6 +4429,7 @@ do
     local ReadoutSection = AdvancedTab:CreateSection('readout')
 
     Advanced.ui.state = addStat(ReadoutSection, { Title = 'advanced mode', Value = 'off' })
+    Advanced.ui.pick = addStat(ReadoutSection, { Title = 'perfection pick', Value = '-' })
     Adapt.leadStats[#Adapt.leadStats + 1] = addStat(ReadoutSection, { Title = 'lead', Value = '-' })
     Advanced.ui.weights = addStat(ReadoutSection, { Title = 'model weights', Value = '-' })
     Advanced.ui.biasStat = addStat(ReadoutSection, { Title = 'bias correction', Value = '-' })
@@ -5098,7 +5245,8 @@ task.spawn(function()
             gunMultStat.Set(gunAuto and ('%.2fx'):format(GunLead.mult) or 'off')
             knifeMultStat.Set(knifeAuto and ('%.2fx'):format(KnifeLead.mult) or 'off')
 
-            solverStat.Set(Advanced.Enabled and ('advanced: ' .. Advanced.Solver)
+            solverStat.Set(Advanced.Enabled
+                and ('advanced: ' .. (Advanced.Perfection and 'perfection' or Advanced.Solver))
                 or (Aim.Math == 'Adaptive' and lastModelUsed or Aim.Math))
 
             local lead = Adapt.lead
@@ -5149,11 +5297,33 @@ task.spawn(function()
                 Advanced.ui.state.Set('off')
                 Advanced.ui.weights.Set('-')
                 Advanced.ui.biasStat.Set('-')
+                Advanced.ui.pick.Set('-')
             else
                 Advanced.ui.state.Set(Advanced.Perfection and 'perfection' or 'on',
                     Color3.fromRGB(126, 217, 87))
 
                 local entry = gunPlan and gunPlan.entry or knifePlan and knifePlan.entry
+                local tuned = entry and Adapt.tuned(entry)
+                if not Advanced.Perfection then
+                    Advanced.ui.pick.Set('perfection is off')
+                elseif not tuned then
+                    Advanced.ui.pick.Set('nobody watched yet')
+                else
+                    -- the share perfection is taking back out for this player,
+                    -- how often it has landed on them, and whether it is still
+                    -- the default or already their own pick
+                    local share = Adapt.TuneShares[tuned.pick]
+                    local loss = tuned.loss[tuned.pick]
+                    local text = ('bias %d%%'):format(math.floor(share * 100 + 0.5))
+                    if loss then text = text .. (', lands %d%%'):format(math.floor((1 - loss) * 100 + 0.5)) end
+                    if tuned.rounds < Adapt.TuneRounds then
+                        text = text .. (', default, watching %d/%d'):format(tuned.rounds, Adapt.TuneRounds)
+                    else
+                        text = text .. (', their own pick after %d rounds'):format(tuned.rounds)
+                    end
+                    Advanced.ui.pick.Set(text, Color3.fromRGB(126, 217, 87))
+                end
+
                 if not entry or entry.scored < Adapt.Samples then
                     Advanced.ui.weights.Set('learning')
                     Advanced.ui.biasStat.Set('learning')
@@ -5176,12 +5346,19 @@ task.spawn(function()
                     end
                     Advanced.ui.weights.Set(#shown > 0 and table.concat(shown, '  ') or '-')
 
-                    if Advanced.Bias == "Off" or entry.biasAlong == nil then
+                    -- a tuned player's drift is their own combination's
+                    local share, along, across
+                    if tuned then
+                        share, along, across = Adapt.TuneShares[tuned.pick], tuned.along, tuned.across
+                    elseif Advanced.Bias ~= "Off" then
+                        share = Choice.valueOf(Choice.Adv.Bias, Advanced.Bias) or 0
+                        along, across = entry.biasAlong, entry.biasAcross
+                    end
+                    if not share or share <= 0 or along == nil then
                         Advanced.ui.biasStat.Set('off')
                     else
-                        local share = Choice.valueOf(Choice.Adv.Bias, Advanced.Bias) or 0
                         Advanced.ui.biasStat.Set(('%+.2f along %+.2f across at %d%%'):format(
-                            entry.biasAlong, entry.biasAcross, math.floor(share * 100 + 0.5)))
+                            along, across, math.floor(share * 100 + 0.5)))
                     end
                 end
             end
