@@ -127,7 +127,9 @@ local function serialize(value, depth)
     local kind = typeof(value)
     if kind == "string" then
         if #value > 200 then value = value:sub(1, 200) .. "..." end
-        return ("%q"):format(value)
+        -- %q keeps a newline as backslash + real line break, which would
+        -- shift every line number after it
+        return (("%q"):format(value):gsub("\\\n", "\\n"):gsub("\r", "\\r"))
     elseif kind == "number" then
         return fmt(value)
     elseif kind == "boolean" or kind == "nil" then
@@ -258,6 +260,8 @@ function Buffer.new()
 end
 
 function Buffer:line(text)
+    -- one call is one line: names and values can carry their own line breaks
+    if text:find("[\r\n]") then text = text:gsub("\r?\n", "\\n"):gsub("\r", "\\r") end
     local n = self.n
     self.parts[n + 1] = text
     self.parts[n + 2] = "\n"
