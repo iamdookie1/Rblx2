@@ -559,74 +559,45 @@ function Choice.valueOf(set, value)
     return set.value[Choice.pick(set, value)]
 end
 
--- walk fling. the teleport and the spin in the usual fling scripts are only the
--- delivery: they exist to reach someone across the map and to keep the solver
--- from settling. walking supplies the contact for free, so all that is left to
--- supply is the momentum - claimed before the physics step and taken back after
+-- fling. a flung player is one whose own client resolved a contact against a
+-- part of yours that your client reported moving absurdly fast; every method
+-- below is a different way of getting that contact and that report to them
 Choice.Fling = {
+    -- how a run reaches the person it is aimed at
+    Method = {
+        default = 'Spin',
+        order = { 'Spin', 'Ram', 'Orbit' },
+    },
+
     Power = {
         default = 'Normal',
         order = { 'Gentle', 'Normal', 'Strong', 'Extreme', 'Absurd' },
-        -- lift multiplies the vertical component, which is what sends them up
-        -- rather than skidding along the floor
+        -- linear, angular and lift are what a run reports; touch is what the
+        -- touch fling multiplies your velocity by, and the lift it adds on top.
+        -- lift is what sends people up rather than skidding along the floor
         value = {
-            ['Gentle']  = { linear = 1e4, angular = 1e5, lift = 2 },
-            ['Normal']  = { linear = 1e6, angular = 1e7, lift = 5 },
-            ['Strong']  = { linear = 1e7, angular = 1e8, lift = 8 },
-            ['Extreme'] = { linear = 9e7, angular = 9e8, lift = 10 },
-            ['Absurd']  = { linear = 9e9, angular = 9e9, lift = 10 },
+            ['Gentle']  = { linear = 1e4, angular = 1e5, lift = 2,  touch = 1e3 },
+            ['Normal']  = { linear = 1e6, angular = 1e7, lift = 5,  touch = 1e4 },
+            ['Strong']  = { linear = 1e7, angular = 1e8, lift = 8,  touch = 1e5 },
+            ['Extreme'] = { linear = 9e7, angular = 9e8, lift = 10, touch = 1e6 },
+            ['Absurd']  = { linear = 9e9, angular = 9e9, lift = 10, touch = 1e8 },
         },
     },
 
+    -- how close someone has to be before the touch fling arms. Always runs it
+    -- every frame whoever is around, the way the classic scripts do
     Reach = {
-        default = 'Touch',
-        order = { 'Touch', 'Close', 'Medium', 'Wide' },
-        value = { ['Touch'] = 6, ['Close'] = 10, ['Medium'] = 16, ['Wide'] = 28 },
-    },
-
-    -- Angular is the one that actually transfers. A spin claim puts an enormous
-    -- velocity on the *surface* of your assembly, which is what the contact
-    -- resolves against; a linear claim mostly just launches you, because your
-    -- own centre of mass is what it moves. Angular only is the default for
-    -- that reason, and it is also the only mode that leaves you able to walk,
-    -- since your walking *is* linear velocity and nothing here touches it.
-    Claim = {
-        default = 'Angular only',
-        order = { 'Angular only', 'Angular + lift', 'Both', 'Linear only' },
-        value = {
-            ['Angular only']  = { angular = true, linear = false, lift = false },
-            ['Angular + lift'] = { angular = true, linear = false, lift = true },
-            ['Both']          = { angular = true, linear = true,  lift = true },
-            ['Linear only']   = { angular = false, linear = true,  lift = true },
-        },
-    },
-
-    -- How far your own character is allowed to move in one step before it gets
-    -- put back. Walking at 16 studs a second covers about a quarter of a stud
-    -- per frame, so anything here is orders of magnitude above normal movement
-    -- and only ever catches a claim that threw you.
-    Leash = {
-        default = 'Normal',
-        order = { 'Tight', 'Normal', 'Loose', 'Off' },
-        value = { ['Tight'] = 8, ['Normal'] = 20, ['Loose'] = 60, ['Off'] = math.huge },
+        default = 'Close',
+        order = { 'Touch', 'Close', 'Medium', 'Wide', 'Always' },
+        value = { ['Touch'] = 6, ['Close'] = 10, ['Medium'] = 16, ['Wide'] = 28, ['Always'] = math.huge },
     },
 
     Targets = {
         default = 'Anyone',
-        order = { 'Anyone', 'Murderer only', 'Armed only' },
+        order = { 'Anyone', 'Murderer only', 'Sheriff only', 'Armed only' },
     },
 
-    -- Overlap is the one that actually works. It puts your root inside theirs
-    -- and alternates above and below them a frame apart, so every frame is a
-    -- fresh interpenetration the solver has to resolve, from a direction that
-    -- keeps changing. Orbit circles at arm's length instead - quieter to watch
-    -- and much weaker, kept only because it does not put you inside anybody.
-    Style = {
-        default = 'Overlap',
-        order = { 'Overlap', 'Orbit' },
-    },
-
-    -- how wide the circle is when it orbits someone. kept at or under six
+    -- how wide the circle is when a run orbits someone. kept at or under six
     -- studs so it stays a contact rather than a lunge across the room
     Orbit = {
         default = 'Four',
@@ -634,7 +605,7 @@ Choice.Fling = {
         value = { ['Two'] = 2, ['Three'] = 3, ['Four'] = 4, ['Five'] = 5, ['Six'] = 6 },
     },
 
-    -- how long to keep circling before giving up and going home, so a target
+    -- how long a run keeps at it before giving up and going home, so a target
     -- that simply cannot be flung does not strand you next to them
     Patience = {
         default = 'Normal',
@@ -642,15 +613,23 @@ Choice.Fling = {
         value = { ['Brief'] = 1, ['Normal'] = 2.5, ['Stubborn'] = 5 },
     },
 
-    -- what counts as abnormal motion on your own character. walking is 16 and
-    -- a jump peaks near 50, so even strict leaves ordinary movement alone
+    -- how anti fling keeps you on your feet
+    AntiMethod = {
+        default = 'Smart',
+        order = { 'Smart', 'No collide', 'Guard' },
+    },
+
+    -- spin and speed are what marks someone else as flinging; tumble and thrown
+    -- are what marks you as being flung. walking is 16, a jump rises at about
+    -- 50, and turning only ever spins you about the vertical axis, which the
+    -- tumble reading leaves out entirely
     Guard = {
         default = 'Normal',
-        order = { 'Strict', 'Normal', 'Loose' },
+        order = { 'Relaxed', 'Normal', 'Strict' },
         value = {
-            ['Strict'] = { linear = 120, angular = 25 },
-            ['Normal'] = { linear = 250, angular = 60 },
-            ['Loose']  = { linear = 600, angular = 150 },
+            ['Relaxed'] = { spin = 80, speed = 300, tumble = 60, thrown = 250 },
+            ['Normal']  = { spin = 40, speed = 180, tumble = 30, thrown = 150 },
+            ['Strict']  = { spin = 20, speed = 120, tumble = 18, thrown = 110 },
         },
     },
 
@@ -2945,65 +2924,73 @@ if hasNamecallHook then
     Trigger.hooked = true
 end
 
---// walk fling ---------------------------------------------------------------
+--// fling --------------------------------------------------------------------
 --
--- Your client owns your character's physics, so whatever velocity it reports is
--- taken as true. The claim is made before the physics step, where it takes part
--- in resolving any contact you are already standing in, and taken back after it
--- with your position restored - so the momentum lands on them and nothing about
--- your own character visibly moves. No teleport, because walking into someone
--- already provides the contact a teleport exists to manufacture.
+-- Every player's client simulates their own character, and takes the velocity
+-- reported for everybody else's parts as true. A fling is a contact between
+-- them and a part of yours that your client reports moving absurdly fast. What
+-- follows are different ways of getting that contact and that report to them:
+--
+--  * Touch fling (the classic). Right after your physics step - after the frame
+--    has been simulated, just before it is sent - your velocity is swapped for
+--    an enormous one, and it is put back before the next frame, so your own
+--    character never feels it. Anyone who touches you, or you them, gets it.
+--  * Spin. A run that sits inside the target, a stud and a half above then
+--    below them each frame, spinning and reporting that velocity, until they go.
+--  * Ram. Comes at them from alternating sides, the velocity pointed through them.
+--  * Orbit. Circles them at arm's length, spinning. The weakest and quietest.
+--
+-- A run holds you in place with a zero BodyVelocity while it reports, then puts
+-- you back where you started.
 
 Fling = {
-    Enabled = false,
-    OnTouch = true,
-    Passive = false,
+    Touch = false,       -- the classic touch fling
+    TouchSpin = false,   -- report a spin with it as well
+    OnTouch = false,     -- run on anyone who touches you
+    Tap = false,         -- tap or click a player to run on them
+    Loop = false,        -- keep running on targets, nearest first
+    Method = Choice.Fling.Method.default,
     Power = Choice.Fling.Power.default,
     Reach = Choice.Fling.Reach.default,
-    Claim = Choice.Fling.Claim.default,
-    Leash = Choice.Fling.Leash.default,
     Targets = Choice.Fling.Targets.default,
-    Style = Choice.Fling.Style.default,
     Orbit = Choice.Fling.Orbit.default,
     Patience = Choice.Fling.Patience.default,
-    Upright = true,
-    savedHeight = nil,
 
-    armed = false,
-    busy = false,
-    tookLinear = false,
-    savedPos = nil,
-    hits = 0,
+    busy = false,        -- a run is going
+    target = nil,        -- the player it is on
+    cancel = false,
+    armed = false,       -- the touch fling found someone in reach this frame
+    claimed = false,     -- the touch fling's report is live right now
+    saved = nil,
+    savedSpin = nil,
+    nudge = 0.1,
+    runs = 0,
     flung = 0,
     cooldown = {},
+    savedHeight = nil,
+    tapStart = nil,
 }
 
--- A flung player picks up a velocity nothing in normal play produces, and
--- leaves the spot they were standing in. Either is enough to call it done.
+-- A flung player picks up a speed nothing in normal play produces, or goes up.
 Fling.FLUNG_SPEED = 120
-Fling.FLUNG_DISTANCE = 18
-Fling.RETOUCH = 1.5
+Fling.FLUNG_RISE = 12
+-- seconds before the same player can be run on again
+Fling.RETRY = 3
+-- how far ahead of a moving target to sit: what they have covered since the
+-- position we see was sent
+Fling.LEAD = 0.15
 Fling.GUARD_NAME = "MM2FlingGuard"
 
 function Fling.allowed(plr)
     if plr == LocalPlayer or not isAlivePlr(plr) then return false end
     local mode = Fling.Targets
     if mode == 'Murderer only' then return isMurderer(plr) end
+    if mode == 'Sheriff only' then
+        local role = roleOf(plr)
+        return role == 'Sheriff' or role == 'Hero'
+    end
     if mode == 'Armed only' then return heldWeapon(plr.Character) ~= nil end
     return true
-end
-
-function Fling.inRange(root, reach)
-    for _, plr in ipairs(Players:GetPlayers()) do
-        if Fling.allowed(plr) then
-            local char = plr.Character
-            local theirRoot = char and char:FindFirstChild("HumanoidRootPart")
-            if theirRoot and (theirRoot.Position - root.Position).Magnitude <= reach then
-                return true
-            end
-        end
-    end
-    return false
 end
 
 function Fling.myRoot()
@@ -3013,9 +3000,7 @@ function Fling.myRoot()
 end
 
 -- AssemblyLinearVelocity is the current name; the old one is kept as a fallback
--- so this still works on an older client. Either argument may be nil, and a nil
--- one is left strictly alone - that is what lets Angular only leave your own
--- walking velocity untouched instead of stamping over it every frame.
+-- so this still works on an older client. A nil argument is left alone.
 function Fling.setVelocity(root, linear, angular)
     if linear then
         pcall(function() root.AssemblyLinearVelocity = linear end)
@@ -3027,143 +3012,89 @@ function Fling.setVelocity(root, linear, angular)
     end
 end
 
--- The leash, which replaces the old hard position pin. That pin restored your
--- CFrame every single frame, which also undid the walking you did during that
--- step - it was an anchor, not a walk fling. This only intervenes when you have
--- moved further in one step than any amount of walking could explain, and it
--- keeps the facing you currently have rather than the one you had a step ago,
--- so ordinary movement passes straight through untouched.
-function Fling.leash(root)
-    if not Fling.savedPos or Fling.savedChar ~= LocalPlayer.Character then return end
-
-    local limit = Choice.valueOf(Choice.Fling.Leash, Fling.Leash)
-    if limit == math.huge then return end
-
-    local drift = (root.Position - Fling.savedPos).Magnitude
-    if drift <= limit then return end
-
-    pcall(function()
-        root.CFrame = CFrame.new(Fling.savedPos) * (root.CFrame - root.CFrame.Position)
-    end)
+function Fling.rootOf(plr)
+    local char = plr and plr.Character
+    return char and char:FindFirstChild("HumanoidRootPart")
 end
 
-function Fling.reset()
-    Fling.armed = false
-
-    -- a guard left behind would pin you at a standstill forever, and a
-    -- FallenPartsDestroyHeight left at NaN would stay that way for the session,
-    -- so both come off here as well as at the end of a normal run
-    local char = LocalPlayer.Character
-    if char then
-        local stale = char:FindFirstChild("HumanoidRootPart")
-        stale = stale and stale:FindFirstChild(Fling.GUARD_NAME)
-        if stale then pcall(function() stale:Destroy() end) end
-
-        local hum = char:FindFirstChildOfClass("Humanoid")
-        if hum then
-            pcall(function() hum:SetStateEnabled(Enum.HumanoidStateType.Seated, true) end)
-        end
-    end
-
-    if Fling.savedHeight then
-        pcall(function() Workspace.FallenPartsDestroyHeight = Fling.savedHeight end)
-        Fling.savedHeight = nil
-    end
-
+-- the nearest player this may go for, skipping anyone run on a moment ago
+function Fling.nearest(maxDistance)
     local root = Fling.myRoot()
-    if root then
-        -- only put linear back if this script was the thing that took it; the
-        -- rest of the time that value is your own movement and is not ours
-        Fling.setVelocity(root, Fling.tookLinear and Vector3.zero or nil, Vector3.zero)
-        Fling.leash(root)
+    if not root then return nil end
+    local best, bestDistance
+    local now = os.clock()
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if Fling.allowed(plr) and (Fling.cooldown[plr] or 0) <= now then
+            local theirRoot = Fling.rootOf(plr)
+            local distance = theirRoot and (theirRoot.Position - root.Position).Magnitude
+            if distance and (not maxDistance or distance <= maxDistance) and (not best or distance < bestDistance) then
+                best, bestDistance = plr, distance
+            end
+        end
     end
-
-    Fling.tookLinear = false
-    Fling.savedPos = nil
-    Fling.savedChar = nil
+    return best
 end
 
---// anti fling ---------------------------------------------------------------
---
--- Every fling, whichever script threw it, has to reach your character through
--- one of two doors: a velocity written straight onto your root, or a mover
--- instance parented into your character to push it. This watches both, and
--- puts you back where you were standing the last time your motion looked
--- ordinary. It stands down while this script is flinging, so the two never
--- fight over the same root part.
+--// touch fling
 
-AntiFling = {
-    Enabled = false,
-    Guard = Choice.Fling.Guard.default,
-    blocked = 0,
-    home = nil,
-    homeChar = nil,
-}
+function Fling.touchArmed(root)
+    local reach = Choice.valueOf(Choice.Fling.Reach, Fling.Reach)
+    if reach == math.huge then return true end
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if Fling.allowed(plr) then
+            local theirRoot = Fling.rootOf(plr)
+            if theirRoot and (theirRoot.Position - root.Position).Magnitude <= reach then return true end
+        end
+    end
+    return false
+end
 
--- the instance classes a fling can be delivered through
-AntiFling.MOVERS = {
-    BodyVelocity = true, BodyAngularVelocity = true, BodyForce = true,
-    BodyThrust = true, BodyPosition = true, BodyGyro = true,
-    LinearVelocity = true, AngularVelocity = true, VectorForce = true,
-    AlignPosition = true, AlignOrientation = true, Torque = true,
-}
-
-function AntiFling.tick()
-    if Unloading or not AntiFling.Enabled then return end
-    -- ours is not an attack, so leave it alone
-    if Fling.busy or Fling.armed then return end
-
+-- after the physics step: the enormous velocity, which is what gets sent
+function Fling.touchClaim()
+    Fling.armed = false
+    if Unloading or not Fling.Touch or Fling.busy or Fling.claimed then return end
     local root, hum = Fling.myRoot()
-    local char = LocalPlayer.Character
-    if not root or not char then return end
+    if not root or not hum or hum.Health <= 0 or not Fling.touchArmed(root) then return end
+    local power = Choice.valueOf(Choice.Fling.Power, Fling.Power)
+    local velocity = root.AssemblyLinearVelocity
+    Fling.saved = velocity
+    Fling.savedSpin = root.AssemblyAngularVelocity
+    Fling.claimed = true
+    Fling.armed = true
+    Fling.setVelocity(root, velocity * power.touch + Vector3.new(0, power.touch, 0),
+        Fling.TouchSpin and Vector3.new(0, power.touch, 0) or nil)
+end
 
-    local caught = false
-
-    for _, inst in ipairs(char:GetDescendants()) do
-        -- never eat our own self-protection guard, which is the one mover in
-        -- here that is holding you still rather than throwing you
-        if AntiFling.MOVERS[inst.ClassName] and inst.Name ~= Fling.GUARD_NAME then
-            pcall(function() inst:Destroy() end)
-            caught = true
-        end
-    end
-
-    local guard = Choice.valueOf(Choice.Fling.Guard, AntiFling.Guard)
-    local linear = root.AssemblyLinearVelocity
-    local angular = root.AssemblyAngularVelocity
-
-    if linear.Magnitude > guard.linear or angular.Magnitude > guard.angular then
-        caught = true
-    end
-
-    if caught then
-        Fling.setVelocity(root, Vector3.zero, Vector3.zero)
-        if AntiFling.home and AntiFling.homeChar == char then
-            pcall(function() root.CFrame = AntiFling.home end)
-        end
-        if hum then
-            pcall(function()
-                hum.PlatformStand = false
-                hum:ChangeState(Enum.HumanoidStateType.GettingUp)
-            end)
-        end
-        AntiFling.blocked = AntiFling.blocked + 1
-    else
-        -- only remember a position reached under your own power
-        AntiFling.home = root.CFrame
-        AntiFling.homeChar = char
+-- before the next frame: your own velocity back, so your next step starts from
+-- exactly what you were doing and nothing about your character moves
+function Fling.touchRestore()
+    if not Fling.claimed then return end
+    Fling.claimed = false
+    local root = Fling.myRoot()
+    if root and Fling.saved then
+        Fling.setVelocity(root, Fling.saved, Fling.TouchSpin and Fling.savedSpin or nil)
     end
 end
 
-track(RunService.Heartbeat:Connect(AntiFling.tick))
+-- and just before the step, a tenth of a stud a second up or down, alternating,
+-- so a contact never settles into resting
+function Fling.touchNudge()
+    Fling.touchRestore()
+    if not Fling.armed or Fling.busy then return end
+    local root = Fling.myRoot()
+    if not root then return end
+    Fling.nudge = -Fling.nudge
+    Fling.setVelocity(root, root.AssemblyLinearVelocity + Vector3.new(0, Fling.nudge, 0), nil)
+end
 
--- Claiming a velocity that enormous would throw you as hard as it throws them.
--- A BodyVelocity pinned at zero with effectively unlimited force cancels your
--- own motion continuously, while the claim still registers for the contact -
--- that asymmetry is the whole reason they go and you do not. The seated state
--- would zero the claim outright, and FallenPartsDestroyHeight is pushed to NaN
--- because every comparison against NaN is false, so nothing of yours gets
--- deleted for being briefly somewhere absurd.
+--// runs
+
+-- Reporting a velocity that size would throw you as hard as it throws them. A
+-- BodyVelocity pinned at zero with effectively unlimited force cancels your own
+-- motion, while the report still goes out - that asymmetry is why they go and
+-- you do not. The seated state would zero the report outright, and
+-- FallenPartsDestroyHeight goes to NaN, which every comparison fails, so nothing
+-- of yours is deleted for being briefly somewhere absurd.
 function Fling.protect(root, hum)
     local guard = Instance.new("BodyVelocity")
     guard.Name = Fling.GUARD_NAME
@@ -3175,7 +3106,7 @@ function Fling.protect(root, hum)
         pcall(function() hum:SetStateEnabled(Enum.HumanoidStateType.Seated, false) end)
     end
 
-    Fling.savedHeight = Workspace.FallenPartsDestroyHeight
+    if Fling.savedHeight == nil then Fling.savedHeight = Workspace.FallenPartsDestroyHeight end
     pcall(function() Workspace.FallenPartsDestroyHeight = 0 / 0 end)
 
     return guard
@@ -3186,31 +3117,29 @@ function Fling.unprotect(guard, hum)
     if hum then
         pcall(function() hum:SetStateEnabled(Enum.HumanoidStateType.Seated, true) end)
     end
-    if Fling.savedHeight then
-        pcall(function() Workspace.FallenPartsDestroyHeight = Fling.savedHeight end)
+    if Fling.savedHeight ~= nil then
+        local height = Fling.savedHeight
         Fling.savedHeight = nil
+        pcall(function() Workspace.FallenPartsDestroyHeight = height end)
     end
 end
 
--- One CFrame write does not bring you home. The step right after it can move
--- you again, the other limbs are still carrying their own velocity, and a
--- ragdolled humanoid will not stand up on its own. So this keeps putting you
--- back, zeroing every part rather than only the root, until you are actually
--- there - which is the difference between landing where you started and
--- carrying on into the void.
+-- One CFrame write does not bring you home: the next step can move you again,
+-- the other limbs still carry their own velocity, and a tumbled humanoid will
+-- not stand up on its own. So this keeps putting you back, every part zeroed,
+-- until you are actually there.
 function Fling.goHome(home, homeChar)
     if not home or not homeChar then return end
 
     local deadline = os.clock() + 3
     repeat
-        if Unloading then break end
-        if LocalPlayer.Character ~= homeChar then break end
+        if Unloading or LocalPlayer.Character ~= homeChar then break end
 
         pcall(function()
             for _, part in ipairs(homeChar:GetDescendants()) do
                 if part:IsA("BasePart") then
-                    part.Velocity = Vector3.zero
-                    part.RotVelocity = Vector3.zero
+                    part.AssemblyLinearVelocity = Vector3.zero
+                    part.AssemblyAngularVelocity = Vector3.zero
                 end
             end
 
@@ -3227,91 +3156,92 @@ function Fling.goHome(home, homeChar)
         task.wait()
 
         local root = homeChar:FindFirstChild("HumanoidRootPart")
-        if not root then break end
-        if (root.Position - home.Position).Magnitude < 6 then break end
+        if not root or (root.Position - home.Position).Magnitude < 6 then break end
     until os.clock() > deadline
 end
 
--- Circling someone at close range, spinning, until they go. This is the active
--- half: the passive claim above only fires while you happen to be touching
--- somebody, whereas this holds contact deliberately for as long as it takes.
--- It still never teleports onto them - it orbits at arm's length and puts you
--- back where you started the moment they are gone.
-function Fling.orbit(char, why)
-    if Fling.busy or Unloading then return false end
+-- where your root goes this frame, and what it reports
+function Fling.place(method, theirRoot, step, power)
+    local velocity = theirRoot.AssemblyLinearVelocity
+    local lead = Vector3.new(velocity.X, 0, velocity.Z) * Fling.LEAD
+    if lead.Magnitude > 6 then lead = lead.Unit * 6 end
+    local at = theirRoot.Position + lead
+    local spin = Vector3.new(power.angular, power.angular, power.angular)
 
+    if method == 'Orbit' then
+        local radius = Choice.valueOf(Choice.Fling.Orbit, Fling.Orbit)
+        local angle = step * 0.35
+        return CFrame.new(at + Vector3.new(math.cos(angle) * radius, 0, math.sin(angle) * radius)), nil, spin
+    end
+
+    if method == 'Ram' then
+        local side = (step % 2 == 0) and 1 or -1
+        local from = at + theirRoot.CFrame.RightVector * (2.5 * side)
+        local through = (at - from).Unit
+        return CFrame.lookAt(from, at),
+            through * power.linear + Vector3.new(0, power.linear * power.lift * 0.2, 0), spin
+    end
+
+    local up = (step % 2 == 0) and 1.5 or -1.5
+    return CFrame.new(at + Vector3.new(0, up, 0)) * CFrame.Angles(math.rad(step * 100), 0, 0),
+        Vector3.new(power.linear, power.linear * power.lift, power.linear), spin
+end
+
+-- flung means actually going somewhere: up, or fast and away. Someone who is
+-- flinging reports a huge speed too, but stays where they are
+function Fling.landed(theirRoot, theirHum, start)
+    if theirHum and theirHum.Health <= 0 then return true end
+    local moved = theirRoot.Position - start
+    if moved.Y > Fling.FLUNG_RISE then return true end
+    return theirRoot.AssemblyLinearVelocity.Magnitude > Fling.FLUNG_SPEED and moved.Magnitude > 4
+end
+
+-- a run on one player, from wherever you are, back to where you started
+function Fling.run(plr, why)
+    if Fling.busy or Unloading or not plr or plr == LocalPlayer then return false end
+    local char = plr.Character
     local theirRoot = char and char:FindFirstChild("HumanoidRootPart")
-    if not theirRoot then return false end
+    local root, hum = Fling.myRoot()
+    if not theirRoot or not root or not hum or hum.Health <= 0 then return false end
 
-    local root = Fling.myRoot()
-    if not root then return false end
-
+    Fling.touchRestore()
     Fling.busy = true
-    Fling.hits = Fling.hits + 1
+    Fling.cancel = false
+    Fling.target = plr
+    Fling.runs = Fling.runs + 1
+    Fling.cooldown[plr] = os.clock() + Fling.RETRY
 
     task.spawn(function()
-        local home = root.CFrame
         local homeChar = LocalPlayer.Character
-        local guard, hum
+        local home = root.CFrame
+        local guard
 
         local ok = pcall(function()
-            hum = homeChar and homeChar:FindFirstChildOfClass("Humanoid")
             guard = Fling.protect(root, hum)
 
-            local startPos = theirRoot.Position
-            local style = Choice.pick(Choice.Fling.Style, Fling.Style)
-            local radius = Choice.valueOf(Choice.Fling.Orbit, Fling.Orbit)
-            local patience = Choice.valueOf(Choice.Fling.Patience, Fling.Patience)
+            local method = Choice.pick(Choice.Fling.Method, Fling.Method)
             local power = Choice.valueOf(Choice.Fling.Power, Fling.Power)
+            local deadline = os.clock() + Choice.valueOf(Choice.Fling.Patience, Fling.Patience)
+            local start = theirRoot.Position
+            local step = 0
 
-            local linear = Vector3.new(power.linear, power.linear * power.lift, power.linear)
-            local spin = Vector3.new(power.angular, power.angular, power.angular)
-
-            local deadline = os.clock() + patience
-            local angle, flip, landed = 0, 1, false
-
-            while os.clock() < deadline do
-                if Unloading or not Fling.Enabled then break end
-                if LocalPlayer.Character ~= homeChar then break end
-                if not theirRoot.Parent or not root.Parent then break end
-
-                local theirHum = char:FindFirstChildOfClass("Humanoid")
-                angle = angle + 0.35
-
-                if style == 'Orbit' then
-                    root.CFrame = CFrame.new(theirRoot.Position
-                        + Vector3.new(math.cos(angle) * radius, 0, math.sin(angle) * radius))
-                    Fling.setVelocity(root, nil, spin)
-                else
-                    -- sit inside them, a stud and a half above then below, and
-                    -- drift with wherever they are running so a moving target
-                    -- does not simply walk out of the overlap
-                    local drift = Vector3.zero
-                    if theirHum then
-                        drift = theirHum.MoveDirection * math.min(theirHum.WalkSpeed, 24) * 0.08
-                    end
-
-                    flip = -flip
-                    root.CFrame = CFrame.new(theirRoot.Position + drift + Vector3.new(0, 1.5 * flip, 0))
-                        * CFrame.Angles(math.rad(angle * 40), 0, 0)
-                    Fling.setVelocity(root, linear, spin)
-                end
-
-                if theirRoot.AssemblyLinearVelocity.Magnitude > Fling.FLUNG_SPEED
-                    or (theirRoot.Position - startPos).Magnitude > Fling.FLUNG_DISTANCE
-                then
-                    landed = true
+            while os.clock() < deadline and not Fling.cancel and not Unloading do
+                if LocalPlayer.Character ~= homeChar or not root.Parent or not theirRoot.Parent then break end
+                if Fling.landed(theirRoot, char:FindFirstChildOfClass("Humanoid"), start) then
+                    Fling.flung = Fling.flung + 1
                     break
                 end
 
+                step = step + 1
+                local cf, linear, spin = Fling.place(method, theirRoot, step, power)
+                root.CFrame = cf
+                Fling.setVelocity(root, linear, spin)
                 task.wait()
             end
-
-            if landed then Fling.flung = Fling.flung + 1 end
         end)
 
-        -- teardown runs whatever happened above, including a thrown error, so
-        -- a failure part way through can never strand you mid claim
+        -- teardown runs whatever happened above, a thrown error included, so a
+        -- failure part way through can never strand you mid report
         pcall(function()
             local live = homeChar and homeChar:FindFirstChild("HumanoidRootPart")
             if live then Fling.setVelocity(live, Vector3.zero, Vector3.zero) end
@@ -3320,28 +3250,52 @@ function Fling.orbit(char, why)
         end)
 
         Fling.busy = false
+        Fling.target = nil
         if not ok then Fling.reset() end
     end)
 
     return true
 end
 
--- Anyone whose part brushes one of ours gets orbited, once, then goes on a
--- short cooldown - Touched fires many times a second against a single body and
--- re-entering for every one of them would just restart the routine forever.
-function Fling.onTouched(hit)
-    if not Fling.Enabled or not Fling.OnTouch or Fling.busy or Unloading then return end
-    if typeof(hit) ~= "Instance" then return end
+function Fling.stop()
+    Fling.cancel = true
+end
 
+-- everything off and put back: for unload, and after an error
+function Fling.reset()
+    Fling.cancel = true
+    Fling.touchRestore()
+    Fling.armed = false
+
+    local char = LocalPlayer.Character
+    if char then
+        local root = char:FindFirstChild("HumanoidRootPart")
+        local stale = root and root:FindFirstChild(Fling.GUARD_NAME)
+        if stale then pcall(function() stale:Destroy() end) end
+
+        local hum = char:FindFirstChildOfClass("Humanoid")
+        if hum then
+            pcall(function() hum:SetStateEnabled(Enum.HumanoidStateType.Seated, true) end)
+        end
+    end
+
+    if Fling.savedHeight ~= nil then
+        local height = Fling.savedHeight
+        Fling.savedHeight = nil
+        pcall(function() Workspace.FallenPartsDestroyHeight = height end)
+    end
+end
+
+--// ways to start a run
+
+-- Touched fires many times a second against one body, so each player gets one
+-- run and then a short cooldown.
+function Fling.onTouched(hit)
+    if not Fling.OnTouch or Fling.busy or Unloading or typeof(hit) ~= "Instance" then return end
     local char = hit.Parent
     local plr = char and Players:GetPlayerFromCharacter(char)
-    if not plr or plr == LocalPlayer or not Fling.allowed(plr) then return end
-
-    local now = os.clock()
-    if (Fling.cooldown[plr] or 0) > now then return end
-    Fling.cooldown[plr] = now + Fling.RETOUCH
-
-    Fling.orbit(char, 'touched')
+    if not plr or not Fling.allowed(plr) or (Fling.cooldown[plr] or 0) > os.clock() then return end
+    Fling.run(plr, 'touched')
 end
 
 function Fling.watchCharacter(char)
@@ -3358,14 +3312,14 @@ function Fling.watchCharacter(char)
     end))
 end
 
--- the two buttons. sheriff also matches hero, since a hero is whoever picked
--- the gun up after the sheriff died and is the same threat
+-- sheriff also matches hero, since a hero is whoever picked the gun up after
+-- the sheriff died and is the same threat
 function Fling.byRole(wanted)
     for _, plr in ipairs(Players:GetPlayers()) do
         if plr ~= LocalPlayer and isAlivePlr(plr) then
             local role = roleOf(plr)
             local match = role == wanted or (wanted == 'Sheriff' and role == 'Hero')
-            if match and Fling.orbit(plr.Character, wanted) then
+            if match and Fling.run(plr, wanted) then
                 return plr.Name
             end
         end
@@ -3373,11 +3327,56 @@ function Fling.byRole(wanted)
     return nil
 end
 
+function Fling.runNearest()
+    local plr = Fling.nearest()
+    if plr and Fling.run(plr, 'nearest') then return plr.Name end
+    return nil
+end
+
+-- the player whose body is under a point on the screen; accessories and tools
+-- sit a model deeper than the character, so this climbs until it finds one
+function Fling.playerAt(screenPos)
+    local ray = Camera:ScreenPointToRay(screenPos.X, screenPos.Y)
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = { LocalPlayer.Character }
+    local result = Workspace:Raycast(ray.Origin, ray.Direction * 1000, params)
+    local model = result and result.Instance and result.Instance:FindFirstAncestorOfClass("Model")
+    while model do
+        local plr = Players:GetPlayerFromCharacter(model)
+        if plr then return plr end
+        model = model.Parent and model.Parent:FindFirstAncestorOfClass("Model")
+    end
+    return nil
+end
+
+-- a quick tap or click, not a drag of the camera or a held press
+function Fling.isPress(input)
+    return input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch
+end
+
+track(UserInputService.InputBegan:Connect(function(input, processed)
+    if processed or not Fling.Tap or not Fling.isPress(input) then return end
+    Fling.tapStart = { at = os.clock(), pos = input.Position }
+end))
+
+track(UserInputService.InputEnded:Connect(function(input)
+    local start = Fling.tapStart
+    if not start or not Fling.Tap or not Fling.isPress(input) then return end
+    Fling.tapStart = nil
+    if os.clock() - start.at > 0.35 or (input.Position - start.pos).Magnitude > 12 then return end
+    local ok, plr = pcall(Fling.playerAt, input.Position)
+    if ok and plr and Fling.allowed(plr) then Fling.run(plr, 'tap') end
+end))
+
 task.spawn(function()
     if LocalPlayer.Character then Fling.watchCharacter(LocalPlayer.Character) end
 end)
 track(LocalPlayer.CharacterAdded:Connect(function(char)
     Fling.busy = false
+    Fling.target = nil
+    Fling.claimed = false
     table.clear(Fling.cooldown)
     task.spawn(Fling.watchCharacter, char)
 end))
@@ -3386,79 +3385,246 @@ track(Players.PlayerRemoving:Connect(function(plr)
     Fling.cooldown[plr] = nil
 end))
 
--- before the step: claim the momentum
-track(PreSimulation:Connect(function()
-    if Unloading or not Fling.Enabled or not Fling.Passive or Fling.busy then return end
-
-    local ok = pcall(function()
-        local root = Fling.myRoot()
-        if not root then
-            Fling.armed = false
-            return
+-- keep going through targets, nearest first
+task.spawn(function()
+    while not Unloading do
+        task.wait(0.25)
+        if Fling.Loop and not Fling.busy then
+            local plr = Fling.nearest()
+            if plr then Fling.run(plr, 'loop') end
         end
+    end
+end)
 
-        local reach = Choice.valueOf(Choice.Fling.Reach, Fling.Reach)
-        if not Fling.inRange(root, reach) then
-            Fling.armed = false
-            return
+--// anti fling ---------------------------------------------------------------
+--
+-- Nobody else can put anything into your character, and nothing they do runs
+-- on your client. The one way a fling reaches you is a contact with a part of
+-- theirs that is reported moving absurdly fast. So this looks at them, not at
+-- you: anyone whose own root reports a spin or a speed that normal play never
+-- produces is marked, and for as long as they are, their parts stop colliding
+-- with you and their velocity reads zero before each of your steps. Your own
+-- motion is only checked as a backstop, and only for what a fling does to a
+-- body: tumbling end over end, or being thrown faster than anything can move
+-- you. Turning spins you about the vertical axis and is never counted, and the
+-- movers the game puts in your character are its own business.
+
+AntiFling = {
+    Enabled = false,
+    Method = Choice.Fling.AntiMethod.default,
+    Guard = Choice.Fling.Guard.default,
+    Tell = true,
+
+    saved = 0,       -- times you were caught being thrown and steadied
+    caught = 0,      -- flingers spotted
+    flagged = {},    -- [player] = marked until
+    strikes = {},    -- [player] = frames in a row reading abnormal
+    since = {},      -- [player] = { at, pos } when this marking began
+    told = {},       -- [player] = when we last said so
+    ghosted = {},    -- [part] = its CanCollide before we touched it
+    selfStrikes = 0,
+    safe = nil,
+    safeChar = nil,
+    safeAt = 0,
+}
+
+function AntiFling.limits() return Choice.valueOf(Choice.Fling.Guard, AntiFling.Guard) end
+function AntiFling.method() return Choice.pick(Choice.Fling.AntiMethod, AntiFling.Method) end
+
+function AntiFling.isFlagged(plr, now)
+    return (AntiFling.flagged[plr] or 0) > (now or os.clock())
+end
+
+-- someone reporting a spin or a speed no normal movement makes. Two frames in a
+-- row, or one that is way past it; a mark lasts two seconds past the last one
+function AntiFling.scan(limits, now)
+    for _, plr in ipairs(Players:GetPlayers()) do
+        local root = plr ~= LocalPlayer and Fling.rootOf(plr)
+        if root then
+            local linear = root.AssemblyLinearVelocity
+            local spin = root.AssemblyAngularVelocity.Magnitude
+            local speed = Vector3.new(linear.X, 0, linear.Z).Magnitude
+            local abnormal = spin > limits.spin or speed > limits.speed or linear.Y > limits.speed
+            local extreme = spin > limits.spin * 5 or speed > limits.speed * 5 or linear.Y > limits.speed * 5
+
+            if abnormal then
+                AntiFling.strikes[plr] = (AntiFling.strikes[plr] or 0) + 1
+                if extreme or AntiFling.strikes[plr] >= 2 then
+                    if not AntiFling.isFlagged(plr, now) then
+                        AntiFling.since[plr] = { at = now, pos = root.Position, said = false }
+                    end
+                    AntiFling.flagged[plr] = now + 2
+                    AntiFling.tell(plr, root, now)
+                end
+            else
+                AntiFling.strikes[plr] = 0
+            end
         end
+    end
+end
 
-        if not Fling.armed then Fling.hits = Fling.hits + 1 end
-        Fling.armed = true
-        Fling.savedPos = root.Position
-        Fling.savedChar = LocalPlayer.Character
+-- a flinger keeps reporting that velocity while going nowhere; someone who was
+-- flung reports it too but is actually flying off, so they are left out of this
+function AntiFling.tell(plr, root, now)
+    local since = AntiFling.since[plr]
+    if not since or since.said or now - since.at < 0.5 then return end
+    if (root.Position - since.pos).Magnitude > 25 then return end
+    since.said = true
+    AntiFling.caught = AntiFling.caught + 1
+    if AntiFling.Tell and now - (AntiFling.told[plr] or -1e9) > 30 then
+        AntiFling.told[plr] = now
+        pcall(function()
+            Onyx:Notify({ Title = 'anti fling', Content = plr.Name .. ' is flinging - they cannot touch you', Type = 'warning', Duration = 4 })
+        end)
+    end
+end
 
-        local power = Choice.valueOf(Choice.Fling.Power, Fling.Power)
-        local claim = Choice.valueOf(Choice.Fling.Claim, Fling.Claim)
-
-        local linear = nil
-        if claim.linear then
-            linear = Vector3.new(power.linear, power.linear * power.lift, power.linear)
-        elseif claim.lift then
-            -- lift without a full linear claim: keep whatever you are doing
-            -- horizontally and only add upward, so you still walk normally
-            local current = root.AssemblyLinearVelocity
-            linear = Vector3.new(current.X, power.linear * power.lift, current.Z)
+function AntiFling.flingerNear(root, distance, now)
+    for plr in pairs(AntiFling.flagged) do
+        if AntiFling.isFlagged(plr, now) then
+            local theirRoot = Fling.rootOf(plr)
+            if theirRoot and (theirRoot.Position - root.Position).Magnitude <= distance then return true end
         end
-        Fling.tookLinear = linear ~= nil
+    end
+    return false
+end
 
-        Fling.setVelocity(root, linear,
-            claim.angular and Vector3.new(power.angular, power.angular, power.angular) or nil)
-    end)
+function AntiFling.shouldGhost(plr, now)
+    -- a run of ours needs the contact
+    if plr == Fling.target then return false end
+    if AntiFling.isFlagged(plr, now) then return true end
+    -- nobody at all, unless something of ours needs people to be touchable
+    return AntiFling.method() == 'No collide' and not Fling.Touch and not Fling.OnTouch
+end
 
-    if not ok then Fling.reset() end
-end))
+function AntiFling.restoreAll()
+    for part, original in pairs(AntiFling.ghosted) do
+        if part.Parent then pcall(function() part.CanCollide = original end) end
+        AntiFling.ghosted[part] = nil
+    end
+end
 
--- after it: take the claim back. this runs every frame the claim was made,
--- never conditionally - leaving a claim live across frames is what threw you
--- into the void and killed you
-track(RunService.Heartbeat:Connect(function()
-    if Unloading or not Fling.armed then return end
-
-    if not Fling.Enabled or Fling.busy then
-        Fling.reset()
+-- before your physics step: marked players' parts stop colliding, and their
+-- reported velocity reads zero for this step
+function AntiFling.beforeStep()
+    if Unloading or not AntiFling.Enabled then
+        if next(AntiFling.ghosted) then AntiFling.restoreAll() end
         return
     end
 
-    local ok = pcall(function()
-        local root, hum = Fling.myRoot()
-        if not root then return end
+    local now = os.clock()
+    AntiFling.scan(AntiFling.limits(), now)
 
-        -- angular is always ours, so it always goes back to zero. linear is
-        -- only ours if we took it, and otherwise it is your own walking
-        Fling.setVelocity(root, Fling.tookLinear and Vector3.zero or nil, Vector3.zero)
-        Fling.leash(root)
-
-        -- a big angular claim throws the humanoid into a falling state, which is
-        -- what renders as the spin; putting it straight back into Running each
-        -- frame is what keeps it looking like walking
-        if Fling.Upright and hum then
-            pcall(function() hum:ChangeState(Enum.HumanoidStateType.Running) end)
+    local keep = {}
+    if AntiFling.method() ~= 'Guard' then
+        for _, plr in ipairs(Players:GetPlayers()) do
+            local char = plr ~= LocalPlayer and plr.Character
+            if char and AntiFling.shouldGhost(plr, now) then
+                for _, part in ipairs(char:GetDescendants()) do
+                    if part:IsA("BasePart") then
+                        if AntiFling.ghosted[part] == nil then AntiFling.ghosted[part] = part.CanCollide end
+                        part.CanCollide = false
+                        keep[part] = true
+                    end
+                end
+                if AntiFling.isFlagged(plr, now) then
+                    local root = char:FindFirstChild("HumanoidRootPart")
+                    if root then
+                        root.AssemblyLinearVelocity = Vector3.zero
+                        root.AssemblyAngularVelocity = Vector3.zero
+                    end
+                end
+            end
         end
-    end)
+    end
 
-    Fling.tookLinear = false
+    -- hand back whatever no longer needs it
+    for part, original in pairs(AntiFling.ghosted) do
+        if not keep[part] then
+            if part.Parent then pcall(function() part.CanCollide = original end) end
+            AntiFling.ghosted[part] = nil
+        end
+    end
+end
+
+-- after your physics step: the backstop. Only tumbling or being thrown counts,
+-- two frames in a row (or once, way past it); Smart only steps in when someone
+-- flinging is close by or it is way past it
+function AntiFling.afterStep()
+    if Unloading or not AntiFling.Enabled or Fling.busy or Fling.claimed then return end
+
+    local root, hum = Fling.myRoot()
+    local char = LocalPlayer.Character
+    if not root or not hum or hum.Health <= 0 then
+        AntiFling.safe = nil
+        return
+    end
+
+    local limits = AntiFling.limits()
+    local now = os.clock()
+    local linear = root.AssemblyLinearVelocity
+    local angular = root.AssemblyAngularVelocity
+    local tumble = Vector3.new(angular.X, 0, angular.Z).Magnitude
+    local speed = Vector3.new(linear.X, 0, linear.Z).Magnitude
+    local thrown = tumble > limits.tumble or speed > limits.thrown or linear.Y > limits.thrown
+    local extreme = tumble > limits.tumble * 4 or speed > limits.thrown * 4 or linear.Y > limits.thrown * 4
+
+    if not thrown then
+        AntiFling.selfStrikes = 0
+        -- somewhere you got to under your own power, to go back to
+        if speed < 60 and tumble < 8 and math.abs(linear.Y) < 80 then
+            AntiFling.safe, AntiFling.safeChar, AntiFling.safeAt = root.CFrame, char, now
+        end
+        return
+    end
+
+    AntiFling.selfStrikes = AntiFling.selfStrikes + 1
+    if not extreme and AntiFling.selfStrikes < 2 then return end
+    if AntiFling.method() == 'Smart' and not extreme and not AntiFling.flingerNear(root, 30, now) then return end
+
+    AntiFling.selfStrikes = 0
+    AntiFling.saved = AntiFling.saved + 1
+    for _, part in ipairs(char:GetDescendants()) do
+        if part:IsA("BasePart") then
+            part.AssemblyLinearVelocity = Vector3.zero
+            part.AssemblyAngularVelocity = Vector3.zero
+        end
+    end
+    if AntiFling.safe and AntiFling.safeChar == char and now - AntiFling.safeAt < 3
+        and (root.Position - AntiFling.safe.Position).Magnitude > 4 then
+        root.CFrame = AntiFling.safe
+    end
+    if tumble > limits.tumble then
+        pcall(function() hum:ChangeState(Enum.HumanoidStateType.GettingUp) end)
+    end
+end
+
+track(Players.PlayerRemoving:Connect(function(plr)
+    AntiFling.flagged[plr] = nil
+    AntiFling.strikes[plr] = nil
+    AntiFling.since[plr] = nil
+    AntiFling.told[plr] = nil
+end))
+
+--// the frame
+-- before the physics step: the touch fling's nudge (its report already taken
+-- back), and anti fling taking marked players out of your step
+track(PreSimulation:Connect(function()
+    pcall(Fling.touchNudge)
+    pcall(AntiFling.beforeStep)
+end))
+
+-- after it: anti fling's backstop looks at what the step did to you, then the
+-- touch fling puts its report up to be sent
+track(RunService.Heartbeat:Connect(function()
+    pcall(AntiFling.afterStep)
+    local ok = pcall(Fling.touchClaim)
     if not ok then Fling.reset() end
+end))
+
+-- and before the next frame renders, the touch fling's report comes back down
+track(resolveEvent("PreRender", "RenderStepped"):Connect(function()
+    pcall(Fling.touchRestore)
 end))
 
 local SilentAimTab = Window:CreateTab({ Title = 'silent aim' })
@@ -4560,85 +4726,121 @@ end
 do
     local FlingTab = Window:CreateTab({ Title = 'fling' })
 
-    local FlingSection = FlingTab:CreateSection('walk fling')
+    local function say(title, content, ok)
+        Onyx:Notify({ Title = title, Content = content, Type = ok and 'success' or 'warning', Duration = 3 })
+    end
 
-    FlingSection:Toggle({
-        Title = 'fling if touched',
-        Description = 'anyone who touches you gets circled at close range until they go, then you are put back',
-        Flag = 'mm2_fling',
+    local TouchSection = FlingTab:CreateSection('touch fling')
+
+    TouchSection:Toggle({
+        Title = 'touch fling',
+        Description = 'anyone you touch, or who touches you, goes flying. your own character never feels it',
+        Flag = 'mm2_touch_fling',
         Default = false,
         Callback = function(state)
-            Fling.Enabled = state
-            if not state then Fling.reset() end
+            Fling.Touch = state
+            if not state then Fling.touchRestore() end
         end,
     })
 
-    FlingSection:Toggle({
-        Title = 'on contact',
-        Description = 'what triggers it. off leaves the buttons below as the only way to start one',
-        Flag = 'mm2_fling_touch',
-        Default = true,
-        Callback = function(state) Fling.OnTouch = state end,
-    })
-
-    FlingSection:Toggle({
-        Title = 'passive claim',
-        Description = 'the older behaviour - claims momentum every frame anyone is in reach, without circling',
-        Flag = 'mm2_fling_passive',
-        Default = false,
-        Callback = function(state)
-            Fling.Passive = state
-            if not state then Fling.reset() end
-        end,
-    })
-
-    FlingSection:Button({
-        Title = 'fling murderer',
-        Description = 'starts a run on whoever is holding the knife right now',
-        Callback = function()
-            local name = Fling.byRole('Murderer')
-            Onyx:Notify({
-                Title = 'fling',
-                Content = name and ('going for ' .. name) or 'no living murderer found',
-                Type = name and 'success' or 'warning',
-                Duration = 3,
-            })
-        end,
-    })
-
-    FlingSection:Button({
-        Title = 'fling sheriff',
-        Description = 'matches the hero too, since a hero is whoever picked the gun up',
-        Callback = function()
-            local name = Fling.byRole('Sheriff')
-            Onyx:Notify({
-                Title = 'fling',
-                Content = name and ('going for ' .. name) or 'no living sheriff or hero found',
-                Type = name and 'success' or 'warning',
-                Duration = 3,
-            })
-        end,
-    })
-
-    FlingSection:Dropdown({
-        Title = 'power',
-        Description = 'how much momentum gets claimed. gentle is a shove, absurd is orbit',
-        Values = Choice.Fling.Power.order,
-        Default = Choice.Fling.Power.default,
-        Flag = 'mm2_fling_power',
-        Callback = function(value) Fling.Power = Choice.pick(Choice.Fling.Power, value) end,
-    })
-
-    FlingSection:Dropdown({
-        Title = 'reach',
-        Description = 'how close they have to be before it arms. touch is the least obvious',
+    TouchSection:Dropdown({
+        Title = 'arm when',
+        Description = 'how close someone has to be before it arms. always runs it every frame, like the classic scripts',
         Values = Choice.Fling.Reach.order,
         Default = Choice.Fling.Reach.default,
         Flag = 'mm2_fling_reach',
         Callback = function(value) Fling.Reach = Choice.pick(Choice.Fling.Reach, value) end,
     })
 
-    FlingSection:Dropdown({
+    TouchSection:Toggle({
+        Title = 'add spin',
+        Description = 'reports a spin as well, which knocks people sideways as well as up',
+        Flag = 'mm2_touch_spin',
+        Default = false,
+        Callback = function(state) Fling.TouchSpin = state end,
+    })
+
+    TouchSection:Dropdown({
+        Title = 'power',
+        Description = 'for the touch fling and for runs. gentle is a shove, absurd is orbit',
+        Values = Choice.Fling.Power.order,
+        Default = Choice.Fling.Power.default,
+        Flag = 'mm2_fling_power',
+        Callback = function(value) Fling.Power = Choice.pick(Choice.Fling.Power, value) end,
+    })
+
+    local RunSection = FlingTab:CreateSection('fling someone')
+
+    RunSection:Button({
+        Title = 'fling murderer',
+        Description = 'goes for whoever is holding the knife right now, then brings you back',
+        Callback = function()
+            local name = Fling.byRole('Murderer')
+            say('fling', name and ('going for ' .. name) or 'no living murderer found', name ~= nil)
+        end,
+    })
+
+    RunSection:Button({
+        Title = 'fling sheriff',
+        Description = 'matches the hero too, since a hero is whoever picked the gun up',
+        Callback = function()
+            local name = Fling.byRole('Sheriff')
+            say('fling', name and ('going for ' .. name) or 'no living sheriff or hero found', name ~= nil)
+        end,
+    })
+
+    RunSection:Button({
+        Title = 'fling nearest',
+        Description = 'the closest player the target filter allows',
+        Callback = function()
+            local name = Fling.runNearest()
+            say('fling', name and ('going for ' .. name) or 'nobody to go for', name ~= nil)
+        end,
+    })
+
+    RunSection:Button({
+        Title = 'stop',
+        Description = 'ends the run in progress and brings you back',
+        Callback = function() Fling.stop() end,
+    })
+
+    RunSection:Toggle({
+        Title = 'tap a player to fling them',
+        Description = 'a quick tap or click on someone starts a run on them. dragging the camera does not count',
+        Flag = 'mm2_fling_tap',
+        Default = false,
+        Callback = function(state) Fling.Tap = state end,
+    })
+
+    RunSection:Toggle({
+        Title = 'fling back whoever touches you',
+        Description = 'anyone who brushes against you gets a run, then a few seconds of cooldown',
+        Flag = 'mm2_fling_back',
+        Default = false,
+        Callback = function(state) Fling.OnTouch = state end,
+    })
+
+    RunSection:Toggle({
+        Title = 'keep flinging targets',
+        Description = 'one run after another, nearest first, on whoever the target filter allows',
+        Flag = 'mm2_fling_loop',
+        Default = false,
+        Callback = function(state)
+            Fling.Loop = state
+            if not state then Fling.stop() end
+        end,
+    })
+
+    RunSection:Dropdown({
+        Title = 'method',
+        Description = 'spin sits inside them going above and below; ram comes at them from the sides; orbit circles them and is the weakest',
+        Values = Choice.Fling.Method.order,
+        Default = Choice.Fling.Method.default,
+        Flag = 'mm2_fling_method',
+        Callback = function(value) Fling.Method = Choice.pick(Choice.Fling.Method, value) end,
+    })
+
+    RunSection:Dropdown({
         Title = 'targets',
         Values = Choice.Fling.Targets.order,
         Default = Choice.Fling.Targets.default,
@@ -4646,121 +4848,85 @@ do
         Callback = function(value) Fling.Targets = Choice.pick(Choice.Fling.Targets, value) end,
     })
 
-    local OrbitSection = FlingTab:CreateSection('orbit')
-
-    OrbitSection:Dropdown({
-        Title = 'style',
-        Description = 'overlap sits inside them and alternates above and below; orbit circles at arm\'s length and is much weaker',
-        Values = Choice.Fling.Style.order,
-        Default = Choice.Fling.Style.default,
-        Flag = 'mm2_fling_style',
-        Callback = function(value) Fling.Style = Choice.pick(Choice.Fling.Style, value) end,
-    })
-
-    OrbitSection:Dropdown({
-        Title = 'orbit radius',
-        Description = 'orbit style only. overlap ignores it and sits inside them instead',
-        Values = Choice.Fling.Orbit.order,
-        Default = Choice.Fling.Orbit.default,
-        Flag = 'mm2_fling_orbit',
-        Callback = function(value) Fling.Orbit = Choice.pick(Choice.Fling.Orbit, value) end,
-    })
-
-    OrbitSection:Dropdown({
+    RunSection:Dropdown({
         Title = 'patience',
-        Description = 'how long to keep circling before giving up, so an unflingable target does not strand you',
+        Description = 'how long a run keeps at it before giving up, so an unflingable target does not strand you',
         Values = Choice.Fling.Patience.order,
         Default = Choice.Fling.Patience.default,
         Flag = 'mm2_fling_patience',
         Callback = function(value) Fling.Patience = Choice.pick(Choice.Fling.Patience, value) end,
     })
 
-    Fling.ui2 = addStat(OrbitSection, { Title = 'flung', Value = '0' })
+    RunSection:Dropdown({
+        Title = 'orbit radius',
+        Description = 'orbit method only',
+        Values = Choice.Fling.Orbit.order,
+        Default = Choice.Fling.Orbit.default,
+        Flag = 'mm2_fling_orbit',
+        Callback = function(value) Fling.Orbit = Choice.pick(Choice.Fling.Orbit, value) end,
+    })
+
+    Fling.ui = addStat(RunSection, { Title = 'runs', Value = '0' })
+    Fling.ui2 = addStat(RunSection, { Title = 'flung', Value = '0' })
 
     local GuardSection = FlingTab:CreateSection('anti fling')
 
     GuardSection:Toggle({
         Title = 'anti fling',
-        Description = 'catches anything trying to throw you and puts you back where you were standing',
+        Description = 'anyone flinging stops being able to touch you, and anything that still throws you gets you steadied',
         Flag = 'mm2_antifling',
         Default = false,
         Callback = function(state)
             AntiFling.Enabled = state
-            AntiFling.home = nil
-            AntiFling.homeChar = nil
+            AntiFling.safe = nil
+            AntiFling.selfStrikes = 0
+            if not state then AntiFling.restoreAll() end
         end,
     })
 
     GuardSection:Dropdown({
+        Title = 'method',
+        Description = 'smart only ever acts on someone actually flinging. no collide makes everybody pass through you. guard only watches your own body',
+        Values = Choice.Fling.AntiMethod.order,
+        Default = Choice.Fling.AntiMethod.default,
+        Flag = 'mm2_antifling_method',
+        Callback = function(value) AntiFling.Method = Choice.pick(Choice.Fling.AntiMethod, value) end,
+    })
+
+    GuardSection:Dropdown({
         Title = 'sensitivity',
-        Description = 'what counts as abnormal motion. walking is 16 and a jump peaks near 50, so even strict leaves normal movement alone',
+        Description = 'what counts as flinging and as being thrown. every level leaves walking, jumping, falling and turning alone',
         Values = Choice.Fling.Guard.order,
         Default = Choice.Fling.Guard.default,
         Flag = 'mm2_antifling_guard',
         Callback = function(value) AntiFling.Guard = Choice.pick(Choice.Fling.Guard, value) end,
     })
 
-    AntiFling.ui = addStat(GuardSection, { Title = 'blocked', Value = '0' })
-
-    GuardSection:Label({
-        Title = 'Watches both doors a fling can come through: a velocity written straight onto your root, and a mover instance parented into your character. It stands down while this script is flinging, so the two never fight over the same part.',
-    })
-
-    local TuningSection = FlingTab:CreateSection('tuning')
-
-    TuningSection:Dropdown({
-        Title = 'claim',
-        Description = 'angular only is the one that transfers, and the only one that leaves you able to walk',
-        Values = Choice.Fling.Claim.order,
-        Default = Choice.Fling.Claim.default,
-        Flag = 'mm2_fling_claim',
-        Callback = function(value) Fling.Claim = Choice.pick(Choice.Fling.Claim, value) end,
-    })
-
-    TuningSection:Dropdown({
-        Title = 'leash',
-        Description = 'how far you may move in one step before you are put back. this is what stops you being thrown',
-        Values = Choice.Fling.Leash.order,
-        Default = Choice.Fling.Leash.default,
-        Flag = 'mm2_fling_leash',
-        Callback = function(value) Fling.Leash = Choice.pick(Choice.Fling.Leash, value) end,
-    })
-
-    TuningSection:Toggle({
-        Title = 'stay upright',
-        Description = 'puts the humanoid straight back into running each frame, so it reads as walking',
-        Flag = 'mm2_fling_upright',
+    GuardSection:Toggle({
+        Title = 'say who is flinging',
+        Flag = 'mm2_antifling_tell',
         Default = true,
-        Callback = function(state) Fling.Upright = state end,
+        Callback = function(state) AntiFling.Tell = state end,
     })
 
-    Fling.ui = addStat(TuningSection, { Title = 'contacts armed', Value = '0' })
-
-    TuningSection:Button({
-        Title = 'reset counter',
-        Callback = function() Fling.hits = 0 end,
-    })
+    AntiFling.ui = addStat(GuardSection, { Title = 'steadied you', Value = '0' })
+    AntiFling.ui2 = addStat(GuardSection, { Title = 'flingers seen', Value = '0' })
 
     local NotesSection = FlingTab:CreateSection('notes')
 
     NotesSection:Paragraph({
-        Title = 'how it works',
-        Content = 'your client owns your own character physics, so whatever velocity it reports is taken as true. the claim is made before the physics step, where it takes part in resolving whatever contact you are already standing in, and taken straight back after. a spin claim is what actually transfers: it puts an enormous velocity on the surface of your assembly, which is what the contact resolves against. a linear claim mostly just moves your own centre of mass, which is to say it launches you rather than them',
+        Title = 'how a fling works',
+        Content = 'every player\'s client simulates their own character and believes the velocity your client reports for yours. a fling is them touching a part of yours that is reported moving absurdly fast. the touch fling makes that report right after your physics step, when it is sent, and takes it back before your next step, so you never feel it. a run goes to the target and keeps reporting it while a zero BodyVelocity holds you still, then brings you back',
     })
 
     NotesSection:Paragraph({
-        Title = 'why angular only is the default',
-        Content = 'two reasons, and both came out of testing. it is the only claim that reliably transfers, and it is the only one that leaves you able to walk - your walking is linear velocity, so any mode that claims linear is writing over your own movement every frame and pinning you in place. angular never touches linear at all, which is why you keep full control of your character while it runs',
-    })
-
-    NotesSection:Paragraph({
-        Title = 'the leash',
-        Content = 'a spin claim can still throw you, because ground friction turns spin into travel. the leash is the backstop: move further in one step than any amount of walking could explain and you get put back, keeping the direction you are currently facing. walking covers about a quarter of a stud per frame, so normal movement passes through untouched and only a claim that threw you ever gets caught. turn it off and you are relying on nothing going wrong',
+        Title = 'why anti fling stopped misfiring',
+        Content = 'the old one deleted every mover in your character and treated any spin as an attack. the game puts its own movers in there, and turning spins you about the vertical axis, so it kept firing on nothing. nobody else can put anything in your character, so movers are left alone now; only tumbling end over end or being thrown faster than anything normal counts, and smart only steps in when someone flinging is actually near you',
     })
 
     NotesSection:Paragraph({
         Title = 'what this cannot do',
-        Content = 'if the game puts players in a collision group that stops them touching each other there is no contact to exploit and no amount of power helps. your own screen stays clean either way, but other clients see the state you replicate, so a large claim can still read as jitter on their end. if you are being noticed, drop the power before anything else',
+        Content = 'if the game puts players in a collision group that stops them touching each other, there is no contact and no power helps. other clients see what you report, so a big touch fling can read as jitter on their end; if you are being noticed, drop the power first',
     })
 end
 
@@ -5185,14 +5351,16 @@ SessionSection:Button({
     Callback = function()
         -- put the character back before anything is disconnected, so unloading
         -- mid fling cannot leave you holding a claim nothing is going to revert
-        Fling.Enabled = false
+        Fling.Touch = false
         Fling.OnTouch = false
-        Fling.Passive = false
+        Fling.Tap = false
+        Fling.Loop = false
         AntiFling.Enabled = false
         AutoGun.Enabled = false
         Trigger.Gun = false
         Trigger.Throw = false
         pcall(Fling.reset)
+        pcall(AntiFling.restoreAll)
 
         Unloading = true
 
@@ -5275,17 +5443,20 @@ task.spawn(function()
             end
 
             if Fling.ui then
-                Fling.ui.Set(tostring(Fling.hits),
-                    Fling.Enabled and (Fling.armed or Fling.busy)
-                        and Color3.fromRGB(126, 217, 87) or nil)
+                Fling.ui.Set(tostring(Fling.runs),
+                    (Fling.busy or Fling.armed) and Color3.fromRGB(126, 217, 87) or nil)
             end
             if Fling.ui2 then
                 Fling.ui2.Set(tostring(Fling.flung),
                     Fling.flung > 0 and Color3.fromRGB(126, 217, 87) or nil)
             end
             if AntiFling.ui then
-                AntiFling.ui.Set(tostring(AntiFling.blocked),
-                    AntiFling.blocked > 0 and Color3.fromRGB(255, 196, 87) or nil)
+                AntiFling.ui.Set(tostring(AntiFling.saved),
+                    AntiFling.saved > 0 and Color3.fromRGB(255, 196, 87) or nil)
+            end
+            if AntiFling.ui2 then
+                AntiFling.ui2.Set(tostring(AntiFling.caught),
+                    AntiFling.caught > 0 and Color3.fromRGB(255, 196, 87) or nil)
             end
             if AutoGun.ui2 then
                 local n = 0
@@ -5389,6 +5560,7 @@ do
         Advanced = Advanced,
         Trigger = Trigger,
         Fling = Fling,
+        AntiFling = AntiFling,
         Visual = Visual,
         Xray = Xray,
         Debug = Debug,
