@@ -1,13 +1,21 @@
---// Dumper -----------------------------------------------------------------------
+--// Dumper -------------------------------------------------------------------------
 --
 -- loadstring(game:HttpGet('https://raw.githubusercontent.com/iamdookie1/Rblx2/main/Tools/Dumper.lua'))()
 --
--- Every option in the menu can also be set before loading, and AutoStart/NoUI
+-- Every option in the menu can also be set before loading; AutoStart + NoUI
 -- run it headless:
 --
--- getgenv().DumperConfig = { Tree = false, Spy = true, SpySeconds = 30, AutoStart = true, NoUI = true }
+-- getgenv().DumperConfig = { Spy = true, SpySeconds = 30, Speed = "Max", AutoStart = true, NoUI = true }
 --
 -- Output lands in Dumper/<PlaceId>/ in the executor's workspace folder.
+--
+-- Why it is fast now:
+--   * it works to a time budget per frame instead of pausing every 25
+--     instances, which alone was ~17s of waiting on a 25k instance game
+--   * the walk only queues scripts; they are decompiled afterwards in one
+--     sorted pass, duplicates are caught by hash before decompiling
+--   * the output is built in memory and written in a handful of calls instead
+--     of thousands of appends, then stitched with a contents page
 
 local Players = game:GetService("Players")
 local LocalPlayer = Players.LocalPlayer
@@ -24,6 +32,7 @@ local Has = {
     delfile = typeof(delfile) == "function",
     decompile = typeof(decompile) == "function",
     scripthash = typeof(getscripthash) == "function",
+    bytecode = typeof(getscriptbytecode) == "function",
     nilinstances = typeof(getnilinstances) == "function",
     loadedmodules = typeof(getloadedmodules) == "function",
     runningscripts = typeof(getrunningscripts) == "function",
@@ -31,16 +40,28 @@ local Has = {
     checkcaller = typeof(checkcaller) == "function",
 }
 
-local VERSION = "Dumper v5"
-local SEP = string.rep("=", 80)
+local VERSION = "Dumper v6"
+local WIDTH = 80
+local RULE = string.rep("=", WIDTH)
+local THIN = string.rep("-", WIDTH)
 
 local ROOT_ORDER = {
     "Workspace", "ReplicatedStorage", "ReplicatedFirst", "StarterGui", "StarterPlayer",
     "StarterPack", "Players", "Lighting", "SoundService", "Teams", "Chat",
 }
+-- scripts are written grouped by where they live, shared code first
+local SCRIPT_ROOT_RANK = {
+    ReplicatedFirst = 1, ReplicatedStorage = 2, StarterPlayer = 3, StarterGui = 4,
+    StarterPack = 5, Players = 6, Workspace = 7, Lighting = 8, SoundService = 9,
+    Teams = 10, Chat = 11,
+}
+
+-- seconds of work per frame before handing the frame back to the game
+local SPEEDS = { Smooth = 0.006, Fast = 0.016, Max = 0.05 }
 
 local Config = {
     Output = "Single file",
+    Speed = "Fast",
     Info = true,
     Scripts = true,
     Tree = true,
@@ -57,8 +78,8 @@ local Config = {
     OnlyMyPlayer = false,
     CollapseRepeats = true,
     SkipGuiValues = true,
-    MaxDepth = 16,
-    MaxScriptChars = 150000,
+    MaxDepth = 40,
+    MaxScriptChars = 500000,
     DecompileTimeout = 10,
     Roots = { "Workspace", "ReplicatedStorage", "ReplicatedFirst", "StarterGui", "StarterPlayer",
         "StarterPack", "Players", "Lighting", "SoundService", "Teams" },
@@ -72,8 +93,7 @@ if typeof(env.DumperConfig) == "table" then
     end
 end
 
--- Roblox's own player/chat scripts: identical in every game, and on the last
--- dump they were thousands of lines of the tree before anything game-specific.
+-- Roblox's own player/chat scripts: identical in every game
 local DEFAULT_SCRIPTS = {
     PlayerModule = true, PlayerScriptsLoader = true, RbxCharacterSounds = true,
     ChatScript = true, BubbleChat = true, ChatMain = true,
@@ -84,8 +104,18 @@ local REMOTE_CLASSES = {
     RemoteEvent = true, RemoteFunction = true, UnreliableRemoteEvent = true,
     BindableEvent = true, BindableFunction = true,
 }
+local VALUE_CLASSES = {
+    StringValue = true, IntValue = true, NumberValue = true, BoolValue = true,
+    ObjectValue = true, Vector3Value = true, CFrameValue = true, Color3Value = true,
+    BrickColorValue = true, RayValue = true,
+}
+local INTERACT_CLASSES = { ProximityPrompt = true, ClickDetector = true, TouchTransmitter = true }
 
---// Serialising values --------------------------------------------------------------
+-- plain functions for pcall, so a guarded read allocates no closure
+local function readValue(inst) return inst.Value end
+local function readRunContext(inst) return inst.RunContext end
+
+--// Serialising values ----------------------------------------------------------------
 local function fmt(n)
     if n == math.floor(n) and math.abs(n) < 1e15 then return tostring(n) end
     local text = ("%.3f"):format(n):gsub("0+$", ""):gsub("%.$", "")
@@ -103,7 +133,7 @@ local function serialize(value, depth)
     elseif kind == "boolean" or kind == "nil" then
         return tostring(value)
     elseif kind == "Instance" then
-        local ok, name = pcall(function() return value:GetFullName() end)
+        local ok, name = pcall(value.GetFullName, value)
         return "<" .. (ok and name or "?") .. ">"
     elseif kind == "Vector3" then
         return ("Vector3(%s, %s, %s)"):format(fmt(value.X), fmt(value.Y), fmt(value.Z))
@@ -135,37 +165,50 @@ local function serialize(value, depth)
     return kind .. "(" .. (ok and text or "?") .. ")"
 end
 
-local function attributesOf(inst)
-    local ok, attrs = pcall(function() return inst:GetAttributes() end)
+-- sorted { key, text } pairs, or nil when there are none
+local function readAttributes(inst)
+    local ok, attrs = pcall(inst.GetAttributes, inst)
     if not ok or typeof(attrs) ~= "table" or next(attrs) == nil then return nil end
-    local keys = {}
-    for key in pairs(attrs) do keys[#keys + 1] = key end
-    table.sort(keys)
-    local parts = {}
-    for _, key in ipairs(keys) do
-        parts[#parts + 1] = key .. "=" .. serialize(attrs[key], 1)
+    local list = {}
+    for key, value in pairs(attrs) do
+        list[#list + 1] = { key = key, text = serialize(value, 1) }
     end
+    table.sort(list, function(a, b) return a.key < b.key end)
+    return list
+end
+
+local function inlineAttributes(list)
+    local parts = {}
+    for i, attr in ipairs(list) do parts[i] = attr.key .. "=" .. attr.text end
     local text = table.concat(parts, ", ")
     if #text > 300 then text = text:sub(1, 300) .. "..." end
     return text
 end
 
---// Paths ----------------------------------------------------------------------------
--- The last game named every one of its 90 remotes plain "RemoteEvent", so a
--- full name alone pointed at nothing. Siblings that share a name get their
--- position appended - RemoteEvent[3] - which stays stable for the life of the
--- server and is what the spy log uses too, so the two can be matched up.
+local function pad(text, width)
+    if #text >= width then return text end
+    return text .. string.rep(" ", width - #text)
+end
+
+local function padLeft(text, width)
+    if #text >= width then return text end
+    return string.rep(" ", width - #text) .. text
+end
+
+--// Paths ------------------------------------------------------------------------------
+-- Siblings that share a name get their position appended - RemoteEvent[3] -
+-- which stays stable for the life of the server and is what the spy uses too.
 local siblingIndex = setmetatable({}, { __mode = "k" })
 
 local function indexSiblings(parent, children)
     local counts, seen, map = {}, {}, {}
     for _, child in ipairs(children) do
-        local ok, name = pcall(function() return child.Name end)
-        if ok then counts[name] = (counts[name] or 0) + 1 end
+        local name = child.Name
+        counts[name] = (counts[name] or 0) + 1
     end
     for _, child in ipairs(children) do
-        local ok, name = pcall(function() return child.Name end)
-        if ok and counts[name] > 1 then
+        local name = child.Name
+        if counts[name] > 1 then
             seen[name] = (seen[name] or 0) + 1
             map[child] = seen[name]
         end
@@ -175,9 +218,8 @@ local function indexSiblings(parent, children)
 end
 
 local function segment(inst, map)
-    local name = inst.Name
     local index = map and map[inst]
-    return index and (name .. "[" .. index .. "]") or name
+    return index and (inst.Name .. "[" .. index .. "]") or inst.Name
 end
 
 local function pathOf(inst)
@@ -192,7 +234,7 @@ local function pathOf(inst)
         end
         local map = siblingIndex[parent]
         if not map then
-            local ok, children = pcall(function() return parent:GetChildren() end)
+            local ok, children = pcall(parent.GetChildren, parent)
             map = ok and indexSiblings(parent, children) or {}
         end
         table.insert(parts, 1, segment(current, map))
@@ -201,41 +243,46 @@ local function pathOf(inst)
     return table.concat(parts, ".")
 end
 
---// Streaming file writer --------------------------------------------------------------
--- Buffers small chunks and flushes them as it goes, so a dump of a huge game
--- never sits in memory as one giant string.
-local FileWriter = {}
-FileWriter.__index = FileWriter
-
-function FileWriter.new(path)
-    local self = setmetatable({ path = path, buffer = {}, chars = 0 }, FileWriter)
-    pcall(writefile, path, "")
-    return self
+local function parentPathOf(path)
+    return path:match("^(.*)%.[^%.]+$") or path
 end
 
-function FileWriter:write(text)
-    self.buffer[#self.buffer + 1] = text
-    self.chars = self.chars + #text
-    if self.chars >= 32768 then self:flush() end
+--// Output buffers -------------------------------------------------------------------
+-- Everything is built in memory and counted in lines as it goes, which is what
+-- lets the contents page and the script index point at exact line numbers.
+local Buffer = {}
+Buffer.__index = Buffer
+
+function Buffer.new()
+    return setmetatable({ parts = {}, n = 0, lines = 0 }, Buffer)
 end
 
-function FileWriter:flush()
-    if #self.buffer == 0 then return end
-    local chunk = table.concat(self.buffer)
-    self.buffer, self.chars = {}, 0
-    if Has.appendfile then
-        pcall(appendfile, self.path, chunk)
-    elseif Has.readfile then
-        local existing = ""
-        pcall(function() existing = readfile(self.path) or "" end)
-        pcall(writefile, self.path, existing .. chunk)
-    else
-        self.whole = (self.whole or "") .. chunk
-        pcall(writefile, self.path, self.whole)
+function Buffer:line(text)
+    local n = self.n
+    self.parts[n + 1] = text
+    self.parts[n + 2] = "\n"
+    self.n = n + 2
+    self.lines = self.lines + 1
+end
+
+-- multi-line text, and how many lines it is if the caller already knows
+function Buffer:block(text, count)
+    if text:sub(-1) ~= "\n" then text = text .. "\n" end
+    if not count then
+        local _, newlines = text:gsub("\n", "")
+        count = newlines
     end
+    self.n = self.n + 1
+    self.parts[self.n] = text
+    self.lines = self.lines + count
+    return count
 end
 
---// Output layout ----------------------------------------------------------------------
+function Buffer:text()
+    return table.concat(self.parts, "", 1, self.n)
+end
+
+--// Files ------------------------------------------------------------------------------
 local function folder()
     return ("Dumper/%d"):format(game.PlaceId)
 end
@@ -252,44 +299,71 @@ local function filePath(name)
     return ("Dumper_%d_%s"):format(game.PlaceId, name)
 end
 
--- written smallest and most useful first, so the top of a single-file dump
--- is the part worth reading before scrolling into the tree
-local SECTIONS = {
-    { key = "Info", file = "Info.txt", title = "GAME INFO" },
-    { key = "Spy", file = "Spy.txt", title = "REMOTE SPY (live calls while dumping)" },
-    { key = "Remotes", file = "Remotes.txt", title = "REMOTE CATALOGUE" },
-    { key = "Interactables", file = "Interactables.txt", title = "INTERACTABLES (prompts, click and touch parts)" },
-    { key = "Values", file = "Values.txt", title = "VALUE + ATTRIBUTE SNAPSHOT" },
-    { key = "Hidden", file = "Hidden.txt", title = "HIDDEN (nil parented, loaded or running but not in the tree)" },
-    { key = "Tree", file = "Tree.txt", title = "INSTANCE TREE" },
-    { key = "Scripts", file = "Scripts.txt", title = "SCRIPTS" },
-}
+-- a few big writes rather than thousands of small ones
+local function writeChunks(path, chunks)
+    if Has.appendfile then
+        pcall(writefile, path, chunks[1] or "")
+        for i = 2, #chunks do pcall(appendfile, path, chunks[i]) end
+    else
+        pcall(writefile, path, table.concat(chunks))
+    end
+end
 
---// Crash memory -------------------------------------------------------------------
+--// Crash memory ---------------------------------------------------------------------
 -- A decompile that takes the client down never gets to say so. Each script is
--- marked ATTEMPT before decompiling and DONE after; an ATTEMPT without a DONE
--- on the next run is the script that crashed it, and it gets skipped.
+-- written down as an ATTEMPT just before it is decompiled - one append, nothing
+-- after - and a finished dump rewrites the file with only the known SUSPECTs.
+-- So a file still holding attempts means the last run died, and since scripts
+-- are decompiled one at a time, the last attempt is the one that killed it.
+-- (Files from the old dumper paired ATTEMPT with DONE; those still read.)
 local function loadSuspects(path)
     local suspects = {}
     if not Has.readfile or (Has.isfile and not isfile(path)) then return suspects end
     local ok, content = pcall(readfile, path)
     if not ok or typeof(content) ~= "string" then return suspects end
-    local attempted, done = {}, {}
+    local attempted, done, lastAttempt, oldFormat = {}, {}, nil, false
     for line in content:gmatch("[^\r\n]+") do
         local tag, name = line:match("^(%a+)\t(.+)$")
-        if tag == "ATTEMPT" then attempted[name] = true elseif tag == "DONE" then done[name] = true end
+        if tag == "SUSPECT" then
+            suspects[name] = true
+        elseif tag == "ATTEMPT" then
+            attempted[name] = true
+            lastAttempt = name
+        elseif tag == "DONE" then
+            done[name] = true
+            oldFormat = true
+        end
     end
-    for name in pairs(attempted) do
-        if not done[name] then suspects[name] = true end
+    if oldFormat then
+        for name in pairs(attempted) do
+            if not done[name] then suspects[name] = true end
+        end
+    elseif lastAttempt then
+        suspects[lastAttempt] = true
     end
     return suspects
 end
 
---// Remote spy ---------------------------------------------------------------------
--- Records every remote the game's own scripts fire (and every event the
--- server sends back) while the dump runs, with the real arguments. On a game
--- whose remotes all share one name, this is the only way to tell which one
--- is the dodge and which is the purchase.
+local State = {}
+
+function State.open(path, suspects)
+    State.path, State.text = path, {}
+    for name in pairs(suspects) do State.text[#State.text + 1] = "SUSPECT\t" .. name .. "\n" end
+    pcall(writefile, path, table.concat(State.text))
+end
+
+function State.add(line)
+    State.text[#State.text + 1] = line
+    if Has.appendfile then
+        pcall(appendfile, State.path, line)
+    else
+        pcall(writefile, State.path, table.concat(State.text))
+    end
+end
+
+--// Remote spy -----------------------------------------------------------------------
+-- Records every remote the game's own scripts fire (and every event the server
+-- sends back) while the dump runs, with the real arguments.
 local Spy = env.__DumperSpy
 if typeof(Spy) ~= "table" then
     Spy = { active = false }
@@ -317,7 +391,7 @@ function Spy.record(direction, remote, ...)
         local args = { ... }
         local parts = {}
         for i = 1, n do parts[i] = serialize(args[i]) end
-        entry.samples[#entry.samples + 1] = ("@%.2fs  (%s)"):format(os.clock() - Spy.started, table.concat(parts, ", "))
+        entry.samples[#entry.samples + 1] = ("@%6.2fs  (%s)"):format(os.clock() - Spy.started, table.concat(parts, ", "))
     end
 end
 
@@ -349,10 +423,10 @@ function Spy.start()
     Spy.reset()
     Spy.hooked = installSpyHook()
     for _, root in ipairs({ game:GetService("ReplicatedStorage"), workspace, LocalPlayer }) do
-        local ok, descendants = pcall(function() return root:GetDescendants() end)
+        local ok, descendants = pcall(root.GetDescendants, root)
         for _, inst in ipairs(ok and descendants or {}) do
-            local okClass, className = pcall(function() return inst.ClassName end)
-            if okClass and (className == "RemoteEvent" or className == "UnreliableRemoteEvent") then
+            local className = inst.ClassName
+            if className == "RemoteEvent" or className == "UnreliableRemoteEvent" then
                 local okConn, connection = pcall(function()
                     return inst.OnClientEvent:Connect(function(...)
                         if Spy.active then pcall(Spy.record, "IN  OnClientEvent", inst, ...) end
@@ -371,25 +445,39 @@ function Spy.stop()
     Spy.connections = {}
 end
 
-function Spy.write(writer)
+function Spy.write(out)
     if not Spy.hooked then
-        writer:write("-- outgoing calls need hookmetamethod, which this executor does not have; incoming only\n\n")
+        out:line("outgoing calls need hookmetamethod, which this executor does not have - incoming only")
+        out:line("")
     end
-    if #Spy.order == 0 then
-        writer:write("-- nothing fired while recording. play the game (use tools, buy things, move) during the spy window\n")
+    if not Spy.order or #Spy.order == 0 then
+        out:line("nothing fired while recording - play the game (use tools, buy, move) during the spy window")
         return
     end
-    table.sort(Spy.order, function(a, b) return a.count > b.count end)
+    table.sort(Spy.order, function(a, b)
+        if a.direction ~= b.direction then return a.direction > b.direction end
+        return a.count > b.count
+    end)
+    local lastSide
     for _, entry in ipairs(Spy.order) do
+        local side = entry.direction:match("^%a+")
+        if side ~= lastSide then
+            if lastSide then out:line("") end
+            out:line(side == "OUT" and "sent by the game (client -> server)" or "received (server -> client)")
+            out:line(THIN)
+            lastSide = side
+        end
         local okPath, path = pcall(pathOf, entry.remote)
-        writer:write(("[%s] %s   x%d\n"):format(entry.direction, okPath and path or "?", entry.count))
-        for i, sample in ipairs(entry.samples) do
-            writer:write(("    #%d %s\n"):format(i, sample))
+        out:line(("%-18s %s   x%d"):format(entry.direction:gsub("^%a+%s+", ""), okPath and path or "?", entry.count))
+        for _, sample in ipairs(entry.samples) do
+            out:line("      " .. sample)
         end
     end
 end
 
---// Traversal helpers ------------------------------------------------------------
+--// Walking the game -------------------------------------------------------------------
+local Dump = { running = false, cancel = false }
+
 local function isDefaultScript(inst)
     local current = inst
     while current and current ~= game do
@@ -400,10 +488,10 @@ local function isDefaultScript(inst)
 end
 
 -- only client code ships to the client: a plain server Script's bytecode never
--- replicates, so there is nothing to decompile and trying just wastes time
+-- replicates, so there is nothing to decompile
 local function isClientReadable(inst, className)
     if className ~= "Script" then return true end
-    local ok, context = pcall(function() return inst.RunContext end)
+    local ok, context = pcall(readRunContext, inst)
     return ok and context == Enum.RunContext.Client
 end
 
@@ -423,142 +511,72 @@ local function decompileWithTimeout(inst)
     return ok, result
 end
 
-local function characterOwner(inst)
-    local ok, player = pcall(function() return Players:GetPlayerFromCharacter(inst) end)
-    return ok and player or nil
-end
-
---// The dump -----------------------------------------------------------------------
-local Dump = { running = false, cancel = false }
-
-local function newStats()
+local function newContext()
+    local characters = {}
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player.Character then characters[player.Character] = player end
+    end
     return {
-        instances = 0, scripts = 0, duplicates = 0, defaults = 0, serverScripts = 0,
-        failures = 0, suspects = 0, remotes = 0, values = 0, interactables = 0,
-        collapsed = 0, hidden = 0,
+        stats = {
+            instances = 0, scripts = 0, duplicates = 0, defaults = 0, serverScripts = 0,
+            failures = 0, suspects = 0, remotes = 0, values = 0, interactables = 0,
+            collapsed = 0, hidden = 0,
+        },
+        timings = {},
+        characters = characters,
+        classCount = {},
+        visited = setmetatable({}, { __mode = "k" }),
+        stack = {},
+        queue = {},        -- scripts found by the walk, decompiled afterwards
+        remotes = {},      -- { parent, name, className }
+        interactables = {},
+        hidden = {},
+        index = {},        -- the script index rows
+        seenScripts = {},
+        out = {
+            Tree = Buffer.new(),
+            Values = Buffer.new(),
+            Scripts = Buffer.new(),
+        },
     }
 end
 
-local function writeScript(ctx, inst, className, path)
-    local stats = ctx.stats
-    if Config.SkipDefaults and isDefaultScript(inst) then
-        stats.defaults = stats.defaults + 1
-        return
-    end
+-- hands the frame back once this frame's share of work is spent
+local Budget = { last = 0 }
 
-    local w = ctx.writers.Scripts
-    local header = ("%s\n%s | Type: %s | Method: decompile\nLocation: %s\n%s\n\n"):format(SEP, inst.Name, className, path, SEP)
+function Budget.start() Budget.last = os.clock() end
 
-    if not isClientReadable(inst, className) then
-        stats.serverScripts = stats.serverScripts + 1
-        return
+function Budget.check(onYield)
+    if os.clock() - Budget.last >= (SPEEDS[Config.Speed] or SPEEDS.Fast) then
+        if onYield then onYield() end
+        task.wait()
+        Budget.last = os.clock()
     end
-
-    if not Has.decompile then
-        w:write(header .. "-- [decompile unavailable on this executor]\n\n")
-        return
-    end
-
-    if ctx.suspects[path] then
-        w:write(header .. "-- [skipped: a previous dump crashed while decompiling this one. forget crash skips to retry it]\n\n")
-        stats.suspects = stats.suspects + 1
-        return
-    end
-
-    -- the same Animate/Sprint script lives in every character and the same
-    -- template in every clone - one copy is plenty
-    local hash
-    if Config.DedupeScripts and Has.scripthash then
-        local ok, value = pcall(getscripthash, inst)
-        if ok and value then hash = value end
-    end
-    if hash and ctx.seenScripts[hash] then
-        w:write(header .. "-- [identical to " .. ctx.seenScripts[hash] .. "]\n\n")
-        stats.duplicates = stats.duplicates + 1
-        return
-    end
-
-    ctx.writers.State:write("ATTEMPT\t" .. path .. "\n")
-    ctx.writers.State:flush()
-    local ok, source = decompileWithTimeout(inst)
-    ctx.writers.State:write("DONE\t" .. path .. "\n")
-
-    if not ok or typeof(source) ~= "string" then
-        w:write(header .. "-- [decompile failed: " .. tostring(source) .. "]\n\n")
-        stats.failures = stats.failures + 1
-        return
-    end
-
-    if Config.DedupeScripts and not hash then
-        if ctx.seenScripts[source] then
-            w:write(header .. "-- [identical to " .. ctx.seenScripts[source] .. "]\n\n")
-            stats.duplicates = stats.duplicates + 1
-            return
-        end
-        ctx.seenScripts[source] = path
-    elseif hash then
-        ctx.seenScripts[hash] = path
-    end
-
-    if #source > Config.MaxScriptChars then
-        source = source:sub(1, Config.MaxScriptChars) .. ("\n-- [...truncated, %d chars total]"):format(#source)
-    end
-    w:write(header .. source .. "\n\n")
-    stats.scripts = stats.scripts + 1
 end
 
-local function writeInteractable(ctx, inst, className, path)
-    local w = ctx.writers.Interactables
-    if className == "ProximityPrompt" then
-        local ok, text = pcall(function()
-            return ("action=%q object=%q hold=%ss range=%s enabled=%s"):format(
-                inst.ActionText, inst.ObjectText, fmt(inst.HoldDuration), fmt(inst.MaxActivationDistance), tostring(inst.Enabled))
-        end)
-        w:write(("[Prompt] %s  %s\n"):format(path, ok and text or ""))
-    elseif className == "ClickDetector" then
-        local ok, range = pcall(function() return inst.MaxActivationDistance end)
-        w:write(("[Click] %s  range=%s\n"):format(path, ok and fmt(range) or "?"))
-    else
-        local part = path:gsub("%.TouchInterest$", "")
-        w:write(("[Touch] %s\n"):format(part))
-    end
-    ctx.stats.interactables = ctx.stats.interactables + 1
-end
-
-local function treeNote(inst, className)
+local function treeNote(className, value, hasValue)
     if REMOTE_CLASSES[className] then return "  <- remote" end
-    if className == "Script" then
-        local ok, context = pcall(function() return inst.RunContext end)
-        return (ok and context == Enum.RunContext.Client) and "  [client]" or "  [server, unreadable]"
-    end
-    local ok, isValue = pcall(function() return inst:IsA("ValueBase") end)
-    if ok and isValue then
-        local okVal, value = pcall(function() return inst.Value end)
-        return okVal and ("  = " .. serialize(value)) or ""
-    end
+    if className == "Script" then return nil end
+    if hasValue then return "  = " .. value end
     return ""
 end
 
 -- the children worth walking into, with repeats and other players' copies of
 -- the same character folded down to a single line each
-local function childrenOf(ctx, inst, depth, prefix, parentPath)
-    if depth >= Config.MaxDepth then return {} end
-    local ok, children = pcall(function() return inst:GetChildren() end)
-    if not ok then return {} end
+local function childFrames(ctx, inst, depth, prefix, parentPath, inGui)
+    if depth >= Config.MaxDepth then return nil end
+    local ok, children = pcall(inst.GetChildren, inst)
+    if not ok or #children == 0 then return nil end
     local map = indexSiblings(inst, children)
 
     local groups, kept = {}, {}
     for _, child in ipairs(children) do
-        local okName, name = pcall(function() return child.Name end)
-        local okClass, className = pcall(function() return child.ClassName end)
-        if okName and okClass and className ~= "Terrain" then
-            local path = parentPath .. "." .. segment(child, map)
-            local owner = className == "Model" and Config.OnlyMyCharacter and characterOwner(child)
-            local otherPlayer = className == "Player" and Config.OnlyMyPlayer and child ~= LocalPlayer
-
+        local name, className = child.Name, child.ClassName
+        if className ~= "Terrain" then
+            local owner = className == "Model" and Config.OnlyMyCharacter and ctx.characters[child]
             if owner and owner ~= LocalPlayer then
-                kept[#kept + 1] = { note = name .. " (Model)  -- character of " .. owner.Name .. ", same as yours, skipped" }
-            elseif otherPlayer then
+                kept[#kept + 1] = { note = name .. " (Model)  -- " .. owner.Name .. "'s character, same as yours, skipped" }
+            elseif className == "Player" and Config.OnlyMyPlayer and child ~= LocalPlayer then
                 kept[#kept + 1] = { note = name .. " (Player)  -- skipped, only your own player is dumped" }
             elseif Config.SkipDefaults and DEFAULT_SCRIPTS[name] and SCRIPT_CLASSES[className] then
                 kept[#kept + 1] = { note = name .. " (" .. className .. ")  -- roblox default, skipped" }
@@ -569,28 +587,32 @@ local function childrenOf(ctx, inst, depth, prefix, parentPath)
                 local groupKey = name .. "\0" .. className
                 local group = groups[groupKey]
                 if not group then
-                    group = { count = 0 }
+                    group = { count = 0, name = name, className = className }
                     groups[groupKey] = group
                 end
                 group.count = group.count + 1
                 local foldable = Config.CollapseRepeats and not REMOTE_CLASSES[className] and not SCRIPT_CLASSES[className]
                 if not foldable or group.count <= 3 then
-                    kept[#kept + 1] = { inst = child, path = path, label = segment(child, map) }
+                    local label = segment(child, map)
+                    kept[#kept + 1] = {
+                        inst = child, className = className, label = label,
+                        path = parentPath .. "." .. label,
+                        inGui = inGui or name == "PlayerGui" or name == "StarterGui",
+                    }
                     group.last = #kept
-                    group.name, group.className = name, className
                 end
             end
         end
     end
 
     for _, group in pairs(groups) do
-        local hidden = group.count - 3
-        if Config.CollapseRepeats and hidden > 0 and group.last
+        local extra = group.count - 3
+        if extra > 0 and group.last and Config.CollapseRepeats
             and not REMOTE_CLASSES[group.className] and not SCRIPT_CLASSES[group.className]
         then
             kept[group.last].fold = ("... +%d more %s (%s), same shape as the ones above, not walked")
-                :format(hidden, group.name, group.className)
-            ctx.stats.collapsed = ctx.stats.collapsed + hidden
+                :format(extra, group.name, group.className)
+            ctx.stats.collapsed = ctx.stats.collapsed + extra
         end
     end
 
@@ -599,65 +621,98 @@ local function childrenOf(ctx, inst, depth, prefix, parentPath)
         frames[#frames + 1] = item
         if item.fold then frames[#frames + 1] = { note = item.fold } end
     end
+    local count = #frames
     for i, frame in ipairs(frames) do
-        frame.depth, frame.prefix, frame.isLast = depth, prefix, i == #frames
+        frame.depth, frame.prefix, frame.isLast = depth, prefix, i == count
     end
     return frames
 end
 
 local function visit(ctx, frame)
-    local w, stats = ctx.writers, ctx.stats
+    local out, stats = ctx.out, ctx.stats
     local branch = frame.depth == 0 and "" or (frame.isLast and "`-- " or "|-- ")
 
     if frame.note then
-        if Config.Tree then w.Tree:write(frame.prefix .. branch .. frame.note .. "\n") end
+        if Config.Tree then out.Tree:line(frame.prefix .. branch .. frame.note) end
         return
     end
 
     local inst, path = frame.inst, frame.path
-    local okClass, className = pcall(function() return inst.ClassName end)
-    if not okClass then return end
+    local className = frame.className or inst.ClassName
     ctx.visited[inst] = true
     stats.instances = stats.instances + 1
+    ctx.classCount[className] = (ctx.classCount[className] or 0) + 1
 
-    local attrs = Config.Attributes and attributesOf(inst)
+    local attrs = Config.Attributes and readAttributes(inst) or nil
+    local hasValue, valueText = false, nil
+    if VALUE_CLASSES[className] then
+        local ok, value = pcall(readValue, inst)
+        hasValue, valueText = true, ok and serialize(value) or "<unreadable>"
+    end
+
     if Config.Tree then
-        w.Tree:write(frame.prefix .. branch .. (frame.label or inst.Name) .. " (" .. className .. ")" .. treeNote(inst, className)
-            .. (attrs and ("  {" .. attrs .. "}") or "") .. "\n")
-    end
-
-    if Config.Scripts and SCRIPT_CLASSES[className] then
-        writeScript(ctx, inst, className, path)
-    elseif Config.Remotes and REMOTE_CLASSES[className] then
-        w.Remotes:write(("[%s] %s\n"):format(className, path))
-        stats.remotes = stats.remotes + 1
-    elseif Config.Interactables and (className == "ProximityPrompt" or className == "ClickDetector" or className == "TouchTransmitter") then
-        writeInteractable(ctx, inst, className, path)
-    end
-
-    local inGui = path:find("PlayerGui", 1, true) or path:find("StarterGui", 1, true)
-    if Config.Values and not (Config.SkipGuiValues and inGui) then
-        local okValue, isValue = pcall(function() return inst:IsA("ValueBase") end)
-        if okValue and isValue then
-            local okVal, value = pcall(function() return inst.Value end)
-            w.Values:write(("%-16s %s = %s\n"):format(className, path, okVal and serialize(value) or "<unreadable>"))
-            stats.values = stats.values + 1
+        local note
+        if className == "Script" then
+            local ok, context = pcall(readRunContext, inst)
+            note = (ok and context == Enum.RunContext.Client) and "  [client]" or "  [server, unreadable]"
+        else
+            note = treeNote(className, valueText, hasValue)
         end
+        out.Tree:line(frame.prefix .. branch .. (frame.label or inst.Name) .. " (" .. className .. ")" .. note
+            .. (attrs and ("  {" .. inlineAttributes(attrs) .. "}") or ""))
+    end
+
+    if SCRIPT_CLASSES[className] then
+        if Config.Scripts then
+            ctx.queue[#ctx.queue + 1] = { inst = inst, className = className, path = path }
+        end
+    elseif REMOTE_CLASSES[className] then
+        if Config.Remotes then
+            ctx.remotes[#ctx.remotes + 1] = { parent = parentPathOf(path), name = frame.label or inst.Name, className = className }
+            stats.remotes = stats.remotes + 1
+        end
+    elseif INTERACT_CLASSES[className] and Config.Interactables then
+        ctx.interactables[#ctx.interactables + 1] = { inst = inst, className = className, path = path }
+        stats.interactables = stats.interactables + 1
+    end
+
+    -- values hang off their parent, attributes off the instance itself; the
+    -- walk visits an instance right before its children, so both land under
+    -- one heading
+    if Config.Values and not (Config.SkipGuiValues and frame.inGui) then
+        local values = out.Values
         if attrs then
-            w.Values:write(("%-16s %s {%s}\n"):format("Attributes", path, attrs))
+            if values.group ~= path then
+                values.group = path
+                values:line("")
+                values:line(path)
+            end
+            for _, attr in ipairs(attrs) do
+                values:line("    @" .. pad(attr.key, 26) .. " = " .. attr.text)
+            end
+        end
+        if hasValue then
+            local parent = parentPathOf(path)
+            if values.group ~= parent then
+                values.group = parent
+                values:line("")
+                values:line(parent)
+            end
+            values:line("    " .. pad(frame.label or inst.Name, 27) .. " = " .. pad(valueText, 30) .. "  " .. className)
+            stats.values = stats.values + 1
         end
     end
 
     local childPrefix = frame.prefix
     if frame.depth > 0 then childPrefix = childPrefix .. (frame.isLast and "    " or "|   ") end
-    local children = childrenOf(ctx, inst, frame.depth + 1, childPrefix, path)
-    for i = #children, 1, -1 do
-        ctx.stack[#ctx.stack + 1] = children[i]
+    local children = childFrames(ctx, inst, frame.depth + 1, childPrefix, path, frame.inGui)
+    if children then
+        local stack = ctx.stack
+        for i = #children, 1, -1 do stack[#stack + 1] = children[i] end
     end
 end
 
-local function dumpHidden(ctx)
-    local w = ctx.writers.Hidden
+local function collectHidden(ctx)
     local sources = {
         { "nil parented", Has.nilinstances and getnilinstances },
         { "loaded module", Has.loadedmodules and getloadedmodules },
@@ -674,192 +729,565 @@ local function dumpHidden(ctx)
                     ctx.visited[inst] = true
                     local okPath, path = pcall(pathOf, inst)
                     path = okPath and path or ("nil." .. tostring(inst))
-                    w:write(("[%s] %s  (%s)\n"):format(className, path, label))
+                    ctx.hidden[#ctx.hidden + 1] = { className = className, path = path, label = label }
                     ctx.stats.hidden = ctx.stats.hidden + 1
-                    if Config.Scripts and SCRIPT_CLASSES[className] then
-                        writeScript(ctx, inst, className, path)
+                    if Config.Scripts and SCRIPT_CLASSES[className]
+                        and not (Config.SkipDefaults and isDefaultScript(inst))
+                    then
+                        ctx.queue[#ctx.queue + 1] = { inst = inst, className = className, path = path, hidden = true }
                     end
-                    task.wait()
                 end
+                Budget.check()
             end
         else
-            w:write(("-- %s: not supported on this executor\n"):format(label))
+            ctx.hidden[#ctx.hidden + 1] = { note = label .. ": not supported on this executor" }
         end
     end
 end
 
-local function writeInfo(w)
-    local ok, info = pcall(function()
-        return game:GetService("MarketplaceService"):GetProductInfo(game.PlaceId)
-    end)
+-- One script: skipped, matched to one already written, or decompiled and
+-- written under a header that is itself a Lua comment, so a script copied out
+-- of the dump still runs.
+local function decompileOne(ctx, item)
+    local stats, out = ctx.stats, ctx.out.Scripts
+    local row = { path = item.path, className = item.className }
+    ctx.index[#ctx.index + 1] = row
+
+    if not isClientReadable(item.inst, item.className) then
+        stats.serverScripts = stats.serverScripts + 1
+        row.status = "server"
+        return
+    end
+    if not Has.decompile then
+        row.status = "no decompiler"
+        return
+    end
+    if ctx.suspects[item.path] then
+        stats.suspects = stats.suspects + 1
+        row.status = "crash-skipped"
+        return
+    end
+
+    -- the same Animate/Sprint script lives in every character and the same
+    -- template in every clone - one copy is plenty, and a hash says so
+    -- without decompiling it again
+    local key
+    if Config.DedupeScripts then
+        if Has.scripthash then
+            local ok, hash = pcall(getscripthash, item.inst)
+            if ok and hash then key = hash end
+        end
+        if not key and Has.bytecode then
+            local ok, bytecode = pcall(getscriptbytecode, item.inst)
+            if ok and typeof(bytecode) == "string" then
+                if bytecode == "" then
+                    row.status = "empty"
+                    return
+                end
+                key = bytecode
+            end
+        end
+        if key and ctx.seenScripts[key] then
+            stats.duplicates = stats.duplicates + 1
+            row.status, row.sameAs = "same", ctx.seenScripts[key]
+            return
+        end
+    end
+
+    State.add("ATTEMPT\t" .. item.path .. "\n")
+    local started = os.clock()
+    local ok, source = decompileWithTimeout(item.inst)
+    local took = os.clock() - started
+
+    if not ok or typeof(source) ~= "string" then
+        stats.failures = stats.failures + 1
+        row.status, row.note = "failed", tostring(source)
+        return
+    end
+
+    if Config.DedupeScripts then
+        -- no hash on this executor: the source itself is the key
+        key = key or source
+        if ctx.seenScripts[key] then
+            stats.duplicates = stats.duplicates + 1
+            row.status, row.sameAs = "same", ctx.seenScripts[key]
+            return
+        end
+        ctx.seenScripts[key] = item.path
+    end
+
+    local chars = #source
+    if chars > Config.MaxScriptChars then
+        source = source:sub(1, Config.MaxScriptChars) .. ("\n-- [...truncated, %d chars total]"):format(chars)
+    end
+    if source:sub(-1) ~= "\n" then source = source .. "\n" end
+    local _, lines = source:gsub("\n", "")
+
+    out:line("")
+    out:line(THIN)
+    row.line = out.lines + 1   -- this header's line, counted within the section
+    out:line(("-- [%s] %s%s"):format(item.className, item.inst.Name, item.hidden and "  (hidden)" or ""))
+    out:line("-- " .. item.path)
+    out:line(("-- %d lines, %.1f KB, decompiled in %.2fs"):format(lines, chars / 1024, took))
+    out:line(THIN)
+    out:block(source, lines)
+    row.lines, row.kb = lines, chars / 1024
+    stats.scripts = stats.scripts + 1
+    row.status = "ok"
+end
+
+--// The report -------------------------------------------------------------------------
+local function sectionHeader(out, number, title)
+    out:line("")
+    out:line(RULE)
+    out:line((" %d. %s"):format(number, title))
+    out:line(RULE)
+    out:line("")
+end
+local SECTION_HEADER_LINES = 5
+
+local function writeInfo(ctx, out)
     local identify = typeof(identifyexecutor) == "function" and identifyexecutor
         or typeof(getexecutorname) == "function" and getexecutorname
     local okExec, executor = pcall(function() return identify and identify() end)
+    local s, t = ctx.stats, ctx.timings
 
-    w:write(("%s\n"):format(VERSION))
-    w:write(("Game: %s\n"):format(ok and info and info.Name or "?"))
-    w:write(("PlaceId: %d   GameId: %d   PlaceVersion: %d\n"):format(game.PlaceId, game.GameId, game.PlaceVersion))
-    w:write(("JobId: %s\n"):format(game.JobId))
-    w:write(("Creator: %s %s\n"):format(tostring(game.CreatorType), tostring(game.CreatorId)))
-    w:write(("Players: %d / %d\n"):format(#Players:GetPlayers(), Players.MaxPlayers))
-    w:write(("Executor: %s\n"):format(okExec and tostring(executor or "?") or "?"))
-    w:write(("Generated: %s\n\n"):format(os.date("%Y-%m-%d %H:%M:%S")))
-
+    out:line(pad("game", 12) .. (ctx.gameName or "?"))
+    out:line(pad("place", 12) .. ("%d   (game %d, version %d)"):format(game.PlaceId, game.GameId, game.PlaceVersion))
+    out:line(pad("server", 12) .. ("%s   players %d/%d"):format(game.JobId, #Players:GetPlayers(), Players.MaxPlayers))
+    out:line(pad("executor", 12) .. (okExec and tostring(executor or "?") or "?"))
+    out:line(pad("generated", 12) .. os.date("%Y-%m-%d %H:%M:%S"))
+    out:line(pad("took", 12) .. ("%.1fs   walk %.1fs, hidden %.1fs, decompile %.1fs, spy %.1fs"):format(
+        t.total or 0, t.walk or 0, t.hidden or 0, t.decompile or 0, t.spy or 0))
+    out:line("")
+    out:line(pad("instances", 12) .. ("%d walked, %d repeats folded"):format(s.instances, s.collapsed))
+    out:line(pad("scripts", 12) .. ("%d decompiled, %d same as another, %d roblox default, %d server-only, %d failed, %d crash-skipped")
+        :format(s.scripts, s.duplicates, s.defaults, s.serverScripts, s.failures, s.suspects))
+    out:line(pad("found", 12) .. ("%d remotes, %d values, %d interactables, %d hidden"):format(
+        s.remotes, s.values, s.interactables, s.hidden))
+    out:line("")
     local keys = {}
     for key in pairs(Config) do keys[#keys + 1] = key end
     table.sort(keys)
-    w:write("Settings:\n")
+    out:line("settings")
     for _, key in ipairs(keys) do
         local value = Config[key]
-        w:write(("  %-16s %s\n"):format(key, typeof(value) == "table" and table.concat(value, ", ") or tostring(value)))
+        out:line("  " .. pad(key, 18) .. (typeof(value) == "table" and table.concat(value, ", ") or tostring(value)))
     end
 end
 
-function Dump.run(report)
+local function writeRemotes(ctx, out)
+    table.sort(ctx.remotes, function(a, b)
+        if a.parent ~= b.parent then return a.parent < b.parent end
+        return a.name < b.name
+    end)
+    local last
+    for _, remote in ipairs(ctx.remotes) do
+        if remote.parent ~= last then
+            if last then out:line("") end
+            out:line(remote.parent)
+            last = remote.parent
+        end
+        out:line("    " .. pad(remote.className, 22) .. remote.name)
+    end
+    if #ctx.remotes == 0 then out:line("none found") end
+end
+
+local function writeInteractables(ctx, out)
+    local groups = {
+        { "ProximityPrompt", "proximity prompts" },
+        { "ClickDetector", "click detectors" },
+        { "TouchTransmitter", "touch parts" },
+    }
+    local any = false
+    for _, group in ipairs(groups) do
+        local first = true
+        for _, item in ipairs(ctx.interactables) do
+            if item.className == group[1] then
+                if first then
+                    if any then out:line("") end
+                    out:line(group[2])
+                    first, any = false, true
+                end
+                if item.className == "ProximityPrompt" then
+                    local ok, text = pcall(function()
+                        return ("action=%q object=%q hold=%ss range=%s enabled=%s"):format(
+                            item.inst.ActionText, item.inst.ObjectText, fmt(item.inst.HoldDuration),
+                            fmt(item.inst.MaxActivationDistance), tostring(item.inst.Enabled))
+                    end)
+                    out:line("    " .. item.path .. "   " .. (ok and text or ""))
+                elseif item.className == "ClickDetector" then
+                    local ok, range = pcall(function() return item.inst.MaxActivationDistance end)
+                    out:line("    " .. item.path .. "   range=" .. (ok and fmt(range) or "?"))
+                else
+                    out:line("    " .. item.path:gsub("%.TouchInterest$", ""))
+                end
+            end
+        end
+    end
+    if not any then out:line("none found") end
+end
+
+local function writeHidden(ctx, out)
+    for _, item in ipairs(ctx.hidden) do
+        if item.note then
+            out:line(item.note)
+        else
+            out:line(pad("[" .. item.className .. "]", 18) .. pad(item.label, 16) .. item.path)
+        end
+    end
+    if #ctx.hidden == 0 then out:line("none found") end
+end
+
+local function writeTreeSummary(ctx, out)
+    local list = {}
+    for className, count in pairs(ctx.classCount) do list[#list + 1] = { className, count } end
+    table.sort(list, function(a, b) return a[2] > b[2] end)
+    local parts = {}
+    for i = 1, math.min(12, #list) do parts[i] = ("%s %d"):format(list[i][1], list[i][2]) end
+    out:line("most common: " .. table.concat(parts, ", "))
+    out:line("")
+end
+
+-- The index rows. `bodyAt` is the line the Scripts section's first body line
+-- lands on in whichever file it ends up in, so every row points at the exact
+-- line of that script's header.
+local function writeIndex(ctx, out, bodyAt, scriptsFile)
+    local rows = ctx.index
+    local written, other = {}, {}
+    for _, row in ipairs(rows) do
+        if row.status == "ok" then written[#written + 1] = row else other[#other + 1] = row end
+    end
+    out:line(("%d written below%s, %d not written"):format(#written,
+        scriptsFile and (" in " .. scriptsFile) or "", #other))
+    out:line("")
+    out:line(padLeft("line", 7) .. padLeft("lines", 7) .. padLeft("KB", 7) .. "   " .. pad("type", 14) .. "path")
+    for _, row in ipairs(written) do
+        out:line(padLeft(tostring(bodyAt + row.line - 1), 7) .. padLeft(tostring(row.lines), 7)
+            .. padLeft(("%.1f"):format(row.kb), 7) .. "   " .. pad(row.className, 14) .. row.path)
+    end
+    if #other > 0 then
+        out:line("")
+        out:line("not written")
+        for _, row in ipairs(other) do
+            local why = row.status == "same" and ("same as " .. row.sameAs)
+                or row.status == "failed" and ("decompile failed: " .. (row.note or "?"))
+                or row.status == "server" and "server script, never sent to the client"
+                or row.status == "crash-skipped" and "crashed a previous dump - forget crash skips to retry"
+                or row.status
+            out:line("    " .. pad(row.className, 14) .. row.path)
+            out:line("    " .. string.rep(" ", 14) .. "-> " .. why)
+        end
+    end
+end
+
+-- Stitches every section together behind a banner and a contents page that
+-- gives each section's line, and writes it out.
+local function writeOutputs(ctx)
+    local sections = {}
+    local function add(key, title, build, count)
+        if key and not Config[key] then return end
+        local out = Buffer.new()
+        build(out)
+        sections[#sections + 1] = { key = key or title, title = title, out = out, count = count }
+        return sections[#sections]
+    end
+
+    add("Info", "GAME INFO", function(out) writeInfo(ctx, out) end)
+    add("Spy", "REMOTE SPY", function(out) Spy.write(out) end)
+    add("Remotes", "REMOTES", function(out) writeRemotes(ctx, out) end, #ctx.remotes)
+    add("Interactables", "INTERACTABLES", function(out) writeInteractables(ctx, out) end, #ctx.interactables)
+    local values = ctx.out.Values
+    if Config.Values then
+        if values.lines == 0 then values:line("none found") end
+        sections[#sections + 1] = { key = "Values", title = "VALUES + ATTRIBUTES", out = values, count = ctx.stats.values }
+    end
+    add("Hidden", "HIDDEN (nil parented, loaded or running, not in the tree)", function(out) writeHidden(ctx, out) end, #ctx.hidden)
+    -- the index is sized now and filled once the scripts' final line is known
+    local index
+    if Config.Scripts then
+        index = { key = "Index", title = "SCRIPT INDEX", out = nil, count = ctx.stats.scripts }
+        sections[#sections + 1] = index
+    end
+    if Config.Tree then
+        local tree = Buffer.new()
+        writeTreeSummary(ctx, tree)
+        tree:block(ctx.out.Tree:text())
+        sections[#sections + 1] = { key = "Tree", title = "INSTANCE TREE", out = tree, count = ctx.stats.instances }
+    end
+    local scripts
+    if Config.Scripts then
+        scripts = { key = "Scripts", title = "SCRIPTS", out = ctx.out.Scripts, count = ctx.stats.scripts }
+        if scripts.out.lines == 0 then scripts.out:line("none written") end
+        sections[#sections + 1] = scripts
+    end
+
+    -- a dry run of the index tells how many lines it takes, which is all the
+    -- contents page needs before the real numbers exist
+    if index then
+        local probe = Buffer.new()
+        writeIndex(ctx, probe, 1)
+        index.lines = probe.lines
+    end
+
+    local function titled(section)
+        return section.count and ("%s  (%d)"):format(section.title, section.count) or section.title
+    end
+    local gameName = ctx.gameName or "?"
+
+    if Config.Output == "Split files" then
+        local contents = Buffer.new()
+        contents:line(RULE)
+        contents:line(("  %s  -  %s  (place %d)"):format(VERSION, gameName, game.PlaceId))
+        contents:line(RULE)
+        contents:line("")
+        for _, section in ipairs(sections) do
+            section.file = section.key .. ".txt"
+            contents:line("  " .. pad(titled(section), 60) .. section.file)
+        end
+        if index then
+            contents:line("")
+            contents:line(RULE)
+            contents:line(" SCRIPT INDEX  (line numbers are in Scripts.txt)")
+            contents:line(RULE)
+            contents:line("")
+            -- a split file has no section header, so its body starts on line 1
+            writeIndex(ctx, contents, 1, "Scripts.txt")
+        end
+        writeChunks(filePath("Index.txt"), { contents:text() })
+        for _, section in ipairs(sections) do
+            if section ~= index then
+                writeChunks(filePath(section.file), { section.out:text() })
+            end
+        end
+        return folder() .. "/  (start with Index.txt)"
+    end
+
+    -- Banner + contents first. Its size is fixed by the number of sections, so
+    -- every section's position is known before anything is written:
+    -- a section's header takes SECTION_HEADER_LINES, its title is the third of
+    -- them, and its body starts right after.
+    local headLines = 5 + 4 + #sections
+    local line = headLines + 1
+    for number, section in ipairs(sections) do
+        section.number = number
+        section.titleAt = line + 2
+        section.bodyAt = line + SECTION_HEADER_LINES
+        local bodyLines = section == index and index.lines or section.out.lines
+        line = line + SECTION_HEADER_LINES + bodyLines
+    end
+
+    local head = Buffer.new()
+    head:line(RULE)
+    head:line(("  %s  -  %s"):format(VERSION, gameName))
+    head:line(("  place %d  -  game %d  -  version %d  -  %s"):format(game.PlaceId, game.GameId, game.PlaceVersion,
+        os.date("%Y-%m-%d %H:%M")))
+    head:line(RULE)
+    head:line("")
+    head:line("CONTENTS" .. string.rep(" ", WIDTH - 8 - 4) .. "line")
+    head:line("")
+    for _, section in ipairs(sections) do
+        local label = ("  %d. %s "):format(section.number, titled(section))
+        local at = " " .. tostring(section.titleAt)
+        head:line(label .. string.rep(".", math.max(2, WIDTH - #label - #at)) .. at)
+    end
+    head:line("")
+    head:line("")
+
+    local chunks = { head:text() }
+    for _, section in ipairs(sections) do
+        local header = Buffer.new()
+        sectionHeader(header, section.number, titled(section))
+        if section == index then
+            local body = Buffer.new()
+            writeIndex(ctx, body, scripts.bodyAt)
+            chunks[#chunks + 1] = header:text() .. body:text()
+        else
+            chunks[#chunks + 1] = header:text() .. section.out:text()
+        end
+    end
+    local path = filePath("Dump.txt")
+    writeChunks(path, chunks)
+    return path
+end
+
+--// Running ----------------------------------------------------------------------------
+-- `ui` receives phase(name, fraction, detail), log(text, kind) and
+-- done(ok, output, summary); every field is optional.
+function Dump.run(ui)
+    ui = ui or {}
+    local function phase(name, fraction, detail)
+        if ui.phase then pcall(ui.phase, name, fraction, detail) end
+    end
+    local function log(text, kind)
+        if ui.log then pcall(ui.log, text, kind) end
+    end
+
     if Dump.running then return end
     if not Has.writefile then
-        report("writefile is not available on this executor", true)
+        log("writefile is not available on this executor", "bad")
+        if ui.done then pcall(ui.done, false, nil, "writefile is not available on this executor") end
         return
     end
     Dump.running, Dump.cancel = true, false
     ensureFolder()
 
+    local ctx = newContext()
+    -- a web request, so it runs alongside the walk instead of in front of it
+    task.spawn(function()
+        local okInfo, info = pcall(function()
+            return game:GetService("MarketplaceService"):GetProductInfo(game.PlaceId)
+        end)
+        ctx.gameName = okInfo and info and info.Name or nil
+    end)
     local statePath = filePath("State.txt")
-    local ctx = {
-        stats = newStats(),
-        suspects = loadSuspects(statePath),
-        seenScripts = {},
-        visited = setmetatable({}, { __mode = "k" }),
-        stack = {},
-        writers = { State = FileWriter.new(statePath) },
-    }
-    -- the state file starts over, so anything already known to crash is
-    -- written straight back in or it would be forgotten if this run dies too
-    for path in pairs(ctx.suspects) do
-        ctx.writers.State:write("ATTEMPT\t" .. path .. "\n")
-    end
-    ctx.writers.State:flush()
-
-    for _, section in ipairs(SECTIONS) do
-        local writer = FileWriter.new(filePath(section.file))
-        writer:write(("%s\n%s\n%s\n\n"):format(SEP, section.title, SEP))
-        ctx.writers[section.key] = writer
-    end
+    ctx.suspects = loadSuspects(statePath)
+    State.open(statePath, ctx.suspects)
 
     local started = os.clock()
-    if Config.Spy then Spy.start() end
-    if Config.Info then writeInfo(ctx.writers.Info) end
+    local stats = ctx.stats
+    if Config.Spy then
+        Spy.start()
+        log(Spy.hooked and "remote spy recording, in and out" or "remote spy recording, incoming only")
+    end
 
     local ok, err = pcall(function()
+        -- 1. walk
+        Budget.start()
         local wanted = {}
         for _, name in ipairs(Config.Roots) do wanted[name] = true end
         local roots = {}
         for _, name in ipairs(ROOT_ORDER) do
             if wanted[name] then
-                local okService, service = pcall(function() return game:GetService(name) end)
+                local okService, service = pcall(game.GetService, game, name)
                 if okService and service then roots[#roots + 1] = service end
             end
         end
         for i = #roots, 1, -1 do
-            ctx.stack[#ctx.stack + 1] = { inst = roots[i], path = roots[i].Name, depth = 0, prefix = "", isLast = i == #roots }
+            ctx.stack[#ctx.stack + 1] = {
+                inst = roots[i], path = roots[i].Name, depth = 0, prefix = "", isLast = i == #roots,
+            }
         end
-
-        local processed = 0
-        while #ctx.stack > 0 and not Dump.cancel do
-            local frame = ctx.stack[#ctx.stack]
-            ctx.stack[#ctx.stack] = nil
+        log(("walking %d services"):format(#roots))
+        local walkStart = os.clock()
+        local function walkProgress()
+            local done = stats.instances
+            phase("walking", done / math.max(1, done + #ctx.stack),
+                ("%d instances, %d scripts found"):format(done, #ctx.queue))
+        end
+        local stack = ctx.stack
+        while #stack > 0 and not Dump.cancel do
+            local frame = stack[#stack]
+            stack[#stack] = nil
             visit(ctx, frame)
-            processed = processed + 1
-            if processed % 25 == 0 then
-                report(("walking - %d instances, %d scripts, %d queued"):format(ctx.stats.instances, ctx.stats.scripts, #ctx.stack))
-                task.wait()
-            end
+            Budget.check(walkProgress)
         end
+        ctx.timings.walk = os.clock() - walkStart
+        log(("walked %d instances in %.1fs"):format(stats.instances, ctx.timings.walk))
 
+        -- 2. hidden scripts and remotes
         if Config.Hidden and not Dump.cancel then
-            report("checking nil / loaded / running scripts")
-            dumpHidden(ctx)
+            phase("hidden", 0, "nil parented, loaded and running scripts")
+            local hiddenStart = os.clock()
+            collectHidden(ctx)
+            ctx.timings.hidden = os.clock() - hiddenStart
+            log(("found %d hidden"):format(stats.hidden))
         end
 
+        -- 3. decompile, grouped by where each script lives
+        if Config.Scripts and not Dump.cancel then
+            local queue = ctx.queue
+            for _, item in ipairs(queue) do
+                item.rank = item.hidden and 99 or (SCRIPT_ROOT_RANK[item.path:match("^[^%.]+")] or 50)
+            end
+            table.sort(queue, function(a, b)
+                if a.rank ~= b.rank then return a.rank < b.rank end
+                return a.path < b.path
+            end)
+            local decompileStart = os.clock()
+            log(("decompiling %d scripts"):format(#queue))
+            for i, item in ipairs(queue) do
+                if Dump.cancel then break end
+                decompileOne(ctx, item)
+                Budget.check(function()
+                    phase("decompiling", i / #queue, ("%d / %d  -  %s"):format(i, #queue, item.inst.Name))
+                end)
+            end
+            ctx.timings.decompile = os.clock() - decompileStart
+            log(("decompiled %d (%d same as another, %d failed) in %.1fs"):format(
+                stats.scripts, stats.duplicates, stats.failures, ctx.timings.decompile))
+            if stats.failures > 0 then log(("%d scripts failed to decompile - see the index"):format(stats.failures), "bad") end
+        end
+
+        -- 4. whatever is left of the spy window
         if Config.Spy then
+            local spyStart = os.clock()
             local remaining = Config.SpySeconds - (os.clock() - started)
             while remaining > 0 and not Dump.cancel do
-                report(("recording remotes - %ds left, keep playing"):format(math.ceil(remaining)))
-                task.wait(0.5)
+                phase("recording remotes", 1 - remaining / math.max(1, Config.SpySeconds),
+                    ("%ds left - keep playing"):format(math.ceil(remaining)))
+                task.wait(0.25)
                 remaining = Config.SpySeconds - (os.clock() - started)
             end
             Spy.stop()
-            Spy.write(ctx.writers.Spy)
+            ctx.timings.spy = os.clock() - spyStart
         end
     end)
     if Config.Spy then Spy.stop() end
 
-    local stats = ctx.stats
-    local summary = ("instances %d | scripts %d (+%d duplicate, %d default skipped, %d server-only, %d failed, %d crash-skipped) | remotes %d | values %d | interactables %d | hidden %d | folded repeats %d | %.1fs")
-        :format(stats.instances, stats.scripts, stats.duplicates, stats.defaults, stats.serverScripts, stats.failures,
-            stats.suspects, stats.remotes, stats.values, stats.interactables, stats.hidden, stats.collapsed, os.clock() - started)
-    if Config.Info then
-        ctx.writers.Info:write("\nResult: " .. (ok and summary or ("errored - " .. tostring(err))) .. (Dump.cancel and " (stopped early)" or "") .. "\n")
-    end
+    phase("writing", 1, "")
+    ctx.timings.total = os.clock() - started
+    local okWrite, output = pcall(writeOutputs, ctx)
 
-    for _, writer in pairs(ctx.writers) do writer:flush() end
-    -- a dump that finished only needs to remember the scripts known to crash
-    -- the client, so they stay skipped until "forget crash skips" is pressed;
-    -- one that stopped or errored keeps its whole trail so the next run also
-    -- skips whatever was mid-decompile when it died
-    if ok and not Dump.cancel then
+    -- Getting here at all means nothing crashed the client - even a stopped or
+    -- errored run - so the attempt trail is dropped and only the scripts known
+    -- to crash it stay remembered, skipped until "forget crash skips".
+    do
         local lines = {}
-        for path in pairs(ctx.suspects) do lines[#lines + 1] = "ATTEMPT\t" .. path .. "\n" end
+        for path in pairs(ctx.suspects) do lines[#lines + 1] = "SUSPECT\t" .. path .. "\n" end
         pcall(writefile, statePath, table.concat(lines))
     end
 
-    local output = folder()
-    if Config.Output == "Single file" and Has.readfile then
-        local combined = FileWriter.new(filePath("Dump.txt"))
-        for _, section in ipairs(SECTIONS) do
-            if Config[section.key] then
-                local path = filePath(section.file)
-                local okRead, content = pcall(readfile, path)
-                if okRead and content then combined:write(content .. "\n") end
-            end
-        end
-        combined:flush()
-        for _, section in ipairs(SECTIONS) do
-            local path = filePath(section.file)
-            if Has.delfile then pcall(delfile, path) else pcall(writefile, path, "") end
-        end
-        output = filePath("Dump.txt")
-    else
-        for _, section in ipairs(SECTIONS) do
-            if not Config[section.key] then
-                local path = filePath(section.file)
-                if Has.delfile then pcall(delfile, path) else pcall(writefile, path, "") end
-            end
-        end
-    end
-
+    local summary = ("%d instances - %d scripts (+%d same) - %d remotes - %d values - %.1fs"):format(
+        stats.instances, stats.scripts, stats.duplicates, stats.remotes, stats.values, os.clock() - started)
     Dump.running = false
-    report(ok and ("done - saved to " .. output) or ("errored - " .. tostring(err)), not ok, summary)
+
+    local success = ok and okWrite
+    local message = not ok and ("errored: " .. tostring(err))
+        or not okWrite and ("writing failed: " .. tostring(output))
+        or (Dump.cancel and "stopped early, saved what it had" or "done")
+    log(message, success and "good" or "bad")
+    if ui.done then pcall(ui.done, success, okWrite and output or nil, summary, message) end
 end
 
---// Headless ------------------------------------------------------------------------
+local function forgetCrashes()
+    pcall(writefile, filePath("State.txt"), "")
+end
+
+env.Dumper = {
+    Config = Config,
+    Run = Dump.run,
+    Stop = function() Dump.cancel = true end,
+    ForgetCrashes = forgetCrashes,
+}
+
+--// Headless ---------------------------------------------------------------------------
 if Config.NoUI then
     if Config.AutoStart then
-        task.spawn(Dump.run, function(text, isError, summary)
-            if isError then warn("[Dumper] " .. text) end
-            if summary then print("[Dumper] " .. text .. "\n[Dumper] " .. summary) end
-        end)
+        task.spawn(Dump.run, {
+            log = function(text, kind)
+                if kind == "bad" then warn("[Dumper] " .. text) else print("[Dumper] " .. text) end
+            end,
+            done = function(_, output, summary)
+                print("[Dumper] " .. summary .. (output and ("\n[Dumper] saved to " .. output) or ""))
+            end,
+        })
     end
-    env.Dumper = {
-        Config = Config, Run = Dump.run,
-        Stop = function() Dump.cancel = true end,
-        ForgetCrashes = function() pcall(writefile, filePath("State.txt"), "") end,
-    }
     return
 end
 
---// UI ----------------------------------------------------------------------------
-local Onyx
+--// UI ---------------------------------------------------------------------------------
+local Void
 do
     local ref = "main"
     local resolved, sha = pcall(function()
@@ -867,90 +1295,153 @@ do
         return commit.sha
     end)
     if resolved and sha then ref = sha end
-    Onyx = loadstring(game:HttpGet(("https://raw.githubusercontent.com/iamdookie1/Ui2/%s/Ui.lua"):format(ref)))()
+    Void = loadstring(game:HttpGet(("https://raw.githubusercontent.com/iamdookie1/Ui2/%s/VoidUI.lua"):format(ref)))()
 end
 
-local Window = Onyx:CreateWindow({
+local Window = Void:CreateWindow({
     Title = "dumper",
     SubTitle = VERSION,
-    Folder = "Dumper",
     Keybind = Enum.KeyCode.RightShift,
-    Accent = Color3.fromRGB(255, 170, 60),
+    Scope = "universal",
+    Status = "idle",
+    StartOpen = true,
+    Opener = "Topbar",
 })
+pcall(function() Void:SetAccent(Color3.fromRGB(255, 170, 60)) end)
 
-local StatusLabel, SummaryLabel
+local Run = {}
 
 do
-    local Tab = Window:CreateTab({ Title = "dump" })
-    local section = Tab:CreateSection("sections")
+    local Tab = Window:CreateTab("dump")
 
-    local function toggle(title, key, description)
-        section:Toggle({
+    local section = Tab:CreateSection("run")
+    section:Button({
+        Title = "start dump",
+        Half = true,
+        Callback = function()
+            if Dump.running then return end
+            Run.start()
+        end,
+    })
+    section:Button({
+        Title = "stop",
+        Half = true,
+        Callback = function()
+            if Dump.running then
+                Dump.cancel = true
+                Run.log:Append("stopping...")
+            end
+        end,
+    })
+    Run.progress = section:Progress({ Title = "progress", Default = 0 })
+    Run.phase = section:Stat({ Title = "phase", Value = "idle" })
+    Run.detail = section:Stat({ Title = "now", Value = "-" })
+    Run.time = section:Stat({ Title = "elapsed", Value = "-" })
+    Run.saved = section:Stat({ Title = "saved to", Value = "-" })
+    Run.log = section:Console({ Title = "log", Height = 120, MaxLines = 60 })
+
+    section = Tab:CreateSection("what goes in")
+    local function toggle(group, title, key)
+        group:Toggle({
             Title = title,
-            Description = description,
             Flag = "dumper_" .. key,
             Default = Config[key],
+            Half = true,
             Callback = function(state) Config[key] = state end,
         })
     end
-
-    toggle("game info", "Info", "place, game id, creator, executor and the settings this dump used")
-    toggle("scripts", "Scripts", "decompiles every client-readable script")
-    toggle("workspace tree", "Tree", "every instance, with values, attributes and remotes marked inline")
-    toggle("remotes", "Remotes", "every remote and bindable, numbered when siblings share a name")
-    toggle("values + attributes", "Values", "the live value of every ValueBase and every attribute")
-    toggle("interactables", "Interactables", "proximity prompts, click detectors and touch parts - what auto farms hook into")
-    toggle("hidden scripts", "Hidden", "scripts and remotes parented to nil, or loaded/running without being in the tree")
+    toggle(section, "game info", "Info")
+    toggle(section, "scripts", "Scripts")
+    toggle(section, "instance tree", "Tree")
+    toggle(section, "remotes", "Remotes")
+    toggle(section, "values", "Values")
+    toggle(section, "interactables", "Interactables")
+    toggle(section, "hidden scripts", "Hidden")
+    toggle(section, "attributes", "Attributes")
 
     section = Tab:CreateSection("remote spy")
-    toggle("record remotes", "Spy", "logs every remote the game fires and receives while the dump runs, with real arguments. play normally during it")
+    section:Toggle({
+        Title = "record remotes while dumping",
+        Flag = "dumper_Spy",
+        Default = Config.Spy,
+        Callback = function(state) Config.Spy = state end,
+    })
     section:Slider({
         Title = "record for",
-        Description = "the dump waits for this long before finishing so there is time to use things",
         Min = 5, Max = 180, Increment = 5, Suffix = "s",
         Default = Config.SpySeconds,
         Flag = "dumper_spy_seconds",
         Callback = function(value) Config.SpySeconds = tonumber(value) or Config.SpySeconds end,
     })
-
-    section = Tab:CreateSection("filters")
-    toggle("skip roblox defaults", "SkipDefaults", "PlayerModule, chat and character sound scripts - the same in every game")
-    toggle("dedupe scripts", "DedupeScripts", "one copy of a script that exists in every character or clone")
-    toggle("only my character", "OnlyMyCharacter", "other players' characters are copies of yours")
-    toggle("only my player", "OnlyMyPlayer", "skip other players' data folders (keeps yours)")
-    toggle("fold repeats", "CollapseRepeats", "more than 3 identical siblings become one line. never folds remotes or scripts")
-    toggle("skip gui values", "SkipGuiValues", "values inside PlayerGui/StarterGui are nearly always animation state")
-    toggle("attributes", "Attributes", "show attributes in the tree and snapshot")
-
-    section = Tab:CreateSection("where to look")
-    section:Dropdown({
-        Title = "roots",
-        Description = "which services get walked",
-        Values = ROOT_ORDER,
-        Default = Config.Roots,
-        Multi = true,
-        Flag = "dumper_roots",
-        Callback = function(value)
-            if typeof(value) == "table" then Config.Roots = value end
-        end,
+    section:Paragraph({
+        Title = "how to use it",
+        Content = "logs every remote the game fires and receives, with the real arguments. the dump waits out this window at the end, so play normally while it runs - use tools, attack, buy, open menus",
     })
 
-    section = Tab:CreateSection("limits")
-    section:Dropdown({
-        Title = "output",
-        Description = "one file to upload, or one file per section",
+    Tab = Window:CreateTab("options")
+
+    section = Tab:CreateSection("speed")
+    section:Segmented({
+        Title = "speed",
+        Values = { "Smooth", "Fast", "Max" },
+        Default = Config.Speed,
+        Flag = "dumper_Speed",
+        Callback = function(value) if SPEEDS[value] then Config.Speed = value end end,
+    })
+    section:Paragraph({
+        Title = "what it changes",
+        Content = "how much of each frame the dump gets. smooth keeps the game playable, fast is the default, max takes most of the frame - the game stutters while it runs but it finishes soonest",
+    })
+
+    section = Tab:CreateSection("output")
+    section:Segmented({
+        Title = "file",
         Values = { "Single file", "Split files" },
         Default = Config.Output,
-        Flag = "dumper_output",
+        Flag = "dumper_Output",
         Callback = function(value) Config.Output = value end,
     })
+    section:Paragraph({
+        Title = "what you get",
+        Content = "single file writes Dumper/<place id>/Dump.txt with a contents page and a script index that give the line each part starts on. split files writes one file per section plus Index.txt",
+    })
+
+    section = Tab:CreateSection("filters")
+    local function filter(title, key)
+        section:Toggle({
+            Title = title,
+            Flag = "dumper_" .. key,
+            Default = Config[key],
+            Callback = function(state) Config[key] = state end,
+        })
+    end
+    filter("skip roblox default scripts", "SkipDefaults")
+    filter("one copy of identical scripts", "DedupeScripts")
+    filter("only my character", "OnlyMyCharacter")
+    filter("only my player", "OnlyMyPlayer")
+    filter("fold 4+ identical siblings", "CollapseRepeats")
+    filter("skip values inside guis", "SkipGuiValues")
+
+    section = Tab:CreateSection("where to look")
+    local roots = section:Dropdown({
+        Title = "services",
+        Values = ROOT_ORDER,
+        Multi = true,
+        Flag = "dumper_roots",
+        Callback = function(list)
+            if typeof(list) == "table" then Config.Roots = list end
+        end,
+    })
+    pcall(function() roots:Set(Config.Roots) end)
+
+    section = Tab:CreateSection("limits")
     section:Slider({
-        Title = "max tree depth", Min = 4, Max = 40, Increment = 1,
+        Title = "max tree depth", Min = 4, Max = 60, Increment = 1,
         Default = Config.MaxDepth, Flag = "dumper_depth",
         Callback = function(value) Config.MaxDepth = tonumber(value) or Config.MaxDepth end,
     })
     section:Slider({
-        Title = "max chars per script", Min = 10000, Max = 500000, Increment = 10000,
+        Title = "max chars per script", Min = 10000, Max = 1000000, Increment = 10000,
         Default = Config.MaxScriptChars, Flag = "dumper_chars",
         Callback = function(value) Config.MaxScriptChars = tonumber(value) or Config.MaxScriptChars end,
     })
@@ -960,61 +1451,63 @@ do
         Callback = function(value) Config.DecompileTimeout = tonumber(value) or Config.DecompileTimeout end,
     })
 
-    section = Tab:CreateSection("run")
-    StatusLabel = section:Label({ Title = "status: idle" })
-    SummaryLabel = section:Label({ Title = "-" })
-
-    section:Button({
-        Title = "start dump",
-        Callback = function()
-            if Dump.running then return end
-            task.spawn(Dump.run, function(text, isError, summary)
-                StatusLabel:SetText("status: " .. text)
-                if summary then
-                    SummaryLabel:SetText(summary)
-                    Onyx:Notify({ Title = "dumper", Content = text, Type = isError and "error" or "success", Duration = 8 })
-                elseif isError then
-                    Onyx:Notify({ Title = "dumper", Content = text, Type = "error", Duration = 6 })
-                end
-            end)
-        end,
-    })
-    section:Button({
-        Title = "stop",
-        Callback = function()
-            if Dump.running then
-                Dump.cancel = true
-                StatusLabel:SetText("status: stopping...")
-            end
-        end,
-    })
-
+    section = Tab:CreateSection("crash guard")
     section:Button({
         Title = "forget crash skips",
+        Confirm = true,
+        ConfirmText = "Scripts that crashed a previous dump get decompiled again next run.",
         Callback = function()
             if Dump.running then return end
-            pcall(writefile, filePath("State.txt"), "")
-            StatusLabel:SetText("status: crash skips cleared, every script gets retried")
+            forgetCrashes()
+            Run.log:Append("crash skips cleared - every script gets retried")
         end,
     })
-
     section:Paragraph({
-        Title = "what to send back",
-        Content = "single file mode writes Dumper/<place id>/Dump.txt - that one file is everything. turn on record remotes and actually play during the window (use tools, buy, open menus) - it is what makes a game whose remotes all share one name readable",
+        Title = "what it is",
+        Content = "a decompile that crashes the game is remembered, and that script is skipped on the next run so the dump can finish. this clears the list",
     })
 end
 
-env.Dumper = {
-    Config = Config, Run = Dump.run,
-    Stop = function() Dump.cancel = true end,
-    ForgetCrashes = function() pcall(writefile, filePath("State.txt"), "") end,
-}
-
-if Config.AutoStart then
-    task.spawn(Dump.run, function(text, _, summary)
-        StatusLabel:SetText("status: " .. text)
-        if summary then SummaryLabel:SetText(summary) end
-    end)
+function Run.start()
+    local started = os.clock()
+    Run.progress:Set(0)
+    Run.saved:Set("-")
+    Run.log:Clear()
+    Window:SetStatus("dumping")
+    task.spawn(Dump.run, {
+        phase = function(name, fraction, detail)
+            Run.phase:Set(name)
+            Run.detail:Set(detail ~= "" and detail or "-")
+            Run.progress:Set(math.clamp(fraction or 0, 0, 1))
+            Run.time:Set(("%.1fs"):format(os.clock() - started))
+            Window:SetStatus(name)
+        end,
+        log = function(text, kind)
+            if kind == "good" then
+                Run.log:Good(text)
+            elseif kind == "bad" then
+                Run.log:Bad(text)
+            else
+                Run.log:Append(text)
+            end
+        end,
+        done = function(success, output, summary, message)
+            Run.progress:Set(success and 1 or 0)
+            Run.phase:Set(message or (success and "done" or "failed"))
+            Run.detail:Set(summary)
+            Run.time:Set(("%.1fs"):format(os.clock() - started))
+            if output then Run.saved:Set(output) end
+            Window:SetStatus(success and "done" or "failed")
+            Void:Notify({
+                Title = "dumper",
+                Content = success and ("saved - " .. summary) or (message or "failed"),
+                Duration = 8,
+                Warn = not success,
+            })
+        end,
+    })
 end
 
-Onyx:Notify({ Title = "dumper", Content = "loaded - RightShift toggles the menu", Type = "success", Duration = 5 })
+if Config.AutoStart then Run.start() end
+
+Void:Notify({ Title = "dumper", Content = "loaded - RightShift or the top bar button opens it", Duration = 5 })
