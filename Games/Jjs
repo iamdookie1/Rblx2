@@ -789,7 +789,7 @@ end
 -- second-largest to mean anything. One bad blame no longer decides anything:
 -- it takes two independent hits from that far out.
 local REACH_MIN_SAMPLES = 4
--- learnedReach feeds inReach()'s distance limit, which feeds back into what
+-- learnedReach feeds the counters' reach check, which feeds back into what
 -- blameFor() is willing to attribute next time - each accepted sample can
 -- raise the ceiling for the next one by REACH_MARGIN. With no ceiling of its
 -- own that compounds: 25% growth per generation reaches the thousands within
@@ -841,6 +841,11 @@ end
 -- a server script and always will. What they give is a record of what happened
 -- the last N times we tried, per move, which is the thing worth acting on.
 
+-- Auto block and auto manji, filled in under "Counter automation" further
+-- down. Declared this early because the announcement hook and the throw
+-- tracking below feed it.
+local Counter = {}
+
 local Outcomes = {
     -- key -> { blocked, pierced, countered, whiffed }
     Moves = {},
@@ -890,32 +895,37 @@ local function blockVerdict(key)
     return 'mixed', rate, tried
 end
 
--- The measured counter window: the largest timeLeft that has ever actually
--- produced a hit, shrunk slightly for margin. Falls back to nil while there is
--- nothing to go on, which is what makes the manual slider still matter on a
--- fresh session.
+-- The measured counter window: how long the counter stays up once it reaches
+-- the server. A throw that caught something with the hit still `timeLeft` out
+-- here, sent with a round trip of `rtt`, reached the server rtt before that
+-- hit did - so the window is at least timeLeft - rtt. The widest of those is
+-- the estimate.
+--
+-- This used to be 90% of the widest raw timeLeft, which only ever shrank: a
+-- few catches of hits already nearly on top of us pulled it under the
+-- reaction floor, and from then on every threat was "too early" forever. The
+-- round trip is taken off now, and the estimate is held between a floor and
+-- a ceiling so no run of odd samples can switch the counter off.
 local MIN_THROWS_FOR_WINDOW = 4
 
 local function learnedWindow()
-    local hits, misses = {}, {}
+    local hits, misses, widest = 0, 0, 0
     for _, throw in ipairs(Outcomes.Throws) do
-        table.insert(throw.hit and hits or misses, throw.timeLeft)
+        if throw.hit then
+            hits = hits + 1
+            widest = math.max(widest, throw.timeLeft - (throw.rtt or 0))
+        else
+            misses = misses + 1
+        end
     end
-    if #hits < MIN_THROWS_FOR_WINDOW then
-        return nil, #hits, #misses
+    if hits < MIN_THROWS_FOR_WINDOW then
+        return nil, hits, misses
     end
-    local widest = 0
-    for _, value in ipairs(hits) do
-        if value > widest then widest = value end
-    end
-    -- Every miss further out than the widest hit is evidence the window ends
-    -- between them; sit just inside the hit rather than splitting the gap,
-    -- because throwing early is the expensive mistake.
-    return widest * 0.9, #hits, #misses
+    return math.clamp(widest, 0.2, 1.5), hits, misses
 end
 
-local function recordThrow(timeLeft)
-    table.insert(Outcomes.Throws, { timeLeft = timeLeft, hit = false, at = tick() })
+local function recordThrow(timeLeft, rtt)
+    table.insert(Outcomes.Throws, { timeLeft = timeLeft, rtt = rtt, hit = false, at = tick() })
     while #Outcomes.Throws > Outcomes.ThrowLimit do
         table.remove(Outcomes.Throws, 1)
     end
@@ -1084,7 +1094,7 @@ end
 -- immediately backfired: blameFor runs for *every* stun on *every* player,
 -- so any hit with no good nearby explanation got attributed to whatever
 -- scored best regardless of how far away it actually was, teaching some
--- ordinary move a wildly inflated reach and making inReach() accept it from
+-- ordinary move a wildly inflated reach and making the counters accept it from
 -- absurd range afterward - reported back as auto block firing on things
 -- "10 million studs away". The tracked-projectile system added at the same
 -- time already solves the actual ranged-move problem this was for, through
@@ -1097,7 +1107,7 @@ local pendingThrow = nil
 -- Outcomes are attributed when they *resolve*, by asking which announcement
 -- was most recently responsible - not when the script decides to act.
 --
--- That distinction is the whole thing. Keying off our own tryBlock/tryManji
+-- That distinction is the whole thing. Keying off our own auto block/auto manji
 -- meant the tally only ever saw what the script did, so a session spent
 -- blocking and countering by hand recorded nothing at all. Blaming at
 -- resolution counts every block and every counter, whoever pressed it.
@@ -1159,6 +1169,8 @@ end
 -- Every Manji Kick announces its own startup, ours included, so this fires
 -- whether the script threw it or we did.
 local function noteThrow()
+    -- our own startup coming back is the proof a throw actually went out
+    if Counter.manji then Counter.manji.confirmedAt = tick() end
     local blame = blameFor(ownCharacter(), tick())
     local timeLeft = 0
     local key = 'unprovoked'
@@ -1167,7 +1179,7 @@ local function noteThrow()
         timeLeft = (blame.at + lead) - tick()
         key = blame.key
     end
-    pendingThrow = recordThrow(timeLeft)
+    pendingThrow = recordThrow(timeLeft, Counter.rtt and Counter.rtt() or 0)
     pendingThrow.key = key
     local throw = pendingThrow
     task.delay(1.2, function()
@@ -1254,8 +1266,8 @@ function Projectiles.update()
 end
 
 -- The most urgent tracked projectile actually heading at us, in the same
--- shape pendingThreat's Effects-based branch returns, so tryBlock and
--- tryManji cannot tell the two apart.
+-- shape Counter.threats lists announcements in, so auto block cannot tell
+-- the two apart.
 function Projectiles.threat()
     local mine = ownCharacter()
     local myPos = mine and positionOf(mine)
@@ -1343,7 +1355,7 @@ local function hookService(serviceFolder)
         if type(effectName) ~= 'string' then return end
 
         -- Every ranged moveset's projectile carries itself with this same
-        -- announcement - see the tracked-projectiles section above pendingThreat
+        -- announcement - see the tracked-projectiles section
         -- for why it gets tracked directly instead of going through actorFrom
         -- and the announcement-lead system below at all.
         if effectName == 'Interp' then
@@ -1363,7 +1375,7 @@ local function hookService(serviceFolder)
         -- block, same as any other service. Its own Startup and Fade are
         -- neither in IMPACT_EFFECTS nor contain "Hit", so is_impact_effect
         -- never caught them either, and they landed in noteAnnouncement -
-        -- the exact table pendingThreat scans for something worth putting a
+        -- the exact table Counter.threats scans for something worth putting a
         -- guard up against. A counter kick is not an attack the block system
         -- should ever be reasoning about, ours or an opponent's - it is what
         -- happens to whoever overswung, not a move that respects the block
@@ -1412,7 +1424,15 @@ local function hookService(serviceFolder)
         noteAnnouncement(serviceName, effectName, actor, mine)
         -- Recorded above so a stun we cause can be attributed, but our own
         -- moves are not threats and do not belong in the feed or on a tag.
-        if mine then return end
+        if mine then
+            if not Counter.NonAttack[effectName] then Counter.lastOwnAttack = tick() end
+            return
+        end
+
+        -- React the moment it lands rather than on the next Heartbeat, and
+        -- count it toward telling attacks from dashes and auras.
+        pcall(Counter.noteSeen, timingKey(serviceName, effectName), actor)
+        pcall(Counter.step)
 
         if noteEspMove then
             noteEspMove(actor, serviceName, effectName)
@@ -1787,10 +1807,31 @@ local function watchCharacters()
 end
 
 --// Counter automation -------------------------------------------------------
--- Both of these drive the game's own ToolController rather than firing remotes
--- by hand. Block() and UseTool() are exactly what a keypress calls, so what
--- reaches the server is shaped like a real input instead of a reconstruction
--- of one.
+-- Auto block and auto manji share one picture of what is coming at us, built
+-- fresh every frame - and again the instant an announcement arrives, so a
+-- reaction never waits for the next Heartbeat:
+--
+--   what   every recent announcement from someone else, and every tracked
+--          projectile, that is an attack: a basic swing, a move that has
+--          stunned somebody or hit a guard, or one not yet seen enough to rule
+--          out. Not one that has gone off beside people over and over without
+--          ever hurting anyone - a dash, a sprint, an aura.
+--   who    whether it is us they are going for. We have to be inside the
+--          move's reach, where a learned reach only ever extends the slider
+--          and never shrinks below it, and where someone already running at us
+--          counts as closer by the ground they cover before it lands. They
+--          must not be facing away from us, and nobody else standing in front
+--          of them may be the obvious target instead.
+--   when   how long until it lands, from the move's measured lead, judged
+--          against the whole round trip: a guard or a counter has to reach the
+--          server before the hit does, not merely leave here in time.
+--
+-- Neither action is trusted just because the call returned. A block counts
+-- once the server has put Block in our Info; a counter once our own Manji
+-- Kick startup comes back. A way of pressing it that twice produces nothing
+-- is dropped for the next one, so whichever of the game's controller, the
+-- key, or the remote actually works on this version of the game gets found by
+-- itself instead of silently doing nothing.
 
 local ToolController = nil
 
@@ -1805,520 +1846,680 @@ local function toolController()
     return ToolController
 end
 
-local BlockDeactivated do
-    local folder = Services:FindFirstChild("BlockService")
-    local re = folder and folder:FindFirstChild("RE")
-    BlockDeactivated = re and re:FindFirstChild("Deactivated") or nil
-end
-
 local ManjiConfig = {
     Enabled = false,
-    -- How long the counter stays active once thrown. This is a COUNTER node's
-    -- TIME field, which lives server-side for the built-in movesets, so it is
-    -- a setting rather than a reading. Everything else on this panel is real.
+    Method = 'Auto',
+    -- Turn to the attacker as it goes out; the kick comes out forwards.
+    Face = true,
+    -- How long the counter stays up once it reaches the server. A setting
+    -- until enough throws have connected to measure it.
     Window = 0.5,
-    -- Once enough throws have actually connected, the measured window replaces
-    -- the setting above and the slider stops mattering.
     AutoWindow = true,
-    -- Below this the input would land after the hit does.
-    Reaction = 0.08,
-    -- Only used until a move has enough history to say how far it reaches.
-    -- Deliberately short: assume melee and let evidence extend it.
-    Range = 30,
-    AssumeLead = 0.35,
-    -- Was false, which meant that until a move had been measured - and on a
-    -- fresh session that is every move - there was never anything to counter.
-    -- The window check is what stops a wasted throw; refusing to look was not.
-    UseUnmeasured = true,
-    -- The attacker has to be pointed at us. Wide cone up close where swings
-    -- turn into you, tight at range where they cannot.
-    AimFrom = 25,
-    AimConeNear = 105,
-    AimCone = 50,
-    -- A counter-kick only ever makes sense against something that has to
-    -- actually reach you - an M1, Cursed Strikes, anything in a chain - not
-    -- a thrown projectile closing from across the map. MaxRange is a hard
-    -- ceiling independent of whatever a move's own learned reach says, kept
-    -- deliberately tight, so this never depends on that number being
-    -- trustworthy.
+    -- A counter kick answers something that has to reach you, so it is held
+    -- to melee: this range, which a learned reach may stretch to at most
+    -- double, and never a thrown projectile.
+    Range = 22,
     MeleeOnly = true,
-    MaxRange = 15,
+    OnlyMe = true,
+    UseUnmeasured = true,
+    AssumeLead = 0.35,
     Attempts = 0,
     Skipped = 0,
     Last = 'idle',
+    Using = '-',
 }
 
 local BlockConfig = {
     Enabled = false,
-    -- Only block attacks arriving from inside this cone. The game breaks a
-    -- block that is not facing the attack, and blocking a hit coming from
-    -- behind is the tell that gives an auto block away, so both reasons point
-    -- the same way.
-    MaxAngle = 75,
-    Hold = 0.45,
-    LookAhead = 0.9,
-    -- How long after an attack was announced the guard is still worth having
-    -- up, since the next hit of the chain is coming.
-    Sustain = 1.2,
-    -- As above: what stands in until reach is known, biased short.
-    Range = 32,
-    AimFrom = 25,
-    AimConeNear = 110,
-    AimCone = 55,
-    -- Refuse to block moves that have been measured going through guards.
+    Method = 'Auto',
+    Key = 'F',
+    -- Turn into the attack and keep turning with it while holding. This used
+    -- to be the opposite - anything more than 75 degrees off our facing was
+    -- simply not blocked - which is why hits from the side walked straight in.
+    Face = true,
+    -- Guard goes up once a hit is this close, on top of the round trip.
+    LookAhead = 0.6,
+    -- And stays up this long past the last hit it was held for, so a chain
+    -- gets one continuous guard instead of dropping between swings.
+    Release = 0.3,
+    Range = 30,
+    Projectiles = true,
+    OnlyMe = true,
+    NotAttacking = false,
     SkipUnblockable = true,
-    MinSamples = 3,
-    MinSuccess = 0.34,
-    -- How often to re-test a move already written off, so a wrong verdict can
-    -- correct itself instead of being permanent.
+    DodgeUnblockable = false,
     RetryChance = 0.15,
-    AssumeLead = 0.35,
     UseUnmeasured = true,
+    AssumeLead = 0.35,
     Attempts = 0,
     Skipped = 0,
     Last = 'idle',
+    Using = '-',
 }
 
--- Called from the Heartbeat loop, so it repaints only on an actual change
--- rather than rewriting four labels sixty times a second.
+-- Called every frame, so it repaints only on an actual change.
 local function setStatus(which, text)
     if which.Last == text then return end
     which.Last = text
     if statusSink then statusSink() end
 end
 
--- The freshest announcement we could still do something about, plus how long
--- until it lands. Returns nil when nothing is pending or the timing is unknown
--- and the caller does not want to guess.
--- Whether an attack can actually arrive here, rather than whether the attacker
--- is inside some number we picked.
---
--- Two questions, and neither needs the attack type - which is just as well,
--- since that is server-side:
---
---   Can it cross the distance? Answered by what the move has already done. Any
---   move that has connected from 80 studs is a ranged one whatever it is
---   called, and one that has only ever landed at 6 is not going to reach
---   across a room. That number is already being measured on every sample.
---
---   Is it pointed here? A projectile fired at somebody else is not a threat.
---   Only asked past AimFrom, because close-up swings have wide hitboxes and
---   track, so facing means much less than it does at range.
--- Is the attacker pointed at us?
---
--- This used to be skipped outright below AimFrom studs, on the reasoning that
--- close-range swings track and have wide hitboxes. That is true of a glancing
--- angle and completely false of someone facing the other way, which is how it
--- ended up blocking an M1 from a player with their back turned.
---
--- So the cone is never off, it just widens up close: generous enough that a
--- swing which might plausibly turn into us still counts, tight enough that
--- somebody facing away does not.
-local function aimedHere(actor, distance, cfg)
-    local mine = ownCharacter()
-    local ours = mine and mine:FindFirstChild('HumanoidRootPart')
-    local theirs = actor:FindFirstChild('HumanoidRootPart')
-    if not ours or not theirs then return true end
-    local toward = (ours.Position - theirs.Position) * Vector3.new(1, 0, 1)
-    if toward.Magnitude < 0.01 then return true end
-    local look = theirs.CFrame.LookVector * Vector3.new(1, 0, 1)
-    if look.Magnitude < 0.01 then return true end
-    local dot = math.clamp(look.Unit:Dot(toward.Unit), -1, 1)
-    local angle = math.deg(math.acos(dot))
-    local cone = distance <= cfg.AimFrom and cfg.AimConeNear or cfg.AimCone
-    return angle <= cone
-end
+Counter.Methods = {
+    Block = { 'Controller', 'Key', 'Remote' },
+    Manji = { 'Tool', 'KeyBind', 'Press', 'Remote' },
+}
+-- Whatever the ToolController calls its release, if it has one.
+Counter.UnblockNames = { 'Unblock', 'UnBlock', 'StopBlock', 'StopBlocking', 'EndBlock', 'BlockEnd', 'ReleaseBlock' }
+Counter.NumberKeys = { 'One', 'Two', 'Three', 'Four', 'Five', 'Six', 'Seven', 'Eight', 'Nine' }
+-- Announcements that are never an attack in themselves.
+Counter.NonAttack = {
+    Dash = true, Sprint = true, Run = true, Walk = true, Jump = true, Equip = true,
+    Unequip = true, Idle = true, Taunt = true, Trail = true, Aura = true, Fade = true,
+}
+Counter.HarmlessAfter = 8    -- announcements beside someone with no stun, no guard hit
+Counter.NearVictim = 20      -- studs from the actor that make someone a possible victim
+Counter.FacingAway = 110     -- degrees off their facing at which we are behind them
+Counter.TargetMargin = 25    -- how clearly someone else must be the target to skip
+Counter.Tail = 0.25          -- how long past its hit time a threat still counts
+Counter.ConfirmWait = 0.3    -- plus the round trip, before a press counts as missed
+Counter.OwnAttackGap = 0.4   -- "attacking" means one of ours went out this recently
 
-local function inReach(event, actor, distance, cfg)
-    local reach = learnedReach(event.key)
-    -- Until it has connected once there is nothing to go on, so the slider
-    -- stands in. After that the slider is not consulted at all.
-    local limit = reach and (reach * REACH_MARGIN) or cfg.Range
-    if distance > limit then
-        return false, 'out of reach'
-    end
-    if not aimedHere(actor, distance, cfg) then
-        return false, 'aimed elsewhere'
-    end
-    return true
-end
+Counter.seen = {}
+Counter.lastOwnAttack = 0
+Counter.dodgedUntil = 0
+Counter.retry = setmetatable({}, { __mode = 'k' })   -- event -> rolled retry
+Counter.counted = setmetatable({}, { __mode = 'k' }) -- event -> already tallied
+Counter.block = { index = 1, misses = 0, asked = nil, ours = false, pressedWith = nil, liveUntil = 0, target = nil }
+Counter.manji = { index = 1, misses = 0, asked = nil, busyUntil = 0, firedAt = 0, confirmedAt = 0 }
 
-local function pendingThreat(cfg)
+-- The whole round trip, in seconds. GetNetworkPing reads about half of it, so
+-- it is doubled, and the network stats' data ping wins when it is larger.
+function Counter.rtt()
     local now = tick()
-    -- Kept so the status can say why everything was passed over, rather than
-    -- reporting "nothing incoming" while an attack is plainly in progress.
-    local skipped = nil
-    for index = #Intel.Recent, 1, -1 do
-        local event = Intel.Recent[index]
-        if now - event.at > Intel.RecentWindow then
-            -- Everything below this point in the list is older still.
-            break
-        end
-        local actor = event.actor
-        if actor and actor.Parent and not event.mine then
-            local distance = distanceTo(actor)
-            local lead, samples = predictedLead(event.key)
-            local measured = lead ~= nil
-            local usable = true
-
-            if not measured and not cfg.UseUnmeasured then
-                skipped = skipped or ('unmeasured: ' .. event.service)
-                usable = false
-            end
-            if usable then
-                local reaches, why = inReach(event, actor, distance, cfg)
-                if not reaches then
-                    skipped = skipped or (why .. ': ' .. event.service)
-                    usable = false
-                end
-            end
-
-            -- Skipping rather than giving up here is the difference between
-            -- reacting to the newest *usable* threat and refusing to act at
-            -- all because the newest one happened to be unreadable.
-            if usable then
-                if not measured then
-                    lead = cfg.AssumeLead
-                    samples = 0
-                end
-                local announced = {
-                    event = event,
-                    actor = actor,
-                    distance = distance,
-                    measured = measured,
-                    samples = samples or 0,
-                    timeLeft = (event.at + lead) - now,
-                }
-                -- A live-tracked projectile, if one is closer to landing, is
-                -- strictly better information than an announcement-derived
-                -- guess - real position, real speed, recomputed this frame -
-                -- so it wins the comparison rather than being a fallback only
-                -- reached when nothing else was found at all.
-                local proj = Projectiles.threat()
-                if proj and proj.timeLeft < announced.timeLeft then
-                    return proj
-                end
-                return announced
-            end
-        end
-    end
-    local proj = Projectiles.threat()
-    if proj then return proj end
-    return nil, skipped or 'nothing incoming'
-end
-
---// Auto manji kick ----------------------------------------------------------
-
-local manjiBusyUntil = 0
-
-local function manjiMove()
-    local char = ownCharacter()
-    if not char then return nil end
-    local move = findMove(char, "ManjiKickService")
-    if move then return move end
-    -- Fall back to the display name in case the Service attribute is ever
-    -- renamed; the move instance is what UseTool needs either way.
-    local moveset = movesetFolder(char)
-    return moveset and moveset:FindFirstChild("Manji Kick") or nil
-end
-
-local function fireMove(move)
-    local controller = toolController()
-    if controller then
-        local ok = pcall(function()
-            controller:UseTool(move, "Activated")
-        end)
-        if ok then return true end
-        local key = move:GetAttribute("Key")
-        if key then
-            ok = pcall(function()
-                controller:UseKey(key, "Activated")
-            end)
-            if ok then return true end
-        end
-    end
-    -- Last resort: the raw remote, with the move instance the server expects.
-    local folder = Services:FindFirstChild("ManjiKickService")
-    local re = folder and folder:FindFirstChild("RE")
-    local activated = re and re:FindFirstChild("Activated")
-    if activated then
-        local ok = pcall(function()
-            activated:FireServer(move)
-        end)
-        return ok
-    end
-    return false
-end
-
-local function tryManji()
-    if not ManjiConfig.Enabled then return end
-    local now = tick()
-    if now < manjiBusyUntil then return end
-
-    local char = ownCharacter()
-    local able, why = canAct(char)
-    if not able then
-        setStatus(ManjiConfig, why)
-        return
-    end
-    if globallyLocked(char) then
-        setStatus(ManjiConfig, 'global cooldown')
-        return
-    end
-
-    local move = manjiMove()
-    if not move then
-        setStatus(ManjiConfig, 'no manji kick on this moveset')
-        return
-    end
-    local left = cooldownLeft(move)
-    if left > 0 then
-        setStatus(ManjiConfig, ('cooldown %.1fs'):format(left))
-        return
-    end
-
-    local threat, reason = pendingThreat(ManjiConfig)
-    if not threat then
-        setStatus(ManjiConfig, reason or 'nothing incoming')
-        return
-    end
-
-    if ManjiConfig.MeleeOnly then
-        if threat.event.projectile then
-            ManjiConfig.Skipped = ManjiConfig.Skipped + 1
-            setStatus(ManjiConfig, 'ranged - not a kick target')
-            return
-        end
-        if threat.distance > ManjiConfig.MaxRange then
-            ManjiConfig.Skipped = ManjiConfig.Skipped + 1
-            setStatus(ManjiConfig, ('%.0fst - too far to be melee'):format(threat.distance))
-            return
-        end
-    end
-
-    -- The waste test. A counter thrown too early expires before the hit
-    -- arrives and eats its cooldown for nothing; thrown too late it does not
-    -- come out in time at all. Only the band between the two is worth spending
-    -- the move on.
-    --
-    -- The width of that band is the one number the dump cannot give us, so it
-    -- is measured: every throw records how far out the hit was, and whether a
-    -- ManjiKick Hit followed. Once enough throws have connected, the widest
-    -- one that worked defines the window and the slider stops being used.
-    local window = ManjiConfig.Window
-    local source = 'set'
-    if ManjiConfig.AutoWindow then
-        local learned = learnedWindow()
-        if learned then
-            window = learned
-            source = 'learned'
-        end
-    end
-
-    if threat.timeLeft < ManjiConfig.Reaction then
-        ManjiConfig.Skipped = ManjiConfig.Skipped + 1
-        setStatus(ManjiConfig, ('too late (%.2fs)'):format(threat.timeLeft))
-        return
-    end
-    if threat.timeLeft > window then
-        ManjiConfig.Skipped = ManjiConfig.Skipped + 1
-        setStatus(ManjiConfig, ('too early (%.2fs > %.2fs %s)')
-            :format(threat.timeLeft, window, source))
-        return
-    end
-
-    if fireMove(move) then
-        ManjiConfig.Attempts = ManjiConfig.Attempts + 1
-        manjiBusyUntil = now + 0.35
-        -- Not recorded here: the throw's own Startup broadcast does that, so
-        -- one code path covers this and a manual counter alike.
-        setStatus(ManjiConfig, ('countered %s (%.2fs)')
-            :format(threat.event.service, threat.timeLeft))
-        pushFeed(('manji -> %s in %.2fs'):format(threat.event.service, threat.timeLeft), 'success')
-    else
-        setStatus(ManjiConfig, 'activation failed')
-    end
-end
-
---// Auto block ---------------------------------------------------------------
-
-local blockReleaseToken = 0
--- Calling Block() does not make hasState(char, 'Block') true on the same
--- frame - that only appears once the server round-trip actually creates the
--- Info state, which is never instant. Removing the old fixed hold timer to
--- fix "holding through" also removed the only thing that had been stopping
--- tryBlock from calling Block() again on every single Heartbeat in between:
--- not yet confirmed as blocking, so it looked identical to never having
--- tried at all, and it tried again, and again, spamming the same block on
--- top of itself until the state finally landed. This is a short debounce
--- covering only that specific confirmation gap - once hasState is actually
--- true, the hold-through branch below takes over and this plays no part.
-local BLOCK_REQUEST_DEBOUNCE = 0.25
-local blockRequestedUntil = 0
-
-local function releaseBlock()
-    if BlockDeactivated then
-        pcall(function()
-            BlockDeactivated:FireServer()
-        end)
-    end
-end
-
--- How far off our facing the attacker is, in degrees. The game breaks a block
--- that is not oriented into the attack, so this is both the "will it even
--- work" test and the "will this look like a 360 block" test.
-local function angleToward(char, actor)
-    local mine = char and char:FindFirstChild('HumanoidRootPart')
-    if not mine or not actor then return 180 end
-    -- A tracked projectile is a bare BasePart, not a character, so it has no
-    -- HumanoidRootPart to read - its own Position stands in directly, which
-    -- is the more honest question anyway ("are we facing the incoming
-    -- ball") rather than trying to recover whoever threw it.
-    local theirsPart = actor:FindFirstChild('HumanoidRootPart')
-    local theirPosition = theirsPart and theirsPart.Position
-    if not theirPosition and actor:IsA('BasePart') then
-        theirPosition = actor.Position
-    end
-    if not theirPosition then return 180 end
-    local toward = (theirPosition - mine.Position) * Vector3.new(1, 0, 1)
-    if toward.Magnitude < 0.01 then return 0 end
-    local look = mine.CFrame.LookVector * Vector3.new(1, 0, 1)
-    if look.Magnitude < 0.01 then return 180 end
-    local dot = math.clamp(look.Unit:Dot(toward.Unit), -1, 1)
-    return math.deg(math.acos(dot))
-end
-
--- Pushes the scheduled release forward instead of letting the original one
--- fire on schedule. Shared by the "still under threat" branch below so a
--- sustained chain gets one continuous hold instead of release-then-reacquire
--- every Hold seconds - the reacquire gap is exactly where an unguarded hit
--- got through, which is what made holding feel like it wasn't happening at
--- all.
-local function extendBlockHold()
-    blockReleaseToken = blockReleaseToken + 1
-    local token = blockReleaseToken
-    task.delay(BlockConfig.Hold, function()
-        if token == blockReleaseToken then
-            releaseBlock()
-        end
+    if Counter.rttValue and now - Counter.rttAt < 0.5 then return Counter.rttValue end
+    local rtt = 0
+    local ok, ping = pcall(function() return LocalPlayer:GetNetworkPing() end)
+    if ok and type(ping) == 'number' and ping > 0 then rtt = ping * 2 end
+    local okStats, ms = pcall(function()
+        return game:GetService('Stats').Network.ServerStatsItem['Data Ping']:GetValue()
     end)
+    if okStats and type(ms) == 'number' and ms / 1000 > rtt then rtt = ms / 1000 end
+    if rtt <= 0 then rtt = 0.12 end
+    Counter.rttValue, Counter.rttAt = math.min(rtt, 0.6), now
+    return Counter.rttValue
 end
 
-local function tryBlock()
-    if not BlockConfig.Enabled then return end
-    local now = tick()
+function Counter.isM1(effect)
+    return type(effect) == 'string' and effect:match('^Swing%d*$') ~= nil
+end
 
-    local char = ownCharacter()
-    local able, why = canAct(char)
-    if not able then
-        setStatus(BlockConfig, why)
-        return
-    end
-    if hasState(char, 'NoBlock') then
-        setStatus(BlockConfig, 'blocking disabled on us')
-        return
-    end
-    if hasState(char, 'Block') then
-        -- Already guarding for real (server-confirmed, not just our own
-        -- timer) - keep holding through as long as something is still
-        -- worth guarding against, rather than always releasing on a fixed
-        -- schedule and needing a fresh Block() call a moment later.
-        local threat = pendingThreat(BlockConfig)
-        if threat and threat.timeLeft <= BlockConfig.LookAhead then
-            extendBlockHold()
-            setStatus(BlockConfig, 'holding through')
-        else
-            setStatus(BlockConfig, 'already blocking')
-        end
-        return
-    end
+-- Whether an announcement is an attack, and whether that is known rather
+-- than assumed. Anything that has stunned someone or met a guard is one; a
+-- basic swing always is; a name that is never one is not; and something that
+-- keeps going off beside people without either has shown it is harmless.
+function Counter.isAttack(key, effect)
+    if Counter.isM1(effect) then return true, true end
+    local timing = Intel.Timing[key]
+    if timing and timing.n > 0 then return true, true end
+    local outcome = Outcomes.Moves[key]
+    if outcome and outcome.blocked + outcome.pierced + outcome.countered > 0 then return true, true end
+    if Counter.NonAttack[effect] then return false end
+    if (Counter.seen[key] or 0) >= Counter.HarmlessAfter then return false end
+    return true, false
+end
 
-    if now < blockRequestedUntil then return end
-
-    local threat, reason = pendingThreat(BlockConfig)
-    if not threat then
-        setStatus(BlockConfig, reason or 'nothing incoming')
-        return
-    end
-
-    -- Deliberately not a narrow timing band. Attacks here come in chains, and
-    -- a guard that goes up "too late" for the first hit still stops the next
-    -- three - so missing the window is not a reason to stand there unguarded.
-    -- What matters is that someone nearby is actively swinging.
-    if threat.timeLeft > BlockConfig.LookAhead then
-        setStatus(BlockConfig, ('waiting (%.2fs out)'):format(threat.timeLeft))
-        return
-    end
-    -- Sustain exists so the guard lingers past one hit for the rest of a
-    -- chain, but as a flat cap it ends up vetoing a correctly-timed reaction
-    -- to any move whose own measured lead already runs longer than it - a
-    -- charge-up ranged throw (ReserveBall, ReversalRed) can easily take over
-    -- a second between the "Red"/"Fire" announcement and actually landing,
-    -- past this constant on its own before travel time is even added.
-    -- timeLeft above already handles "is this too far out to react to yet"
-    -- correctly from the measured lead; Sustain should only ever raise that
-    -- ceiling for a slow move, never lower it below what has actually been
-    -- measured.
-    -- A tracked projectile's timeLeft is recomputed from its live position
-    -- every frame, so "how long ago did tracking start" says nothing about
-    -- whether it is still worth reacting to - the LookAhead check above
-    -- already covers that correctly. Sustain only means anything for an
-    -- announcement, which goes stale the moment nothing new confirms it.
-    if not threat.event.projectile then
-        local lead = predictedLead(threat.event.key)
-        local sustainLimit = lead and math.max(BlockConfig.Sustain, lead + BlockConfig.LookAhead)
-            or BlockConfig.Sustain
-        local age = tick() - threat.event.at
-        if age > sustainLimit then
-            setStatus(BlockConfig, 'nothing recent')
-            return
-        end
-    end
-
-    -- Learned refusal: if blocking this move has been tried and mostly failed,
-    -- putting a guard up again just holds us still for it. Unknown moves are
-    -- still worth a try, since a block that works is how they become known.
-    if BlockConfig.SkipUnblockable then
-        local verdict, rate, tried = blockVerdict(threat.event.key)
-        if verdict == 'unblockable' then
-            -- Never retrying would lock in the verdict: a move written off
-            -- after three unlucky samples could never earn its way back,
-            -- because refusing to block it is also refusing to gather any
-            -- more evidence. So a fraction of the time, try it anyway.
-            if math.random() >= BlockConfig.RetryChance then
-                BlockConfig.Skipped = BlockConfig.Skipped + 1
-                setStatus(BlockConfig, ('%s unblockable (%d%%, n=%d)')
-                    :format(threat.event.service, math.floor(rate * 100), tried))
+-- Counts an announcement that went off with somebody close enough to hit.
+function Counter.noteSeen(key, actor)
+    local origin = positionOf(actor)
+    local folder = charactersFolder()
+    if not origin or not folder then return end
+    for _, other in ipairs(folder:GetChildren()) do
+        if other ~= actor then
+            local position = positionOf(other)
+            if position and (position - origin).Magnitude <= Counter.NearVictim then
+                Counter.seen[key] = (Counter.seen[key] or 0) + 1
                 return
             end
         end
     end
+end
 
-    local angle = angleToward(char, threat.actor)
-    if angle > BlockConfig.MaxAngle then
-        BlockConfig.Skipped = BlockConfig.Skipped + 1
-        setStatus(BlockConfig, ('%.0f deg off - not facing it'):format(angle))
-        return
+function Counter.flat(v)
+    return Vector3.new(v.X, 0, v.Z)
+end
+
+-- Degrees between where `root` faces and the direction to `position`.
+function Counter.angle(root, position)
+    local toward = Counter.flat(position - root.Position)
+    if toward.Magnitude < 0.5 then return 0 end
+    local look = Counter.flat(root.CFrame.LookVector)
+    if look.Magnitude < 0.01 then return 0 end
+    return math.deg(math.acos(math.clamp(look.Unit:Dot(toward.Unit), -1, 1)))
+end
+
+-- Whether this attacker is going for us rather than for somebody beside us.
+-- Everyone they could reach is scored on how far off their facing and how far
+-- away they stand; we are the target unless someone else clearly beats us.
+function Counter.goingForMe(actor, mine, reach)
+    local theirs = actor:FindFirstChild('HumanoidRootPart')
+    local ours = mine:FindFirstChild('HumanoidRootPart')
+    if not theirs or not ours then return true end
+    local myAngle = Counter.angle(theirs, ours.Position)
+    if myAngle > Counter.FacingAway then return false, 'facing away' end
+    local myScore = myAngle + Counter.flat(ours.Position - theirs.Position).Magnitude * 2
+    local folder = charactersFolder()
+    if not folder then return true end
+    for _, other in ipairs(folder:GetChildren()) do
+        if other ~= actor and other ~= mine and not isOwn(other) and not other:GetAttribute('Dead') then
+            local root = other:FindFirstChild('HumanoidRootPart')
+            if root then
+                local distance = Counter.flat(root.Position - theirs.Position).Magnitude
+                if distance <= reach then
+                    local score = Counter.angle(theirs, root.Position) + distance * 2
+                    if score + Counter.TargetMargin < myScore then
+                        return false, 'going for ' .. other.Name
+                    end
+                end
+            end
+        end
+    end
+    return true
+end
+
+-- Where a threat is right now: the attacker's root, or the projectile itself.
+function Counter.whereIs(actor)
+    if not actor or not actor.Parent then return nil end
+    local root = actor:FindFirstChild('HumanoidRootPart')
+    if root then return root.Position end
+    if actor:IsA('BasePart') then return actor.Position end
+    return nil
+end
+
+-- Every threat to us, soonest to land first. The second value explains why
+-- the first thing passed over was passed over, for the status line.
+function Counter.threats(cfg, mine, withProjectiles)
+    local list, skipped = {}, nil
+    local ours = mine:FindFirstChild('HumanoidRootPart')
+    if not ours then return list, 'no character' end
+    local now = tick()
+
+    for index = #Intel.Recent, 1, -1 do
+        local event = Intel.Recent[index]
+        if now - event.at > Intel.RecentWindow then break end
+        local actor = event.actor
+        if not event.mine and actor and actor.Parent and not actor:GetAttribute('Dead') then
+            local why
+            local attack = Counter.isAttack(event.key, event.effect)
+            local lead = predictedLead(event.key)
+            if not attack then
+                why = 'not an attack'
+            elseif not lead and not cfg.UseUnmeasured and not Counter.isM1(event.effect) then
+                why = 'unmeasured'
+            end
+
+            local timeLeft = event.at + (lead or cfg.AssumeLead) - now
+            if not why and timeLeft < -Counter.Tail then why = 'already landed' end
+
+            local distance
+            if not why then
+                distance = distanceTo(actor)
+                local theirs = actor:FindFirstChild('HumanoidRootPart')
+                if theirs then
+                    -- someone running at us covers ground before it lands
+                    local toUs = Counter.flat(ours.Position - theirs.Position)
+                    if toUs.Magnitude > 0.01 then
+                        local closing = Counter.flat(theirs.AssemblyLinearVelocity):Dot(toUs.Unit)
+                        if closing > 0 then
+                            distance = math.max(0, distance - closing * math.max(timeLeft, 0))
+                        end
+                    end
+                end
+                local learned = learnedReach(event.key)
+                local reach = math.max(cfg.Range, learned and learned * REACH_MARGIN or 0)
+                if cfg.MeleeOnly then reach = math.min(reach, cfg.Range * 2) end
+                if distance > reach then
+                    why = ('%.0fst away'):format(distance)
+                elseif cfg.OnlyMe then
+                    local forMe, whyNot = Counter.goingForMe(actor, mine, reach)
+                    if not forMe then why = whyNot end
+                end
+            end
+
+            if why then
+                skipped = skipped or (why .. ': ' .. event.service)
+            else
+                list[#list + 1] = {
+                    event = event,
+                    key = event.key,
+                    service = event.service,
+                    effect = event.effect,
+                    actor = actor,
+                    timeLeft = timeLeft,
+                    measured = lead ~= nil,
+                    distance = distance,
+                }
+            end
+        end
     end
 
-    local controller = toolController()
-    if not controller then
-        setStatus(BlockConfig, 'no ToolController')
-        return
+    if withProjectiles then
+        local projectile = Projectiles.threat()
+        if projectile then
+            list[#list + 1] = {
+                event = projectile.event,
+                key = projectile.event.key,
+                service = projectile.event.service,
+                effect = 'Interp',
+                actor = projectile.actor,
+                timeLeft = projectile.timeLeft,
+                measured = true,
+                distance = projectile.distance,
+                projectile = true,
+            }
+        end
     end
-    local ok = pcall(function()
-        controller:Block()
+
+    table.sort(list, function(a, b) return a.timeLeft < b.timeLeft end)
+    return list, skipped or 'nothing incoming'
+end
+
+-- Turns us to look at a point, on the ground plane.
+function Counter.face(mine, position)
+    local root = mine and mine:FindFirstChild('HumanoidRootPart')
+    if not root or not position then return end
+    local flat = Vector3.new(position.X, root.Position.Y, position.Z)
+    if (flat - root.Position).Magnitude < 0.5 then return end
+    pcall(function()
+        root.CFrame = CFrame.lookAt(root.Position, flat)
     end)
-    if not ok then
-        setStatus(BlockConfig, 'block call failed')
+end
+
+function Counter.vim()
+    if Counter.vimService == nil then
+        local ok, service = pcall(function() return game:GetService('VirtualInputManager') end)
+        Counter.vimService = ok and service or false
+    end
+    return Counter.vimService or nil
+end
+
+-- A key from a setting or a move's Key attribute: a KeyCode, its name, or a
+-- hotbar number.
+function Counter.keyCode(value)
+    if typeof(value) == 'EnumItem' then return value end
+    if type(value) == 'number' then value = tostring(math.floor(value)) end
+    if type(value) ~= 'string' or value == '' then return nil end
+    local digit = tonumber(value)
+    if digit and Counter.NumberKeys[digit] then return Enum.KeyCode[Counter.NumberKeys[digit]] end
+    local ok, code = pcall(function() return Enum.KeyCode[value] end)
+    return ok and code or nil
+end
+
+-- A real key tap, down then up, the way a finger would.
+function Counter.tap(code, hold)
+    local vim = Counter.vim()
+    if not vim or not code then return false end
+    local ok = pcall(function() vim:SendKeyEvent(true, code, false, game) end)
+    if not ok then return false end
+    task.delay(hold or 0.06, function()
+        pcall(function() vim:SendKeyEvent(false, code, false, game) end)
+    end)
+    return true
+end
+
+function Counter.remote(service, name)
+    local folder = Services:FindFirstChild(service)
+    local re = folder and folder:FindFirstChild('RE')
+    return re and re:FindFirstChild(name) or nil
+end
+
+-- The method in charge: the one picked, or on Auto the one still standing.
+function Counter.method(cfg, state, list)
+    if cfg.Method ~= 'Auto' then return cfg.Method end
+    return list[state.index] or list[1]
+end
+
+-- A press that produced nothing. On Auto, a method that misses twice running
+-- hands over to the next.
+function Counter.missed(cfg, state, list, method, label)
+    state.misses = state.misses + 1
+    if cfg.Method == 'Auto' and state.misses >= 2 then
+        state.misses = 0
+        state.index = state.index % #list + 1
+        pushFeed(('%s: %s did nothing, trying %s'):format(label, method, list[state.index]), 'warn')
+    end
+end
+
+-- Settles the last press: confirmed, or given up on once the server has had
+-- the round trip plus a margin to answer.
+function Counter.settle(cfg, state, list, confirmed, label)
+    local asked = state.asked
+    if not asked then return end
+    if confirmed then
+        state.asked = nil
+        state.misses = 0
+        cfg.Using = asked.method
+        return
+    end
+    if tick() - asked.at < Counter.ConfirmWait + Counter.rtt() then return end
+    state.asked = nil
+    Counter.missed(cfg, state, list, asked.method, label)
+end
+
+-- Tallies a skip once per announcement rather than once per frame.
+function Counter.skip(cfg, threat)
+    if threat and Counter.counted[threat.event] ~= cfg then
+        Counter.counted[threat.event] = cfg
+        cfg.Skipped = cfg.Skipped + 1
+    end
+end
+
+--// Auto manji kick ----------------------------------------------------------
+
+function Counter.manjiMove(mine)
+    local move = findMove(mine, "ManjiKickService")
+    if move then return move end
+    -- The display name, in case the Service attribute is ever renamed.
+    local moveset = movesetFolder(mine)
+    return moveset and moveset:FindFirstChild("Manji Kick") or nil
+end
+
+function Counter.fireManji(method, move)
+    local controller = toolController()
+    if method == 'Tool' then
+        if not controller then return false end
+        local ok = pcall(function() controller:UseTool(move, "Activated") end)
+        if ok then
+            task.delay(0.06, function()
+                pcall(function() controller:UseTool(move, "Deactivated") end)
+            end)
+        end
+        return ok
+    elseif method == 'KeyBind' then
+        local key = move:GetAttribute("Key")
+        if not controller or key == nil then return false end
+        local ok = pcall(function() controller:UseKey(key, "Activated") end)
+        if ok then
+            task.delay(0.06, function()
+                pcall(function() controller:UseKey(key, "Deactivated") end)
+            end)
+        end
+        return ok
+    elseif method == 'Press' then
+        return Counter.tap(Counter.keyCode(move:GetAttribute("Key")))
+    end
+    local activated = Counter.remote("ManjiKickService", "Activated")
+    if not activated then return false end
+    return (pcall(function() activated:FireServer(move) end))
+end
+
+-- The counter has to be up on the server when the hit arrives there. Sent now
+-- it arrives a round trip ahead of a hit timeLeft out (both directions of
+-- delay are in it) and then lasts `window`, so it catches anything landing
+-- between rtt and rtt + window from now. It goes out once the soonest threat
+-- is inside that band, with a little of the window kept back for error in
+-- the lead; a hit already closer than half the round trip cannot be caught
+-- and is left to the block.
+function Counter.manjiStep(mine, threats, reason, rtt)
+    local cfg, state = ManjiConfig, Counter.manji
+    local now = tick()
+    local move = Counter.manjiMove(mine)
+
+    local readyAt = move and move:GetAttribute("ReadyAt")
+    local fired = state.asked and (state.confirmedAt >= state.asked.at
+        or (readyAt ~= nil and readyAt ~= state.asked.readyAt))
+    Counter.settle(cfg, state, Counter.Methods.Manji, fired, 'manji')
+
+    local window = cfg.Window
+    local source = 'set'
+    if cfg.AutoWindow then
+        local learned = learnedWindow()
+        if learned then window, source = learned, 'learned' end
+    end
+    -- still guarding us from the last throw
+    local busy = now < state.firedAt + rtt + window
+
+    if now < state.busyUntil then return busy end
+    if not move then
+        setStatus(cfg, 'no manji kick on this moveset')
+        return busy
+    end
+    local able, why = canAct(mine)
+    if not able then
+        setStatus(cfg, why)
+        return busy
+    end
+    if globallyLocked(mine) then
+        setStatus(cfg, 'global cooldown')
+        return busy
+    end
+    local left = cooldownLeft(move)
+    if left > 0 then
+        setStatus(cfg, ('cooldown %.1fs'):format(left))
+        return busy
+    end
+
+    local fireBy = rtt + window * 0.8
+    local target, waiting, late
+    for _, threat in ipairs(threats) do
+        if threat.timeLeft < rtt * 0.5 then
+            late = late or threat
+        elseif threat.timeLeft <= fireBy then
+            target = threat
+            break
+        else
+            waiting = waiting or threat
+        end
+    end
+
+    if not target then
+        if waiting then
+            setStatus(cfg, ('%s in %.2fs, goes at %.2fs (%s window)')
+                :format(waiting.service, waiting.timeLeft, fireBy, source))
+        elseif late then
+            Counter.skip(cfg, late)
+            setStatus(cfg, ('%s too close to catch (%.2fs)'):format(late.service, late.timeLeft))
+        else
+            setStatus(cfg, reason)
+        end
+        return busy
+    end
+
+    -- a counter beats a guard, and a guard would stop it coming out
+    if hasState(mine, 'Block') and Counter.block.ours then Counter.releaseBlock() end
+    if cfg.Face then Counter.face(mine, Counter.whereIs(target.actor)) end
+
+    local method = Counter.method(cfg, state, Counter.Methods.Manji)
+    if not Counter.fireManji(method, move) then
+        setStatus(cfg, method .. ' failed')
+        Counter.missed(cfg, state, Counter.Methods.Manji, method, 'manji')
+        return busy
+    end
+
+    state.asked = { at = now, method = method, readyAt = readyAt }
+    state.busyUntil = now + 0.4
+    state.firedAt = now
+    cfg.Attempts = cfg.Attempts + 1
+    setStatus(cfg, ('countered %s (%.2fs)'):format(target.service, target.timeLeft))
+    pushFeed(('manji -> %s in %.2fs'):format(target.service, target.timeLeft), 'success')
+    return true
+end
+
+--// Auto block ---------------------------------------------------------------
+
+function Counter.pressBlock(method, down)
+    if method == 'Controller' then
+        local controller = toolController()
+        if not controller then return false end
+        if down then
+            return (pcall(function() controller:Block() end))
+        end
+        for _, name in ipairs(Counter.UnblockNames) do
+            local release = controller[name]
+            if type(release) == 'function' then pcall(release, controller) end
+        end
+        local deactivated = Counter.remote("BlockService", "Deactivated")
+        if deactivated then pcall(function() deactivated:FireServer() end) end
+        return true
+    elseif method == 'Key' then
+        local vim, code = Counter.vim(), Counter.keyCode(BlockConfig.Key)
+        if not vim or not code then return false end
+        return (pcall(function() vim:SendKeyEvent(down, code, false, game) end))
+    end
+    local remote = Counter.remote("BlockService", down and "Activated" or "Deactivated")
+    if not remote then return false end
+    return (pcall(function() remote:FireServer() end))
+end
+
+-- Drops a guard we put up, the same way it went up, and tells the server
+-- directly as well so a release can never be the thing that sticks.
+function Counter.releaseBlock()
+    local state = Counter.block
+    local method = state.pressedWith or Counter.method(BlockConfig, state, Counter.Methods.Block)
+    Counter.pressBlock(method, false)
+    if method ~= 'Remote' then
+        local deactivated = Counter.remote("BlockService", "Deactivated")
+        if deactivated then pcall(function() deactivated:FireServer() end) end
+    end
+    state.ours = false
+    state.pressedWith = nil
+    state.liveUntil = 0
+    state.target = nil
+end
+
+-- Backs out of something a guard will not stop.
+function Counter.dodge(mine, threat)
+    local now = tick()
+    if now < Counter.dodgedUntil or hasState(mine, 'NoDash') then return end
+    Counter.dodgedUntil = now + 1.5
+    -- facing them first makes Back mean away from them
+    Counter.face(mine, Counter.whereIs(threat.actor))
+    pcall(function() DashRemote:FireServer("Back") end)
+    local controller = getMovementController()
+    if controller then
+        pcall(function() controller:Dash(LocalPlayer, mine, "Back") end)
+    end
+    pushFeed(('dodged %s - it beats blocks'):format(threat.service), 'success')
+end
+
+-- A guard goes up for the soonest threat that will land within the round trip
+-- plus the look-ahead, turns to face it, and then holds - turning with it -
+-- until nothing has been due for `Release` seconds, so a chain of hits meets
+-- one continuous guard. Only a guard this script raised is ever dropped by it.
+function Counter.blockStep(mine, threats, reason, rtt, manjiBusy)
+    local cfg, state = BlockConfig, Counter.block
+    local now = tick()
+    local blocking = hasState(mine, 'Block')
+    Counter.settle(cfg, state, Counter.Methods.Block, blocking and state.asked ~= nil, 'block')
+    -- a guard we asked for that never came, or one that has been broken: let
+    -- go of whatever is still held down and start over, rather than go on
+    -- "holding" a guard that is not there
+    if state.ours and not blocking and not state.asked then
+        Counter.releaseBlock()
+    end
+
+    local target, why
+    for _, threat in ipairs(threats) do
+        if threat.timeLeft > rtt + cfg.LookAhead then
+            why = why or ('%s in %.2fs'):format(threat.service, threat.timeLeft)
+        else
+            local verdict, rate, tried = blockVerdict(threat.key)
+            local beatsBlocks = cfg.SkipUnblockable and not threat.projectile and not Counter.isM1(threat.effect)
+                and verdict == 'unblockable' and tried >= 5
+            if beatsBlocks then
+                -- rolled once per announcement: a verdict that is never
+                -- retested can never be corrected
+                if Counter.retry[threat.event] == nil then
+                    Counter.retry[threat.event] = math.random() < cfg.RetryChance
+                end
+                beatsBlocks = not Counter.retry[threat.event]
+            end
+            if beatsBlocks then
+                Counter.skip(cfg, threat)
+                if cfg.DodgeUnblockable then Counter.dodge(mine, threat) end
+                why = why or ('%s beats blocks (%d%%, n=%d)'):format(threat.service, math.floor(rate * 100), tried)
+            else
+                target = threat
+                break
+            end
+        end
+    end
+
+    if target and cfg.NotAttacking and now - Counter.lastOwnAttack < Counter.OwnAttackGap then
+        why, target = 'you are attacking', nil
+    end
+    if target and manjiBusy then
+        why, target = 'manji has it', nil
+    end
+    if target then
+        state.liveUntil = math.max(state.liveUntil, now + math.max(target.timeLeft, 0) + cfg.Release)
+        state.target = target
+    end
+
+    -- holding: keep facing whatever the guard is for, drop it once it is over
+    if state.ours then
+        if now < state.liveUntil then
+            if cfg.Face and state.target then Counter.face(mine, Counter.whereIs(state.target.actor)) end
+            setStatus(cfg, 'holding vs ' .. (state.target and state.target.service or '?'))
+        else
+            Counter.releaseBlock()
+            setStatus(cfg, 'released')
+        end
         return
     end
 
-    BlockConfig.Attempts = BlockConfig.Attempts + 1
-    blockRequestedUntil = now + BLOCK_REQUEST_DEBOUNCE
-    extendBlockHold()
-    setStatus(BlockConfig, ('blocked %s at %.0f deg'):format(threat.event.service, angle))
-    pushFeed(('block -> %s (%.0f deg, %.2fs)'):format(threat.event.service, angle, threat.timeLeft), 'success')
+    if not target then
+        setStatus(cfg, blocking and 'you are blocking' or (why or reason))
+        return
+    end
+    if blocking then
+        setStatus(cfg, 'you are blocking')
+        return
+    end
+    local able, whyNot = canAct(mine)
+    if not able then
+        setStatus(cfg, whyNot)
+        return
+    end
+    if hasState(mine, 'NoBlock') then
+        setStatus(cfg, 'blocking disabled on us')
+        return
+    end
+
+    if cfg.Face then Counter.face(mine, Counter.whereIs(target.actor)) end
+    local method = Counter.method(cfg, state, Counter.Methods.Block)
+    if not Counter.pressBlock(method, true) then
+        setStatus(cfg, method .. ' failed')
+        Counter.missed(cfg, state, Counter.Methods.Block, method, 'block')
+        return
+    end
+
+    state.asked = { at = now, method = method }
+    state.ours = true
+    state.pressedWith = method
+    if Counter.counted[target.event] ~= 'block' then
+        Counter.counted[target.event] = 'block'
+        cfg.Attempts = cfg.Attempts + 1
+    end
+    setStatus(cfg, ('blocking %s (%.2fs)'):format(target.service, target.timeLeft))
+    pushFeed(('block -> %s in %.2fs, %.0fst'):format(target.service, target.timeLeft, target.distance or 0), 'success')
+end
+
+function Counter.step()
+    if not ManjiConfig.Enabled and not BlockConfig.Enabled then return end
+    local mine = ownCharacter()
+    if not mine then return end
+    local rtt = Counter.rtt()
+    local manjiBusy = false
+    if ManjiConfig.Enabled then
+        local threats, reason = Counter.threats(ManjiConfig, mine, not ManjiConfig.MeleeOnly)
+        manjiBusy = Counter.manjiStep(mine, threats, reason, rtt)
+    end
+    if BlockConfig.Enabled then
+        local threats, reason = Counter.threats(BlockConfig, mine, BlockConfig.Projectiles)
+        Counter.blockStep(mine, threats, reason, rtt, manjiBusy)
+    elseif Counter.block.ours then
+        Counter.releaseBlock()
+    end
 end
 
 task.spawn(function()
@@ -2326,8 +2527,7 @@ task.spawn(function()
         RunService.Heartbeat:Wait()
         if IntelConfig.Enabled then
             pcall(Projectiles.update)
-            pcall(tryManji)
-            pcall(tryBlock)
+            pcall(Counter.step)
         end
     end
 end)
@@ -2738,7 +2938,7 @@ local ManjiSection = CounterTab:CreateSection('auto manji kick')
 
 ManjiSection:Toggle({
     Title = 'enabled',
-    Flag = 'manji_enabled',
+    Flag = 'manji2_enabled',
     Default = false,
     Callback = function(state)
         ManjiConfig.Enabled = state
@@ -2757,17 +2957,60 @@ ManjiSection:Toggle({
     end,
 })
 
+ManjiSection:Dropdown({
+    Title = 'how it presses',
+    Flag = 'manji2_method',
+    Values = { 'Auto', 'Tool', 'KeyBind', 'Press', 'Remote' },
+    Default = 'Auto',
+    Callback = function(value)
+        ManjiConfig.Method = value
+        Counter.manji.index, Counter.manji.misses = 1, 0
+    end,
+})
+
 ManjiSection:Toggle({
-    Title = 'learn the window',
-    Flag = 'manji_autowindow',
+    Title = 'turn to face them',
+    Flag = 'manji2_face',
+    Default = true,
+    Callback = function(state) ManjiConfig.Face = state end,
+})
+
+ManjiSection:Toggle({
+    Title = 'only when they are going for me',
+    Flag = 'manji2_onlyme',
+    Default = true,
+    Callback = function(state) ManjiConfig.OnlyMe = state end,
+})
+
+ManjiSection:Toggle({
+    Title = 'melee only',
+    Flag = 'manji2_melee',
+    Default = true,
+    Callback = function(state) ManjiConfig.MeleeOnly = state end,
+})
+
+ManjiSection:Slider({
+    Title = 'melee range',
+    Flag = 'manji2_range',
+    Min = 8,
+    Max = 60,
+    Increment = 1,
+    Default = 22,
+    Suffix = 'st',
+    Callback = function(v) ManjiConfig.Range = v end,
+})
+
+ManjiSection:Toggle({
+    Title = 'learn the counter window',
+    Flag = 'manji2_autowindow',
     Default = true,
     Callback = function(state) ManjiConfig.AutoWindow = state end,
 })
 
 ManjiSection:Slider({
     Title = 'counter window (until learned)',
-    Flag = 'manji_window',
-    Min = 0.1,
+    Flag = 'manji2_window',
+    Min = 0.2,
     Max = 1.5,
     Increment = 0.05,
     Rounding = 2,
@@ -2776,108 +3019,38 @@ ManjiSection:Slider({
     Callback = function(v) ManjiConfig.Window = v end,
 })
 
-ManjiSection:Slider({
-    Title = 'min reaction',
-    Flag = 'manji_reaction',
-    Min = 0,
-    Max = 0.4,
-    Increment = 0.01,
-    Rounding = 2,
-    Default = 0.08,
-    Suffix = 's',
-    Callback = function(v) ManjiConfig.Reaction = v end,
-})
-
-ManjiSection:Slider({
-    Title = 'range (until reach is learned)',
-    Flag = 'manji_range',
-    Min = 10,
-    Max = 150,
-    Increment = 5,
-    Default = 60,
-    Suffix = 'st',
-    Callback = function(v) ManjiConfig.Range = v end,
-})
-
-ManjiSection:Toggle({
-    Title = 'melee only (ignore ranged threats)',
-    Flag = 'manji_meleeonly',
-    Default = true,
-    Callback = function(state) ManjiConfig.MeleeOnly = state end,
-})
-
-ManjiSection:Slider({
-    Title = 'melee max range (hard cap)',
-    Flag = 'manji_maxrange',
-    Min = 5,
-    Max = 40,
-    Increment = 1,
-    Default = 15,
-    Suffix = 'st',
-    Callback = function(v) ManjiConfig.MaxRange = v end,
-})
-
 ManjiSection:Toggle({
     Title = 'act on unmeasured moves',
-    Flag = 'manji_unmeasured2',
+    Flag = 'manji2_unmeasured',
     Default = true,
     Callback = function(state) ManjiConfig.UseUnmeasured = state end,
 })
 
 ManjiSection:Slider({
-    Title = 'aim cone',
-    Flag = 'manji_aimcone',
-    Min = 15,
-    Max = 180,
-    Increment = 5,
-    Default = 50,
-    Suffix = ' deg',
-    Callback = function(v) ManjiConfig.AimCone = v end,
-})
-
-ManjiSection:Slider({
-    Title = 'wide cone under',
-    Flag = 'manji_aimfrom',
-    Min = 0,
-    Max = 60,
-    Increment = 5,
-    Default = 25,
-    Suffix = 'st',
-    Callback = function(v) ManjiConfig.AimFrom = v end,
-})
-
-ManjiSection:Slider({
-    Title = 'close aim cone',
-    Flag = 'manji_aimconenear',
-    Min = 30,
-    Max = 180,
-    Increment = 5,
-    Default = 105,
-    Suffix = ' deg',
-    Callback = function(v) ManjiConfig.AimConeNear = v end,
-})
-
-ManjiSection:Slider({
     Title = 'assumed lead (unmeasured)',
-    Flag = 'manji_assume',
-    Min = 0.05,
+    Flag = 'manji2_assume',
+    Min = 0.1,
     Max = 1,
     Increment = 0.05,
     Rounding = 2,
     Default = 0.35,
     Suffix = 's',
-    Callback = function(v) ManjiConfig.AssumeLead = v end,
+    Callback = function(v)
+        ManjiConfig.AssumeLead = v
+        ManjiConfig_AssumeLead = v
+    end,
 })
 
 local ManjiStatus = ManjiSection:Stat({ Title = 'status', Value = 'idle' })
 local ManjiCount = ManjiSection:Stat({ Title = 'thrown / skipped', Value = '0 / 0' })
 local ManjiWindow = ManjiSection:Stat({ Title = 'window in use', Value = 'set' })
+ManjiConfig.UsingStat = ManjiSection:Stat({ Title = 'pressing with', Value = '-' })
 
 local BlockSection = CounterTab:CreateSection('auto block')
 
 BlockSection:Toggle({
     Title = 'enabled',
-    Flag = 'block_enabled',
+    Flag = 'block2_enabled',
     Default = false,
     Callback = function(state)
         BlockConfig.Enabled = state
@@ -2896,115 +3069,115 @@ BlockSection:Toggle({
     end,
 })
 
-BlockSection:Slider({
-    Title = 'max angle',
-    Flag = 'block_angle',
-    Min = 15,
-    Max = 180,
-    Increment = 5,
-    Default = 75,
-    Suffix = ' deg',
-    Callback = function(v) BlockConfig.MaxAngle = v end,
+BlockSection:Dropdown({
+    Title = 'how it presses',
+    Flag = 'block2_method',
+    Values = { 'Auto', 'Controller', 'Key', 'Remote' },
+    Default = 'Auto',
+    Callback = function(value)
+        BlockConfig.Method = value
+        Counter.block.index, Counter.block.misses = 1, 0
+    end,
+})
+
+BlockSection:Keybind({
+    Title = 'block key (for Key)',
+    Flag = 'block2_key',
+    Default = Enum.KeyCode.F,
+    Callback = function() end,
+    ChangedCallback = function(key)
+        if typeof(key) == 'EnumItem' then BlockConfig.Key = key.Name end
+    end,
+})
+
+BlockSection:Toggle({
+    Title = 'turn to face them',
+    Flag = 'block2_face',
+    Default = true,
+    Callback = function(state) BlockConfig.Face = state end,
+})
+
+BlockSection:Toggle({
+    Title = 'only when they are going for me',
+    Flag = 'block2_onlyme',
+    Default = true,
+    Callback = function(state) BlockConfig.OnlyMe = state end,
+})
+
+BlockSection:Toggle({
+    Title = 'block projectiles',
+    Flag = 'block2_projectiles',
+    Default = true,
+    Callback = function(state) BlockConfig.Projectiles = state end,
 })
 
 BlockSection:Slider({
-    Title = 'hold',
-    Flag = 'block_hold',
-    Min = 0.1,
-    Max = 2,
-    Increment = 0.05,
-    Rounding = 2,
-    Default = 0.45,
-    Suffix = 's',
-    Callback = function(v) BlockConfig.Hold = v end,
-})
-
-BlockSection:Slider({
-    Title = 'look ahead',
-    Flag = 'block_lookahead',
-    Min = 0.1,
-    Max = 2,
-    Increment = 0.05,
-    Rounding = 2,
-    Default = 0.9,
-    Suffix = 's',
-    Callback = function(v) BlockConfig.LookAhead = v end,
-})
-
-BlockSection:Slider({
-    Title = 'hold through',
-    Flag = 'block_sustain',
-    Min = 0.2,
-    Max = 3,
-    Increment = 0.05,
-    Rounding = 2,
-    Default = 1.2,
-    Suffix = 's',
-    Callback = function(v) BlockConfig.Sustain = v end,
-})
-
-BlockSection:Slider({
-    Title = 'range (until reach is learned)',
-    Flag = 'block_range',
-    Min = 10,
-    Max = 200,
-    Increment = 5,
-    Default = 70,
+    Title = 'range (grows with learned reach)',
+    Flag = 'block2_range',
+    Min = 8,
+    Max = 120,
+    Increment = 1,
+    Default = 30,
     Suffix = 'st',
     Callback = function(v) BlockConfig.Range = v end,
 })
 
 BlockSection:Slider({
-    Title = 'aim cone',
-    Flag = 'block_aimcone',
-    Min = 15,
-    Max = 180,
-    Increment = 5,
-    Default = 55,
-    Suffix = ' deg',
-    Callback = function(v) BlockConfig.AimCone = v end,
+    Title = 'guard up this early',
+    Flag = 'block2_lookahead',
+    Min = 0.1,
+    Max = 1.5,
+    Increment = 0.05,
+    Rounding = 2,
+    Default = 0.6,
+    Suffix = 's',
+    Callback = function(v) BlockConfig.LookAhead = v end,
 })
 
 BlockSection:Slider({
-    Title = 'wide cone under',
-    Flag = 'block_aimfrom',
-    Min = 0,
-    Max = 60,
-    Increment = 5,
-    Default = 25,
-    Suffix = 'st',
-    Callback = function(v) BlockConfig.AimFrom = v end,
+    Title = 'hold after the last hit',
+    Flag = 'block2_release',
+    Min = 0.05,
+    Max = 1.5,
+    Increment = 0.05,
+    Rounding = 2,
+    Default = 0.3,
+    Suffix = 's',
+    Callback = function(v) BlockConfig.Release = v end,
 })
 
-BlockSection:Slider({
-    Title = 'close aim cone',
-    Flag = 'block_aimconenear',
-    Min = 30,
-    Max = 180,
-    Increment = 5,
-    Default = 110,
-    Suffix = ' deg',
-    Callback = function(v) BlockConfig.AimConeNear = v end,
+BlockSection:Toggle({
+    Title = 'not while I am attacking',
+    Flag = 'block2_notattacking',
+    Default = false,
+    Callback = function(state) BlockConfig.NotAttacking = state end,
 })
 
 BlockSection:Toggle({
     Title = 'skip moves that beat blocks',
-    Flag = 'block_skipunblockable',
+    Flag = 'block2_skipunblockable',
     Default = true,
     Callback = function(state) BlockConfig.SkipUnblockable = state end,
 })
 
 BlockSection:Toggle({
+    Title = 'dash away from those instead',
+    Flag = 'block2_dodge',
+    Default = false,
+    Callback = function(state) BlockConfig.DodgeUnblockable = state end,
+})
+
+BlockSection:Toggle({
     Title = 'act on unmeasured moves',
-    Flag = 'block_unmeasured',
+    Flag = 'block2_unmeasured',
     Default = true,
     Callback = function(state) BlockConfig.UseUnmeasured = state end,
 })
 
 BlockSection:Slider({
     Title = 'assumed lead (unmeasured)',
-    Flag = 'block_assume',
-    Min = 0.05,
+    Flag = 'block2_assume',
+    Min = 0.1,
     Max = 1,
     Increment = 0.05,
     Rounding = 2,
@@ -3015,6 +3188,7 @@ BlockSection:Slider({
 
 local BlockStatus = BlockSection:Stat({ Title = 'status', Value = 'idle' })
 local BlockCount = BlockSection:Stat({ Title = 'blocked / skipped', Value = '0 / 0' })
+BlockConfig.UsingStat = BlockSection:Stat({ Title = 'pressing with', Value = '-' })
 
 local OutcomeSection = CounterTab:CreateSection('what actually worked')
 
@@ -3076,23 +3250,28 @@ CounterNotes:Paragraph({
 })
 
 CounterNotes:Paragraph({
-    Title = 'what it gates on instead',
-    Content = 'Manji gates on timing: it only goes out when the hit is due inside the counter window, so it is not spent on something landing after the counter expires. Block deliberately does not - attacks come in chains, and a guard that goes up late for the first hit still stops the next three, so missing a window is no reason to stand there unguarded. It gates on the attack being inside your facing cone instead, because a block facing the wrong way gets broken anyway and one that snaps to a hit from behind is the obvious tell.',
+    Title = 'what counts as an attack',
+    Content = 'A basic swing always does, and so does anything that has stunned somebody or landed on a guard anywhere on the server. A move nobody has seen yet counts too, until it has gone off beside people eight times without ever hurting anyone - that is how dashes, sprints and auras stop setting it off without anybody having to list them.',
 })
 
 CounterNotes:Paragraph({
-    Title = 'ranged attacks',
-    Content = 'Reach is measured, not set. Every sample records how far away the attacker was, and a move\'s reach is the second furthest it has connected from over its last two dozen samples - second, not furthest, so one mis-blamed sample cannot decide it. Until a move has four samples the slider stands in, and it is set short on purpose: assume melee and let evidence extend it, never the other way round.',
+    Title = 'who they are going for',
+    Content = 'You have to be inside the move\'s reach, and a learned reach only ever stretches the slider, never shrinks it - it used to replace it, so an M1 that had learned six studs was ignored from eight. Someone already running at you counts as closer by the ground they will cover before it lands, which is what a lunge is. They must not be facing away from you, and if somebody else is standing more squarely in front of them, that is who it is for.',
 })
 
 CounterNotes:Paragraph({
-    Title = 'facing',
-    Content = 'The attacker always has to be pointed roughly this way - the cone just widens up close, where a swing can still turn into you, and tightens at range where it cannot. Somebody with their back to you fails at any distance.',
+    Title = 'timing and ping',
+    Content = 'What matters is the guard or the counter being up on the server when the hit arrives there, so the whole round trip is taken off. The block goes up once a hit is inside that plus the look-ahead and holds until nothing has been due for the hold time, so a chain meets one guard. The kick goes out once the hit is due inside the counter window from when the kick will arrive, and a hit already closer than that is left to the block rather than wasting the kick.',
+})
+
+CounterNotes:Paragraph({
+    Title = 'checked, not assumed',
+    Content = 'A block counts once the server puts Block on you, a kick once its own startup comes back. On Auto, a way of pressing that twice produces nothing is swapped for the next - the game controller, the key itself, then the remote - and the one that works is shown under each. If both are on, the kick drops your guard to go out and the block stays down while the counter is up.',
 })
 
 CounterNotes:Paragraph({
     Title = 'untested',
-    Content = 'None of this has been run in-game yet. The remotes and attributes are read straight from the dump, but the reaction and window defaults are starting points, not measurements.',
+    Content = 'None of this has been run in-game yet. The remotes and attributes come from the dump, and the defaults are starting points, not measurements - but everything that could quietly fail now says so on the status line and in the feed.',
 })
 
 --// Dash ---------------------------------------------------------------------
@@ -3209,6 +3388,12 @@ statusSink = function()
     ManjiCount:Set(ManjiConfig.Attempts .. ' / ' .. ManjiConfig.Skipped)
     BlockStatus:Set(BlockConfig.Last)
     BlockCount:Set(BlockConfig.Attempts .. ' / ' .. BlockConfig.Skipped)
+    local function using(cfg, state, list)
+        local method = Counter.method(cfg, state, list)
+        return cfg.Method == 'Auto' and ('auto: ' .. method) or method
+    end
+    ManjiConfig.UsingStat:Set(using(ManjiConfig, Counter.manji, Counter.Methods.Manji))
+    BlockConfig.UsingStat:Set(using(BlockConfig, Counter.block, Counter.Methods.Block))
 end
 
 task.spawn(function()
@@ -3221,7 +3406,7 @@ task.spawn(function()
         SEvade:Set(evadeMeter(mine))
         SBurst:Set(canBurst(mine) and 'ready' or 'spent')
 
-        local move = manjiMove()
+        local move = mine and Counter.manjiMove(mine)
         if not move then
             SManji:Set('not equipped')
         else
