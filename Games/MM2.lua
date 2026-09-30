@@ -226,169 +226,6 @@ local Window = Onyx:CreateWindow({
     Accent = Color3.fromRGB(210, 45, 45),
 })
 
-do
-    local InfoTab = Window:CreateTab({ Title = 'info' })
-
-    local InfoSilentAimSection = InfoTab:CreateSection('silent aim')
-    InfoSilentAimSection:Paragraph({
-        Title = 'silent aim',
-        Content = 'gun redirects to whoever the gun targets dropdown allows, knife to whoever the knife one allows. your click, animation and the real origin stay as fired',
-    })
-    InfoSilentAimSection:Paragraph({
-        Title = 'no sliders',
-        Content = 'there is not a single number to dial in on the silent aim side any more. every setting is a dropdown, and each option carries a whole set of tuned values behind it - the filter constants, how many times the lead re-solves, how much of your ping counts, how far the search reaches. picking a name picks all of it at once. the trigger bot reaction time is the one slider, since that one really is just a number',
-    })
-    InfoSilentAimSection:Paragraph({
-        Title = 'prediction maths',
-        Content = 'which solver works out where they will be. off aims where they are right now. linear walks their current speed forward in a straight line. projected does the same but lets their acceleration change the speed along the way. arc bends the path by a smoothed turn rate that fades out over the lead. circle fits an actual circle through the path they just walked and trusts it for the whole lead. adaptive is the default and picks between the other four per person, per second',
-    })
-    InfoSilentAimSection:Paragraph({
-        Title = 'how adaptive decides',
-        Content = 'every target carries a short buffer of their own past motion. about a dozen times a second it takes a snapshot from roughly a fifth of a second ago, replays all four solvers forward from exactly what was known back then, and measures each one against where that person actually got to. the running average of those errors is the score, and the lowest score wins. it is measured against real movement, not guessed, and a challenger only takes over once it is clearly ahead so the pick does not flicker',
-    })
-    InfoSilentAimSection:Paragraph({
-        Title = 'motion filter',
-        Content = 'how hard the raw velocity, turn and acceleration readings are filtered before any solver sees them, and how many times the distance dependent part of the lead re-solves against where that lead itself would put them. raw reacts instantly and jitters, locked settles on a very steady number and is slow to notice a sudden turn, balanced sits in the middle. this shapes the reading only - nothing here is fitted from your shots',
-    })
-    InfoSilentAimSection:Paragraph({
-        Title = 'aim part',
-        Content = 'the gun one shots anywhere on the body, so body is not a compromise - it is the same kill with a wider target. the server checks the shot by casting from your gun to the point sent, so how far the prediction can be off before missing is just the width of what you aimed at: about a stud either side of the torso against about half that on the head. auto takes the head only when the shot is easy anyway - close, not sprinting, not mid jump - and drops to body the moment any of that stops being true',
-    })
-    InfoSilentAimSection:Paragraph({
-        Title = 'wall check',
-        Content = 'strict needs a clear line from the real muzzle to both where they are and the point the lead solved for. loose only asks that they are not behind a wall right now, which redirects more often at the cost of the occasional shot into cover. off never raycasts at all',
-    })
-    InfoSilentAimSection:Paragraph({
-        Title = 'gun targets / knife targets',
-        Content = 'who each weapon is allowed to redirect onto. the gun defaults to the murderer alone, the knife to anyone. murderer + armed also lets the gun take a hero or sheriff holding one, and everyone but the murderer keeps the knife off them if you are not the one holding it',
-    })
-    InfoSilentAimSection:Paragraph({
-        Title = 'priority',
-        Content = 'how the allowed targets get ranked once more than one qualifies. crosshair takes whoever is nearest to where you are pointing, closest takes whoever is nearest to you in the world, weakest takes the lowest health, armed first puts anyone holding a weapon ahead of everyone else and falls back to the crosshair between them',
-    })
-    InfoSilentAimSection:Paragraph({
-        Title = 'range',
-        Content = 'how far the search reaches. no limit turns the cap off entirely and lets anything loaded be a target',
-    })
-    InfoSilentAimSection:Paragraph({
-        Title = 'fov',
-        Content = 'off means the whole screen is fair game - anything visible can be targeted. any other option restricts it to that radius in pixels around the anchor below',
-    })
-    InfoSilentAimSection:Paragraph({
-        Title = 'fov anchor',
-        Content = 'whether that radius is measured from your mouse or from the middle of the screen',
-    })
-    InfoSilentAimSection:Paragraph({
-        Title = 'search',
-        Content = 'anywhere also allows targets that are off screen entirely, including behind you, ranked by angle from where the camera points. on screen targets always take priority either way',
-    })
-    InfoSilentAimSection:Paragraph({
-        Title = 'air handling',
-        Content = 'the vertical aim point is always solved the same safe way - it never overshoots above where they are now by more than a couple of studs, and it never undershoots the ground. this only changes where on their body it aims while they are in the air. safe aims near their feet and also drops a head pick to the torso for repeat jumpers, feet does the first without the second, normal keeps aiming at the usual point mid jump, and off stops solving the jump arc at all',
-    })
-    InfoSilentAimSection:Paragraph({
-        Title = 'ping',
-        Content = 'how much of your round trip counts toward the lead. the shot has to reach the server and the target you are looking at was already a trip old when it reached you, so the whole round trip belongs in the lead, not half of it. it is read from the game network stats - the same data ping the performance overlay shows - with the per player ping doubled as a floor, since that one only reads about half the trip. ignore contributes nothing, full + margin overshoots slightly for a connection that spikes',
-    })
-    InfoSilentAimSection:Paragraph({
-        Title = 'replication buffer',
-        Content = 'roblox draws every other player a little behind even the newest position it has for them, so their movement looks smooth instead of stepping from packet to packet. that delay is real lead the shot has to cover, but the game does not expose it, so this is a setting rather than a reading. normal is about a tenth of a second, which is typical. if shots still land behind people who are running straight, go up one; if they land in front, go down one. a target whose updates are visibly arriving in steps is measured and covered on top of this automatically',
-    })
-    InfoSilentAimSection:Paragraph({
-        Title = 'shots redirected',
-        Content = 'how many of your shots get redirected at all. the rest fire exactly where you aimed, untouched. a shot the trigger bot fires is always redirected',
-    })
-    InfoSilentAimSection:Paragraph({
-        Title = 'gun lead / knife lead',
-        Content = 'a flat amount added on top of ping, the replication buffer, frame time and, for the knife, its real flight time. lead options aim further ahead of the target, back options aim behind them - use those if shots keep landing in front, since they walk the point back toward where the target already was',
-    })
-    InfoSilentAimSection:Paragraph({
-        Title = 'auto lead',
-        Content = 'the auto option on either lead dropdown tries a slightly shorter or longer lead than usual on a random real shot now and then, and nudges a multiplier toward whichever length is actually landing more - measured from the target really taking damage, not from any raycast guess. only shots that were really fired and redirected count, a run of shots where nothing landed at any length is thrown away rather than read as a direction, and the multiplier stays between 0.6x and 2x. it is a slow fine tune on top of the lead model, not the thing that makes the lead right',
-    })
-    InfoSilentAimSection:Paragraph({
-        Title = 'lead time readout',
-        Content = 'the lead line under prediction maths shows exactly what the last solve used - round trip, buffer, frame, flight, the lead profile and the auto multiplier - so if something is off you can see which part',
-    })
-
-    local InfoTriggerSection = InfoTab:CreateSection('trigger bot')
-    InfoTriggerSection:Paragraph({
-        Title = 'trigger bot',
-        Content = 'fires for you once a target has been in view for your reaction time. it only ever uses a weapon that is already in your hands - it never equips anything. the gun one fires through the gun itself where it can, so its own cooldown, animation and sound all happen as normal, and silent aim redirects the shot like any other',
-    })
-    InfoTriggerSection:Paragraph({
-        Title = 'reaction time',
-        Content = 'runs twice, in order: once from the moment the weapon comes out, and again from the moment a target is first seen after that. so pulling the gun on someone already standing in front of you takes two reactions, like it would for a person. losing sight of someone for a split second does not restart it, losing them properly does. reaction variance spreads each one randomly either side of the slider so no two are identical',
-    })
-    InfoTriggerSection:Paragraph({
-        Title = 'sees a target when',
-        Content = 'visible is any target silent aim would take that the weapon has a clear line to. near crosshair also needs them close to your mouse, on crosshair needs your mouse actually over them. with silent aim off, the gun fired through its own script shoots where you point, so the gun trigger bot falls back to on crosshair by itself then - otherwise it would fire at someone it cannot hit',
-    })
-    InfoTriggerSection:Paragraph({
-        Title = 'gun safety',
-        Content = 'shooting an innocent as sheriff gets you killed, so the gun trigger bot only fires at the murderer unless you switch it to follow the silent aim gun targets',
-    })
-    InfoTriggerSection:Paragraph({
-        Title = 'fire method',
-        Content = 'activate clicks the gun through its own script. remote sends the gun shot straight at the solved point, which works even if the game does not listen for a tool click. auto starts with activate and switches to remote for good if a few attempts in a row never produce a shot at the hook',
-    })
-    InfoTriggerSection:Paragraph({
-        Title = 'throw trigger bot',
-        Content = 'same reaction rules for the knife. a throw is always sent at the solved point, so it leads the target by the knife real flight time whether silent aim is on or not. throw range keeps it from throwing at someone far enough away to simply walk out of the way',
-    })
-
-    local InfoProofSection = InfoTab:CreateSection('proof')
-    InfoProofSection:Paragraph({
-        Title = 'proof mode',
-        Content = 'counts and logs every shot the hook sees. if shots seen stays on zero the hook is not firing at all, if seen climbs while redirected stays on zero it is finding no target, and if redirected climbs it is redirecting - the log then shows by how far',
-    })
-    InfoProofSection:Paragraph({
-        Title = 'world markers',
-        Content = 'red ball where the shot was actually sent, green ball where the target really was when it should have arrived. if the two sit on top of each other the prediction was right. both are set to be ignored by raycasts so they cannot affect your own aim or the hit check',
-    })
-
-    local InfoVisualSection = InfoTab:CreateSection('visual')
-    InfoVisualSection:Paragraph({
-        Title = 'esp',
-        Content = 'highlights every other living player',
-    })
-    InfoVisualSection:Paragraph({
-        Title = 'color by role',
-        Content = 'colors the highlight by current role instead of a flat white',
-    })
-    InfoVisualSection:Paragraph({
-        Title = 'gun esp',
-        Content = 'highlights anyone actually holding a gun right now, in a color of its own that role esp never uses. checked directly off the weapon they are holding rather than guessed from round data, so it still catches a hero even when role detection gets that wrong. works even with esp and role esp both off',
-    })
-    InfoVisualSection:Paragraph({
-        Title = 'role esp',
-        Content = 'shows role above the head while alive and in the round, never on you. a dropped gun being picked up reads as hero the moment it is equipped',
-    })
-    InfoVisualSection:Paragraph({
-        Title = 'xray',
-        Content = 'fades opaque parts in range, leaves anything already see-through alone',
-    })
-    InfoVisualSection:Paragraph({
-        Title = 'trap esp',
-        Content = 'a placed trap is invisible until it catches someone, so this looks for it directly instead of waiting for that. matches the part the trap actually uses for its position and the marker object it carries naming who placed it, then puts a highlight and a solid marker ball on it - the marker so it still shows even if the trap part itself has no visible shape of its own',
-    })
-    InfoVisualSection:Paragraph({
-        Title = 'dropped gun esp',
-        Content = 'when a sheriff or hero dies holding the gun, it lands somewhere in the world rather than vanishing. this looks for exactly the same tool the gun is identified by everywhere else in this script - by name, its own marker child, or its tag - lying anywhere that is not inside a character, and puts a highlight and a marker ball on it. stops tracking it the moment someone actually picks it back up',
-    })
-
-    local InfoItemsSection = InfoTab:CreateSection('items')
-    InfoItemsSection:Paragraph({
-        Title = 'spam equip/unequip',
-        Content = 'repeatedly equips then unequips the saved item using the delays below. re-finds the item by name in your character and backpack each cycle, so it keeps working even if the item leaves your inventory and comes back',
-    })
-    InfoItemsSection:Paragraph({
-        Title = 'floating spam button',
-        Content = 'a small button on screen, separate from this menu, that starts and stops spam equip - drag it anywhere, click it to toggle. stays in sync with the spam equip/unequip toggle above either way',
-    })
-
-end
-
 local CoinsStat, GemsStat, PrestigeStat, LevelStat, XPBar, WeaponsStat, PetsStat, MaterialsStat
 do
     local ProfileTab = Window:CreateTab({ Title = 'profile' })
@@ -440,114 +277,10 @@ task.spawn(function()
     end
 end)
 
--- there is not a slider left in this tab. every control is a dropdown, and an
--- option is a name standing in for the whole set of numbers behind it, so
--- picking one picks the filtering, the passes, the reach and the lead together
-local Choice = {
-    Part   = { default = 'Auto',   order = { 'Auto', 'Body', 'Head' } },
-    Wall   = { default = 'Strict', order = { 'Strict', 'Loose', 'Off' } },
-    Math   = { default = 'Adaptive', order = { 'Adaptive', 'Circle', 'Arc', 'Projected', 'Linear', 'Off' } },
-    Air    = { default = 'Safe',   order = { 'Safe', 'Feet', 'Normal', 'Off' } },
-    Anchor = { default = 'Mouse',  order = { 'Mouse', 'Screen centre' } },
-    Search = { default = 'On screen', order = { 'On screen', 'Anywhere' } },
-
-    Priority     = { default = 'Crosshair',     order = { 'Crosshair', 'Closest', 'Weakest', 'Armed first' } },
-    GunTargets   = { default = 'Murderer only', order = { 'Murderer only', 'Murderer + armed', 'Anyone' } },
-    KnifeTargets = { default = 'Anyone',        order = { 'Anyone', 'Armed only', 'Everyone but the murderer' } },
-
-    Range = {
-        default = 'Long',
-        order = { 'Close', 'Medium', 'Long', 'Max', 'No limit' },
-        value = {
-            ['Close']    = 100,
-            ['Medium']   = 175,
-            ['Long']     = 250,
-            ['Max']      = 300,
-            ['No limit'] = math.huge,
-        },
-    },
-
-    Fov = {
-        default = 'Off',
-        order = { 'Off', 'Tight', 'Normal', 'Wide', 'Huge' },
-        value = {
-            ['Off']    = math.huge,
-            ['Tight']  = 90,
-            ['Normal'] = 200,
-            ['Wide']   = 350,
-            ['Huge']   = 500,
-        },
-    },
-
-    Ping = {
-        default = 'Full',
-        order = { 'Ignore', 'Half', 'Full', 'Full + margin' },
-        value = {
-            ['Ignore']        = 0,
-            ['Half']          = 0.5,
-            ['Full']          = 1,
-            ['Full + margin'] = 1.25,
-        },
-    },
-
-    -- seconds other players are drawn behind the newest state the client has
-    -- for them. the engine interpolates remote characters through a buffer it
-    -- never exposes, so this is a setting rather than a reading
-    Buffer = {
-        default = 'Normal',
-        order = { 'None', 'Low', 'Normal', 'High', 'Very high' },
-        value = {
-            ['None']      = 0,
-            ['Low']       = 0.05,
-            ['Normal']    = 0.1,
-            ['High']      = 0.15,
-            ['Very high'] = 0.2,
-        },
-    },
-
-    Shots = {
-        default = 'Every shot',
-        order = { 'Every shot', 'Most (75%)', 'Half', 'Some (25%)' },
-        value = {
-            ['Every shot'] = 100,
-            ['Most (75%)'] = 75,
-            ['Half']       = 50,
-            ['Some (25%)'] = 25,
-        },
-    },
-
-    -- smooth is the share of the raw reading folded in on each sample, so a
-    -- high number reacts at once and a low one settles slowly. passes is how
-    -- many times the distance dependent lead re-solves against its own answer
-    Filter = {
-        default = 'Balanced',
-        order = { 'Raw', 'Light', 'Balanced', 'Heavy', 'Locked' },
-        value = {
-            ['Raw']      = { smooth = 0.95, vertical = 0.90, turn = 0.60, accel = 0.70, passes = 1, trust = 0.45 },
-            ['Light']    = { smooth = 0.70, vertical = 0.80, turn = 0.50, accel = 0.55, passes = 2, trust = 0.55 },
-            ['Balanced'] = { smooth = 0.50, vertical = 0.65, turn = 0.35, accel = 0.40, passes = 2, trust = 0.70 },
-            ['Heavy']    = { smooth = 0.32, vertical = 0.50, turn = 0.25, accel = 0.30, passes = 3, trust = 0.80 },
-            ['Locked']   = { smooth = 0.18, vertical = 0.40, turn = 0.15, accel = 0.20, passes = 3, trust = 0.90 },
-        },
-    },
-
-    Lead = {
-        default = 'Auto',
-        order = { 'Auto', 'Pull back', 'Slight back', 'Neutral', 'Slight lead', 'More lead', 'Heavy lead' },
-        value = {
-            ['Auto']        = { extra = 0,   auto = true  },
-            ['Pull back']   = { extra = -60, auto = false },
-            ['Slight back'] = { extra = -25, auto = false },
-            ['Neutral']     = { extra = 0,   auto = false },
-            ['Slight lead'] = { extra = 25,  auto = false },
-            ['More lead']   = { extra = 60,  auto = false },
-            ['Heavy lead']  = { extra = 120, auto = false },
-        },
-    },
-}
-
 -- a config saved by an older build holds a number or a boolean where one of
 -- these names now belongs, so anything not on the list falls back to the default
+local Choice = {}
+
 function Choice.pick(set, value)
     for _, name in ipairs(set.order) do
         if name == value then return name end
@@ -558,6 +291,9 @@ end
 function Choice.valueOf(set, value)
     return set.value[Choice.pick(set, value)]
 end
+
+-- the one dropdown silent aim v2 has
+Choice.Targets = { default = 'Enemies', order = { 'Enemies', 'Anyone' } }
 
 -- fling. a flung player is one whose own client resolved a contact against a
 -- part of yours that your client reported moving absurdly fast; every method
@@ -639,73 +375,6 @@ Choice.Fling = {
     },
 }
 
--- the advanced tab's own option sets, kept on Choice so they resolve through
--- the same pick/valueOf guard as everything else
-Choice.Adv = {
-    Solver = {
-        default = 'Ensemble',
-        order = { 'Ensemble', 'Best single', 'Top two', 'Fixed circle', 'Fixed arc' },
-    },
-
-    -- how an ensemble turns four running error scores into four weights
-    -- sharper weightings collapse toward simply picking the winner, which is
-    -- what you want when one model is clearly right; the soft ones only pay
-    -- off when two models are genuinely within noise of each other
-    Weighting = {
-        default = 'Inverse square',
-        order = { 'Equal', 'Inverse error', 'Softmax', 'Inverse square', 'Inverse fourth' },
-    },
-
-    -- how much of the running signed residual gets subtracted back out
-    Bias = {
-        default = 'Normal',
-        order = { 'Off', 'Light', 'Normal', 'Aggressive', 'Full' },
-        value = { ['Off'] = 0, ['Light'] = 0.3, ['Normal'] = 0.6, ['Aggressive'] = 0.85, ['Full'] = 1 },
-    },
-
-    -- how close two passes must land before the lead solve calls it settled
-    Converge = {
-        default = 'Tight',
-        order = { 'Fixed', 'Loose', 'Tight', 'Exhaustive' },
-        value = { ['Fixed'] = nil, ['Loose'] = 0.25, ['Tight'] = 0.05, ['Exhaustive'] = 0.01 },
-    },
-
-    -- how many samples of their motion the backtest gets to replay over
-    Depth = {
-        default = 'Long',
-        order = { 'Short', 'Normal', 'Long', 'Maximum' },
-        value = {
-            ['Short']   = { limit = 16, window = 0.4 },
-            ['Normal']  = { limit = 28, window = 0.7 },
-            ['Long']    = { limit = 40, window = 0.9 },
-            ['Maximum'] = { limit = 64, window = 1.4 },
-        },
-    },
-
-    -- the lead length the models are scored at. weapon match tracks the real
-    -- travel time, so the scoring horizon follows the shot it is scoring for
-    Horizon = {
-        default = 'Weapon match',
-        order = { 'Snap', 'Short', 'Weapon match', 'Long', 'Very long' },
-        value = { ['Snap'] = 0.1, ['Short'] = 0.15, ['Weapon match'] = -1, ['Long'] = 0.3, ['Very long'] = 0.45 },
-    },
-
-    -- how fast a scoring round moves a model's running error
-    Reaction = {
-        default = 'Normal',
-        order = { 'Instant', 'Fast', 'Normal', 'Slow', 'Glacial' },
-        value = { ['Instant'] = 0.8, ['Fast'] = 0.45, ['Normal'] = 0.25, ['Slow'] = 0.12, ['Glacial'] = 0.05 },
-    },
-
-    -- a model scoring worse than this multiple of the best is dropped from the
-    -- blend entirely rather than dragging the average toward its own answer
-    Guard = {
-        default = 'Normal',
-        order = { 'Off', 'Light', 'Normal', 'Strict' },
-        value = { ['Off'] = math.huge, ['Light'] = 6, ['Normal'] = 3, ['Strict'] = 1.8 },
-    },
-}
-
 -- the trigger bot tab. reaction time itself is the one slider in it; the rest
 -- follow the same dropdown convention as everywhere else
 Choice.Trigger = {
@@ -735,11 +404,6 @@ Choice.Trigger = {
         order = { 'Auto', 'Activate', 'Remote' },
     },
 
-    GunTargets = {
-        default = 'Murderer only',
-        order = { 'Murderer only', 'Silent aim targets' },
-    },
-
     -- studs; a throw at someone further than this has time to be walked out of
     ThrowRange = {
         default = 'Medium',
@@ -748,30 +412,15 @@ Choice.Trigger = {
     },
 }
 
+-- silent aim v2. Four settings; the rest it works out on its own.
 local Aim = {
     Enabled = false,
-
-    GunTargets = Choice.GunTargets.default,
-    KnifeTargets = Choice.KnifeTargets.default,
-    Priority = Choice.Priority.default,
-    AimPart = Choice.Part.default,
-
-    WallCheck = Choice.Wall.default,
-    MaxRange = Choice.valueOf(Choice.Range),
-    FOVRadius = Choice.valueOf(Choice.Fov),
-    FOVAnchor = Choice.Anchor.default,
-    OffScreen = false,
-
-    Math = Choice.Math.default,
-    Filter = Choice.Filter.default,
-    Air = Choice.Air.default,
-    PingScale = Choice.valueOf(Choice.Ping),
-    Buffer = Choice.valueOf(Choice.Buffer),
-    ShotChance = Choice.valueOf(Choice.Shots),
+    Targets = Choice.Targets.default,
+    WallCheck = true,
+    Fov = 0,        -- degrees either side of where you shot; 0 takes anyone on screen
+    Trim = 0,       -- ms added to the lead on top of what it has learned
+    Learn = true,   -- learn the real delay from shots that really landed
 }
-
-local GunTune = { Extra = 0, Auto = Choice.Lead.value[Choice.Lead.default].auto }
-local KnifeTune = { Extra = 0, Speed = 96, Auto = Choice.Lead.value[Choice.Lead.default].auto }
 
 -- global on purpose: cold enough that a hash lookup costs nothing, and
 -- reachable from a console without going through the MM2 table below
@@ -780,92 +429,8 @@ Debug = {
     Markers = true,
 }
 
-local Adapt = {
-    -- velocity rides the speed the game itself replicates for them, which
-    -- turns the instant they do; center is the middle of where they have been
-    -- lately, which is where someone spamming left and right keeps coming back
-    -- to. the backtest scores them like the rest, so each only earns weight
-    -- on the people it actually predicts
-    Models = { 'Circle', 'Arc', 'Projected', 'Linear', 'Velocity', 'Center' },
-    CenterWindow = 0.6, -- seconds of their path the center is taken over
-    PeakFade = 0.93,    -- share of the worst recent miss kept each scoring round
-    ChangeWindow = 4,   -- seconds of starts, stops and turns counted toward how often they change
-    MinAge = 0.1,    -- youngest snapshot worth replaying against
-    MaxAge = 0.5,    -- older than this and the replay says nothing useful
-    Target = 0.2,    -- and the age it aims for, near a real shot's lead
-    Rate = 0.08,     -- seconds between scoring rounds
-    Blend = 0.25,    -- how fast a round moves a model's running error
-    Samples = 6,     -- rounds before the pick is trusted over the default
-    Margin = 0.12,   -- share of the held error a challenger must beat it by
-    Floor = 0.01,    -- and a studs floor, so near-identical models do not swap
-    Fit = 14,        -- newest samples the circle is fitted through
-    HeadRange = 60,  -- past this, auto aim part drops the head
-    HeadSpeed = 10,  -- and past this speed too
-
-    Epsilon = 0.05,  -- keeps an inverse-error weight finite at zero error
-    MaxPasses = 12,  -- ceiling on the converging lead solve
-    Temp = 0.25,     -- softmax temperature, as a share of the best error
-    MinHeading = 0.5, -- speed below which there is no heading to resolve bias in
-
-    -- what the last lead solve was made of, overwritten in place rather than
-    -- rebuilt so the per-frame solve does not allocate. the readout shows it
-    lead = { rtt = 0, buffer = 0, frame = 0, flight = 0, extra = 0, mult = 1, total = 0 },
-    leadStats = {},
-
-    -- reused by every blend so a solve does not build a fresh table per pass
-    scratch = {},
-
-    -- perfection. benched over eight kinds of movement, the solve that lands
-    -- most is the single best model by a slow running score with a light
-    -- share of its drift taken back out - and the one setting worth choosing
-    -- per player is that share, which is the part that depends on how they
-    -- move: someone spamming a and d wants more of it back, someone running
-    -- straight wants none. so every scoring round replays each share from the
-    -- same snapshot, and each player is shot with whichever has landed on
-    -- them most often. the rest was benched per player too and gained nothing
-    -- over one setting for everyone, so it is not chosen per player
-    TuneShares = { 0, 0.3, 0.6, 0.85 }, -- off, light, normal, aggressive
-    TuneDefault = 2,   -- light, until a player's own pick is trusted
-    TuneRate = 0.05,   -- how fast a round moves perfection's model scores and drift (glacial)
-    TuneHit = 1,       -- studs a replayed shot may miss by and still count as landing
-    TuneScore = 0.04,  -- how fast a round moves each share's running miss rate
-    TuneRounds = 12,   -- rounds before a player's own pick replaces the default
-    TuneMargin = 0.05, -- share of the held miss rate a challenger must beat it by
-    disp = {},         -- each model's step for the snapshot being scored
-}
-
--- the advanced tab. when Enabled, these take over from the normal silent aim
--- tab for everything about how the shot is solved. what still comes from that
--- tab is listed in Advanced.Passthrough below - the target side of things,
--- which advanced has no better answer for
-local Advanced = {
-    Enabled = false,
-    Perfection = false,
-
-    Solver = 'Ensemble',
-    -- the dropdowns only fire on a change, never at startup, so every field
-    -- here has to start on exactly what its dropdown shows
-    Weighting = Choice.Adv.Weighting.default,
-    Bias = 'Normal',
-    Converge = 'Tight',
-
-    Depth = 'Long',
-    Horizon = 'Weapon match',
-    Reaction = 'Normal',
-    Guard = 'Normal',
-    Smoothing = 'Balanced',
-    Part = 'Auto',
-    Air = 'Safe',
-    Ping = 'Full',
-    Buffer = 'Normal',
-    Lead = 'Auto',
-
-    Passthrough = 'range, gun and knife targets, priority, wall check, fov and search',
-    ui = {},
-}
-
--- global on purpose, like Fling and AutoGun: this chunk is at its local limit,
--- and it is only read a handful of times a frame, where a hash lookup is free
+-- global on purpose, like Fling and AutoGun: it is only read a handful of
+-- times a frame, where a hash lookup is free
 Trigger = {
     Gun = false,
     Throw = false,
@@ -874,15 +439,11 @@ Trigger = {
     Sees = Choice.Trigger.Sees.default,
     Interval = Choice.Trigger.Interval.default,
     Method = Choice.Trigger.Method.default,
-    GunTargets = Choice.Trigger.GunTargets.default,
     ThrowRange = Choice.Trigger.ThrowRange.default,
 
-    -- sure shots only: fire only once the shot would land within this many
-    -- studs of the body (or the head) with at least these odds of them not
-    -- changing what they are doing before it does
+    -- sure shots only: fire only once the predicted chance of the shot
+    -- landing is at least this
     Sure = false,
-    SureBody = 1,
-    SureHead = 0.5,
     SureOdds = 0.9,
 
     -- how long a target may drop out of sight before it counts as lost, and
@@ -905,7 +466,6 @@ Trigger = {
     pendingAt = 0,
     misfires = 0,
     fallback = false,
-    forceUntil = 0,
     hooked = false,
     shots = 0,
     throws = 0,
@@ -916,58 +476,11 @@ local cachedPing = 0.12
 local cachedFrame = 1 / 60
 local lastTick = 0
 
-local shotStats = { seen = 0, redirected = 0, suppressed = 0, proved = 0, error = 0 }
+local shotStats = { seen = 0, redirected = 0, suppressed = 0, proved = 0, error = 0, hits = 0, resolved = 0 }
 local shotEvents = {}
-local lastModelUsed = '-'
 
-local MAX_TRAVEL_TIME = 5
-local MAX_LEAD_OFFSET = 50
-local MAX_VERTICAL_RISE = 2
-local MAX_VERTICAL_DROP = 12
-local MAX_PENDING = 24
-local JUMP_SPAM_WINDOW = 3
-local JUMP_SPAM_COUNT = 3
-local SAMPLE_STALE = 0.5
-local HISTORY_LIMIT = 40
-local HISTORY_WINDOW = 0.9
-local MIN_TURN_RATE = 0.05
-local MAX_TURN_RATE = 4
-local MIN_TURN_RADIUS = 2.5
-local MAX_TURN_RADIUS = 400
-local TURN_DECAY = 0.45
-local MAX_TANGENTIAL = 120
-local SPEED_CEILING = 1.6
-local ARC_STEPS = 6
 local PLAN_STALE = 0.25
 local TRANSPARENT_SKIPS = 8
-local HIT_WINDOW = 0.35
-local MAX_CANDIDATES = 5
-local PART_ORDER_HEAD = { "Head", "UpperTorso", "Torso", "HumanoidRootPart", "LowerTorso" }
-local PART_ORDER_BODY = { "HumanoidRootPart", "UpperTorso", "Torso", "LowerTorso", "Head" }
-
-local function filterSettings()
-    if Advanced.Enabled then
-        return Choice.valueOf(Choice.Filter, Advanced.Smoothing)
-    end
-    return Choice.valueOf(Choice.Filter, Aim.Filter)
-end
-
--- the scoring horizon. weapon match follows the travel time the solver last
--- actually produced, so the models are scored over the lead they are being
--- asked to cover rather than a fixed guess at it
-function Adapt.horizon()
-    if not Advanced.Enabled then return Adapt.Target end
-    local want = Choice.valueOf(Choice.Adv.Horizon, Advanced.Horizon) or Adapt.Target
-    if want and want > 0 then return want end
-    return math.clamp(Adapt.lastTravel or Adapt.Target, Adapt.MinAge, Adapt.MaxAge)
-end
-
-function Adapt.depth()
-    if not Advanced.Enabled then return HISTORY_LIMIT, HISTORY_WINDOW end
-    local set = Choice.valueOf(Choice.Adv.Depth, Advanced.Depth)
-    if not set then return HISTORY_LIMIT, HISTORY_WINDOW end
-    return set.limit, set.window
-end
 
 local visionParams = RaycastParams.new()
 visionParams.FilterType = Enum.RaycastFilterType.Exclude
@@ -999,21 +512,85 @@ local function weaponCast(origin, direction, ignore)
     return nil
 end
 
-local function clearPath(origin, target, char)
-    if Aim.WallCheck == 'Off' then return true end
-    local direction = target - origin
-    local result = weaponCast(origin, direction, { char })
-    if not result then return true end
-    return (result.Position - origin).Magnitude >= direction.Magnitude - 2
+local function gravity()
+    local ok, value = pcall(function() return Workspace.Gravity end)
+    if ok and typeof(value) == "number" and value > 0 then return value end
+    return 196.2
 end
 
-local function screenAnchor()
-    if Aim.FOVAnchor == 'Mouse' then
-        return UserInputService:GetMouseLocation()
-    end
-    local viewport = Camera.ViewportSize
-    return Vector2.new(viewport.X / 2, viewport.Y / 2)
+local function flatDistance(a, b)
+    return (Vector3.new(a.X, 0, a.Z) - Vector3.new(b.X, 0, b.Z)).Magnitude
 end
+
+local function isMurderer(plr)
+    local role, dead = roleOf(plr)
+    return role == "Murderer" and not dead
+end
+
+--// silent aim v2 --------------------------------------------------------------
+--
+-- Where to aim, worked out from how each player has really been moving.
+--
+-- Across the ground: every moment of the last few seconds of someone's own
+-- movement whose future is already known says "from a moment like that, over a
+-- lead this long, they moved like this". Each of those outcomes is turned into
+-- the frame of the way they were heading then and rotated onto the way they
+-- head now, and weighted by how recent it is and how alike the moment was: how
+-- long since they last changed direction (which separates a runner from someone
+-- strafing) and how fast they were turning (which catches circlers). The shot
+-- goes wherever the most of those outcomes land inside the body's width across
+-- the line of fire, so it bets on what that person actually does rather than on
+-- a type of player. A plain straight-line guess rides along as one heavy
+-- outcome, so with little seen yet it simply leads them.
+--
+-- Up and down: jump physics. Mid-air they follow the arc down to the floor that
+-- is really under them. Someone who keeps jumping goes straight back up after a
+-- frame or two on the floor, measured off them, and the aim height is chosen to
+-- sit inside their body whether they jump again or not. Spam jumpers are the
+-- easy case for this, not the hard one.
+--
+-- The lead is your round trip plus the delay the game adds drawing other
+-- players, and that delay is learned: after every redirected shot, once it is
+-- known whether they really went down, each possible delay is checked against
+-- where they actually went, and the ones that agree with what happened gain.
+-- Its best guess is kept between sessions.
+local SA = {
+    WINDOW = 3,             -- seconds of their past used as outcomes
+    RECENCY = 1.2,          -- seconds for an outcome's weight to fall to about a third
+    PHASE = 0.2,            -- seconds: how alike the time since their last change must be
+    PHASE_CAP = 1,          -- past this long without a change, every moment looks alike
+    MOVING = 2,             -- studs/s
+    TURN = math.cos(math.rad(40)),
+    TURN_LOOKBACK = 0.1,
+    TURN_SPAN = 0.15,
+    TURN_WIDTH = 1,         -- rad/s
+    RADIUS = 0.8,           -- studs either side of the line of fire that count as the body
+    PRIOR = 3,              -- weight of the straight-line guess
+    KEEP = 4,               -- seconds of samples kept per player
+    BODY_LOW = -2.9,        -- the body around the root: feet
+    BODY_HIGH = 2.1,        -- and the top of the head
+    SIGMA_STAY = 0.8,       -- studs of doubt in where someone who stays down will be
+    SIGMA_GO = 0.6,         -- and in where someone jumping again will be
+    MAX_LEAD = 1.5,
+
+    -- the delay learned on top of the round trip, per weapon
+    GRID_LO = -0.05,
+    GRID_HI = 0.45,
+    GRID_STEP = 0.01,
+    PRIOR_DELAY = 0.1,
+    PRIOR_WIDTH = 0.1,
+    FORGET = 0.97,
+    WINDOW_HIT = 0.5,       -- seconds after the lead that a hit still counts
+
+    tracks = {},
+    lat = {}, alo = {}, wt = {}, order = {},
+    knifeSpeed = 96,
+    pending = {},
+    cal = {},
+    lastPlan = nil,
+    floorAt = 0,
+    file = 'MM2Assist/silent_aim_v2.json',
+}
 
 -- The full round trip in seconds. The shot has to travel up to the server, and
 -- the target on screen was already one trip down old when it arrived, so the
@@ -1027,13 +604,13 @@ local function getPing()
     local ok, ping = pcall(function() return LocalPlayer:GetNetworkPing() end)
     if ok and typeof(ping) == "number" and ping > 0 then rtt = ping * 2 end
 
-    local item = Adapt.pingItem
+    local item = SA.pingItem
     if item == nil then
         local found = pcall(function()
             item = game:GetService("Stats").Network.ServerStatsItem["Data Ping"]
         end)
         item = found and item or false
-        Adapt.pingItem = item
+        SA.pingItem = item
     end
     if item then
         local okData, ms = pcall(function() return item:GetValue() end)
@@ -1044,1159 +621,664 @@ local function getPing()
     return math.min(rtt, 1)
 end
 
-local function gravity()
-    local ok, value = pcall(function() return Workspace.Gravity end)
-    if ok and typeof(value) == "number" and value > 0 then return value end
-    return 196.2
-end
-
-local function flatDistance(a, b)
-    return (Vector3.new(a.X, 0, a.Z) - Vector3.new(b.X, 0, b.Z)).Magnitude
-end
-
-local function perpOf(forward)
-    return Vector3.new(-forward.Z, 0, forward.X)
-end
-
-local function dotOf(a, b)
-    return a.X * b.X + a.Y * b.Y + a.Z * b.Z
-end
-
--- a circle through three points of the path just walked. when the fit survives
--- every sanity check the turn it implies is real rather than a smoothing
--- artefact. only the newest slice is used, so the longer buffer the backtest
--- needs does not quietly stretch the baseline this is measured over
-local function fitTurnRate(history, speed)
-    local count = history and #history or 0
-    if count < 5 then return nil end
-
-    local from = math.max(1, count - Adapt.Fit + 1)
-    local first = history[from]
-    local middle = history[from + math.floor((count - from) / 2)]
-    local last = history[count]
-    local span = last.t - first.t
-    if span < 0.12 then return nil end
-
-    local origin = last.p
-    local ax, az = first.p.X - origin.X, first.p.Z - origin.Z
-    local bx, bz = middle.p.X - origin.X, middle.p.Z - origin.Z
-
-    local d = 2 * (ax * bz - bx * az)
-    if math.abs(d) < 1e-4 then return nil end
-
-    local aSq = ax * ax + az * az
-    local bSq = bx * bx + bz * bz
-    local cx = (aSq * bz - bSq * az) / d
-    local cz = (bSq * ax - aSq * bx) / d
-
-    local radius = math.sqrt(cx * cx + cz * cz)
-    if radius < MIN_TURN_RADIUS or radius > MAX_TURN_RADIUS then return nil end
-
-    local toStart = Vector3.new(first.p.X - origin.X - cx, 0, first.p.Z - origin.Z - cz)
-    local toEnd = Vector3.new(-cx, 0, -cz)
-    if toStart.Magnitude < 0.001 or toEnd.Magnitude < 0.001 then return nil end
-
-    local startUnit, endUnit = toStart.Unit, toEnd.Unit
-    local dot = math.clamp(dotOf(startUnit, endUnit), -1, 1)
-    local cross = startUnit.X * endUnit.Z - startUnit.Z * endUnit.X
-    local omega = math.atan2(cross, dot) / span
-    if math.abs(omega) < MIN_TURN_RATE then return nil end
-
-    local implied = radius * math.abs(omega)
-    if implied < speed * 0.5 or implied > speed * 2 then return nil end
-
-    return omega
-end
-
--- the maths dropdown, one function per mode. state is any table carrying the
--- motion fields, so a live target and a stored snapshot of one go through
--- exactly the same solver - which is what makes the replay below honest
-local function modelStep(mode, state, t)
-    if t <= 0 or mode == 'Off' then return Vector3.zero end
-
-    -- back to the middle of where they have been lately, however long the lead
-    if mode == 'Center' then
-        return state.center or Vector3.zero
-    end
-
-    -- straight on at the velocity the game replicates for them, which has no
-    -- smoothing lag behind a turn the way the measured one does
-    if mode == 'Velocity' then
-        local reported = state.netVel
-        if not reported then return Vector3.zero end
-        local speed = reported.Magnitude
-        if speed < 0.5 then return Vector3.zero end
-        local ceiling = (state.walkSpeed or 16) * SPEED_CEILING
-        return reported.Unit * (math.min(speed, ceiling) * t)
-    end
-
-    local velocity = state.horizontal
-    if not velocity then return Vector3.zero end
-
-    local speed = velocity.Magnitude
-    if speed < 0.5 then return Vector3.zero end
-
-    local ceiling = (state.walkSpeed or 16) * SPEED_CEILING
-    if speed > ceiling then speed = ceiling end
-
-    local forward = velocity.Unit
-
-    if mode == 'Linear' then
-        return forward * (speed * t)
-    end
-
-    local tangential = math.clamp(dotOf(state.accel or Vector3.zero, forward), -MAX_TANGENTIAL, MAX_TANGENTIAL)
-
-    if mode == 'Projected' then
-        local travelled = 0
-        local straight = t / ARC_STEPS
-        for index = 1, ARC_STEPS do
-            local mid = (index - 0.5) * straight
-            travelled = travelled + math.clamp(speed + tangential * mid, 0, ceiling) * straight
-        end
-        return forward * travelled
-    end
-
-    -- circle rides the fitted turn for the whole lead, arc rides a smoothed
-    -- turn that fades out across it. circle with no usable fit is arc
-    local fitted = mode == 'Circle' and state.fit or nil
-    local steady = math.clamp(state.steady or 1, 0, 1)
-    local omega = math.clamp(fitted or state.turnRate or 0, -MAX_TURN_RATE, MAX_TURN_RATE) * steady
-
-    local trust = filterSettings().trust
-    local horizon = t * (trust + (1 - trust) * steady)
-    local side = perpOf(forward)
-    local step = horizon / ARC_STEPS
-    local displacement = Vector3.zero
-
-    for index = 1, ARC_STEPS do
-        local mid = (index - 0.5) * step
-        local heading
-        if fitted then
-            heading = omega * mid
-        else
-            heading = omega * TURN_DECAY * (1 - math.exp(-mid / TURN_DECAY))
-        end
-        local moving = math.clamp(speed + tangential * mid, 0, ceiling)
-        displacement = displacement
-            + (forward * math.cos(heading) + side * math.sin(heading)) * (moving * step)
-    end
-
-    return displacement
-end
-
--- what makes adaptive more than a guess: replay every model forward from a
--- snapshot of what was known a fraction of a second ago, and measure each one
--- against where that person actually ended up. lowest running error wins
-local function backtest(entry, actual, now)
-    if now - entry.backtestAt < Adapt.Rate then return end
-
-    local history = entry.history
-    local count = #history
-    if count < 5 then return end
-
-    -- the snapshot nearest the age a real shot's lead covers, so the models are
-    -- scored over the horizon they will actually be asked to solve. history runs
-    -- oldest first, so ages only fall as the index climbs
-    local snap, bestGap = nil, math.huge
-    for index = 1, count do
-        local age = now - history[index].t
-        if age < Adapt.MinAge then break end
-        if age <= Adapt.MaxAge then
-            local gap = math.abs(age - Adapt.horizon())
-            if gap < bestGap then snap, bestGap = history[index], gap end
-        end
-    end
-    if not snap then return end
-
-    entry.backtestAt = now
-    local dt = now - snap.t
-
-    local blend = Advanced.Enabled
-        and (Choice.valueOf(Choice.Adv.Reaction, Advanced.Reaction) or Adapt.Blend)
-        or Adapt.Blend
-
-    -- each model's step is kept, so perfection's tuner below can replay every
-    -- combination from the same steps instead of stepping the models again
-    local disp = Adapt.disp
-    for _, name in ipairs(Adapt.Models) do
-        local step = modelStep(name, snap, dt)
-        disp[name] = step
-        local missed = flatDistance(snap.p + step, actual)
-        local previous = entry.scores[name]
-        entry.scores[name] = previous and (previous + (missed - previous) * blend) or missed
-    end
-
-    entry.scored = entry.scored + 1
-
-    if Advanced.Enabled and Advanced.Perfection then Adapt.tuneRound(entry, snap, dt, actual) end
-
-    -- and how far off the solver a real shot uses has been, which is what the
-    -- trigger bot's sure shots are measured against
-    if Adapt.scoreSolve then Adapt.scoreSolve(entry, snap, dt, actual, blend) end
-
-    -- Replay whatever the solver would actually have sent for this snapshot and
-    -- keep the signed miss, so the correction is measured against the real
-    -- answer rather than against whichever single model happened to win.
-    -- Perfection measures a drift per combination of its own, so this one is
-    -- only kept while it is off.
-    if Advanced.Enabled and not Advanced.Perfection and Advanced.Bias ~= 'Off' and entry.scored >= Adapt.Samples then
-        local heading = snap.horizontal
-        if heading and heading.Magnitude >= Adapt.MinHeading then
-            local ok, step = pcall(Adapt.step, entry, dt, snap)
-            if ok and typeof(step) == "Vector3" then
-                local residual = actual - (snap.p + step)
-
-                -- split along and across the heading they had at the time, so
-                -- the average survives them turning
-                local forward = heading.Unit
-                local side = perpOf(forward)
-                local along = dotOf(residual, forward)
-                local across = dotOf(residual, side)
-
-                entry.biasAlong = entry.biasAlong
-                    and entry.biasAlong + (along - entry.biasAlong) * blend or along
-                entry.biasAcross = entry.biasAcross
-                    and entry.biasAcross + (across - entry.biasAcross) * blend or across
-                entry.biasSpan = dt
-            end
-        end
-    end
-    if entry.scored < Adapt.Samples then return end
-
-    local best, bestError = nil, math.huge
-    for _, name in ipairs(Adapt.Models) do
-        local score = entry.scores[name]
-        if score and score < bestError then
-            best, bestError = name, score
-        end
-    end
-
-    -- only hand over when the challenger is clearly ahead, so the pick does not
-    -- flicker between two models sitting within noise of each other. the margin
-    -- is a share of the error being beaten rather than a flat number of studs,
-    -- because over a short lead every model is wrong by well under a stud and a
-    -- flat margin would swallow the whole spread between them
-    if best and best ~= entry.best then
-        local held = entry.scores[entry.best]
-        if held == nil or bestError + Adapt.Floor < held * (1 - Adapt.Margin) then
-            entry.best = best
-        end
-    end
-end
-
-local function chooseModel(entry)
-    if Advanced.Enabled then
-        local solver = Advanced.Perfection and 'Ensemble' or Advanced.Solver
-        if solver == 'Fixed circle' then return 'Circle' end
-        if solver == 'Fixed arc' then return 'Arc' end
-        -- Ensemble / Best single / Top two all resolve per shot inside
-        -- Adapt.step; the name returned here is only what gets reported
-        if not entry or entry.scored < Adapt.Samples then return 'Arc' end
-        return solver == 'Best single' and (entry.best or 'Arc') or solver
-    end
-
-    local mode = Aim.Math
-    if mode ~= 'Adaptive' then return mode end
-    if not entry or entry.scored < Adapt.Samples then return 'Arc' end
-    return entry.best or 'Arc'
-end
-
--- Replays the solver a real shot would use from the backtest's snapshot and
--- keeps its running miss: the blend when advanced mode blends, otherwise the
--- one model picked. That miss, scaled to a shot's lead, is how sure a shot is.
-function Adapt.scoreSolve(entry, snap, dt, actual, blend)
-    local missed
-    local tune = entry.tune
-    if Adapt.tuned(entry) and tune.pickMiss and entry.scored >= Adapt.Samples then
-        -- perfection already replayed its pick this round, drift correction
-        -- included, which is exactly the solve a shot at this player uses
-        missed = tune.pickMiss
-    else
-        local step
-        if Adapt.blending() and entry.scored >= Adapt.Samples then
-            local ok, blended = pcall(Adapt.step, entry, dt, snap)
-            step = ok and blended or nil
-        else
-            step = modelStep(chooseModel(entry), snap, dt)
-        end
-        if typeof(step) ~= "Vector3" then return end
-        missed = flatDistance(snap.p + step, actual)
-    end
-    entry.solveError = entry.solveError and (entry.solveError + (missed - entry.solveError) * blend) or missed
-    -- the worst recent miss, fading, since a shot that has to land cannot go
-    -- by the average: someone spamming left and right is dead on half the
-    -- time and nowhere near the rest
-    entry.solvePeak = math.max(missed, (entry.solvePeak or missed) * Adapt.PeakFade)
-    entry.solveSpan = dt
-    entry.solveRounds = (entry.solveRounds or 0) + 1
-end
-
--- The blend's weights, one per model, written into out. The solve and the
--- advanced tab's readout both go through this, so the readout shows exactly
--- the blend the shot used rather than its own copy of the maths drifting from
--- it. Returns the total weight and the single best model.
---
--- A player perfection is shooting is weighed by perfection's own model scores,
--- as the single best model.
-function Adapt.weights(entry, out)
-    local scores, weighting, solver, guard
-    local tuned = Adapt.tuned(entry)
-    if tuned then
-        scores, weighting, solver, guard = tuned.scores, 'Inverse fourth', 'Best single', math.huge
-    else
-        scores, weighting, solver = entry.scores, Advanced.Weighting, Advanced.Solver
-        guard = Choice.valueOf(Choice.Adv.Guard, Advanced.Guard)
-    end
-
-    local best, bestError = nil, math.huge
-    for _, name in ipairs(Adapt.Models) do
-        local score = scores[name]
-        if score and score < bestError then best, bestError = name, score end
-    end
-
-    -- Top two keeps the winner and the runner up and drops the rest
-    local secondError = math.huge
-    if solver == 'Top two' then
-        for _, name in ipairs(Adapt.Models) do
-            local score = scores[name]
-            if score and name ~= best and score < secondError then secondError = score end
-        end
-    end
-
-    local cutoff = bestError * guard + Adapt.Epsilon
-    local total = 0
-
-    for _, name in ipairs(Adapt.Models) do
-        local score = scores[name]
-        local weight = 0
-
-        if not best then
-            weight = 0
-        elseif solver == 'Best single' then
-            weight = name == best and 1 or 0
-        elseif score and score <= cutoff then
-            if solver == 'Top two' and name ~= best and score > secondError then
-                weight = 0
-            elseif weighting == 'Equal' then
-                weight = 1
-            elseif weighting == 'Softmax' then
-                weight = math.exp(-(score - bestError) / (bestError * Adapt.Temp + Adapt.Epsilon))
-            elseif weighting == 'Inverse square' then
-                local inv = 1 / (score + Adapt.Epsilon)
-                weight = inv * inv
-            elseif weighting == 'Inverse fourth' then
-                local inv = 1 / (score + Adapt.Epsilon)
-                inv = inv * inv
-                weight = inv * inv
-            else
-                weight = 1 / (score + Adapt.Epsilon)
-            end
-        end
-
-        out[name] = weight
-        total = total + weight
-    end
-
-    return total, best
-end
-
--- Argmax throws away three quarters of what the backtest learned. This blends
--- every model that is still in contention, weighted by how wrong it has been,
--- so the ones that disagree partly cancel instead of one of them simply losing.
--- entry holds the scores that decide the weights; state is the motion the
--- models are stepped from. They are the same thing for a live shot, but the
--- backtest has to replay from a *snapshot* while still weighting by what the
--- entry has learned, so the two are separate arguments.
-function Adapt.step(entry, t, state)
-    state = state or entry
-
-    local weights = Adapt.scratch
-    local total, best = Adapt.weights(entry, weights)
-    if not best then return modelStep('Arc', state, t) end
-    if total <= 0 then return modelStep(best, state, t) end
-
-    local blended = Vector3.zero
-    for _, name in ipairs(Adapt.Models) do
-        local weight = weights[name]
-        if weight > 0 then
-            blended = blended + modelStep(name, state, t) * weight
-        end
-    end
-    return blended / total
-end
-
--- The models are wrong in a direction, not just by an amount. Tracking the
--- signed residual and subtracting it back out is what corrects a lead that is
--- consistently short or consistently long, which no amount of picking between
--- models will ever fix on its own.
-function Adapt.correct(entry, t)
-    if not Advanced.Enabled or entry.scored < Adapt.Samples then return Vector3.zero end
-
-    -- a player perfection is shooting gets the drift perfection measured on
-    -- them, taken back out at the share that has landed on them most; anyone
-    -- else gets the bias correction dropdown's
-    local share, along, across, measured
-    local tuned = Adapt.tuned(entry)
-    if tuned then
-        share = Adapt.TuneShares[tuned.pick]
-        along, across = tuned.along, tuned.across
-        measured = tuned.span or Adapt.Target
-    else
-        if Advanced.Bias == 'Off' then return Vector3.zero end
-        share = Choice.valueOf(Choice.Adv.Bias, Advanced.Bias) or 0
-        along, across = entry.biasAlong, entry.biasAcross
-        -- the residual was measured over one scoring horizon, so it scales
-        -- with however much lead this particular shot is actually asking for
-        measured = entry.biasSpan or Adapt.Target
-    end
-    if along == nil or share <= 0 or measured <= 0 then return Vector3.zero end
-
-    -- Rebuilt in the heading they have *now*. The bias is stored as along-track
-    -- and cross-track, never as a world vector: a lead that is consistently
-    -- short is short along their direction of travel whichever way that points,
-    -- and averaging that in world space just smears it into nothing on anyone
-    -- who is turning.
-    local heading = entry.horizontal
-    if not heading or heading.Magnitude < Adapt.MinHeading then return Vector3.zero end
-
-    -- A running average of past misses is only worth anything on someone whose
-    -- motion is consistent enough for the past to say something about the next
-    -- fraction of a second. On a target flipping direction every few frames it
-    -- is stale noise, so it fades out with how steady they actually are.
-    local forward = heading.Unit
-    local side = perpOf(forward)
-    local scale = (t / measured) * share * math.clamp(entry.steady or 1, 0, 1)
-
-    local scaled = (forward * along + side * across) * scale
-    if scaled.Magnitude > MAX_LEAD_OFFSET then
-        scaled = scaled.Unit * MAX_LEAD_OFFSET
-    end
-    return scaled
-end
-
--- Whether the solve blends at all: advanced mode, and a solver that blends.
--- Perfection always does, whatever the solver dropdown says.
-function Adapt.blending()
-    return Advanced.Enabled and (Advanced.Perfection
-        or (Advanced.Solver ~= 'Fixed circle' and Advanced.Solver ~= 'Fixed arc'))
-end
-
--- Perfection's state for this player, or nil while perfection is off or has
--- not scored them yet. Until a player has been watched for Adapt.TuneRounds it
--- holds the default share, the one that landed most across everything tested.
-function Adapt.tuned(entry)
-    if not (Advanced.Enabled and Advanced.Perfection) then return nil end
-    local tune = entry and entry.tune
-    if not tune or tune.rounds < 1 then return nil end
-    return tune
-end
-
--- One scoring round of perfection for one player. Its own model scores pick
--- the single best model, and each share of its own measured drift is replayed
--- on top of that from the snapshot, with what was known *before* this round,
--- and counted as landed or not against where they really went. Only then does
--- it learn from the round. Predicting before learning keeps it honest: each
--- share's record is how it would really have done, not how well it fits data
--- it has already seen.
-function Adapt.tuneRound(entry, snap, dt, actual)
-    local tune = entry.tune
-    if not tune then
-        tune = { rounds = 0, scores = {}, loss = {}, pick = Adapt.TuneDefault }
-        entry.tune = tune
-    end
-
-    local disp = Adapt.disp
-    local scores = tune.scores
-    local forget = Adapt.TuneRate
-
-    if tune.rounds > 0 then
-        local best, bestError = nil, math.huge
-        for _, name in ipairs(Adapt.Models) do
-            local score = scores[name]
-            if score and score < bestError then best, bestError = name, score end
-        end
-        local base = snap.p + (best and disp[best] or disp.Arc)
-
-        local heading = snap.horizontal
-        if heading and heading.Magnitude >= Adapt.MinHeading then
-            local forward = heading.Unit
-            local side = perpOf(forward)
-            -- the drift was measured over the last round's lead, so it scales
-            -- to this one's the same way a live shot scales it
-            local drift = tune.along and (forward * tune.along + side * tune.across)
-                * (dt / math.max(tune.span or dt, 0.01) * math.clamp(snap.steady or 1, 0, 1))
-
-            for index, share in ipairs(Adapt.TuneShares) do
-                local aimed = base
-                if drift and share > 0 then
-                    local shift = drift * share
-                    if shift.Magnitude > MAX_LEAD_OFFSET then shift = shift.Unit * MAX_LEAD_OFFSET end
-                    aimed = base + shift
-                end
-                local missed = flatDistance(aimed, actual)
-                if index == tune.pick then tune.pickMiss = missed end
-                local failed = missed > Adapt.TuneHit and 1 or 0
-                local held = tune.loss[index]
-                tune.loss[index] = held and (held + (failed - held) * Adapt.TuneScore) or failed
-            end
-
-            -- then the drift learns from the round, split along and across
-            -- the heading they had at the time
-            local residual = actual - base
-            local along, across = dotOf(residual, forward), dotOf(residual, side)
-            tune.along = tune.along and (tune.along + (along - tune.along) * forget) or along
-            tune.across = tune.across and (tune.across + (across - tune.across) * forget) or across
-        else
-            -- with no heading there is no drift to take out, so every share
-            -- would land the same and the round says nothing about them
-            tune.pickMiss = flatDistance(base, actual)
-        end
-    end
-
-    -- and each model's running miss, at perfection's own slow rate
-    for _, name in ipairs(Adapt.Models) do
-        local missed = flatDistance(snap.p + disp[name], actual)
-        local held = scores[name]
-        scores[name] = held and (held + (missed - held) * forget) or missed
-    end
-
-    tune.span = dt
-    tune.rounds = tune.rounds + 1
-
-    -- hand over only when a challenger is clearly ahead, as the model pick
-    -- does, so two shares within noise of each other do not flicker
-    if tune.rounds >= Adapt.TuneRounds then
-        local best, bestLoss = nil, math.huge
-        for index = 1, #Adapt.TuneShares do
-            local loss = tune.loss[index]
-            if loss and loss < bestLoss then best, bestLoss = index, loss end
-        end
-        local held = tune.loss[tune.pick]
-        if best and best ~= tune.pick
-            and (held == nil or bestLoss + Adapt.Floor < held * (1 - Adapt.TuneMargin))
-        then
-            tune.pick = best
-        end
-    end
-end
-
-local motion = {}
-
-local function humanoidState(char)
+SA.floorParams = RaycastParams.new()
+SA.floorParams.FilterType = Enum.RaycastFilterType.Exclude
+SA.floorParams.IgnoreWater = true
+
+-- the root's height above the floor when standing: HipHeight on R15, the legs
+-- on R6
+function SA.standHeight(char, root)
     local hum = char and char:FindFirstChildOfClass("Humanoid")
-    if not hum then return nil, false end
-    local ok, state = pcall(function() return hum:GetState() end)
-    local airborne = ok and (state == Enum.HumanoidStateType.Freefall
-        or state == Enum.HumanoidStateType.Jumping
-        or state == Enum.HumanoidStateType.FallingDown)
-    return hum, airborne and true or false
+    local ok, r15 = pcall(function() return hum and hum.RigType == Enum.HumanoidRigType.R15 end)
+    if ok and r15 then
+        local okHip, hip = pcall(function() return hum.HipHeight end)
+        if okHip and typeof(hip) == "number" and hip > 0 then return hip + root.Size.Y / 2 end
+    end
+    return 3
 end
 
-local function jumpLaunchVelocity(hum)
-    local ok, useJumpPower = pcall(function() return hum.UseJumpPower end)
-    if ok and useJumpPower then
-        local ok2, power = pcall(function() return hum.JumpPower end)
-        if ok2 and typeof(power) == "number" and power > 0 then return power end
-        return nil
+-- characters are never floors or walls here
+function SA.refreshFilter(now)
+    if now - SA.floorAt < 1 then return end
+    SA.floorAt = now
+    local list = {}
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr.Character then list[#list + 1] = plr.Character end
     end
-    local ok3, height = pcall(function() return hum.JumpHeight end)
-    if ok3 and typeof(height) == "number" and height > 0 then
-        return math.sqrt(2 * gravity() * height)
-    end
+    SA.floorParams.FilterDescendantsInstances = list
+end
+
+-- the root height they would stand at on the floor under (x, y, z), or nil
+function SA.floorUnder(x, y, z, stand)
+    local ok, hit = pcall(function()
+        return Workspace:Raycast(Vector3.new(x, y, z), Vector3.new(0, -60, 0), SA.floorParams)
+    end)
+    if ok and hit then return hit.Position.Y + stand end
     return nil
 end
 
-local function feetOffset(char)
-    local hum = char and char:FindFirstChildOfClass("Humanoid")
-    local ok, hip = pcall(function() return hum and hum.HipHeight end)
-    if ok and typeof(hip) == "number" and hip > 0 then
-        return hip + 0.5
-    end
-    return 2.5
+function SA.newTrack(char)
+    return {
+        char = char,
+        first = 1, last = 0,
+        t = {}, x = {}, y = {}, z = {}, vx = {}, vz = {}, vy = {}, e = {}, w = {},
+        changeAt = nil, legMoving = false,
+        air = false, groundY = nil, lastLandAt = nil, takeoffAt = nil,
+        spam = 0.2, launch = 50, groundTime = 0.03, pendingLand = nil,
+        stand = 3, floorY = nil,
+    }
 end
 
-local function sampleMotion(plr, root, now)
-    local name = plr.Name
-    local entry = motion[name]
-    local position = root.Position
-    local hum, airborne = humanoidState(plr.Character)
-
-    if not entry then
-        entry = {
-            position = position,
-            time = now,
-            horizontal = Vector3.zero,
-            vertical = 0,
-            accel = Vector3.zero,
-            turnRate = 0,
-            steady = 1,
-            fit = nil,
-            walkSpeed = 16,
-            speedCheck = 0,
-            repLag = 0,
-            lastMove = now,
-            history = {},
-            scores = {},
-            scored = 0,
-            best = 'Arc',
-            biasAlong = nil,
-            biasAcross = nil,
-            biasSpan = nil,
-            backtestAt = 0,
-            groundY = position.Y,
-            airborne = airborne,
-            jumps = {},
-            jumpStart = nil,
-            jumpFromY = position.Y,
-            jumpLaunchV = nil,
-            jumpElapsed = 0,
-            changes = {},
-            firstSeen = now,
-        }
-        motion[name] = entry
-        return entry
-    end
-
-    local dt = now - entry.time
-    if dt > 0 and dt < SAMPLE_STALE then
-        local settings = filterSettings()
-        local delta = position - entry.position
-        local rawHorizontal = Vector3.new(delta.X, 0, delta.Z) / dt
-        local rawVertical = delta.Y / dt
-        local previous = entry.horizontal
-
-        entry.horizontal = previous:Lerp(rawHorizontal, settings.smooth)
-        entry.vertical = entry.vertical + (rawVertical - entry.vertical) * settings.vertical
-
-        local accel = (entry.horizontal - previous) / dt
-        entry.accel = entry.accel:Lerp(accel, settings.accel)
-
-        if previous.Magnitude > 1 and entry.horizontal.Magnitude > 1 then
-            local a, b = previous.Unit, entry.horizontal.Unit
-            local dot = math.clamp(a:Dot(b), -1, 1)
-            local cross = a.X * b.Z - a.Z * b.X
-            local turn = math.atan2(cross, dot) / dt
-            entry.turnRate = entry.turnRate + (turn - entry.turnRate) * settings.turn
-            entry.steady = entry.steady + (math.max(dot, 0) - entry.steady) * 0.3
-        else
-            entry.turnRate = entry.turnRate * 0.8
-            entry.steady = entry.steady + (1 - entry.steady) * 0.1
-        end
-
-        -- the velocity the game replicates for them, flat
-        local okVelocity, reported = pcall(function() return root.AssemblyLinearVelocity end)
-        entry.netVel = okVelocity and typeof(reported) == "Vector3" and Vector3.new(reported.X, 0, reported.Z) or nil
-
-        local snapshot = {
-            p = position,
-            t = now,
-            horizontal = entry.horizontal,
-            accel = entry.accel,
-            turnRate = entry.turnRate,
-            steady = entry.steady,
-            walkSpeed = entry.walkSpeed,
-            netVel = entry.netVel,
-        }
-        table.insert(entry.history, snapshot)
-        local depthLimit, depthWindow = Adapt.depth()
-        while #entry.history > depthLimit or (entry.history[1] and now - entry.history[1].t > depthWindow) do
-            table.remove(entry.history, 1)
-        end
-
-        -- the middle of where they have been over the center window, from here
-        local sumX, sumZ, counted = 0, 0, 0
-        for index = #entry.history, 1, -1 do
-            local past = entry.history[index]
-            if now - past.t > Adapt.CenterWindow then break end
-            sumX, sumZ, counted = sumX + past.p.X, sumZ + past.p.Z, counted + 1
-        end
-        entry.center = Vector3.new(sumX / counted - position.X, 0, sumZ / counted - position.Z)
-        snapshot.center = entry.center
-
-        -- every start, stop and sharp turn, so the trigger bot knows how often
-        -- this one changes what they are doing
-        if now - (entry.changeCheck or 0) >= 0.1 then
-            local moving = (entry.netVel and entry.netVel.Magnitude > 0.5) and entry.netVel or entry.horizontal
-            local was = entry.lastMoving or moving
-            local changed = (was.Magnitude > 4) ~= (moving.Magnitude > 4)
-                or (moving.Magnitude > 4 and was.Magnitude > 4 and was.Unit:Dot(moving.Unit) < 0.82)
-            local last = entry.changes[#entry.changes]
-            if changed and (not last or now - last > 0.15) then
-                entry.changes[#entry.changes + 1] = now
-            end
-            entry.lastMoving = moving
-            entry.changeCheck = now
-        end
-        while entry.changes[1] and now - entry.changes[1] > Adapt.ChangeWindow do
-            table.remove(entry.changes, 1)
-        end
-
-        -- fitted once per sample rather than once per solve pass, so every lead
-        -- pass and every replay of this moment reads the same circle
-        entry.fit = fitTurnRate(entry.history, entry.horizontal.Magnitude)
-        snapshot.fit = entry.fit
-
-        backtest(entry, position, now)
-    elseif dt >= SAMPLE_STALE then
-        entry.horizontal = Vector3.zero
-        entry.accel = Vector3.zero
-        entry.turnRate = 0
-        entry.vertical = 0
-        entry.steady = 1
-        entry.fit = nil
-        entry.center = nil
-        entry.netVel = nil
-        entry.solveError = nil
-        entry.solveRounds = 0
-        table.clear(entry.history)
-    end
-
-    if now - entry.speedCheck > 0.5 then
-        entry.speedCheck = now
-        local okSpeed, speed = pcall(function() return hum and hum.WalkSpeed end)
-        if okSpeed and typeof(speed) == "number" and speed > 0 then
-            entry.walkSpeed = speed
-        end
-    end
-
-    if (position - entry.position).Magnitude > 0.001 then
-        local gap = now - (entry.lastMove or now)
-        entry.lastMove = now
-        if gap > 0 and gap < 0.5 then
-            entry.repLag = entry.repLag + (gap - entry.repLag) * 0.2
-        end
-    end
-
-    if airborne and not entry.airborne then
-        table.insert(entry.jumps, now)
-        entry.jumpStart = now
-        entry.jumpFromY = entry.position.Y
-        entry.jumpLaunchV = hum and jumpLaunchVelocity(hum) or nil
-    end
-    while entry.jumps[1] and now - entry.jumps[1] > JUMP_SPAM_WINDOW do
-        table.remove(entry.jumps, 1)
-    end
-
-    if airborne and entry.jumpStart then
-        entry.jumpElapsed = now - entry.jumpStart
-    end
-
-    if not airborne then
-        entry.groundY = position.Y
-        entry.jumpStart = nil
-        entry.jumpLaunchV = nil
-    end
-
-    entry.airborne = airborne
-    entry.position = position
-    entry.time = now
-    return entry
+function SA.forget(plr)
+    SA.tracks[plr] = nil
 end
 
-local function isSpamJumper(entry)
-    return #entry.jumps >= JUMP_SPAM_COUNT
-end
-
--- How far from them a shot solved now could land, in studs, and the odds
--- they keep doing what they are doing until it lands. Someone standing still
--- lands wherever they stand; anyone moving is the worst recent miss of the
--- solver the shot uses, scaled from the lead it was measured over to this
--- shot's, plus the guesswork of someone in the air and of updates that arrive
--- for them in steps. The odds come from how often they have started, stopped
--- or turned lately (counted generously while there is little to go on).
--- Nothing learned yet is no answer.
-function Adapt.spread(entry, travel)
-    if not entry then return math.huge, 0 end
-    travel = math.max(travel or 0, 0)
-    local seen = math.min(Adapt.ChangeWindow, (entry.time or 0) - (entry.firstSeen or entry.time or 0))
-    local rate = (#(entry.changes or {}) + 1) / (seen + 1)
-    local odds = math.exp(-rate * travel)
-
-    local speed = entry.horizontal.Magnitude
-    local miss
-    if speed < 0.5 and (entry.center == nil or entry.center.Magnitude < 0.3) then
-        miss = 0.1
-    elseif (entry.solveRounds or 0) < Adapt.Samples or not entry.solvePeak then
-        return math.huge, odds
-    else
-        miss = entry.solvePeak * (travel / math.max(entry.solveSpan or Adapt.Target, 0.05))
-    end
-    if entry.airborne or isSpamJumper(entry) then miss = miss + 1.5 end
-    return miss + speed * math.max(0, (entry.repLag or 0) - cachedFrame), odds
-end
-
-local function predictRoot(entry, base, sinceSample, travelTime, mode)
-    if mode == 'Off' or travelTime == 0 then
-        return base
-    end
-
-    -- advanced blends the models and then corrects the blend's own running
-    -- bias; the normal path is the single picked model, unchanged
-    local horizontal
-    if Adapt.blending() and entry.scored >= Adapt.Samples then
-        horizontal = Adapt.step(entry, travelTime) + Adapt.correct(entry, travelTime)
-    else
-        horizontal = modelStep(mode, entry, travelTime)
-    end
-
-    if horizontal.Magnitude > MAX_LEAD_OFFSET then
-        horizontal = horizontal.Unit * MAX_LEAD_OFFSET
-    end
-
-    local airMode = Advanced.Enabled and Advanced.Air or Aim.Air
-
-    local y = base.Y
-    if entry.airborne and airMode ~= 'Off' then
-        local g = gravity()
-        if entry.jumpLaunchV then
-            local t = entry.jumpElapsed + sinceSample + travelTime
-            y = entry.jumpFromY + entry.jumpLaunchV * t - 0.5 * g * t * t
-        else
-            y = base.Y + entry.vertical * travelTime - 0.5 * g * travelTime * travelTime
-        end
-
-        if y > base.Y + MAX_VERTICAL_RISE then
-            y = base.Y + MAX_VERTICAL_RISE
-        end
-        if y < base.Y - MAX_VERTICAL_DROP then
-            y = base.Y - MAX_VERTICAL_DROP
-        end
-        if entry.groundY and base.Y >= entry.groundY and y < entry.groundY then
-            y = entry.groundY
-        end
-    end
-
-    return Vector3.new(base.X + horizontal.X, y, base.Z + horizontal.Z)
-end
-
--- Auto lead. Every so often a real shot is fired with a slightly shorter or
--- longer lead than the learned centre, and the centre moves toward whichever
--- length is actually landing more. It used to be fed from the per-frame plan
--- rather than from shots, so with a target merely in view it scored thousands
--- of shots nobody fired, all of them "misses", and swept the multiplier up and
--- wrapped it from 4x back to 0.4x every few seconds - the lead was a sawtooth
--- that spent half its time far too short. Now an arm is only ever picked for a
--- shot the hook really redirected, a block with nothing landed is discarded
--- instead of read as a direction, and there is no wrap.
-local newLeadState, pickArm, armMultiplier, updateBandit
-do
-    local DITHER = 0.2
-    local MIN_ARM_SAMPLES = 3
-    local MULT_MIN = 0.6
-    local MULT_MAX = 2
-    local ARM_MARGIN = 0.15
-    local STEP = 0.1
-    local EXPLORE_CHANCE_BASE = 0.3
-    local EXPLORE_CHANCE_MIN = 0.1
-    local EXPLORE_DECAY = 0.8
-
-    -- auto follows whichever lead dropdown is in charge: advanced's own while
-    -- advanced mode is on, otherwise the weapon's one on the silent aim tab
-    local function isAuto(state)
-        if Advanced.Enabled then
-            local profile = Choice.valueOf(Choice.Lead, Advanced.Lead)
-            return profile ~= nil and profile.auto
-        end
-        return state.tune.Auto
-    end
-
-    function newLeadState(tune)
-        return {
-            tune = tune,
-            mult = 1,
-            exploreChance = EXPLORE_CHANCE_BASE,
-            arms = { { hit = 0, shot = 0 }, { hit = 0, shot = 0 }, { hit = 0, shot = 0 } },
-            pending = {},
-            verified = 0,
-            hits = 0,
-        }
-    end
-
-    -- picked once per real shot. nil while auto is off, which is also how a
-    -- resolved shot knows not to feed the bandit
-    function pickArm(state)
-        if not isAuto(state) then return nil end
-        if math.random() >= state.exploreChance then return 2 end
-        return math.random() < 0.5 and 1 or 3
-    end
-
-    -- nil is the standing per-frame solve: the learned centre, no dither
-    function armMultiplier(state, arm)
-        if not isAuto(state) then return 1 end
-        if arm == 1 then return state.mult * (1 - DITHER) end
-        if arm == 3 then return state.mult * (1 + DITHER) end
-        return state.mult
-    end
-
-    function updateBandit(state)
-        local arms = state.arms
-        if arms[1].shot < MIN_ARM_SAMPLES or arms[3].shot < MIN_ARM_SAMPLES then return end
-
-        local landed = arms[1].hit + arms[2].hit + arms[3].hit
-        local moved = false
-
-        -- nothing landing at any length says nothing about which way the lead
-        -- is off - a wall, a dodge and a bad angle miss the same at every
-        -- length - so that block is thrown away, not read as a direction
-        if landed > 0 then
-            local centre = arms[2].shot > 0 and (arms[2].hit / arms[2].shot) or 0
-            local low = arms[1].hit / arms[1].shot
-            local high = arms[3].hit / arms[3].shot
-
-            -- a tie goes long: a lead that is short is the common failure
-            if high > centre + ARM_MARGIN and high >= low then
-                state.mult = state.mult * (1 + STEP)
-                moved = true
-            elseif low > centre + ARM_MARGIN and low > high then
-                state.mult = state.mult * (1 - STEP)
-                moved = true
-            end
-            state.mult = math.clamp(state.mult, MULT_MIN, MULT_MAX)
-        end
-
-        state.exploreChance = moved and EXPLORE_CHANCE_BASE
-            or math.max(EXPLORE_CHANCE_MIN, state.exploreChance * EXPLORE_DECAY)
-
-        for index = 1, 3 do
-            arms[index].hit = 0
-            arms[index].shot = 0
-        end
-    end
-end
-
-local GunLead = newLeadState(GunTune)
-local KnifeLead = newLeadState(KnifeTune)
-
--- How far ahead of what is on screen the shot has to land, in seconds. The
--- target you see was drawn from a state that is your whole round trip plus the
--- replication buffer old by the time your shot reaches the server, so those
--- are the lead, along with a frame of your own and, for the knife, its real
--- flight time. A target whose updates are visibly arriving in steps is behind
--- by more than the buffer alone, so that measured gap wins when it is larger.
--- The auto multiplier only scales the latency part: flight time is measured
--- off the knife itself and the profile is a trim you picked, neither of which
--- is the uncertain bit.
-local function travelTimeFor(state, entry, distance, arm)
-    local tune = state.tune
-    local lead = Adapt.lead
-
-    local pingScale, buffer
-    if Advanced.Enabled then
-        pingScale = Choice.valueOf(Choice.Ping, Advanced.Ping) or 1
-        buffer = Choice.valueOf(Choice.Buffer, Advanced.Buffer) or 0
-    else
-        pingScale, buffer = Aim.PingScale, Aim.Buffer
-    end
-
-    lead.rtt = cachedPing * pingScale
-    lead.buffer = math.max(buffer, entry ~= nil and entry.repLag or 0)
-    lead.frame = cachedFrame
-    lead.flight = (tune.Speed ~= nil and tune.Speed > 0) and distance / tune.Speed or 0
-
-    -- advanced drives both weapons from its own lead dropdown rather than the
-    -- two separate ones on the normal tab
-    if Advanced.Enabled then
-        local profile = Choice.valueOf(Choice.Lead, Advanced.Lead)
-        lead.extra = profile and profile.extra / 1000 or 0
-    else
-        lead.extra = tune.Extra / 1000
-    end
-    lead.mult = armMultiplier(state, arm)
-
-    local total = (lead.rtt + lead.buffer + lead.frame) * lead.mult + lead.flight + lead.extra
-    total = math.clamp(total, -MAX_TRAVEL_TIME, MAX_TRAVEL_TIME)
-    lead.total = total
-    return total
-end
-
-local function scoreShot(state, hit)
-    state.verified = state.verified + 1
-    if hit then state.hits = state.hits + 1 end
-end
-
-local function verifyLead(state, now)
-    local pending = state.pending
-    local index = 1
-    while index <= #pending do
-        local record = pending[index]
-        local resolved, hit = false, false
-
-        if record.hum == nil or record.hum.Parent == nil then
-            resolved, hit = true, true
-        else
-            local ok, health = pcall(function() return record.hum.Health end)
-            if not ok then
-                resolved, hit = true, true
-            elseif health <= 0 or health < record.health - 0.01 then
-                resolved, hit = true, true
-            elseif now >= record.dueAt then
-                resolved, hit = true, false
-            end
-        end
-
-        if resolved then
-            scoreShot(state, hit)
-            -- arm is only set on a shot fired with auto lead on
-            if record.arm then
-                local arm = state.arms[record.arm]
-                arm.shot = arm.shot + 1
-                if hit then arm.hit = arm.hit + 1 end
-                updateBandit(state)
-            end
-            table.remove(pending, index)
-        else
-            index = index + 1
-        end
-    end
-end
-
-local function logLead(state, char, distance, used, arm, now)
-    if #state.pending >= MAX_PENDING then return end
-    local hum = char and char:FindFirstChildOfClass("Humanoid")
-    if not hum then return end
-    local ok, health = pcall(function() return hum.Health end)
-    if not ok or health <= 0 then return end
-
-    table.insert(state.pending, {
-        dueAt = now + used + cachedPing + HIT_WINDOW,
-        hum = hum,
-        health = health,
-        distance = distance,
-        used = used,
-        arm = arm,
-    })
-end
-
--- head is worth its smaller hitbox only when the shot is easy anyway: close,
--- not sprinting, not mid jump. anything else takes the far wider torso
-local function autoAimPart(char, entry)
-    local airMode = Advanced.Enabled and Advanced.Air or Aim.Air
-    if airMode ~= 'Off' and entry and (entry.airborne or isSpamJumper(entry)) then return 'Body' end
-    if entry and entry.horizontal.Magnitude > Adapt.HeadSpeed then return 'Body' end
-
-    local root = char:FindFirstChild("HumanoidRootPart")
-    if root and (root.Position - Camera.CFrame.Position).Magnitude > Adapt.HeadRange then return 'Body' end
-
-    return 'Head'
-end
-
-local function aimPartsFor(char, entry)
-    local airMode = Advanced.Enabled and Advanced.Air or Aim.Air
-    local choice = Advanced.Enabled and Advanced.Part or Aim.AimPart
-    if choice == 'Auto' then choice = autoAimPart(char, entry) end
-
-    local order = PART_ORDER_BODY
-    if choice == 'Head' and not (airMode == 'Safe' and entry and isSpamJumper(entry)) then
-        order = PART_ORDER_HEAD
-    end
-
-    local parts = {}
-    for _, name in ipairs(order) do
-        local part = char:FindFirstChild(name)
-        if part then parts[#parts + 1] = part end
-    end
-    return parts
-end
-
-local function candidateScreenDist(part, anchor, origin)
-    if (part.Position - origin).Magnitude > Aim.MaxRange then return nil end
-
-    local screenPos, onScreen = Camera:WorldToViewportPoint(part.Position)
-    if not onScreen then
-        if not Aim.OffScreen then return nil end
-        local look = Camera.CFrame.LookVector
-        local toward = part.Position - origin
-        if toward.Magnitude < 0.01 then return nil end
-        local angle = math.deg(math.acos(math.clamp(look.Unit:Dot(toward.Unit), -1, 1)))
-        local viewport = Camera.ViewportSize
-        return viewport.Magnitude + angle
-    end
-
-    local screenDist = (Vector2.new(screenPos.X, screenPos.Y) - anchor).Magnitude
-    if screenDist > Aim.FOVRadius then return nil end
-    return screenDist
-end
-
-local function isMurderer(plr)
-    local role, dead = roleOf(plr)
-    return role == "Murderer" and not dead
-end
-
-local function allowedTarget(plr, isKnife)
-    if isKnife then
-        local mode = Aim.KnifeTargets
-        if mode == 'Armed only' then return heldWeapon(plr.Character) ~= nil end
-        if mode == 'Everyone but the murderer' then return not isMurderer(plr) end
+-- in the air or not. The state the game shows for other players can trail, so
+-- a still vertical speed is only called standing once the floor is right there
+function SA.airborne(track, char, root, vy)
+    if math.abs(vy) > 3 then return true end
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    local ok, state = pcall(function() return hum and hum:GetState() end)
+    if ok and (state == Enum.HumanoidStateType.Freefall or state == Enum.HumanoidStateType.Jumping) then
         return true
     end
-
-    local mode = Aim.GunTargets
-    if mode == 'Anyone' then return true end
-    if mode == 'Murderer + armed' then return isMurderer(plr) or heldWeapon(plr.Character) ~= nil end
-    return isMurderer(plr)
+    -- on flat ground the height does not move, so the floor only needs
+    -- looking for again when it does
+    local y = root.Position.Y
+    if not track.air and track.floorY and math.abs(y - track.floorY) < 0.05 then return false end
+    local floor = SA.floorUnder(root.Position.X, y, root.Position.Z, track.stand)
+    if floor and y - floor < 0.6 then
+        track.floorY = y
+        return false
+    end
+    track.floorY = nil
+    return true
 end
 
--- crosshair ranks by pixels from where you point, the rest re-rank the same set
-local function priorityScore(candidate, char)
-    local mode = Aim.Priority
-    if mode == 'Crosshair' then return candidate.screenDist end
-    if mode == 'Closest' then return candidate.worldDist end
+function SA.push(s, t, x, y, z, vx, vy, vz, air)
+    local speed = math.sqrt(vx * vx + vz * vz)
+    local moving = speed > SA.MOVING
 
-    if mode == 'Weakest' then
-        local hum = char:FindFirstChildOfClass("Humanoid")
-        local ok, health = pcall(function() return hum and hum.Health end)
-        return (ok and health) or math.huge
+    -- a new leg: they stopped, started, or turned sharply since a moment ago
+    if s.changeAt == nil then
+        s.changeAt, s.legMoving = t, moving
+    else
+        local changed = moving ~= s.legMoving
+        if not changed and moving then
+            local j = s.last
+            while j > s.first and t - s.t[j] < SA.TURN_LOOKBACK do j = j - 1 end
+            local px, pz = s.vx[j] or 0, s.vz[j] or 0
+            local ps = math.sqrt(px * px + pz * pz)
+            if ps > SA.MOVING and (vx * px + vz * pz) / (speed * ps) < SA.TURN then changed = true end
+        end
+        if changed then s.changeAt, s.legMoving = t, moving end
     end
 
-    return (heldWeapon(char) ~= nil and 0 or 1e6) + candidate.screenDist
+    -- jumps: takeoff, launch speed, landing, and whether a landing is met by
+    -- another jump straight away
+    if air and not s.air then
+        s.takeoffAt = t
+        if s.pendingLand then
+            local gap = t - s.pendingLand
+            s.spam = s.spam + ((gap < 0.15 and 1 or 0) - s.spam) * 0.35
+            if gap < 0.15 then s.groundTime = s.groundTime + (gap - s.groundTime) * 0.3 end
+            s.pendingLand = nil
+        end
+    end
+    if air and s.takeoffAt and t - s.takeoffAt < 0.07 and vy > 15 then
+        local launch = vy + gravity() * (t - s.takeoffAt)
+        s.launch = s.launch + (launch - s.launch) * 0.3
+    end
+    if not air and s.air then
+        s.lastLandAt, s.pendingLand = t, t
+    end
+    if s.pendingLand and not air and t - s.pendingLand >= 0.15 then
+        s.spam = s.spam - s.spam * 0.35
+        s.pendingLand = nil
+    end
+    if not air then s.groundY = y end
+    s.air = air
+
+    local k = s.last + 1
+    s.last = k
+    s.t[k], s.x[k], s.y[k], s.z[k] = t, x, y, z
+    s.vx[k], s.vz[k], s.vy[k] = vx, vz, vy
+    s.e[k] = t - s.changeAt
+
+    -- how fast they are turning: heading now against a moment ago
+    local omega = 0
+    if moving then
+        local j = k - 1
+        while j > s.first and t - s.t[j] < SA.TURN_SPAN do j = j - 1 end
+        local px, pz = s.vx[j] or 0, s.vz[j] or 0
+        local ps = math.sqrt(px * px + pz * pz)
+        local span = t - (s.t[j] or t)
+        if ps > SA.MOVING and span > 0.02 then
+            omega = math.atan2(px * vz - pz * vx, px * vx + pz * vz) / span
+        end
+    end
+    s.w[k] = omega
+
+    while s.first < s.last and t - s.t[s.first] > SA.KEEP do
+        local f = s.first
+        s.t[f], s.x[f], s.y[f], s.z[f], s.vx[f], s.vz[f], s.vy[f], s.e[f], s.w[f] =
+            nil, nil, nil, nil, nil, nil, nil, nil, nil
+        s.first = f + 1
+    end
 end
 
--- allow, when given, replaces the silent aim tab's own target filter: the
--- trigger bot hunts with its own
-local function scanTargets(isKnife, allow)
-    local origin = Camera.CFrame.Position
-    local anchor = screenAnchor()
-
-    local candidates = {}
+-- one sample of everyone else, every frame
+function SA.sampleAll(now)
+    SA.refreshFilter(now)
     for _, plr in ipairs(Players:GetPlayers()) do
-        if plr ~= LocalPlayer and isAlivePlr(plr) and (allow or allowedTarget)(plr, isKnife) then
+        if plr ~= LocalPlayer then
             local char = plr.Character
-            local parts = char and aimPartsFor(char, motion[plr.Name])
-            if parts and #parts > 0 then
-                local best = nil
-                for _, part in ipairs(parts) do
-                    local screenDist = candidateScreenDist(part, anchor, origin)
-                    if screenDist and (not best or screenDist < best) then
-                        best = screenDist
-                    end
+            local root = char and char:FindFirstChild("HumanoidRootPart")
+            if root then
+                local track = SA.tracks[plr]
+                local p = root.Position
+                -- a new body, or a jump across the map, starts the history over
+                if not track or track.char ~= char
+                    or (track.last >= track.first and (Vector3.new(track.x[track.last], track.y[track.last], track.z[track.last]) - p).Magnitude > 25)
+                then
+                    track = SA.newTrack(char)
+                    SA.tracks[plr] = track
                 end
-                if best then
-                    local root = char:FindFirstChild("HumanoidRootPart")
-                    local candidate = {
-                        plr = plr,
-                        char = char,
-                        parts = parts,
-                        screenDist = best,
-                        worldDist = root and (root.Position - origin).Magnitude or math.huge,
-                    }
-                    candidate.score = priorityScore(candidate, char)
-                    candidates[#candidates + 1] = candidate
+                track.root = root
+                track.stand = SA.standHeight(char, root)
+                local okV, v = pcall(function() return root.AssemblyLinearVelocity end)
+                if not okV or typeof(v) ~= "Vector3" then v = Vector3.zero end
+                SA.push(track, now, p.X, p.Y, p.Z, v.X, v.Y, v.Z, SA.airborne(track, char, root, v.Y))
+            end
+        end
+    end
+end
+
+function SA.byLat(a, b) return SA.lat[a] < SA.lat[b] end
+
+-- where across (c) and along (q) the line of fire to aim, from where they are
+-- now, and the share of their past outcomes that lands inside the body
+function SA.horizontal(s, now, L, ax, az)
+    local last = s.last
+    local vx, vz = s.vx[last], s.vz[last]
+    local speed = math.sqrt(vx * vx + vz * vz)
+    local moving = speed > SA.MOVING
+    local fx, fz = 0, 0
+    if moving then fx, fz = vx / speed, vz / speed end
+    local ux, uz = -az, ax
+    local eNow = math.min(now - (s.changeAt or now), SA.PHASE_CAP)
+    local wNow = s.w[last] or 0
+    local lat, alo, wt, order = SA.lat, SA.alo, SA.wt, SA.order
+
+    local count = 1
+    lat[1] = L * (vx * ux + vz * uz)
+    alo[1] = L * (vx * ax + vz * az)
+    wt[1] = SA.PRIOR
+    local total = SA.PRIOR
+
+    local T, X, Z = s.t, s.x, s.z
+    local j = s.first
+    for i = s.first, last do
+        local ti = T[i]
+        local goal = ti + L
+        if goal > now then break end
+        local age = now - ti
+        if age <= SA.WINDOW then
+            if j < i then j = i end
+            while j < last and T[j + 1] <= goal do j = j + 1 end
+            local x2, z2
+            if j >= last then
+                x2, z2 = X[last], Z[last]
+            else
+                local a = (goal - T[j]) / (T[j + 1] - T[j])
+                x2, z2 = X[j] + (X[j + 1] - X[j]) * a, Z[j] + (Z[j + 1] - Z[j]) * a
+            end
+            local dx, dz = x2 - X[i], z2 - Z[i]
+            local vix, viz = s.vx[i], s.vz[i]
+            local vi = math.sqrt(vix * vix + viz * viz)
+            if moving == (vi > SA.MOVING) then
+                local de = (math.min(s.e[i], SA.PHASE_CAP) - eNow) / SA.PHASE
+                local w = math.exp(-age / SA.RECENCY) * (math.exp(-de * de) + 0.02)
+                local ex, ez = dx, dz
+                if moving then
+                    local dw = ((s.w[i] or 0) - wNow) / SA.TURN_WIDTH
+                    w = w * math.exp(-dw * dw)
+                    local fix, fiz = vix / vi, viz / vi
+                    local k = speed / vi
+                    local along = (dx * fix + dz * fiz) * k
+                    local side = (dz * fix - dx * fiz) * k
+                    ex, ez = along * fx - side * fz, along * fz + side * fx
+                end
+                if w > 1e-4 then
+                    count = count + 1
+                    lat[count] = ex * ux + ez * uz
+                    alo[count] = ex * ax + ez * az
+                    wt[count] = w
+                    total = total + w
                 end
             end
         end
     end
 
-    table.sort(candidates, function(a, b) return a.score < b.score end)
-    return candidates
+    for i = 1, count do order[i] = i end
+    for i = count + 1, #order do order[i] = nil end
+    table.sort(order, SA.byLat)
+
+    local bestW, bestL, bestR = -1, 1, 1
+    local r, sum = 1, 0
+    local width = 2 * SA.RADIUS
+    for l = 1, count do
+        while r <= count and lat[order[r]] - lat[order[l]] <= width do
+            sum = sum + wt[order[r]]
+            r = r + 1
+        end
+        if sum > bestW then bestW, bestL, bestR = sum, l, r - 1 end
+        sum = sum - wt[order[l]]
+    end
+
+    local c = (lat[order[bestL]] + lat[order[bestR]]) / 2
+    local q, qw = 0, 0
+    for n = bestL, bestR do
+        local i = order[n]
+        q, qw = q + alo[i] * wt[i], qw + wt[i]
+    end
+    return c, qw > 0 and q / qw or 0, bestW / total
+end
+
+-- the height to aim at, and how sure of it this is. (x, z) is where across the
+-- ground the shot will find them, for the floor under that spot
+function SA.vertical(s, now, L, x, z)
+    local last = s.last
+    local y, vy = s.y[last], s.vy[last]
+    local g = gravity()
+    local launch = math.max(s.launch, 1)
+    local gt = s.groundTime
+    local airtime = 2 * launch / g
+    local p = s.spam
+    local centre = (SA.BODY_LOW + SA.BODY_HIGH) / 2
+
+    local stay, go
+    if s.air then
+        -- the floor they will come down on, under where they are headed
+        local ground = SA.floorUnder(x, y, z, s.stand) or s.groundY or (y - 60)
+        local disc = vy * vy + 2 * g * math.max(y - ground, 0)
+        local land = (vy + math.sqrt(disc)) / g
+        if L <= land then return y + vy * L - 0.5 * g * L * L + centre, 1 end
+        stay = ground
+        local t = (L - land) - gt
+        if t <= 0 then
+            go = ground
+        else
+            t = t % (airtime + gt)
+            go = t > airtime and ground or ground + launch * t - 0.5 * g * t * t
+        end
+    else
+        local since = now - (s.lastLandAt or -math.huge)
+        stay = y
+        if since > gt + 0.08 then
+            p = 0
+            go = y
+        else
+            local t = (L + since) - gt
+            if t <= 0 then
+                go = y
+            else
+                t = t % (airtime + gt)
+                go = t > airtime and y or y + launch * t - 0.5 * g * t * t
+            end
+        end
+    end
+
+    return SA.bestHeight(stay, go, p)
+end
+
+-- the share of a body standing at root height y (give or take sigma) that
+-- an aim at height a lands inside
+function SA.inside(a, y, sigma)
+    local lo = (a - SA.BODY_HIGH - y) / sigma
+    local hi = (a - SA.BODY_LOW - y) / sigma
+    return 1 / (1 + math.exp(-1.702 * hi)) - 1 / (1 + math.exp(-1.702 * lo))
+end
+
+-- the aim height most likely to be inside the body, whether they stay down
+-- (stay) or go straight back up (go, with odds p), and that likelihood
+function SA.bestHeight(stay, go, p)
+    if p <= 0 or math.abs(go - stay) < 1e-6 then return stay + (SA.BODY_LOW + SA.BODY_HIGH) / 2, 1 end
+    local best, bestScore = stay, -1
+    local a, to = math.min(stay, go) - 3, math.max(stay, go) + 3
+    while a <= to do
+        local score = (1 - p) * SA.inside(a, stay, SA.SIGMA_STAY) + p * SA.inside(a, go, SA.SIGMA_GO)
+        if score > bestScore then best, bestScore = a, score end
+        a = a + 0.1
+    end
+    return best, bestScore
+end
+
+-- the point to send, and the chance it lands, for a lead of L seconds from origin
+function SA.predict(s, now, L, origin)
+    local last = s.last
+    local px, pz = s.x[last], s.z[last]
+    local dx, dz = px - origin.X, pz - origin.Z
+    local d = math.sqrt(dx * dx + dz * dz)
+    if d < 1e-3 then dx, dz, d = 1, 0, 1 end
+    local ax, az = dx / d, dz / d
+    local c, q, chance = SA.horizontal(s, now, L, ax, az)
+    local x, z = px - c * az + q * ax, pz + c * ax + q * az
+    local y, sure = SA.vertical(s, now, L, x, z)
+    return Vector3.new(x, y, z), chance * sure
+end
+
+-- The delay learned on top of the round trip, per weapon: a score for every
+-- candidate delay on a grid, from a prior around the usual figure (or the one
+-- saved last session) plus, for every resolved shot, how well that candidate
+-- explains whether it landed.
+function SA.calFor(which)
+    local cal = SA.cal[which]
+    if cal then return cal end
+    cal = { score = {}, n = 0, best = SA.saved and SA.saved[which] or SA.PRIOR_DELAY, shots = 0, used = 0 }
+    cal.centre = cal.best
+    for b = SA.GRID_LO, SA.GRID_HI + 1e-9, SA.GRID_STEP do
+        cal.n = cal.n + 1
+        local d = (b - cal.centre) / SA.PRIOR_WIDTH
+        cal.score[cal.n] = -0.5 * d * d
+    end
+    SA.cal[which] = cal
+    return cal
+end
+
+function SA.delay(which)
+    if not Aim.Learn then return SA.PRIOR_DELAY end
+    return SA.calFor(which).best
+end
+
+function SA.load()
+    if typeof(readfile) ~= "function" or typeof(isfile) ~= "function" then return end
+    pcall(function()
+        if not isfile(SA.file) then return end
+        local data = game:GetService("HttpService"):JSONDecode(readfile(SA.file))
+        if type(data) == "table" then
+            SA.saved = {
+                Gun = tonumber(data.Gun) and math.clamp(tonumber(data.Gun), SA.GRID_LO, SA.GRID_HI) or nil,
+                Knife = tonumber(data.Knife) and math.clamp(tonumber(data.Knife), SA.GRID_LO, SA.GRID_HI) or nil,
+            }
+        end
+    end)
+end
+
+function SA.save()
+    if typeof(writefile) ~= "function" then return end
+    pcall(function()
+        if typeof(makefolder) == "function" and typeof(isfolder) == "function" and not isfolder('MM2Assist') then
+            makefolder('MM2Assist')
+        end
+        writefile(SA.file, game:GetService("HttpService"):JSONEncode({
+            Gun = SA.cal.Gun and SA.cal.Gun.best or (SA.saved and SA.saved.Gun),
+            Knife = SA.cal.Knife and SA.cal.Knife.best or (SA.saved and SA.saved.Knife),
+        }))
+    end)
+end
+
+function SA.forgetLead()
+    SA.cal, SA.saved = {}, nil
+    if typeof(delfile) == "function" and typeof(isfile) == "function" then
+        pcall(function() if isfile(SA.file) then delfile(SA.file) end end)
+    end
+end
+
+-- where they were drawn at time t, from their history
+function SA.positionAt(s, t)
+    if s.last < s.first or t < s.t[s.first] or t > s.t[s.last] then return nil end
+    local lo, hi = s.first, s.last
+    while hi - lo > 1 do
+        local mid = math.floor((lo + hi) / 2)
+        if s.t[mid] <= t then lo = mid else hi = mid end
+    end
+    local span = s.t[hi] - s.t[lo]
+    local a = span > 0 and (t - s.t[lo]) / span or 0
+    return Vector3.new(s.x[lo] + (s.x[hi] - s.x[lo]) * a, s.y[lo] + (s.y[hi] - s.y[lo]) * a,
+        s.z[lo] + (s.z[hi] - s.z[lo]) * a)
+end
+
+-- whether the line from origin through aim passes through a body whose root
+-- is at root: the torso and arms a stud either side, the head narrower
+function SA.through(origin, aim, root)
+    local dx, dy, dz = aim.X - origin.X, aim.Y - origin.Y, aim.Z - origin.Z
+    local flat = dx * dx + dz * dz
+    if flat < 1e-6 then return false end
+    local s = ((root.X - origin.X) * dx + (root.Z - origin.Z) * dz) / flat
+    if s < 0 then return false end
+    local cx, cz = origin.X + dx * s - root.X, origin.Z + dz * s - root.Z
+    local h = origin.Y + dy * s - root.Y
+    if h < SA.BODY_LOW or h > SA.BODY_HIGH then return false end
+    return math.sqrt(cx * cx + cz * cz) <= (h > 0.9 and 0.6 or 1)
+end
+
+-- a redirected shot, kept until it is known whether it landed
+function SA.record(which, plan, origin, aim, now)
+    if #SA.pending >= 24 then return end
+    local hum = plan.char and plan.char:FindFirstChildOfClass("Humanoid")
+    local ok, health = pcall(function() return hum.Health end)
+    if not ok or type(health) ~= "number" or health <= 0 then return end
+    SA.pending[#SA.pending + 1] = {
+        which = which, at = now, track = plan.entry, hum = hum, health = health,
+        origin = origin, aim = aim, rtt = plan.rtt or cachedPing, flight = plan.flight or 0,
+        lead = plan.travel or 0, landed = false,
+    }
+end
+
+function SA.resolve(now)
+    local pending = SA.pending
+    local index = 1
+    while index <= #pending do
+        local shot = pending[index]
+        if not shot.landed then
+            local ok, health = pcall(function() return shot.hum.Parent and shot.hum.Health end)
+            if not ok or not health or health < shot.health - 0.01 then shot.landed = true end
+        end
+        local due = shot.at + shot.rtt + shot.flight + SA.GRID_HI + SA.WINDOW_HIT
+        if now < due then
+            index = index + 1
+        else
+            table.remove(pending, index)
+            shotStats.resolved = shotStats.resolved + 1
+            if shot.landed then shotStats.hits = shotStats.hits + 1 end
+            if Aim.Learn then SA.learn(shot) end
+        end
+    end
+end
+
+-- every candidate delay: would the shot have gone through them, had the delay
+-- been that? The ones that agree with what really happened gain. A shot every
+-- candidate agrees on (someone standing still) teaches nothing and is skipped.
+-- A delay past the end of what was seen of them counts as a miss: a body that
+-- is gone had already gone down, so this shot cannot have been what did it
+function SA.learn(shot)
+    local cal = SA.calFor(shot.which)
+    local verdicts, agree, known = {}, 0, 0
+    for i = 1, cal.n do
+        local b = SA.GRID_LO + (i - 1) * SA.GRID_STEP
+        local at = SA.positionAt(shot.track, shot.at + shot.rtt + b + shot.flight)
+        if at then
+            known = known + 1
+            verdicts[i] = SA.through(shot.origin, shot.aim, at)
+            if verdicts[i] then agree = agree + 1 end
+        end
+    end
+    cal.shots = cal.shots + 1
+    if known < cal.n / 2 or agree == 0 or agree == known then return end
+    cal.used = cal.used + 1
+
+    local best, bestScore = cal.best, -math.huge
+    for i = 1, cal.n do
+        local b = SA.GRID_LO + (i - 1) * SA.GRID_STEP
+        local d = (b - cal.centre) / SA.PRIOR_WIDTH
+        local prior = -0.5 * d * d
+        local verdict = verdicts[i] == true
+        local p
+        if shot.landed then p = verdict and 0.85 or 0.05 else p = verdict and 0.2 or 0.95 end
+        local score = prior + (cal.score[i] - prior) * SA.FORGET + math.log(p)
+        cal.score[i] = score
+        if score > bestScore then best, bestScore = b, score end
+    end
+    cal.best = best
+    SA.save()
+end
+
+-- one team per side: town is the innocents, sheriff and hero; the rest of the
+-- roles the game hands out (murderer, zombies and survivors, freezers and
+-- runners) are each their own
+SA.TEAMS = { Innocent = 'town', Sheriff = 'town', Hero = 'town' }
+
+-- the role the round gave them, which is what sides go by; the weapon in their
+-- hands only fills in when the round has not said (a knife is the murderer's)
+function SA.teamOf(plr)
+    local entry = RoundData[plr.Name]
+    if entry and entry.Dead then return nil, true end
+    local role = entry and entry.Role
+    if role == nil then
+        local held = heldWeapon(plr.Character)
+        role = held == "Knife" and "Murderer" or held == "Gun" and "Hero" or nil
+    end
+    return role and (SA.TEAMS[role] or role) or nil, false
+end
+
+-- who counts as an enemy right now. anyone on another side than you; everyone
+-- when there are no sides (a free for all, or no round); and never someone
+-- the game has not told you the role of while you are town, since shooting an
+-- innocent as sheriff kills you
+function SA.refreshTeams()
+    local mine = SA.teamOf(LocalPlayer)
+    SA.myTeam = mine
+    local sides = false
+    if mine then
+        for _, plr in ipairs(Players:GetPlayers()) do
+            if plr ~= LocalPlayer and isAlivePlr(plr) then
+                local theirs = SA.teamOf(plr)
+                if theirs and theirs ~= mine then sides = true break end
+            end
+        end
+    end
+    SA.sides = sides
+end
+
+function SA.isEnemy(plr)
+    if not SA.sides then return true end
+    local theirs, dead = SA.teamOf(plr)
+    if dead then return false end
+    if theirs == nil then return SA.myTeam ~= 'town' end
+    return theirs ~= SA.myTeam
+end
+
+function SA.allowed(plr, anyone)
+    if plr == LocalPlayer or not isAlivePlr(plr) then return false end
+    if anyone then return true end
+    return SA.isEnemy(plr)
+end
+
+-- a clear line from the weapon to the point, whatever transparent things are
+-- in the way
+local function clearPath(origin, target, char)
+    local direction = target - origin
+    local result = weaponCast(origin, direction, { char })
+    if not result then return true end
+    return (result.Position - origin).Magnitude >= direction.Magnitude - 2
+end
+
+-- the lead for a shot from origin at this target: round trip, the learned
+-- delay, your trim and, for the knife, its flight - solved a few times, since
+-- the flight depends on where the lead puts them
+function SA.solve(track, which, origin, now)
+    local base = cachedPing + SA.delay(which) + (tonumber(Aim.Trim) or 0) / 1000
+    local root = Vector3.new(track.x[track.last], track.y[track.last], track.z[track.last])
+    local flight = 0
+    local lead = math.clamp(base, 0, SA.MAX_LEAD)
+    local aim, chance = SA.predict(track, now, lead, origin)
+    if which == 'Knife' and SA.knifeSpeed > 1 then
+        for _ = 1, 3 do
+            flight = (aim - origin).Magnitude / SA.knifeSpeed
+            lead = math.clamp(base + flight, 0, SA.MAX_LEAD)
+            aim, chance = SA.predict(track, now, lead, origin)
+        end
+    end
+    return aim, chance, lead, flight, root
+end
+
+-- targets for a shot from origin going along dir, best first: the one nearest
+-- that direction, on screen, inside the fov if one is set
+function SA.candidates(origin, dir, anyone)
+    local list = {}
+    local unit = dir.Magnitude > 1e-3 and dir.Unit or Camera.CFrame.LookVector
+    local fov = tonumber(Aim.Fov) or 0
+    local now = os.clock()
+    for _, plr in ipairs(Players:GetPlayers()) do
+        local track = SA.tracks[plr]
+        -- only someone seen a moment ago, in the body they have now
+        if track and track.last >= track.first and now - track.t[track.last] < 0.5
+            and track.char == plr.Character and track.root and track.root:IsDescendantOf(Workspace)
+            and SA.allowed(plr, anyone)
+        then
+            local root = track.root
+            local toward = root.Position - origin
+            if toward.Magnitude > 0.5 then
+                local angle = math.deg(math.acos(math.clamp(unit:Dot(toward.Unit), -1, 1)))
+                local _, onScreen = Camera:WorldToViewportPoint(root.Position)
+                if onScreen and (fov <= 0 or angle <= fov) then
+                    list[#list + 1] = { plr = plr, track = track, root = root, angle = angle }
+                end
+            end
+        end
+    end
+    table.sort(list, function(a, b) return a.angle < b.angle end)
+    return list
+end
+
+-- a plan: who, and the point to send. only would-be targets with a clear line
+-- to that point are taken while the wall check is on (the server casts to it)
+function SA.plan(which, origin, dir, now, anyone, only)
+    if not origin then return nil end
+    local list
+    if only then
+        local track = SA.tracks[only]
+        if not track or not track.root or not isAlivePlr(only) then return nil end
+        list = { { plr = only, track = track, root = track.root, angle = 0 } }
+    else
+        list = SA.candidates(origin, dir, anyone)
+    end
+    for rank, candidate in ipairs(list) do
+        if rank > 4 then break end
+        local track = candidate.track
+        local aim, chance, lead, flight, root = SA.solve(track, which, origin, now)
+        local char = track.char
+        if not Aim.WallCheck or clearPath(origin, aim, char) then
+            return {
+                plr = candidate.plr,
+                char = char,
+                root = candidate.root,
+                part = candidate.root,
+                entry = track,
+                isKnife = which == 'Knife',
+                fallback = CFrame.new(aim),
+                aim = aim,
+                chance = chance,
+                travel = lead,
+                flight = flight,
+                rtt = cachedPing,
+                predicted = aim,
+                from = root,
+                stamp = now,
+                ahead = not clearPath(origin, candidate.root.Position, char),
+            }
+        end
+    end
+    return nil
 end
 
 local knifeSpeedStat = nil
 
 local function onThrowingKnifeAdded(instance)
     local ok, speed = pcall(function() return instance:GetAttribute("ThrowSpeed") end)
-    if ok and typeof(speed) == "number" and speed > 1 and speed ~= KnifeTune.Speed then
-        KnifeTune.Speed = speed
+    if ok and typeof(speed) == "number" and speed > 1 and speed ~= SA.knifeSpeed then
+        SA.knifeSpeed = speed
         if knifeSpeedStat then
             pcall(function() knifeSpeedStat.Set(('%d studs/s'):format(speed)) end)
         end
@@ -2207,9 +1289,6 @@ track(CollectionService:GetInstanceAddedSignal("ThrowingKnife"):Connect(onThrowi
 for _, instance in ipairs(CollectionService:GetTagged("ThrowingKnife")) do
     task.spawn(onThrowingKnifeAdded, instance)
 end
-
-local gunPlan = nil
-local knifePlan = nil
 
 local function findGunOrigin()
     local char = LocalPlayer.Character
@@ -2225,64 +1304,7 @@ local function findKnifeOrigin()
     return handle and handle.Position
 end
 
-local function solveAim(plan, origin, now)
-    local entry = plan.entry
-    local rootPos = plan.root.Position
-    local partPos = plan.part.Position
-    local sinceSample = now - entry.time
-    if sinceSample < 0 then sinceSample = 0 end
-    if sinceSample > SAMPLE_STALE then sinceSample = SAMPLE_STALE end
-
-    local airMode = Advanced.Enabled and Advanced.Air or Aim.Air
-    local offset = partPos - rootPos
-    if entry.airborne and (airMode == 'Feet' or airMode == 'Safe') then
-        offset = Vector3.new(offset.X, -plan.hipOffset, offset.Z)
-    end
-
-    local mode = chooseModel(entry)
-    if mode == 'Off' then
-        return rootPos + offset, rootPos, 0, (partPos - origin).Magnitude, rootPos, mode
-    end
-
-    local state = plan.state
-    local arm = plan.arm
-    local passes = filterSettings().passes
-
-    local distance = (partPos - origin).Magnitude
-    local travelTime = travelTimeFor(state, entry, distance, arm)
-    local predicted = predictRoot(entry, rootPos, sinceSample, travelTime, mode)
-
-    -- A fixed pass count stops wherever it happens to be. Converging runs the
-    -- lead against its own answer until the point stops moving, so the distance
-    -- the travel time is solved from is the distance the shot actually covers.
-    local tolerance = Advanced.Enabled
-        and Choice.Adv.Converge.value[Choice.pick(Choice.Adv.Converge,
-            Advanced.Perfection and 'Exhaustive' or Advanced.Converge)]
-        or nil
-
-    if tolerance then
-        for _ = 2, Adapt.MaxPasses do
-            local previous = predicted
-            distance = ((predicted + offset) - origin).Magnitude
-            travelTime = travelTimeFor(state, entry, distance, arm)
-            predicted = predictRoot(entry, rootPos, sinceSample, travelTime, mode)
-            if (predicted - previous).Magnitude <= tolerance then break end
-        end
-    else
-        for _ = 2, passes do
-            distance = ((predicted + offset) - origin).Magnitude
-            travelTime = travelTimeFor(state, entry, distance, arm)
-            predicted = predictRoot(entry, rootPos, sinceSample, travelTime, mode)
-        end
-    end
-
-    -- what the weapon-match scoring horizon follows
-    Adapt.lastTravel = travelTime
-
-    return predicted + offset, rootPos, travelTime, distance, predicted, mode
-end
-
-local function noteShot(plan, reason, origin, sent, aimed, predictedRoot, travel, model)
+local function noteShot(plan, reason, origin, sent, aimed)
     if not Debug.Enabled or #shotEvents >= 24 then return end
     shotEvents[#shotEvents + 1] = {
         at = os.clock(),
@@ -2293,129 +1315,42 @@ local function noteShot(plan, reason, origin, sent, aimed, predictedRoot, travel
         origin = origin,
         sent = sent,
         aimed = aimed,
-        root = plan ~= nil and plan.root ~= nil and plan.root.Position or nil,
-        predicted = predictedRoot,
-        travel = travel,
-        model = model,
-        part = plan ~= nil and plan.part ~= nil and plan.part.Name or nil,
+        root = plan ~= nil and plan.from or nil,
+        predicted = plan ~= nil and plan.predicted or nil,
+        travel = plan ~= nil and plan.travel or nil,
+        chance = plan ~= nil and plan.chance or nil,
+        part = 'body',
     }
 end
 
-local function resolveRedirect(plan, originCFrame, sentCFrame)
+-- the shot leaving now: who it goes to and where. the direction you actually
+-- fired in ranks the targets, so this follows your aim on a phone as well as
+-- with a mouse. a shot the trigger bot fired stays on the person it fired at
+local function resolveRedirect(which, claimed, originCFrame, sentCFrame)
     shotStats.seen = shotStats.seen + 1
-
     local origin = originCFrame.Position
     local sent = typeof(sentCFrame) == "CFrame" and sentCFrame.Position or nil
+    local now = os.clock()
+
+    local dir = sent and (sent - origin) or Camera.CFrame.LookVector
+    local plan
+    if claimed then
+        plan = SA.plan(which, origin, dir, now, false, claimed.plr)
+    else
+        plan = SA.plan(which, origin, dir, now, Choice.pick(Choice.Targets, Aim.Targets) == 'Anyone')
+    end
 
     if not plan then
         shotStats.suppressed = shotStats.suppressed + 1
-        noteShot(nil, "no target", origin, sent, nil, nil, nil, nil)
+        noteShot(nil, "no target", origin, sent, nil)
         return nil
     end
 
-    if os.clock() - plan.stamp > PLAN_STALE then
-        shotStats.suppressed = shotStats.suppressed + 1
-        noteShot(plan, "plan stale", origin, sent, nil, nil, nil, nil)
-        return nil
-    end
-
-    -- advanced is going for accuracy, so it redirects every shot regardless of
-    -- what the normal tab's shot filter is set to, and a shot the trigger bot
-    -- fired was fired to hit, so it is never left to the roll either
-    local now = os.clock()
-    local chance = (Advanced.Enabled or now < Trigger.forceUntil) and 100 or Aim.ShotChance
-    if chance < 100 and math.random() * 100 >= chance then
-        shotStats.suppressed = shotStats.suppressed + 1
-        noteShot(plan, "chance roll", origin, sent, nil, nil, nil, nil)
-        return nil
-    end
-
-    -- the auto lead arm is chosen here, per real shot, and only a shot that
-    -- actually got solved and sent is logged for it. a sure shot from the
-    -- trigger bot is not the place to try a longer or shorter lead
-    plan.arm = pickArm(plan.state)
-    if plan.sure and plan.arm then plan.arm = 2 end
-
-    local aim, predictedRoot, travel, model
-    local ok, solved, _, solvedTravel, solvedDistance, solvedRoot, solvedModel = pcall(solveAim, plan, origin, now)
-    if ok and typeof(solved) == "Vector3" then
-        aim, predictedRoot, travel, model = solved, solvedRoot, solvedTravel, solvedModel
-        logLead(plan.state, plan.char, solvedDistance, solvedTravel, plan.arm, now)
-    elseif plan.fallback then
-        aim, model = plan.fallback.Position, plan.model
-    else
-        shotStats.suppressed = shotStats.suppressed + 1
-        noteShot(plan, "solve failed", origin, sent, nil, nil, nil, nil)
-        return nil
-    end
-
-    lastModelUsed = model or '-'
+    SA.lastPlan = plan
+    SA.record(which, plan, origin, plan.aim, now)
     shotStats.redirected = shotStats.redirected + 1
-    noteShot(plan, "redirected", origin, sent, aim, predictedRoot, travel, model)
-    return CFrame.new(aim)
-end
-
--- ahead, for the trigger bot at 0 ms, also takes someone still behind cover
--- whose solved point - where the lead says the shot will find them - is out
--- in the open, and marks the plan so
-local function buildPlan(isKnife, origin, now, allow, ahead)
-    if not origin then return nil end
-
-    local candidates = scanTargets(isKnife, allow)
-    if #candidates == 0 then return nil end
-
-    for rank, candidate in ipairs(candidates) do
-        if rank > MAX_CANDIDATES then break end
-
-        local plr = candidate.plr
-        local char = candidate.char
-        local root = char:FindFirstChild("HumanoidRootPart")
-        local entry = motion[plr.Name]
-
-        if root and entry then
-            -- no auto lead arm here: this is the standing solve every frame
-            -- runs, not a shot, so it takes the learned centre and logs nothing
-            local plan = {
-                plr = plr,
-                entry = entry,
-                root = root,
-                char = char,
-                hipOffset = feetOffset(char),
-                state = isKnife and KnifeLead or GunLead,
-                isKnife = isKnife,
-                arm = nil,
-                stamp = now,
-            }
-
-            for _, part in ipairs(candidate.parts) do
-                plan.part = part
-
-                local open = clearPath(origin, part.Position, char)
-                if open or ahead then
-                    local aim, _, travel, _, _, model = solveAim(plan, origin, now)
-
-                    -- strict also demands the solved point be reachable, loose
-                    -- only asks that the target is not behind a wall right now.
-                    -- a plan made ahead needs its solved point properly clear
-                    local usable
-                    if open then
-                        usable = Aim.WallCheck ~= 'Strict' or clearPath(origin, aim, char)
-                    else
-                        usable = Trigger.clear(origin, aim, char)
-                    end
-                    if usable then
-                        plan.fallback = CFrame.new(aim)
-                        plan.model = model
-                        plan.travel = travel
-                        plan.ahead = not open
-                        return plan
-                    end
-                end
-            end
-        end
-    end
-
-    return nil
+    noteShot(plan, "redirected", origin, sent, plan.aim)
+    return CFrame.new(plan.aim)
 end
 
 local proofQueue = {}
@@ -2479,14 +1414,13 @@ local function debugTick(now)
             local moved = event.sent and event.aimed and (event.aimed - event.sent).Magnitude or nil
             local lead = event.root and event.predicted and flatDistance(event.predicted, event.root) or nil
             if debugLog then
-                debugLog:Log(("%s -> %s %s | moved %s | lead %s | travel %s | maths %s"):format(
+                debugLog:Log(("%s -> %s | moved %s | lead %s | travel %s | chance %s"):format(
                     tag,
                     event.target or "?",
-                    event.part or "?",
                     moved and ("%.1f studs"):format(moved) or "n/a",
                     lead and ("%.1f studs"):format(lead) or "n/a",
                     event.travel and ("%.3fs"):format(event.travel) or "n/a",
-                    event.model or "n/a"))
+                    event.chance and ("%d%%"):format(math.floor(event.chance * 100 + 0.5)) or "n/a"))
             end
             showMarker("aim", event.aimed)
 
@@ -2537,11 +1471,11 @@ end
 -- reactions, the way it would for anyone. It only ever uses a weapon already
 -- in your hands; nothing here equips anything.
 --
--- It and silent aim work off one solve. The trigger bot builds its plans with
--- the same solver, only hunting with its own target filter, and every shot it
--- fires carries the plan it was fired on to the hook, which puts that shot on
--- that plan - so the shot lands where the trigger bot decided to fire, on the
--- person it decided to fire at, even with silent aim itself switched off.
+-- It and silent aim work off one solve. The trigger bot plans with silent aim
+-- v2's predictor, only ever at enemies (as sheriff that is the murderer alone,
+-- so it cannot get you killed), and every shot it fires carries its target to
+-- the hook, which solves that shot again as it leaves and puts it on them -
+-- even with silent aim itself switched off.
 
 function Trigger.delay()
     local base = math.max(0, tonumber(Trigger.Reaction) or 0) / 1000
@@ -2584,23 +1518,16 @@ function Trigger.ahead()
     return (tonumber(Trigger.Reaction) or 0) <= 0
 end
 
--- The trigger bot's own plans, from the same solver silent aim uses. The gun
--- set to murderer only hunts the murderer whoever silent aim is locked on to,
--- so an innocent by your crosshair never hides the murderer from it.
+-- The trigger bot's own plans: enemies only, nearest where the camera looks
 function Trigger.buildPlans(now, char)
     local plans = Trigger.plans
     plans.Gun, plans.Knife = nil, nil
-    local ahead = Trigger.ahead()
+    local look = Camera.CFrame.LookVector
     if Trigger.Gun and char and char:FindFirstChild("Gun") then
-        local murdererOnly = Choice.pick(Choice.Trigger.GunTargets, Trigger.GunTargets) == 'Murderer only'
-        if not murdererOnly and not ahead then
-            plans.Gun = gunPlan
-        else
-            plans.Gun = buildPlan(false, findGunOrigin(), now, murdererOnly and isMurderer or nil, ahead)
-        end
+        plans.Gun = SA.plan('Gun', findGunOrigin(), look, now, false)
     end
     if Trigger.Throw and char and char:FindFirstChild("Knife") then
-        plans.Knife = ahead and buildPlan(true, findKnifeOrigin(), now, nil, true) or knifePlan
+        plans.Knife = SA.plan('Knife', findKnifeOrigin(), look, now, false)
     end
 end
 
@@ -2623,17 +1550,12 @@ end
 function Trigger.sees(which, plan, origin, now)
     if not plan or not plan.part or not plan.fallback or now - plan.stamp > PLAN_STALE then return false end
 
-    if which == 'Gun' then
-        -- shooting an innocent as sheriff gets you killed
-        if Choice.pick(Choice.Trigger.GunTargets, Trigger.GunTargets) == 'Murderer only'
-            and not (plan.plr and isMurderer(plan.plr))
-        then
-            return false
-        end
-    else
+    if which == 'Knife' then
         local reach = Choice.valueOf(Choice.Trigger.ThrowRange, Trigger.ThrowRange) or math.huge
         if (plan.part.Position - origin).Magnitude > reach then return false end
     end
+    -- someone still behind cover is only fired at on the prediction itself, at 0 ms
+    if plan.ahead and not Trigger.ahead() then return false end
 
     -- them, and the point the shot will actually be sent at, both in the
     -- open. a plan made ahead only needs the point: they are still stepping
@@ -2661,20 +1583,18 @@ function Trigger.sees(which, plan, origin, now)
 end
 
 -- Sure shots only: whether the shot would land now, and if not, what it is
--- waiting on. Returns true, or false and the reason.
+-- waiting on. The chance is the share of their own past moves the shot would
+-- have caught. Returns true, or false and the reason.
 function Trigger.sure(plan)
-    local spread, odds = Adapt.spread(plan.entry, plan.travel)
-    local limit = plan.part and plan.part.Name == "Head" and Trigger.SureHead or Trigger.SureBody
     if plan.ahead then return false, 'waiting to see them for a sure shot' end
-    if spread == math.huge then return false, 'learning how ' .. plan.char.Name .. ' moves' end
-    if spread > limit or odds < Trigger.SureOdds then
-        return false, ('waiting for a sure shot (%.1f st, %d%%)'):format(spread, math.floor(odds * 100 + 0.5))
+    local chance = plan.chance or 0
+    if chance < Trigger.SureOdds then
+        return false, ('waiting for a sure shot (%d%%)'):format(math.floor(chance * 100 + 0.5))
     end
     return true
 end
 
 function Trigger.fireGun(tool, plan, now)
-    Trigger.forceUntil = now + Trigger.Confirm
     Trigger.claim('Gun', plan, now)
     if Trigger.gunMethod() == 'Remote' then
         local shoot = tool:FindFirstChild("Shoot")
@@ -2692,7 +1612,6 @@ function Trigger.throwKnife(tool, plan, now)
     local thrown = events and events:FindFirstChild("KnifeThrown")
     local handle = tool:FindFirstChild("Handle")
     if not thrown or not handle then return false end
-    Trigger.forceUntil = now + Trigger.Confirm
     Trigger.claim('Knife', plan, now)
     return (pcall(function() thrown:FireServer(handle.CFrame, plan.fallback) end))
 end
@@ -2775,8 +1694,7 @@ function Trigger.run(which, s, now)
         return
     end
 
-    -- the shot waits for the moment it cannot miss, and goes out on the
-    -- learned centre of the lead rather than one of its trial lengths
+    -- the shot waits for the moment it cannot miss
     plan.sure = false
     if Trigger.Sure then
         local ok, reason = Trigger.sure(plan)
@@ -2814,13 +1732,13 @@ function Trigger.step(now)
     Trigger.run('Knife', Trigger.knife, now)
 end
 
+-- every frame: everyone's movement, the sides, the shots waiting to be known
+-- as hits or misses, and the trigger bot. silent aim itself solves each shot
+-- as it leaves, in the hook below
 track(PreSimulation:Connect(function()
-    if Unloading or not (Aim.Enabled or Trigger.Gun or Trigger.Throw) then
-        gunPlan, knifePlan = nil, nil
-        return
-    end
+    if Unloading or not (Aim.Enabled or Trigger.Gun or Trigger.Throw or #SA.pending > 0) then return end
 
-    local ok = pcall(function()
+    pcall(function()
         local now = os.clock()
         cachedPing = cachedPing + (getPing() - cachedPing) * 0.2
         if lastTick > 0 then
@@ -2831,31 +1749,12 @@ track(PreSimulation:Connect(function()
         end
         lastTick = now
 
-        for _, plr in ipairs(Players:GetPlayers()) do
-            if plr ~= LocalPlayer then
-                local char = plr.Character
-                local root = char and char:FindFirstChild("HumanoidRootPart")
-                if root then sampleMotion(plr, root, now) end
-            end
-        end
-
-        verifyLead(GunLead, now)
-        verifyLead(KnifeLead, now)
-
-        -- only the weapon in your hands gets a plan: nothing else can fire, and
-        -- the advanced scoring horizon follows whichever plan solved last, so
-        -- solving both mixed the gun's lead into the knife's every frame
-        local char = LocalPlayer.Character
-        gunPlan = char and char:FindFirstChild("Gun") and buildPlan(false, findGunOrigin(), now) or nil
-        knifePlan = buildPlan(true, findKnifeOrigin(), now)
-
+        SA.sampleAll(now)
+        SA.refreshTeams()
+        SA.resolve(now)
         Trigger.step(now)
         debugTick(now)
     end)
-
-    if not ok then
-        gunPlan, knifePlan = nil, nil
-    end
 end))
 
 local hasNamecallHook = typeof(hookmetamethod) == "function" and typeof(getnamecallmethod) == "function"
@@ -2865,7 +1764,7 @@ if hasNamecallHook then
     local trigger = Trigger
 
     -- silent aim redirects here, and so does every shot the trigger bot
-    -- fires: that one goes on the plan it was fired on, silent aim on or off.
+    -- fires: that one stays on the person it fired at, silent aim on or off.
     -- seeing a shot leave is also what confirms one it asked the gun to fire
     local function onNamecall(self, ...)
         if Unloading or not (Aim.Enabled or trigger.Gun or trigger.Throw)
@@ -2881,7 +1780,7 @@ if hasNamecallHook then
                 local origin, sent = ...
                 local claimed = trigger.claimed('Gun')
                 if (Aim.Enabled or claimed) and typeof(origin) == "CFrame" then
-                    local redirect = resolveRedirect(claimed or gunPlan, origin, sent)
+                    local redirect = resolveRedirect('Gun', claimed, origin, sent)
                     if redirect then
                         local fire = self.FireServer
                         if typeof(fire) == "function" then
@@ -2900,7 +1799,7 @@ if hasNamecallHook then
                 local handle, sent = ...
                 local claimed = trigger.claimed('Knife')
                 if (Aim.Enabled or claimed) and typeof(handle) == "CFrame" then
-                    local redirect = resolveRedirect(claimed or knifePlan, handle, sent)
+                    local redirect = resolveRedirect('Knife', claimed, handle, sent)
                     if redirect then
                         local fire = self.FireServer
                         if typeof(fire) == "function" then
@@ -3627,23 +2526,21 @@ track(resolveEvent("PreRender", "RenderStepped"):Connect(function()
     pcall(Fling.touchRestore)
 end))
 
-local SilentAimTab = Window:CreateTab({ Title = 'silent aim' })
-
-local solverStat
+local SilentAimTab = Window:CreateTab({ Title = 'silent aim v2' })
 
 do
-    local AimSection = SilentAimTab:CreateSection('aim')
+    local MainSection = SilentAimTab:CreateSection('silent aim v2')
 
-    addStat(AimSection, {
+    addStat(MainSection, {
         Title = 'hook api',
         Value = hasNamecallHook and 'available' or 'missing',
         Color = hasNamecallHook and Color3.fromRGB(126, 217, 87) or Color3.fromRGB(255, 96, 106),
     })
 
-    AimSection:Toggle({
+    MainSection:Toggle({
         Title = 'silent aim',
-        Description = 'redirects the shot itself - your click, animation and origin stay as fired',
-        Flag = 'mm2_silent_aim',
+        Description = 'every gun shot and knife throw goes to the target nearest where you fired, led by how that person really moves',
+        Flag = 'mm2_sa2',
         Callback = function(state)
             if state and not hasNamecallHook then
                 Onyx:Notify({
@@ -3657,161 +2554,125 @@ do
         end,
     })
 
-    AimSection:Dropdown({
-        Title = 'aim part',
-        Description = 'auto takes the head only on a shot that is easy anyway, body the rest of the time',
-        Values = Choice.Part.order,
-        Default = Choice.Part.default,
-        Flag = 'mm2_silent_aim_part',
-        Callback = function(value) Aim.AimPart = Choice.pick(Choice.Part, value) end,
+    MainSection:Dropdown({
+        Title = 'targets',
+        Description = 'enemies works in every mode: the murderer while you are sheriff or hero, everyone while you are the murderer, the other side in infection or freeze tag, everyone when there are no sides. anyone takes whoever is nearest your shot',
+        Values = Choice.Targets.order,
+        Default = Choice.Targets.default,
+        Flag = 'mm2_sa2_targets',
+        Callback = function(value) Aim.Targets = Choice.pick(Choice.Targets, value) end,
     })
 
-    AimSection:Dropdown({
+    MainSection:Toggle({
         Title = 'wall check',
-        Description = 'strict needs a clear line to the solved point too, loose only to the target',
-        Values = Choice.Wall.order,
-        Default = Choice.Wall.default,
-        Flag = 'mm2_silent_aim_wallcheck',
-        Callback = function(value) Aim.WallCheck = Choice.pick(Choice.Wall, value) end,
+        Description = 'only redirects when the shot has a clear line to the point it is sent to',
+        Flag = 'mm2_sa2_wallcheck',
+        Default = true,
+        Callback = function(state) Aim.WallCheck = state end,
     })
 
-    AimSection:Dropdown({
-        Title = 'range',
-        Description = 'how far the search reaches',
-        Values = Choice.Range.order,
-        Default = Choice.Range.default,
-        Flag = 'mm2_silent_aim_range',
-        Callback = function(value) Aim.MaxRange = Choice.valueOf(Choice.Range, value) end,
-    })
-
-    AimSection:Dropdown({
-        Title = 'shots redirected',
-        Description = 'the rest fire exactly where you aimed, untouched',
-        Values = Choice.Shots.order,
-        Default = Choice.Shots.default,
-        Flag = 'mm2_silent_aim_shots',
-        Callback = function(value) Aim.ShotChance = Choice.valueOf(Choice.Shots, value) end,
-    })
-end
-
-do
-    local MathSection = SilentAimTab:CreateSection('maths')
-
-    MathSection:Dropdown({
-        Title = 'prediction maths',
-        Description = 'which solver works out where they will be when the shot lands',
-        Values = Choice.Math.order,
-        Default = Choice.Math.default,
-        Flag = 'mm2_silent_aim_math',
-        Callback = function(value) Aim.Math = Choice.pick(Choice.Math, value) end,
-    })
-
-    MathSection:Dropdown({
-        Title = 'motion filter',
-        Description = 'how hard the raw motion reading is filtered, and how many lead passes run',
-        Values = Choice.Filter.order,
-        Default = Choice.Filter.default,
-        Flag = 'mm2_silent_aim_filter',
-        Callback = function(value) Aim.Filter = Choice.pick(Choice.Filter, value) end,
-    })
-
-    MathSection:Dropdown({
-        Title = 'air handling',
-        Description = 'where on them it aims while they are mid jump',
-        Values = Choice.Air.order,
-        Default = Choice.Air.default,
-        Flag = 'mm2_silent_aim_air',
-        Callback = function(value) Aim.Air = Choice.pick(Choice.Air, value) end,
-    })
-
-    MathSection:Dropdown({
-        Title = 'ping',
-        Description = 'how much of your measured round trip counts toward the lead',
-        Values = Choice.Ping.order,
-        Default = Choice.Ping.default,
-        Flag = 'mm2_silent_aim_ping',
-        Callback = function(value) Aim.PingScale = Choice.valueOf(Choice.Ping, value) end,
-    })
-
-    MathSection:Dropdown({
-        Title = 'replication buffer',
-        Description = 'how far behind the server other players are drawn. up one if shots land behind runners, down one if in front',
-        Values = Choice.Buffer.order,
-        Default = Choice.Buffer.default,
-        Flag = 'mm2_silent_aim_buffer',
-        Callback = function(value) Aim.Buffer = Choice.valueOf(Choice.Buffer, value) end,
-    })
-
-    solverStat = addStat(MathSection, { Title = 'solver in use', Value = '-' })
-    Adapt.leadStats[#Adapt.leadStats + 1] = addStat(MathSection, { Title = 'lead', Value = '-' })
-
-    MathSection:Label({
-        Title = 'Adaptive replays all four solvers against motion that has already happened and keeps whichever one has been right about that person. The readout above is what the last redirected shot actually used.',
-    })
-end
-
-do
-    local TargetSection = SilentAimTab:CreateSection('targets')
-
-    TargetSection:Dropdown({
-        Title = 'gun targets',
-        Description = 'who the gun is allowed to redirect onto',
-        Values = Choice.GunTargets.order,
-        Default = Choice.GunTargets.default,
-        Flag = 'mm2_silent_aim_gun_targets',
-        Callback = function(value) Aim.GunTargets = Choice.pick(Choice.GunTargets, value) end,
-    })
-
-    TargetSection:Dropdown({
-        Title = 'knife targets',
-        Description = 'who the knife is allowed to redirect onto',
-        Values = Choice.KnifeTargets.order,
-        Default = Choice.KnifeTargets.default,
-        Flag = 'mm2_silent_aim_knife_targets',
-        Callback = function(value) Aim.KnifeTargets = Choice.pick(Choice.KnifeTargets, value) end,
-    })
-
-    TargetSection:Dropdown({
-        Title = 'priority',
-        Description = 'how the allowed targets get ranked once more than one qualifies',
-        Values = Choice.Priority.order,
-        Default = Choice.Priority.default,
-        Flag = 'mm2_silent_aim_priority',
-        Callback = function(value) Aim.Priority = Choice.pick(Choice.Priority, value) end,
-    })
-end
-
-do
-    local FovSection = SilentAimTab:CreateSection('fov')
-
-    FovSection:Dropdown({
+    MainSection:Slider({
         Title = 'fov',
-        Description = 'off lets anything on screen be a target',
-        Values = Choice.Fov.order,
-        Default = Choice.Fov.default,
-        Flag = 'mm2_silent_aim_fov',
-        Callback = function(value) Aim.FOVRadius = Choice.valueOf(Choice.Fov, value) end,
-    })
-
-    FovSection:Dropdown({
-        Title = 'fov anchor',
-        Description = 'what that radius is measured from',
-        Values = Choice.Anchor.order,
-        Default = Choice.Anchor.default,
-        Flag = 'mm2_silent_aim_anchor',
-        Callback = function(value) Aim.FOVAnchor = Choice.pick(Choice.Anchor, value) end,
-    })
-
-    FovSection:Dropdown({
-        Title = 'search',
-        Description = 'anywhere also allows targets off screen, including behind you',
-        Values = Choice.Search.order,
-        Default = Choice.Search.default,
-        Flag = 'mm2_silent_aim_search',
-        Callback = function(value) Aim.OffScreen = Choice.pick(Choice.Search, value) == 'Anywhere' end,
+        Description = 'degrees either side of where you fired that a target may be. 0 takes anyone on screen',
+        Min = 0,
+        Max = 90,
+        Increment = 1,
+        Suffix = ' deg',
+        Default = 0,
+        Flag = 'mm2_sa2_fov',
+        Callback = function(value) Aim.Fov = tonumber(value) or 0 end,
     })
 end
 
+do
+    local LeadSection = SilentAimTab:CreateSection('lead')
+
+    LeadSection:Toggle({
+        Title = 'learn the lead',
+        Description = 'after every shot it checks whether they really went down, and works out your real delay from it. kept between sessions',
+        Flag = 'mm2_sa2_learn',
+        Default = true,
+        Callback = function(state) Aim.Learn = state end,
+    })
+
+    LeadSection:Slider({
+        Title = 'lead trim',
+        Description = 'added on top of what it learns. raise it if shots land behind people, lower it if they land in front',
+        Min = -150,
+        Max = 150,
+        Increment = 5,
+        Suffix = ' ms',
+        Default = 0,
+        Flag = 'mm2_sa2_trim',
+        Callback = function(value) Aim.Trim = tonumber(value) or 0 end,
+    })
+
+    LeadSection:Button({
+        Title = 'forget the learned lead',
+        Callback = function()
+            SA.forgetLead()
+            Onyx:Notify({ Title = 'mm2', Content = 'learned lead cleared', Type = 'success', Duration = 3 })
+        end,
+    })
+
+    SA.ui = {
+        target = addStat(LeadSection, { Title = 'target', Value = '-' }),
+        lead = addStat(LeadSection, { Title = 'lead', Value = '-' }),
+        learned = addStat(LeadSection, { Title = 'learned delay', Value = '-' }),
+        landed = addStat(LeadSection, { Title = 'shots landed', Value = '0 / 0' }),
+    }
+    knifeSpeedStat = addStat(LeadSection, { Title = 'knife speed (read from the game)', Value = ('%d studs/s'):format(SA.knifeSpeed) })
+
+    LeadSection:Label({
+        Title = 'It aims where each person has really been going: their own last few seconds of movement, matched to what they are doing now, and jump physics for anyone in the air or spamming jump. Chance is how much of that movement the shot would have caught. Lead is your round trip plus the delay it has learned from your own hits and misses.',
+    })
+end
+
+-- what silent aim would take right now for the weapon in your hands, for the
+-- readout: the camera stands in for a shot
+function SA.preview()
+    local char = LocalPlayer.Character
+    if not char then return nil end
+    local which = char:FindFirstChild("Gun") and 'Gun' or char:FindFirstChild("Knife") and 'Knife' or nil
+    if not which then return nil end
+    local origin = which == 'Gun' and findGunOrigin() or findKnifeOrigin()
+    return SA.plan(which, origin, Camera.CFrame.LookVector, os.clock(),
+        Choice.pick(Choice.Targets, Aim.Targets) == 'Anyone'), which
+end
+
+function SA.readout()
+    local ui = SA.ui
+    if not ui then return end
+    local plan, which = nil, nil
+    if Aim.Enabled or Trigger.Gun or Trigger.Throw then plan, which = SA.preview() end
+    if plan then
+        ui.target.Set(('%s, %d%% chance'):format(plan.char.Name, math.floor((plan.chance or 0) * 100 + 0.5)),
+            Color3.fromRGB(126, 217, 87))
+        local delay = SA.delay(which)
+        ui.lead.Set(('%d ms = trip %d + delay %d + trim %d%s'):format(
+            math.floor(plan.travel * 1000 + 0.5),
+            math.floor(cachedPing * 1000 + 0.5),
+            math.floor(delay * 1000 + 0.5),
+            math.floor((tonumber(Aim.Trim) or 0) + 0.5),
+            (plan.flight or 0) > 0 and (' + flight %d'):format(math.floor(plan.flight * 1000 + 0.5)) or ''))
+    else
+        ui.target.Set(Aim.Enabled and 'none in reach' or 'off')
+        ui.lead.Set(('- (round trip %d ms)'):format(math.floor(cachedPing * 1000 + 0.5)))
+    end
+    local function learnt(name)
+        local cal = SA.cal[name]
+        if not Aim.Learn then return 'off' end
+        if not cal then
+            local saved = SA.saved and SA.saved[name]
+            return saved and ('%d ms (saved)'):format(math.floor(saved * 1000 + 0.5)) or 'learning'
+        end
+        return ('%d ms from %d shots'):format(math.floor(cal.best * 1000 + 0.5), cal.used)
+    end
+    ui.learned.Set(('gun %s, knife %s'):format(learnt('Gun'), learnt('Knife')))
+    ui.landed.Set(('%d / %d'):format(shotStats.hits, shotStats.resolved))
+end
+
+SA.load()
 
 -- global on purpose: cold enough that a hash lookup costs nothing, and
 -- reachable from a console without going through the MM2 table below
@@ -3962,7 +2823,7 @@ end)
 
 track(Players.PlayerRemoving:Connect(function(plr)
     destroyEsp(plr)
-    motion[plr.Name] = nil
+    SA.forget(plr)
 end))
 
 -- global on purpose: cold enough that a hash lookup costs nothing, and
@@ -4376,254 +3237,16 @@ track(Workspace.DescendantRemoving:Connect(function(inst)
 end))
 
 
-local gunLeadStat, gunMultStat
-
-do
-    local GunLeadSection = SilentAimTab:CreateSection('gun lead')
-
-    GunLeadSection:Dropdown({
-        Title = 'gun lead',
-        Description = 'auto finds the length itself from shots that really landed',
-        Values = Choice.Lead.order,
-        Default = Choice.Lead.default,
-        Flag = 'mm2_gun_lead',
-        Callback = function(value)
-            local profile = Choice.valueOf(Choice.Lead, value)
-            GunTune.Extra = profile.extra
-            GunTune.Auto = profile.auto
-        end,
-    })
-
-    gunLeadStat = addStat(GunLeadSection, { Title = 'gun hits / shots', Value = '0 / 0' })
-    gunMultStat = addStat(GunLeadSection, { Title = 'gun auto multiplier', Value = 'off' })
-end
-
-local knifeLeadStat, knifeMultStat
-
-do
-    local KnifeLeadSection = SilentAimTab:CreateSection('knife lead')
-
-    KnifeLeadSection:Dropdown({
-        Title = 'knife lead',
-        Description = 'on top of the throw speed below, which is read off the game itself',
-        Values = Choice.Lead.order,
-        Default = Choice.Lead.default,
-        Flag = 'mm2_knife_lead',
-        Callback = function(value)
-            local profile = Choice.valueOf(Choice.Lead, value)
-            KnifeTune.Extra = profile.extra
-            KnifeTune.Auto = profile.auto
-        end,
-    })
-
-    knifeSpeedStat = addStat(KnifeLeadSection, { Title = 'throw speed (auto)', Value = ('%d studs/s'):format(KnifeTune.Speed) })
-    knifeLeadStat = addStat(KnifeLeadSection, { Title = 'knife hits / shots', Value = '0 / 0' })
-    knifeMultStat = addStat(KnifeLeadSection, { Title = 'knife auto multiplier', Value = 'off' })
-end
-
-
-do
-    local AdvancedTab = Window:CreateTab({ Title = 'advanced' })
-
-    local OverrideSection = AdvancedTab:CreateSection('override')
-
-    Advanced.ui.Enabled = OverrideSection:Toggle({
-        Title = 'advanced mode',
-        Description = 'takes over how the shot is solved and ignores the silent aim tab',
-        Flag = 'mm2_adv',
-        Default = false,
-        Callback = function(state) Advanced.Enabled = state end,
-    })
-
-    OverrideSection:Paragraph({
-        Title = 'what this ignores',
-        Content = 'while advanced mode is on, the silent aim tab stops deciding anything about the solve. aim part, prediction maths, motion filter, air handling, ping, replication buffer, both lead dropdowns and the shot filter all come from this tab instead, and every shot gets redirected regardless of what the shot filter says. what still comes from the silent aim tab is the target side of things, which advanced has no better answer for: ' .. Advanced.Passthrough,
-    })
-
-    OverrideSection:Toggle({
-        Title = 'perfection',
-        Description = 'the solve that landed most in testing, with its drift correction tuned to each player from what has landed on them',
-        Flag = 'mm2_adv_perfection',
-        Default = false,
-        Callback = function(state)
-            Advanced.Perfection = state
-            -- perfection lives inside advanced mode, so switching it on switches
-            -- that on too, through its toggle so the switch is visible. nothing
-            -- else is written: what perfection picks it picks per player at solve
-            -- time, so it can never overwrite a dropdown a loaded config set
-            if state and Advanced.ui.Enabled then
-                pcall(function() Advanced.ui.Enabled:Set(true) end)
-            end
-        end,
-    })
-
-    OverrideSection:Paragraph({
-        Title = 'what perfection actually does',
-        Content = 'benched across eight kinds of movement - running, strafing, jittering, zigzagging, stop and go, circling and players who switch between them - the solve that lands most is the single best model by a slow running score, with a light share of its own drift taken back out. that is where perfection starts for everyone. the one setting worth choosing per player is that share, because it depends on how they move: someone spamming a and d wants more of it back, someone running straight wants none. so every scoring round perfection replays that moment of the player with each share - off, light, normal and aggressive - and counts whether each would have landed, before learning from the round, so the record is how each would really have done. after about a second of watching, that player is shot with whichever share has landed on them most, and it only switches when another is clearly ahead. convergence runs at exhaustive, since a tighter lead solve is never less exact. while perfection is on it decides the solver, weighting, outlier guard, bias correction, reaction and convergence; history depth, scoring horizon, motion filter and the whole shot section still come from this tab. the readout shows the share picked for whoever is being solved and how often it has landed on them',
-    })
-
-    local SolverSection = AdvancedTab:CreateSection('solver')
-
-    Advanced.ui.Solver = SolverSection:Dropdown({
-        Title = 'solver',
-        Description = 'ensemble blends every model still in contention; best single is the old argmax',
-        Values = Choice.Adv.Solver.order,
-        Default = Choice.Adv.Solver.default,
-        Flag = 'mm2_adv_solver',
-        Callback = function(value) Advanced.Solver = Choice.pick(Choice.Adv.Solver, value) end,
-    })
-
-    Advanced.ui.Weighting = SolverSection:Dropdown({
-        Title = 'weighting',
-        Description = 'how a running error score becomes a share of the blend',
-        Values = Choice.Adv.Weighting.order,
-        Default = Choice.Adv.Weighting.default,
-        Flag = 'mm2_adv_weighting',
-        Callback = function(value) Advanced.Weighting = Choice.pick(Choice.Adv.Weighting, value) end,
-    })
-
-    Advanced.ui.Bias = SolverSection:Dropdown({
-        Title = 'bias correction',
-        Description = 'how much of the running signed miss gets subtracted back out',
-        Values = Choice.Adv.Bias.order,
-        Default = Choice.Adv.Bias.default,
-        Flag = 'mm2_adv_bias',
-        Callback = function(value) Advanced.Bias = Choice.pick(Choice.Adv.Bias, value) end,
-    })
-
-    Advanced.ui.Converge = SolverSection:Dropdown({
-        Title = 'convergence',
-        Description = 'how close two passes must land before the lead solve calls it settled',
-        Values = Choice.Adv.Converge.order,
-        Default = Choice.Adv.Converge.default,
-        Flag = 'mm2_adv_converge',
-        Callback = function(value) Advanced.Converge = Choice.pick(Choice.Adv.Converge, value) end,
-    })
-
-    Advanced.ui.Guard = SolverSection:Dropdown({
-        Title = 'outlier guard',
-        Description = 'a model scoring worse than this multiple of the best is dropped from the blend',
-        Values = Choice.Adv.Guard.order,
-        Default = Choice.Adv.Guard.default,
-        Flag = 'mm2_adv_guard',
-        Callback = function(value) Advanced.Guard = Choice.pick(Choice.Adv.Guard, value) end,
-    })
-
-    local SamplingSection = AdvancedTab:CreateSection('sampling')
-
-    SamplingSection:Dropdown({
-        Title = 'history depth',
-        Description = 'how much of their past motion the replay gets to work with',
-        Values = Choice.Adv.Depth.order,
-        Default = Choice.Adv.Depth.default,
-        Flag = 'mm2_adv_depth',
-        Callback = function(value) Advanced.Depth = Choice.pick(Choice.Adv.Depth, value) end,
-    })
-
-    Advanced.ui.Horizon = SamplingSection:Dropdown({
-        Title = 'scoring horizon',
-        Description = 'the lead length the models are scored at. weapon match follows the real travel time',
-        Values = Choice.Adv.Horizon.order,
-        Default = Choice.Adv.Horizon.default,
-        Flag = 'mm2_adv_horizon',
-        Callback = function(value) Advanced.Horizon = Choice.pick(Choice.Adv.Horizon, value) end,
-    })
-
-    SamplingSection:Dropdown({
-        Title = 'reaction',
-        Description = 'how fast one scoring round moves a model running error',
-        Values = Choice.Adv.Reaction.order,
-        Default = Choice.Adv.Reaction.default,
-        Flag = 'mm2_adv_reaction',
-        Callback = function(value) Advanced.Reaction = Choice.pick(Choice.Adv.Reaction, value) end,
-    })
-
-    SamplingSection:Dropdown({
-        Title = 'motion filter',
-        Description = 'replaces the silent aim tab filter while advanced mode is on',
-        Values = Choice.Filter.order,
-        Default = Choice.Filter.default,
-        Flag = 'mm2_adv_filter',
-        Callback = function(value) Advanced.Smoothing = Choice.pick(Choice.Filter, value) end,
-    })
-
-    local ShotSection = AdvancedTab:CreateSection('shot')
-
-    ShotSection:Dropdown({
-        Title = 'aim part',
-        Values = Choice.Part.order,
-        Default = Choice.Part.default,
-        Flag = 'mm2_adv_part',
-        Callback = function(value) Advanced.Part = Choice.pick(Choice.Part, value) end,
-    })
-
-    ShotSection:Dropdown({
-        Title = 'air handling',
-        Values = Choice.Air.order,
-        Default = Choice.Air.default,
-        Flag = 'mm2_adv_air',
-        Callback = function(value) Advanced.Air = Choice.pick(Choice.Air, value) end,
-    })
-
-    Advanced.ui.Ping = ShotSection:Dropdown({
-        Title = 'ping',
-        Description = 'how much of your round trip counts toward the lead',
-        Values = Choice.Ping.order,
-        Default = Choice.Ping.default,
-        Flag = 'mm2_adv_ping',
-        Callback = function(value) Advanced.Ping = Choice.pick(Choice.Ping, value) end,
-    })
-
-    Advanced.ui.Buffer = ShotSection:Dropdown({
-        Title = 'replication buffer',
-        Description = 'how far behind the server other players are drawn. up one if shots land behind runners, down one if in front',
-        Values = Choice.Buffer.order,
-        Default = Choice.Buffer.default,
-        Flag = 'mm2_adv_buffer',
-        Callback = function(value) Advanced.Buffer = Choice.pick(Choice.Buffer, value) end,
-    })
-
-    Advanced.ui.Lead = ShotSection:Dropdown({
-        Title = 'lead',
-        Description = 'drives both weapons from one dropdown instead of the two on the silent aim tab',
-        Values = Choice.Lead.order,
-        Default = Choice.Lead.default,
-        Flag = 'mm2_adv_lead',
-        Callback = function(value) Advanced.Lead = Choice.pick(Choice.Lead, value) end,
-    })
-
-    local ReadoutSection = AdvancedTab:CreateSection('readout')
-
-    Advanced.ui.state = addStat(ReadoutSection, { Title = 'advanced mode', Value = 'off' })
-    Advanced.ui.pick = addStat(ReadoutSection, { Title = 'perfection pick', Value = '-' })
-    Adapt.leadStats[#Adapt.leadStats + 1] = addStat(ReadoutSection, { Title = 'lead', Value = '-' })
-    Advanced.ui.weights = addStat(ReadoutSection, { Title = 'model weights', Value = '-' })
-    Advanced.ui.biasStat = addStat(ReadoutSection, { Title = 'bias correction', Value = '-' })
-
-    ReadoutSection:Label({
-        Title = 'Lead is the last solve broken into its parts: round trip, buffer, frame, flight, the lead profile and the auto multiplier. Weights are the live blend for whoever is currently being solved, best first. Bias correction is how far the blend has been missing by and in which direction, which is the number it is subtracting back out.',
-    })
-end
-
 do
     local TriggerTab = Window:CreateTab({ Title = 'trigger bot' })
     local section = TriggerTab:CreateSection('gun')
 
     section:Toggle({
         Title = 'trigger bot',
-        Description = 'shoots once a target has been in view for your reaction time. only while the gun is already in your hands',
+        Description = 'shoots once an enemy has been in view for your reaction time. only while the gun is already in your hands, and never at someone on your side',
         Flag = 'mm2_tb_gun',
         Default = false,
         Callback = function(state) Trigger.Gun = state end,
-    })
-
-    section:Dropdown({
-        Title = 'shoot at',
-        Description = 'murderer only never fires at an innocent, which would get you killed as sheriff',
-        Values = Choice.Trigger.GunTargets.order,
-        Default = Choice.Trigger.GunTargets.default,
-        Flag = 'mm2_tb_gun_targets',
-        Callback = function(value) Trigger.GunTargets = Choice.pick(Choice.Trigger.GunTargets, value) end,
     })
 
     section:Dropdown({
@@ -4702,7 +3325,7 @@ do
 
     section:Toggle({
         Title = 'sure shots only',
-        Description = "holds fire until the shot will land: they are standing still or moving the way the prediction has been getting right, the shot would land within a stud of them (half one on the head), on the ground, and they have not been changing direction enough to do it before it lands. strafers never count. the readout shows what it is waiting on",
+        Description = 'holds fire until the predicted chance of the shot landing is 90% or more. the readout shows the chance it is waiting on',
         Flag = 'mm2_tb_sure',
         Default = false,
         Callback = function(state) Trigger.Sure = state end,
@@ -4718,7 +3341,7 @@ do
     }
 
     section:Label({
-        Title = 'The trigger bot and silent aim share one solve. It picks targets the way silent aim does (priority, range, fov and knife targets from the silent aim tab), except the gun on murderer only always hunts the murderer, whoever silent aim is locked on to. Every shot it fires is put on the exact point it decided to fire at, even with silent aim switched off.',
+        Title = 'The trigger bot uses silent aim v2 to aim, but only ever at enemies: as sheriff or hero that is the murderer alone, so it cannot get you killed. Every shot it fires is put on the person it decided to fire at, even with silent aim switched off.',
     })
 end
 
@@ -5401,34 +4024,8 @@ task.spawn(function()
             ErrorStat.Set(shotStats.proved > 0
                 and ('%.1f studs over %d'):format(shotStats.error / shotStats.proved, shotStats.proved)
                 or '-')
-            gunLeadStat.Set(('%d / %d'):format(GunLead.hits, GunLead.verified))
-            knifeLeadStat.Set(('%d / %d'):format(KnifeLead.hits, KnifeLead.verified))
 
-            -- whichever lead dropdown is in charge decides whether auto is on
-            local gunAuto, knifeAuto = GunTune.Auto, KnifeTune.Auto
-            if Advanced.Enabled then
-                gunAuto = Choice.valueOf(Choice.Lead, Advanced.Lead).auto
-                knifeAuto = gunAuto
-            end
-            gunMultStat.Set(gunAuto and ('%.2fx'):format(GunLead.mult) or 'off')
-            knifeMultStat.Set(knifeAuto and ('%.2fx'):format(KnifeLead.mult) or 'off')
-
-            solverStat.Set(Advanced.Enabled
-                and ('advanced: ' .. (Advanced.Perfection and 'perfection' or Advanced.Solver))
-                or (Aim.Math == 'Adaptive' and lastModelUsed or Aim.Math))
-
-            local lead = Adapt.lead
-            local leadText = lead.total > 0
-                and ('%d ms = (trip %d + buffer %d + frame %d) x%.2f + flight %d + trim %d'):format(
-                    math.floor(lead.total * 1000 + 0.5),
-                    math.floor(lead.rtt * 1000 + 0.5),
-                    math.floor(lead.buffer * 1000 + 0.5),
-                    math.floor(lead.frame * 1000 + 0.5),
-                    lead.mult,
-                    math.floor(lead.flight * 1000 + 0.5),
-                    math.floor(lead.extra * 1000 + 0.5))
-                or ('- (round trip %d ms)'):format(math.floor(cachedPing * 1000 + 0.5))
-            for _, stat in ipairs(Adapt.leadStats) do stat.Set(leadText) end
+            SA.readout()
 
             if Trigger.ui then
                 local acting = Color3.fromRGB(126, 217, 87)
@@ -5463,76 +4060,6 @@ task.spawn(function()
                 for _ in pairs(AutoGun.drops) do n = n + 1 end
                 AutoGun.ui2.Set(tostring(n), n > 0 and Color3.fromRGB(126, 217, 87) or nil)
             end
-
-            if not Advanced.Enabled then
-                Advanced.ui.state.Set('off')
-                Advanced.ui.weights.Set('-')
-                Advanced.ui.biasStat.Set('-')
-                Advanced.ui.pick.Set('-')
-            else
-                Advanced.ui.state.Set(Advanced.Perfection and 'perfection' or 'on',
-                    Color3.fromRGB(126, 217, 87))
-
-                local entry = gunPlan and gunPlan.entry or knifePlan and knifePlan.entry
-                local tuned = entry and Adapt.tuned(entry)
-                if not Advanced.Perfection then
-                    Advanced.ui.pick.Set('perfection is off')
-                elseif not tuned then
-                    Advanced.ui.pick.Set('nobody watched yet')
-                else
-                    -- the share perfection is taking back out for this player,
-                    -- how often it has landed on them, and whether it is still
-                    -- the default or already their own pick
-                    local share = Adapt.TuneShares[tuned.pick]
-                    local loss = tuned.loss[tuned.pick]
-                    local text = ('bias %d%%'):format(math.floor(share * 100 + 0.5))
-                    if loss then text = text .. (', lands %d%%'):format(math.floor((1 - loss) * 100 + 0.5)) end
-                    if tuned.rounds < Adapt.TuneRounds then
-                        text = text .. (', default, watching %d/%d'):format(tuned.rounds, Adapt.TuneRounds)
-                    else
-                        text = text .. (', their own pick after %d rounds'):format(tuned.rounds)
-                    end
-                    Advanced.ui.pick.Set(text, Color3.fromRGB(126, 217, 87))
-                end
-
-                if not entry or entry.scored < Adapt.Samples then
-                    Advanced.ui.weights.Set('learning')
-                    Advanced.ui.biasStat.Set('learning')
-                else
-                    -- the exact weights the blend itself uses, as percentages
-                    local weights, rows = {}, {}
-                    local total = Adapt.weights(entry, weights)
-                    for _, name in ipairs(Adapt.Models) do
-                        rows[#rows + 1] = { name = name, weight = weights[name] or 0 }
-                    end
-
-                    table.sort(rows, function(a, b) return a.weight > b.weight end)
-
-                    local shown = {}
-                    for _, row in ipairs(rows) do
-                        if row.weight > 0 and total > 0 then
-                            shown[#shown + 1] = ('%s %d%%'):format(
-                                row.name:sub(1, 4), math.floor(row.weight / total * 100 + 0.5))
-                        end
-                    end
-                    Advanced.ui.weights.Set(#shown > 0 and table.concat(shown, '  ') or '-')
-
-                    -- a tuned player's drift is their own combination's
-                    local share, along, across
-                    if tuned then
-                        share, along, across = Adapt.TuneShares[tuned.pick], tuned.along, tuned.across
-                    elseif Advanced.Bias ~= "Off" then
-                        share = Choice.valueOf(Choice.Adv.Bias, Advanced.Bias) or 0
-                        along, across = entry.biasAlong, entry.biasAcross
-                    end
-                    if not share or share <= 0 or along == nil then
-                        Advanced.ui.biasStat.Set('off')
-                    else
-                        Advanced.ui.biasStat.Set(('%+.2f along %+.2f across at %d%%'):format(
-                            along, across, math.floor(share * 100 + 0.5)))
-                    end
-                end
-            end
         end)
     end
 end)
@@ -5543,13 +4070,10 @@ end)
 -- One table holding the live config, so anything here can be driven from a
 -- console without editing the script. These are the same tables the script
 -- reads, not copies, so a write takes effect on the next frame exactly as
--- moving the dropdown would: MM2.Fling.Power = 'Absurd' is the dropdown.
+-- moving the control would: MM2.Aim.Targets = 'Anyone' is the dropdown.
 --
 -- Visual, Xray, Debug, TrapEsp, DroppedGunEsp are plain globals as well, since
--- they are read rarely enough that a hash lookup costs nothing. Aim, Advanced,
--- Choice and Adapt stay local and are only reachable through here, because
--- those sit in the per-frame solver - Choice alone is read over a hundred
--- times a frame, and a global is a hash lookup every single time.
+-- they are read rarely enough that a hash lookup costs nothing.
 do
     local env = _G
     local ok, shared = pcall(function() return getgenv() end)
@@ -5557,7 +4081,7 @@ do
 
     env.MM2 = {
         Aim = Aim,
-        Advanced = Advanced,
+        SA = SA,
         Trigger = Trigger,
         Fling = Fling,
         AntiFling = AntiFling,
@@ -5566,15 +4090,11 @@ do
         Debug = Debug,
 
         Choice = Choice,
-        Adapt = Adapt,
-
         Stats = shotStats,
-        GunLead = GunLead,
-        KnifeLead = KnifeLead,
 
         -- every dropdown value is validated on the way in, so a typo through
         -- here falls back to that option's default rather than wedging the
-        -- solver on a name nothing handles
+        -- script on a name nothing handles
         Pick = Choice.pick,
         ValueOf = Choice.valueOf,
     }
