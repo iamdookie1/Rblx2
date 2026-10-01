@@ -42,6 +42,7 @@ local Games = {
     [281489669] = { Name = 'Wand', Script = 'Games/Wand.lua' },
     -- The in-game place of 100 Days on Chunk!, from two of its own dumps.
     [84159479861691] = { Name = '100 Days on Chunk!', Script = 'Games/Chunk.lua' },
+    [78894370647980] = { Name = 'Omni Parry (parry fling)', Script = 'Games/ParryFling.lua' },
 }
 
 -- Loads Onyx straight from its own repo rather than a vendored copy, since
