@@ -1,5 +1,5 @@
 --// [OMNI PARRY] parry fling but its hard -- auto parry, auto perfect and omni
---// parry, entity parries, pvp parry and antis.
+--// parry, faster slow motion and cutscene, entity parries, pvp parry and antis.
 --
 -- What the game's own client scripts show:
 --  * E (or the mobile parry button) runs parry() in PlayerGui.NoResetOnSpawn.
@@ -16,12 +16,17 @@
 --    A perfect parry stops time for 2 s (Lighting.ParryEffect on), then 400.
 --  * With OmniParry on, a press in the last 15 ms of those 2 s (a flag raised
 --    1.985 s in and dropped at 2 s) plays the omni cutscene, then 800.
+--  * The slow motion and the cutscene are plain task.wait calls inside that
+--    script, so swapping its task for one that shortens just those waits speeds
+--    them up for every parry, yours included.
 --  * Roguelike entities live in PlayerGui.Roguelike. Ad, Chatbox, Noob and
 --    builderman each raise a CanParry value for a short window; a parry started
---    inside it beats them, otherwise they deal 100 (60 for builderman). Bacon
---    only needs your parry on cooldown within a second of showing up. Cowboy's
---    bullet checks a 1 stud cube where you stood when it fired, 0.3 s later.
---    Shadows (_shadowN) are a delayed copy of you that kills on touch.
+--    inside it beats them, otherwise they deal 100 (60 for builderman). The
+--    chatbox's is read only when the 0.2 s freeze ends, so its press goes in
+--    just after the eyes. Bacon only needs your parry on cooldown within a
+--    second. Cowboy's bullet checks a 1 stud cube where you stood when it fired,
+--    0.3 s later. Shadows (_shadowN) are a delayed copy of you that kills on
+--    touch. builderman drops glitch orbs (Orb) that hurt him when touched.
 --  * PVP: while the Shadow entity is on, and Parry Players is on or a round is
 --    running, a parry also checks a 9 stud box around you for other players
 --    and your shadow, and one with somebody in it lands.
@@ -34,6 +39,7 @@
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local Lighting = game:GetService("Lighting")
+local TweenService = game:GetService("TweenService")
 local Workspace = workspace
 
 local LocalPlayer = Players.LocalPlayer
@@ -61,17 +67,24 @@ end
 
 --// settings ------------------------------------------------------------------------------
 
-local Auto = { Enabled = false, AirOnly = false, Delay = 0, seenAt = nil, count = 0, inRange = 0 }
+local Auto = { Enabled = false, AirOnly = false, Delay = 0, Predict = true, seenAt = nil, count = 0, inRange = 0 }
 local Perfect = { Enabled = false, Omni = false, count = 0, omni = 0, missed = 0, held = 0 }
+local Fast = { Slowmo = false, Cutscene = false, env = nil, had = nil, cut = 0, failed = false }
 local Entities = {
     Ad = false, Chatbox = false, Noob = false, builderman = false, Bacon = false,
     Cowboy = false, Shadow = false, ShadowSafe = false, ShadowEsp = false,
-    parried = 0, dodged = 0, blocked = 0,
+    Orbs = false, Esp = false, HideAds = false,
+    parried = 0, dodged = 0, blocked = 0, orbs = 0,
 }
 local Pvp = { Enabled = false, count = 0, active = false, players = 0 }
-local Anti = { KillBricks = false, Platforms = false, Legs = false, Wings = false, Jupiter = false }
+local Anti = { KillBricks = false, Platforms = false, Legs = false, Wings = false, Jupiter = false, Void = false, saves = 0 }
+local Show = { Indicator = false }
+local Frame = { dt = 1 / 60 }
 
 local DODGE_DISTANCE = 4.5
+local LEAD = 0.22          -- press to the end of the freeze, with a frame of rounding
+local SLOWMO = 0.3         -- a perfect parry's slow motion, sped up
+local OMNI_SPAN = 0.05     -- and the omni window at its end
 
 --// game state ----------------------------------------------------------------------------
 
@@ -91,6 +104,12 @@ local function valueOf(parent, name)
 end
 
 local function gui(name) return valueOf(PlayerGui, name) end
+
+local function guiRoot()
+    local ok, root = pcall(function() return typeof(gethui) == "function" and gethui() or game:GetService("CoreGui") end)
+    return ok and root or PlayerGui
+end
+local GuiRoot = guiRoot()
 
 -- times an entity's parry window opens, so nothing else starts a parry that
 -- would still be running then
@@ -217,6 +236,83 @@ local function canStart(char)
     return true
 end
 
+--// speed ---------------------------------------------------------------------------------
+-- The parry script's own task, with its two long waits shortened: the 2 s slow
+-- motion (2 s while Lighting.ParryEffect is on; the punish's 2 s is left alone)
+-- and the omni cutscene's waits (while the camera is Scriptable). The omni flag's
+-- 1.985 s moves with the slow motion so the omni window stays at its end.
+
+local realTask = task
+local CUTSCENE = { 7 / 6, 0.75, 1, 7 / 3 }
+
+local function slowmoRunning()
+    local effect = Lighting:FindFirstChild("ParryEffect")
+    return effect ~= nil and effect.Enabled == true
+end
+
+local function inCutscene()
+    local camera = Workspace.CurrentCamera
+    return camera ~= nil and camera.CameraType == Enum.CameraType.Scriptable
+end
+
+local FastTask = setmetatable({
+    wait = function(t)
+        if type(t) == "number" then
+            if Fast.Slowmo and t == 2 and slowmoRunning() then
+                t = SLOWMO
+                Fast.cut = Fast.cut + 1
+            elseif Fast.Cutscene and inCutscene() then
+                for _, long in ipairs(CUTSCENE) do
+                    if math.abs(t - long) < 1e-6 then
+                        t = 0.03
+                        Fast.cut = Fast.cut + 1
+                        break
+                    end
+                end
+            end
+        end
+        return realTask.wait(t)
+    end,
+    delay = function(t, ...)
+        if Fast.Slowmo and t == 1.985 then t = SLOWMO - OMNI_SPAN end
+        return realTask.delay(t, ...)
+    end,
+}, { __index = realTask })
+
+local function installFast()
+    if Fast.env or Fast.failed then return end
+    local fn = Press.parry or Press.fn
+    if not fn then return end
+    -- getfenv also turns off the script's cached globals, so the swap is seen
+    local ok, env = pcall(getfenv, fn)
+    if not ok or type(env) ~= "table" then
+        Fast.failed = true
+        return
+    end
+    Fast.had = rawget(env, "task")
+    rawset(env, "task", FastTask)
+    Fast.env = env
+end
+
+local function removeFast()
+    if not Fast.env then return end
+    pcall(rawset, Fast.env, "task", Fast.had)
+    Fast.env = nil
+end
+
+-- a sped up cutscene leaves its last camera tween running for a second and a
+-- half after the camera is handed back: stop it there
+local lastCameraType = nil
+local function cameraWatch()
+    local camera = Workspace.CurrentCamera
+    if not camera then return end
+    local kind = camera.CameraType
+    if Fast.env and Fast.Cutscene and lastCameraType == Enum.CameraType.Scriptable and kind ~= Enum.CameraType.Scriptable then
+        TweenService:Create(camera, TweenInfo.new(0), { CFrame = camera.CFrame, FieldOfView = camera.FieldOfView }):Play()
+    end
+    lastCameraType = kind
+end
+
 --// the parry hitbox ----------------------------------------------------------------------
 
 local function newProbe(name)
@@ -233,12 +329,16 @@ local function newProbe(name)
 end
 
 local Probe = newProbe("ParryAssistProbe")
+local Ahead = newProbe("ParryAssistAhead")
 local PvpProbe = newProbe("ParryAssistPvpProbe")
 PvpProbe.Size = Vector3.new(9, 9, 9)
 
 local probeParams = OverlapParams.new()
 probeParams.FilterType = Enum.RaycastFilterType.Exclude
 probeParams.RespectCanCollide = true
+
+local aheadParams = OverlapParams.new()
+aheadParams.FilterType = Enum.RaycastFilterType.Include
 
 local pvpParams = OverlapParams.new()
 pvpParams.FilterType = Enum.RaycastFilterType.Exclude
@@ -261,6 +361,27 @@ local function parryBox(root)
     return CFrame.new(root.Position + Vector3.new(0, 3.5, 0)), Vector3.new(0.95, 4, 0.95)
 end
 
+-- a part on the move (a swinging or falling platform) has to still be in the
+-- box when the freeze ends, or the parry misses and punishes you
+local Motion = setmetatable({}, { __mode = "k" })
+
+local function stillThere(part, box, size, now)
+    local pos = part.Position
+    local seen = Motion[part]
+    Motion[part] = { pos = pos, t = now }
+    local okV, velocity = pcall(function() return part:GetVelocityAtPosition(box.Position) end)
+    if not okV or typeof(velocity) ~= "Vector3" then velocity = part.AssemblyLinearVelocity end
+    if seen and now - seen.t > 0 and now - seen.t < 0.1 then
+        local moved = (pos - seen.pos) / (now - seen.t)
+        if moved.Magnitude > velocity.Magnitude then velocity = moved end
+    end
+    if velocity.Magnitude < 1 then return true end
+    Ahead.Size = size
+    Ahead.CFrame = box - velocity * LEAD
+    aheadParams.FilterDescendantsInstances = { part }
+    return #Workspace:GetPartsInPart(Ahead, aheadParams) > 0
+end
+
 local exclude = {}
 
 local function parryTargets(char, root)
@@ -268,17 +389,19 @@ local function parryTargets(char, root)
     Probe.Size = size
     Probe.CFrame = box
     table.clear(exclude)
-    exclude[1], exclude[2], exclude[3] = char, Probe, PvpProbe
+    exclude[1], exclude[2], exclude[3], exclude[4] = char, Probe, PvpProbe, Ahead
     local noParry = Workspace:FindFirstChild("NoParry")
     if noParry then exclude[#exclude + 1] = noParry end
     local frame = towerFrame()
     if frame then exclude[#exclude + 1] = frame end
     probeParams.FilterDescendantsInstances = exclude
     local players = gui("ParryPlayers") == true
+    local now = os.clock()
     local count = 0
     for _, part in ipairs(Workspace:GetPartsInPart(Probe, probeParams)) do
         local parent = part.Parent
-        if part.CanCollide and not (parent and parent:FindFirstChild("Humanoid") and not players) then
+        if part.CanCollide and not (parent and parent:FindFirstChild("Humanoid") and not players)
+            and (not Auto.Predict or stillThere(part, box, size, now)) then
             count = count + 1
         end
     end
@@ -292,20 +415,33 @@ local function pvpOn()
     return gui("ParryPlayers") == true or not (intermission and intermission.Value)
 end
 
+-- a player who is about to leave the box will be gone when the freeze ends
+local function staysInBox(model, box)
+    local root = model:FindFirstChild("HumanoidRootPart")
+    if not root then return false end
+    local inverse = box:Inverse()
+    for _, point in ipairs({ root.Position, root.Position + root.AssemblyLinearVelocity * LEAD }) do
+        local p = inverse * point
+        if math.abs(p.X) > 4.25 or math.abs(p.Y) > 4.25 or math.abs(p.Z) > 4.25 then return false end
+    end
+    return true
+end
+
 -- other players and your shadow in the game's 9 stud pvp box
 local function pvpTargets(char, root)
     local _, yaw = root.CFrame:ToOrientation()
-    PvpProbe.CFrame = CFrame.new(root.Position) * CFrame.fromOrientation(0, yaw, 0)
-    pvpParams.FilterDescendantsInstances = { char, Probe, PvpProbe }
+    local box = CFrame.new(root.Position) * CFrame.fromOrientation(0, yaw, 0)
+    PvpProbe.CFrame = box
+    pvpParams.FilterDescendantsInstances = { char, Probe, PvpProbe, Ahead }
     local players = gui("ParryPlayers") == true
-    local people, shadows = 0, 0
+    local people, shadows, seen = 0, 0, {}
     for _, part in ipairs(Workspace:GetPartsInPart(PvpProbe, pvpParams)) do
         local parent = part.Parent
-        if parent then
+        if parent and not seen[parent] then
+            seen[parent] = true
             if parent.Name:sub(1, 7) == "_shadow" then
                 shadows = shadows + 1
-            elseif players and parent ~= char and Players:GetPlayerFromCharacter(parent)
-                and parent:FindFirstChild("HumanoidRootPart") then
+            elseif players and parent ~= char and Players:GetPlayerFromCharacter(parent) and staysInBox(parent, box) then
                 people = people + 1
             end
         end
@@ -320,6 +456,11 @@ local function windowColor(color)
     return math.abs(color.R - 0.5) < 0.02 and math.abs(color.G - 0.5) < 0.02 and math.abs(color.B - 1) < 0.02
 end
 
+-- how long a perfect parry holds you
+local function perfectHold()
+    return (Fast.env and Fast.Slowmo) and SLOWMO + 0.35 or 2.4
+end
+
 local function bindParryScreen(screen)
     if screen.Name ~= "ParryScreen" then return end
     task.spawn(function()
@@ -328,8 +469,8 @@ local function bindParryScreen(screen)
         track(frame:GetPropertyChangedSignal("BackgroundColor3"):Connect(function()
             if Unloaded or not Perfect.Enabled or not windowColor(frame.BackgroundColor3) then return end
             if gui("CanPerfPar") == false or gui("PerfPar") == true then return end
-            -- a perfect parry holds you for 2 s: not with an entity about to need a parry
-            if dangerWithin(os.clock(), 2.4) then
+            -- not with an entity about to need a parry while it holds you
+            if dangerWithin(os.clock(), perfectHold()) then
                 Perfect.held = Perfect.held + 1
                 return
             end
@@ -340,22 +481,27 @@ end
 
 --// omni parry ----------------------------------------------------------------------------
 -- The window is a flag in the parry function, raised 1.985 s into the perfect
--- parry's slow motion and dropped at 2 s. With the debug library that flag is
--- watched directly: the one true/false value that flips on in that span. Without
--- it, the press goes in on the first frame after 1.985 s.
+-- parry's slow motion and dropped at 2 s (0.25 and 0.3 s sped up). With the
+-- debug library that flag is watched directly: the one true/false value that
+-- flips on in that span. Without it, the press goes in by the clock.
 
-local Omni = { watching = false, t0 = 0, before = nil, beat = 0 }
+local Omni = { watching = false, t0 = 0, before = nil, beat = 0, flagAt = 1.985, endAt = 2 }
 
 local function omniStart()
     findPress()
     if not Perfect.Omni or gui("OmniParry") ~= true or gui("AutoOmniParry") == true then return end
     Omni.watching, Omni.t0, Omni.before, Omni.beat = true, os.clock(), nil, 0
+    if Fast.env and Fast.Slowmo then
+        Omni.flagAt, Omni.endAt = SLOWMO - OMNI_SPAN, SLOWMO
+    else
+        Omni.flagAt, Omni.endAt = 1.985, 2
+    end
 end
 
 local function omniFire()
     Omni.watching = false
-    -- the cutscene holds you for about ten seconds
-    if dangerWithin(os.clock(), 10) then
+    -- the cutscene holds you for about ten seconds (a blink sped up)
+    if dangerWithin(os.clock(), (Fast.env and Fast.Cutscene) and 1 or 10) then
         Perfect.held = Perfect.held + 1
         return
     end
@@ -372,14 +518,14 @@ end
 local function omniCheck(phase)
     if not Omni.watching then return end
     local elapsed = os.clock() - Omni.t0
-    if elapsed > 2.25 then
+    if elapsed > Omni.endAt + 0.25 then
         Omni.watching = false
         Perfect.missed = Perfect.missed + 1
         return
     end
     local flags = parryFlags()
     if flags then
-        if elapsed < 1.96 then
+        if elapsed < Omni.flagAt - 0.025 then
             local before = {}
             for key, value in pairs(flags) do
                 if type(value) == "boolean" then before[key] = value end
@@ -398,7 +544,7 @@ local function omniCheck(phase)
     end
     if phase == "beat" then
         Omni.beat = elapsed
-    elseif phase == "render" and Omni.beat >= 1.987 and Omni.beat < 1.998 then
+    elseif phase == "render" and Omni.beat >= Omni.flagAt + 0.002 and Omni.beat < Omni.endAt - 0.002 then
         omniFire()
     end
 end
@@ -419,8 +565,7 @@ local function controls()
     return Controls or nil
 end
 
--- chatbox only hurts you if you move in its window: when a parry is already
--- running and cannot be started, stand still instead
+-- chatbox only hurts you if you move in its window: stand still through it
 local function freezeMovement(seconds)
     local module = controls()
     if not module then return end
@@ -431,7 +576,7 @@ local function freezeMovement(seconds)
     end)
 end
 
-local Chat = { at = -math.huge }
+local Chat = { at = -math.huge, pressedAt = -math.huge }
 
 local function entityPress(kind)
     if Unloaded or not Entities[kind] or not character() then return end
@@ -452,21 +597,31 @@ local function entityPress(kind)
     if press() then Entities.parried = Entities.parried + 1 end
 end
 
--- the chatbox's CanParry lasts 0.15 s, but the parry only reads it when the
--- freeze ends 0.2 s after the press, so the press goes in just after its eyes
--- show up, 0.2 s before the window, and you keep still through it as well
+local function chatboxPress()
+    if Unloaded or not Entities.Chatbox or not character() then return end
+    local now = os.clock()
+    if now - Chat.pressedAt < 1 then return end
+    Chat.pressedAt = now
+    if gui("ParryCD") ~= true and gui("CanParry") ~= false and press() then
+        Entities.parried = Entities.parried + 1
+    else
+        Entities.blocked = Entities.blocked + 1
+    end
+    freezeMovement(0.5)
+end
+
+-- The chatbox is open from 0.2 to 0.35 s after its eyes, and the parry reads it
+-- when its own 0.2 s freeze ends, each wait rounded up to whole frames: aim for
+-- the middle, which at a low frame rate means pressing on the eyes themselves.
+local function chatboxLead()
+    return math.clamp(0.07 - 1.5 * Frame.dt, 0, 0.05)
+end
+
 local function chatboxEyes()
     Chat.at = os.clock()
     if not Entities.Chatbox then return end
-    task.delay(0.07, function()
-        if Unloaded or not Entities.Chatbox or not character() then return end
-        if gui("ParryCD") ~= true and gui("CanParry") ~= false and press() then
-            Entities.parried = Entities.parried + 1
-        else
-            Entities.blocked = Entities.blocked + 1
-        end
-        freezeMovement(0.45)
-    end)
+    local lead = chatboxLead()
+    if lead <= 0 then chatboxPress() else task.delay(lead, chatboxPress) end
 end
 
 local KINDS = { AdScript = "Ad", ChatboxScript = "Chatbox", NoobScript = "Noob", BuildermanScript = "builderman" }
@@ -490,6 +645,8 @@ local function roguelikeChild(child)
         bindFlag(child, kind)
     elseif child.Name == "AdvertisementClone" then
         addDanger(os.clock() + 1.8)
+        -- after the ad script has shown it
+        if Entities.HideAds then task.defer(function() child.Visible = false end) end
     elseif child.Name == "BaconClone" then
         Bacons[#Bacons + 1] = os.clock()
     end
@@ -499,15 +656,22 @@ local function bindRoguelike(holder)
     if holder.Name ~= "Roguelike" then return end
     for _, child in ipairs(holder:GetChildren()) do roguelikeChild(child) end
     track(holder.ChildAdded:Connect(roguelikeChild))
-    -- the chatbox types "..." 1.3 s before its eyes
+    -- the chatbox types "..." 1.3 s before its eyes, and ":eyes" 0.33 s before
     task.spawn(function()
         local box = holder:WaitForChild("TheChatbox", 10)
         local text = box and box:WaitForChild("Text", 10)
         if not text or Unloaded then return end
         track(text:GetPropertyChangedSignal("Text"):Connect(function()
-            if text.Text == "..." then
-                addDanger(os.clock() + 1.37)
-            elseif text.Text == "\u{1F440}" then
+            local said = text.Text
+            if said == "..." then
+                addDanger(os.clock() + 1.35)
+            elseif said == ":eyes" then
+                -- in case the eyes themselves never show up as text
+                local typed = os.clock()
+                task.delay(0.33 + chatboxLead() + 0.05, function()
+                    if Chat.at < typed then chatboxPress() end
+                end)
+            elseif said == "\u{1F440}" then
                 chatboxEyes()
             end
         end))
@@ -517,13 +681,18 @@ end
 local dodgeParams = RaycastParams.new()
 dodgeParams.FilterType = Enum.RaycastFilterType.Exclude
 
+-- moves the whole character so its root lands on target
+local function moveRootTo(char, root, target)
+    char:PivotTo(target * (root.CFrame:Inverse() * char:GetPivot()))
+end
+
 -- the bullet checks where you stood when it fired, 0.3 s later: be elsewhere
 local function dodge()
     if Unloaded or not Entities.Cowboy then return end
     local char, root, hum = character()
     if not char then return end
     if not root.Anchored and (root.AssemblyLinearVelocity * 0.3).Magnitude > 4 then return end
-    dodgeParams.FilterDescendantsInstances = { char, Probe, PvpProbe }
+    dodgeParams.FilterDescendantsInstances = { char, Probe, PvpProbe, Ahead }
     local look = root.CFrame.LookVector
     local flat = Vector3.new(look.X, 0, look.Z)
     flat = flat.Magnitude > 0.01 and flat.Unit or Vector3.new(0, 0, -1)
@@ -544,18 +713,19 @@ local function dodge()
     Entities.dodged = Entities.dodged + 1
 end
 
-local ShadowMark = Instance.new("Highlight")
-ShadowMark.Name = "ParryAssistShadow"
-ShadowMark.FillColor = Color3.fromRGB(150, 60, 255)
-ShadowMark.OutlineColor = Color3.fromRGB(220, 180, 255)
-ShadowMark.FillTransparency = 0.6
-ShadowMark.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+local function highlight(name, fill, outline)
+    local mark = Instance.new("Highlight")
+    mark.Name = name
+    mark.FillColor = fill
+    mark.OutlineColor = outline
+    mark.FillTransparency = 0.6
+    mark.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+    mark.Parent = GuiRoot
+    return mark
+end
+
+local ShadowMark = highlight("ParryAssistShadow", Color3.fromRGB(150, 60, 255), Color3.fromRGB(220, 180, 255))
 ShadowMark.Enabled = false
-pcall(function()
-    local root = typeof(gethui) == "function" and gethui() or game:GetService("CoreGui")
-    ShadowMark.Parent = root
-end)
-if not ShadowMark.Parent then ShadowMark.Parent = PlayerGui end
 
 local LastShadow = nil
 
@@ -573,6 +743,62 @@ local function shadowAdded(model)
         for _, part in ipairs(model:GetChildren()) do safe(part) end
         model.ChildAdded:Connect(safe)
     end
+end
+
+-- noob, cowboy and builderman's orbs
+local Marks = {}
+local MARK_COLORS = {
+    _noob = Color3.fromRGB(255, 70, 70),
+    Cowboy = Color3.fromRGB(255, 200, 60),
+    Orb = Color3.fromRGB(200, 90, 255),
+}
+
+local function markEntity(model)
+    local color = MARK_COLORS[model.Name]
+    if not color or not Entities.Esp or Marks[model] then return end
+    local mark = highlight("ParryAssistMark", color, Color3.new(1, 1, 1))
+    mark.Adornee = model
+    Marks[model] = mark
+end
+
+local function clearMarks(all)
+    for model, mark in pairs(Marks) do
+        if all or not model.Parent then
+            pcall(function() mark:Destroy() end)
+            Marks[model] = nil
+        end
+    end
+end
+
+local function scanEntities()
+    for _, child in ipairs(Workspace:GetChildren()) do
+        if child:IsA("Model") then markEntity(child) end
+    end
+    local tower = Workspace:FindFirstChild("CurrentTower")
+    if tower then
+        for _, d in ipairs(tower:GetDescendants()) do
+            if d.Name == "Orb" and d:IsA("Model") then markEntity(d) end
+        end
+    end
+end
+
+-- an orb hurts builderman when you touch it: bring it to you
+local function collectOrb(model)
+    if Unloaded or not Entities.Orbs or not model.Parent then return end
+    local char, root = character()
+    if not char then return end
+    local touched = false
+    for _, part in ipairs(model:GetChildren()) do
+        if part:IsA("BasePart") then
+            part.CFrame = root.CFrame
+            touched = true
+            if typeof(firetouchinterest) == "function" then
+                pcall(firetouchinterest, root, part, 0)
+                pcall(firetouchinterest, root, part, 1)
+            end
+        end
+    end
+    if touched then Entities.orbs = Entities.orbs + 1 end
 end
 
 --// antis ---------------------------------------------------------------------------------
@@ -640,17 +866,94 @@ local function curses()
     end
 end
 
+-- anti void: the void under the map stops counting you, and a fall toward it
+-- puts you back where you last stood
+local Safe = { cf = nil, at = -math.huge, void = nil, voidTouch = nil }
+
+local function voidPart()
+    local folder = Workspace:FindFirstChild("NoParry")
+    local void = folder and folder:FindFirstChild("Void")
+    return void and void:IsA("BasePart") and void or nil
+end
+
+local function setVoid(on)
+    Anti.Void = on
+    local void = voidPart()
+    if on and void then
+        if Safe.void ~= void then
+            Safe.void, Safe.voidTouch = void, void.CanTouch
+        end
+        void.CanTouch = false
+    elseif Safe.void then
+        pcall(function() Safe.void.CanTouch = Safe.voidTouch end)
+        Safe.void = nil
+    end
+end
+
+local function voidGuard(char, root, hum, now)
+    if hum.FloorMaterial ~= Enum.Material.Air and not root.Anchored then
+        if now - Safe.at > 0.25 then Safe.cf, Safe.at = root.CFrame, now end
+        return
+    end
+    if not Safe.cf then return end
+    local void = voidPart()
+    local floor = void and (void.Position.Y + void.Size.Y / 2) or (Workspace.FallenPartsDestroyHeight + 60)
+    local falling = math.min(root.AssemblyLinearVelocity.Y, 0)
+    if root.Position.Y + falling * 0.1 < floor + 6 then
+        moveRootTo(char, root, Safe.cf + Vector3.new(0, 3, 0))
+        root.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+        Anti.saves = Anti.saves + 1
+    end
+end
+
+--// parry indicator -----------------------------------------------------------------------
+
+local Indicator = {}
+
+local function showIndicator(ready)
+    if not Indicator.gui then
+        local screen = Instance.new("ScreenGui")
+        screen.Name = "ParryAssistIndicator"
+        screen.ResetOnSpawn = false
+        screen.IgnoreGuiInset = true
+        local dot = Instance.new("Frame")
+        dot.Size = UDim2.fromOffset(18, 18)
+        dot.Position = UDim2.new(0.5, -9, 0.8, 0)
+        dot.BorderSizePixel = 0
+        local corner = Instance.new("UICorner")
+        corner.CornerRadius = UDim.new(1, 0)
+        corner.Parent = dot
+        dot.Parent = screen
+        screen.Parent = GuiRoot
+        Indicator.gui, Indicator.dot = screen, dot
+    end
+    Indicator.gui.Enabled = Show.Indicator
+    Indicator.dot.BackgroundColor3 = ready and Color3.fromRGB(80, 230, 120) or Color3.fromRGB(90, 90, 90)
+end
+
 --// frame loop ----------------------------------------------------------------------------
+
+local lastClean = 0
 
 local function step()
     findPress()
     curses()
+    if Fast.Slowmo or Fast.Cutscene then installFast() elseif Fast.env then removeFast() end
+    local now = os.clock()
+    if now - lastClean > 0.5 then
+        lastClean = now
+        clearMarks(false)
+    end
     local char, root, hum = character()
     if not char then
         Auto.seenAt, Auto.inRange = nil, 0
+        if Indicator.gui then Indicator.gui.Enabled = false end
         return
     end
-    local now = os.clock()
+    if Anti.Void then
+        if voidPart() ~= Safe.void then setVoid(true) end
+        voidGuard(char, root, hum, now)
+    end
     local ready = canStart(char)
     local hits = nil
 
@@ -659,17 +962,21 @@ local function step()
     while #Bacons > 0 and (gui("ParryCD") == true or now - Bacons[1] > 1.2) do table.remove(Bacons, 1) end
     if #Bacons > 0 and Entities.Bacon and ready then
         hits = parryTargets(char, root)
-        if (hits > 0 or now - Bacons[1] >= 0.8) and press() then
+        if (hits > 0 or now - Bacons[1] >= 0.35) and press() then
             table.remove(Bacons, 1)
             Entities.parried = Entities.parried + 1
             return
         end
     end
 
-    if Auto.Enabled then
+    if Auto.Enabled or Show.Indicator then
         hits = hits or parryTargets(char, root)
-        Auto.inRange = hits
-        if hits == 0 then
+    end
+    Auto.inRange = hits or 0
+    if Show.Indicator then showIndicator(ready and Auto.inRange > 0) elseif Indicator.gui then Indicator.gui.Enabled = false end
+
+    if Auto.Enabled then
+        if Auto.inRange == 0 then
             Auto.seenAt = nil
         elseif ready and not (Auto.AirOnly and hum.FloorMaterial ~= Enum.Material.Air) and not dangerWithin(now, 0.45) then
             Auto.seenAt = Auto.seenAt or now
@@ -679,8 +986,6 @@ local function step()
                 return
             end
         end
-    else
-        Auto.inRange = 0
     end
 
     Pvp.active = pvpOn()
@@ -701,9 +1006,13 @@ local function guarded(fn, ...)
     if not ok then warn('[parry assist] ' .. tostring(err)) end
 end
 
-track(RunService.RenderStepped:Connect(function() guarded(omniCheck, "render") end))
+track(RunService.RenderStepped:Connect(function()
+    guarded(omniCheck, "render")
+    guarded(cameraWatch)
+end))
 track(RunService.Stepped:Connect(function() guarded(omniCheck, "step") end))
-track(RunService.Heartbeat:Connect(function()
+track(RunService.Heartbeat:Connect(function(dt)
+    if type(dt) == "number" and dt > 0 and dt < 0.5 then Frame.dt = Frame.dt * 0.9 + dt * 0.1 end
     guarded(omniCheck, "beat")
     guarded(step)
 end))
@@ -724,14 +1033,30 @@ track(Workspace.ChildAdded:Connect(function(child)
         task.defer(guarded, dodge)
     elseif child:IsA("Model") then
         task.defer(function()
-            if child.Parent and child.Name:sub(1, 7) == "_shadow" then guarded(shadowAdded, child) end
+            if not child.Parent then return end
+            if child.Name:sub(1, 7) == "_shadow" then
+                guarded(shadowAdded, child)
+            else
+                markEntity(child)
+            end
         end)
     end
 end))
 
+local function towerAdded(d)
+    guardKillBrick(d)
+    if d.Name == "Orb" and d:IsA("Model") then
+        -- after builderman has put its parts in
+        task.defer(function()
+            markEntity(d)
+            guarded(collectOrb, d)
+        end)
+    end
+end
+
 local function bindTower(tower)
     if tower.Name ~= "CurrentTower" then return end
-    track(tower.DescendantAdded:Connect(guardKillBrick))
+    track(tower.DescendantAdded:Connect(towerAdded))
 end
 local currentTower = Workspace:FindFirstChild("CurrentTower")
 if currentTower then bindTower(currentTower) end
@@ -754,18 +1079,24 @@ local function unload()
         pcall(function() connection:Disconnect() end)
     end
     table.clear(Connections)
+    removeFast()
     Anti.Platforms, Anti.Legs, Anti.Wings, Anti.Jupiter = false, false, false, false
     pcall(curses)
     setKillBricks(false)
+    setVoid(false)
     if Controls then pcall(function() Controls:Enable() end) end
-    pcall(function() Probe:Destroy() end)
-    pcall(function() PvpProbe:Destroy() end)
-    pcall(function() ShadowMark:Destroy() end)
+    clearMarks(true)
+    for _, thing in ipairs({ Probe, Ahead, PvpProbe, ShadowMark, Indicator.gui or false }) do
+        if thing then pcall(function() thing:Destroy() end) end
+    end
     if Genv.__ParryFlingStop == unload then Genv.__ParryFlingStop = nil end
     if Onyx and not Onyx.Unloaded then pcall(function() Onyx:Unload() end) end
 end
 Genv.__ParryFlingStop = unload
-Genv.ParryFling = { Auto = Auto, Perfect = Perfect, Entities = Entities, Pvp = Pvp, Anti = Anti, Press = Press, Unload = unload }
+Genv.ParryFling = {
+    Auto = Auto, Perfect = Perfect, Fast = Fast, Entities = Entities, Pvp = Pvp, Anti = Anti,
+    Show = Show, Press = Press, Frame = Frame, Unload = unload,
+}
 
 --// ui ------------------------------------------------------------------------------------
 
@@ -818,6 +1149,7 @@ do
     local section = Tab:CreateSection('auto parry')
     toggle(section, 'auto parry', 'parries the moment a part is in the parry hitbox, so it never misses and never punishes you', 'pf_auto', Auto, 'Enabled')
     toggle(section, 'only in the air', 'leaves it alone while you stand on something', 'pf_air', Auto, 'AirOnly')
+    toggle(section, 'moving parts', 'a swinging or falling part only counts if it will still be in the hitbox when the parry lands', 'pf_predict', Auto, 'Predict')
     section:Slider({
         Title = 'reaction delay',
         Min = 0,
@@ -828,14 +1160,23 @@ do
         Flag = 'pf_delay',
         Callback = function(value) if type(value) == "number" then Auto.Delay = value end end,
     })
+    toggle(section, 'parry indicator', 'a dot on screen that turns green when a parry would land right now', 'pf_indicator', Show, 'Indicator')
 
     local perfect = Tab:CreateSection('perfect and omni')
     toggle(perfect, 'auto perfect parry', 'presses again the instant the perfect window opens (the game turns the parry screen blue), for the 400 launch. works on your own presses too', 'pf_perfect', Perfect, 'Enabled')
-    toggle(perfect, 'auto omni parry', 'presses in the 15 ms omni window at the end of a perfect parry, for the 800 launch. needs omni parry switched on in the game', 'pf_omni', Perfect, 'Omni')
+    toggle(perfect, 'auto omni parry', 'presses in the omni window at the end of a perfect parry, for the 800 launch. needs omni parry switched on in the game', 'pf_omni', Perfect, 'Omni')
+
+    local speed = Tab:CreateSection('speed')
+    toggle(speed, 'fast perfect parry', 'cuts the perfect parry\'s 2 s slow motion to 0.3 s, for your own presses too. auto omni still works: its window moves to the end of the shorter slow motion', 'pf_fast_slowmo', Fast, 'Slowmo')
+    toggle(speed, 'skip omni cutscene', 'plays the omni cutscene in a blink and launches you straight away', 'pf_fast_cutscene', Fast, 'Cutscene')
 
     local status = Tab:CreateSection('status')
     status:Label({ Title = function()
-        return ('press: %s%s'):format(pressHow(), Press.parry and ' (omni flag found)' or '')
+        local speedText = 'off'
+        if Fast.Slowmo or Fast.Cutscene then
+            speedText = Fast.env and ('on, %d waits cut'):format(Fast.cut) or (Fast.failed and 'not supported here' or 'waiting for the parry button')
+        end
+        return ('press: %s%s  |  speed: %s'):format(pressHow(), Press.parry and ' (omni flag found)' or '', speedText)
     end })
     status:Label({ Title = function()
         return ('auto %d  |  perfect %d  |  omni %d  |  omni missed %d'):format(Auto.count, Perfect.count, Perfect.omni, Perfect.missed)
@@ -852,12 +1193,12 @@ do
 
     local section = Tab:CreateSection('auto parry entities')
     toggle(section, 'ad', 'parries in the ad\'s window', 'pf_ad', Entities, 'Ad')
-    toggle(section, 'chatbox', 'parries the eyes and keeps you still through them', 'pf_chatbox', Entities, 'Chatbox')
+    toggle(section, 'chatbox', 'parries the eyes, timed to your frame rate, and keeps you still through them', 'pf_chatbox', Entities, 'Chatbox')
     toggle(section, 'noob', 'parries when its dash reaches you', 'pf_noob', Entities, 'Noob')
     toggle(section, 'builderman', 'parries every attack that hits you', 'pf_builderman', Entities, 'builderman')
     toggle(section, 'bacon', 'gets your parry on cooldown in time: a real parry if a part comes into range, a missed one if not', 'pf_bacon', Entities, 'Bacon')
 
-    local other = Tab:CreateSection('cowboy and shadow')
+    local other = Tab:CreateSection('cowboy, shadow and builderman')
     toggle(other, 'cowboy dodge', 'steps aside when it fires, since the bullet only checks where you stood', 'pf_cowboy', Entities, 'Cowboy')
     toggle(other, 'parry your shadow', 'parries when your shadow gets within the pvp box, which launches you away from it', 'pf_shadow', Entities, 'Shadow')
     toggle(other, "shadow can't kill you", 'your shadow stops counting touches', 'pf_shadow_safe', Entities, 'ShadowSafe')
@@ -865,9 +1206,23 @@ do
         ShadowMark.Enabled = state and LastShadow ~= nil and LastShadow.Parent ~= nil
         if state and LastShadow then ShadowMark.Adornee = LastShadow end
     end)
+    toggle(other, 'auto collect orbs', 'brings builderman\'s glitch orbs to you the moment they drop, so each one hurts him', 'pf_orbs', Entities, 'Orbs', function(state)
+        if not state then return end
+        local tower = Workspace:FindFirstChild("CurrentTower")
+        if not tower then return end
+        for _, d in ipairs(tower:GetDescendants()) do
+            if d.Name == "Orb" and d:IsA("Model") then guarded(collectOrb, d) end
+        end
+    end)
+
+    local look = Tab:CreateSection('see them')
+    toggle(look, 'entity esp', 'highlights the noob, the cowboy and builderman\'s orbs through walls', 'pf_esp', Entities, 'Esp', function(state)
+        if state then scanEntities() else clearMarks(true) end
+    end)
+    toggle(look, 'hide ads', 'the ad popups stop covering your screen (the ad still needs its parry)', 'pf_hide_ads', Entities, 'HideAds')
 
     local pvp = Tab:CreateSection('pvp')
-    toggle(pvp, 'auto pvp parry', 'parries when another player is in the game\'s 9 stud pvp box. the game only has pvp parries while the shadow entity is on, with parry players on or a round running', 'pf_pvp', Pvp, 'Enabled')
+    toggle(pvp, 'auto pvp parry', 'parries when another player is in the game\'s 9 stud pvp box and will still be there when it lands. the game only has pvp parries while the shadow entity is on, with parry players on or a round running', 'pf_pvp', Pvp, 'Enabled')
 
     local status = Tab:CreateSection('status')
     status:Label({ Title = function()
@@ -880,7 +1235,7 @@ do
         return 'entities: ' .. (#list > 0 and table.concat(list, ', ') or 'none')
     end })
     status:Label({ Title = function()
-        return ('parried %d  |  dodged %d  |  could not parry %d'):format(Entities.parried, Entities.dodged, Entities.blocked)
+        return ('parried %d  |  dodged %d  |  orbs %d  |  could not parry %d'):format(Entities.parried, Entities.dodged, Entities.orbs, Entities.blocked)
     end })
     status:Label({ Title = function()
         if not Pvp.active then return 'pvp: off in this round' end
@@ -892,11 +1247,13 @@ do
     local Tab = Window:CreateTab({ Title = 'extra' })
 
     local section = Tab:CreateSection('anti')
+    toggle(section, 'anti void', 'the void stops counting you, and a fall toward it puts you back where you last stood', 'pf_anti_void', Anti, 'Void', setVoid)
     toggle(section, 'anti kill bricks', 'kill bricks stop registering your touch', 'pf_anti_kill', Anti, 'KillBricks', setKillBricks)
     toggle(section, 'anti platforms curse', 'platforms stop disappearing', 'pf_anti_platforms', Anti, 'Platforms')
     toggle(section, 'anti legs curse', 'double jumps stop failing', 'pf_anti_legs', Anti, 'Legs')
     toggle(section, 'anti wings curse', 'parries give their double jump back', 'pf_anti_wings', Anti, 'Wings')
     toggle(section, 'anti jupiter curse', 'normal gravity', 'pf_anti_jupiter', Anti, 'Jupiter')
+    section:Label({ Title = function() return ('void saves %d'):format(Anti.saves) end })
 
     local scriptSection = Tab:CreateSection('script')
     scriptSection:Button({ Title = 'unload', Callback = unload })
