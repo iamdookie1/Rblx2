@@ -79,6 +79,15 @@ local Entities = {
 local Pvp = { Enabled = false, count = 0, active = false, players = 0 }
 local Anti = { KillBricks = false, Platforms = false, Legs = false, Wings = false, Jupiter = false, Void = false, saves = 0 }
 local Show = { Indicator = false }
+local Bot = {
+    Enabled = false, Perfect = false, Omni = false, Missed = true, DoubleJumps = true, Protect = true,
+    StopOnWin = true, ShowPad = false,
+    mode = 'off', tower = nil, pad = nil, parts = {}, bounds = nil, scannedAt = -math.huge,
+    lastLaunch = -math.huge, noclip = 0, prevVy = 0, bestY = -math.huge, bestAt = 0,
+    avoid = {}, wanderUntil = 0, wanderDir = nil, target = nil, jumpedAt = -math.huge,
+    misses = 0, startedAt = 0, took = nil, wins = 0, winsAt = nil, wonBefore = false,
+    protecting = false, holding = false, skipPerfect = false, skipOmni = false, handle = nil,
+}
 local Frame = { dt = 1 / 60 }
 
 local DODGE_DISTANCE = 4.5
@@ -467,7 +476,8 @@ local function bindParryScreen(screen)
         local frame = screen:WaitForChild("Frame", 10)
         if not frame or Unloaded then return end
         track(frame:GetPropertyChangedSignal("BackgroundColor3"):Connect(function()
-            if Unloaded or not Perfect.Enabled or not windowColor(frame.BackgroundColor3) then return end
+            local wanted = Perfect.Enabled or (Bot.Enabled and Bot.Perfect and not Bot.skipPerfect)
+            if Unloaded or not wanted or not windowColor(frame.BackgroundColor3) then return end
             if gui("CanPerfPar") == false or gui("PerfPar") == true then return end
             -- not with an entity about to need a parry while it holds you
             if dangerWithin(os.clock(), perfectHold()) then
@@ -489,7 +499,8 @@ local Omni = { watching = false, t0 = 0, before = nil, beat = 0, flagAt = 1.985,
 
 local function omniStart()
     findPress()
-    if not Perfect.Omni or gui("OmniParry") ~= true or gui("AutoOmniParry") == true then return end
+    local wanted = Perfect.Omni or (Bot.Enabled and Bot.Omni and not Bot.skipOmni)
+    if not wanted or gui("OmniParry") ~= true or gui("AutoOmniParry") == true then return end
     Omni.watching, Omni.t0, Omni.before, Omni.beat = true, os.clock(), nil, 0
     if Fast.env and Fast.Slowmo then
         Omni.flagAt, Omni.endAt = SLOWMO - OMNI_SPAN, SLOWMO
@@ -572,7 +583,7 @@ local function freezeMovement(seconds)
     frozenUntil = math.max(frozenUntil, os.clock() + seconds)
     pcall(function() module:Disable() end)
     task.delay(seconds + 0.05, function()
-        if os.clock() >= frozenUntil then pcall(function() module:Enable() end) end
+        if os.clock() >= frozenUntil and not Bot.holding then pcall(function() module:Enable() end) end
     end)
 end
 
@@ -931,6 +942,476 @@ local function showIndicator(ready)
     Indicator.dot.BackgroundColor3 = ready and Color3.fromRGB(80, 230, 120) or Color3.fromRGB(90, 90, 90)
 end
 
+
+local function guarded(fn, ...)
+    local ok, err = pcall(fn, ...)
+    if not ok then warn('[parry assist] ' .. tostring(err)) end
+end
+
+--// bot -------------------------------------------------------------------------------------
+-- Beats the tower with the game's own moves. Every parry off the underside of a
+-- platform adds 250 to your climb (400 perfect, 800 omni) and lets you pass
+-- through the tower for a moment, so the bot keeps chaining them: in the air it
+-- steers to the platform it can get under soonest before it stops rising, on
+-- the ground it walks under one and jumps. Near the top it goes for the win pad,
+-- flying into it from below or dropping onto it; overshot, a deliberate missed
+-- parry throws you down at 200.
+
+local PROBE_LOW, PROBE_HIGH = 1.5, 5.5
+
+local function towerFolder()
+    local current = Workspace:FindFirstChild("CurrentTower")
+    if not current then return nil end
+    for _, child in ipairs(current:GetChildren()) do
+        if child:IsA("Folder") and child:FindFirstChild("Obby") then return child end
+    end
+    return current:FindFirstChildOfClass("Folder")
+end
+
+local function findPad(tower)
+    local best, bestScore = nil, 0
+    for _, d in ipairs(tower:GetDescendants()) do
+        if d:IsA("BasePart") then
+            local name = d.Name:lower()
+            local score = (d.Name == "WinPad" and 3) or (d:FindFirstChild("WinScript") and 2)
+                or ((name:find("win", 1, true) or name:find("finish", 1, true)) and 1) or 0
+            if score > bestScore or (score > 0 and score == bestScore and d.Position.Y > best.Position.Y) then
+                best, bestScore = d, score
+            end
+        end
+    end
+    return best
+end
+
+-- a part's box in the world
+local function boxOf(part)
+    local cf, s = part.CFrame, part.Size / 2
+    local r, u, l = cf.RightVector, cf.UpVector, cf.LookVector
+    local hx = math.abs(r.X) * s.X + math.abs(u.X) * s.Y + math.abs(l.X) * s.Z
+    local hy = math.abs(r.Y) * s.X + math.abs(u.Y) * s.Y + math.abs(l.Y) * s.Z
+    local hz = math.abs(r.Z) * s.X + math.abs(u.Z) * s.Y + math.abs(l.Z) * s.Z
+    local p = cf.Position
+    return p.X - hx, p.X + hx, p.Y - hy, p.Y + hy, p.Z - hz, p.Z + hz
+end
+
+local function scanTower()
+    local tower = towerFolder()
+    Bot.tower, Bot.scannedAt = tower, os.clock()
+    Bot.pad = tower and findPad(tower) or nil
+    local list, walls = {}, nil
+    if tower then
+        local frame = tower:FindFirstChild("Frame")
+        for _, d in ipairs(tower:GetDescendants()) do
+            if d:IsA("BasePart") then
+                local x0, x1, y0, y1, z0, z1 = boxOf(d)
+                if walls then
+                    walls.x0, walls.x1 = math.min(walls.x0, x0), math.max(walls.x1, x1)
+                    walls.y0, walls.z0, walls.z1 = math.min(walls.y0, y0), math.min(walls.z0, z0), math.max(walls.z1, z1)
+                else
+                    walls = { x0 = x0, x1 = x1, y0 = y0, z0 = z0, z1 = z1 }
+                end
+                if not (frame and d:IsDescendantOf(frame)) and d ~= Bot.pad and d.CanCollide and not isKillBrick(d) then
+                    list[#list + 1] = { part = d, moving = not d.Anchored, x0 = x0, x1 = x1, y0 = y0, y1 = y1, z0 = z0, z1 = z1 }
+                end
+            end
+        end
+    end
+    table.sort(list, function(a, b) return a.y0 < b.y0 end)
+    Bot.parts, Bot.bounds = list, walls
+end
+
+local function insideTower(p)
+    local b = Bot.bounds
+    if not b then return true end
+    return p.X > b.x0 - 8 and p.X < b.x1 + 8 and p.Z > b.z0 - 8 and p.Z < b.z1 + 8 and p.Y > b.y0 - 20
+end
+
+-- how long a rise at vy takes to reach height h (nil if it never does)
+local function riseTime(y, vy, h, g)
+    local dy = h - y
+    if dy <= 0 then return 0 end
+    if vy <= 0 then return nil end
+    local disc = vy * vy - 2 * g * dy
+    if disc < 0 then return nil end
+    return (vy - math.sqrt(disc)) / g
+end
+
+-- the nearest point to (x, z) on a footprint, kept a margin in from its edges
+local function inside(x0, x1, z0, z1, x, z, margin)
+    local mx, mz = math.min(margin, (x1 - x0) / 2), math.min(margin, (z1 - z0) / 2)
+    return math.clamp(x, x0 + mx, x1 - mx), math.clamp(z, z0 + mz, z1 - mz)
+end
+
+local function flatDistance(p, x, z)
+    return math.sqrt((x - p.X) ^ 2 + (z - p.Z) ^ 2)
+end
+
+-- first platform whose underside is above height y
+local function firstAbove(y)
+    local list = Bot.parts
+    local lo, hi = 1, #list + 1
+    while lo < hi do
+        local mid = math.floor((lo + hi) / 2)
+        if list[mid].y0 <= y then lo = mid + 1 else hi = mid end
+    end
+    return lo
+end
+
+local function usable(e, now)
+    if not e.part.Parent or (Bot.avoid[e.part] or 0) > now then return false end
+    if e.moving then e.x0, e.x1, e.y0, e.y1, e.z0, e.z1 = boxOf(e.part) end
+    return true
+end
+
+-- in the air: the platform you can get under soonest while still rising at vy
+-- (one you would pass through anyway before the tower turns solid again is no use)
+local function choose(p, vy, speed, g, noclipLeft, now, padX, padZ)
+    if vy <= 0 then return nil end
+    local apex = p.Y + vy * vy / (2 * g)
+    local list = Bot.parts
+    local best, bestScore, bx, bz
+    local checked = 0
+    for i = firstAbove(p.Y + PROBE_LOW), #list do
+        local e = list[i]
+        if e.y0 > apex + PROBE_HIGH then break end
+        checked = checked + 1
+        if checked > 600 then break end
+        if usable(e, now) and e.y0 > p.Y + PROBE_LOW then
+            -- the box sees it from when your root is 5.5 under it until 1.5 under it
+            -- (or the top of your rise): you have until then to get under it
+            local t = riseTime(p.Y, vy, e.y0 - PROBE_HIGH + 0.4, g)
+            local last = t and riseTime(p.Y, vy, math.min(apex - 0.05, e.y0 - PROBE_LOW - 0.2), g)
+            if t and last and last >= noclipLeft then
+                local ax, az = inside(e.x0, e.x1, e.z0, e.z1, p.X, p.Z, 0.6)
+                if flatDistance(p, ax, az) <= speed * last + 0.3 then
+                    local score = t + 0.002 * math.sqrt((ax - padX) ^ 2 + (az - padZ) ^ 2)
+                    if not best or score < bestScore then best, bestScore, bx, bz = e, score, ax, az end
+                end
+            end
+        end
+    end
+    return best, bx, bz
+end
+
+local floorParams = RaycastParams.new()
+floorParams.FilterType = Enum.RaycastFilterType.Exclude
+
+-- standing: the nearest platform above that a jump (and a double jump) reaches,
+-- with floor under the spot to jump from
+local function chooseFromGround(char, p, reach, now)
+    local list = Bot.parts
+    floorParams.FilterDescendantsInstances = { char, Probe, PvpProbe, Ahead }
+    local best, bestD, bx, bz
+    local checked = 0
+    for i = firstAbove(p.Y + PROBE_LOW), #list do
+        local e = list[i]
+        if e.y0 > p.Y + reach + PROBE_HIGH - 0.4 then break end
+        checked = checked + 1
+        if checked > 400 then break end
+        if usable(e, now) then
+            local ax, az = inside(e.x0, e.x1, e.z0, e.z1, p.X, p.Z, 0.6)
+            local d = flatDistance(p, ax, az)
+            if d < 40 and (not best or d < bestD)
+                and (d < 1 or Workspace:Raycast(Vector3.new(ax, p.Y, az), Vector3.new(0, -4.5, 0), floorParams)) then
+                best, bestD, bx, bz = e, d, ax, az
+            end
+        end
+    end
+    return best, bx, bz, bestD
+end
+
+local function jumpPower(hum)
+    local power = hum.JumpPower
+    return (type(power) == "number" and power > 0) and power or 50
+end
+
+-- the game's own double jump (its space key handler), so its jump count and curses apply
+local Jumper = { fn = nil, lookedAt = -math.huge }
+
+local function doubleJump()
+    if gui("CanDoubleJump") == false or (gui("TempJumps") or 0) <= 0 then return false end
+    if not Jumper.fn and os.clock() - Jumper.lookedAt > 2 and typeof(getconnections) == "function" then
+        Jumper.lookedAt = os.clock()
+        local ok, list = pcall(getconnections, game:GetService("UserInputService").InputBegan)
+        if ok and type(list) == "table" then
+            for _, connection in ipairs(list) do
+                local okFn, fn = pcall(function() return connection.Function end)
+                if okFn and type(fn) == "function" then
+                    local okSource, source = pcall(debug.info, fn, "s")
+                    if okSource and type(source) == "string" and source:find("DoubleJump", 1, true) then
+                        Jumper.fn = fn
+                        break
+                    end
+                end
+            end
+        end
+    end
+    if Jumper.fn then
+        return (pcall(Jumper.fn, { KeyCode = Enum.KeyCode.Space }, false))
+    end
+    if VirtualInputManager then
+        pcall(function() VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.Space, false, game) end)
+        task.delay(0.03, function()
+            pcall(function() VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.Space, false, game) end)
+        end)
+        return true
+    end
+    return false
+end
+
+-- a missed parry throws you down at 200, unless it would kill you or do nothing
+local function missAllowed(hum)
+    if gui("NoPunish") == true then return false end
+    if valueOf(PlayerGui:FindFirstChild("NoResetOnSpawn"), "DeathPunish") == true then return false end
+    if gui("DamagePunish") == true and hum.Health <= 45 then return false end
+    return true
+end
+
+local function botMove(hum, direction)
+    Bot.move = direction
+    hum:Move(direction, false)
+end
+
+local function steerTo(hum, root, x, z)
+    local dx, dz = x - root.Position.X, z - root.Position.Z
+    local d = math.sqrt(dx * dx + dz * dz)
+    botMove(hum, d < 0.2 and Vector3.new(0, 0, 0) or Vector3.new(dx / d, 0, dz / d))
+end
+
+local PadMark = nil
+
+local function markPad()
+    local want = Bot.ShowPad and Bot.pad ~= nil and Bot.pad.Parent ~= nil
+    if want and not PadMark then
+        PadMark = Instance.new("Highlight")
+        PadMark.Name = "ParryAssistWinPad"
+        PadMark.FillColor = Color3.fromRGB(80, 255, 120)
+        PadMark.OutlineColor = Color3.new(1, 1, 1)
+        PadMark.FillTransparency = 0.4
+        PadMark.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+        PadMark.Parent = GuiRoot
+    end
+    if PadMark then
+        PadMark.Enabled = want
+        if want then PadMark.Adornee = Bot.pad end
+    end
+end
+
+local function botWon()
+    local wins = valueOf(LocalPlayer:FindFirstChild("leaderstats"), "Wins")
+    if type(wins) == "number" and type(Bot.winsAt) == "number" and wins > Bot.winsAt then return true end
+    return gui("HasWon") == true and not Bot.wonBefore
+end
+
+local function releaseBot()
+    if Bot.holding then
+        local module = controls()
+        if module then pcall(function() module:Enable() end) end
+        Bot.holding = false
+    end
+    local _, _, hum = character()
+    if hum then pcall(function() hum:Move(Vector3.new(0, 0, 0), false) end) end
+    Bot.move = nil
+    if Bot.protecting then
+        Bot.protecting = false
+        setKillBricks(false)
+    end
+    Bot.mode, Bot.target, Bot.skipPerfect, Bot.skipOmni = 'off', nil, false, false
+end
+
+local function setBot(on)
+    Bot.Enabled = on
+    if not on then
+        releaseBot()
+        return
+    end
+    local now = os.clock()
+    Bot.startedAt, Bot.took, Bot.misses = now, nil, 0
+    Bot.bestY, Bot.bestAt, Bot.wanderUntil = -math.huge, now, 0
+    Bot.avoid = {}
+    Bot.winsAt = valueOf(LocalPlayer:FindFirstChild("leaderstats"), "Wins")
+    Bot.wonBefore = gui("HasWon") == true
+    scanTower()
+    if Bot.Protect and not Anti.KillBricks then
+        setKillBricks(true)
+        Bot.protecting = true
+    end
+end
+
+local function botStep(char, root, hum, now)
+    if (now - Bot.scannedAt > 20 or not (Bot.tower and Bot.tower.Parent)) and now - Bot.lastLaunch > 1.5 then
+        scanTower()
+    end
+    markPad()
+    if botWon() then
+        Bot.wins = Bot.wins + 1
+        Bot.took = now - Bot.startedAt
+        Bot.winsAt = valueOf(LocalPlayer:FindFirstChild("leaderstats"), "Wins")
+        Bot.wonBefore = true
+        if Bot.onWin then pcall(Bot.onWin, Bot.took) end
+        if Bot.StopOnWin then
+            if Bot.handle then pcall(function() Bot.handle:Set(false) end) end
+            if Bot.Enabled then setBot(false) end
+            return
+        end
+        Bot.startedAt = now
+    end
+    local pad = Bot.pad
+    if not pad or not pad.Parent then
+        Bot.mode = 'no win pad found'
+        return
+    end
+    if not Bot.holding then
+        local module = controls()
+        if module then
+            pcall(function() module:Disable() end)
+            Bot.holding = true
+        end
+    end
+
+    local g = Workspace.Gravity
+    local v = root.AssemblyLinearVelocity
+    -- a launch shows as a jump in climbing speed; the tower lets you through for a while after
+    if v.Y - Bot.prevVy > 150 then
+        local gain = v.Y - math.max(Bot.prevVy, 0)
+        Bot.lastLaunch = now
+        Bot.noclip = (gain > 650 and 1.35) or (gain > 330 and 0.75) or 0.45
+    end
+    Bot.prevVy = v.Y
+    local noclipLeft = math.max(0, Bot.lastLaunch + Bot.noclip - now)
+    local p = root.Position
+    local px0, px1, py0, py1, pz0, pz1 = boxOf(pad)
+    local cx, cz = (px0 + px1) / 2, (pz0 + pz1) / 2
+    local speed = math.max(hum.WalkSpeed, 1)
+    local grounded = hum.FloorMaterial ~= Enum.Material.Air
+
+    -- a normal launch already gets there: no slow motion this close
+    Bot.skipPerfect = py0 - p.Y < 150
+    Bot.skipOmni = py0 - p.Y < 420
+    if p.Y > Bot.bestY + 4 then Bot.bestY, Bot.bestAt = p.Y, now end
+
+    if gui("DirectionalParry") == true then
+        -- the climb is planned around the box over your head
+        Bot.mode = 'directional parry is on: the bot needs it off'
+        botMove(hum, Vector3.new(0, 0, 0))
+        return
+    end
+    if now - Chat.at < 0.5 then
+        -- the chatbox's eyes are up: keep still through its window
+        Bot.mode = 'keeping still for the chatbox'
+        botMove(hum, Vector3.new(0, 0, 0))
+        return
+    end
+
+    local folder = Workspace:FindFirstChild("NoParry")
+    local teleports = folder and folder:FindFirstChild("Teleports")
+    local door = teleports and Bot.tower and teleports:FindFirstChild(Bot.tower.Name)
+    if not insideTower(p) and door and door:IsA("BasePart") then
+        Bot.mode = 'walking to the ' .. Bot.tower.Name .. ' teleport'
+        steerTo(hum, root, door.Position.X, door.Position.Z)
+        if grounded and now - Bot.bestAt > 2 and now - Bot.jumpedAt > 0.6 then
+            hum.Jump = true
+            Bot.jumpedAt = now
+        end
+        return
+    end
+
+    -- overshot: come down onto the pad
+    if p.Y - 3 > py1 + 0.5 then
+        Bot.mode = 'dropping onto the pad'
+        local ax, az = inside(px0, px1, pz0, pz1, p.X, p.Z, 1)
+        steerTo(hum, root, ax, az)
+        -- a missed parry freezes you for 0.2 s and then throws you down at 200:
+        -- only when that fall still lets you line up with the pad
+        local drop = p.Y - 3 - py1
+        local fall = 0.2 + drop / (200 + 0.5 * g * drop / 200)
+        if Bot.Missed and not root.Anchored and missAllowed(hum) and canStart(char)
+            and (v.Y > 5 or drop > 30) and flatDistance(p, ax, az) <= speed * (fall - 0.2) + 0.3
+            and parryTargets(char, root) == 0 and press() then
+            Bot.misses = Bot.misses + 1
+        end
+        return
+    end
+
+    -- no progress for a while: wander off and jump, and leave that platform alone
+    if now < Bot.wanderUntil and Bot.wanderDir then
+        Bot.mode = 'getting unstuck'
+        botMove(hum, Bot.wanderDir)
+        if grounded and now - Bot.jumpedAt > 0.5 then
+            hum.Jump = true
+            Bot.jumpedAt = now
+        end
+        return
+    end
+    if now - Bot.bestAt > 6 then
+        if Bot.target then Bot.avoid[Bot.target.part] = now + 8 end
+        local a = math.random() * math.pi * 2
+        Bot.wanderDir = Vector3.new(math.cos(a), 0, math.sin(a))
+        Bot.wanderUntil = now + 1.2
+        Bot.bestY, Bot.bestAt = p.Y, now
+        return
+    end
+
+    -- the pad within this rise (or a jump): straight for it
+    local power = jumpPower(hum)
+    local tPad = riseTime(p.Y, grounded and power or v.Y, py0 - 2.5, g)
+    if tPad then
+        local ax, az = inside(px0, px1, pz0, pz1, p.X, p.Z, 1)
+        local d = flatDistance(p, ax, az)
+        if grounded or d <= speed * tPad + 0.5 then
+            Bot.mode, Bot.target = 'going for the pad', nil
+            steerTo(hum, root, ax, az)
+            if grounded and d < 0.6 and now - Bot.jumpedAt > 0.4 then
+                hum.Jump = true
+                Bot.jumpedAt = now
+            end
+            return
+        end
+    end
+
+    if grounded then
+        local jumpHeight = power * power / (2 * g)
+        local reach = jumpHeight
+        if Bot.DoubleJumps and (gui("TempJumps") or 0) > 0 then reach = reach * 2 end
+        local pick, ax, az, d = chooseFromGround(char, p, reach, now)
+        if pick then
+            Bot.mode, Bot.target = 'getting under a platform', pick
+            steerTo(hum, root, ax, az)
+            if d < 0.5 and now - Bot.jumpedAt > 0.4 then
+                hum.Jump = true
+                Bot.jumpedAt = now
+            end
+            return
+        end
+        Bot.mode, Bot.target = 'heading for the pad', nil
+        steerTo(hum, root, cx, cz)
+        return
+    end
+
+    local pick, ax, az = choose(p, v.Y, speed, g, noclipLeft, now, cx, cz)
+    if not pick and Bot.DoubleJumps and v.Y < 15 and not root.Anchored and (gui("TempJumps") or 0) > 0 then
+        local again, ax2, az2 = choose(p, power, speed, g, noclipLeft, now, cx, cz)
+        if again and doubleJump() then pick, ax, az = again, ax2, az2 end
+    end
+    if pick then
+        Bot.mode, Bot.target = 'climbing', pick
+        steerTo(hum, root, ax, az)
+        return
+    end
+    local held = Bot.target
+    if held and usable(held, now) and held.y0 > p.Y + PROBE_LOW then
+        Bot.mode = 'going for the platform it jumped to'
+        steerTo(hum, root, inside(held.x0, held.x1, held.z0, held.z1, p.X, p.Z, 0.6))
+    elseif py0 - p.Y < 160 or noclipLeft > 0 then
+        Bot.mode, Bot.target = 'lining up with the pad', nil
+        steerTo(hum, root, cx, cz)
+    else
+        -- nothing to reach this time: come straight back down where you were
+        Bot.mode, Bot.target = 'waiting to land', nil
+        botMove(hum, Vector3.new(0, 0, 0))
+    end
+end
+
 --// frame loop ----------------------------------------------------------------------------
 
 local lastClean = 0
@@ -954,8 +1435,11 @@ local function step()
         if voidPart() ~= Safe.void then setVoid(true) end
         voidGuard(char, root, hum, now)
     end
+    if Bot.Enabled then guarded(botStep, char, root, hum, now) end
     local ready = canStart(char)
     local hits = nil
+    -- the bot parries like auto parry, except while it drops onto the pad
+    local autoOn = Auto.Enabled or (Bot.Enabled and Bot.mode ~= 'dropping onto the pad')
 
     -- bacon: any parry on cooldown within the second covers you; a real one if
     -- a part comes into range in time, a missed one if not
@@ -969,18 +1453,18 @@ local function step()
         end
     end
 
-    if Auto.Enabled or Show.Indicator then
+    if autoOn or Show.Indicator then
         hits = hits or parryTargets(char, root)
     end
     Auto.inRange = hits or 0
     if Show.Indicator then showIndicator(ready and Auto.inRange > 0) elseif Indicator.gui then Indicator.gui.Enabled = false end
 
-    if Auto.Enabled then
+    if autoOn then
         if Auto.inRange == 0 then
             Auto.seenAt = nil
-        elseif ready and not (Auto.AirOnly and hum.FloorMaterial ~= Enum.Material.Air) and not dangerWithin(now, 0.45) then
+        elseif ready and not (Auto.AirOnly and not Bot.Enabled and hum.FloorMaterial ~= Enum.Material.Air) and not dangerWithin(now, 0.45) then
             Auto.seenAt = Auto.seenAt or now
-            if now - Auto.seenAt >= Auto.Delay / 1000 and press() then
+            if now - Auto.seenAt >= (Bot.Enabled and 0 or Auto.Delay / 1000) and press() then
                 Auto.seenAt = nil
                 Auto.count = Auto.count + 1
                 return
@@ -1001,16 +1485,20 @@ local function step()
     end
 end
 
-local function guarded(fn, ...)
-    local ok, err = pcall(fn, ...)
-    if not ok then warn('[parry assist] ' .. tostring(err)) end
-end
-
 track(RunService.RenderStepped:Connect(function()
     guarded(omniCheck, "render")
     guarded(cameraWatch)
 end))
 track(RunService.Stepped:Connect(function() guarded(omniCheck, "step") end))
+-- after the control module, so the bot's steering holds even when it cannot switch it off
+pcall(function()
+    RunService:BindToRenderStep("ParryAssistBot", Enum.RenderPriority.Input.Value + 1, function()
+        if not Bot.Enabled or not Bot.move then return end
+        local _, _, hum = character()
+        if hum then hum:Move(Bot.move, false) end
+    end)
+end)
+track(LocalPlayer.CharacterAdded:Connect(function() Jumper.fn = nil end))
 track(RunService.Heartbeat:Connect(function(dt)
     if type(dt) == "number" and dt > 0 and dt < 0.5 then Frame.dt = Frame.dt * 0.9 + dt * 0.1 end
     guarded(omniCheck, "beat")
@@ -1080,6 +1568,12 @@ local function unload()
     end
     table.clear(Connections)
     removeFast()
+    pcall(function() RunService:UnbindFromRenderStep("ParryAssistBot") end)
+    if Bot.Enabled then
+        Bot.Enabled = false
+        releaseBot()
+    end
+    if PadMark then pcall(function() PadMark:Destroy() end) end
     Anti.Platforms, Anti.Legs, Anti.Wings, Anti.Jupiter = false, false, false, false
     pcall(curses)
     setKillBricks(false)
@@ -1095,7 +1589,7 @@ end
 Genv.__ParryFlingStop = unload
 Genv.ParryFling = {
     Auto = Auto, Perfect = Perfect, Fast = Fast, Entities = Entities, Pvp = Pvp, Anti = Anti,
-    Show = Show, Press = Press, Frame = Frame, Unload = unload,
+    Show = Show, Press = Press, Frame = Frame, Bot = Bot, Unload = unload,
 }
 
 --// ui ------------------------------------------------------------------------------------
@@ -1128,7 +1622,7 @@ local Window = Onyx:CreateWindow({
 Onyx.OnUnload = unload
 
 local function toggle(section, title, description, flag, owner, key, changed)
-    section:Toggle({
+    return section:Toggle({
         Title = title,
         Description = description,
         Default = owner[key],
@@ -1257,6 +1751,45 @@ do
 
     local scriptSection = Tab:CreateSection('script')
     scriptSection:Button({ Title = 'unload', Callback = unload })
+end
+
+
+do
+    local Tab = Window:CreateTab({ Title = 'bot' })
+
+    local section = Tab:CreateSection('auto beat tower')
+    Bot.handle = toggle(section, 'auto beat tower', 'climbs to the win pad by itself with parries: chains launches off the platforms above you, steering in the air to the next one it can reach, then flies into the pad or drops onto it. it finds the tower and its win pad by itself', 'pf_bot', Bot, 'Enabled', setBot)
+    toggle(section, 'use perfect parries', 'perfect parries launch 400 instead of 250 (skipped close to the top). turn on fast perfect parry in the parry tab, or each one holds you for 2 s', 'pf_bot_perfect', Bot, 'Perfect')
+    toggle(section, 'use omni parries', '800 launches when omni parry is on in the game (skipped close to the top)', 'pf_bot_omni', Bot, 'Omni')
+    toggle(section, 'missed parries to drop down', 'overshot the pad: a deliberate missed parry throws you down at 200. never used with death punish on', 'pf_bot_missed', Bot, 'Missed')
+    toggle(section, 'double jumps', 'uses your double jumps to reach a platform that is just too high', 'pf_bot_double', Bot, 'DoubleJumps')
+    toggle(section, 'protect from kill bricks', 'turns on anti kill bricks while it runs, since a launch passes through them', 'pf_bot_protect', Bot, 'Protect')
+    toggle(section, 'stop after a win', nil, 'pf_bot_stop', Bot, 'StopOnWin')
+    toggle(section, 'show the win pad', 'highlights the win pad through walls', 'pf_bot_pad', Bot, 'ShowPad', function()
+        if not Bot.pad then scanTower() end
+        markPad()
+    end)
+
+    local status = Tab:CreateSection('status')
+    status:Label({ Title = function()
+        if not Bot.tower then return 'tower: not found yet' end
+        local pad = Bot.pad
+        return ('tower: %s  |  win pad: %s'):format(Bot.tower.Name, pad and ('%d studs up'):format(math.floor(pad.Position.Y + 0.5)) or 'not found')
+    end })
+    status:Label({ Title = function()
+        local _, root = character()
+        local height = root and ('%d'):format(math.floor(root.Position.Y + 0.5)) or '-'
+        return ('bot: %s  |  height %s'):format(Bot.Enabled and Bot.mode or 'off', height)
+    end })
+    status:Label({ Title = function()
+        local run = Bot.Enabled and ('%.1f s'):format(os.clock() - Bot.startedAt) or '-'
+        local last = Bot.took and ('%.1f s'):format(Bot.took) or '-'
+        return ('this run %s  |  last win %s  |  wins %d  |  drop misses %d'):format(run, last, Bot.wins, Bot.misses)
+    end })
+end
+
+Bot.onWin = function(took)
+    Onyx:Notify({ Title = 'parry fling', Content = ('Tower beaten in %.1f s.'):format(took), Type = 'success', Duration = 6 })
 end
 
 Onyx:Notify({ Title = 'parry fling', Content = 'Loaded. Turn on auto parry to start.', Type = 'success', Duration = 5 })
