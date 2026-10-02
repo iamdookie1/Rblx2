@@ -292,8 +292,9 @@ function Choice.valueOf(set, value)
     return set.value[Choice.pick(set, value)]
 end
 
--- the one dropdown silent aim v2 has
+-- silent aim v2's dropdowns
 Choice.Targets = { default = 'Enemies', order = { 'Enemies', 'Anyone' } }
+Choice.NeverSure = { default = 'Drop the shot', order = { 'Drop the shot', 'Fire anyway' } }
 
 -- fling. a flung player is one whose own client resolved a contact against a
 -- part of yours that your client reported moving absurdly fast; every method
@@ -412,7 +413,7 @@ Choice.Trigger = {
     },
 }
 
--- silent aim v2. Four settings; the rest it works out on its own.
+-- silent aim v2. A few settings; the rest it works out on its own.
 local Aim = {
     Enabled = false,
     Targets = Choice.Targets.default,
@@ -420,6 +421,13 @@ local Aim = {
     Fov = 0,        -- degrees either side of where you shot; 0 takes anyone on screen
     Trim = 0,       -- ms added to the lead on top of what it has learned
     Learn = true,   -- learn the real delay from shots that really landed
+
+    -- hold for a sure shot: a shot of yours waits, up to MaxHold ms, for the
+    -- moment its chance of landing is at least SureOdds percent, then goes
+    Hold = true,
+    SureOdds = 90,
+    MaxHold = 1000,
+    NeverSure = Choice.NeverSure.default,
 }
 
 -- global on purpose: cold enough that a hash lookup costs nothing, and
@@ -442,9 +450,8 @@ Trigger = {
     ThrowRange = Choice.Trigger.ThrowRange.default,
 
     -- sure shots only: fire only once the predicted chance of the shot
-    -- landing is at least this
+    -- landing is at least silent aim's sure enough
     Sure = false,
-    SureOdds = 0.9,
 
     -- how long a target may drop out of sight before it counts as lost, and
     -- how long a gun activation has to show up at the hook as a real shot
@@ -543,11 +550,17 @@ end
 -- a type of player. A plain straight-line guess rides along as one heavy
 -- outcome, so with little seen yet it simply leads them.
 --
--- Up and down: jump physics. Mid-air they follow the arc down to the floor that
--- is really under them. Someone who keeps jumping goes straight back up after a
--- frame or two on the floor, measured off them, and the aim height is chosen to
--- sit inside their body whether they jump again or not. Spam jumpers are the
--- easy case for this, not the hard one.
+-- Up and down: jump physics. Mid-air they follow the arc of their jump, placed
+-- by how high the drawn body is (its launch speed measured off how high their
+-- jumps go), down to the floor that is really under them. On the floor they
+-- may hop at any moment, as often as they have been, and someone who keeps
+-- jumping goes straight back up after a frame or two, with odds counted over
+-- their last several landings. The aim height is the one inside their body in
+-- the most of those.
+--
+-- The chance is the share of all that the shot would catch, held back while
+-- it rests on too little: a few seconds of one person are only a few separate
+-- moves, the fewer the longer the lead. Hold for a sure shot waits on it.
 --
 -- The lead is your round trip plus the delay the game adds drawing other
 -- players, and that delay is learned: after every redirected shot, once it is
@@ -555,8 +568,8 @@ end
 -- where they actually went, and the ones that agree with what happened gain.
 -- Its best guess is kept between sessions.
 local SA = {
-    WINDOW = 3,             -- seconds of their past used as outcomes
-    RECENCY = 1.2,          -- seconds for an outcome's weight to fall to about a third
+    WINDOW = 4,             -- seconds of their past used as outcomes
+    RECENCY = 1.6,          -- seconds for an outcome's weight to fall to about a third
     PHASE = 0.2,            -- seconds: how alike the time since their last change must be
     PHASE_CAP = 1,          -- past this long without a change, every moment looks alike
     MOVING = 2,             -- studs/s
@@ -571,7 +584,30 @@ local SA = {
     BODY_HIGH = 2.1,        -- and the top of the head
     SIGMA_STAY = 0.8,       -- studs of doubt in where someone who stays down will be
     SIGMA_GO = 0.6,         -- and in where someone jumping again will be
+    SIGMA_ARC = 0.3,        -- and in where someone mid-air will be before they land
+    ARC_SPAN = 0.1,         -- seconds of drawn heights the arc they are on is fitted to
     MAX_LEAD = 1.5,
+    STEP = 0.012,           -- seconds between samples at least: the chance must not depend on your frame rate
+
+    -- jumps at random moments, rather than jump held down: learned per person
+    -- as hops per second spent on the floor, remembered over HOP_MEMORY seconds
+    HOP_MEMORY = 12,
+    HOP_PRIOR_RATE = 0.15,
+    HOP_PRIOR_TIME = 3,
+    HOP_SLICES = 8,
+
+    -- how far a handful of past moves is trusted: the chance is pulled toward
+    -- SHRINK_TO by SHRINK / (SHRINK + how many outcomes it really has). The
+    -- further ahead, the more neighbouring moments share the same future, so
+    -- the fewer separate outcomes they really are: SHRINK is for a lead of
+    -- SHRINK_LEAD and grows with it
+    SHRINK = 3,
+    SHRINK_LEAD = 0.25,
+    SHRINK_TO = 0.35,
+
+    -- the lead is never known exactly, so every outcome is taken a little
+    -- either side of it as well, and the aim and its chance hold up if it is off
+    LEAD_SPREAD = 0.03,
 
     -- the delay learned on top of the round trip, per weapon
     GRID_LO = -0.05,
@@ -584,6 +620,7 @@ local SA = {
 
     tracks = {},
     lat = {}, alo = {}, wt = {}, order = {},
+    hs = {}, hw = {}, hsig = {},
     knifeSpeed = 96,
     pending = {},
     cal = {},
@@ -665,6 +702,8 @@ function SA.newTrack(char)
         changeAt = nil, legMoving = false,
         air = false, groundY = nil, lastLandAt = nil, takeoffAt = nil,
         spam = 0.2, launch = 50, groundTime = 0.03, pendingLand = nil,
+        hops = SA.HOP_PRIOR_RATE * SA.HOP_PRIOR_TIME, floorTime = SA.HOP_PRIOR_TIME, lastT = nil,
+        landings = 0, helds = 0,
         stand = 3, floorY = nil,
     }
 end
@@ -714,29 +753,63 @@ function SA.push(s, t, x, y, z, vx, vy, vz, air)
         if changed then s.changeAt, s.legMoving = t, moving end
     end
 
-    -- jumps: takeoff, launch speed, landing, and whether a landing is met by
-    -- another jump straight away
+    -- jumps: takeoff, launch speed, landing, whether a landing is met by
+    -- another jump straight away, and how often they hop off the floor
+    -- otherwise, per second spent on it
+    local dt = s.lastT and math.clamp(t - s.lastT, 0, 0.1) or 0
+    s.lastT = t
+    local keep = math.exp(-dt / SA.HOP_MEMORY)
+    s.hops, s.floorTime = s.hops * keep, s.floorTime * keep
+    s.landings, s.helds = s.landings * keep, s.helds * keep
+    if not air then s.floorTime = s.floorTime + dt end
     if air and not s.air then
         s.takeoffAt = t
+        s.jumped, s.airTop, s.pastTop = vy > 15, y, false
+        local held = false
         if s.pendingLand then
             local gap = t - s.pendingLand
-            s.spam = s.spam + ((gap < 0.15 and 1 or 0) - s.spam) * 0.35
-            if gap < 0.15 then s.groundTime = s.groundTime + (gap - s.groundTime) * 0.3 end
+            held = gap < 0.15
+            s.landings = s.landings + 1
+            if held then
+                s.helds = s.helds + 1
+                s.groundTime = s.groundTime + (gap - s.groundTime) * 0.3
+            end
             s.pendingLand = nil
         end
-    end
-    if air and s.takeoffAt and t - s.takeoffAt < 0.07 and vy > 15 then
-        local launch = vy + gravity() * (t - s.takeoffAt)
-        s.launch = s.launch + (launch - s.launch) * 0.3
+        if not held then s.hops = s.hops + 1 end
     end
     if not air and s.air then
         s.lastLandAt, s.pendingLand = t, t
+        -- the launch speed, from how high the drawn body went: the replicated
+        -- speed arrives a moment before the body is drawn rising, so read off
+        -- it at takeoff the launch comes out low
+        if s.jumped and s.pastTop and s.groundY and s.airTop then
+            local launch = math.sqrt(2 * gravity() * math.max(s.airTop - s.groundY, 0))
+            if launch > 15 then s.launch = s.launch + (launch - s.launch) * 0.3 end
+        end
     end
     if s.pendingLand and not air and t - s.pendingLand >= 0.15 then
-        s.spam = s.spam - s.spam * 0.35
+        s.landings = s.landings + 1
         s.pendingLand = nil
     end
-    if not air then s.groundY = y end
+    -- the odds a landing is met by another jump straight away, over the
+    -- landings of the last HOP_MEMORY seconds or so: someone jumping in bursts
+    -- stops at some landing, and a few landings in a row cannot say which
+    s.spam = (s.helds + 0.2) / (s.landings + 1)
+    -- the floor they stand on, once the drawn body has settled on it: the
+    -- state can say landed a moment before the body is drawn down
+    local prev = s.last >= s.first and s.y[s.last] or nil
+    if not air and (s.groundY == nil or (not s.air and prev and math.abs(y - prev) < 0.3)) then s.groundY = y end
+    -- when the drawn body actually left the floor: the state can come a
+    -- snapshot before the body is drawn moving
+    if not air or not s.air then
+        s.riseAt = nil
+    end
+    if air then
+        s.airTop = math.max(s.airTop or y, y)
+        if y < s.airTop - 0.3 then s.pastTop = true end
+        if not s.riseAt and math.abs(y - (s.groundY or y)) > 0.05 then s.riseAt = t end
+    end
     s.air = air
 
     local k = s.last + 1
@@ -744,6 +817,28 @@ function SA.push(s, t, x, y, z, vx, vy, vz, air)
     s.t[k], s.x[k], s.y[k], s.z[k] = t, x, y, z
     s.vx[k], s.vz[k], s.vy[k] = vx, vz, vy
     s.e[k] = t - s.changeAt
+
+    -- mid-air without a jump (off a ledge, knocked), the arc as it is drawn:
+    -- the height and upward speed that fit the last few drawn heights under
+    -- gravity. The replicated speed can be a snapshot ahead of the drawn body,
+    -- which is studs over a long lead
+    s.arcY, s.arcVy = nil, nil
+    if air and not s.jumped and s.riseAt then
+        local g = gravity()
+        local n, st, sz, stt, stz = 0, 0, 0, 0, 0
+        local i = k
+        while i >= s.first and s.t[i] >= s.riseAt and t - s.t[i] <= SA.ARC_SPAN do
+            local d = s.t[i] - t
+            local h = s.y[i] + 0.5 * g * d * d
+            n, st, sz, stt, stz = n + 1, st + d, sz + h, stt + d * d, stz + d * h
+            i = i - 1
+        end
+        local det = n * stt - st * st
+        if n >= 3 and det > 1e-9 then
+            local b = (n * stz - st * sz) / det
+            s.arcY, s.arcVy = (sz - b * st) / n, b
+        end
+    end
 
     -- how fast they are turning: heading now against a moment ago
     local omega = 0
@@ -767,7 +862,8 @@ function SA.push(s, t, x, y, z, vx, vy, vz, air)
     end
 end
 
--- one sample of everyone else, every frame
+-- one sample of everyone else, every frame up to about 80 a second: past
+-- that, more of the same moments would only look like more evidence
 function SA.sampleAll(now)
     SA.refreshFilter(now)
     for _, plr in ipairs(Players:GetPlayers()) do
@@ -785,10 +881,12 @@ function SA.sampleAll(now)
                     SA.tracks[plr] = track
                 end
                 track.root = root
-                track.stand = SA.standHeight(char, root)
-                local okV, v = pcall(function() return root.AssemblyLinearVelocity end)
-                if not okV or typeof(v) ~= "Vector3" then v = Vector3.zero end
-                SA.push(track, now, p.X, p.Y, p.Z, v.X, v.Y, v.Z, SA.airborne(track, char, root, v.Y))
+                if track.last < track.first or now - track.t[track.last] >= SA.STEP then
+                    track.stand = SA.standHeight(char, root)
+                    local okV, v = pcall(function() return root.AssemblyLinearVelocity end)
+                    if not okV or typeof(v) ~= "Vector3" then v = Vector3.zero end
+                    SA.push(track, now, p.X, p.Y, p.Z, v.X, v.Y, v.Z, SA.airborne(track, char, root, v.Y))
+                end
             end
         end
     end
@@ -797,7 +895,8 @@ end
 function SA.byLat(a, b) return SA.lat[a] < SA.lat[b] end
 
 -- where across (c) and along (q) the line of fire to aim, from where they are
--- now, and the share of their past outcomes that lands inside the body
+-- now, and the chance it lands: the share of their past outcomes inside the
+-- body, pulled toward SHRINK_TO by how few outcomes that share really rests on
 function SA.horizontal(s, now, L, ax, az)
     local last = s.last
     local vx, vz = s.vx[last], s.vz[last]
@@ -809,22 +908,34 @@ function SA.horizontal(s, now, L, ax, az)
     local eNow = math.min(now - (s.changeAt or now), SA.PHASE_CAP)
     local wNow = s.w[last] or 0
     local lat, alo, wt, order = SA.lat, SA.alo, SA.wt, SA.order
+    local spread = SA.LEAD_SPREAD
 
-    local count = 1
-    lat[1] = L * (vx * ux + vz * uz)
-    alo[1] = L * (vx * ax + vz * az)
-    wt[1] = SA.PRIOR
-    local total = SA.PRIOR
+    -- the straight-line guess, at the lead and either side of it
+    local count, total = 0, 0
+    for k = -1, 1 do
+        local lead = math.max(L + k * spread, 0)
+        count = count + 1
+        lat[count] = lead * (vx * ux + vz * uz)
+        alo[count] = lead * (vx * ax + vz * az)
+        wt[count] = SA.PRIOR * (k == 0 and 0.5 or 0.25)
+        total = total + wt[count]
+    end
+    local priors = count
 
+    -- every past moment, each over the lead or a little either side of it in
+    -- turn (-, 0, +, 0), so neighbouring moments cover the spread between them
     local T, X, Z = s.t, s.x, s.z
+    local soonest = math.max(L - spread, 0)
     local j = s.first
     for i = s.first, last do
         local ti = T[i]
-        local goal = ti + L
-        if goal > now then break end
+        if ti + soonest > now then break end
         local age = now - ti
-        if age <= SA.WINDOW then
+        local turn = i % 4
+        local goal = ti + math.max(L + (turn == 1 and -spread or turn == 3 and spread or 0), 0)
+        if age <= SA.WINDOW and goal <= now then
             if j < i then j = i end
+            while j > i and T[j] > goal do j = j - 1 end
             while j < last and T[j + 1] <= goal do j = j + 1 end
             local x2, z2
             if j >= last then
@@ -882,54 +993,125 @@ function SA.horizontal(s, now, L, ax, az)
         local i = order[n]
         q, qw = q + alo[i] * wt[i], qw + wt[i]
     end
-    return c, qw > 0 and q / qw or 0, bestW / total
+
+    -- how many outcomes the share really rests on: a few heavy ones count for
+    -- little, however neatly they agree
+    local seen, squares = 0, 0
+    for i = priors + 1, count do
+        seen, squares = seen + wt[i], squares + wt[i] * wt[i]
+    end
+    local trust = 0
+    if squares > 0 then
+        local outcomes = seen * seen / squares
+        trust = outcomes / (outcomes + SA.SHRINK * math.max(L, 0.05) / SA.SHRINK_LEAD)
+    end
+    return c, qw > 0 and q / qw or 0, bestW / total * trust + SA.SHRINK_TO * (1 - trust)
 end
 
 -- the height to aim at, and how sure of it this is. (x, z) is where across the
--- ground the shot will find them, for the floor under that spot
+-- ground the shot will find them, for the floor under that spot. Every way
+-- they could be by then is an outcome with a weight and a doubt: following the
+-- arc they are on, jumping straight back up after landing, or on the floor,
+-- staying down or partway through a hop at any moment of that time. All of it
+-- at the lead and either side of it, the same as across.
 function SA.vertical(s, now, L, x, z)
+    local last = s.last
+    local y = s.y[last]
+    local ground = s.groundY or y
+    if s.air then
+        -- the floor they will come down on, under where they are headed
+        ground = SA.floorUnder(x, y, z, s.stand) or s.groundY or (y - 60)
+    end
+    local spread = SA.LEAD_SPREAD
+    local n = SA.verticalAt(s, now, math.max(L - spread, 0), ground, 0, 0.25)
+    n = SA.verticalAt(s, now, L, ground, n, 0.5)
+    n = SA.verticalAt(s, now, L + spread, ground, n, 0.25)
+    return SA.bestOf(n)
+end
+
+-- the outcomes at one lead, added after the first n, weighted by share
+function SA.verticalAt(s, now, L, ground, n, share)
     local last = s.last
     local y, vy = s.y[last], s.vy[last]
     local g = gravity()
     local launch = math.max(s.launch, 1)
+    if s.air and s.jumped and s.groundY then
+        -- a jump: how far into its arc the drawn body is, from its height
+        -- (the state says airborne a moment before the body is drawn rising,
+        -- and the replicated speed is that moment ahead of it too)
+        -- below the floor they left (jumped down off it) is the far end of the
+        -- same arc
+        local up = y - s.groundY
+        if up > -0.3 then up = math.max(up, 0) end
+        local apex = launch * launch / (2 * g)
+        local into = launch / g
+        if up < apex then
+            local root = math.sqrt(launch * launch - 2 * g * up)
+            local before = last > s.first and s.y[last - 1] or y
+            into = ((up < 0 or y < before - 0.01) and launch + root or launch - root) / g
+        end
+        y, vy = s.groundY + launch * into - 0.5 * g * into * into, launch - g * into
+    elseif s.arcY then
+        y, vy = s.arcY, s.arcVy
+    end
     local gt = s.groundTime
     local airtime = 2 * launch / g
     local p = s.spam
-    local centre = (SA.BODY_LOW + SA.BODY_HIGH) / 2
+    local rate = s.hops / math.max(s.floorTime, 0.5)
+    local hs, hw, hsig = SA.hs, SA.hw, SA.hsig
 
-    local stay, go
-    if s.air then
-        -- the floor they will come down on, under where they are headed
-        local ground = SA.floorUnder(x, y, z, s.stand) or s.groundY or (y - 60)
-        local disc = vy * vy + 2 * g * math.max(y - ground, 0)
-        local land = (vy + math.sqrt(disc)) / g
-        if L <= land then return y + vy * L - 0.5 * g * L * L + centre, 1 end
-        stay = ground
-        local t = (L - land) - gt
-        if t <= 0 then
-            go = ground
-        else
-            t = t % (airtime + gt)
-            go = t > airtime and ground or ground + launch * t - 0.5 * g * t * t
-        end
-    else
-        local since = now - (s.lastLandAt or -math.huge)
-        stay = y
-        if since > gt + 0.08 then
-            p = 0
-            go = y
-        else
-            local t = (L + since) - gt
-            if t <= 0 then
-                go = y
-            else
-                t = t % (airtime + gt)
-                go = t > airtime and y or y + launch * t - 0.5 * g * t * t
+    local function add(h, w, sigma)
+        w = w * share
+        if w <= 1e-5 then return end
+        for i = 1, n do
+            if hsig[i] == sigma and math.abs(hs[i] - h) < 0.02 then
+                hw[i] = hw[i] + w
+                return
             end
+        end
+        n = n + 1
+        hs[n], hw[n], hsig[n] = h, w, sigma
+    end
+    -- t seconds into a jump off the floor
+    local function arc(t)
+        if t <= 0 or t >= airtime then return ground end
+        return ground + launch * t - 0.5 * g * t * t
+    end
+    -- t seconds after landing, for someone who keeps jumping
+    local function again(t)
+        t = t - gt
+        if t <= 0 then return ground end
+        t = t % (airtime + gt)
+        if t > airtime then return ground end
+        return ground + launch * t - 0.5 * g * t * t
+    end
+    -- span seconds on the floor: still down, or partway through a hop that
+    -- started at any moment of it, as often as they hop
+    local function floor(span, weight)
+        local stay = math.exp(-rate * span)
+        add(ground, weight * stay, SA.SIGMA_STAY)
+        local slices = math.clamp(math.ceil((1 - stay) * 40), 1, SA.HOP_SLICES)
+        for i = 1, slices do
+            add(arc(span - span * (i - 0.5) / slices), weight * (1 - stay) / slices, SA.SIGMA_GO)
         end
     end
 
-    return SA.bestHeight(stay, go, p)
+    if s.air then
+        local disc = vy * vy + 2 * g * math.max(y - ground, 0)
+        local land = (vy + math.sqrt(disc)) / g
+        if L <= land then
+            add(y + vy * L - 0.5 * g * L * L, 1, SA.SIGMA_ARC)
+            return n
+        end
+        add(again(L - land), p, SA.SIGMA_GO)
+        floor(L - land, 1 - p)
+    else
+        local since = now - (s.lastLandAt or -math.huge)
+        if since > gt + 0.08 then p = 0 end
+        if p > 0 then add(again(L + since), p, SA.SIGMA_GO) end
+        floor(L, 1 - p)
+    end
+    return n
 end
 
 -- the share of a body standing at root height y (give or take sigma) that
@@ -940,31 +1122,60 @@ function SA.inside(a, y, sigma)
     return 1 / (1 + math.exp(-1.702 * hi)) - 1 / (1 + math.exp(-1.702 * lo))
 end
 
--- the aim height most likely to be inside the body, whether they stay down
--- (stay) or go straight back up (go, with odds p), and that likelihood
-function SA.bestHeight(stay, go, p)
-    if p <= 0 or math.abs(go - stay) < 1e-6 then return stay + (SA.BODY_LOW + SA.BODY_HIGH) / 2, 1 end
-    local best, bestScore = stay, -1
-    local a, to = math.min(stay, go) - 3, math.max(stay, go) + 3
-    while a <= to do
-        local score = (1 - p) * SA.inside(a, stay, SA.SIGMA_STAY) + p * SA.inside(a, go, SA.SIGMA_GO)
-        if score > bestScore then best, bestScore = a, score end
-        a = a + 0.1
-    end
-    return best, bestScore
+function SA.heightScore(a, n)
+    local hs, hw, hsig = SA.hs, SA.hw, SA.hsig
+    local sum = 0
+    for i = 1, n do sum = sum + hw[i] * SA.inside(a, hs[i], hsig[i]) end
+    return sum
 end
 
--- the point to send, and the chance it lands, for a lead of L seconds from origin
+-- the aim height inside the most of the first n outcomes, and that share: a
+-- coarse pass over every height that could matter, then a fine one around it
+function SA.bestOf(n)
+    local hs, hw = SA.hs, SA.hw
+    local from, to, total = math.huge, -math.huge, 0
+    for i = 1, n do
+        from, to = math.min(from, hs[i]), math.max(to, hs[i])
+        total = total + hw[i]
+    end
+    if n == 0 then return 0, 0 end
+    if to - from < 1e-6 then
+        local centre = from + (SA.BODY_LOW + SA.BODY_HIGH) / 2
+        return centre, SA.heightScore(centre, n) / math.max(total, 1e-9)
+    end
+    local best, bestScore = from, -1
+    local a = from + SA.BODY_LOW
+    while a <= to + SA.BODY_HIGH + 1e-9 do
+        local score = SA.heightScore(a, n)
+        if score > bestScore then best, bestScore = a, score end
+        a = a + 0.3
+    end
+    local centre = best
+    for k = -4, 4 do
+        if k ~= 0 then
+            local b = centre + k * 0.075
+            local score = SA.heightScore(b, n)
+            if score > bestScore then best, bestScore = b, score end
+        end
+    end
+    return best, bestScore / math.max(total, 1e-9)
+end
+
+-- the point to send, and the chance it lands, for a lead of L seconds from
+-- origin. The last sample of them can be a frame or so old, so the lead runs
+-- from when it was taken
 function SA.predict(s, now, L, origin)
     local last = s.last
+    local at = s.t[last]
+    L = L + math.clamp(now - at, 0, 0.1)
     local px, pz = s.x[last], s.z[last]
     local dx, dz = px - origin.X, pz - origin.Z
     local d = math.sqrt(dx * dx + dz * dz)
     if d < 1e-3 then dx, dz, d = 1, 0, 1 end
     local ax, az = dx / d, dz / d
-    local c, q, chance = SA.horizontal(s, now, L, ax, az)
+    local c, q, chance = SA.horizontal(s, at, L, ax, az)
     local x, z = px - c * az + q * ax, pz + c * ax + q * az
-    local y, sure = SA.vertical(s, now, L, x, z)
+    local y, sure = SA.vertical(s, at, L, x, z)
     return Vector3.new(x, y, z), chance * sure
 end
 
@@ -1185,20 +1396,21 @@ local function clearPath(origin, target, char)
 end
 
 -- the lead for a shot from origin at this target: round trip, the learned
--- delay, your trim and, for the knife, its flight - solved a few times, since
--- the flight depends on where the lead puts them
+-- delay, your trim and, for the knife, its flight. The flight depends on where
+-- the lead puts them, so it starts from where they are and is solved once
+-- more from where the first pass put them, which leaves it a fraction of a
+-- stud out at knife speeds
 function SA.solve(track, which, origin, now)
     local base = cachedPing + SA.delay(which) + (tonumber(Aim.Trim) or 0) / 1000
     local root = Vector3.new(track.x[track.last], track.y[track.last], track.z[track.last])
-    local flight = 0
-    local lead = math.clamp(base, 0, SA.MAX_LEAD)
+    local knife = which == 'Knife' and SA.knifeSpeed > 1
+    local flight = knife and (root - origin).Magnitude / SA.knifeSpeed or 0
+    local lead = math.clamp(base + flight, 0, SA.MAX_LEAD)
     local aim, chance = SA.predict(track, now, lead, origin)
-    if which == 'Knife' and SA.knifeSpeed > 1 then
-        for _ = 1, 3 do
-            flight = (aim - origin).Magnitude / SA.knifeSpeed
-            lead = math.clamp(base + flight, 0, SA.MAX_LEAD)
-            aim, chance = SA.predict(track, now, lead, origin)
-        end
+    if knife then
+        flight = (aim - origin).Magnitude / SA.knifeSpeed
+        lead = math.clamp(base + flight, 0, SA.MAX_LEAD)
+        aim, chance = SA.predict(track, now, lead, origin)
     end
     return aim, chance, lead, flight, root
 end
@@ -1304,9 +1516,10 @@ local function findKnifeOrigin()
     return handle and handle.Position
 end
 
-local function noteShot(plan, reason, origin, sent, aimed)
+local function noteShot(plan, reason, origin, sent, aimed, waited)
     if not Debug.Enabled or #shotEvents >= 24 then return end
     shotEvents[#shotEvents + 1] = {
+        waited = waited,
         at = os.clock(),
         reason = reason,
         knife = plan ~= nil and plan.isKnife or false,
@@ -1323,31 +1536,167 @@ local function noteShot(plan, reason, origin, sent, aimed)
     }
 end
 
+-- Hold for a sure shot. A shot of yours that would not land for sure is kept
+-- back at the hook rather than sent, and solved again every frame after that
+-- from wherever your weapon is by then, on the same person: the first frame it
+-- is sure enough, it goes. Not sure by the end of the max hold, it is dropped,
+-- or sent as sure as it got if you would rather. The trigger bot's shots are
+-- never held, since it already waits for its moment before it fires, and one
+-- of them going out replaces a shot of yours still being held.
+--
+-- The server never sees two shots closer together than you fired them, as
+-- long as you fired them close enough together for its cooldown to matter: a
+-- shot held for a while pushes the next one back by as much, if that one
+-- comes within COOLDOWN of it
+SA.COOLDOWN = 4
+SA.held = {}
+SA.sentAt = {}
+SA.holdStats = { sure = 0, anyway = 0, dropped = 0, waited = 0 }
+
+function SA.sureOdds()
+    return math.clamp((tonumber(Aim.SureOdds) or 90) / 100, 0, 1)
+end
+
+-- the earliest a shot pressed now may reach the server
+function SA.earliest(which, now)
+    local last = SA.sentAt[which]
+    if not last or now - last.press >= SA.COOLDOWN then return now end
+    return math.max(now, last.at + (now - last.press))
+end
+
+function SA.noteSent(which, press, at)
+    SA.sentAt[which] = { press = press, at = at }
+end
+
+-- where a shot from this weapon leaves from right now, as the game sends it
+function SA.weaponCFrame(which, tool)
+    if which == 'Gun' then
+        local char = LocalPlayer.Character
+        local root = char and char:FindFirstChild("HumanoidRootPart")
+        local attachment = root and root:FindFirstChild("GunRaycastAttachment")
+        return attachment and attachment.WorldCFrame
+    end
+    local handle = tool and tool:FindFirstChild("Handle")
+    return handle and handle.CFrame
+end
+
+function SA.dropHeld(which, now)
+    local held = SA.held[which]
+    if not held then return end
+    SA.held[which] = nil
+    SA.holdStats.dropped = SA.holdStats.dropped + 1
+    shotStats.suppressed = shotStats.suppressed + 1
+    noteShot(held.plan, "held, never sure: dropped", nil, nil, nil)
+end
+
+-- send a held shot, past the hook, at the plan's point (or where you aimed,
+-- with no plan)
+function SA.release(which, held, originCFrame, plan, now, how)
+    SA.held[which] = nil
+    local remote = held.remote
+    local target = plan and CFrame.new(plan.aim) or held.sent
+    local ok = typeof(target) == "CFrame" and pcall(function() remote.FireServer(remote, originCFrame, target) end)
+    if not ok then
+        SA.holdStats.dropped = SA.holdStats.dropped + 1
+        return
+    end
+    SA.noteSent(which, held.pressAt, now)
+    local stats = SA.holdStats
+    stats[how] = stats[how] + 1
+    stats.waited = stats.waited + (now - held.pressAt)
+    if plan then
+        SA.lastPlan = plan
+        SA.record(which, plan, originCFrame.Position, plan.aim, now)
+        shotStats.redirected = shotStats.redirected + 1
+        noteShot(plan, "redirected", originCFrame.Position, held.sent and held.sent.Position, plan.aim,
+            now - held.pressAt)
+    else
+        shotStats.suppressed = shotStats.suppressed + 1
+    end
+end
+
+-- every frame: each held shot, solved again from where the weapon is now
+function SA.stepHeld(now)
+    for which, held in pairs(SA.held) do
+        local tool = held.tool
+        local char = LocalPlayer.Character
+        local originCFrame = tool and tool.Parent == char and held.remote.Parent and SA.weaponCFrame(which, tool)
+        if not Aim.Enabled or not originCFrame then
+            -- the weapon put away, or silent aim switched off
+            SA.dropHeld(which, now)
+        else
+            local plan = SA.plan(which, originCFrame.Position, held.dir, now, held.anyone, held.plr)
+            held.plan = plan or held.plan
+            held.chance = plan and plan.chance or 0
+            if now >= held.earliest then
+                if plan and plan.chance >= SA.sureOdds() then
+                    SA.release(which, held, originCFrame, plan, now, 'sure')
+                elseif now >= held.deadline then
+                    if Choice.pick(Choice.NeverSure, Aim.NeverSure) == 'Fire anyway' then
+                        SA.release(which, held, originCFrame, plan, now, 'anyway')
+                    else
+                        SA.dropHeld(which, now)
+                    end
+                end
+            elseif now >= held.deadline and Choice.pick(Choice.NeverSure, Aim.NeverSure) ~= 'Fire anyway' then
+                SA.dropHeld(which, now)
+            end
+        end
+    end
+end
+
 -- the shot leaving now: who it goes to and where. the direction you actually
 -- fired in ranks the targets, so this follows your aim on a phone as well as
--- with a mouse. a shot the trigger bot fired stays on the person it fired at
-local function resolveRedirect(which, claimed, originCFrame, sentCFrame)
-    shotStats.seen = shotStats.seen + 1
+-- with a mouse. a shot the trigger bot fired stays on the person it fired at.
+-- Returns the point to send it at, nil to let it go as it is, or false when
+-- it is being held for a sure shot
+local function resolveRedirect(which, claimed, originCFrame, sentCFrame, remote)
     local origin = originCFrame.Position
     local sent = typeof(sentCFrame) == "CFrame" and sentCFrame.Position or nil
     local now = os.clock()
 
+    -- already holding one: this press waits with it, the hold running on from now
+    local held = SA.held[which]
+    if held and not claimed then
+        held.deadline = now + math.max(tonumber(Aim.MaxHold) or 0, 0) / 1000
+        return false
+    end
+    if held then SA.dropHeld(which, now) end
+
+    shotStats.seen = shotStats.seen + 1
     local dir = sent and (sent - origin) or Camera.CFrame.LookVector
     local plan
+    local anyone = not claimed and Choice.pick(Choice.Targets, Aim.Targets) == 'Anyone'
     if claimed then
         plan = SA.plan(which, origin, dir, now, false, claimed.plr)
     else
-        plan = SA.plan(which, origin, dir, now, Choice.pick(Choice.Targets, Aim.Targets) == 'Anyone')
+        plan = SA.plan(which, origin, dir, now, anyone)
     end
 
     if not plan then
         shotStats.suppressed = shotStats.suppressed + 1
         noteShot(nil, "no target", origin, sent, nil)
+        SA.noteSent(which, now, now)
         return nil
+    end
+
+    -- not sure of it yet, or too soon after a held shot: kept for the moment it is
+    local earliest = SA.earliest(which, now)
+    if not claimed and Aim.Hold and remote and (plan.chance < SA.sureOdds() or now < earliest) then
+        local tool = which == 'Gun' and remote.Parent or remote.Parent and remote.Parent.Parent
+        SA.held[which] = {
+            remote = remote, tool = tool, plr = plan.plr, dir = dir, anyone = anyone,
+            sent = typeof(sentCFrame) == "CFrame" and sentCFrame or nil,
+            pressAt = now, earliest = earliest,
+            deadline = now + math.max(tonumber(Aim.MaxHold) or 0, 0) / 1000,
+            plan = plan, chance = plan.chance,
+        }
+        return false
     end
 
     SA.lastPlan = plan
     SA.record(which, plan, origin, plan.aim, now)
+    SA.noteSent(which, now, now)
     shotStats.redirected = shotStats.redirected + 1
     noteShot(plan, "redirected", origin, sent, plan.aim)
     return CFrame.new(plan.aim)
@@ -1414,13 +1763,14 @@ local function debugTick(now)
             local moved = event.sent and event.aimed and (event.aimed - event.sent).Magnitude or nil
             local lead = event.root and event.predicted and flatDistance(event.predicted, event.root) or nil
             if debugLog then
-                debugLog:Log(("%s -> %s | moved %s | lead %s | travel %s | chance %s"):format(
+                debugLog:Log(("%s -> %s | moved %s | lead %s | travel %s | chance %s%s"):format(
                     tag,
                     event.target or "?",
                     moved and ("%.1f studs"):format(moved) or "n/a",
                     lead and ("%.1f studs"):format(lead) or "n/a",
                     event.travel and ("%.3fs"):format(event.travel) or "n/a",
-                    event.chance and ("%d%%"):format(math.floor(event.chance * 100 + 0.5)) or "n/a"))
+                    event.chance and ("%d%%"):format(math.floor(event.chance * 100 + 0.5)) or "n/a",
+                    event.waited and (" | held %d ms"):format(math.floor(event.waited * 1000 + 0.5)) or ""))
             end
             showMarker("aim", event.aimed)
 
@@ -1584,11 +1934,12 @@ end
 
 -- Sure shots only: whether the shot would land now, and if not, what it is
 -- waiting on. The chance is the share of their own past moves the shot would
--- have caught. Returns true, or false and the reason.
+-- have caught, as far as that many moves can be trusted, and sure enough is
+-- the setting on the silent aim tab. Returns true, or false and the reason.
 function Trigger.sure(plan)
     if plan.ahead then return false, 'waiting to see them for a sure shot' end
     local chance = plan.chance or 0
-    if chance < Trigger.SureOdds then
+    if chance < SA.sureOdds() then
         return false, ('waiting for a sure shot (%d%%)'):format(math.floor(chance * 100 + 0.5))
     end
     return true
@@ -1733,10 +2084,10 @@ function Trigger.step(now)
 end
 
 -- every frame: everyone's movement, the sides, the shots waiting to be known
--- as hits or misses, and the trigger bot. silent aim itself solves each shot
--- as it leaves, in the hook below
+-- as hits or misses, shots held for a sure one, and the trigger bot. silent
+-- aim itself solves each shot as it leaves, in the hook below
 track(PreSimulation:Connect(function()
-    if Unloading or not (Aim.Enabled or Trigger.Gun or Trigger.Throw or #SA.pending > 0) then return end
+    if Unloading or not (Aim.Enabled or Trigger.Gun or Trigger.Throw or #SA.pending > 0 or next(SA.held)) then return end
 
     pcall(function()
         local now = os.clock()
@@ -1752,6 +2103,7 @@ track(PreSimulation:Connect(function()
         SA.sampleAll(now)
         SA.refreshTeams()
         SA.resolve(now)
+        SA.stepHeld(now)
         Trigger.step(now)
         debugTick(now)
     end)
@@ -1765,7 +2117,9 @@ if hasNamecallHook then
 
     -- silent aim redirects here, and so does every shot the trigger bot
     -- fires: that one stays on the person it fired at, silent aim on or off.
-    -- seeing a shot leave is also what confirms one it asked the gun to fire
+    -- seeing a shot leave is also what confirms one it asked the gun to fire.
+    -- a shot of yours held for a sure shot is kept back here, and sent later
+    -- past the hook
     local function onNamecall(self, ...)
         if Unloading or not (Aim.Enabled or trigger.Gun or trigger.Throw)
             or typeof(self) ~= "Instance" or getnamecallmethod() ~= "FireServer"
@@ -1780,7 +2134,8 @@ if hasNamecallHook then
                 local origin, sent = ...
                 local claimed = trigger.claimed('Gun')
                 if (Aim.Enabled or claimed) and typeof(origin) == "CFrame" then
-                    local redirect = resolveRedirect('Gun', claimed, origin, sent)
+                    local redirect = resolveRedirect('Gun', claimed, origin, sent, self)
+                    if redirect == false then return end
                     if redirect then
                         local fire = self.FireServer
                         if typeof(fire) == "function" then
@@ -1799,7 +2154,8 @@ if hasNamecallHook then
                 local handle, sent = ...
                 local claimed = trigger.claimed('Knife')
                 if (Aim.Enabled or claimed) and typeof(handle) == "CFrame" then
-                    local redirect = resolveRedirect('Knife', claimed, handle, sent)
+                    local redirect = resolveRedirect('Knife', claimed, handle, sent, self)
+                    if redirect == false then return end
                     if redirect then
                         local fire = self.FireServer
                         if typeof(fire) == "function" then
@@ -2582,6 +2938,47 @@ do
         Flag = 'mm2_sa2_fov',
         Callback = function(value) Aim.Fov = tonumber(value) or 0 end,
     })
+
+    MainSection:Toggle({
+        Title = 'hold for a sure shot',
+        Description = 'a shot that would not land for sure waits, up to the max hold, for the moment it would, then goes on its own. the server never gets two shots closer together than you fired them',
+        Flag = 'mm2_sa2_hold',
+        Default = true,
+        Callback = function(state) Aim.Hold = state end,
+    })
+
+    MainSection:Slider({
+        Title = 'sure enough',
+        Description = 'the chance of landing a held shot waits for. the trigger bot sure shots use it too',
+        Min = 50,
+        Max = 99,
+        Increment = 1,
+        Suffix = '%',
+        Default = 90,
+        Flag = 'mm2_sa2_sure',
+        Callback = function(value) Aim.SureOdds = tonumber(value) or 90 end,
+    })
+
+    MainSection:Slider({
+        Title = 'max hold',
+        Description = 'the longest a shot waits to be sure',
+        Min = 100,
+        Max = 2000,
+        Increment = 50,
+        Suffix = ' ms',
+        Default = 1000,
+        Flag = 'mm2_sa2_maxhold',
+        Callback = function(value) Aim.MaxHold = tonumber(value) or 1000 end,
+    })
+
+    MainSection:Dropdown({
+        Title = 'never sure',
+        Description = 'what happens to a shot still not sure at the end of the max hold: dropped, or sent as sure as it got',
+        Values = Choice.NeverSure.order,
+        Default = Choice.NeverSure.default,
+        Flag = 'mm2_sa2_neversure',
+        Callback = function(value) Aim.NeverSure = Choice.pick(Choice.NeverSure, value) end,
+    })
 end
 
 do
@@ -2620,11 +3017,12 @@ do
         lead = addStat(LeadSection, { Title = 'lead', Value = '-' }),
         learned = addStat(LeadSection, { Title = 'learned delay', Value = '-' }),
         landed = addStat(LeadSection, { Title = 'shots landed', Value = '0 / 0' }),
+        hold = addStat(LeadSection, { Title = 'held shots', Value = '-' }),
     }
     knifeSpeedStat = addStat(LeadSection, { Title = 'knife speed (read from the game)', Value = ('%d studs/s'):format(SA.knifeSpeed) })
 
     LeadSection:Label({
-        Title = 'It aims where each person has really been going: their own last few seconds of movement, matched to what they are doing now, and jump physics for anyone in the air or spamming jump. Chance is how much of that movement the shot would have caught. Lead is your round trip plus the delay it has learned from your own hits and misses.',
+        Title = 'It aims where each person has really been going: their own last few seconds of movement, matched to what they are doing now, and jump physics for anyone in the air, spamming jump or hopping now and then. Chance is how much of that movement the shot would have caught, held back while it has seen too little of them to be sure. Lead is your round trip plus the delay it has learned from your own hits and misses.',
     })
 end
 
@@ -2645,7 +3043,12 @@ function SA.readout()
     if not ui then return end
     local plan, which = nil, nil
     if Aim.Enabled or Trigger.Gun or Trigger.Throw then plan, which = SA.preview() end
-    if plan then
+    local held = SA.held.Gun or SA.held.Knife
+    if held and held.plr then
+        ui.target.Set(('holding for %s, %d%% (sure at %d%%)'):format(held.plr.Name,
+            math.floor((held.chance or 0) * 100 + 0.5), math.floor(SA.sureOdds() * 100 + 0.5)),
+            Color3.fromRGB(255, 196, 60))
+    elseif plan then
         ui.target.Set(('%s, %d%% chance'):format(plan.char.Name, math.floor((plan.chance or 0) * 100 + 0.5)),
             Color3.fromRGB(126, 217, 87))
         local delay = SA.delay(which)
@@ -2670,6 +3073,10 @@ function SA.readout()
     end
     ui.learned.Set(('gun %s, knife %s'):format(learnt('Gun'), learnt('Knife')))
     ui.landed.Set(('%d / %d'):format(shotStats.hits, shotStats.resolved))
+    local hold = SA.holdStats
+    local went = hold.sure + hold.anyway
+    ui.hold.Set(('%d sure, %d anyway, %d dropped%s'):format(hold.sure, hold.anyway, hold.dropped,
+        went > 0 and (', %d ms wait'):format(math.floor(hold.waited / went * 1000 + 0.5)) or ''))
 end
 
 SA.load()
@@ -3325,7 +3732,7 @@ do
 
     section:Toggle({
         Title = 'sure shots only',
-        Description = 'holds fire until the predicted chance of the shot landing is 90% or more. the readout shows the chance it is waiting on',
+        Description = 'holds fire until the predicted chance of the shot landing is at least sure enough on the silent aim tab (90% unless you change it). the readout shows the chance it is waiting on',
         Flag = 'mm2_tb_sure',
         Default = false,
         Callback = function(state) Trigger.Sure = state end,
@@ -3822,6 +4229,7 @@ ProofSection:Button({
         shotStats.suppressed = 0
         shotStats.proved = 0
         shotStats.error = 0
+        for key in pairs(SA.holdStats) do SA.holdStats[key] = 0 end
     end,
 })
 
