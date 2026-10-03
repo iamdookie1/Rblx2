@@ -198,8 +198,18 @@ local function saveBad()
     end
     pcall(writefile, FOLDER .. "/bad_words.txt", table.concat(list, "\n"))
 end
+-- A rejection can mean "already used", so a word is only remembered as bad
+-- once it's been turned down in two different matches.
+local Suspect = {}
+local MatchId = 0
 local function markBad(word)
-    if word and not Bad[word] and S.LearnBadWords then
+    if not word or Bad[word] or not S.LearnBadWords then
+        return
+    end
+    local first = Suspect[word]
+    if first == nil then
+        Suspect[word] = MatchId
+    elseif first ~= MatchId then
         Bad[word] = true
         BadCount += 1
         task.spawn(saveBad)
@@ -315,6 +325,7 @@ local function resetSeen(reason)
 end
 
 local function resetMatch()
+    MatchId += 1
     Match.turn, Match.prefix, Match.player, Match.word, Match.lastWord = 0, "", nil, "", nil
     Match.used, Match.usedStart, Match.usedCount = {}, {}, 0
     Match.lives, Match.lastPrefixLen = {}, 0
@@ -509,6 +520,8 @@ local function pickFirstLetter(options)
     return best
 end
 
+local Turn = { gen = 0, active = false, prefix = "", s2 = "", word = nil, deadline = 0, tries = 0, autoPrefix = nil }
+
 --// Keys: the on-screen keyboard every device has, or real key events \\--
 local function keyboard()
     return guiPath("Overbar", "Frame", "Keyboard")
@@ -589,13 +602,72 @@ local function pressKey(key)
     return true
 end
 
+-- The word on screen, in typed order (nil when an ability has scrambled it).
+local function currentWordFrame()
+    return guiPath("InGame", "Frame", "CurrentWord")
+end
+local function screenWord()
+    local frame = currentWordFrame()
+    if not frame then
+        return nil
+    end
+    local letters = {}
+    for _, child in frame:GetChildren() do
+        local index = tonumber(child.Name)
+        local label = index and child:IsA("Frame") and child:FindFirstChild("Letter")
+        if label and label:IsA("TextLabel") then
+            letters[index] = label.Text
+        end
+    end
+    local out = {}
+    local i = 1
+    while letters[i] do
+        local letter = string.lower(letters[i])
+        if not string.match(letter, "^%l$") then
+            return nil
+        end
+        out[i] = letter
+        i += 1
+    end
+    return #out > 0 and table.concat(out) or nil
+end
+
+-- Whether the game already put the starting letters in your word. When it
+-- hasn't, it shows them as grey boxes (Filled = false) you have to type over.
+local function prefixOnScreen()
+    local frame = currentWordFrame()
+    if not frame then
+        return nil
+    end
+    local sawBase = false
+    for _, child in frame:GetChildren() do
+        if child:IsA("Frame") and child:GetAttribute("BaseLetter") == true then
+            sawBase = true
+            if child:GetAttribute("Filled") == false then
+                return false
+            end
+        end
+    end
+    return sawBase and true or nil
+end
+
 local function autoTypePrefix()
     if S.PrefixMode == "Game types it" then
         return true
     elseif S.PrefixMode == "I type it" then
         return false
     end
-    return Game.settings ~= nil and Game.settings.AutoTypePrefix == true
+    if Turn.autoPrefix ~= nil then
+        return Turn.autoPrefix
+    end
+    local onScreen = prefixOnScreen()
+    if onScreen ~= nil then
+        return onScreen
+    end
+    if Game.settings ~= nil and Game.settings.AutoTypePrefix ~= nil then
+        return Game.settings.AutoTypePrefix == true
+    end
+    return true
 end
 
 local function timeLeft()
@@ -625,7 +697,6 @@ local function paused()
 end
 
 --// Typing a turn \\--
-local Turn = { gen = 0, active = false, prefix = "", s2 = "", word = nil, deadline = 0, tries = 0 }
 local Log -- set once the UI exists
 
 local function logLine(text, color)
@@ -722,7 +793,9 @@ local function answerTurn(gen, retry)
     if not retry then
         -- Read the letters now: the ask can land just before Rotate.
         Turn.prefix = string.upper(Match.prefix or "")
-        Turn.s2 = autoTypePrefix() and Turn.prefix or ""
+        Turn.autoPrefix = nil
+        Turn.autoPrefix = autoTypePrefix()
+        Turn.s2 = Turn.autoPrefix and Turn.prefix or ""
     end
     local word, trapN = pickWord(Turn.prefix)
     if not word then
@@ -751,7 +824,8 @@ local function onWordRequest(timeToRespond, firstAsk, extra)
     Turn.deadline = os.clock() + (tonumber(timeToRespond) or 15)
     local retry = not (firstAsk and not extra)
     if not retry then
-        Turn.s2 = autoTypePrefix() and Turn.prefix or ""
+        Turn.autoPrefix = nil
+        Turn.s2 = ""
         Turn.tries = 0
         Turn.stuck = false
     end
@@ -883,6 +957,11 @@ onEvent("Rotate", function(newWord, letters, playerName, seat)
         return
     end
     if newWord then
+        -- The last turn's word is done: if it's a real word, it's used now.
+        local finished = string.lower(Match.word or "")
+        if #finished > #(Match.prefix or "") and Dict.set[finished] then
+            useWord(finished)
+        end
         Match.word = letters
     else
         Match.word = (Match.word or "") .. letters
@@ -933,7 +1012,11 @@ end)
 onEvent("AnswerResults", function(correct, userId)
     local mine = userId == LocalPlayer.UserId
     if correct then
-        local word = mine and Turn.word or Match.word
+        local word = mine and Turn.word or screenWord() or Match.word
+        if not mine and word and not Dict.set[word] and Dict.set[string.lower(Match.word or "")] then
+            word = Match.word
+        end
+        word = word and string.lower(word)
         useWord(word)
         local who = Players:GetPlayerByUserId(userId)
         logLine((who and who.DisplayName or "?") .. ": " .. string.upper(word or "?"))
@@ -1201,7 +1284,9 @@ do -- Main
         local gen = Turn.gen
         Turn.prefix = string.upper(Match.prefix or "")
         if Turn.s2 == "" or not Turn.active then
-            Turn.s2 = autoTypePrefix() and Turn.prefix or ""
+            Turn.autoPrefix = nil
+            Turn.autoPrefix = autoTypePrefix()
+            Turn.s2 = Turn.autoPrefix and Turn.prefix or ""
         end
         Turn.deadline = os.clock() + (timeLeft() or 10)
         task.spawn(function()
