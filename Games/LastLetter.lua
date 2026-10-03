@@ -72,7 +72,8 @@ local S = {
     AutoType = false, WordStyle = "Balanced", TargetLength = 6, MinLength = 4, MaxLength = 12, PickFrom = 5,
     -- typing
     TypeMethod = "Auto", PrefixMode = "Auto", Wpm = 75, WpmJitter = 25, ReactMin = 600, ReactMax = 1400,
-    TypoChance = 0, FinishInTime = true, AutoSubmit = true, RetryDelay = 500,
+    TypoChance = 0, AutoSubmit = true, SpeedPreset = "Custom",
+    PreferEndings = "", EndingsFirst = true, AvoidRecent = 40, StopWhenITyped = true,
     -- one by one
     AutoOneByOne = false, ObOStrategy = "Win, else safe", ObOMinLength = 3,
     -- first letter
@@ -91,8 +92,7 @@ local S = {
     AvoidLetters = "", AvoidEndings = "", BannedWords = "", FavoriteWords = "", SkipOddWords = true,
     IgnoreFiltersIfStuck = true,
     -- timing
-    WaitUntilLeft = 0, ThinkPerLetter = 0, PauseChance = 0, PauseMin = 200, PauseMax = 700,
-    SubmitMin = 80, SubmitMax = 250, TypoFixDelay = 250, MaxTries = 5,
+    WaitUntilLeft = 0, PauseChance = 0, SubmitWait = 250, MaxTries = 5,
     -- lobby
     AutoJoin = false, JoinModes = { ["Last Letter"] = true }, JoinSizes = { ["2"] = true, ["4"] = true, ["8"] = true },
     JoinPreferWaiting = true, JoinEvery = 4, AutoDaily = false, AutoTasks = false, LogAbilities = true, NotifyBlocked = true,
@@ -108,7 +108,7 @@ local function wordSet(text)
     end
     return set
 end
-local Filters = { avoidLetters = {}, avoidEndings = {}, banned = {}, favorite = {} }
+local Filters = { avoidLetters = {}, avoidEndings = {}, banned = {}, favorite = {}, preferEndings = {} }
 local function refreshFilters()
     Filters.avoidLetters = {}
     for c in string.gmatch(string.lower(S.AvoidLetters), "%l") do
@@ -117,6 +117,11 @@ local function refreshFilters()
     Filters.avoidEndings = wordSet(S.AvoidEndings)
     Filters.banned = wordSet(S.BannedWords)
     Filters.favorite = wordSet(S.FavoriteWords)
+    -- Kept in the order typed: earlier endings win.
+    Filters.preferEndings = {}
+    for ending in string.gmatch(string.lower(S.PreferEndings or ""), "%l+") do
+        table.insert(Filters.preferEndings, ending)
+    end
 end
 
 --// Plumbing \\--
@@ -460,6 +465,59 @@ local function allowedWord(w)
     return true
 end
 
+-- Your own recent words, kept across matches so you don't play the same ones.
+local Recent = { list = {}, set = {} }
+local function rebuildRecent()
+    Recent.set = {}
+    if S.AvoidRecent <= 0 then
+        return
+    end
+    for i = math.max(1, #Recent.list - S.AvoidRecent + 1), #Recent.list do
+        Recent.set[Recent.list[i]] = true
+    end
+end
+local function rememberWord(word)
+    word = word and string.lower(word)
+    if not word then
+        return
+    end
+    table.insert(Recent.list, word)
+    while #Recent.list > 300 do
+        table.remove(Recent.list, 1)
+    end
+    rebuildRecent()
+    if fileOk() then
+        task.spawn(function()
+            ensureFolder()
+            pcall(writefile, FOLDER .. "/recent.txt", table.concat(Recent.list, "\n"))
+        end)
+    end
+end
+
+local function loadRecent()
+    if not fileOk() or not isfile(FOLDER .. "/recent.txt") then
+        return
+    end
+    local ok, text = pcall(readfile, FOLDER .. "/recent.txt")
+    if ok and text then
+        for w in string.gmatch(text, "%l+") do
+            table.insert(Recent.list, w)
+        end
+        rebuildRecent()
+    end
+end
+-- Closest to the length you aim for, picked at random among the best few.
+local function bestFit(list)
+    local scored = {}
+    for _, w in list do
+        scored[#scored + 1] = { w = w, s = math.abs(#w - S.TargetLength) + math.random() * 0.5 }
+    end
+    table.sort(scored, function(a, b)
+        return a.s < b.s
+    end)
+    return scored[math.random(1, math.clamp(S.PickFrom, 1, #scored))].w
+end
+
 local function pickWord(prefix)
     prefix = string.lower(prefix or "")
     local all = wordsWithPrefix(prefix, Match.used, S.MinLength, S.MaxLength)
@@ -495,7 +553,42 @@ local function pickWord(prefix)
         end
         list = all
     end
+    -- Leave out your recent words unless that leaves nothing.
+    if next(Recent.set) then
+        local fresh = {}
+        for _, w in list do
+            if not Recent.set[w] then
+                fresh[#fresh + 1] = w
+            end
+        end
+        if #fresh > 0 then
+            list = fresh
+        end
+    end
 
+    -- "End with when you can": the first ending in your list that some word reaches.
+    local function preferredEnding()
+        for _, ending in Filters.preferEndings do
+            local hits = {}
+            for _, w in list do
+                if #w > #ending and string.sub(w, -#ending) == ending then
+                    hits[#hits + 1] = w
+                end
+            end
+            if #hits > 0 then
+                return bestFit(hits), ending
+            end
+        end
+        return nil
+    end
+    if S.EndingsFirst then
+        local w, ending = preferredEnding()
+        if w then
+            return w, nil, ending
+        end
+    end
+
+    local hardWord
     if S.UseTraps then
         -- Fewest answers for the next player; ties go to the length you aim for,
         -- since the shortest "words" in a big list are often abbreviations.
@@ -512,12 +605,19 @@ local function pickWord(prefix)
                 end
             end
         end
+        hardWord = hard
         if best then
             return best, bestN
         end
-        if S.HardEndings and hard then
-            return hard
+    end
+    if not S.EndingsFirst then
+        local w, ending = preferredEnding()
+        if w then
+            return w, nil, ending
         end
+    end
+    if S.UseTraps and S.HardEndings and hardWord then
+        return hardWord
     end
 
     local style = S.WordStyle
@@ -681,6 +781,7 @@ local function pressKey(key)
     if not code then
         return false
     end
+    Turn.syntheticUntil = os.clock() + 0.15
     pcall(function()
         VirtualInputManager:SendKeyEvent(true, code, false, game)
         task.wait(0.02)
@@ -806,7 +907,7 @@ local function charDelay(remaining)
     local base = 60 / (math.max(S.Wpm, 10) * 5)
     local jitter = base * (S.WpmJitter / 100)
     local d = base + (math.random() * 2 - 1) * jitter
-    if S.FinishInTime and remaining and remaining > 0 then
+    if remaining and remaining > 0 then
         local timeAvailable = Turn.deadline - os.clock() - 0.6
         if timeAvailable > 0 then
             d = math.min(d, timeAvailable / remaining)
@@ -848,7 +949,7 @@ local function typeWord(word, gen)
             if wrong ~= letter then
                 pressKey(wrong)
                 mirrorKey(wrong)
-                task.wait(math.max(charDelay(#word - i + 2), S.TypoFixDelay / 1000))
+                task.wait(math.max(charDelay(#word - i + 2) * 2, 0.15))
                 pressKey("Delete")
                 Turn.s2 = string.sub(Turn.s2, 1, -2)
                 task.wait(charDelay(#word - i + 1))
@@ -860,14 +961,12 @@ local function typeWord(word, gen)
         -- A short hesitation mid-word now and then, unless time is short.
         if S.PauseChance > 0 and i < #word and math.random(1, 100) <= S.PauseChance
             and Turn.deadline - os.clock() > 3 then
-            task.wait((S.PauseMin + math.random() * math.max(S.PauseMax - S.PauseMin, 0)) / 1000)
+            task.wait(0.15 + math.random() * 0.45)
         end
     end
     if S.AutoSubmit and gen == Turn.gen then
-        local pause = (S.SubmitMin + math.random() * math.max(S.SubmitMax - S.SubmitMin, 0)) / 1000
-        if S.FinishInTime then
-            pause = math.min(pause, math.max(Turn.deadline - os.clock() - 0.4, 0))
-        end
+        local pause = S.SubmitWait / 1000 * (0.4 + math.random() * 0.6)
+        pause = math.min(pause, math.max(Turn.deadline - os.clock() - 0.4, 0))
         task.wait(pause)
         pressKey("Done")
     end
@@ -884,7 +983,7 @@ local function answerTurn(gen, retry)
     end
     local react = (S.ReactMin + math.random() * math.max(S.ReactMax - S.ReactMin, 0)) / 1000
     if retry then
-        react = S.RetryDelay / 1000
+        react *= 0.5
     end
     task.wait(react)
     if gen ~= Turn.gen or not alive() then
@@ -897,7 +996,7 @@ local function answerTurn(gen, retry)
         Turn.autoPrefix = autoTypePrefix()
         Turn.s2 = Turn.autoPrefix and Turn.prefix or ""
     end
-    local word, trapN = pickWord(Turn.prefix)
+    local word, trapN, ending = pickWord(Turn.prefix)
     if not word then
         logLine("No word left for " .. Turn.prefix, Color3.fromRGB(255, 120, 90))
         if S.AutoAbility and S.AbilityOnStuck then
@@ -907,13 +1006,12 @@ local function answerTurn(gen, retry)
     end
     Turn.word = word
     if trapN then
-        local _, ending = trapOf(word)
-        logLine(string.format("Trap: %s (next gets \"%s\", %d answers)", word, ending or "?", trapN), Library.Scheme.AccentColor)
+        local _, trapEnding = trapOf(word)
+        logLine(string.format("Trap: %s (next gets \"%s\", %d answers)", word, trapEnding or "?", trapN), Library.Scheme.AccentColor)
     end
 
-    -- Longer words take a little longer to think of.
-    if not retry and S.ThinkPerLetter > 0 then
-        task.wait(#word * S.ThinkPerLetter / 1000)
+    if ending then
+        logLine(string.format("Ending: %s (\"%s\")", word, ending), Library.Scheme.AccentColor)
     end
     -- Hold the answer until only this much time is left (when it can still be typed).
     if not retry and S.WaitUntilLeft > 0 then
@@ -1142,6 +1240,7 @@ onEvent("AnswerResults", function(correct, userId)
         if mine then
             Turn.active = false
             Turn.gen += 1
+            rememberWord(word)
         end
     elseif mine then
         Turn.tries += 1
@@ -1294,7 +1393,7 @@ end
 do -- Main
     local Tab = Window:AddTab("Main", "keyboard", "Auto type and helpers")
 
-    local Auto = Tab:AddLeftGroupbox("Last Letter", "type")
+    local Auto = Tab:AddLeftGroupbox("Auto type", "type")
     Auto:AddToggle("AutoType", {
         Text = "Auto type",
         Default = false,
@@ -1304,10 +1403,10 @@ do -- Main
         end,
     }):AddKeyPicker("AutoTypeKey", { Default = "None", Mode = "Toggle", SyncToggleState = true, Text = "Auto type" })
     Auto:AddDropdown("WordStyle", {
-        Text = "Word choice",
+        Text = "Word length",
         Values = { "Balanced", "Shortest", "Longest", "Random" },
         Default = S.WordStyle,
-        Tooltip = "Balanced aims for the target length. Traps (Traps tab) win over this when one fits",
+        Tooltip = "Balanced aims for the target length",
         Callback = function(v)
             S.WordStyle = v or "Balanced"
         end,
@@ -1322,36 +1421,100 @@ do -- Main
         S.MaxLength = v
     end })
     Auto:AddSlider("PickFrom", {
-        Text = "Pick from the best",
+        Text = "Variety",
         Default = S.PickFrom,
         Min = 1,
         Max = 20,
-        Tooltip = "Picks at random among this many best words, so you don't play the same ones every match",
+        Tooltip = "Picks at random among this many best words",
         Callback = function(v)
             S.PickFrom = v
         end,
     })
-
-    local Typing = Tab:AddRightGroupbox("Typing", "keyboard")
-    Typing:AddDropdown("TypeMethod", {
-        Text = "Key presses",
-        Values = { "Auto", "On-screen keys", "Keyboard (PC)" },
-        Default = S.TypeMethod,
-        Tooltip = "On-screen keys work on every device. Keyboard (PC) sends real key events",
+    Auto:AddSlider("AvoidRecent", {
+        Text = "Don't repeat my last",
+        Default = S.AvoidRecent,
+        Min = 0,
+        Max = 300,
+        Suffix = " words",
+        Tooltip = "Remembers the words you played (across matches) and skips them while anything else fits",
         Callback = function(v)
-            S.TypeMethod = v or "Auto"
+            S.AvoidRecent = v
+            rebuildRecent()
         end,
     })
-    Typing:AddDropdown("PrefixMode", {
+    Auto:AddDropdown("PrefixMode", {
         Text = "Starting letters",
         Values = { "Auto", "Game types it", "I type it" },
         Default = S.PrefixMode,
-        Tooltip = "Auto follows the game's Auto Type Prefix setting",
+        Tooltip = "Auto reads it off the screen each turn",
         Callback = function(v)
             S.PrefixMode = v or "Auto"
         end,
     })
-    Typing:AddSlider("Wpm", { Text = "Typing speed", Default = S.Wpm, Min = 20, Max = 250, Suffix = " WPM", Tooltip = "Everyone at the table sees your WPM after each answer", Callback = function(v)
+    Auto:AddToggle("StopWhenITyped", {
+        Text = "Stop when I type",
+        Default = S.StopWhenITyped,
+        Tooltip = "Press a key on your turn to take over; auto type is back next turn (keyboard)",
+        Callback = function(v)
+            S.StopWhenITyped = v
+        end,
+    })
+
+    local Ending = Tab:AddRightGroupbox("End with", "flag")
+    Ending:AddInput("PreferEndings", {
+        Text = "End with when you can",
+        Default = "",
+        Placeholder = "e.g. ez, x, tion",
+        Finished = true,
+        Tooltip = "Whenever a word ending in one of these fits, it's used. Earlier ones in the list win",
+        Callback = function(v)
+            S.PreferEndings = v or ""
+            refreshFilters()
+        end,
+    })
+    Ending:AddToggle("EndingsFirst", {
+        Text = "Before traps",
+        Default = S.EndingsFirst,
+        Tooltip = "On: your endings win over traps. Off: traps first, your endings when no trap fits",
+        Callback = function(v)
+            S.EndingsFirst = v
+        end,
+    })
+    Ending:AddInput("AvoidEndings", {
+        Text = "Never end with",
+        Default = "",
+        Placeholder = "e.g. s, e",
+        Finished = true,
+        Callback = function(v)
+            S.AvoidEndings = v or ""
+            refreshFilters()
+        end,
+    })
+
+    local Typing = Tab:AddRightGroupbox("Typing", "keyboard")
+    local presets = {
+        Human = { Wpm = 70, WpmJitter = 30, ReactMin = 700, ReactMax = 1600, PauseChance = 8, TypoChance = 3, SubmitWait = 300 },
+        Fast = { Wpm = 140, WpmJitter = 15, ReactMin = 200, ReactMax = 500, PauseChance = 0, TypoChance = 0, SubmitWait = 100 },
+        Instant = { Wpm = 250, WpmJitter = 0, ReactMin = 0, ReactMax = 50, PauseChance = 0, TypoChance = 0, SubmitWait = 0 },
+    }
+    Typing:AddDropdown("SpeedPreset", {
+        Text = "Preset",
+        Values = { "Custom", "Human", "Fast", "Instant" },
+        Default = "Custom",
+        Tooltip = "Sets the sliders below. Everyone at the table sees your WPM",
+        Callback = function(v)
+            local preset = presets[v or ""]
+            if not preset then
+                return
+            end
+            for key, value in preset do
+                if Options[key] then
+                    Options[key]:SetValue(value)
+                end
+            end
+        end,
+    })
+    Typing:AddSlider("Wpm", { Text = "Speed", Default = S.Wpm, Min = 20, Max = 250, Suffix = " WPM", Callback = function(v)
         S.Wpm = v
     end })
     Typing:AddSlider("WpmJitter", { Text = "Speed variation", Default = S.WpmJitter, Min = 0, Max = 80, Suffix = "%", Callback = function(v)
@@ -1363,15 +1526,36 @@ do -- Main
     Typing:AddSlider("ReactMax", { Text = "Think time (max)", Default = S.ReactMax, Min = 0, Max = 6000, Suffix = " ms", Callback = function(v)
         S.ReactMax = v
     end })
-    Typing:AddSlider("TypoChance", { Text = "Typo chance", Default = S.TypoChance, Min = 0, Max = 30, Suffix = "%", Tooltip = "Hits a wrong key now and then and fixes it", Callback = function(v)
+    Typing:AddSlider("WaitUntilLeft", {
+        Text = "Answer when time left is",
+        Default = S.WaitUntilLeft,
+        Min = 0,
+        Max = 14,
+        Suffix = " s",
+        Tooltip = "0 answers right away. Otherwise waits until this much time is left (never too late to type it)",
+        Callback = function(v)
+            S.WaitUntilLeft = v
+        end,
+    })
+    Typing:AddSlider("PauseChance", { Text = "Mid-word pauses", Default = S.PauseChance, Min = 0, Max = 40, Suffix = "%", Callback = function(v)
+        S.PauseChance = v
+    end })
+    Typing:AddSlider("TypoChance", { Text = "Typos (fixed right away)", Default = S.TypoChance, Min = 0, Max = 30, Suffix = "%", Callback = function(v)
         S.TypoChance = v
     end })
-    Typing:AddSlider("RetryDelay", { Text = "Delay after a rejected word", Default = S.RetryDelay, Min = 0, Max = 3000, Suffix = " ms", Callback = function(v)
-        S.RetryDelay = v
+    Typing:AddSlider("SubmitWait", { Text = "Wait before enter", Default = S.SubmitWait, Min = 0, Max = 2000, Suffix = " ms", Callback = function(v)
+        S.SubmitWait = v
     end })
-    Typing:AddToggle("FinishInTime", { Text = "Speed up to beat the timer", Default = S.FinishInTime, Callback = function(v)
-        S.FinishInTime = v
-    end })
+    Typing:AddSlider("MaxTries", {
+        Text = "Tries per turn",
+        Default = S.MaxTries,
+        Min = 1,
+        Max = 5,
+        Tooltip = "How many words to try before giving up on a turn",
+        Callback = function(v)
+            S.MaxTries = v
+        end,
+    })
     Typing:AddToggle("AutoSubmit", { Text = "Press enter when done", Default = S.AutoSubmit, Callback = function(v)
         S.AutoSubmit = v
     end })
@@ -1392,16 +1576,6 @@ do -- Main
         Finished = true,
         Callback = function(v)
             S.AvoidLetters = v or ""
-            refreshFilters()
-        end,
-    })
-    Filter:AddInput("AvoidEndings", {
-        Text = "Never end with",
-        Default = "",
-        Placeholder = "e.g. s, ing, e",
-        Finished = true,
-        Callback = function(v)
-            S.AvoidEndings = v or ""
             refreshFilters()
         end,
     })
@@ -1430,64 +1604,6 @@ do -- Main
         Default = S.IgnoreFiltersIfStuck,
         Callback = function(v)
             S.IgnoreFiltersIfStuck = v
-        end,
-    })
-
-    local Timing = Tab:AddRightGroupbox("Timing", "timer")
-    Timing:AddSlider("WaitUntilLeft", {
-        Text = "Answer when time left is",
-        Default = S.WaitUntilLeft,
-        Min = 0,
-        Max = 14,
-        Suffix = " s",
-        Tooltip = "0 answers right away. Otherwise holds the word until this much time is left (never too late to type it)",
-        Callback = function(v)
-            S.WaitUntilLeft = v
-        end,
-    })
-    Timing:AddSlider("ThinkPerLetter", {
-        Text = "Extra think time per letter",
-        Default = S.ThinkPerLetter,
-        Min = 0,
-        Max = 400,
-        Suffix = " ms",
-        Callback = function(v)
-            S.ThinkPerLetter = v
-        end,
-    })
-    Timing:AddSlider("PauseChance", {
-        Text = "Pause mid-word chance",
-        Default = S.PauseChance,
-        Min = 0,
-        Max = 40,
-        Suffix = "%",
-        Callback = function(v)
-            S.PauseChance = v
-        end,
-    })
-    Timing:AddSlider("PauseMin", { Text = "Pause length (min)", Default = S.PauseMin, Min = 50, Max = 2000, Suffix = " ms", Callback = function(v)
-        S.PauseMin = v
-    end })
-    Timing:AddSlider("PauseMax", { Text = "Pause length (max)", Default = S.PauseMax, Min = 50, Max = 3000, Suffix = " ms", Callback = function(v)
-        S.PauseMax = v
-    end })
-    Timing:AddSlider("TypoFixDelay", { Text = "Time to notice a typo", Default = S.TypoFixDelay, Min = 50, Max = 1500, Suffix = " ms", Callback = function(v)
-        S.TypoFixDelay = v
-    end })
-    Timing:AddSlider("SubmitMin", { Text = "Wait before enter (min)", Default = S.SubmitMin, Min = 0, Max = 2000, Suffix = " ms", Callback = function(v)
-        S.SubmitMin = v
-    end })
-    Timing:AddSlider("SubmitMax", { Text = "Wait before enter (max)", Default = S.SubmitMax, Min = 0, Max = 3000, Suffix = " ms", Callback = function(v)
-        S.SubmitMax = v
-    end })
-    Timing:AddSlider("MaxTries", {
-        Text = "Tries per turn",
-        Default = S.MaxTries,
-        Min = 1,
-        Max = 5,
-        Tooltip = "How many words to try before giving up on a turn (the game allows 5)",
-        Callback = function(v)
-            S.MaxTries = v
         end,
     })
 
@@ -2128,6 +2244,25 @@ task.spawn(function()
 end)
 
 loadBad()
+-- You pressing a key on your turn takes over: auto type stops until the next turn.
+bind(game:GetService("UserInputService").InputBegan, function(input, processed)
+    if not alive() or processed or not S.StopWhenITyped or not Turn.active then
+        return
+    end
+    if Match.player ~= LocalPlayer.Name or os.clock() < (Turn.syntheticUntil or 0) then
+        return
+    end
+    if input.UserInputType == Enum.UserInputType.Keyboard then
+        local name = input.KeyCode.Name
+        if #name == 1 or name == "Backspace" then
+            Turn.gen += 1
+            Turn.active = false
+            logLine("You took over this turn")
+        end
+    end
+end)
+
+loadRecent()
 refreshFilters()
 loadDictionary(false)
 if not Game.remotes then
