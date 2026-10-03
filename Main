@@ -44,6 +44,8 @@ local Games = {
     [84159479861691] = { Name = '100 Days on Chunk!', Script = 'Games/Chunk.lua' },
     -- The in-game place (not the lobby) of Survive 99 Nights, from its dump.
     [126509999114328] = { Name = 'Survive 99 Nights', Script = 'Games/NinetyNineNights.lua' },
+    -- From the Last Letter dump's own place id.
+    [129866685202296] = { Name = 'Last Letter', Script = 'Games/LastLetter.lua' },
 }
 
 -- Loads Onyx straight from its own repo rather than a vendored copy, since
