@@ -87,9 +87,37 @@ local S = {
     -- staff
     StaffDetect = true, StaffAttribute = true, StaffGroupRank = 2, StaffManager = true,
     StaffActions = { Notify = true, ["Pause auto play"] = true },
+    -- word filters
+    AvoidLetters = "", AvoidEndings = "", BannedWords = "", FavoriteWords = "", SkipOddWords = true,
+    IgnoreFiltersIfStuck = true,
+    -- timing
+    WaitUntilLeft = 0, ThinkPerLetter = 0, PauseChance = 0, PauseMin = 200, PauseMax = 700,
+    SubmitMin = 80, SubmitMax = 250, TypoFixDelay = 250, MaxTries = 5,
+    -- lobby
+    AutoJoin = false, JoinModes = { ["Last Letter"] = true }, JoinSizes = { ["2"] = true, ["4"] = true, ["8"] = true },
+    JoinPreferWaiting = true, JoinEvery = 4, AutoDaily = false, AutoTasks = false, LogAbilities = true, NotifyBlocked = true,
     -- misc
     CacheDictionary = true, LearnBadWords = true, AntiAfk = true,
 }
+
+-- "q, x z" -> { q = true, x = true, z = true }
+local function wordSet(text)
+    local set = {}
+    for w in string.gmatch(string.lower(tostring(text or "")), "%l+") do
+        set[w] = true
+    end
+    return set
+end
+local Filters = { avoidLetters = {}, avoidEndings = {}, banned = {}, favorite = {} }
+local function refreshFilters()
+    Filters.avoidLetters = {}
+    for c in string.gmatch(string.lower(S.AvoidLetters), "%l") do
+        Filters.avoidLetters[c] = true
+    end
+    Filters.avoidEndings = wordSet(S.AvoidEndings)
+    Filters.banned = wordSet(S.BannedWords)
+    Filters.favorite = wordSet(S.FavoriteWords)
+end
 
 --// Plumbing \\--
 local Connections = {}
@@ -398,15 +426,74 @@ local function trapOf(word)
 end
 
 --// Word choice \\--
+-- Junk in a big list: no vowel at all, a letter three times in a row, or a long
+-- run of six consonants usually means an abbreviation or code the game won't take.
+local function looksOdd(w)
+    if not string.find(w, "[aeiouy]") then
+        return true
+    end
+    if string.find(w, "(%l)%1%1") then
+        return true
+    end
+    return string.find(w, "[^aeiouy][^aeiouy][^aeiouy][^aeiouy][^aeiouy][^aeiouy]") ~= nil
+end
+
+local function allowedWord(w)
+    if Filters.banned[w] then
+        return false
+    end
+    if S.SkipOddWords and looksOdd(w) then
+        return false
+    end
+    if next(Filters.avoidLetters) then
+        for c in string.gmatch(w, "%l") do
+            if Filters.avoidLetters[c] then
+                return false
+            end
+        end
+    end
+    for ending in Filters.avoidEndings do
+        if #ending < #w and string.sub(w, -#ending) == ending then
+            return false
+        end
+    end
+    return true
+end
+
 local function pickWord(prefix)
     prefix = string.lower(prefix or "")
-    local list = wordsWithPrefix(prefix, Match.used, S.MinLength, S.MaxLength)
-    if #list == 0 then
+    local all = wordsWithPrefix(prefix, Match.used, S.MinLength, S.MaxLength)
+    if #all == 0 then
         -- Nothing fits the length limits: take anything that starts right.
-        list = wordsWithPrefix(prefix, Match.used, 2, 99)
+        all = wordsWithPrefix(prefix, Match.used, 2, 99)
+    end
+    if #all == 0 then
+        return nil
+    end
+
+    -- Favorites first, when one fits (any length, even outside the dictionary).
+    local favorites = {}
+    for w in Filters.favorite do
+        if #w > #prefix and string.sub(w, 1, #prefix) == prefix and not Match.used[w]
+            and not Bad[w] and not Filters.banned[w] then
+            favorites[#favorites + 1] = w
+        end
+    end
+    if #favorites > 0 then
+        return favorites[math.random(1, #favorites)]
+    end
+
+    local list = {}
+    for _, w in all do
+        if allowedWord(w) then
+            list[#list + 1] = w
+        end
     end
     if #list == 0 then
-        return nil
+        if not S.IgnoreFiltersIfStuck then
+            return nil
+        end
+        list = all
     end
 
     if S.UseTraps then
@@ -761,7 +848,7 @@ local function typeWord(word, gen)
             if wrong ~= letter then
                 pressKey(wrong)
                 mirrorKey(wrong)
-                task.wait(charDelay(#word - i + 2) * 1.5)
+                task.wait(math.max(charDelay(#word - i + 2), S.TypoFixDelay / 1000))
                 pressKey("Delete")
                 Turn.s2 = string.sub(Turn.s2, 1, -2)
                 task.wait(charDelay(#word - i + 1))
@@ -770,9 +857,18 @@ local function typeWord(word, gen)
         pressKey(letter)
         mirrorKey(letter)
         task.wait(charDelay(#word - i))
+        -- A short hesitation mid-word now and then, unless time is short.
+        if S.PauseChance > 0 and i < #word and math.random(1, 100) <= S.PauseChance
+            and Turn.deadline - os.clock() > 3 then
+            task.wait((S.PauseMin + math.random() * math.max(S.PauseMax - S.PauseMin, 0)) / 1000)
+        end
     end
     if S.AutoSubmit and gen == Turn.gen then
-        task.wait(charDelay(1))
+        local pause = (S.SubmitMin + math.random() * math.max(S.SubmitMax - S.SubmitMin, 0)) / 1000
+        if S.FinishInTime then
+            pause = math.min(pause, math.max(Turn.deadline - os.clock() - 0.4, 0))
+        end
+        task.wait(pause)
         pressKey("Done")
     end
     return true
@@ -780,6 +876,10 @@ end
 
 local function answerTurn(gen, retry)
     if not S.AutoType or paused() or not Dict.ready then
+        return
+    end
+    if retry and Turn.tries >= S.MaxTries then
+        logLine("Stopped after " .. Turn.tries .. " tries")
         return
     end
     local react = (S.ReactMin + math.random() * math.max(S.ReactMax - S.ReactMin, 0)) / 1000
@@ -809,6 +909,25 @@ local function answerTurn(gen, retry)
     if trapN then
         local _, ending = trapOf(word)
         logLine(string.format("Trap: %s (next gets \"%s\", %d answers)", word, ending or "?", trapN), Library.Scheme.AccentColor)
+    end
+
+    -- Longer words take a little longer to think of.
+    if not retry and S.ThinkPerLetter > 0 then
+        task.wait(#word * S.ThinkPerLetter / 1000)
+    end
+    -- Hold the answer until only this much time is left (when it can still be typed).
+    if not retry and S.WaitUntilLeft > 0 then
+        local typingTime = (#word + 1) * 60 / (math.max(S.Wpm, 10) * 5) + 0.6
+        local holdUntil = Turn.deadline - math.max(S.WaitUntilLeft, typingTime)
+        while os.clock() < holdUntil do
+            if gen ~= Turn.gen or not alive() then
+                return
+            end
+            task.wait(0.05)
+        end
+    end
+    if gen ~= Turn.gen or not alive() then
+        return
     end
     typeWord(word, gen)
 end
@@ -1057,6 +1176,24 @@ onEvent("GameEnded", function()
     logLine("Match ended (" .. Match.usedCount .. " words)", Library.Scheme.AccentColor)
 end)
 
+
+-- Abilities: who used what at your table, and being blocked.
+onEvent("AbilityEnabled", function(kind, ...)
+    local args = { ... }
+    if kind == "AbilityUsed" then
+        local style, userId, uses = args[1], args[2], args[3]
+        local who = Players:GetPlayerByUserId(userId)
+        local _, myTable = currentTable()
+        if S.LogAbilities and who and (who == LocalPlayer or tostring(who:GetAttribute("InTable") or "") == tostring(myTable or "")) then
+            logLine(string.format("%s used %s (%s left)", who == LocalPlayer and "You" or who.DisplayName, tostring(style), tostring(uses)),
+                Color3.fromRGB(150, 200, 255))
+        end
+    elseif kind == "Blocker" and S.NotifyBlocked then
+        notify("Blocked", "You were blocked by " .. tostring(args[1]), 3)
+        logLine("Blocked by " .. tostring(args[1]), Color3.fromRGB(255, 140, 140))
+    end
+end)
+
 --// Traps list \\--
 local Traps = { list = {}, page = 1, dirty = true, reach = {}, reachPrefix = nil }
 
@@ -1238,6 +1375,121 @@ do -- Main
     Typing:AddToggle("AutoSubmit", { Text = "Press enter when done", Default = S.AutoSubmit, Callback = function(v)
         S.AutoSubmit = v
     end })
+
+    local Filter = Tab:AddLeftGroupbox("Word filters", "filter")
+    Filter:AddToggle("SkipOddWords", {
+        Text = "Skip odd-looking words",
+        Default = S.SkipOddWords,
+        Tooltip = "No vowels, a letter three times in a row, or six consonants in a row: usually abbreviations the game rejects",
+        Callback = function(v)
+            S.SkipOddWords = v
+        end,
+    })
+    Filter:AddInput("AvoidLetters", {
+        Text = "Never use letters",
+        Default = "",
+        Placeholder = "e.g. q z",
+        Finished = true,
+        Callback = function(v)
+            S.AvoidLetters = v or ""
+            refreshFilters()
+        end,
+    })
+    Filter:AddInput("AvoidEndings", {
+        Text = "Never end with",
+        Default = "",
+        Placeholder = "e.g. s, ing, e",
+        Finished = true,
+        Callback = function(v)
+            S.AvoidEndings = v or ""
+            refreshFilters()
+        end,
+    })
+    Filter:AddInput("BannedWords", {
+        Text = "Never use these words",
+        Default = "",
+        Placeholder = "word, word",
+        Finished = true,
+        Callback = function(v)
+            S.BannedWords = v or ""
+            refreshFilters()
+        end,
+    })
+    Filter:AddInput("FavoriteWords", {
+        Text = "Always use these when they fit",
+        Default = "",
+        Placeholder = "word, word",
+        Finished = true,
+        Callback = function(v)
+            S.FavoriteWords = v or ""
+            refreshFilters()
+        end,
+    })
+    Filter:AddToggle("IgnoreFiltersIfStuck", {
+        Text = "Drop the filters if nothing fits",
+        Default = S.IgnoreFiltersIfStuck,
+        Callback = function(v)
+            S.IgnoreFiltersIfStuck = v
+        end,
+    })
+
+    local Timing = Tab:AddRightGroupbox("Timing", "timer")
+    Timing:AddSlider("WaitUntilLeft", {
+        Text = "Answer when time left is",
+        Default = S.WaitUntilLeft,
+        Min = 0,
+        Max = 14,
+        Suffix = " s",
+        Tooltip = "0 answers right away. Otherwise holds the word until this much time is left (never too late to type it)",
+        Callback = function(v)
+            S.WaitUntilLeft = v
+        end,
+    })
+    Timing:AddSlider("ThinkPerLetter", {
+        Text = "Extra think time per letter",
+        Default = S.ThinkPerLetter,
+        Min = 0,
+        Max = 400,
+        Suffix = " ms",
+        Callback = function(v)
+            S.ThinkPerLetter = v
+        end,
+    })
+    Timing:AddSlider("PauseChance", {
+        Text = "Pause mid-word chance",
+        Default = S.PauseChance,
+        Min = 0,
+        Max = 40,
+        Suffix = "%",
+        Callback = function(v)
+            S.PauseChance = v
+        end,
+    })
+    Timing:AddSlider("PauseMin", { Text = "Pause length (min)", Default = S.PauseMin, Min = 50, Max = 2000, Suffix = " ms", Callback = function(v)
+        S.PauseMin = v
+    end })
+    Timing:AddSlider("PauseMax", { Text = "Pause length (max)", Default = S.PauseMax, Min = 50, Max = 3000, Suffix = " ms", Callback = function(v)
+        S.PauseMax = v
+    end })
+    Timing:AddSlider("TypoFixDelay", { Text = "Time to notice a typo", Default = S.TypoFixDelay, Min = 50, Max = 1500, Suffix = " ms", Callback = function(v)
+        S.TypoFixDelay = v
+    end })
+    Timing:AddSlider("SubmitMin", { Text = "Wait before enter (min)", Default = S.SubmitMin, Min = 0, Max = 2000, Suffix = " ms", Callback = function(v)
+        S.SubmitMin = v
+    end })
+    Timing:AddSlider("SubmitMax", { Text = "Wait before enter (max)", Default = S.SubmitMax, Min = 0, Max = 3000, Suffix = " ms", Callback = function(v)
+        S.SubmitMax = v
+    end })
+    Timing:AddSlider("MaxTries", {
+        Text = "Tries per turn",
+        Default = S.MaxTries,
+        Min = 1,
+        Max = 5,
+        Tooltip = "How many words to try before giving up on a turn (the game allows 5)",
+        Callback = function(v)
+            S.MaxTries = v
+        end,
+    })
 
     local Obo = Tab:AddLeftGroupbox("One By One", "list-ordered")
     Obo:AddToggle("AutoOneByOne", { Text = "Auto letter", Default = false, Callback = function(v)
@@ -1431,6 +1683,90 @@ do -- Traps
             Traps.page += 1
         end,
     })
+end
+
+do -- Lobby
+    local Tab = Window:AddTab("Lobby", "armchair", "Tables, rewards and codes")
+
+    local Join = Tab:AddLeftGroupbox("Auto join", "log-in")
+    Join:AddToggle("AutoJoin", {
+        Text = "Auto join a table",
+        Default = false,
+        Tooltip = "Walks up to a table that fits and takes a seat, again after every match",
+        Callback = function(v)
+            S.AutoJoin = v
+        end,
+    })
+    Join:AddDropdown("JoinModes", {
+        Text = "Modes",
+        Values = { "Last Letter", "One By One" },
+        Default = { "Last Letter" },
+        Multi = true,
+        Callback = function(v)
+            S.JoinModes = v
+        end,
+    })
+    Join:AddDropdown("JoinSizes", {
+        Text = "Table size",
+        Values = { "2", "4", "8" },
+        Default = { "2", "4", "8" },
+        Multi = true,
+        Callback = function(v)
+            S.JoinSizes = v
+        end,
+    })
+    Join:AddToggle("JoinPreferWaiting", {
+        Text = "Prefer tables with people waiting",
+        Default = S.JoinPreferWaiting,
+        Callback = function(v)
+            S.JoinPreferWaiting = v
+        end,
+    })
+    Join:AddSlider("JoinEvery", { Text = "Try every", Default = S.JoinEvery, Min = 2, Max = 30, Suffix = " s", Callback = function(v)
+        S.JoinEvery = v
+    end })
+    UI.JoinLabel = Join:AddLabel("Not joining", true)
+
+    local Rewards = Tab:AddRightGroupbox("Rewards", "gift")
+    Rewards:AddToggle("AutoDaily", { Text = "Auto claim daily reward", Default = false, Callback = function(v)
+        S.AutoDaily = v
+    end })
+    Rewards:AddToggle("AutoTasks", {
+        Text = "Auto claim tasks",
+        Default = false,
+        Tooltip = "Claims finished daily and weekly tasks",
+        Callback = function(v)
+            S.AutoTasks = v
+        end,
+    })
+    local CodeInput = Rewards:AddInput("Codes", {
+        Text = "Codes",
+        Default = "",
+        Placeholder = "code1, code2",
+        ClearTextOnFocus = false,
+    })
+    Rewards:AddButton("Redeem codes", function()
+        local packet = Game.remotes and Game.remotes.Redeem
+        if not packet then
+            notify("Codes", "Can't reach the game's remotes", 3)
+            return
+        end
+        task.spawn(function()
+            for code in string.gmatch(CodeInput.Value or "", "[^,%s]+") do
+                local ok, success, message = pcall(packet.Fire, packet, code)
+                logLine(string.format("Code %s: %s", code, ok and (success and "redeemed" or tostring(message)) or "failed"))
+                task.wait(1)
+            end
+        end)
+    end)
+
+    local Watch = Tab:AddLeftGroupbox("Abilities", "zap")
+    Watch:AddToggle("LogAbilities", { Text = "Log abilities used at my table", Default = S.LogAbilities, Callback = function(v)
+        S.LogAbilities = v
+    end })
+    Watch:AddToggle("NotifyBlocked", { Text = "Notify when I'm blocked", Default = S.NotifyBlocked, Callback = function(v)
+        S.NotifyBlocked = v
+    end })
 end
 
 do -- Staff
@@ -1698,7 +2034,101 @@ task.spawn(function()
     end
 end)
 
+-- Auto join: the best table that fits, by the table's own prompt.
+local function joinTable()
+    if LocalPlayer:GetAttribute("InTable") then
+        UI.JoinLabel:SetText("Seated at table " .. tostring(LocalPlayer:GetAttribute("InTable")))
+        return
+    end
+    local tables = Workspace:FindFirstChild("Tables")
+    local char = LocalPlayer.Character
+    local root = char and char:FindFirstChild("HumanoidRootPart")
+    if not tables or not root then
+        return
+    end
+    local seated = {}
+    for _, p in Players:GetPlayers() do
+        local t = p:GetAttribute("InTable")
+        if t then
+            seated[tostring(t)] = (seated[tostring(t)] or 0) + 1
+        end
+    end
+    local best, bestScore, bestPrompt
+    for _, tbl in tables:GetChildren() do
+        local mode, size = tbl:GetAttribute("Gamemode"), tbl:GetAttribute("MaxPlayers")
+        local billboard = tbl:FindFirstChild("Billboard")
+        local prompt = billboard and billboard:FindFirstChildWhichIsA("ProximityPrompt")
+        local count = seated[tbl.Name] or 0
+        if prompt and prompt.Enabled and mode and S.JoinModes[mode] and size and S.JoinSizes[tostring(size)]
+            and not tbl:GetAttribute("Started") and count < size then
+            local pos = billboard:IsA("BasePart") and billboard.Position or tbl:GetPivot().Position
+            local score = -(pos - root.Position).Magnitude / 1000
+            if S.JoinPreferWaiting then
+                score += count
+            end
+            if not bestScore or score > bestScore then
+                best, bestScore, bestPrompt = tbl, score, prompt
+            end
+        end
+    end
+    if not best then
+        UI.JoinLabel:SetText("No open table fits")
+        return
+    end
+    if typeof(fireproximityprompt) ~= "function" then
+        UI.JoinLabel:SetText("Your executor has no fireproximityprompt")
+        return
+    end
+    local anchor = bestPrompt.Parent
+    local pos = anchor:IsA("BasePart") and anchor.Position or best:GetPivot().Position
+    root.CFrame = CFrame.new(pos + Vector3.new(0, 2, 4), pos)
+    task.wait(0.35)
+    pcall(fireproximityprompt, bestPrompt)
+    UI.JoinLabel:SetText("Joining table " .. best.Name .. " (" .. tostring(best:GetAttribute("Gamemode")) .. ")")
+end
+
+task.spawn(function()
+    while alive() do
+        if S.AutoJoin and not paused() then
+            pcall(joinTable)
+        elseif not S.AutoJoin then
+            UI.JoinLabel:SetText("Not joining")
+        end
+        task.wait(S.JoinEvery)
+    end
+end)
+
+-- Daily reward and finished tasks, once a minute.
+task.spawn(function()
+    task.wait(5)
+    while alive() do
+        local remotes = Game.remotes
+        if remotes and S.AutoDaily and remotes.UpdateDailyRewards and remotes.ClaimReward then
+            pcall(function()
+                local canClaim, streak = remotes.UpdateDailyRewards:Fire()
+                if canClaim and streak then
+                    local ok, message = remotes.ClaimReward:Fire(tostring(streak))
+                    logLine(ok and ("Daily reward claimed (day " .. tostring(streak) .. ")") or ("Daily reward: " .. tostring(message)))
+                end
+            end)
+        end
+        if remotes and S.AutoTasks and remotes.ClaimTask then
+            for _, kind in { "Daily", "Weekly" } do
+                for index = 1, 5 do
+                    local ok, claimed = pcall(remotes.ClaimTask.Fire, remotes.ClaimTask, index, kind)
+                    if ok and claimed then
+                        logLine(kind .. " task " .. index .. " claimed")
+                    end
+                    task.wait(0.3)
+                end
+            end
+        end
+        task.wait(60)
+    end
+end)
+
 loadBad()
+refreshFilters()
 loadDictionary(false)
 if not Game.remotes then
     notify("Last Letter", "Couldn't reach the game's remotes, auto play won't work", 8)
