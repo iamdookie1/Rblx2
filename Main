@@ -46,6 +46,8 @@ local Games = {
     [126509999114328] = { Name = 'Survive 99 Nights', Script = 'Games/NinetyNineNights.lua' },
     -- From the Last Letter dump's own place id.
     [129866685202296] = { Name = 'Last Letter', Script = 'Games/LastLetter.lua' },
+    -- Last Stop's game place (the lobby is 85967844112283), from its own Config.Places.
+    [122776220269735] = { Name = 'Last Stop', Script = 'Games/LastStop.lua' },
 }
 
 -- Loads Onyx straight from its own repo rather than a vendored copy, since
