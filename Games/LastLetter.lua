@@ -72,10 +72,12 @@ local S = {
     AutoType = false, WordStyle = "Balanced", TargetLength = 6, MinLength = 4, MaxLength = 12, PickFrom = 5,
     -- typing
     TypeMethod = "Auto", PrefixMode = "Auto", Wpm = 75, WpmJitter = 25, ReactMin = 600, ReactMax = 1400,
-    TypoChance = 0, AutoSubmit = true, SpeedPreset = "Custom",
+    TypoChance = 0, AutoSubmit = true, SpeedPreset = "Custom", FinishInTime = true, DeleteSpeed = 70,
+    KeepTyped = true,
     PreferEndings = "", EndingsFirst = true, AvoidRecent = 40, StopWhenITyped = true,
     -- one by one
-    AutoOneByOne = false, ObOStrategy = "Win, else safe", ObOMinLength = 3,
+    AutoOneByOne = false, ObOStrategy = "Smart (look ahead)", ObOMinLength = 3, ObOLookAhead = 3,
+    ObOVariety = 1, ObOThinkMin = 300, ObOThinkMax = 900, ObOFallback = "Most options",
     -- first letter
     AutoFirstLetter = false, FirstLetterStyle = "Easiest",
     -- suggestions
@@ -85,6 +87,7 @@ local S = {
     -- traps
     UseTraps = false, RespectSeen = true, ResetOnLife = true, TrapLength = 2, TrapMinAnswers = 3,
     TrapMaxAnswers = 15, ShowTraps = true, TrapsUsableOnly = false, TrapMinEnds = 2, HardEndings = true,
+    TrapGuess = "Smart (learned)", TrapCleanCount = true, TrapCounter = true, TrapAfterTurn = 0,
     -- staff
     StaffDetect = true, StaffAttribute = true, StaffGroupRank = 2, StaffManager = true,
     StaffActions = { Notify = true, ["Pause auto play"] = true },
@@ -249,8 +252,20 @@ local function markBad(word)
     end
 end
 
+-- Junk in a big list: no vowel at all, a letter three times in a row, or a long
+-- run of six consonants usually means an abbreviation or code the game won't take.
+local function looksOdd(w)
+    if not string.find(w, "[aeiouy]") then
+        return true
+    end
+    if string.find(w, "(%l)%1%1") then
+        return true
+    end
+    return string.find(w, "[^aeiouy][^aeiouy][^aeiouy][^aeiouy][^aeiouy][^aeiouy]") ~= nil
+end
+
 local function buildDictionary(text)
-    local buckets, byFirst, set, start, ends = {}, {}, {}, {}, {}
+    local buckets, byFirst, set, start, ends, startClean = {}, {}, {}, {}, {}, {}
     local n = 0
     for w in string.gmatch(text, "%l+") do
         local len = #w
@@ -267,9 +282,13 @@ local function buildDictionary(text)
                 table.insert(byFirst[first], bucket)
             end
             bucket[#bucket + 1] = w
+            local clean = not looksOdd(w)
             for k = 1, (len < 4 and len or 4) do
                 local p = string.sub(w, 1, k)
                 start[p] = (start[p] or 0) + 1
+                if clean then
+                    startClean[p] = (startClean[p] or 0) + 1
+                end
                 local e = string.sub(w, len - k + 1)
                 ends[e] = (ends[e] or 0) + 1
             end
@@ -283,6 +302,7 @@ local function buildDictionary(text)
         end
     end
     Dict.buckets, Dict.byFirst, Dict.set, Dict.start, Dict.ends = buckets, byFirst, set, start, ends
+    Dict.startClean = startClean
     Dict.words, Dict.progress, Dict.total = n, n, n
     Dict.ready = true
 end
@@ -348,19 +368,19 @@ end
 --// Match state \\--
 local Match = {
     tableName = nil, mode = nil, started = false, turn = 0, prefix = "", player = nil,
-    word = "", lastWord = nil, used = {}, usedStart = {}, usedCount = 0,
-    seen = { [1] = true }, seenMax = 1, lives = {}, lastPrefixLen = 0,
+    word = "", lastWord = nil, used = {}, usedStart = {}, usedStartClean = {}, usedCount = 0,
+    seen = { [1] = true }, seenMax = 1, lenCount = {}, lives = {}, lastPrefixLen = 0,
 }
 
 local function resetSeen(reason)
-    Match.seen, Match.seenMax = { [1] = true }, 1
+    Match.seen, Match.seenMax, Match.lenCount = { [1] = true }, 1, {}
     return reason
 end
 
 local function resetMatch()
     MatchId += 1
     Match.turn, Match.prefix, Match.player, Match.word, Match.lastWord = 0, "", nil, "", nil
-    Match.used, Match.usedStart, Match.usedCount = {}, {}, 0
+    Match.used, Match.usedStart, Match.usedStartClean, Match.usedCount = {}, {}, {}, 0
     Match.lives, Match.lastPrefixLen = {}, 0
     resetSeen()
 end
@@ -397,21 +417,26 @@ local function useWord(word)
     end
     Match.used[word] = true
     Match.usedCount += 1
+    local clean = not looksOdd(word)
     for k = 1, math.min(4, #word) do
         local p = string.sub(word, 1, k)
         Match.usedStart[p] = (Match.usedStart[p] or 0) + 1
+        if clean then
+            Match.usedStartClean[p] = (Match.usedStartClean[p] or 0) + 1
+        end
     end
     Match.lastWord = word
 end
 
--- Answers left for an ending this match.
+-- Answers left for an ending this match. Real-looking words only when that's
+-- on: abbreviations in the big list are rarely in the game's own.
 local function liveAnswers(ending)
+    if S.TrapCleanCount and Dict.startClean then
+        return math.max((Dict.startClean[ending] or 0) - (Match.usedStartClean[ending] or 0), 0)
+    end
     return (Dict.start[ending] or 0) - (Match.usedStart[ending] or 0)
 end
 
--- Longest trap ending the next player could get from `word`: the longest allowed
--- length whose ending still has enough answers (the server skips endings with too
--- few). Returns the answer count and the ending.
 local function trapLengthCap()
     local cap = S.TrapLength
     if S.RespectSeen then
@@ -419,30 +444,78 @@ local function trapLengthCap()
     end
     return cap
 end
-local function trapOf(word)
-    for len = math.min(trapLengthCap(), #word - 1), 1, -1 do
-        local ending = string.sub(word, -len)
-        local n = liveAnswers(ending)
-        if n >= S.TrapMinAnswers then
-            return n, ending
+
+-- The ending the next player gets when the game wants `len` letters: it falls
+-- back to shorter endings while one has too few answers.
+local function endingFor(word, len)
+    for l = math.min(len, #word - 1), 1, -1 do
+        local e = string.sub(word, -l)
+        if liveAnswers(e) >= S.TrapMinAnswers then
+            return e
         end
     end
     return nil
 end
 
---// Word choice \\--
--- Junk in a big list: no vowel at all, a letter three times in a row, or a long
--- run of six consonants usually means an abbreviation or code the game won't take.
-local function looksOdd(w)
-    if not string.find(w, "[aeiouy]") then
-        return true
+-- How likely each prefix length is, from what this match has shown so far.
+local function lengthOdds()
+    local cap = trapLengthCap()
+    local odds, total = {}, 0
+    for len = 1, cap do
+        if not S.RespectSeen or Match.seen[len] then
+            local w = (Match.lenCount[len] or 0) + 1
+            odds[len] = w
+            total += w
+        end
     end
-    if string.find(w, "(%l)%1%1") then
-        return true
+    for len, w in odds do
+        odds[len] = w / total
     end
-    return string.find(w, "[^aeiouy][^aeiouy][^aeiouy][^aeiouy][^aeiouy][^aeiouy]") ~= nil
+    return odds, cap
 end
 
+-- A word's trap: the answers left for the next player, the ending they'd get,
+-- and the chance the trap lands. "Longest seen" assumes the longest allowed
+-- length; "Smart" weighs every length by how often it showed up this match.
+local function trapOf(word, odds, cap)
+    if not odds then
+        odds, cap = lengthOdds()
+    end
+    if S.TrapGuess == "Longest seen" then
+        local e = endingFor(word, cap)
+        if not e then
+            return nil
+        end
+        local n = liveAnswers(e)
+        return n, e, n <= S.TrapMaxAnswers and 1 or 0
+    end
+    local bestN, bestE, chance = nil, nil, 0
+    for len, p in odds do
+        local e = endingFor(word, len)
+        if e then
+            local n = liveAnswers(e)
+            if n <= S.TrapMaxAnswers then
+                chance += p
+            end
+            if not bestN or n < bestN then
+                bestN, bestE = n, e
+            end
+        end
+    end
+    return bestN, bestE, chance
+end
+
+local function alivePlayers()
+    local n = 0
+    for _, left in Match.lives do
+        if left > 0 then
+            n += 1
+        end
+    end
+    return n
+end
+
+--// Word choice \\--
 local function allowedWord(w)
     if Filters.banned[w] then
         return false
@@ -518,7 +591,8 @@ local function bestFit(list)
     return scored[math.random(1, math.clamp(S.PickFrom, 1, #scored))].w
 end
 
-local function pickWord(prefix)
+-- typed: what's already in the box on a retry, so the next word can keep it.
+local function pickWord(prefix, typed)
     prefix = string.lower(prefix or "")
     local all = wordsWithPrefix(prefix, Match.used, S.MinLength, S.MaxLength)
     if #all == 0 then
@@ -565,6 +639,32 @@ local function pickWord(prefix)
             list = fresh
         end
     end
+    -- On a retry, words that keep the most of what's typed need the fewest deletes.
+    typed = typed and string.lower(typed) or ""
+    if S.KeepTyped and #typed > #prefix then
+        local bestKeep, keep = #prefix, {}
+        for _, w in list do
+            local c = #prefix
+            for i = #prefix + 1, math.min(#w, #typed) do
+                if string.byte(w, i) ~= string.byte(typed, i) then
+                    break
+                end
+                c = i
+            end
+            -- A word that ends inside what's typed still needs a delete for the rest.
+            if c == #w and #typed > #w then
+                c -= 1
+            end
+            if c > bestKeep then
+                bestKeep, keep = c, { w }
+            elseif c == bestKeep and c > #prefix then
+                keep[#keep + 1] = w
+            end
+        end
+        if #keep > 0 then
+            list = keep
+        end
+    end
 
     -- "End with when you can": the first ending in your list that some word reaches.
     local function preferredEnding()
@@ -589,26 +689,55 @@ local function pickWord(prefix)
     end
 
     local hardWord
-    if S.UseTraps then
-        -- Fewest answers for the next player; ties go to the length you aim for,
-        -- since the shortest "words" in a big list are often abbreviations.
-        local best, bestN, bestFit, hard, hardN, hardFit
+    if S.UseTraps and Match.turn >= S.TrapAfterTurn then
+        -- Most likely to land, then fewest answers for the next player; ties go to
+        -- the length you aim for, since the shortest "words" in a big list are often
+        -- abbreviations.
+        local odds, cap = lengthOdds()
+        local traps, hard, hardN, hardFit = {}, nil, nil, nil
         for _, w in list do
-            local n = trapOf(w)
+            local n, e, chance = trapOf(w, odds, cap)
             if n then
                 local fit = math.abs(#w - S.TargetLength) + math.random() * 0.5
-                if n <= S.TrapMaxAnswers and (not bestN or n < bestN or (n == bestN and fit < bestFit)) then
-                    best, bestN, bestFit = w, n, fit
+                if chance > 0 then
+                    traps[#traps + 1] = { w = w, n = n, e = e, chance = chance, fit = fit }
                 end
                 if not hardN or n < hardN or (n == hardN and fit < hardFit) then
                     hard, hardN, hardFit = w, n, fit
                 end
             end
         end
-        hardWord = hard
-        if best then
-            return best, bestN
+        table.sort(traps, function(a, b)
+            if math.abs(a.chance - b.chance) > 0.01 then
+                return a.chance > b.chance
+            end
+            if a.n ~= b.n then
+                return a.n < b.n
+            end
+            return a.fit < b.fit
+        end)
+        -- 1v1: skip a trap the other player can answer with a harder one back.
+        if S.TrapCounter and #traps > 0 and (alivePlayers() == 2 or #tablePlayers() == 2) then
+            for i = 1, math.min(#traps, 8) do
+                local t = traps[i]
+                local worst
+                for _, reply in wordsWithPrefix(t.e, Match.used, 2, 99) do
+                    if reply ~= t.w and not looksOdd(reply) then
+                        local n2, _, c2 = trapOf(reply, odds, cap)
+                        if n2 and c2 > 0 and (not worst or n2 < worst) then
+                            worst = n2
+                        end
+                    end
+                end
+                if not worst or worst >= t.n then
+                    return t.w, t.n, nil, t.e
+                end
+            end
         end
+        if traps[1] then
+            return traps[1].w, traps[1].n, nil, traps[1].e
+        end
+        hardWord = hard
     end
     if not S.EndingsFirst then
         local w, ending = preferredEnding()
@@ -616,7 +745,7 @@ local function pickWord(prefix)
             return w, nil, ending
         end
     end
-    if S.UseTraps and S.HardEndings and hardWord then
+    if S.HardEndings and hardWord then
         return hardWord
     end
 
@@ -642,45 +771,119 @@ local function pickWord(prefix)
     return scored[math.random(1, top)].w
 end
 
--- One By One: a letter that finishes a word, else one that doesn't let the next
--- player finish, else the letter with the most ways to go on.
+-- One By One: adding a letter that finishes a word wins. Looks `depth` letters
+-- ahead, each player taking their best letter: 1 means you win, -1 you lose.
+local function oboValue(plen, list, depth)
+    local groups = {}
+    for _, w in list do
+        local c = string.sub(w, plen + 1, plen + 1)
+        local g = groups[c]
+        if not g then
+            g = { win = false, rest = {} }
+            groups[c] = g
+        end
+        if #w == plen + 1 then
+            if #w >= S.ObOMinLength then
+                g.win = true
+            end
+        else
+            g.rest[#g.rest + 1] = w
+        end
+    end
+    local best = nil
+    for _, g in groups do
+        local v
+        if g.win then
+            v = 1
+        elseif depth <= 1 or #g.rest == 0 then
+            v = 0
+        else
+            v = -0.9 * oboValue(plen + 1, g.rest, depth - 1)
+        end
+        if not best or v > best then
+            best = v
+        end
+        if best == 1 then
+            break
+        end
+    end
+    return best or 0
+end
+
 local function pickLetter(current)
     current = string.lower(current or "")
     if current == "" then
         return nil
     end
     local list = wordsWithPrefix(current, nil, 2, 99)
-    local options = {}
+    if S.SkipOddWords then
+        local clean = {}
+        for _, w in list do
+            if not looksOdd(w) then
+                clean[#clean + 1] = w
+            end
+        end
+        if #clean > 0 then
+            list = clean
+        end
+    end
+    local options, letters = {}, {}
     local plen = #current
     for _, w in list do
         local c = string.sub(w, plen + 1, plen + 1)
         local o = options[c]
         if not o then
-            o = { letter = c, ways = 0, win = false, danger = false }
+            o = { letter = c, ways = 0, win = false, danger = false, rest = {} }
             options[c] = o
+            letters[#letters + 1] = o
         end
         o.ways += 1
-        if #w == plen + 1 and #w >= S.ObOMinLength then
-            o.win = true
-        elseif #w == plen + 2 and #w >= S.ObOMinLength then
-            o.danger = true
-        end
-    end
-    local best, bestScore
-    for _, o in options do
-        local score = o.ways
-        if S.ObOStrategy ~= "Most options" then
-            if o.win then
-                score += 1e9
-            elseif not o.danger then
-                score += 1e6
+        if #w == plen + 1 then
+            if #w >= S.ObOMinLength then
+                o.win = true
+            end
+        else
+            o.rest[#o.rest + 1] = w
+            if #w == plen + 2 and #w >= S.ObOMinLength then
+                o.danger = true
             end
         end
-        if not bestScore or score > bestScore then
-            best, bestScore = o, score
+    end
+    if #letters == 0 then
+        return nil
+    end
+    local strategy = S.ObOStrategy
+    for _, o in letters do
+        local value
+        if strategy == "Smart (look ahead)" then
+            value = o.win and 1 or (#o.rest > 0 and S.ObOLookAhead > 1 and -0.9 * oboValue(plen + 1, o.rest, S.ObOLookAhead - 1) or 0)
+        elseif strategy == "Win, else safe" then
+            value = o.win and 1 or (o.danger and -1 or 0)
+        else
+            value = 0
+        end
+        -- Rounded so letters that play out the same count as a tie.
+        o.value = math.floor(value * 100 + 0.5)
+        if strategy == "Random" then
+            o.tie = math.random()
+        elseif S.ObOFallback == "Fewest options" then
+            o.tie = -o.ways
+        else
+            o.tie = o.ways
         end
     end
-    return best and best.letter
+    table.sort(letters, function(a, b)
+        if a.value ~= b.value then
+            return a.value > b.value
+        end
+        return a.tie > b.tie
+    end)
+    -- Variety: any of the top few that are as good as the best.
+    local pool = 1
+    while pool < math.min(S.ObOVariety, #letters) and letters[pool + 1].value == letters[1].value do
+        pool += 1
+    end
+    return letters[math.random(1, pool)].letter, letters[1].value
 end
 
 local function pickFirstLetter(options)
@@ -903,11 +1106,9 @@ local function mirrorKey(letter)
     end
 end
 
-local function charDelay(remaining)
-    local base = 60 / (math.max(S.Wpm, 10) * 5)
-    local jitter = base * (S.WpmJitter / 100)
-    local d = base + (math.random() * 2 - 1) * jitter
-    if remaining and remaining > 0 then
+-- Speeds up to beat the timer when that's on and `remaining` keys are left.
+local function fitDeadline(d, remaining)
+    if S.FinishInTime and remaining and remaining > 0 then
         local timeAvailable = Turn.deadline - os.clock() - 0.6
         if timeAvailable > 0 then
             d = math.min(d, timeAvailable / remaining)
@@ -916,6 +1117,18 @@ local function charDelay(remaining)
         end
     end
     return math.max(d, 0.01)
+end
+
+local function charDelay(remaining)
+    local base = 60 / (math.max(S.Wpm, 10) * 5)
+    local jitter = base * (S.WpmJitter / 100)
+    return fitDeadline(base + (math.random() * 2 - 1) * jitter, remaining)
+end
+
+local function deleteDelay(remaining)
+    local base = S.DeleteSpeed / 1000
+    local jitter = base * (S.WpmJitter / 100)
+    return fitDeadline(base + (math.random() * 2 - 1) * jitter, remaining)
 end
 
 local NEIGHBOURS = "qwertyuiopasdfghjklzxcvbnm"
@@ -936,7 +1149,7 @@ local function typeWord(word, gen)
         end
         pressKey("Delete")
         Turn.s2 = string.sub(Turn.s2, 1, -2)
-        task.wait(charDelay(#word))
+        task.wait(deleteDelay(#Turn.s2 - math.max(common, floor) + #word - math.max(common, floor)))
     end
     for i = #Turn.s2 + 1, #word do
         if gen ~= Turn.gen or not alive() then
@@ -949,10 +1162,10 @@ local function typeWord(word, gen)
             if wrong ~= letter then
                 pressKey(wrong)
                 mirrorKey(wrong)
-                task.wait(math.max(charDelay(#word - i + 2) * 2, 0.15))
+                task.wait(math.max(charDelay(#word - i + 2) * 2, S.FinishInTime and 0.01 or 0.15))
                 pressKey("Delete")
                 Turn.s2 = string.sub(Turn.s2, 1, -2)
-                task.wait(charDelay(#word - i + 1))
+                task.wait(deleteDelay(#word - i + 1))
             end
         end
         pressKey(letter)
@@ -966,7 +1179,9 @@ local function typeWord(word, gen)
     end
     if S.AutoSubmit and gen == Turn.gen then
         local pause = S.SubmitWait / 1000 * (0.4 + math.random() * 0.6)
-        pause = math.min(pause, math.max(Turn.deadline - os.clock() - 0.4, 0))
+        if S.FinishInTime then
+            pause = math.min(pause, math.max(Turn.deadline - os.clock() - 0.4, 0))
+        end
         task.wait(pause)
         pressKey("Done")
     end
@@ -996,7 +1211,7 @@ local function answerTurn(gen, retry)
         Turn.autoPrefix = autoTypePrefix()
         Turn.s2 = Turn.autoPrefix and Turn.prefix or ""
     end
-    local word, trapN, ending = pickWord(Turn.prefix)
+    local word, trapN, ending, trapEnding = pickWord(Turn.prefix, retry and Turn.s2 or nil)
     if not word then
         logLine("No word left for " .. Turn.prefix, Color3.fromRGB(255, 120, 90))
         if S.AutoAbility and S.AbilityOnStuck then
@@ -1006,7 +1221,6 @@ local function answerTurn(gen, retry)
     end
     Turn.word = word
     if trapN then
-        local _, trapEnding = trapOf(word)
         logLine(string.format("Trap: %s (next gets \"%s\", %d answers)", word, trapEnding or "?", trapN), Library.Scheme.AccentColor)
     end
 
@@ -1057,14 +1271,15 @@ local function onLetterRequest(timeToRespond)
     local gen = Turn.gen
     Turn.deadline = os.clock() + (tonumber(timeToRespond) or 15)
     task.spawn(function()
-        task.wait((S.ReactMin + math.random() * math.max(S.ReactMax - S.ReactMin, 0)) / 1000)
+        task.wait((S.ObOThinkMin + math.random() * math.max(S.ObOThinkMax - S.ObOThinkMin, 0)) / 1000)
         if gen ~= Turn.gen or not alive() then
             return
         end
-        local letter = pickLetter(Match.word)
+        local letter, value = pickLetter(Match.word)
         if letter then
             pressKey(string.upper(letter))
-            logLine("One By One: " .. string.upper(Match.word) .. "+" .. string.upper(letter))
+            local note = value and value >= 90 and "  (winning)" or value and value <= -50 and "  (losing)" or ""
+            logLine("One By One: " .. string.upper(Match.word) .. "+" .. string.upper(letter) .. note)
         end
     end)
 end
@@ -1189,6 +1404,7 @@ onEvent("Rotate", function(newWord, letters, playerName, seat)
     if currentMode() ~= "One By One" and letters ~= "" then
         Match.prefix = letters
         local len = #letters
+        Match.lenCount[len] = (Match.lenCount[len] or 0) + 1
         if not Match.seen[len] then
             Match.seen[len] = true
             if len > Match.seenMax then
@@ -1493,9 +1709,9 @@ do -- Main
 
     local Typing = Tab:AddRightGroupbox("Typing", "keyboard")
     local presets = {
-        Human = { Wpm = 70, WpmJitter = 30, ReactMin = 700, ReactMax = 1600, PauseChance = 8, TypoChance = 3, SubmitWait = 300 },
-        Fast = { Wpm = 140, WpmJitter = 15, ReactMin = 200, ReactMax = 500, PauseChance = 0, TypoChance = 0, SubmitWait = 100 },
-        Instant = { Wpm = 250, WpmJitter = 0, ReactMin = 0, ReactMax = 50, PauseChance = 0, TypoChance = 0, SubmitWait = 0 },
+        Human = { Wpm = 70, WpmJitter = 30, ReactMin = 700, ReactMax = 1600, PauseChance = 8, TypoChance = 3, SubmitWait = 300, DeleteSpeed = 110 },
+        Fast = { Wpm = 140, WpmJitter = 15, ReactMin = 200, ReactMax = 500, PauseChance = 0, TypoChance = 0, SubmitWait = 100, DeleteSpeed = 40 },
+        Instant = { Wpm = 250, WpmJitter = 0, ReactMin = 0, ReactMax = 50, PauseChance = 0, TypoChance = 0, SubmitWait = 0, DeleteSpeed = 15 },
     }
     Typing:AddDropdown("SpeedPreset", {
         Text = "Preset",
@@ -1559,6 +1775,33 @@ do -- Main
     Typing:AddToggle("AutoSubmit", { Text = "Press enter when done", Default = S.AutoSubmit, Callback = function(v)
         S.AutoSubmit = v
     end })
+    Typing:AddToggle("FinishInTime", {
+        Text = "Speed up to beat the timer",
+        Default = S.FinishInTime,
+        Tooltip = "Types and deletes faster than your speed when the word wouldn't finish in time",
+        Callback = function(v)
+            S.FinishInTime = v
+        end,
+    })
+    Typing:AddSlider("DeleteSpeed", {
+        Text = "Delete speed",
+        Default = S.DeleteSpeed,
+        Min = 10,
+        Max = 400,
+        Suffix = " ms",
+        Tooltip = "Time per delete when a word is rejected or a typo is fixed (speed variation applies)",
+        Callback = function(v)
+            S.DeleteSpeed = v
+        end,
+    })
+    Typing:AddToggle("KeepTyped", {
+        Text = "Retry: keep typed letters",
+        Default = S.KeepTyped,
+        Tooltip = "After a rejected word, picks the next word that keeps the most of what's typed. Only the letters that differ get deleted",
+        Callback = function(v)
+            S.KeepTyped = v
+        end,
+    })
 
     local Filter = Tab:AddLeftGroupbox("Word filters", "filter")
     Filter:AddToggle("SkipOddWords", {
@@ -1613,15 +1856,51 @@ do -- Main
     end })
     Obo:AddDropdown("ObOStrategy", {
         Text = "Strategy",
-        Values = { "Win, else safe", "Most options" },
+        Values = { "Smart (look ahead)", "Win, else safe", "Most options", "Random" },
         Default = S.ObOStrategy,
-        Tooltip = "Win, else safe: finishes a word when it can, otherwise avoids letting the next player finish",
+        Tooltip = "Smart plays out the next few letters for everyone. Win, else safe only checks the next player",
         Callback = function(v)
-            S.ObOStrategy = v or "Win, else safe"
+            S.ObOStrategy = v or "Smart (look ahead)"
+        end,
+    })
+    Obo:AddSlider("ObOLookAhead", {
+        Text = "Look ahead",
+        Default = S.ObOLookAhead,
+        Min = 1,
+        Max = 6,
+        Suffix = " letters",
+        Tooltip = "For Smart: how many letters to play out, yours included",
+        Callback = function(v)
+            S.ObOLookAhead = v
+        end,
+    })
+    Obo:AddDropdown("ObOFallback", {
+        Text = "When letters tie",
+        Values = { "Most options", "Fewest options" },
+        Default = S.ObOFallback,
+        Tooltip = "Most options keeps the word open, fewest options narrows it down for the others",
+        Callback = function(v)
+            S.ObOFallback = v or "Most options"
+        end,
+    })
+    Obo:AddSlider("ObOVariety", {
+        Text = "Pick among the best",
+        Default = S.ObOVariety,
+        Min = 1,
+        Max = 5,
+        Tooltip = "Random pick among this many equally good letters, so you're less predictable",
+        Callback = function(v)
+            S.ObOVariety = v
         end,
     })
     Obo:AddSlider("ObOMinLength", { Text = "Shortest word that counts", Default = S.ObOMinLength, Min = 2, Max = 6, Callback = function(v)
         S.ObOMinLength = v
+    end })
+    Obo:AddSlider("ObOThinkMin", { Text = "Think time (min)", Default = S.ObOThinkMin, Min = 0, Max = 5000, Suffix = " ms", Callback = function(v)
+        S.ObOThinkMin = v
+    end })
+    Obo:AddSlider("ObOThinkMax", { Text = "Think time (max)", Default = S.ObOThinkMax, Min = 0, Max = 6000, Suffix = " ms", Callback = function(v)
+        S.ObOThinkMax = v
     end })
 
     local First = Tab:AddRightGroupbox("Starting letter", "a-large-small")
@@ -1658,7 +1937,7 @@ do -- Main
         end
         Turn.deadline = os.clock() + (timeLeft() or 10)
         task.spawn(function()
-            local word = pickWord(Turn.prefix)
+            local word = pickWord(Turn.prefix, Turn.active and Turn.s2 or nil)
             if word then
                 Turn.word = word
                 typeWord(word, gen)
@@ -1761,6 +2040,42 @@ do -- Traps
         Callback = function(v)
             S.TrapMinEnds = v
             Traps.dirty = true
+        end,
+    })
+    Use:AddDropdown("TrapGuess", {
+        Text = "Guess the next prefix length",
+        Values = { "Smart (learned)", "Longest seen" },
+        Default = S.TrapGuess,
+        Tooltip = "Smart weighs every length by how often it showed up this match and picks the trap most likely to land. Longest seen assumes the longest one",
+        Callback = function(v)
+            S.TrapGuess = v or "Smart (learned)"
+        end,
+    })
+    Use:AddToggle("TrapCleanCount", {
+        Text = "Count only real-looking answers",
+        Default = S.TrapCleanCount,
+        Tooltip = "Abbreviations in the word list barely count as answers, since players won't think of them",
+        Callback = function(v)
+            S.TrapCleanCount = v
+            Traps.dirty = true
+        end,
+    })
+    Use:AddToggle("TrapCounter", {
+        Text = "1v1: skip traps they can turn back",
+        Default = S.TrapCounter,
+        Tooltip = "Skips a trap when an answer to it traps you harder. Takes the best trap anyway if every one can be turned back",
+        Callback = function(v)
+            S.TrapCounter = v
+        end,
+    })
+    Use:AddSlider("TrapAfterTurn", {
+        Text = "Start trapping at turn",
+        Default = S.TrapAfterTurn,
+        Min = 0,
+        Max = 60,
+        Tooltip = "0 traps from the start. Higher plays normal words first so you look less obvious",
+        Callback = function(v)
+            S.TrapAfterTurn = v
         end,
     })
     Use:AddToggle("HardEndings", {
@@ -2069,7 +2384,14 @@ task.spawn(function()
             end
             UI.MatchCards2:SetValue("Prefix lengths", table.concat(seen, ","))
             UI.MatchCards2:SetValue("Hard mode", Match.turn >= HARD_MODE_TURN and "On" or ("turn " .. HARD_MODE_TURN))
-            UI.SeenLabel:SetText("Prefix lengths seen: " .. table.concat(seen, ", ") .. (S.RespectSeen and ("  ·  traps up to " .. trapLengthCap()) or ""))
+            local counts = {}
+            for len = 1, 6 do
+                if Match.lenCount[len] then
+                    table.insert(counts, string.format("%d: %dx", len, Match.lenCount[len]))
+                end
+            end
+            UI.SeenLabel:SetText("Prefix lengths seen: " .. table.concat(seen, ", ") .. (S.RespectSeen and ("  ·  traps up to " .. trapLengthCap()) or "")
+                .. (#counts > 0 and ("\nThis match: " .. table.concat(counts, ",  ")) or ""))
 
             local left = timeLeft()
             if left then
@@ -2101,7 +2423,7 @@ task.spawn(function()
 
             -- Suggestions and traps follow the current letters.
             local prefix = string.lower(Match.prefix or "")
-            local trapKey = table.concat({ prefix, Match.usedCount, Match.seenMax, S.TrapLength, S.TrapMinAnswers,
+            local trapKey = table.concat({ prefix, Match.usedCount, Match.seenMax, S.TrapLength, S.TrapMinAnswers, tostring(S.TrapCleanCount),
                 S.TrapMaxAnswers, S.TrapMinEnds, tostring(S.TrapsUsableOnly), tostring(Dict.ready) }, "|")
             if trapKey ~= lastTrapKey or Traps.dirty then
                 lastTrapKey = trapKey
@@ -2119,8 +2441,8 @@ task.spawn(function()
                         return #a < #b
                     end)
                     for i = 1, math.min(6, #list) do
-                        local n, ending = trapOf(list[i])
-                        table.insert(lines, string.upper(list[i]) .. (n and n <= S.TrapMaxAnswers and string.format("  (trap \"%s\": %d)", ending, n) or ""))
+                        local n, ending, chance = trapOf(list[i])
+                        table.insert(lines, string.upper(list[i]) .. (n and chance > 0 and string.format("  (trap \"%s\": %d, %.0f%%)", ending, n, chance * 100) or ""))
                     end
                     UI.Suggestions:SetText(#lines > 0 and table.concat(lines, "\n") or "No words left for " .. string.upper(prefix))
                 end
