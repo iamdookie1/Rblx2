@@ -46,6 +46,10 @@ local Games = {
     [126509999114328] = { Name = 'Survive 99 Nights', Script = 'Games/NinetyNineNights.lua' },
     -- From the Last Letter dump's own place id.
     [129866685202296] = { Name = 'Last Letter', Script = 'Games/LastLetter.lua' },
+    -- Last Letter's pro and wilderness servers. The script tells them apart by
+    -- place id (wilderness gives prefixes up to 6 letters).
+    [107232715689665] = { Name = 'Last Letter (pro)', Script = 'Games/LastLetter.lua' },
+    [95898962477575] = { Name = 'Last Letter (wilderness)', Script = 'Games/LastLetter.lua' },
 }
 
 -- Loads Onyx straight from its own repo rather than a vendored copy, since
