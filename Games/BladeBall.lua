@@ -1,23 +1,3 @@
---// Blade Ball ------------------------------------------------------------------------
--- Written from how the game is laid out (names below), not from a dump of this exact
--- version, so a renamed folder or attribute after an update is the first thing to check.
---
---  * Balls live in Workspace.Balls (Workspace.TrainingBalls in training). The live ball
---    has the realBall attribute, `target` is the name of the player it's flying at, and
---    its motion is the "zoomies" LinearVelocity (VectorVelocity).
---  * Players still in the round are in Workspace.Alive. Effects (Tornado...) spawn in
---    Workspace.Runtime.
---  * Remotes: ParrySuccess / ParrySuccessAll fire on a good parry, DeathBall and
---    InfinityBall flag those abilities, and the sleitnick net package carries the
---    Time Hole and Slashes of Fury events. AbilityButtonPress (and ParryButtonPress
---    when it exists) are the game's own client-side buttons: firing them is the same
---    as pressing the button on screen.
---  * The game signs every parry it sends. This script never builds or sends a parry
---    packet itself: it presses the game's own parry input (the parry button event, or
---    the F key / a click), and the game's code sends the real, signed parry and plays
---    its own animation.
---
--- Everything here is LOCAL PLAYER ONLY.
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
