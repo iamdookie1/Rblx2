@@ -34,7 +34,7 @@ local Workspace = workspace
 
 local LocalPlayer = Players.LocalPlayer
 
-local DICTIONARY_URL = "https://raw.githubusercontent.com/Unknowns-debug/words/refs/heads/main/English-words"
+local DICTIONARY_URL = "https://raw.githubusercontent.com/iamdookie1/Wordz/refs/heads/main/English-words.txt"
 local FOLDER = "LastLetter"
 local STAFF_GROUP = 35222573
 local MANAGER_ID = 3012508695
@@ -95,7 +95,8 @@ local S = {
     AvoidLetters = "", AvoidEndings = "", BannedWords = "", FavoriteWords = "", SkipOddWords = true,
     IgnoreFiltersIfStuck = true,
     -- timing
-    WaitUntilLeft = 0, PauseChance = 0, SubmitWait = 250, MaxTries = 5,
+    WaitUntilLeft = 0, PauseChance = 0, PauseMin = 150, PauseMax = 600, SubmitWait = 250, MaxTries = 5,
+    VariationStyle = "Natural", WordDrift = 20, BurstChance = 8, KeyRhythm = true, ShowWpm = true,
     -- lobby
     AutoJoin = false, JoinModes = { ["Last Letter"] = true }, JoinSizes = { ["2"] = true, ["4"] = true, ["8"] = true },
     JoinPreferWaiting = true, JoinEvery = 4, AutoDaily = false, AutoTasks = false, LogAbilities = true, NotifyBlocked = true,
@@ -203,7 +204,7 @@ end
 
 --// Dictionary \\--
 local Dict = {
-    ready = false, loading = false, progress = 0, total = 445955,
+    ready = false, loading = false, progress = 0, total = 511362,
     words = 0, buckets = {}, byFirst = {}, set = {}, start = {}, ends = {},
 }
 local Bad = {}       -- words the server turned down, kept across runs
@@ -314,7 +315,8 @@ local function loadDictionary(fresh)
     Dict.loading, Dict.ready, Dict.progress = true, false, 0
     task.spawn(function()
         local text
-        local cache = FOLDER .. "/words.txt"
+        -- Named after the list, so switching lists never reads the old one's cache.
+        local cache = FOLDER .. "/wordz.txt"
         if not fresh and S.CacheDictionary and fileOk() and isfile(cache) then
             local ok, cached = pcall(readfile, cache)
             if ok and cached and #cached > 100000 then
@@ -1119,21 +1121,90 @@ local function fitDeadline(d, remaining)
     return math.max(d, 0.01)
 end
 
-local function charDelay(remaining)
-    local base = 60 / (math.max(S.Wpm, 10) * 5)
-    local jitter = base * (S.WpmJitter / 100)
-    return fitDeadline(base + (math.random() * 2 - 1) * jitter, remaining)
+-- Where each key sits on a QWERTY keyboard, for the rhythm between letters.
+local KEY_POS, LEFT_HAND = {}, {}
+for row, keys in { "qwertyuiop", "asdfghjkl", "zxcvbnm" } do
+    for col = 1, #keys do
+        local k = string.sub(keys, col, col)
+        KEY_POS[k] = { x = col + (row - 1) * 0.5, y = row }
+        LEFT_HAND[k] = col <= 5
+    end
+end
+
+-- Per-word typing state: this word's speed and its planned gaps.
+local Typ = { mult = 1, burst = 0, gaps = {} }
+
+-- Random spread around 1. "Natural" is skewed like real typing: mostly near your
+-- speed with the odd slow key. "Even" spreads evenly both ways.
+local function spread(amount)
+    if amount <= 0 then
+        return 1
+    end
+    if S.VariationStyle == "Even" then
+        return 1 + (math.random() * 2 - 1) * amount
+    end
+    local g = math.sqrt(-2 * math.log(1 - math.random())) * math.cos(2 * math.pi * math.random())
+    return math.clamp(math.exp(g * amount), 0.3, 3)
+end
+
+-- A raw gap after letter `i` of `word`, before scaling to your speed.
+local function rawGap(word, i)
+    local d = spread(S.WpmJitter / 100)
+    if i < #word then
+        local a, b = string.lower(string.sub(word, i, i)), string.lower(string.sub(word, i + 1, i + 1))
+        if S.KeyRhythm and KEY_POS[a] and KEY_POS[b] then
+            if a == b then
+                d *= 0.7
+            else
+                local pa, pb = KEY_POS[a], KEY_POS[b]
+                local dist = math.sqrt((pa.x - pb.x) ^ 2 + (pa.y - pb.y) ^ 2)
+                d *= 0.8 + dist * 0.05
+                if LEFT_HAND[a] ~= LEFT_HAND[b] then
+                    d *= 0.88
+                end
+            end
+        end
+        if Typ.burst > 0 then
+            Typ.burst -= 1
+            d *= 0.55
+        elseif S.BurstChance > 0 and math.random(1, 100) <= S.BurstChance then
+            Typ.burst = math.random(2, 4)
+        end
+    end
+    return d
+end
+
+-- Plans every gap of a word, scaled so the word still averages your speed
+-- (times this word's own speed change).
+local function planGaps(word)
+    Typ.mult = 1 + (math.random() * 2 - 1) * S.WordDrift / 100
+    Typ.burst = 0
+    local gaps, sum = {}, 0
+    for i = 1, #word do
+        gaps[i] = rawGap(word, i)
+        sum += gaps[i]
+    end
+    local scale = 60 / (math.max(S.Wpm, 10) * 5) * Typ.mult * #word / math.max(sum, 1e-6)
+    for i = 1, #word do
+        gaps[i] *= scale
+    end
+    Typ.gaps = gaps
+end
+
+-- The gap after typing letter `i` of the planned word (any gap when `i` is nil).
+local function charDelay(remaining, i)
+    local d = i and Typ.gaps[i] or 60 / (math.max(S.Wpm, 10) * 5) * Typ.mult * spread(S.WpmJitter / 100)
+    return fitDeadline(d, remaining)
 end
 
 local function deleteDelay(remaining)
-    local base = S.DeleteSpeed / 1000
-    local jitter = base * (S.WpmJitter / 100)
-    return fitDeadline(base + (math.random() * 2 - 1) * jitter, remaining)
+    return fitDeadline(S.DeleteSpeed / 1000 * spread(S.WpmJitter / 100), remaining)
 end
 
 local NEIGHBOURS = "qwertyuiopasdfghjklzxcvbnm"
 local function typeWord(word, gen)
     word = string.upper(word)
+    planGaps(word)
     -- Delete back to what the new word shares with what's typed.
     local common = 0
     for i = 1, math.min(#Turn.s2, #word) do
@@ -1151,6 +1222,7 @@ local function typeWord(word, gen)
         Turn.s2 = string.sub(Turn.s2, 1, -2)
         task.wait(deleteDelay(#Turn.s2 - math.max(common, floor) + #word - math.max(common, floor)))
     end
+    local started, firstTyped = os.clock(), #Turn.s2 + 1
     for i = #Turn.s2 + 1, #word do
         if gen ~= Turn.gen or not alive() then
             return false
@@ -1170,12 +1242,18 @@ local function typeWord(word, gen)
         end
         pressKey(letter)
         mirrorKey(letter)
-        task.wait(charDelay(#word - i))
+        task.wait(charDelay(#word - i, i))
         -- A short hesitation mid-word now and then, unless time is short.
         if S.PauseChance > 0 and i < #word and math.random(1, 100) <= S.PauseChance
             and Turn.deadline - os.clock() > 3 then
-            task.wait(0.15 + math.random() * 0.45)
+            task.wait((S.PauseMin + math.random() * math.max(S.PauseMax - S.PauseMin, 0)) / 1000)
         end
+    end
+    local typed = #word - firstTyped + 1
+    local took = os.clock() - started
+    if S.ShowWpm and typed >= 2 and took > 0 then
+        logLine(string.format("Typed %d letters in %.2fs (%.0f WPM, this word %.0f%% speed)", typed, took,
+            typed / 5 / (took / 60), 100 / Typ.mult))
     end
     if S.AutoSubmit and gen == Turn.gen then
         local pause = S.SubmitWait / 1000 * (0.4 + math.random() * 0.6)
@@ -1594,7 +1672,7 @@ do -- Dashboard
     Log = UI.Log
 
     local DictBox = Tab:AddBigGroupbox("Dictionary", "book-open")
-    UI.DictBar = DictBox:AddProgressBar("DictBar", { Text = "Loading dictionary", Default = 0, Max = 445955, Percent = true })
+    UI.DictBar = DictBox:AddProgressBar("DictBar", { Text = "Loading dictionary", Default = 0, Max = 511362, Percent = true })
     UI.DictCards = DictBox:AddStatCards("DictCards", {
         Cards = {
             { Title = "Words", Value = "-", Icon = "library" },
@@ -1709,9 +1787,9 @@ do -- Main
 
     local Typing = Tab:AddRightGroupbox("Typing", "keyboard")
     local presets = {
-        Human = { Wpm = 70, WpmJitter = 30, ReactMin = 700, ReactMax = 1600, PauseChance = 8, TypoChance = 3, SubmitWait = 300, DeleteSpeed = 110 },
-        Fast = { Wpm = 140, WpmJitter = 15, ReactMin = 200, ReactMax = 500, PauseChance = 0, TypoChance = 0, SubmitWait = 100, DeleteSpeed = 40 },
-        Instant = { Wpm = 250, WpmJitter = 0, ReactMin = 0, ReactMax = 50, PauseChance = 0, TypoChance = 0, SubmitWait = 0, DeleteSpeed = 15 },
+        Human = { Wpm = 70, WpmJitter = 30, ReactMin = 700, ReactMax = 1600, PauseChance = 8, TypoChance = 3, SubmitWait = 300, DeleteSpeed = 110, WordDrift = 25, BurstChance = 10 },
+        Fast = { Wpm = 140, WpmJitter = 15, ReactMin = 200, ReactMax = 500, PauseChance = 0, TypoChance = 0, SubmitWait = 100, DeleteSpeed = 40, WordDrift = 12, BurstChance = 6 },
+        Instant = { Wpm = 250, WpmJitter = 0, ReactMin = 0, ReactMax = 50, PauseChance = 0, TypoChance = 0, SubmitWait = 0, DeleteSpeed = 15, WordDrift = 0, BurstChance = 0 },
     }
     Typing:AddDropdown("SpeedPreset", {
         Text = "Preset",
@@ -1733,9 +1811,56 @@ do -- Main
     Typing:AddSlider("Wpm", { Text = "Speed", Default = S.Wpm, Min = 20, Max = 250, Suffix = " WPM", Callback = function(v)
         S.Wpm = v
     end })
-    Typing:AddSlider("WpmJitter", { Text = "Speed variation", Default = S.WpmJitter, Min = 0, Max = 80, Suffix = "%", Callback = function(v)
-        S.WpmJitter = v
-    end })
+    Typing:AddSlider("WpmJitter", {
+        Text = "Speed variation (per letter)",
+        Default = S.WpmJitter,
+        Min = 0,
+        Max = 80,
+        Suffix = "%",
+        Tooltip = "How much each gap between letters can differ from your speed",
+        Callback = function(v)
+            S.WpmJitter = v
+        end,
+    })
+    Typing:AddDropdown("VariationStyle", {
+        Text = "Variation style",
+        Values = { "Natural", "Even" },
+        Default = S.VariationStyle,
+        Tooltip = "Natural: mostly near your speed with the odd slow key, like real typing. Even: spread evenly faster and slower",
+        Callback = function(v)
+            S.VariationStyle = v or "Natural"
+        end,
+    })
+    Typing:AddSlider("WordDrift", {
+        Text = "Speed change per word",
+        Default = S.WordDrift,
+        Min = 0,
+        Max = 60,
+        Suffix = "%",
+        Tooltip = "Each word gets its own speed, up to this much faster or slower, so your WPM isn't the same every turn",
+        Callback = function(v)
+            S.WordDrift = v
+        end,
+    })
+    Typing:AddSlider("BurstChance", {
+        Text = "Fast streaks",
+        Default = S.BurstChance,
+        Min = 0,
+        Max = 40,
+        Suffix = "%",
+        Tooltip = "Chance per letter to rattle off the next 2-4 letters almost twice as fast",
+        Callback = function(v)
+            S.BurstChance = v
+        end,
+    })
+    Typing:AddToggle("KeyRhythm", {
+        Text = "Keyboard rhythm",
+        Default = S.KeyRhythm,
+        Tooltip = "Double letters and switching hands are quicker, keys far apart are slower",
+        Callback = function(v)
+            S.KeyRhythm = v
+        end,
+    })
     Typing:AddSlider("ReactMin", { Text = "Think time (min)", Default = S.ReactMin, Min = 0, Max = 5000, Suffix = " ms", Callback = function(v)
         S.ReactMin = v
     end })
@@ -1756,6 +1881,12 @@ do -- Main
     Typing:AddSlider("PauseChance", { Text = "Mid-word pauses", Default = S.PauseChance, Min = 0, Max = 40, Suffix = "%", Callback = function(v)
         S.PauseChance = v
     end })
+    Typing:AddSlider("PauseMin", { Text = "Pause length (min)", Default = S.PauseMin, Min = 50, Max = 2000, Suffix = " ms", Callback = function(v)
+        S.PauseMin = v
+    end })
+    Typing:AddSlider("PauseMax", { Text = "Pause length (max)", Default = S.PauseMax, Min = 50, Max = 3000, Suffix = " ms", Callback = function(v)
+        S.PauseMax = v
+    end })
     Typing:AddSlider("TypoChance", { Text = "Typos (fixed right away)", Default = S.TypoChance, Min = 0, Max = 30, Suffix = "%", Callback = function(v)
         S.TypoChance = v
     end })
@@ -1770,6 +1901,22 @@ do -- Main
         Tooltip = "How many words to try before giving up on a turn",
         Callback = function(v)
             S.MaxTries = v
+        end,
+    })
+    Typing:AddToggle("ShowWpm", {
+        Text = "Log typing speed",
+        Default = S.ShowWpm,
+        Tooltip = "Writes the WPM of each word you type to the log, so you can see the variation",
+        Callback = function(v)
+            S.ShowWpm = v
+        end,
+    })
+    Typing:AddToggle("ShowWpm", {
+        Text = "Log typing speed",
+        Default = S.ShowWpm,
+        Tooltip = "Writes the WPM of each word you type to the log, so you can see the variation",
+        Callback = function(v)
+            S.ShowWpm = v
         end,
     })
     Typing:AddToggle("AutoSubmit", { Text = "Press enter when done", Default = S.AutoSubmit, Callback = function(v)
