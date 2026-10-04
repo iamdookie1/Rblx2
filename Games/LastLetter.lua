@@ -37,7 +37,6 @@ local Workspace = workspace
 
 local LocalPlayer = Players.LocalPlayer
 
-local DICTIONARY_URL = "https://raw.githubusercontent.com/iamdookie1/Wordz/refs/heads/main/English-words.txt"
 local FOLDER = "LastLetter"
 local STAFF_GROUP = 35222573
 local MANAGER_ID = 3012508695
@@ -48,6 +47,18 @@ local SERVERS = { [107232715689665] = "Pro", [95898962477575] = "Wilderness" }
 local SERVER = SERVERS[game.PlaceId] or "Main"
 local WILD = SERVER == "Wilderness"
 local MAX_PREFIX = WILD and 6 or 4
+
+-- Pro has its own word list, with hyphens and apostrophes ("break-in", "o'er").
+local DICTIONARY_URL = SERVER == "Pro" and "https://raw.githubusercontent.com/iamdookie1/Wordz/refs/heads/main/English-words-pro.txt"
+    or "https://raw.githubusercontent.com/iamdookie1/Wordz/refs/heads/main/English-words.txt"
+local DICTIONARY_CACHE = SERVER == "Pro" and "wordz-pro.txt" or "wordz.txt"
+local DICTIONARY_SIZE = SERVER == "Pro" and 558316 or 511362
+
+-- What a word can be made of. Hyphens and apostrophes only show up in the pro list
+-- (the game's keyboard gets Hyphen and Apostrophe keys there), so this is safe
+-- everywhere.
+local WORD = "[%l'%-]+"
+local CHAR = "[%l'%-]"
 
 -- A second run of the script retires the first one.
 local Genv = (typeof(getgenv) == "function" and getgenv()) or _G
@@ -101,7 +112,7 @@ local S = {
     StaffDetect = true, StaffAttribute = true, StaffGroupRank = 2, StaffManager = true,
     StaffActions = { Notify = true, ["Pause auto play"] = true },
     -- word filters
-    AvoidLetters = "", AvoidEndings = "", BannedWords = "", FavoriteWords = "", SkipOddWords = true,
+    AvoidLetters = "", AvoidEndings = "", BannedWords = "", FavoriteWords = "", SkipOddWords = true, UsePunctuation = true,
     IgnoreFiltersIfStuck = true,
     -- timing
     WaitUntilLeft = 0, PauseChance = 0, PauseMin = 150, PauseMax = 600, SubmitWait = 250, MaxTries = 5,
@@ -116,15 +127,17 @@ local S = {
 -- "q, x z" -> { q = true, x = true, z = true }
 local function wordSet(text)
     local set = {}
-    for w in string.gmatch(string.lower(tostring(text or "")), "%l+") do
-        set[w] = true
+    for w in string.gmatch(string.lower(tostring(text or "")), WORD) do
+        if string.find(w, "%l") then
+            set[w] = true
+        end
     end
     return set
 end
 local Filters = { avoidLetters = {}, avoidEndings = {}, banned = {}, favorite = {}, preferEndings = {} }
 local function refreshFilters()
     Filters.avoidLetters = {}
-    for c in string.gmatch(string.lower(S.AvoidLetters), "%l") do
+    for c in string.gmatch(string.lower(S.AvoidLetters), CHAR) do
         Filters.avoidLetters[c] = true
     end
     Filters.avoidEndings = wordSet(S.AvoidEndings)
@@ -132,7 +145,7 @@ local function refreshFilters()
     Filters.favorite = wordSet(S.FavoriteWords)
     -- Kept in the order typed: earlier endings win.
     Filters.preferEndings = {}
-    for ending in string.gmatch(string.lower(S.PreferEndings or ""), "%l+") do
+    for ending in string.gmatch(string.lower(S.PreferEndings or ""), WORD) do
         table.insert(Filters.preferEndings, ending)
     end
 end
@@ -213,7 +226,7 @@ end
 
 --// Dictionary \\--
 local Dict = {
-    ready = false, loading = false, progress = 0, total = 511362,
+    ready = false, loading = false, progress = 0, total = DICTIONARY_SIZE,
     words = 0, buckets = {}, byFirst = {}, set = {}, start = {}, ends = {},
 }
 local Bad = {}       -- words the server turned down, kept across runs
@@ -225,7 +238,7 @@ local function loadBad()
     end
     local ok, text = pcall(readfile, FOLDER .. "/bad_words.txt")
     if ok and text then
-        for w in string.gmatch(text, "%l+") do
+        for w in string.gmatch(text, WORD) do
             if not Bad[w] then
                 Bad[w] = true
                 BadCount += 1
@@ -271,13 +284,14 @@ local function looksOdd(w)
     if string.find(w, "(%l)%1%1") then
         return true
     end
-    return string.find(w, "[^aeiouy][^aeiouy][^aeiouy][^aeiouy][^aeiouy][^aeiouy]") ~= nil
+    local c = "[bcdfghjklmnpqrstvwxz]"
+    return string.find(w, string.rep(c, 6)) ~= nil
 end
 
 local function buildDictionary(text)
     local buckets, byFirst, set, start, ends, startClean = {}, {}, {}, {}, {}, {}
     local n = 0
-    for w in string.gmatch(text, "%l+") do
+    for w in string.gmatch(text, WORD) do
         local len = #w
         if len >= 2 then
             n += 1
@@ -325,7 +339,7 @@ local function loadDictionary(fresh)
     task.spawn(function()
         local text
         -- Named after the list, so switching lists never reads the old one's cache.
-        local cache = FOLDER .. "/wordz.txt"
+        local cache = FOLDER .. "/" .. DICTIONARY_CACHE
         if not fresh and S.CacheDictionary and fileOk() and isfile(cache) then
             local ok, cached = pcall(readfile, cache)
             if ok and cached and #cached > 100000 then
@@ -423,7 +437,7 @@ end
 
 local function useWord(word)
     word = word and string.lower(word)
-    if not word or word == "" or not string.match(word, "^%l+$") or Match.used[word] then
+    if not word or word == "" or not string.match(word, "^" .. WORD .. "$") or Match.used[word] then
         return
     end
     Match.used[word] = true
@@ -534,8 +548,11 @@ local function allowedWord(w)
     if S.SkipOddWords and looksOdd(w) then
         return false
     end
+    if not S.UsePunctuation and string.find(w, "[-']") then
+        return false
+    end
     if next(Filters.avoidLetters) then
-        for c in string.gmatch(w, "%l") do
+        for c in string.gmatch(w, CHAR) do
             if Filters.avoidLetters[c] then
                 return false
             end
@@ -584,7 +601,7 @@ local function loadRecent()
     end
     local ok, text = pcall(readfile, FOLDER .. "/recent.txt")
     if ok and text then
-        for w in string.gmatch(text, "%l+") do
+        for w in string.gmatch(text, WORD) do
             table.insert(Recent.list, w)
         end
         rebuildRecent()
@@ -974,9 +991,11 @@ local function useScreenKeys()
     return canFire and keyboard() ~= nil
 end
 
-local VIM_KEYS = { Done = Enum.KeyCode.Return, Delete = Enum.KeyCode.Backspace }
+local VIM_KEYS = { Done = Enum.KeyCode.Return, Delete = Enum.KeyCode.Backspace, Hyphen = Enum.KeyCode.Minus, Apostrophe = Enum.KeyCode.Quote }
+local KEY_NAMES = { ["-"] = "Hyphen", ["'"] = "Apostrophe" }
 local function pressKey(key)
-    -- key: "A".."Z", "Done" or "Delete"
+    -- key: "A".."Z", "-", "'", "Done" or "Delete"
+    key = KEY_NAMES[key] or key
     if useScreenKeys() then
         local button = keyButton(key)
         if key == "Delete" then
@@ -1025,7 +1044,7 @@ local function screenWord()
     local i = 1
     while letters[i] do
         local letter = string.lower(letters[i])
-        if not string.match(letter, "^%l$") then
+        if not string.match(letter, "^" .. CHAR .. "$") then
             return nil
         end
         out[i] = letter
@@ -1681,7 +1700,7 @@ do -- Dashboard
     Log = UI.Log
 
     local DictBox = Tab:AddBigGroupbox("Dictionary", "book-open")
-    UI.DictBar = DictBox:AddProgressBar("DictBar", { Text = "Loading dictionary", Default = 0, Max = 511362, Percent = true })
+    UI.DictBar = DictBox:AddProgressBar("DictBar", { Text = "Loading dictionary", Default = 0, Max = DICTIONARY_SIZE, Percent = true })
     UI.DictCards = DictBox:AddStatCards("DictCards", {
         Cards = {
             { Title = "Words", Value = "-", Icon = "library" },
@@ -1996,6 +2015,14 @@ do -- Main
         Callback = function(v)
             S.FavoriteWords = v or ""
             refreshFilters()
+        end,
+    })
+    Filter:AddToggle("UsePunctuation", {
+        Text = "Use words with - and '",
+        Default = S.UsePunctuation,
+        Tooltip = "Pro server only: hyphenated words and ones with an apostrophe (\"break-in\", \"o'er\")",
+        Callback = function(v)
+            S.UsePunctuation = v
         end,
     })
     Filter:AddToggle("IgnoreFiltersIfStuck", {
