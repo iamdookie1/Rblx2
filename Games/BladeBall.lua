@@ -78,35 +78,32 @@ local function getRoot()
 end
 
 -- ============================================================
--- PARRY REMOTE
+-- AZURE TOKEN SYSTEM
 -- ============================================================
--- Remote parries need the game's own parry remote and its token function.
--- If either can't be found, parries fall back to pressing the block key, so
--- the script keeps working instead of stopping.
-local Remote = {
-    token = nil,        -- the game's key function, from getgc
-    remote = nil,       -- the parry RemoteEvent / RemoteFunction
-    args = nil,         -- the last real parry packet the game sent
-    hooked = false,
-}
-
-pcall(function()
-    for _, fn in getgc(true) do
-        if type(fn) == 'function' then
-            local ok, src = pcall(debug.info, fn, 's')
-            if ok and src and src:find('PRY', 1, true) then
-                for _, value in debug.getupvalues(fn) do
-                    if type(value) == 'function' then Remote.token = value; break end
-                end
-                if Remote.token then break end
-            end
+local _token
+local _tokenFound = false
+for _, Function in getgc(true) do
+    if type(Function) ~= 'function' or not debug.info(Function, 's'):find('PRY', 1, true) then continue end
+    for _, value in debug.getupvalues(Function) do
+        if type(value) == 'function' then
+            _token = value
+            _tokenFound = true
+            break
         end
     end
-end)
+    if _token then break end
+end
 
-local function tokenize(remote_uid)
-    local time = tostring(math.floor(Workspace:GetServerTimeNow() * 100))
-    local key = Remote.token(remote_uid, 'TIME')
+if not _tokenFound then
+    Notify("Blade Ball", "Remote not found!", 5)
+    return
+end
+
+Notify("Blade Ball", "First block yourself", 3)
+
+function _tokenize(_remote_uid)
+    local time = tostring(math.floor(workspace:GetServerTimeNow() * 100))
+    local key = _token(_remote_uid, 'TIME')
     local characters = table.create(#time)
     for index = 1, #time do
         characters[index] = string.char(bit32.bxor(
@@ -117,77 +114,101 @@ local function tokenize(remote_uid)
     return table.concat(characters)
 end
 
--- A parry packet is (id, uid, token, number, CFrame, {screen points}, {x, y}, bool).
--- Checking the shape, not just the length, keeps some other 8-argument remote
--- from being mistaken for the parry remote.
-local function isParryPacket(args)
-    return type(args) == 'table' and #args >= 8
-        and typeof(args[5]) == 'CFrame'
-        and type(args[6]) == 'table'
-        and type(args[7]) == 'table'
-end
+local _reverted = {}
+local _original = {}
+local _capturedRemote = nil
+local _capturedArgs = nil
 
-local function capture(remote, args)
-    if not isParryPacket(args) then return end
-    if not Remote.remote then
-        task.defer(Notify, "Blade Ball", "Parry remote found. Remote mode is ready.", 3)
-    end
-    Remote.remote = remote
-    Remote.args = args
-end
+function _is_valid(args) if not args or #args < 8 then return false end; return true end
 
-local function isRemote(self)
-    return typeof(self) == 'Instance' and (self.ClassName == 'RemoteEvent' or self.ClassName == 'RemoteFunction')
-end
-
-if Remote.token then
-    -- The game calls its remotes as method calls, which go through __namecall;
-    -- a cached remote.FireServer goes through __index. Both are watched.
-    pcall(function()
-        if not (hookmetamethod and getnamecallmethod) then return end
-        local old_namecall
-        old_namecall = hookmetamethod(game, '__namecall', function(self, ...)
-            local method = getnamecallmethod()
-            if (method == 'FireServer' or method == 'InvokeServer') and not (checkcaller and checkcaller()) and isRemote(self) then
-                capture(self, {...})
-            end
-            return old_namecall(self, ...)
-        end)
-        Remote.hooked = true
-    end)
-    pcall(function()
-        local meta = getrawmetatable(game)
-        local old_index = meta.__index
-        setreadonly(meta, false)
-        meta.__index = function(self, key)
-            if (key == 'FireServer' or key == 'InvokeServer') and not (checkcaller and checkcaller()) and isRemote(self) then
-                local real = old_index(self, key)
-                return function(remote, ...)
-                    capture(remote, {...})
-                    return real(remote, ...)
+function _hook(remote)
+    if not remote then return end
+    if _reverted[remote] then return end
+    if _original[getrawmetatable(remote)] then return end
+    _original[getrawmetatable(remote)] = true
+    local _meta = getrawmetatable(remote)
+    setreadonly(_meta, false)
+    local _old = _meta.__index
+    _meta.__index = function(self, key)
+        if (key == 'FireServer' and self:IsA('RemoteEvent')) or
+           (key == 'InvokeServer' and self:IsA('RemoteFunction')) then
+            return function(_, ...)
+                local _arguments = {...}
+                if _is_valid(_arguments) then
+                    if not _reverted[self] then
+                        _reverted[self] = _arguments
+                        _capturedRemote = self
+                        _capturedArgs = _arguments
+                    end
                 end
+                return _old(self, key)(_, unpack(_arguments))
             end
-            return old_index(self, key)
         end
-        setreadonly(meta, true)
-        Remote.hooked = true
+        return _old(self, key)
+    end
+    setreadonly(_meta, true)
+end
+
+for _iterator, _remote in pairs(ReplicatedStorage:GetDescendants()) do
+    if _remote:IsA('RemoteEvent') or _remote:IsA('RemoteFunction') then _hook(_remote) end
+end
+
+task.wait(5)
+
+task.spawn(function()
+    local attempts = 0
+    while not _capturedRemote and attempts < 30 do
+        task.wait(1)
+        attempts = attempts + 1
+    end
+    if _capturedRemote then
+        Notify("Blade Ball", "Remote hooked", 3)
+    else
+        Notify("Blade Ball", "Remote not found!", 5)
+    end
+end)
+
+local function fireParryRemote(curveCF)
+    if not _capturedRemote or not _capturedArgs then return false end
+    local cam = workspace.CurrentCamera
+    local aim_target
+    if isMobile then
+        local vp = cam.ViewportSize
+        aim_target = {math.floor(vp.X / 2), math.floor(vp.Y / 2)}
+    else
+        local ok, mouse = pcall(function() return UserInputService:GetMouseLocation() end)
+        if ok and mouse then
+            aim_target = {math.floor(mouse.X), math.floor(mouse.Y)}
+        else
+            local vp = cam.ViewportSize
+            aim_target = {math.floor(vp.X / 2), math.floor(vp.Y / 2)}
+        end
+    end
+    local event_data = {}
+    if Alive then
+        for _, entity in pairs(Alive:GetChildren()) do
+            if entity.PrimaryPart then
+                local ok, sp = pcall(function() return cam:WorldToScreenPoint(entity.PrimaryPart.Position) end)
+                if ok then event_data[entity.Name] = sp end
+            end
+        end
+    end
+    local packet = {
+        _capturedArgs[1], _capturedArgs[2], _tokenize(_capturedArgs[2]),
+        0.5, curveCF or cam.CFrame, event_data, aim_target, false
+    }
+    pcall(function()
+        if _capturedRemote:IsA('RemoteEvent') then _capturedRemote:FireServer(unpack(packet))
+        elseif _capturedRemote:IsA('RemoteFunction') then _capturedRemote:InvokeServer(unpack(packet)) end
     end)
+    return true
 end
 
 local function remoteReady()
-    return Remote.token ~= nil and Remote.remote ~= nil and Remote.args ~= nil
+    return _capturedRemote ~= nil and _capturedArgs ~= nil
 end
 
-if not Remote.token then
-    Notify("Blade Ball", "Token not found. Parries will use the block key instead of the remote.", 6)
-elseif not Remote.hooked then
-    Notify("Blade Ball", "Couldn't hook remotes. Parries will use the block key.", 6)
-else
-    Notify("Blade Ball", "Block once (F or click) to finish remote setup. Until then parries use the block key.", 6)
-end
-
--- Presses the block key. Works without the remote, at the cost of the game's
--- own parry cooldown and no curve control.
+-- Presses the block key. Only used by the "Keypress" modes.
 local function pressBlockKey()
     pcall(function()
         VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.F, false, game)
@@ -195,32 +216,6 @@ local function pressBlockKey()
     end)
 end
 
-local function fireParryRemote(curveCF)
-    if not remoteReady() then return false end
-    local cam = Workspace.CurrentCamera
-    local aim_target
-    local mouseOk, mouse = pcall(function() return UserInputService:GetMouseLocation() end)
-    if not isMobile and mouseOk and mouse then
-        aim_target = {math.floor(mouse.X), math.floor(mouse.Y)}
-    else
-        local vp = cam.ViewportSize
-        aim_target = {math.floor(vp.X / 2), math.floor(vp.Y / 2)}
-    end
-    local event_data = {}
-    for _, entity in pairs(Alive:GetChildren()) do
-        if entity.PrimaryPart then
-            local ok, sp = pcall(function() return cam:WorldToScreenPoint(entity.PrimaryPart.Position) end)
-            if ok then event_data[entity.Name] = sp end
-        end
-    end
-    local args = Remote.args
-    local ok = pcall(function()
-        local packet = {args[1], args[2], tokenize(args[2]), 0.5, curveCF or cam.CFrame, event_data, aim_target, false}
-        if Remote.remote:IsA('RemoteEvent') then Remote.remote:FireServer(unpack(packet))
-        else Remote.remote:InvokeServer(unpack(packet)) end
-    end)
-    return ok
-end
 
 -- ============================================================
 -- SYSTEM
@@ -427,10 +422,10 @@ end
 
 System.parry = {}
 -- "Remote" fires the parry remote with the chosen curve. "Keypress" presses the
--- block key. Remote mode falls back to the key until the remote is captured.
+-- block key.
 function System.parry.execute()
     if System.__properties.__parries > 10000 or not LocalPlayer.Character then return end
-    if not fireParryRemote(System.curve.get_cframe()) then pressBlockKey() end
+    fireParryRemote(System.curve.get_cframe())
     System.__properties.__parries = System.__properties.__parries + 1
     System.__properties.__total_parries = System.__properties.__total_parries + 1
     task.delay(0.5, function()
@@ -1398,10 +1393,8 @@ local RemoteLabel = Overview:AddLabel("Remote: checking...", true)
 local TargetLabel = Overview:AddLabel("Ball target: -", true)
 
 local function remoteStatusText()
-    if remoteReady() then return "Remote: ready, parries use the remote" end
-    if not Remote.token then return "Remote: token not found, parries use the block key" end
-    if not Remote.hooked then return "Remote: hook unavailable, parries use the block key" end
-    return "Remote: waiting. Block once (F or click) to capture it. Parries use the block key until then"
+    if remoteReady() then return "Remote: hooked" end
+    return "Remote: waiting. Block once yourself to capture it"
 end
 
 local status_peak, status_ball = 0, nil
