@@ -23,6 +23,9 @@
 --    (its value is the rank), a rank in group 35222573 (255 owner, 2 tester), and the
 --    manager's UserId. Your WPM is shown to the whole table after every answer.
 --  * There is no word list on the client; the dictionary is downloaded.
+--  * The pro server (107232715689665) plays like the main game. The wilderness server
+--    (95898962477575) gives prefixes up to 6 letters and is looser about which
+--    endings it hands out, so traps there can go longer and leave fewer answers.
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -39,6 +42,12 @@ local FOLDER = "LastLetter"
 local STAFF_GROUP = 35222573
 local MANAGER_ID = 3012508695
 local HARD_MODE_TURN = 50
+
+-- Which server this is, and how long its prefixes get.
+local SERVERS = { [107232715689665] = "Pro", [95898962477575] = "Wilderness" }
+local SERVER = SERVERS[game.PlaceId] or "Main"
+local WILD = SERVER == "Wilderness"
+local MAX_PREFIX = WILD and 6 or 4
 
 -- A second run of the script retires the first one.
 local Genv = (typeof(getgenv) == "function" and getgenv()) or _G
@@ -85,7 +94,7 @@ local S = {
     -- abilities
     AutoAbility = false, AbilityTime = 4, AbilityOnStuck = true, AbilityOthers = false, AbilityOthersDelay = 2,
     -- traps
-    UseTraps = false, RespectSeen = true, ResetOnLife = true, TrapLength = 2, TrapMinAnswers = 3,
+    UseTraps = false, RespectSeen = true, ResetOnLife = true, TrapLength = WILD and 6 or 2, TrapMinAnswers = WILD and 1 or 3,
     TrapMaxAnswers = 15, ShowTraps = true, TrapsUsableOnly = false, TrapMinEnds = 2, HardEndings = true,
     TrapGuess = "Smart (learned)", TrapCleanCount = true, TrapCounter = true, TrapAfterTurn = 0,
     -- staff
@@ -284,7 +293,7 @@ local function buildDictionary(text)
             end
             bucket[#bucket + 1] = w
             local clean = not looksOdd(w)
-            for k = 1, (len < 4 and len or 4) do
+            for k = 1, math.min(len, MAX_PREFIX) do
                 local p = string.sub(w, 1, k)
                 start[p] = (start[p] or 0) + 1
                 if clean then
@@ -420,7 +429,7 @@ local function useWord(word)
     Match.used[word] = true
     Match.usedCount += 1
     local clean = not looksOdd(word)
-    for k = 1, math.min(4, #word) do
+    for k = 1, math.min(MAX_PREFIX, #word) do
         local p = string.sub(word, 1, k)
         Match.usedStart[p] = (Match.usedStart[p] or 0) + 1
         if clean then
@@ -1453,7 +1462,7 @@ onEvent("GameStarting", function()
     for _, p in tablePlayers() do
         Match.lives[p.UserId] = 2
     end
-    logLine("Match started: " .. tostring(Match.mode), Library.Scheme.AccentColor)
+    logLine("Match started: " .. tostring(Match.mode) .. " (" .. SERVER .. " server)", Library.Scheme.AccentColor)
 end)
 
 onEvent("Rotate", function(newWord, letters, playerName, seat)
@@ -1597,7 +1606,7 @@ local function rebuildReach()
         return
     end
     for _, w in wordsWithPrefix(prefix, Match.used, 2, 99) do
-        for len = 1, math.min(4, #w - 1) do
+        for len = 1, math.min(MAX_PREFIX, #w - 1) do
             local e = string.sub(w, -len)
             local cur = Traps.reach[e]
             if not cur or #w < #cur then
@@ -1638,7 +1647,7 @@ end
 
 --// UI \\--
 local Window = Library:CreateWindow({
-    Title = "Last Letter",
+    Title = SERVER == "Main" and "Last Letter" or ("Last Letter · " .. SERVER),
     Footer = "dookie hub · Ui3",
     Icon = "message-square-text",
     Size = UDim2.fromOffset(760, 580),
@@ -2155,9 +2164,9 @@ do -- Traps
         Text = "Trap length",
         Default = S.TrapLength,
         Min = 1,
-        Max = 4,
+        Max = MAX_PREFIX,
         Suffix = " letters",
-        Tooltip = "Longest ending to look at, for using and showing traps",
+        Tooltip = "Longest ending to look at, for using and showing traps" .. (WILD and " (wilderness goes up to 6)" or ""),
         Callback = function(v)
             S.TrapLength = v
             Traps.dirty = true
@@ -2168,7 +2177,8 @@ do -- Traps
         Default = S.TrapMinAnswers,
         Min = 1,
         Max = 10,
-        Tooltip = "The game won't give a prefix with fewer than 3 answers, so 3 is the safe floor",
+        Tooltip = WILD and "Wilderness hands out endings with very few answers, so this can go down to 1"
+            or "The game won't give a prefix with fewer than 3 answers, so 3 is the safe floor",
         Callback = function(v)
             S.TrapMinAnswers = v
             Traps.dirty = true
