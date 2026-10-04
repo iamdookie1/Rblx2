@@ -52,6 +52,8 @@ local Games = {
     [95898962477575] = { Name = 'Last Letter (wilderness)', Script = 'Games/LastLetter.lua' },
     -- Chapter 1 (Farmhouse) of the needle in a haystack game, from its dump.
     [108628039999641] = { Name = 'Needle in a Haystack', Script = 'Games/NeedleHaystack.lua' },
+    -- Blade Ball's main place. Its other modes have their own place ids, not added yet.
+    [13772394625] = { Name = 'Blade Ball', Script = 'Games/BladeBall.lua' },
 }
 
 -- Loads Onyx straight from its own repo rather than a vendored copy, since
