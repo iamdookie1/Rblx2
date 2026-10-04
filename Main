@@ -50,6 +50,8 @@ local Games = {
     -- place id (wilderness gives prefixes up to 6 letters).
     [107232715689665] = { Name = 'Last Letter (pro)', Script = 'Games/LastLetter.lua' },
     [95898962477575] = { Name = 'Last Letter (wilderness)', Script = 'Games/LastLetter.lua' },
+    -- Chapter 1 (Farmhouse) of the needle in a haystack game, from its dump.
+    [108628039999641] = { Name = 'Needle in a Haystack', Script = 'Games/NeedleHaystack.lua' },
 }
 
 -- Loads Onyx straight from its own repo rather than a vendored copy, since
