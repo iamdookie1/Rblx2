@@ -973,6 +973,7 @@ WorldEspBox:AddToggle("ESPRobberies", { Text = "Robberies (open/closed)", Defaul
 WorldEspBox:AddToggle("ESPAirdrops", { Text = "Airdrops", Default = false })
 WorldEspBox:AddToggle("ESPCash", { Text = "Dropped cash", Default = false })
 WorldEspBox:AddToggle("ESPVehicles", { Text = "Empty vehicles", Default = false })
+WorldEspBox:AddToggle("ESPNPCs", { Text = "NPCs (guards etc.)", Default = false })
 
 -- Movement -------------------------------------------------------------------------
 local CharBox = MovementTab:AddLeftGroupbox("Character", "user")
@@ -1042,8 +1043,18 @@ TravelBox:AddDropdown("TPMode", {
 TravelBox:AddSlider("TPSpeed", { Text = "On-foot speed", Default = 120, Min = 20, Max = 500, Rounding = 0 })
 TravelBox:AddSlider("TPVehicleSpeed", { Text = "Vehicle speed", Default = 350, Min = 50, Max = 1500, Rounding = 0 })
 TravelBox:AddToggle("TPUseVehicle", { Text = "Use vehicle if driving", Default = true, Tooltip = "Moves your car with you in it. Much safer than on foot." })
-TravelBox:AddToggle("TPSkyRoute", { Text = "Sky route", Default = true, Tooltip = "Rises first, flies over everything, then drops down." })
-TravelBox:AddSlider("TPSkyHeight", { Text = "Sky route height", Default = 150, Min = 30, Max = 600, Rounding = 0 })
+TravelBox:AddDropdown("TPRoute", {
+    Text = "Route",
+    Values = { "Sky", "Ground", "Direct" },
+    Default = "Sky",
+    Tooltip = "Sky: up, across, down. Ground: hugs the terrain a few studs up. Direct: a straight line.",
+})
+TravelBox:AddSlider("TPSkyHeight", { Text = "Sky height", Default = 150, Min = 30, Max = 600, Rounding = 0, Suffix = " studs" })
+TravelBox:AddSlider("TPGroundHeight", { Text = "Ground hover", Default = 6, Min = 2, Max = 40, Rounding = 0, Suffix = " studs" })
+TravelBox:AddToggle("TPSmooth", { Text = "Smooth start and stop", Default = true, Tooltip = "Speeds up gradually and brakes before arriving." })
+TravelBox:AddSlider("TPAccel", { Text = "Acceleration", Default = 250, Min = 30, Max = 2000, Rounding = 0, Suffix = " studs/s²" })
+TravelBox:AddToggle("TPFaceDirection", { Text = "Face where you're going", Default = true })
+TravelBox:AddToggle("ClickTP", { Text = "Ctrl + click to travel", Default = false, Tooltip = "Hold Left Ctrl and click a spot to travel there with these settings." })
 TravelStatus = TravelBox:AddLabel("Status: idle")
 TravelBox:AddButton({ Text = "Stop", Func = stopTravel })
 
@@ -1069,7 +1080,20 @@ PlacesBox:AddButton({
         local instance = robbery and robberyInstance(robbery)
         local position, size = instancePosition(instance)
         if position then
-            travelTo(landingPoint(position, size), robbery.Name)
+            -- Trains, the money truck, the ship and the plane move, so the
+            -- goal is re-read each frame; still robberies land on top once.
+            local moving = robbery.Key:find("TRAIN") or robbery.Key == "MONEY_TRUCK"
+                or robbery.Key == "CARGO_SHIP" or robbery.Key == "CARGO_PLANE"
+            if moving then
+                travelTo(function()
+                    local current = robberyInstance(robbery)
+                    local at, extent = instancePosition(current)
+                    if not at then return nil end
+                    return at + Vector3.new(0, (extent and extent.Y / 2 or 0) + 5, 0)
+                end, robbery.Name)
+            else
+                travelTo(landingPoint(position, size), robbery.Name)
+            end
         else
             notify("Teleport", "That robbery isn't in the map right now.", 4)
         end
@@ -1134,16 +1158,55 @@ PlacesBox:AddButton({
 
 local PeopleBox = TeleportTab:AddRightGroupbox("Players", "users")
 PeopleBox:AddDropdown("TPPlayer", { Text = "Player", SpecialType = "Player", ExcludeLocalPlayer = true })
+local function selectedPlayer()
+    local player = Players:FindFirstChild(tostring(opt("TPPlayer", "")))
+    if player and getRoot(player.Character) then return player end
+    notify("Teleport", "Pick a player who has spawned.", 3)
+    return nil
+end
+
+-- Re-read every frame, so you end up where they are now rather than where
+-- they were when you clicked.
+local function playerGoal(player)
+    return function()
+        local root = player.Parent and getRoot(player.Character)
+        if not root then return nil end
+        return root.Position - root.CFrame.LookVector * opt("TPFollowDistance", 4) + Vector3.new(0, 3, 0)
+    end
+end
+
 PeopleBox:AddButton({
     Text = "Go to player",
     Func = function()
-        local player = Players:FindFirstChild(tostring(opt("TPPlayer", "")))
-        local root = player and getRoot(player.Character)
-        if root then
-            travelTo(root.Position + Vector3.new(0, 3, 0), player.DisplayName)
-        else
-            notify("Teleport", "Pick a player who has spawned.", 3)
+        local player = selectedPlayer()
+        if player then travelTo(playerGoal(player), player.DisplayName) end
+    end,
+}):AddButton({
+    Text = "Follow",
+    Func = function()
+        local player = selectedPlayer()
+        if not player then return end
+        travelTo(playerGoal(player), player.DisplayName, {
+            Follow = true,
+            Velocity = function()
+                local root = getRoot(player.Character)
+                return root and root.AssemblyLinearVelocity or nil
+            end,
+        })
+    end,
+})
+PeopleBox:AddSlider("TPFollowDistance", { Text = "Stay behind by", Default = 4, Min = 0, Max = 30, Rounding = 0, Suffix = " studs" })
+PeopleBox:AddButton({
+    Text = "Spectate / stop spectating",
+    Func = function()
+        local mine = getHumanoid()
+        if mine and Camera.CameraSubject ~= mine then
+            Camera.CameraSubject = mine
+            return
         end
+        local player = selectedPlayer()
+        local target = player and getHumanoid(player.Character)
+        if target then Camera.CameraSubject = target end
     end,
 })
 
@@ -1906,6 +1969,18 @@ local function worldEspUpdate()
         end
     end
 
+    if on("ESPNPCs") then
+        for _, npc in ipairs(getNpcs()) do
+            local humanoid = getHumanoid(npc.Character)
+            local npcRoot = getRoot(npc.Character)
+            if humanoid and npcRoot and humanoid.Health > 0 then
+                local text = ("%s  %d HP%s"):format(npc.Name, humanoid.Health, npc.Docile and " (docile)" or "")
+                local color = npc.Docile and Color3.fromRGB(170, 170, 170) or Color3.fromRGB(255, 120, 60)
+                worldEspSet(npc.Character, npc.Character:FindFirstChild("Head") or npcRoot, text .. distanceTo(npcRoot), color, wanted)
+            end
+        end
+    end
+
     for key, entry in pairs(WorldEsp) do
         if not wanted[key] then
             entry.Billboard:Destroy()
@@ -2497,6 +2572,7 @@ end))
 track(PreRender:Connect(function()
     if Unloading then return end
     updateAimTarget()
+    autoShootStep()
 
     local showCircle = on("SilentAim") and on("ShowFOV")
     FOVCircle.Visible = showCircle
@@ -2531,7 +2607,7 @@ task.spawn(function()
     while not Unloading do
         specTweaksStep()
         autoInteractStep()
-        TravelStatus:SetText("Status: " .. (Travel.Active and ("going to " .. Travel.Label) or "idle"))
+        TravelStatus:SetText(travelStatusText())
         mobileStep()
         task.wait(0.15)
     end
@@ -2554,6 +2630,26 @@ track(PostSimulation:Connect(function()
         lightingStep()
     end
 end))
+
+track(UserInputService.InputBegan:Connect(function(input, processed)
+    if processed or not on("ClickTP") then return end
+    if input.UserInputType ~= Enum.UserInputType.MouseButton1 or not keyDown(Enum.KeyCode.LeftControl) then return end
+    local mouse = UserInputService:GetMouseLocation()
+    local ray = Camera:ViewportPointToRay(mouse.X, mouse.Y)
+    local mover = getMover()
+    refreshTravelIgnore(mover)
+    local hit = Workspace:Raycast(ray.Origin, ray.Direction * 5000, TravelRayParams)
+    if hit then
+        travelTo(hit.Position + Vector3.new(0, mover and mover.Vehicle and 6 or 4, 0), "clicked spot")
+    end
+end))
+
+onCleanup(function()
+    local humanoid = getHumanoid()
+    if humanoid and Camera.CameraSubject ~= humanoid then
+        Camera.CameraSubject = humanoid
+    end
+end)
 
 --// Unload --------------------------------------------------------------------------
 local unloadFromOutside
