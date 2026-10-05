@@ -106,7 +106,7 @@ if not _tokenFound then
     return
 end
 
-Notify("Blade Ball", "Status tab > Capture remote to hook the parry remote", 4)
+Notify("Blade Ball", "Parry once when the ball enters the circle to hook the remote", 4)
 
 function _tokenize(_remote_uid)
     local time = tostring(math.floor(workspace:GetServerTimeNow() * 100))
@@ -125,9 +125,9 @@ local _capturedRemote = nil
 local _capturedArgs = nil
 
 -- Every Instance shares one metatable, so an __index hook runs on every
--- property read in the whole game. It's only installed for a short window
--- after Capture remote (Status tab) presses F, and taken off as soon as the parry
--- remote is caught (or the window runs out).
+-- property read in the whole game. It's only installed while the ball is
+-- inside the capture circle around you (you're about to parry), and taken
+-- off as soon as the parry remote is caught or the ball leaves the circle.
 -- Any key other than FireServer / InvokeServer, and any call this script
 -- makes itself, falls straight through.
 local _checkcaller = checkcaller or function() return false end
@@ -156,7 +156,7 @@ local function _capture(remote, args)
     _destroyConn = remote.AncestryChanged:Connect(function(_, parent)
         if parent == nil and _capturedRemote == remote then
             _capturedRemote, _capturedArgs = nil, nil
-            Notify("Blade Ball", "Parry remote changed. Press Capture remote again.", 4)
+            Notify("Blade Ball", "Parry remote changed. Parry once inside the circle.", 4)
         end
     end)
     task.defer(function()
@@ -194,35 +194,9 @@ local function _hook()
     setreadonly(_meta, true)
 end
 
--- How long the hook stays on after a Capture press. Covers the game's block
--- cooldown and a slow frame; if nothing is caught by then it comes off again.
-local CAPTURE_WINDOW = 3
-local _captureGen = 0
-
-local function _captureNow()
-    _capturedRemote, _capturedArgs = nil, nil
-    if _destroyConn then _destroyConn:Disconnect(); _destroyConn = nil end
-    _captureGen = _captureGen + 1
-    local gen = _captureGen
-    _hook()
-    -- VirtualInputManager works the same on phone, so this needs no keyboard.
-    -- A real block (F, click or the game's mobile button) inside the window
-    -- is caught too.
-    pcall(function()
-        VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.F, false, game)
-        VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.F, false, game)
-    end)
-    task.delay(CAPTURE_WINDOW, function()
-        if gen ~= _captureGen or _capturedRemote then return end
-        _unhook()
-        Notify("Blade Ball", "Not caught (block on cooldown?). Press Capture remote again.", 3)
-    end)
-end
-
--- Nothing is hooked until Capture remote is pressed.
 task.delay(30, function()
     if not _capturedRemote then
-        Notify("Blade Ball", "Remote not caught yet. Press Capture remote on the Status tab.", 5)
+        Notify("Blade Ball", "Remote not caught yet. Parry once when the ball is in the circle.", 5)
     end
 end)
 
@@ -445,6 +419,52 @@ function System.ball.get_training()
     refreshBalls()
     return ball_cache.training
 end
+
+-- ============================================================
+-- CAPTURE CIRCLE
+-- ============================================================
+-- Until the parry remote is caught, a ring is drawn around you. The hook is
+-- only on while a ball is inside it, which is when you'd parry anyway, so
+-- parrying once in the ring catches the remote. Once caught, the ring goes
+-- away and this loop does nothing.
+local CAPTURE_RADIUS = 35
+local CaptureRing = Instance.new('Part')
+CaptureRing.Name = 'BladeBall_CaptureRing'; CaptureRing.Shape = Enum.PartType.Cylinder
+CaptureRing.Size = Vector3.new(0.2, CAPTURE_RADIUS * 2, CAPTURE_RADIUS * 2)
+CaptureRing.Anchored = true; CaptureRing.CanCollide = false; CaptureRing.CanQuery = false
+CaptureRing.CanTouch = false; CaptureRing.CastShadow = false
+CaptureRing.Material = Enum.Material.ForceField; CaptureRing.Transparency = 0.3
+local RING_IDLE, RING_HOOKED = Color3.fromRGB(0, 170, 255), Color3.fromRGB(0, 255, 120)
+CaptureRing.Color = RING_IDLE
+local RING_TILT = CFrame.Angles(0, 0, math.rad(90))
+
+local function ballInRing(root)
+    for _, list in ipairs({System.ball.get_all(), System.ball.get_training()}) do
+        for _, ball in ipairs(list) do
+            if (ball.Position - root.Position).Magnitude <= CAPTURE_RADIUS then return true end
+        end
+    end
+    return false
+end
+
+System.__properties.__connections.__capture_ring = RunService.Heartbeat:Connect(function()
+    if remoteReady() then
+        if CaptureRing.Parent then CaptureRing.Parent = nil end
+        return
+    end
+    local root = getRoot()
+    if not root then
+        if _armed then _unhook() end
+        CaptureRing.Parent = nil
+        return
+    end
+    CaptureRing.CFrame = CFrame.new(root.Position - Vector3.new(0, 2.9, 0)) * RING_TILT
+    CaptureRing.Parent = workspace.CurrentCamera
+    local inside = ballInRing(root)
+    if inside and not _armed then _hook()
+    elseif not inside and _armed then _unhook() end
+    CaptureRing.Color = inside and RING_HOOKED or RING_IDLE
+end)
 
 System.player = {}
 local Closest_Entity = nil; local last_closest_check = 0
@@ -1537,12 +1557,8 @@ local TargetLabel = Overview:AddLabel("Ball target: -", true)
 
 local function remoteStatusText()
     if remoteReady() then return "Remote: hooked" end
-    return "Remote: waiting. Press Capture remote"
+    return "Remote: waiting. Parry once inside the circle"
 end
-
-Overview:AddButton({Text = "Capture remote",
-    Tooltip = "Presses F and hooks for 3s to catch the parry remote. Use again if parries stop registering.",
-    Func = _captureNow})
 
 local status_peak, status_ball = 0, nil
 task.spawn(function()
@@ -1904,8 +1920,8 @@ end))
 -- UNLOAD
 -- ============================================================
 Library:OnUnload(function()
-    _captureGen = _captureGen + 1
     _unhook()
+    pcall(function() CaptureRing:Destroy() end)
     if _destroyConn then pcall(function() _destroyConn:Disconnect() end) end
     System.autoparry.stop()
     setTriggerbot(false)
