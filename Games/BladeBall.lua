@@ -819,6 +819,12 @@ function System.parry_distance(speed)
         -- The parry reaches the server about half a round trip later, and the
         -- ball keeps closing in the meantime.
         distance = distance + speed * (ping_ms / 1000) * 0.5
+        -- Never later than the parry can reach the server in time: the server
+        -- sees the ball half a ping ahead and gets our parry half a ping late,
+        -- so the ball has to be at least a full ping (plus a couple of frames)
+        -- out when we fire, whatever the accuracy setting.
+        local min_lead = speed * (ping_ms / 1000 + props.__frame_dt * 2)
+        if distance < min_lead then distance = min_lead end
     end
     -- High-speed safety: a ball moving fast enough can jump the whole window in
     -- a single frame. Guarantee the window is at least a few frames of travel so
@@ -838,28 +844,44 @@ end
 local APCfg = {
     close_range = 20,       -- studs
     instant = true,         -- parry straight from the target change
-    preparry = true,        -- parry ahead while the ball is on a player next to you
-    timeout = 1,            -- far-away re-parry lockout while the ball stays on us
-    parry_window = 0.45,    -- how long a parry stays useful (game's own is ~0.5s)
-    cover_time = 0.4,       -- how long we count on one of our parries still being up
+    preparry = true,        -- parry ahead when a player next to you is about to hit it back
+    parry_window = 0.45,    -- parry once the ball lands within this (+ ping); a bit under the real window
+    parry_lasts = 0.5,      -- how long the game keeps a parry up
+    landed_hold = 0.75,     -- max wait for the ball to leave us after a parry lands
 }
 
--- One record of our last auto parry, shared by every auto parry path (frame
--- loop, instant retarget, pre-parry, parry-back). Before, each ran on its own
--- timer, so a single return could get a pre-parry, an instant retarget parry and
--- a frame-loop retry on top of each other. Now a path only fires when the last
--- parry won't still be up by the time the ball arrives. A parry that lands
--- (ParrySuccess, or the ball leaving us) is used up and frees the next at once.
-local ParryCover = {at = 0}
-local function parry_covers(eta)
-    return ParryCover.at > 0 and tick() + (eta or 0) <= ParryCover.at + APCfg.cover_time
+-- One parry at a time, shared by every auto parry path (frame loop, instant
+-- retarget, pre-parry, parry-back), mirroring the game's own client rule that
+-- you can't parry while one is still up:
+--   * nothing fires while our last parry is still up. In our own (client)
+--     time that's the game's window plus a full ping: it starts half a ping
+--     late on the server, and the server sees the ball half a ping ahead;
+--     If the ball was due to land late in that window, we also hold until the
+--     success has had time to come back from that landing;
+--   * once it lands (ParrySuccess) we stay locked until the ball actually
+--     leaves us. The success event usually arrives a moment before the
+--     target flips, and that gap used to get a second parry;
+--   * the ball leaving us frees the next parry at once.
+local ParryCover = {at = 0, busy_until = 0, landed = false, landed_at = 0}
+local function parry_up_for()
+    return APCfg.parry_lasts + getPing() / 1000 + 0.03
 end
-local function mark_parry() ParryCover.at = tick() end
-local function consume_parry() ParryCover.at = 0 end
-
-local function retry_after(distance)
-    if distance > APCfg.close_range then return APCfg.timeout end
-    return math.clamp(getPing() / 1000 * 1.25 + 0.05, 0.08, 0.4)
+local function parry_busy()
+    local now = tick()
+    if ParryCover.at > 0 and now < ParryCover.busy_until then return true end
+    return ParryCover.landed and now - ParryCover.landed_at < APCfg.landed_hold
+end
+-- eta: when the ball we're parrying is due to land (nil for a pre-parry).
+local function mark_parry(eta)
+    local now = tick()
+    ParryCover.at, ParryCover.landed = now, false
+    ParryCover.busy_until = now + math.max(parry_up_for(), (eta or 0) + getPing() / 2000 + 0.05)
+end
+local function parry_landed()
+    ParryCover.landed, ParryCover.landed_at = true, tick()
+end
+local function parry_released()
+    ParryCover.at, ParryCover.landed = 0, false
 end
 
 -- ------------------------------------------------------------
@@ -881,7 +903,7 @@ local function get_ball_state(ball)
         swaps[#swaps + 1] = {t = os.clock(), from = state.target, to = new}
         if #swaps > BALL_HISTORY then table.remove(swaps, 1) end
         -- The ball left us: our parry landed, so it's used up.
-        if state.target == LocalPlayer.Name and new ~= LocalPlayer.Name then consume_parry() end
+        if state.target == LocalPlayer.Name and new ~= LocalPlayer.Name then parry_released() end
         state.target = new
         state.parried = false
         if new == LocalPlayer.Name and System.autoparry.on_retarget then
@@ -986,11 +1008,12 @@ local function try_parry_ball(ball, root, now, curve_hold, training)
     local state = get_ball_state(ball)
     if props.__parried or ball:GetAttribute('target') ~= LocalPlayer.Name then return false end
 
+    -- A parry is already up (or just landed and the ball hasn't left yet).
+    if parry_busy() then return false end
+
     local speed = zoomies.VectorVelocity.Magnitude
     local distance = (root.Position - ball.Position).Magnitude
     local close = distance <= APCfg.close_range
-
-    if state.parried and now - state.at < retry_after(distance) then return false end
 
     local tornado = Runtime:FindFirstChild('Tornado')
     if tornado and (now - props.__tornado_time) < (tornado:GetAttribute('TornadoTime') or 1) + 0.314159 then return false end
@@ -999,15 +1022,16 @@ local function try_parry_ball(ball, root, now, curve_hold, training)
     if blocked_by_detection() then return false end
 
     -- Inside the window, or up close and arriving before a parry would expire.
+    -- Inside the window (or up close), and only once the ball will land while
+    -- the parry is still up. Parrying earlier (slow balls get a wide window) just
+    -- has it expire before the ball arrives and need a second one.
     local eta = distance / math.max(speed, 1)
-    local in_window = distance <= System.parry_distance(speed)
-    if not in_window and not (close and eta <= APCfg.parry_window) then return false end
-    -- Already have a parry up that will still be up when this ball lands.
-    if parry_covers(eta) then return false end
+    if not (distance <= System.parry_distance(speed) or close) then return false end
+    if eta > APCfg.parry_window + getPing() / 1000 then return false end
 
     state.parried = true
     state.at = now
-    mark_parry()
+    mark_parry(eta)
     if not try_ability() then
         System.parry.by_mode(getgenv().AutoParryMode)
     end
@@ -1018,15 +1042,16 @@ local function preparry_now()
     -- Remote only: a block-key press puts the game's own ~1.3s parry cooldown on
     -- you, so pre-parrying by key would burn it right before the ball arrives.
     if getgenv().AutoParryMode == "Keypress" or not remoteReady() then return false end
-    -- One pre-parry per cover window, renewed only once it's about to lapse.
-    if ParryCover.at > 0 and tick() - ParryCover.at < APCfg.cover_time * 0.75 then return false end
+    if parry_busy() then return false end
     mark_parry()
     System.parry.by_mode(getgenv().AutoParryMode)
     return true
 end
 
--- Ball is on a player standing next to us and close: their parry will send it
--- straight back, so put ours up first.
+-- Ball is on a player standing next to us and about to reach them: their parry
+-- will send it straight back faster than we can react, so put ours up first.
+-- Only when they're about to hit it, not just whenever they hold it, so one
+-- return gets one parry.
 local function try_preparry(ball, root)
     if not APCfg.preparry then return false end
     local target = ball:GetAttribute('target')
@@ -1034,6 +1059,10 @@ local function try_preparry(ball, root)
     local their_root = character_root(target)
     if not their_root or (their_root.Position - root.Position).Magnitude > APCfg.close_range then return false end
     if (ball.Position - root.Position).Magnitude > APCfg.close_range * 1.5 then return false end
+    local zoomies = ball:FindFirstChild('zoomies')
+    local speed = zoomies and zoomies.VectorVelocity.Magnitude or 0
+    local their_eta = (ball.Position - their_root.Position).Magnitude / math.max(speed, 1)
+    if their_eta > 0.12 + getPing() / 1000 then return false end
     if blocked_by_detection() then return false end
     return preparry_now()
 end
@@ -1073,8 +1102,8 @@ function System.autoparry.on_retarget(ball)
     pcall(try_parry_ball, ball, root, tick(), false, Workspace:FindFirstChild("TrainingBalls"))
 end
 
--- Our own parry landed: it's used up, so the next return gets a fresh one.
-Remotes.ParrySuccess.OnClientEvent:Connect(consume_parry)
+-- Our own parry landed: stay locked until the ball actually leaves us.
+Remotes.ParrySuccess.OnClientEvent:Connect(parry_landed)
 
 -- Close-range parry by someone else: the ball is about to be ours, parry back.
 Remotes.ParrySuccessAll.OnClientEvent:Connect(function(_, root)
