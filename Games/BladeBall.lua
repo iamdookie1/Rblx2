@@ -182,12 +182,19 @@ local function remoteReady()
     return Remote.token ~= nil and Remote.remote ~= nil and Remote.args ~= nil
 end
 
--- "A place where they can parry": a live character parented under Workspace.Alive,
--- which is the in-round state the rest of the script already keys off. In the
--- lobby / between rounds the character isn't under Alive, so the hook stays off.
+-- "A place where they can parry" — not merely "in a round". Being parented under
+-- Workspace.Alive is necessary but not sufficient: during the round intro, while
+-- eliminated, or while capped by the Singularity you're in the round yet can't
+-- actually block. So require a live character, a sword equipped, and no cape.
 local function canParryNow()
     local char = LocalPlayer.Character
-    return char ~= nil and char.Parent == Alive
+    if not char or char.Parent ~= Alive then return false end
+    local humanoid = char:FindFirstChildOfClass("Humanoid")
+    if not humanoid or humanoid.Health <= 0 then return false end
+    local root = char.PrimaryPart
+    if not root or root:FindFirstChild('SingularityCape') then return false end
+    local sword = char:GetAttribute("CurrentlyEquippedSword")
+    return sword ~= nil and sword ~= ""
 end
 
 if not Remote.token then
@@ -195,8 +202,9 @@ if not Remote.token then
 elseif not (hookmetamethod and getnamecallmethod and getrawmetatable) then
     Notify("Blade Ball", "Couldn't hook remotes. Parries will use the block key.", 6)
 else
-    -- Arm the hook the first time the player enters a round, not at load. Up to
-    -- then (and in the lobby) parries fall back to the block key on their own.
+    -- Arm the hook the first time the player can actually parry, not at load. Up
+    -- to then (lobby, round intro, eliminated...) parries fall back to the block
+    -- key on their own.
     task.spawn(function()
         while not canParryNow() do
             if Library.Unloaded then return end
@@ -1579,9 +1587,9 @@ local function remoteStatusText()
     if remoteReady() then return "Remote: ready, parries use the remote" end
     if not Remote.token then return "Remote: token not found, parries use the block key" end
     if not Remote.hooked then
-        -- The hook is deferred until you're in a round. Say so instead of
-        -- calling it unavailable while simply waiting to spawn in.
-        if not canParryNow() then return "Remote: waiting until you're in a round. Parries use the block key until then" end
+        -- The hook is deferred until you can actually parry. Say so instead of
+        -- calling it unavailable while simply waiting for that.
+        if not canParryNow() then return "Remote: waiting until you can parry. Parries use the block key until then" end
         return "Remote: hook unavailable, parries use the block key"
     end
     return "Remote: waiting. Block once (F or click) to capture it. Parries use the block key until then"
