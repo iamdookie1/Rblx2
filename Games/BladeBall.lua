@@ -106,7 +106,7 @@ if not _tokenFound then
     return
 end
 
-Notify("Blade Ball", "Press Capture to hook the parry remote", 3)
+Notify("Blade Ball", "Status tab > Capture remote to hook the parry remote", 4)
 
 function _tokenize(_remote_uid)
     local time = tostring(math.floor(workspace:GetServerTimeNow() * 100))
@@ -126,7 +126,7 @@ local _capturedArgs = nil
 
 -- Every Instance shares one metatable, so an __index hook runs on every
 -- property read in the whole game. It's only installed for a short window
--- after the Capture button presses F, and taken off as soon as the parry
+-- after Capture remote (Status tab) presses F, and taken off as soon as the parry
 -- remote is caught (or the window runs out).
 -- Any key other than FireServer / InvokeServer, and any call this script
 -- makes itself, falls straight through.
@@ -147,7 +147,6 @@ local function _unhook()
     end
 end
 
-local _showCapture
 local _destroyConn
 
 local function _capture(remote, args)
@@ -157,13 +156,11 @@ local function _capture(remote, args)
     _destroyConn = remote.AncestryChanged:Connect(function(_, parent)
         if parent == nil and _capturedRemote == remote then
             _capturedRemote, _capturedArgs = nil, nil
-            _showCapture()
-            Notify("Blade Ball", "Parry remote changed. Press Capture again.", 4)
+            Notify("Blade Ball", "Parry remote changed. Press Capture remote again.", 4)
         end
     end)
     task.defer(function()
         _unhook()
-        _showCapture(false)
         Notify("Blade Ball", "Remote hooked", 3)
     end)
 end
@@ -218,41 +215,14 @@ local function _captureNow()
     task.delay(CAPTURE_WINDOW, function()
         if gen ~= _captureGen or _capturedRemote then return end
         _unhook()
-        Notify("Blade Ball", "Not caught (block on cooldown?). Press Capture again.", 3)
+        Notify("Blade Ball", "Not caught (block on cooldown?). Press Capture remote again.", 3)
     end)
 end
 
--- On-screen button so this works without a keyboard. It's shown on load and
--- whenever the remote needs catching again, and hidden once it's caught.
-local CaptureGui = Instance.new('ScreenGui')
-CaptureGui.Name = 'BladeBall_Capture'; CaptureGui.ResetOnSpawn = false
-CaptureGui.IgnoreGuiInset = true; CaptureGui.DisplayOrder = 9999
-local CaptureButton = Instance.new('TextButton')
-CaptureButton.Size = UDim2.new(0, 150, 0, 50)
-CaptureButton.Position = UDim2.new(0.5, 0, 0.18, 0); CaptureButton.AnchorPoint = Vector2.new(0.5, 0)
-CaptureButton.BackgroundColor3 = Color3.fromRGB(40, 40, 40); CaptureButton.AutoButtonColor = true
-CaptureButton.Active = true; CaptureButton.Draggable = true
-CaptureButton.Font = Enum.Font.GothamBold; CaptureButton.TextSize = 16
-CaptureButton.TextColor3 = Color3.fromRGB(255, 255, 255); CaptureButton.Text = "Capture (F)"
-Instance.new('UICorner', CaptureButton).CornerRadius = UDim.new(0, 10)
-local captureStroke = Instance.new('UIStroke', CaptureButton)
-captureStroke.Color = Color3.fromRGB(0, 170, 255); captureStroke.Thickness = 2
-captureStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
-CaptureButton.Parent = CaptureGui
-pcall(function() CaptureGui.Parent = gethui and gethui() or CoreGui end)
-if not CaptureGui.Parent then CaptureGui.Parent = LocalPlayer:WaitForChild('PlayerGui') end
-CaptureButton.MouseButton1Click:Connect(_captureNow)
-
-function _showCapture(visible)
-    CaptureGui.Enabled = visible ~= false
-end
-
--- Nothing is hooked until the button is pressed.
-_showCapture(true)
-
+-- Nothing is hooked until Capture remote is pressed.
 task.delay(30, function()
     if not _capturedRemote then
-        Notify("Blade Ball", "Remote not caught yet. Press the Capture button.", 5)
+        Notify("Blade Ball", "Remote not caught yet. Press Capture remote on the Status tab.", 5)
     end
 end)
 
@@ -1567,15 +1537,12 @@ local TargetLabel = Overview:AddLabel("Ball target: -", true)
 
 local function remoteStatusText()
     if remoteReady() then return "Remote: hooked" end
-    return "Remote: waiting. Press the Capture button"
+    return "Remote: waiting. Press Capture remote"
 end
 
-Overview:AddButton({Text = "Recapture remote",
-    Tooltip = "Use if parries stop registering. Shows the Capture button again.",
-    Func = function()
-        _showCapture(true)
-        Notify("Blade Ball", "Press Capture to hook the remote again", 3)
-    end})
+Overview:AddButton({Text = "Capture remote",
+    Tooltip = "Presses F and hooks for 3s to catch the parry remote. Use again if parries stop registering.",
+    Func = _captureNow})
 
 local status_peak, status_ball = 0, nil
 task.spawn(function()
@@ -1939,7 +1906,6 @@ end))
 Library:OnUnload(function()
     _captureGen = _captureGen + 1
     _unhook()
-    pcall(function() CaptureGui:Destroy() end)
     if _destroyConn then pcall(function() _destroyConn:Disconnect() end) end
     System.autoparry.stop()
     setTriggerbot(false)
