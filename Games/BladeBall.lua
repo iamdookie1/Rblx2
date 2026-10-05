@@ -121,47 +121,84 @@ function _tokenize(_remote_uid)
     return table.concat(characters)
 end
 
-local _reverted = {}
-local _original = {}
 local _capturedRemote = nil
 local _capturedArgs = nil
 
-function _is_valid(args) if not args or #args < 8 then return false end; return true end
+-- Every Instance shares one metatable, so an __index hook runs on every
+-- property read in the whole game. It only needs to run until the parry
+-- remote is caught, so it's armed while waiting and taken off right after.
+-- Any key other than FireServer / InvokeServer, and any call this script
+-- makes itself, falls straight through.
+local _checkcaller = checkcaller or function() return false end
+local _meta, _old, _hookFn = nil, nil, nil
+local _armed = false
 
-function _hook(remote)
-    if not remote then return end
-    if _reverted[remote] then return end
-    if _original[getrawmetatable(remote)] then return end
-    _original[getrawmetatable(remote)] = true
-    local _meta = getrawmetatable(remote)
-    setreadonly(_meta, false)
-    local _old = _meta.__index
-    _meta.__index = function(self, key)
-        if (key == 'FireServer' and self:IsA('RemoteEvent')) or
-           (key == 'InvokeServer' and self:IsA('RemoteFunction')) then
-            return function(_, ...)
-                local _arguments = {...}
-                if _is_valid(_arguments) then
-                    if not _reverted[self] then
-                        local first = _capturedRemote == nil
-                        _reverted[self] = _arguments
-                        _capturedRemote = self
-                        _capturedArgs = _arguments
-                        -- Say so the moment it's caught, not on the next poll.
-                        if first then task.defer(Notify, "Blade Ball", "Remote hooked", 3) end
-                    end
-                end
-                return _old(self, key)(_, unpack(_arguments))
-            end
-        end
-        return _old(self, key)
+local function _unhook()
+    _armed = false
+    if not _meta then return end
+    -- Only put the old __index back if nothing hooked on top of ours since.
+    -- Otherwise leave ours in place; disarmed, it's a plain pass-through.
+    if rawget(_meta, '__index') == _hookFn then
+        setreadonly(_meta, false)
+        _meta.__index = _old
+        setreadonly(_meta, true)
+        _meta, _old, _hookFn = nil, nil, nil
     end
+end
+
+local _rearm
+local _destroyConn
+
+local function _capture(remote, args)
+    _capturedRemote, _capturedArgs = remote, args
+    -- If the game swaps the remote out, go back to waiting for the new one.
+    if _destroyConn then _destroyConn:Disconnect() end
+    _destroyConn = remote.AncestryChanged:Connect(function(_, parent)
+        if parent == nil and _capturedRemote == remote then _rearm() end
+    end)
+    task.defer(function()
+        _unhook()
+        Notify("Blade Ball", "Remote hooked", 3)
+    end)
+end
+
+local function _hook()
+    _armed = true
+    if _meta then return end
+    _meta = getrawmetatable(game)
+    _old = _meta.__index
+    local old = _old
+    _hookFn = function(self, key)
+        if not _armed or (key ~= 'FireServer' and key ~= 'InvokeServer') or _checkcaller() then
+            return old(self, key)
+        end
+        local method = old(self, key)
+        local class = old(self, 'ClassName')
+        if (key == 'FireServer' and class ~= 'RemoteEvent') or
+           (key == 'InvokeServer' and class ~= 'RemoteFunction') then
+            return method
+        end
+        return function(this, ...)
+            if _armed and select('#', ...) >= 8 then
+                _armed = false
+                _capture(self, {...})
+            end
+            return method(this, ...)
+        end
+    end
+    setreadonly(_meta, false)
+    _meta.__index = _hookFn
     setreadonly(_meta, true)
 end
 
-for _iterator, _remote in pairs(ReplicatedStorage:GetDescendants()) do
-    if _remote:IsA('RemoteEvent') or _remote:IsA('RemoteFunction') then _hook(_remote) end
+-- Drop the caught remote and wait for the next block.
+function _rearm()
+    _capturedRemote, _capturedArgs = nil, nil
+    if _destroyConn then _destroyConn:Disconnect(); _destroyConn = nil end
+    _hook()
 end
+
+_hook()
 
 -- The hook is live from here, so the rest of the script (and the menu) loads
 -- straight away instead of after a fixed 5 second wait. The remote is caught
@@ -1486,6 +1523,13 @@ local function remoteStatusText()
     return "Remote: waiting. Block once yourself to capture it"
 end
 
+Overview:AddButton({Text = "Recapture remote",
+    Tooltip = "Use if parries stop registering. Block once after pressing this.",
+    Func = function()
+        _rearm()
+        Notify("Blade Ball", "Block once to recapture the remote", 3)
+    end})
+
 local status_peak, status_ball = 0, nil
 task.spawn(function()
     while task.wait(0.1) do
@@ -1846,6 +1890,8 @@ end))
 -- UNLOAD
 -- ============================================================
 Library:OnUnload(function()
+    _unhook()
+    if _destroyConn then pcall(function() _destroyConn:Disconnect() end) end
     System.autoparry.stop()
     setTriggerbot(false)
     System.__properties.__autoparry_enabled = false
