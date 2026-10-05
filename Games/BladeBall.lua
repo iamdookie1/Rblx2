@@ -143,9 +143,12 @@ function _hook(remote)
                 local _arguments = {...}
                 if _is_valid(_arguments) then
                     if not _reverted[self] then
+                        local first = _capturedRemote == nil
                         _reverted[self] = _arguments
                         _capturedRemote = self
                         _capturedArgs = _arguments
+                        -- Say so the moment it's caught, not on the next poll.
+                        if first then task.defer(Notify, "Blade Ball", "Remote hooked", 3) end
                     end
                 end
                 return _old(self, key)(_, unpack(_arguments))
@@ -160,18 +163,12 @@ for _iterator, _remote in pairs(ReplicatedStorage:GetDescendants()) do
     if _remote:IsA('RemoteEvent') or _remote:IsA('RemoteFunction') then _hook(_remote) end
 end
 
-task.wait(5)
-
-task.spawn(function()
-    local attempts = 0
-    while not _capturedRemote and attempts < 30 do
-        task.wait(1)
-        attempts = attempts + 1
-    end
-    if _capturedRemote then
-        Notify("Blade Ball", "Remote hooked", 3)
-    else
-        Notify("Blade Ball", "Remote not found!", 5)
+-- The hook is live from here, so the rest of the script (and the menu) loads
+-- straight away instead of after a fixed 5 second wait. The remote is caught
+-- the instant you block; this only warns if that hasn't happened in 30s.
+task.delay(30, function()
+    if not _capturedRemote then
+        Notify("Blade Ball", "Remote not found yet. Block once (F or click).", 5)
     end
 end)
 
