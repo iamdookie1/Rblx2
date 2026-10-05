@@ -395,13 +395,21 @@ local function screenData()
 end
 
 -- The send function looks 10 stack levels up for an env with writefile and
--- reports to a decoy remote if it finds one. So the entry is called on a fresh
--- thread whose only Lua frame runs in the game's env.
+-- reports to a decoy remote ("64565gfdd") if it finds one. getfenv on a C
+-- frame (pcall, and the pcall inside that check) returns the thread's globals,
+-- and a thread spawned from this script inherits the executor's globals, which
+-- have writefile. That report is what got parries kicked. So the entry runs on
+-- a fresh thread whose globals and only Lua frame are both the game's env.
 local _gameEnv = (getrenv and getrenv()) or nil
+local _setfenv = setfenv
 local function _callPryEntry(...)
     local args = table.pack(...)
-    local caller = function() pcall(_pryEntry, table.unpack(args, 1, args.n)) end
-    if _gameEnv and setfenv then pcall(setfenv, caller, _gameEnv) end
+    local entry, env, setenv = _pryEntry, _gameEnv, _setfenv
+    local caller = function()
+        if env and setenv then pcall(setenv, 0, env) end
+        pcall(entry, table.unpack(args, 1, args.n))
+    end
+    if env and setenv then pcall(setenv, caller, env) end
     task.spawn(caller)
 end
 
