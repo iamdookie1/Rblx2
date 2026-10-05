@@ -104,8 +104,13 @@ pcall(function()
     end
 end)
 
+-- The token only changes when the server time ticks over a centisecond, so a
+-- burst of parries inside one centisecond (spam) reuses it instead of calling
+-- the game's key function and rebuilding the string every time.
+local token_cache = {uid = nil, time = nil, out = nil}
 local function tokenize(remote_uid)
     local time = tostring(math.floor(Workspace:GetServerTimeNow() * 100))
+    if token_cache.uid == remote_uid and token_cache.time == time then return token_cache.out end
     local key = Remote.token(remote_uid, 'TIME')
     local characters = table.create(#time)
     for index = 1, #time do
@@ -114,7 +119,9 @@ local function tokenize(remote_uid)
             string.byte(key, (index - 1) % #key + 1)
         ))
     end
-    return table.concat(characters)
+    local out = table.concat(characters)
+    token_cache.uid, token_cache.time, token_cache.out = remote_uid, time, out
+    return out
 end
 
 -- A parry packet is (id, uid, token, number, CFrame, {screen points}, {x, y}, bool).
@@ -234,31 +241,70 @@ local function pressBlockKey()
     end)
 end
 
+local CollectionService = cloneref(game:GetService('CollectionService'))
+
+-- Screen points sent with a parry, built the way the game's own parry handler
+-- builds them: everyone under Alive, or in lobby training the other trainees
+-- under Workspace.Dead plus the LobbyTrainingTarget dummies.
+local function build_screen_points(cam)
+    local points = {}
+    local char = LocalPlayer.Character
+    local dead = Workspace:FindFirstChild('Dead')
+    if dead and char and char.Parent == dead and LocalPlayer:GetAttribute('LobbyTraining') then
+        for _, other in ipairs(dead:GetChildren()) do
+            local plr = Players:GetPlayerFromCharacter(other)
+            local hrp = other:FindFirstChild('HumanoidRootPart')
+            if plr and hrp and plr:GetAttribute('LobbyTraining') then
+                points[other.Name] = cam:WorldToScreenPoint(hrp.Position)
+            end
+        end
+        for _, dummy in ipairs(CollectionService:GetTagged('LobbyTrainingTarget')) do
+            if dummy:IsA('BasePart') then points[dummy.Name] = cam:WorldToScreenPoint(dummy.Position) end
+        end
+    else
+        for _, entity in ipairs(Alive:GetChildren()) do
+            local hrp = entity:FindFirstChild('HumanoidRootPart') or entity.PrimaryPart
+            if hrp then points[entity.Name] = cam:WorldToScreenPoint(hrp.Position) end
+        end
+    end
+    return points
+end
+
+local function aim_point(cam)
+    local ok, mouse = pcall(UserInputService.GetMouseLocation, UserInputService)
+    if not isMobile and ok and mouse then return {math.floor(mouse.X), math.floor(mouse.Y)} end
+    local vp = cam.ViewportSize
+    return {math.floor(vp.X / 2), math.floor(vp.Y / 2)}
+end
+
+-- Screen points and aim only change frame to frame, so parries fired in the
+-- same frame (spam) share one copy instead of re-projecting every player.
+local PACKET_TTL = 1 / 240
+local packet_cache = {at = -1, points = nil, aim = nil}
+local function packet_parts(cam)
+    local now = os.clock()
+    if now - packet_cache.at > PACKET_TTL then
+        packet_cache.points = build_screen_points(cam)
+        packet_cache.aim = aim_point(cam)
+        packet_cache.at = now
+    end
+    return packet_cache.points, packet_cache.aim
+end
+
 local function fireParryRemote(curveCF)
     if not remoteReady() then return false end
     local cam = Workspace.CurrentCamera
-    local aim_target
-    local mouseOk, mouse = pcall(function() return UserInputService:GetMouseLocation() end)
-    if not isMobile and mouseOk and mouse then
-        aim_target = {math.floor(mouse.X), math.floor(mouse.Y)}
-    else
-        local vp = cam.ViewportSize
-        aim_target = {math.floor(vp.X / 2), math.floor(vp.Y / 2)}
-    end
-    local event_data = {}
-    for _, entity in pairs(Alive:GetChildren()) do
-        if entity.PrimaryPart then
-            local ok, sp = pcall(function() return cam:WorldToScreenPoint(entity.PrimaryPart.Position) end)
-            if ok then event_data[entity.Name] = sp end
+    local points, aim = packet_parts(cam)
+    local args, remote = Remote.args, Remote.remote
+    return (pcall(function()
+        local token = tokenize(args[2])
+        if remote.ClassName == 'RemoteEvent' then
+            remote:FireServer(args[1], args[2], token, 0.5, curveCF or cam.CFrame, points, aim, false)
+        else
+            -- InvokeServer yields; spawn it so a burst never stalls on a reply.
+            task.spawn(remote.InvokeServer, remote, args[1], args[2], token, 0.5, curveCF or cam.CFrame, points, aim, false)
         end
-    end
-    local args = Remote.args
-    local ok = pcall(function()
-        local packet = {args[1], args[2], tokenize(args[2]), 0.5, curveCF or cam.CFrame, event_data, aim_target, false}
-        if Remote.remote:IsA('RemoteEvent') then Remote.remote:FireServer(unpack(packet))
-        else Remote.remote:InvokeServer(unpack(packet)) end
-    end)
-    return ok
+    end))
 end
 
 -- ============================================================
@@ -479,6 +525,18 @@ function System.curve.get_cframe()
     return cf
 end
 
+-- Same curve for every parry fired in one frame (spam), so the per-player screen
+-- projection in get_cframe runs once per frame, not once per parry.
+local curve_cache = {at = -1, mode = nil, cf = nil}
+function System.curve.get_cframe_fast()
+    local now, mode = os.clock(), System.__properties.__curve_mode
+    if now - curve_cache.at > PACKET_TTL or curve_cache.mode ~= mode then
+        curve_cache.cf = System.curve.get_cframe()
+        curve_cache.at, curve_cache.mode = now, mode
+    end
+    return curve_cache.cf
+end
+
 System.parry = {}
 -- "Remote" fires the parry remote with the chosen curve. "Keypress" presses the
 -- block key. Remote mode falls back to the key until the remote is captured.
@@ -494,6 +552,14 @@ end
 function System.parry.keypress()
     if not LocalPlayer.Character then return end
     pressBlockKey()
+    System.__properties.__total_parries = System.__properties.__total_parries + 1
+end
+-- Light parry for spam: same remote and curve as execute, but reuses the frame's
+-- curve/packet and leaves no cleanup thread behind (execute schedules a
+-- task.delay per call, which piles up into thousands at spam rates).
+function System.parry.fast()
+    if not LocalPlayer.Character then return end
+    if not fireParryRemote(System.curve.get_cframe_fast()) then pressBlockKey() end
     System.__properties.__total_parries = System.__properties.__total_parries + 1
 end
 function System.parry.execute_action() System.animation.play_grab_parry(); System.parry.execute() end
@@ -622,24 +688,6 @@ Runtime.ChildAdded:Connect(function(Object)
     task.delay(3, function() if FocusConnection and FocusConnection.Connected then FocusConnection:Disconnect() end end)
 end)
 
-Remotes.ParrySuccessAll.OnClientEvent:Connect(function(_, root)
-    local myRoot = getRoot()
-    if not myRoot or typeof(root) ~= 'Instance' or not root.Parent then return end
-    if root.Parent ~= LocalPlayer.Character and root.Parent.Parent ~= Alive then return end
-    local closest = System.player.get_closest(); local ball = System.ball.get()
-    if not ball or not closest or not closest.PrimaryPart then return end
-    local target_distance = (myRoot.Position - closest.PrimaryPart.Position).Magnitude
-    local distance = (myRoot.Position - ball.Position).Magnitude
-    local velocity = ball.AssemblyLinearVelocity
-    if velocity.Magnitude < 1 then return end
-    local dot = (myRoot.Position - ball.Position).Unit:Dot(velocity.Unit)
-    -- Close-range clash: the opponent parried at point blank, so parry right back.
-    if System.__properties.__autoparry_enabled and target_distance < 15 and distance < 15 and dot > -0.25 then
-        if System.detection.is_curved() then System.parry.execute_action() end
-    end
-    if System.__properties.__grab_animation then System.__properties.__grab_animation:Stop() end
-end)
-
 Remotes.ParrySuccess.OnClientEvent:Connect(function()
     if not LocalPlayer.Character or LocalPlayer.Character.Parent ~= Alive then return end
     if System.__properties.__grab_animation then System.__properties.__grab_animation:Stop() end
@@ -699,107 +747,6 @@ function System.triggerbot.enable(enabled)
 end
 
 -- ============================================================
--- MANUAL SPAM (HEARTBEAT - ULTRA FAST)
--- ============================================================
-System.manual_spam = {}
-local macroAnimFix = false
-local spam_accumulator = 0
-local SPAM_RATE = 0.01          -- seconds between fires (set by the rate slider)
-
-function System.manual_spam.start()
-    System.__properties.__manual_spam_enabled = true
-end
-
-function System.manual_spam.stop()
-    System.__properties.__manual_spam_enabled = false
-end
-
--- One parry fire for the spam loops, honouring the mode (remote vs keypress)
--- and the optional animation fix. Shared by manual spam and auto spam.
-local function spam_fire()
-    if getgenv().ManualSpamMode == "Keypress" then
-        pcall(function() System.parry.keypress() end)
-    else
-        pcall(function() System.parry.execute() end)
-        if getgenv().ManualSpamAnimationFix and macroAnimFix then
-            pcall(function() System.animation.play_grab_parry() end)
-        end
-    end
-end
-
-RunService.Heartbeat:Connect(function(dt)
-    if not System.__properties.__manual_spam_enabled then
-        spam_accumulator = 0
-        return
-    end
-    spam_accumulator = spam_accumulator + dt
-    -- Cap fires per frame so a frame spike can't dump a huge burst at once,
-    -- but scale it to the rate so fast rates still keep up.
-    local maxFires = math.clamp(math.ceil(dt / SPAM_RATE) + 2, 5, 30)
-    local fired = 0
-    while spam_accumulator >= SPAM_RATE and fired < maxFires do
-        spam_accumulator = spam_accumulator - SPAM_RATE
-        fired = fired + 1
-        spam_fire()
-    end
-    if spam_accumulator > SPAM_RATE * 10 then spam_accumulator = 0 end
-end)
-
--- ============================================================
--- AUTO SPAM (SMART - ONLY WHEN NEEDED)
--- ============================================================
--- Unlike manual spam, this only fires while a ball is actually bearing down on
--- you (targeting you and inside a danger range) or during Slashes Of Fury, so
--- it stays idle the rest of the time instead of hammering parries non-stop.
-System.auto_spam = {}
-local AUTO_SPAM_RATE = 0.02     -- seconds between fires while engaged
-local autoSpamRange = 1.6       -- multiplier of the normal parry range for the danger zone
-local auto_spam_accumulator = 0
-
-local function auto_spam_needed()
-    if System.__properties.__slashesoffury_active then return true end
-    local root = getRoot()
-    if not root or root:FindFirstChild('SingularityCape') then return false end
-    local balls = System.ball.get_all()
-    local training = Workspace:FindFirstChild("TrainingBalls")
-    if training then
-        for _, ball in ipairs(training:GetChildren()) do
-            if ball:GetAttribute("realBall") then table.insert(balls, ball) end
-        end
-    end
-    for _, ball in ipairs(balls) do
-        if ball:GetAttribute('target') == LocalPlayer.Name then
-            local zoomies = ball:FindFirstChild('zoomies')
-            local speed = zoomies and zoomies.VectorVelocity.Magnitude or ball.AssemblyLinearVelocity.Magnitude
-            local distance = (root.Position - ball.Position).Magnitude
-            if distance <= System.parry_distance(speed) * autoSpamRange then return true end
-        end
-    end
-    return false
-end
-
-RunService.Heartbeat:Connect(function(dt)
-    if not System.__properties.__auto_spam_enabled then
-        auto_spam_accumulator = 0
-        return
-    end
-    if not auto_spam_needed() then
-        auto_spam_accumulator = 0
-        return
-    end
-    auto_spam_accumulator = auto_spam_accumulator + dt
-    local maxFires = math.clamp(math.ceil(dt / AUTO_SPAM_RATE) + 2, 5, 30)
-    local fired = 0
-    while auto_spam_accumulator >= AUTO_SPAM_RATE and fired < maxFires do
-        auto_spam_accumulator = auto_spam_accumulator - AUTO_SPAM_RATE
-        fired = fired + 1
-        spam_fire()
-    end
-    if auto_spam_accumulator > AUTO_SPAM_RATE * 10 then auto_spam_accumulator = 0 end
-end)
-
-
--- ============================================================
 -- AUTO PARRY
 -- ============================================================
 System.autoparry = {}
@@ -828,19 +775,82 @@ function System.parry_distance(speed)
     return distance + props.__extra_distance
 end
 
--- One state per ball, so with several balls in play parrying one doesn't
--- block the others. The target listener is made once per ball; the old loop
--- made a new one every frame for every ball.
-local PARRY_TIMEOUT = 1
+-- Close range is where a reactive parry loses: the ball comes back from a
+-- player next to you faster than a round trip, so by the time "ball is on me"
+-- replicates it's already too late. The game's parry stays up for ~0.5s though,
+-- so up close auto parry (a) parries the instant the ball retargets you instead
+-- of waiting a frame, (b) retries a parry that didn't take after about one round
+-- trip instead of a full second, and (c) pre-parries while the ball is on a
+-- player standing right next to you, so the parry is already up when it returns.
+local APCfg = {
+    close_range = 20,       -- studs
+    instant = true,         -- parry straight from the target change
+    preparry = true,        -- parry ahead while the ball is on a player next to you
+    preparry_interval = 0.08,
+    last_preparry = 0,
+    timeout = 1,            -- far-away re-parry lockout while the ball stays on us
+    parry_window = 0.45,    -- how long a parry stays useful (game's own is ~0.5s)
+}
+
+local function retry_after(distance)
+    if distance > APCfg.close_range then return APCfg.timeout end
+    return math.clamp(getPing() / 1000 * 1.25 + 0.05, 0.08, 0.4)
+end
+
+-- ------------------------------------------------------------
+-- Ball tracking (shared by auto parry and auto spam)
+-- ------------------------------------------------------------
+-- One record per ball. Its target listener is made once, keeps a short history
+-- of who the ball went from/to (what clash detection reads), resets the parry
+-- lockout, and hands a retarget onto us straight to auto parry.
+local BALL_HISTORY = 16
 local ball_state = setmetatable({}, {__mode = 'k'})
 local function get_ball_state(ball)
     local state = ball_state[ball]
-    if not state then
-        state = {parried = false, at = 0}
-        ball:GetAttributeChangedSignal('target'):Connect(function() state.parried = false end)
-        ball_state[ball] = state
-    end
+    if state then return state end
+    state = {parried = false, at = 0, target = ball:GetAttribute('target'), swaps = {}}
+    ball_state[ball] = state
+    ball:GetAttributeChangedSignal('target'):Connect(function()
+        local new = ball:GetAttribute('target')
+        local swaps = state.swaps
+        swaps[#swaps + 1] = {t = os.clock(), from = state.target, to = new}
+        if #swaps > BALL_HISTORY then table.remove(swaps, 1) end
+        state.target = new
+        state.parried = false
+        if new == LocalPlayer.Name and System.autoparry.on_retarget then
+            System.autoparry.on_retarget(ball)
+        end
+    end)
     return state
+end
+
+-- Match balls plus lobby training balls.
+local function get_live_balls()
+    local balls = System.ball.get_all()
+    local training = Workspace:FindFirstChild("TrainingBalls")
+    if training then
+        for _, ball in ipairs(training:GetChildren()) do
+            if ball:GetAttribute("realBall") then table.insert(balls, ball) end
+        end
+    end
+    return balls
+end
+
+-- A player's root by character name, from Alive (round) or Dead (training).
+local function character_root(name)
+    if type(name) ~= 'string' or name == '' then return nil end
+    local char = Alive:FindFirstChild(name)
+    if not char then
+        local dead = Workspace:FindFirstChild('Dead')
+        char = dead and dead:FindFirstChild(name)
+    end
+    return char and (char:FindFirstChild('HumanoidRootPart') or char.PrimaryPart)
+end
+
+-- The game's own "can't block right now" flags.
+local function char_blocked()
+    local char = LocalPlayer.Character
+    return not char or char:GetAttribute('Stunned') or char:GetAttribute('DoNotParry')
 end
 
 local ABILITY_PARRY = {"Raging Deflection", "Rapture", "Calming Deflection", "Aerodynamic Slash", "Fracture", "Death Slash"}
@@ -892,11 +902,75 @@ local function blocked_by_detection()
         or (det.__slashesoffury and props.__slashesoffury_active)
 end
 
+local function autoparry_can_run()
+    local props = System.__properties
+    if not props.__autoparry_enabled or System.__triggerbot.__enabled then return nil end
+    local root = getRoot()
+    if not root or root:FindFirstChild('SingularityCape') or char_blocked() then return nil end
+    return root
+end
+
+-- Parry one ball if it's on us and inside the window. `curve_hold` comes from
+-- the frame loop; it never applies up close.
+local function try_parry_ball(ball, root, now, curve_hold, training)
+    local props = System.__properties
+    local zoomies = ball:FindFirstChild('zoomies')
+    if not zoomies then return false end
+    local state = get_ball_state(ball)
+    if props.__parried or ball:GetAttribute('target') ~= LocalPlayer.Name then return false end
+
+    local speed = zoomies.VectorVelocity.Magnitude
+    local distance = (root.Position - ball.Position).Magnitude
+    local close = distance <= APCfg.close_range
+
+    if state.parried and now - state.at < retry_after(distance) then return false end
+
+    local tornado = Runtime:FindFirstChild('Tornado')
+    if tornado and (now - props.__tornado_time) < (tornado:GetAttribute('TornadoTime') or 1) + 0.314159 then return false end
+    if curve_hold and not close and ball.Parent ~= training then return false end
+    if ball:FindFirstChild('ComboCounter') then return false end
+    if blocked_by_detection() then return false end
+
+    -- Inside the window, or up close and arriving before a parry would expire.
+    local in_window = distance <= System.parry_distance(speed)
+    if not in_window and not (close and distance / math.max(speed, 1) <= APCfg.parry_window) then return false end
+
+    state.parried = true
+    state.at = now
+    if not try_ability() then
+        System.parry.by_mode(getgenv().AutoParryMode)
+    end
+    return true
+end
+
+local function preparry_now()
+    -- Remote only: a block-key press puts the game's own ~1.3s parry cooldown on
+    -- you, so pre-parrying by key would burn it right before the ball arrives.
+    if getgenv().AutoParryMode == "Keypress" or not remoteReady() then return false end
+    local now = tick()
+    if now - APCfg.last_preparry < APCfg.preparry_interval then return false end
+    APCfg.last_preparry = now
+    System.parry.by_mode(getgenv().AutoParryMode)
+    return true
+end
+
+-- Ball is on a player standing next to us and close: their parry will send it
+-- straight back, so put ours up first.
+local function try_preparry(ball, root)
+    if not APCfg.preparry then return false end
+    local target = ball:GetAttribute('target')
+    if not target or target == '' or target == LocalPlayer.Name then return false end
+    local their_root = character_root(target)
+    if not their_root or (their_root.Position - root.Position).Magnitude > APCfg.close_range then return false end
+    if (ball.Position - root.Position).Magnitude > APCfg.close_range * 1.5 then return false end
+    if blocked_by_detection() then return false end
+    return preparry_now()
+end
+
 function System.autoparry.step()
     local props = System.__properties
-    if not props.__autoparry_enabled or System.__triggerbot.__enabled then return end
-    local root = getRoot()
-    if not root or root:FindFirstChild('SingularityCape') then return end
+    local root = autoparry_can_run()
+    if not root then return end
 
     -- Re-roll the jittered accuracy once per frame while randomize is on.
     if props.__random_accuracy then roll_accuracy() end
@@ -907,48 +981,48 @@ function System.autoparry.step()
     local one_ball = System.ball.get()
     local curve_hold = curved and one_ball and one_ball:GetAttribute('target') == LocalPlayer.Name
 
-    local balls = System.ball.get_all()
     local training = Workspace:FindFirstChild("TrainingBalls")
-    if training then
-        for _, ball in ipairs(training:GetChildren()) do
-            if ball:GetAttribute("realBall") then table.insert(balls, ball) end
-        end
-    end
-
     local now = tick()
-    for _, ball in ipairs(balls) do
-        local zoomies = ball:FindFirstChild('zoomies')
-        if not zoomies then continue end
-        local state = get_ball_state(ball)
-
+    for _, ball in ipairs(get_live_balls()) do
         if ball:FindFirstChild('AeroDynamicSlashVFX') then
             ball.AeroDynamicSlashVFX:Destroy(); props.__tornado_time = now
         end
-
-        if state.parried then
-            if now - state.at < PARRY_TIMEOUT then continue end
-            state.parried = false
-        end
-        if props.__parried then continue end
-        if ball:GetAttribute('target') ~= LocalPlayer.Name then continue end
-
-        local tornado = Runtime:FindFirstChild('Tornado')
-        if tornado and (now - props.__tornado_time) < (tornado:GetAttribute('TornadoTime') or 1) + 0.314159 then continue end
-        if curve_hold and ball.Parent ~= training then continue end
-        if ball:FindFirstChild('ComboCounter') then continue end
-        if blocked_by_detection() then return end
-
-        local speed = zoomies.VectorVelocity.Magnitude
-        local distance = (root.Position - ball.Position).Magnitude
-        if distance > System.parry_distance(speed) then continue end
-
-        state.parried = true
-        state.at = now
-        if not try_ability() then
-            System.parry.by_mode(getgenv().AutoParryMode)
+        if not try_parry_ball(ball, root, now, curve_hold, training) then
+            try_preparry(ball, root)
         end
     end
 end
+
+-- Straight from the ball's target change: a point-blank return gets answered
+-- the moment it replicates, not on the next frame.
+function System.autoparry.on_retarget(ball)
+    if not APCfg.instant then return end
+    local root = autoparry_can_run()
+    if not root or (root.Position - ball.Position).Magnitude > APCfg.close_range then return end
+    pcall(try_parry_ball, ball, root, tick(), false, Workspace:FindFirstChild("TrainingBalls"))
+end
+
+-- Close-range parry by someone else: shared by auto parry (parry back now) and
+-- auto spam (counts toward a clash).
+local CloseParry = {name = nil, at = 0}
+Remotes.ParrySuccessAll.OnClientEvent:Connect(function(_, root)
+    if System.__properties.__grab_animation then pcall(function() System.__properties.__grab_animation:Stop() end) end
+    local myRoot = getRoot()
+    if not myRoot or typeof(root) ~= 'Instance' or not root:IsA('BasePart') or not root.Parent then return end
+    local char = root.Parent
+    if char == LocalPlayer.Character or (root.Position - myRoot.Position).Magnitude > APCfg.close_range then return end
+    CloseParry.name, CloseParry.at = char.Name, os.clock()
+    -- They just parried next to us: the ball is about to be ours.
+    local apRoot = APCfg.preparry and autoparry_can_run()
+    if apRoot and not blocked_by_detection() then
+        for _, ball in ipairs(get_live_balls()) do
+            if (ball.Position - apRoot.Position).Magnitude <= APCfg.close_range * 1.5 then
+                preparry_now()
+                break
+            end
+        end
+    end
+end)
 
 function System.autoparry.start()
     if System.__properties.__connections.__autoparry then return end
@@ -968,6 +1042,166 @@ function System.autoparry.stop()
         System.__properties.__connections.__autoparry:Disconnect()
         System.__properties.__connections.__autoparry = nil
     end
+end
+
+-- ============================================================
+-- SPAM ENGINE (MANUAL + AUTO)
+-- ============================================================
+-- One engine drives both. It ticks at three points of every frame
+-- (PreSimulation, Heartbeat, PreRender) so parries are spread through the frame
+-- instead of dumped at one point, starts a burst on the very first tick, and
+-- uses System.parry.fast, which reuses the frame's curve/packet/token.
+System.manual_spam = {}
+System.auto_spam = {}
+local macroAnimFix = false
+local ManualSpam = {rate = 300}     -- parries per second
+-- Auto spam fires only while it detects a clash: the ball bouncing between you
+-- and one other player who's close, read from the ball's recent target swaps
+-- (plus close-range parries by that player). Optionally also at point blank.
+local AutoSpam = {
+    rate = 250,
+    clash_range = 30,       -- max studs between you and them
+    clash_swaps = 2,        -- swaps between you and them inside the window
+    clash_window = 0.75,    -- seconds
+    point_blank = true,
+    point_blank_range = 14, -- studs
+    linger = 0.2,           -- keep going this long after the last detection
+    active_until = 0,
+    reason = nil,
+}
+local SPAM_MAX_PER_TICK = 40
+
+function System.manual_spam.start() System.__properties.__manual_spam_enabled = true end
+function System.manual_spam.stop() System.__properties.__manual_spam_enabled = false end
+
+local function spam_fire()
+    if getgenv().ManualSpamMode == "Keypress" then
+        System.parry.keypress()
+    else
+        System.parry.fast()
+        if getgenv().ManualSpamAnimationFix and macroAnimFix then
+            pcall(System.animation.play_grab_parry)
+        end
+    end
+end
+
+local function detect_clash(ball, root, now)
+    local me = LocalPlayer.Name
+    local swaps = get_ball_state(ball).swaps
+    local count, opponent = 0, nil
+    for i = #swaps, 1, -1 do
+        local s = swaps[i]
+        if now - s.t > AutoSpam.clash_window then break end
+        if s.to == me or s.from == me then
+            local other = (s.to == me) and s.from or s.to
+            if type(other) == 'string' and other ~= '' and other ~= me and (opponent == nil or other == opponent) then
+                opponent = other
+                count = count + 1
+            end
+        end
+    end
+    -- A close-range parry by the same player counts as part of the exchange.
+    if CloseParry.name and now - CloseParry.at <= AutoSpam.clash_window and (opponent == nil or opponent == CloseParry.name) then
+        opponent = CloseParry.name
+        count = count + 1
+    end
+    if count < AutoSpam.clash_swaps or not opponent then return nil end
+    local their_root = character_root(opponent)
+    if not their_root or (their_root.Position - root.Position).Magnitude > AutoSpam.clash_range then return nil end
+    -- The ball has to be in the exchange, not flying off somewhere else.
+    if (ball.Position - root.Position).Magnitude > AutoSpam.clash_range * 1.5 then return nil end
+    return "clash vs " .. opponent
+end
+
+local function detect_point_blank(ball, root)
+    if not AutoSpam.point_blank then return nil end
+    local target = ball:GetAttribute('target')
+    if type(target) ~= 'string' or target == '' then return nil end
+    if (ball.Position - root.Position).Magnitude > AutoSpam.point_blank_range then return nil end
+    if target == LocalPlayer.Name then return "point blank" end
+    local their_root = character_root(target)
+    if their_root and (their_root.Position - root.Position).Magnitude <= AutoSpam.point_blank_range then
+        return "point blank vs " .. target
+    end
+    return nil
+end
+
+-- Once per frame: decide whether auto spam should be firing.
+local function auto_spam_evaluate()
+    if not System.__properties.__auto_spam_enabled then
+        AutoSpam.active_until, AutoSpam.reason = 0, nil
+        return
+    end
+    local now = os.clock()
+    local root = getRoot()
+    if root and not root:FindFirstChild('SingularityCape') and canParryNow() and not blocked_by_detection() then
+        for _, ball in ipairs(get_live_balls()) do
+            local reason = detect_clash(ball, root, now) or detect_point_blank(ball, root)
+            if reason then
+                AutoSpam.active_until = now + AutoSpam.linger
+                AutoSpam.reason = reason
+                return
+            end
+        end
+    end
+    if now >= AutoSpam.active_until then AutoSpam.reason = nil end
+end
+
+function System.auto_spam.status()
+    if not System.__properties.__auto_spam_enabled then return "off" end
+    if os.clock() < AutoSpam.active_until then return "SPAMMING (" .. tostring(AutoSpam.reason or "clash") .. ")" end
+    return "watching for clashes"
+end
+
+local spam_acc, spam_last, spam_active = 0, os.clock(), false
+local function spam_tick()
+    local now = os.clock()
+    local elapsed = math.min(now - spam_last, 0.1)
+    spam_last = now
+    local props = System.__properties
+    local rate
+    if props.__manual_spam_enabled then
+        rate = ManualSpam.rate
+    elseif props.__auto_spam_enabled and now < AutoSpam.active_until then
+        rate = AutoSpam.rate
+    end
+    if not rate or not LocalPlayer.Character then
+        spam_acc, spam_active = 0, false
+        return
+    end
+    local interval = 1 / math.max(rate, 1)
+    if spam_active then
+        spam_acc = spam_acc + elapsed
+    else
+        -- First tick of a burst fires right away instead of waiting an interval.
+        spam_acc, spam_active = interval, true
+    end
+    local fires = math.min(math.floor(spam_acc / interval), SPAM_MAX_PER_TICK)
+    if fires > 0 then
+        spam_acc = spam_acc - fires * interval
+        for _ = 1, fires do spam_fire() end
+    end
+    if spam_acc > interval * 4 then spam_acc = 0 end
+end
+
+do
+    local last_error
+    local function run(fn)
+        local ok, err = pcall(fn)
+        if not ok and err ~= last_error then
+            last_error = err
+            warn("[Blade Ball] spam: " .. tostring(err))
+        end
+    end
+    local conns = System.__properties.__connections
+    conns.__spam_pre = RunService.PreSimulation:Connect(function()
+        run(auto_spam_evaluate)
+        run(spam_tick)
+    end)
+    conns.__spam_heartbeat = RunService.Heartbeat:Connect(function() run(spam_tick) end)
+    pcall(function()
+        conns.__spam_render = RunService.PreRender:Connect(function() run(spam_tick) end)
+    end)
 end
 
 -- ============================================================
@@ -1664,6 +1898,15 @@ AP:AddToggle("PingCompensation", {Text = "Ping compensation", Default = true,
     Callback = function(v) System.__properties.__ping_compensation = v end})
 AP:AddSlider("ExtraDistance", {Text = "Extra distance", Default = 0, Min = -10, Max = 30, Rounding = 0, Suffix = " studs",
     Callback = function(v) System.__properties.__extra_distance = v end})
+AP:AddSlider("CloseRange", {Text = "Close range", Default = 20, Min = 8, Max = 45, Rounding = 0, Suffix = " studs",
+    Tooltip = "Inside this distance auto parry switches to close-range rules (instant retarget parry, fast retries, pre-parry).",
+    Callback = function(v) APCfg.close_range = v end})
+AP:AddToggle("InstantRetarget", {Text = "Instant parry on retarget", Default = true,
+    Tooltip = "Up close, parries the moment the ball switches to you instead of waiting for the next frame.",
+    Callback = function(v) APCfg.instant = v end})
+AP:AddToggle("ClosePreParry", {Text = "Close-range pre-parry", Default = true,
+    Tooltip = "When the ball is on a player standing next to you, parries ahead of time so your parry is already up when they send it back.",
+    Callback = function(v) APCfg.preparry = v end})
 AP:AddToggle("RandomCurve", {Text = "Random curve", Default = false, Callback = function(s)
     if s then
         if not System.__properties.__connections.__rc then
@@ -1765,44 +2008,50 @@ SP:AddToggle("ManualSpam", {Text = "Manual spam", Default = false, Callback = fu
     NotifyToggle("Manual Spam", v)
 end}):AddKeyPicker("ManualSpamKey", {Default = "E", Mode = "Hold", SyncToggleState = true, Text = "Manual spam"})
 SP:AddDropdown("SpamMode", {Text = "Mode", Values = {"Remote", "Keypress"}, Default = "Remote", Callback = function(v) getgenv().ManualSpamMode = v end})
-SP:AddSlider("SpamRate", {Text = "Spam rate", Default = 100, Min = 10, Max = 250, Rounding = 0, Suffix = " /s",
+SP:AddSlider("SpamRate", {Text = "Spam rate", Default = 300, Min = 20, Max = 1000, Rounding = 0, Suffix = " /s",
     Tooltip = "Parries per second while spamming.",
-    Callback = function(v) SPAM_RATE = 1 / math.max(v, 1) end})
+    Callback = function(v) ManualSpam.rate = v end})
 SP:AddToggle("SpamAnimFix", {Text = "Animation fix", Default = false, Callback = function(v)
     getgenv().ManualSpamAnimationFix = v
     macroAnimFix = v
 end})
 
 local AS = Tabs.Spam:AddRightGroupbox("Auto Spam", "activity")
-AS:AddToggle("AutoSpam", {Text = "Auto spam (smart)", Default = false,
-    Tooltip = "Only spams parries when a ball is targeting you inside the danger range, or during Slashes Of Fury. Idle otherwise.",
+AS:AddToggle("AutoSpam", {Text = "Auto spam", Default = false,
+    Tooltip = "Watches for clashes (the ball bouncing between you and a nearby player) and spams only while one is happening.",
     Callback = function(v)
         System.__properties.__auto_spam_enabled = v
+        if not v then AutoSpam.active_until, AutoSpam.reason = 0, nil end
         NotifyToggle("Auto Spam", v)
-        if not isMobile then return end
-        if v then
-            if not System.__properties.__mobile_guis.auto_spam then
-                local asb = create_mobile_button('AutoSpam', 0.50, Color3.fromRGB(0, 200, 255), 0.15)
-                System.__properties.__mobile_guis.auto_spam = asb
-                asb.button.MouseButton1Click:Connect(function()
-                    System.__properties.__auto_spam_enabled = not System.__properties.__auto_spam_enabled
-                    local on = System.__properties.__auto_spam_enabled
-                    asb.text.Text = on and "ON" or "AutoSpam"
-                    asb.text.TextColor3 = on and Color3.fromRGB(0, 255, 100) or Color3.fromRGB(255, 255, 255)
-                    Notify("Auto Spam", on and "ON" or "OFF", 1.5)
-                end)
-            end
-        else
-            destroy_mobile_gui(System.__properties.__mobile_guis.auto_spam)
-            System.__properties.__mobile_guis.auto_spam = nil
-        end
-    end}):AddKeyPicker("AutoSpamKey", {Default = "None", Mode = "Toggle", SyncToggleState = true, Text = "Auto spam"})
-AS:AddSlider("AutoSpamRate", {Text = "Spam rate", Default = 50, Min = 10, Max = 250, Rounding = 0, Suffix = " /s",
-    Tooltip = "Parries per second while engaged.",
-    Callback = function(v) AUTO_SPAM_RATE = 1 / math.max(v, 1) end})
-AS:AddSlider("AutoSpamRange", {Text = "Danger range", Default = 160, Min = 100, Max = 400, Rounding = 0, Suffix = "%",
-    Tooltip = "How large the danger zone is, as a percentage of the normal parry range. Higher engages sooner.",
-    Callback = function(v) autoSpamRange = v / 100 end})
+    end})
+local AutoSpamLabel = AS:AddLabel("Status: off", true)
+AS:AddSlider("AutoSpamRate", {Text = "Spam rate", Default = 250, Min = 20, Max = 1000, Rounding = 0, Suffix = " /s",
+    Tooltip = "Parries per second while a clash is detected.",
+    Callback = function(v) AutoSpam.rate = v end})
+AS:AddSlider("ClashRange", {Text = "Clash range", Default = 30, Min = 10, Max = 80, Rounding = 0, Suffix = " studs",
+    Tooltip = "How close the other player has to be for the exchange to count as a clash.",
+    Callback = function(v) AutoSpam.clash_range = v end})
+AS:AddSlider("ClashSwaps", {Text = "Clash sensitivity", Default = 2, Min = 1, Max = 5, Rounding = 0, Suffix = " swaps",
+    Tooltip = "How many times the ball has to go between you and them inside the clash window. Lower kicks in sooner.",
+    Callback = function(v) AutoSpam.clash_swaps = v end})
+AS:AddSlider("ClashWindow", {Text = "Clash window", Default = 0.75, Min = 0.2, Max = 2, Rounding = 2, Suffix = "s",
+    Tooltip = "How far back to look for those swaps.",
+    Callback = function(v) AutoSpam.clash_window = v end})
+AS:AddToggle("PointBlankSpam", {Text = "Point-blank spam", Default = true,
+    Tooltip = "Also spams when the ball is right on top of you, or on a player standing right next to you.",
+    Callback = function(v) AutoSpam.point_blank = v end})
+AS:AddSlider("PointBlankRange", {Text = "Point-blank range", Default = 14, Min = 4, Max = 35, Rounding = 0, Suffix = " studs",
+    Callback = function(v) AutoSpam.point_blank_range = v end})
+AS:AddSlider("AutoSpamLinger", {Text = "Keep spamming for", Default = 0.2, Min = 0, Max = 1, Rounding = 2, Suffix = "s",
+    Tooltip = "How long to keep spamming after the clash stops being detected.",
+    Callback = function(v) AutoSpam.linger = v end})
+
+task.spawn(function()
+    while task.wait(0.1) do
+        if Library.Unloaded then break end
+        if Library.Toggled then AutoSpamLabel:SetText("Status: " .. System.auto_spam.status()) end
+    end
+end)
 
 -- PLAYER TAB
 local AVC = Tabs.Player:AddLeftGroupbox("Avatar Changer", "user")
@@ -2017,6 +2266,7 @@ Library:OnUnload(function()
     setTriggerbot(false)
     System.__properties.__autoparry_enabled = false
     System.__properties.__manual_spam_enabled = false
+    System.__properties.__auto_spam_enabled = false
     System.__properties.__show_ping = false
     AutoJump = false
     for _, conn in pairs(System.__properties.__connections) do pcall(function() conn:Disconnect() end) end
