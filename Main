@@ -52,7 +52,7 @@ local Games = {
     [95898962477575] = { Name = 'Last Letter (wilderness)', Script = 'Games/LastLetter.lua' },
     -- Chapter 1 (Farmhouse) of the needle in a haystack game, from its dump.
     [108628039999641] = { Name = 'Needle in a Haystack', Script = 'Games/NeedleHaystack.lua' },
-    -- Blade Ball's main place. Its other modes have their own place ids, not added yet.
+    -- Blade Ball's main place. Its other modes are picked up by Fingerprints below.
     [13772394625] = { Name = 'Blade Ball', Script = 'Games/BladeBall.lua' },
 }
 
@@ -274,13 +274,48 @@ Menu:Button({
     end,
 })
 
+-- Games whose other modes (ranked, duels, events...) each have their own place
+-- id. Rather than list every one, these check for things every mode of the
+-- game has. Only used when the place id itself isn't in Games.
+local Fingerprints = {
+    {
+        Name = 'Blade Ball',
+        Script = 'Games/BladeBall.lua',
+        -- Every Blade Ball mode has the Alive folder, the parry remotes and the
+        -- sword API the script itself relies on. Balls isn't required: it can
+        -- be missing between rounds.
+        Match = function()
+            local ReplicatedStorage = game:GetService('ReplicatedStorage')
+            local remotes = ReplicatedStorage:FindFirstChild('Remotes')
+            local shared = ReplicatedStorage:FindFirstChild('Shared')
+            return workspace:FindFirstChild('Alive') ~= nil
+                and remotes ~= nil and remotes:FindFirstChild('ParrySuccessAll') ~= nil
+                and shared ~= nil and shared:FindFirstChild('SwordAPI') ~= nil
+        end,
+    },
+}
+
+local function findGame()
+    local match = Games[game.PlaceId]
+    if match then
+        return match
+    end
+    for _, entry in ipairs(Fingerprints) do
+        local ok, found = pcall(entry.Match)
+        if ok and found then
+            return { Name = entry.Name .. ' (detected)', Script = entry.Script }
+        end
+    end
+    return nil
+end
+
 -- Watch for a supported game for up to WATCH_DURATION seconds after load, then
 -- stop. PlaceId is set before this ever runs in practice, but a slow join can
 -- still be mid-swap when the hub is executed.
 task.spawn(function()
     local start = os.clock()
     while os.clock() - start < WATCH_DURATION do
-        local match = Games[game.PlaceId]
+        local match = findGame()
         if match then
             MatchedGame = match
             PlaceStat.Set(tostring(game.PlaceId))

@@ -67,9 +67,16 @@ local function ensureSaveFolder()
     end)
 end
 
+-- Reading the stat is not free, and the parry loop asks for it every frame.
+local ping_cache, ping_at = 0, 0
 local function getPing()
-    local ok, ping = pcall(function() return Stats.Network.ServerStatsItem['Data Ping']:GetValue() end)
-    return ok and ping or 0
+    local now = os.clock()
+    if now - ping_at > 0.2 then
+        local ok, ping = pcall(function() return Stats.Network.ServerStatsItem['Data Ping']:GetValue() end)
+        if ok and ping then ping_cache = ping end
+        ping_at = now
+    end
+    return ping_cache
 end
 
 local function getRoot()
@@ -168,8 +175,15 @@ task.spawn(function()
     end
 end)
 
-local function fireParryRemote(curveCF)
-    if not _capturedRemote or not _capturedArgs then return false end
+-- The screen points and aim spot only change between frames, so spam firing
+-- several times in one frame builds them once. The packet itself is unchanged.
+local FRAME = 1 / 240
+local screen_cache = {at = 0, aim = nil, data = nil}
+local function screenData()
+    local now = os.clock()
+    if screen_cache.data and now - screen_cache.at < FRAME then
+        return screen_cache.aim, screen_cache.data
+    end
     local cam = workspace.CurrentCamera
     local aim_target
     if isMobile then
@@ -193,6 +207,14 @@ local function fireParryRemote(curveCF)
             end
         end
     end
+    screen_cache.at, screen_cache.aim, screen_cache.data = now, aim_target, event_data
+    return aim_target, event_data
+end
+
+local function fireParryRemote(curveCF)
+    if not _capturedRemote or not _capturedArgs then return false end
+    local cam = workspace.CurrentCamera
+    local aim_target, event_data = screenData()
     local packet = {
         _capturedArgs[1], _capturedArgs[2], _tokenize(_capturedArgs[2]),
         0.5, curveCF or cam.CFrame, event_data, aim_target, false
@@ -236,7 +258,8 @@ local System = {
         __peak_velocity = 0, __last_ball_id = nil, __show_ping = false,
         __auto_ability_enabled = false, __cooldown_protection = false,
         __total_parries = 0, __ping_compensation = true, __extra_distance = 0,
-        __curve_hotkeys = true
+        __curve_hotkeys = true, __retry_delay = 0.6,
+        __spam_rate = 100, __auto_spam_enabled = false, __auto_spam_range = 20
     },
     __config = {
         __curve_names = {'Camera', 'Random', 'Accelerated', 'Backwards', 'Slow', 'High', 'Normal', 'Speed', 'Down', 'Left', 'Right'},
@@ -336,19 +359,40 @@ pcall(function()
 end)
 
 -- Ball
+-- Everything asks for the balls several times a frame, so the list is built
+-- once per frame. Treat the returned table as read-only.
 System.ball = {}
+local ball_cache = {at = 0, list = {}, training = {}}
+local no_collide = setmetatable({}, {__mode = 'k'})
+local function collectBalls(folder, into)
+    if not folder then return end
+    for _, ball in ipairs(folder:GetChildren()) do
+        if ball:GetAttribute('realBall') then
+            if not no_collide[ball] then no_collide[ball] = true; pcall(function() ball.CanCollide = false end) end
+            table.insert(into, ball)
+        end
+    end
+end
+local function refreshBalls()
+    local now = os.clock()
+    if now - ball_cache.at < FRAME then return end
+    ball_cache.at = now
+    ball_cache.list = {}
+    ball_cache.training = {}
+    collectBalls(Workspace:FindFirstChild('Balls'), ball_cache.list)
+    collectBalls(Workspace:FindFirstChild('TrainingBalls'), ball_cache.training)
+end
 function System.ball.get()
-    local balls = Workspace:FindFirstChild('Balls'); if not balls then return nil end
-    for _, ball in pairs(balls:GetChildren()) do
-        if ball:GetAttribute('realBall') then ball.CanCollide = false; return ball end
-    end; return nil
+    refreshBalls()
+    return ball_cache.list[1]
 end
 function System.ball.get_all()
-    local balls_table = {}; local balls = Workspace:FindFirstChild('Balls')
-    if not balls then return balls_table end
-    for _, ball in pairs(balls:GetChildren()) do
-        if ball:GetAttribute('realBall') then ball.CanCollide = false; table.insert(balls_table, ball) end
-    end; return balls_table
+    refreshBalls()
+    return ball_cache.list
+end
+function System.ball.get_training()
+    refreshBalls()
+    return ball_cache.training
 end
 
 System.player = {}
@@ -423,14 +467,21 @@ end
 System.parry = {}
 -- "Remote" fires the parry remote with the chosen curve. "Keypress" presses the
 -- block key.
+-- The curve is cached for the frame too, so a spam burst doesn't redo the
+-- on-screen target search for every fire.
+local curve_cache = {at = 0, cf = nil}
+local function curveForFrame()
+    local now = os.clock()
+    if not curve_cache.cf or now - curve_cache.at >= FRAME then
+        curve_cache.cf = System.curve.get_cframe()
+        curve_cache.at = now
+    end
+    return curve_cache.cf
+end
 function System.parry.execute()
-    if System.__properties.__parries > 10000 or not LocalPlayer.Character then return end
-    fireParryRemote(System.curve.get_cframe())
-    System.__properties.__parries = System.__properties.__parries + 1
+    if not LocalPlayer.Character then return end
+    fireParryRemote(curveForFrame())
     System.__properties.__total_parries = System.__properties.__total_parries + 1
-    task.delay(0.5, function()
-        if System.__properties.__parries > 0 then System.__properties.__parries = System.__properties.__parries - 1 end
-    end)
 end
 function System.parry.keypress()
     if not LocalPlayer.Character then return end
@@ -613,12 +664,12 @@ function System.triggerbot.enable(enabled)
 end
 
 -- ============================================================
--- MANUAL SPAM (HEARTBEAT - ULTRA FAST)
+-- MANUAL SPAM / AUTO SPAM
 -- ============================================================
 System.manual_spam = {}
 local macroAnimFix = false
 local spam_accumulator = 0
-local SPAM_RATE = 0.01
+local MAX_FIRES_PER_FRAME = 10
 
 function System.manual_spam.start()
     System.__properties.__manual_spam_enabled = true
@@ -628,27 +679,57 @@ function System.manual_spam.stop()
     System.__properties.__manual_spam_enabled = false
 end
 
-RunService.Heartbeat:Connect(function(dt)
-    if not System.__properties.__manual_spam_enabled then
+-- Auto spam turns spam on by itself during a close-range clash: the ball is
+-- moving, it's on you or the nearest player, and both are within range.
+function System.manual_spam.clash()
+    local props = System.__properties
+    if not props.__auto_spam_enabled then return false end
+    local root = getRoot()
+    local ball = System.ball.get()
+    if not root or not ball then return false end
+    local zoomies = ball:FindFirstChild('zoomies')
+    if not zoomies or zoomies.VectorVelocity.Magnitude < 5 then return false end
+    local target = ball:GetAttribute('target')
+    if not target or target == "" then return false end
+    local closest = System.player.get_closest()
+    if not closest or not closest.PrimaryPart then return false end
+    local range = props.__auto_spam_range
+    if (root.Position - closest.PrimaryPart.Position).Magnitude > range then return false end
+    if (root.Position - ball.Position).Magnitude > range then return false end
+    return target == LocalPlayer.Name or target == closest.Name
+end
+
+-- Runs before physics each frame, so a fire goes out as early in the frame as
+-- possible. The rate is fires per second, spread across frames; a slow frame
+-- catches up by up to MAX_FIRES_PER_FRAME instead of bunching hundreds at once.
+RunService.PreSimulation:Connect(function(dt)
+    local props = System.__properties
+    local active = props.__manual_spam_enabled
+    if not active then
+        local ok, clash = pcall(System.manual_spam.clash)
+        active = ok and clash
+    end
+    if not active or not LocalPlayer.Character then
         spam_accumulator = 0
         return
     end
-    spam_accumulator = spam_accumulator + dt
-    local maxFires = 5
+    local interval = 1 / math.max(props.__spam_rate, 1)
+    spam_accumulator = math.min(spam_accumulator + dt, interval * MAX_FIRES_PER_FRAME)
+    local keypress = getgenv().ManualSpamMode == "Keypress"
     local fired = 0
-    while spam_accumulator >= SPAM_RATE and fired < maxFires do
-        spam_accumulator = spam_accumulator - SPAM_RATE
+    while spam_accumulator >= interval and fired < MAX_FIRES_PER_FRAME do
+        spam_accumulator = spam_accumulator - interval
         fired = fired + 1
-        if getgenv().ManualSpamMode == "Keypress" then
-            pcall(function() System.parry.keypress() end)
+        if keypress then
+            pcall(System.parry.keypress)
         else
-            pcall(function() System.parry.execute() end)
-            if getgenv().ManualSpamAnimationFix and macroAnimFix then
-                pcall(function() System.animation.play_grab_parry() end)
-            end
+            pcall(System.parry.execute)
         end
     end
-    if spam_accumulator > SPAM_RATE * 10 then spam_accumulator = 0 end
+    -- Once per frame is plenty for the animation; it has its own cooldown.
+    if fired > 0 and not keypress and getgenv().ManualSpamAnimationFix and macroAnimFix then
+        pcall(System.animation.play_grab_parry)
+    end
 end)
 
 
@@ -673,9 +754,8 @@ function System.parry_distance(speed)
 end
 
 -- One state per ball, so with several balls in play parrying one doesn't
--- block the others. The target listener is made once per ball; the old loop
--- made a new one every frame for every ball.
-local PARRY_TIMEOUT = 1
+-- block the others. The target listener is made once per ball. If the ball is
+-- still on us `__retry_delay` seconds after a parry, it parries again.
 local ball_state = setmetatable({}, {__mode = 'k'})
 local function get_ball_state(ball)
     local state = ball_state[ball]
@@ -736,7 +816,7 @@ local function blocked_by_detection()
         or (det.__slashesoffury and props.__slashesoffury_active)
 end
 
-function System.autoparry.step()
+function System.autoparry.step(dt)
     local props = System.__properties
     if not props.__autoparry_enabled or System.__triggerbot.__enabled then return end
     local root = getRoot()
@@ -748,14 +828,17 @@ function System.autoparry.step()
     local one_ball = System.ball.get()
     local curve_hold = curved and one_ball and one_ball:GetAttribute('target') == LocalPlayer.Name
 
-    local balls = System.ball.get_all()
-    local training = Workspace:FindFirstChild("TrainingBalls")
-    if training then
-        for _, ball in ipairs(training:GetChildren()) do
-            if ball:GetAttribute("realBall") then table.insert(balls, ball) end
-        end
+    local balls = table.clone(System.ball.get_all())
+    local training = System.ball.get_training()
+    local is_training = {}
+    for _, ball in ipairs(training) do
+        is_training[ball] = true
+        table.insert(balls, ball)
     end
 
+    -- Look one frame ahead: if the ball will be inside the parry range by the
+    -- next check, parry now rather than a frame late.
+    local frame = math.clamp(dt or 1/60, 0, 0.1)
     local now = tick()
     for _, ball in ipairs(balls) do
         local zoomies = ball:FindFirstChild('zoomies')
@@ -767,7 +850,7 @@ function System.autoparry.step()
         end
 
         if state.parried then
-            if now - state.at < PARRY_TIMEOUT then continue end
+            if now - state.at < props.__retry_delay then continue end
             state.parried = false
         end
         if props.__parried then continue end
@@ -775,13 +858,17 @@ function System.autoparry.step()
 
         local tornado = Runtime:FindFirstChild('Tornado')
         if tornado and (now - props.__tornado_time) < (tornado:GetAttribute('TornadoTime') or 1) + 0.314159 then continue end
-        if curve_hold and ball.Parent ~= training then continue end
+        if curve_hold and not is_training[ball] then continue end
         if ball:FindFirstChild('ComboCounter') then continue end
         if blocked_by_detection() then return end
 
-        local speed = zoomies.VectorVelocity.Magnitude
-        local distance = (root.Position - ball.Position).Magnitude
-        if distance > System.parry_distance(speed) then continue end
+        local velocity = zoomies.VectorVelocity
+        local speed = velocity.Magnitude
+        local offset = root.Position - ball.Position
+        local distance = offset.Magnitude
+        -- Only the part of the velocity heading at us closes the gap.
+        local closing = distance > 0 and math.max(velocity:Dot(offset / distance), 0) or speed
+        if distance - closing * frame > System.parry_distance(speed) then continue end
 
         state.parried = true
         state.at = now
@@ -794,8 +881,8 @@ end
 function System.autoparry.start()
     if System.__properties.__connections.__autoparry then return end
     local last_error
-    System.__properties.__connections.__autoparry = RunService.PreSimulation:Connect(function()
-        local ok, err = pcall(System.autoparry.step)
+    System.__properties.__connections.__autoparry = RunService.PreSimulation:Connect(function(dt)
+        local ok, err = pcall(System.autoparry.step, dt)
         if not ok and err ~= last_error then
             last_error = err
             warn("[Blade Ball] auto parry: " .. tostring(err))
@@ -1227,7 +1314,12 @@ local function create_ability_esp_for_player(player)
         local humanoid = character:FindFirstChild('Humanoid')
         if humanoid then humanoid.DisplayDistanceType = Enum.HumanoidDisplayDistanceType.None end
         local heartbeatConnection
-        heartbeatConnection = RunService.Heartbeat:Connect(function()
+        -- Text only needs a refresh a few times a second, not every frame.
+        local esp_elapsed = 1
+        heartbeatConnection = RunService.Heartbeat:Connect(function(dt)
+            esp_elapsed = esp_elapsed + dt
+            if esp_elapsed < 0.25 then return end
+            esp_elapsed = 0
             if not (character and character.Parent) then
                 if heartbeatConnection then heartbeatConnection:Disconnect() end
                 pcall(function() billboard:Destroy() end)
@@ -1450,6 +1542,9 @@ AP:AddToggle("PingCompensation", {Text = "Ping compensation", Default = true,
     Callback = function(v) System.__properties.__ping_compensation = v end})
 AP:AddSlider("ExtraDistance", {Text = "Extra distance", Default = 0, Min = -10, Max = 30, Rounding = 0, Suffix = " studs",
     Callback = function(v) System.__properties.__extra_distance = v end})
+AP:AddSlider("RetryDelay", {Text = "Retry delay", Default = 0.6, Min = 0.2, Max = 1.5, Rounding = 2, Suffix = "s",
+    Tooltip = "If the ball is still on you this long after a parry, parry again.",
+    Callback = function(v) System.__properties.__retry_delay = v end})
 AP:AddToggle("RandomCurve", {Text = "Random curve", Default = false, Callback = function(s)
     if s then
         if not System.__properties.__connections.__rc then
@@ -1542,11 +1637,25 @@ SP:AddToggle("ManualSpam", {Text = "Manual spam", Default = false, Callback = fu
         System.__properties.__mobile_guis.manual_spam = nil
     end
 end}):AddKeyPicker("ManualSpamKey", {Default = "E", Mode = "Toggle", SyncToggleState = true, Text = "Manual spam"})
+SP:AddSlider("SpamRate", {Text = "Spam speed", Default = 100, Min = 10, Max = 240, Rounding = 0, Suffix = "/s",
+    Tooltip = "Parries per second while spamming.",
+    Callback = function(v) System.__properties.__spam_rate = v end})
 SP:AddDropdown("SpamMode", {Text = "Mode", Values = {"Remote", "Keypress"}, Default = "Remote", Callback = function(v) getgenv().ManualSpamMode = v end})
 SP:AddToggle("SpamAnimFix", {Text = "Animation fix", Default = false, Callback = function(v)
     getgenv().ManualSpamAnimationFix = v
     macroAnimFix = v
 end})
+
+local AS = Tabs.Spam:AddRightGroupbox("Auto Spam", "swords")
+AS:AddToggle("AutoSpam", {Text = "Auto spam", Default = false,
+    Tooltip = "Spams by itself during close-range clashes. Uses the spam speed and mode on the left.",
+    Callback = function(v)
+        System.__properties.__auto_spam_enabled = v
+        NotifyToggle("Auto Spam", v)
+    end}):AddKeyPicker("AutoSpamKey", {Default = "None", Mode = "Toggle", SyncToggleState = true, Text = "Auto spam"})
+AS:AddSlider("AutoSpamRange", {Text = "Clash range", Default = 20, Min = 5, Max = 50, Rounding = 0, Suffix = " studs",
+    Tooltip = "Both the ball and the nearest player have to be this close.",
+    Callback = function(v) System.__properties.__auto_spam_range = v end})
 
 -- PLAYER TAB
 local AVC = Tabs.Player:AddLeftGroupbox("Avatar Changer", "user")
@@ -1744,6 +1853,7 @@ Library:OnUnload(function()
     setTriggerbot(false)
     System.__properties.__autoparry_enabled = false
     System.__properties.__manual_spam_enabled = false
+    System.__properties.__auto_spam_enabled = false
     System.__properties.__show_ping = false
     AutoJump = false
     for _, conn in pairs(System.__properties.__connections) do pcall(function() conn:Disconnect() end) end
