@@ -160,11 +160,33 @@ end
 local _token, _direct = nil, nil
 local _tokenFallback = nil
 local _candidate = nil
+-- PRY's entry point: the function SwordsController calls as
+-- PRY(hold, CFrame, screen points, mouse, false). Besides calling the send
+-- function it rolls the uid forward, and the server expects the next uid on
+-- every parry. Sending through the send function alone kept reusing the same
+-- uid, which got kicked after a few parries.
+local _pryEntry = nil
+local function _isPryFunction(f)
+    if type(f) ~= 'function' then return false end
+    local ok, s = pcall(debug.info, f, 's')
+    return ok and type(s) == 'string' and s:find('PRY', 1, true) ~= nil
+end
 _log("scanning")
 for _, Function in getgc(true) do
     if type(Function) ~= 'function' then continue end
     local okSrc, src = pcall(debug.info, Function, 's')
-    if not okSrc or type(src) ~= 'string' or not src:find('PRY', 1, true) then continue end
+    if not okSrc or type(src) ~= 'string' then continue end
+    if not src:find('PRY', 1, true) then
+        if not _pryEntry and src:find('SwordsController', 1, true) then
+            local okUp, ups = pcall(debug.getupvalues, Function)
+            if okUp and type(ups) == 'table' then
+                for _, v in pairs(ups) do
+                    if _isPryFunction(v) then _pryEntry = v; break end
+                end
+            end
+        end
+        continue
+    end
     local okUp, ups = pcall(debug.getupvalues, Function)
     if not okUp or type(ups) ~= 'table' then continue end
     -- Same token pick as before: the first function upvalue of a PRY function.
@@ -184,9 +206,10 @@ for _, Function in getgc(true) do
     if token and netIdx and holder and type(ups[netIdx + 1]) == 'string' and ups[netIdx + 2] ~= nil then
         _candidate = {token = token, net = ups[netIdx], name = ups[netIdx + 1], first = ups[netIdx + 2], holder = holder}
     end
-    if _candidate and _tokenFallback then break end
+    if _candidate and _tokenFallback and _pryEntry then break end
 end
-_log("scan done, send function " .. (_candidate and "found" or "not found"))
+_log("scan done, send function " .. (_candidate and "found" or "not found")
+    .. ", entry " .. (_pryEntry and "found" or "not found"))
 
 -- The remote lookup runs after the scan, outside the getgc loop.
 if _candidate then
@@ -371,10 +394,26 @@ local function screenData()
     return aim_target, event_data
 end
 
+-- The send function looks 10 stack levels up for an env with writefile and
+-- reports to a decoy remote if it finds one. So the entry is called on a fresh
+-- thread whose only Lua frame runs in the game's env.
+local _gameEnv = (getrenv and getrenv()) or nil
+local function _callPryEntry(...)
+    local args = table.pack(...)
+    local caller = function() pcall(_pryEntry, table.unpack(args, 1, args.n)) end
+    if _gameEnv and setfenv then pcall(setfenv, caller, _gameEnv) end
+    task.spawn(caller)
+end
+
 local function fireParryRemote(curveCF)
+    local cam = workspace.CurrentCamera
+    if _pryEntry and _direct then
+        local aim_target, event_data = screenData()
+        _callPryEntry(parryHold(), curveCF or cam.CFrame, event_data, aim_target, false)
+        return true
+    end
     if not _capturedRemote or not _capturedArgs then return false end
     if _direct then _capturedArgs[2] = _directUid() end
-    local cam = workspace.CurrentCamera
     local aim_target, event_data = screenData()
     local packet = {
         _capturedArgs[1], _capturedArgs[2], _capturedArgs[2] and _tokenize(_capturedArgs[2]) or "",
