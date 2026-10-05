@@ -199,7 +199,7 @@ end
 
 -- How long the hook stays on after a Capture press. Covers the game's block
 -- cooldown and a slow frame; if nothing is caught by then it comes off again.
-local CAPTURE_WINDOW = 1.5
+local CAPTURE_WINDOW = 3
 local _captureGen = 0
 
 local function _captureNow()
