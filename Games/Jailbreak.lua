@@ -339,7 +339,7 @@ local function flyVelocity(speed, verticalSpeed)
 end
 
 --// Teleport / travel -----------------------------------------------------------
-local Travel = { Token = 0, Active = false, Label = "idle" }
+local Travel = { Token = 0, Active = false, Label = "idle", Remaining = 0, Speed = 0, Following = false }
 
 -- What moves: your vehicle if you're driving one, otherwise your character.
 local function getMover()
@@ -365,78 +365,226 @@ local function getMover()
 end
 
 -- Moving the assembly root moves everything welded to it, so this carries the
--- whole car (and you in it), or your whole character.
-local function placeMover(mover, position)
+-- whole car (and you in it), or your whole character. Velocity is set to the
+-- travel velocity rather than zero so the motion reads as smooth movement
+-- instead of a string of jumps.
+local function placeMover(mover, position, velocity, facing)
     local root = mover.Root
-    root.CFrame = root.CFrame + (position - root.Position)
-    root.AssemblyLinearVelocity = Vector3.zero
+    local rotation = root.CFrame - root.Position
+    if facing and on("TPFaceDirection") then
+        local flat = Vector3.new(facing.X, 0, facing.Z)
+        if flat.Magnitude > 0.1 then
+            local wanted = CFrame.lookAt(Vector3.zero, flat.Unit)
+            rotation = rotation:Lerp(wanted, 0.2)
+        end
+    end
+    root.CFrame = CFrame.new(position) * rotation
+    root.AssemblyLinearVelocity = velocity or Vector3.zero
     root.AssemblyAngularVelocity = Vector3.zero
 end
 
 local function stopTravel()
     Travel.Token += 1
     Travel.Active = false
+    Travel.Following = false
     Travel.Label = "idle"
+    Travel.Speed = 0
+    Travel.Remaining = 0
 end
 
-local function travelTo(target, label)
+local TravelRayParams = RaycastParams.new()
+TravelRayParams.FilterType = Enum.RaycastFilterType.Exclude
+pcall(function() TravelRayParams.RespectCanCollide = true end)
+
+local function refreshTravelIgnore(mover)
+    local ignore = { Overlay }
+    if LocalPlayer.Character then table.insert(ignore, LocalPlayer.Character) end
+    if mover and mover.Model then table.insert(ignore, mover.Model) end
+    TravelRayParams.FilterDescendantsInstances = ignore
+end
+
+local function groundHeight(position)
+    local hit = Workspace:Raycast(position + Vector3.new(0, 300, 0), Vector3.new(0, -1200, 0), TravelRayParams)
+    return hit and hit.Position.Y or nil
+end
+
+local function noclipCharacter()
+    local character = LocalPlayer.Character
+    if not character then return end
+    for _, part in ipairs(character:GetDescendants()) do
+        if part:IsA("BasePart") and part.CanCollide then
+            part.CanCollide = false
+        end
+    end
+end
+
+-- target: a Vector3, or a function returning one (players, moving robberies).
+-- options.Follow keeps you on a moving target until you press Stop.
+--
+-- Routes:
+--   Sky     straight up, across at altitude, straight down
+--   Ground  hugs the terrain a few studs up, looking ahead for slopes
+--   Direct  a straight line
+-- Speed ramps up by the acceleration setting and, with Smooth on, brakes so
+-- you arrive at a crawl instead of slamming into the spot.
+local function travelTo(target, label, options)
+    options = options or {}
     local mover, reason = getMover()
     if not mover then
         notify("Teleport", reason, 4)
         return
     end
 
+    local resolve = type(target) == "function" and target or function() return target end
+    local first = resolve()
+    if typeof(first) ~= "Vector3" then
+        notify("Teleport", "That destination isn't available right now.", 3)
+        return
+    end
+
     Travel.Token += 1
     local token = Travel.Token
     Travel.Active = true
+    Travel.Following = options.Follow == true
     Travel.Label = label or "destination"
+    Travel.Speed = 0
 
     task.spawn(function()
-        local start = mover.Root.Position
-        local points
-        if on("TPSkyRoute") then
-            local altitude = math.max(start.Y, target.Y) + opt("TPSkyHeight", 150)
-            points = {
-                Vector3.new(start.X, altitude, start.Z),
-                Vector3.new(target.X, altitude, target.Z),
-                target,
-            }
-        else
-            points = { target }
-        end
+        local arrived = false
 
-        if opt("TPMode", "Tween") == "Instant" then
-            placeMover(mover, target)
+        if opt("TPMode", "Tween") == "Instant" and not options.Follow then
+            placeMover(mover, first)
+            arrived = true
         else
-            local index = 1
-            while index <= #points do
-                if Travel.Token ~= token or Unloading then break end
+            local route = opt("TPRoute", "Sky")
+            local start = mover.Root.Position
+            local altitude = math.max(start.Y, first.Y) + opt("TPSkyHeight", 150)
+            local phase = route == "Sky" and 1 or 2
+            local speed = 0
+
+            while Travel.Token == token and not Unloading do
                 local dt = PreSimulation:Wait()
+                if Travel.Token ~= token or Unloading then break end
+
                 mover = getMover()
                 if not mover then break end
-                local speed = mover.Vehicle and opt("TPVehicleSpeed", 350) or opt("TPSpeed", 120)
+                local humanoid = getHumanoid()
+                if humanoid and humanoid.Health <= 0 then break end
+                local goal = resolve()
+                if typeof(goal) ~= "Vector3" then break end
+
+                refreshTravelIgnore(mover)
                 local position = mover.Root.Position
-                local delta = points[index] - position
-                local step = speed * dt
-                if delta.Magnitude <= step then
-                    placeMover(mover, points[index])
-                    index += 1
-                else
-                    placeMover(mover, position + delta.Unit * step)
-                end
-                if not mover.Vehicle and LocalPlayer.Character then
-                    for _, part in ipairs(LocalPlayer.Character:GetDescendants()) do
-                        if part:IsA("BasePart") then part.CanCollide = false end
+                local flat = Vector3.new(goal.X - position.X, 0, goal.Z - position.Z)
+                local maxSpeed = mover.Vehicle and opt("TPVehicleSpeed", 350) or opt("TPSpeed", 120)
+                local waypoint
+
+                if phase == 1 then
+                    -- A moving target can pull the cruise altitude up.
+                    altitude = math.max(altitude, goal.Y + 20)
+                    if position.Y >= altitude - 2 or flat.Magnitude < 10 then
+                        phase = 2
+                    else
+                        waypoint = Vector3.new(position.X, altitude, position.Z)
                     end
                 end
+                if phase == 2 then
+                    if route == "Sky" then
+                        if flat.Magnitude < 4 then
+                            phase = 3
+                        else
+                            waypoint = Vector3.new(goal.X, altitude, goal.Z)
+                        end
+                    elseif route == "Ground" then
+                        if flat.Magnitude < 25 then
+                            phase = 3
+                        else
+                            local ahead = position + flat.Unit * math.min(flat.Magnitude, 40)
+                            local hover = opt("TPGroundHeight", 6)
+                            local groundHere = groundHeight(position) or position.Y - hover
+                            local groundAhead = groundHeight(ahead) or groundHere
+                            local y = math.max(groundHere, groundAhead) + hover
+                            waypoint = Vector3.new(goal.X, y, goal.Z)
+                            -- Stay level and only change height toward y,
+                            -- otherwise the far-off goal height would drag us
+                            -- through hills.
+                            waypoint = position + flat.Unit * math.min(flat.Magnitude, 60) + Vector3.new(0, y - position.Y, 0)
+                        end
+                    else
+                        phase = 3
+                    end
+                end
+                if phase == 3 then
+                    waypoint = goal
+                end
+
+                local delta = waypoint - position
+                local remaining = (goal - position).Magnitude
+                if phase == 1 then
+                    remaining = (waypoint - position).Magnitude + (Vector3.new(goal.X, altitude, goal.Z) - waypoint).Magnitude + math.abs(altitude - goal.Y)
+                elseif phase == 2 and route == "Sky" then
+                    remaining = flat.Magnitude + math.abs(altitude - goal.Y)
+                end
+                Travel.Remaining = remaining
+
+                local accel = opt("TPAccel", 250)
+                speed = math.min(maxSpeed, speed + accel * dt)
+                if on("TPSmooth") then
+                    speed = math.min(speed, math.max(12, math.sqrt(2 * accel * remaining)))
+                end
+                Travel.Speed = speed
+
+                local step = speed * dt
+                if phase == 3 and delta.Magnitude <= math.max(step, 0.5) then
+                    local carry = Vector3.zero
+                    if options.Follow and options.Velocity then
+                        carry = options.Velocity() or Vector3.zero
+                    end
+                    placeMover(mover, goal, carry)
+                    if not mover.Vehicle then noclipCharacter() end
+                    if not options.Follow then
+                        arrived = true
+                        break
+                    end
+                    speed = math.min(speed, 40)
+                else
+                    local direction = delta.Magnitude > 0.001 and delta.Unit or Vector3.zero
+                    local nextPosition = delta.Magnitude <= step and waypoint or position + direction * step
+                    placeMover(mover, nextPosition, direction * speed, flat.Magnitude > 2 and flat or nil)
+                    if not mover.Vehicle then noclipCharacter() end
+                end
+            end
+        end
+
+        -- Hold still for a moment so physics doesn't bounce you off the spot.
+        if arrived and Travel.Token == token then
+            local settleUntil = os.clock() + 0.3
+            while os.clock() < settleUntil and Travel.Token == token and not Unloading do
+                local current = getMover()
+                if not current then break end
+                current.Root.AssemblyLinearVelocity = Vector3.zero
+                current.Root.AssemblyAngularVelocity = Vector3.zero
+                PreSimulation:Wait()
             end
         end
 
         if Travel.Token == token then
             Travel.Active = false
+            Travel.Following = false
             Travel.Label = "idle"
+            Travel.Speed = 0
+            Travel.Remaining = 0
         end
     end)
+end
+
+local function travelStatusText()
+    if not Travel.Active then return "Status: idle" end
+    if Travel.Following then
+        return ("Status: following %s"):format(Travel.Label)
+    end
+    local eta = Travel.Speed > 1 and Travel.Remaining / Travel.Speed or 0
+    return ("Status: %s - %d studs, %.1fs"):format(Travel.Label, Travel.Remaining, eta)
 end
 
 local function instancePosition(instance)
@@ -715,6 +863,20 @@ local TeleportTab = Window:AddTab("Teleport", "map-pin", "Places, robberies, pla
 local RobberyTab = Window:AddTab("Robbery", "landmark", "Robbery status and helpers")
 local MiscTab = Window:AddTab("Misc", "wrench", "Utility, server and mobile")
 
+local function vehicleIsFree(model)
+    local seat = model:FindFirstChild("Seat")
+    local playerName = seat and seat:FindFirstChild("PlayerName")
+    if not playerName or playerName.Value ~= "" then return false end
+    if model:GetAttribute("Locked") == true then return false end
+    local restrict = model:GetAttribute("TeamRestrict")
+    if restrict and restrict ~= "" and restrict ~= teamName(LocalPlayer) then return false end
+    return true
+end
+
+local TravelStatus
+local StatusLabels = {}
+
+do
 -- Combat ---------------------------------------------------------------------------
 local AimBox = CombatTab:AddLeftGroupbox("Silent aim", "crosshair")
 AimBox:AddToggle("SilentAim", {
@@ -734,8 +896,9 @@ AimBox:AddToggle("AimPointGun", {
 })
 AimBox:AddDropdown("AimPart", {
     Text = "Aim at",
-    Values = { "Head", "UpperTorso", "HumanoidRootPart", "Random" },
-    Default = "UpperTorso",
+    Values = { "Hitbox (root)", "Head", "UpperTorso", "Random" },
+    Default = "Hitbox (root)",
+    Tooltip = "Jailbreak checks hits with a sphere around the root part, so Hitbox is the most reliable.",
 })
 AimBox:AddSlider("AimHitChance", { Text = "Hit chance", Default = 100, Min = 1, Max = 100, Rounding = 0, Suffix = "%" })
 AimBox:AddDropdown("AimOrigin", {
@@ -744,6 +907,14 @@ AimBox:AddDropdown("AimOrigin", {
     Default = Library.IsMobile and "Screen center" or "Mouse",
     Tooltip = "On mobile there's no mouse, so the screen center is used.",
 })
+AimBox:AddToggle("AimSticky", { Text = "Stay on target", Default = true, Tooltip = "Keeps the same target until it dies, hides or leaves the circle." })
+AimBox:AddToggle("AutoShoot", {
+    Text = "Auto shoot",
+    Default = false,
+    Risky = true,
+    Tooltip = "Fires your held gun when a target is in the circle and in clear view. Ammo, reloads and fire rate still apply.",
+}):AddKeyPicker("AutoShootKey", { Default = "None", Mode = "Toggle", SyncToggleState = true, Text = "Auto shoot" })
+AimBox:AddSlider("AutoShootDelay", { Text = "Auto shoot delay", Default = 120, Min = 0, Max = 1000, Rounding = 0, Suffix = " ms" })
 
 local TargetBox = CombatTab:AddRightGroupbox("Targeting", "users")
 TargetBox:AddToggle("AimEnemiesOnly", {
@@ -753,9 +924,13 @@ TargetBox:AddToggle("AimEnemiesOnly", {
 })
 TargetBox:AddToggle("AimPrisoners", { Text = "Police: include prisoners", Default = false })
 TargetBox:AddToggle("AimVisibleOnly", { Text = "Visible only", Default = false, Tooltip = "Skips targets behind walls." })
-TargetBox:AddToggle("AimNPCs", { Text = "Target guard NPCs", Default = false })
+TargetBox:AddToggle("AimNPCs", { Text = "Target NPCs (guards etc.)", Default = true })
+TargetBox:AddToggle("AimSkipDocile", { Text = "Skip docile NPCs", Default = false, Tooltip = "Docile guards don't shoot back." })
+TargetBox:AddToggle("AimSkipForcefield", { Text = "Skip spawn-protected", Default = true })
 TargetBox:AddToggle("AimPrediction", { Text = "Lead moving targets", Default = true })
 TargetBox:AddSlider("AimPredictionScale", { Text = "Lead amount", Default = 1, Min = 0, Max = 2, Rounding = 2, Suffix = "x" })
+TargetBox:AddToggle("AimPredictVertical", { Text = "Lead up/down movement", Default = true, Tooltip = "Turn off if jumping targets make it miss." })
+TargetBox:AddToggle("AimPingComp", { Text = "Ping compensation", Default = true, Tooltip = "Leads a bit more by your ping, since other players are drawn slightly in the past." })
 TargetBox:AddSlider("AimMaxDistance", { Text = "Max distance", Default = 800, Min = 50, Max = 2000, Rounding = 0, Suffix = " studs" })
 TargetBox:AddDropdown("AimPriority", { Text = "Priority", Values = { "Closest to cursor", "Closest to you", "Lowest health" }, Default = "Closest to cursor" })
 
@@ -869,7 +1044,7 @@ TravelBox:AddSlider("TPVehicleSpeed", { Text = "Vehicle speed", Default = 350, M
 TravelBox:AddToggle("TPUseVehicle", { Text = "Use vehicle if driving", Default = true, Tooltip = "Moves your car with you in it. Much safer than on foot." })
 TravelBox:AddToggle("TPSkyRoute", { Text = "Sky route", Default = true, Tooltip = "Rises first, flies over everything, then drops down." })
 TravelBox:AddSlider("TPSkyHeight", { Text = "Sky route height", Default = 150, Min = 30, Max = 600, Rounding = 0 })
-local TravelStatus = TravelBox:AddLabel("Status: idle")
+TravelStatus = TravelBox:AddLabel("Status: idle")
 TravelBox:AddButton({ Text = "Stop", Func = stopTravel })
 
 local PlacesBox = TeleportTab:AddLeftGroupbox("Places", "map")
@@ -919,15 +1094,6 @@ local function nearestTagged(tag, filter)
     return best
 end
 
-local function vehicleIsFree(model)
-    local seat = model:FindFirstChild("Seat")
-    local playerName = seat and seat:FindFirstChild("PlayerName")
-    if not playerName or playerName.Value ~= "" then return false end
-    if model:GetAttribute("Locked") == true then return false end
-    local restrict = model:GetAttribute("TeamRestrict")
-    if restrict and restrict ~= "" and restrict ~= teamName(LocalPlayer) then return false end
-    return true
-end
 
 PlacesBox:AddButton({
     Text = "Nearest free car",
@@ -1021,7 +1187,6 @@ WaypointBox:AddButton({
 
 -- Robbery --------------------------------------------------------------------------
 local StatusBox = RobberyTab:AddLeftGroupbox("Status", "activity")
-local StatusLabels = {}
 for _, robbery in ipairs(Robberies) do
     StatusLabels[robbery] = StatusBox:AddLabel(robbery.Name .. ": ...")
 end
@@ -1142,6 +1307,8 @@ MobileBox:AddToggle("MobileButtons", {
 })
 MobileBox:AddSlider("MobileButtonSize", { Text = "Button size", Default = 52, Min = 36, Max = 80, Rounding = 0 })
 
+end
+
 Library:SetIgnoreIndexes({ "TPPlayer", "NearbyPrompts", "WaypointName", "WaypointList" })
 
 --// Silent aim -------------------------------------------------------------------
@@ -1180,120 +1347,243 @@ local function aimOrigin()
     return UserInputService:GetMouseLocation()
 end
 
-local function aimPartFor(character)
-    local choice = opt("AimPart", "UpperTorso")
+-- Bullets hit by a sphere test around each target's root part (BulletEmitter
+-- Update, via the "Humanoid" tag), not by touching limbs, so the root part is
+-- the surest thing to aim at. Other parts still land inside that sphere at
+-- normal ranges.
+local AIM_PARTS = {
+    ["Hitbox (root)"] = "HumanoidRootPart",
+    Head = "Head",
+    UpperTorso = "UpperTorso",
+    HumanoidRootPart = "HumanoidRootPart",
+}
+
+local function aimPartFor(character, randomPick)
+    local choice = opt("AimPart", "Hitbox (root)")
     if choice == "Random" then
-        local options = { "Head", "UpperTorso", "HumanoidRootPart" }
-        choice = options[math.random(1, #options)]
+        choice = randomPick or "HumanoidRootPart"
     end
-    return character:FindFirstChild(choice) or getRoot(character)
+    local name = AIM_PARTS[choice] or "HumanoidRootPart"
+    return character:FindFirstChild(name) or getRoot(character)
 end
+
+local AimRayParams = RaycastParams.new()
+AimRayParams.FilterType = Enum.RaycastFilterType.Exclude
+-- Bullets fly through anything that doesn't collide, so the wall check does too.
+pcall(function() AimRayParams.RespectCanCollide = true end)
 
 local function isVisible(part, character)
     local origin = Camera.CFrame.Position
-    local params = RaycastParams.new()
-    params.FilterType = Enum.RaycastFilterType.Exclude
     local ignore = { character, Overlay }
     if LocalPlayer.Character then table.insert(ignore, LocalPlayer.Character) end
     local vehicle = getVehicle()
     if vehicle then table.insert(ignore, vehicle) end
-    params.FilterDescendantsInstances = ignore
-    return Workspace:Raycast(origin, part.Position - origin, params) == nil
+    local items = Workspace:FindFirstChild("Items")
+    if items then table.insert(ignore, items) end
+    AimRayParams.FilterDescendantsInstances = ignore
+    local hit = Workspace:Raycast(origin, part.Position - origin, AimRayParams)
+    if not hit then return true end
+    -- Glass and the like are tagged by the game to let bullets through.
+    return hit.Instance:GetAttribute("InvisibleToBullets") == true
+end
+
+-- NPCs: guards carry the "GuardNPC" tag on their model, and every humanoid the
+-- game's bullets can hit carries the "Humanoid" tag. Anything tagged that
+-- isn't a player's character counts as an NPC. Rebuilt twice a second.
+local NpcCache = { At = 0, List = {} }
+
+local function getNpcs()
+    local now = os.clock()
+    if now - NpcCache.At < 0.5 then
+        return NpcCache.List
+    end
+    NpcCache.At = now
+    local list, seen = {}, {}
+    local function add(model)
+        if seen[model] or not model:IsA("Model") or not model:IsDescendantOf(Workspace) then return end
+        if Players:GetPlayerFromCharacter(model) then return end
+        local humanoid = model:FindFirstChildOfClass("Humanoid")
+        if not humanoid then return end
+        seen[model] = true
+        table.insert(list, {
+            Character = model,
+            Name = CollectionService:HasTag(model, "GuardNPC") and "Guard" or model.Name,
+            Docile = model:GetAttribute("IsDocile") == true,
+            Npc = true,
+        })
+    end
+    for _, model in ipairs(CollectionService:GetTagged("GuardNPC")) do
+        add(model)
+    end
+    for _, humanoid in ipairs(CollectionService:GetTagged("Humanoid")) do
+        if humanoid:IsA("Humanoid") and humanoid.Parent then
+            add(humanoid.Parent)
+        end
+    end
+    local folder = Workspace:FindFirstChild("GuardNPCPlayers")
+    if folder then
+        for _, descendant in ipairs(folder:GetDescendants()) do
+            if descendant:IsA("Humanoid") and descendant.Parent then
+                add(descendant.Parent)
+            end
+        end
+    end
+    NpcCache.List = list
+    return list
 end
 
 local function aimCandidates()
     local list = {}
     for _, player in ipairs(Players:GetPlayers()) do
         if player ~= LocalPlayer and player.Character and (not on("AimEnemiesOnly") or isEnemy(player)) then
-            table.insert(list, { Character = player.Character, Name = player.DisplayName })
+            table.insert(list, { Character = player.Character, Name = player.DisplayName, Player = player })
         end
     end
     if on("AimNPCs") then
-        local folder = Workspace:FindFirstChild("GuardNPCPlayers")
-        if folder then
-            for _, model in ipairs(folder:GetDescendants()) do
-                if model:IsA("Humanoid") and model.Parent and model.Parent:IsA("Model") then
-                    table.insert(list, { Character = model.Parent, Name = model.Parent.Name })
-                end
+        for _, npc in ipairs(getNpcs()) do
+            if not (npc.Docile and on("AimSkipDocile")) then
+                table.insert(list, npc)
             end
         end
     end
     return list
 end
 
+local function myPosition()
+    local root = getRoot()
+    return root and root.Position or Camera.CFrame.Position
+end
+
+-- Scores one candidate, or returns nil if it can't be targeted right now.
+local function scoreCandidate(candidate, origin2D, radius)
+    local character = candidate.Character
+    local humanoid = getHumanoid(character)
+    local root = getRoot(character)
+    if not humanoid or not root or humanoid.Health <= 0 or not character:IsDescendantOf(Workspace) then
+        return nil
+    end
+    if character:FindFirstChildOfClass("ForceField") and on("AimSkipForcefield") then
+        return nil
+    end
+    local distance = (root.Position - myPosition()).Magnitude
+    if distance > opt("AimMaxDistance", 800) then return nil end
+    local part = aimPartFor(character, candidate.RandomPart)
+    local screen, onScreen = Camera:WorldToViewportPoint(part.Position)
+    if not onScreen or screen.Z <= 0 then return nil end
+    local cursorDistance = (Vector2.new(screen.X, screen.Y) - origin2D).Magnitude
+    if cursorDistance > radius then return nil end
+    if on("AimVisibleOnly") and not isVisible(part, character) then return nil end
+    local priority = opt("AimPriority", "Closest to cursor")
+    if priority == "Closest to you" then return distance end
+    if priority == "Lowest health" then return humanoid.Health end
+    return cursorDistance
+end
+
+local RANDOM_PARTS = { "Head", "UpperTorso", "HumanoidRootPart" }
+
 local function updateAimTarget()
-    Aim.Target, Aim.Part, Aim.Character = nil, nil, nil
-    if not on("SilentAim") then return end
+    if not on("SilentAim") then
+        Aim.Target, Aim.Part, Aim.Character = nil, nil, nil
+        return
+    end
 
     local origin2D = aimOrigin()
     local radius = opt("AimFOV", 150)
-    local maxDistance = opt("AimMaxDistance", 800)
-    local myRoot = getRoot()
-    local priority = opt("AimPriority", "Closest to cursor")
-    local best, bestScore
 
+    -- Sticky: keep the current target while it stays valid, with some slack
+    -- on the circle so it doesn't flick off at the edge.
+    if on("AimSticky") and Aim.Target then
+        if scoreCandidate(Aim.Target, origin2D, radius * 1.5) then
+            Aim.Part = aimPartFor(Aim.Target.Character, Aim.Target.RandomPart)
+            return
+        end
+    end
+
+    local best, bestScore
     for _, candidate in ipairs(aimCandidates()) do
-        local character = candidate.Character
-        local humanoid = getHumanoid(character)
-        local root = getRoot(character)
-        if humanoid and root and humanoid.Health > 0 then
-            local distance = (root.Position - (myRoot and myRoot.Position or Camera.CFrame.Position)).Magnitude
-            if distance <= maxDistance then
-                local part = character:FindFirstChild(opt("AimPart", "UpperTorso")) or root
-                local screen, onScreen = Camera:WorldToViewportPoint(part.Position)
-                if onScreen and screen.Z > 0 then
-                    local cursorDistance = (Vector2.new(screen.X, screen.Y) - origin2D).Magnitude
-                    if cursorDistance <= radius and (not on("AimVisibleOnly") or isVisible(part, character)) then
-                        local score = cursorDistance
-                        if priority == "Closest to you" then
-                            score = distance
-                        elseif priority == "Lowest health" then
-                            score = humanoid.Health
-                        end
-                        if not bestScore or score < bestScore then
-                            best, bestScore = candidate, score
-                        end
-                    end
-                end
-            end
+        local score = scoreCandidate(candidate, origin2D, radius)
+        if score and (not bestScore or score < bestScore) then
+            best, bestScore = candidate, score
         end
     end
 
     if best then
+        if not Aim.Target or Aim.Target.Character ~= best.Character then
+            best.RandomPart = RANDOM_PARTS[math.random(1, #RANDOM_PARTS)]
+        else
+            best.RandomPart = Aim.Target.RandomPart
+        end
         Aim.Target = best
         Aim.Character = best.Character
-        Aim.Part = aimPartFor(best.Character)
+        Aim.Part = aimPartFor(best.Character, best.RandomPart)
+    else
+        Aim.Target, Aim.Part, Aim.Character = nil, nil, nil
     end
 end
 
--- Aims from the gun's tip at where the target will be when the bullet gets
--- there, then lifts the aim to cancel the bullet's drop.
+local function networkDelay()
+    if not on("AimPingComp") then return 0 end
+    local ok, ping = pcall(function() return LocalPlayer:GetNetworkPing() end)
+    if ok and type(ping) == "number" then
+        return math.clamp(ping, 0, 0.5)
+    end
+    return 0
+end
+
+-- Where to send the bullet from the gun's tip. Bullets keep a fixed speed and
+-- get pulled down by GravityVector, so this leads the target by the travel
+-- time (re-solved a few times, since leading changes the distance), adds the
+-- network delay because what you see of other players is slightly old, then
+-- aims high by the drop over that time.
 local function solveAim(origin, speed, gravity, part)
     local position = part.Position
-    if type(speed) == "number" and speed > 0 then
-        local time = (position - origin).Magnitude / speed
-        if on("AimPrediction") then
-            position += part.AssemblyLinearVelocity * time * opt("AimPredictionScale", 1)
-            time = (position - origin).Magnitude / speed
-        end
-        if typeof(gravity) == "Vector3" then
-            position -= 0.5 * gravity * time * time
+    if type(speed) ~= "number" or speed <= 0 then
+        local direction = position - origin
+        return direction.Magnitude > 0.01 and direction.Unit or nil
+    end
+
+    local velocity = Vector3.zero
+    if on("AimPrediction") then
+        velocity = part.AssemblyLinearVelocity * opt("AimPredictionScale", 1)
+        if not on("AimPredictVertical") then
+            velocity = Vector3.new(velocity.X, 0, velocity.Z)
         end
     end
-    local direction = position - origin
+    local delay = networkDelay()
+
+    local predicted = position
+    local time = (position - origin).Magnitude / speed
+    for _ = 1, 4 do
+        predicted = position + velocity * (time + delay)
+        time = (predicted - origin).Magnitude / speed
+    end
+    if typeof(gravity) == "Vector3" then
+        predicted -= 0.5 * gravity * time * time
+    end
+
+    local direction = predicted - origin
     if direction.Magnitude < 0.01 then return nil end
     return direction.Unit
 end
 
 if BulletEmitter and type(BulletEmitter.Emit) == "function" then
     local originalEmit = BulletEmitter.Emit
+    local lastRoll, lastRollHit = 0, true
     BulletEmitter.Emit = function(self, origin, direction, speed, ...)
         if not Unloading and type(self) == "table" and self.Local and on("SilentAim") then
             local part = Aim.Part
-            if part and part.Parent and typeof(origin) == "Vector3" and math.random(1, 100) <= opt("AimHitChance", 100) then
-                local ok, aimed = pcall(solveAim, origin, speed, self.GravityVector, part)
-                if ok and aimed then
-                    direction = aimed
+            if part and part.Parent and typeof(origin) == "Vector3" then
+                -- One roll per shot, so every shotgun pellet goes the same way.
+                local now = os.clock()
+                if now - lastRoll > 0.03 then
+                    lastRoll = now
+                    lastRollHit = math.random(1, 100) <= opt("AimHitChance", 100)
+                end
+                if lastRollHit then
+                    local ok, aimed = pcall(solveAim, origin, speed, self.GravityVector, part)
+                    if ok and aimed then
+                        direction = aimed
+                    end
                 end
             end
         end
@@ -1304,6 +1594,25 @@ if BulletEmitter and type(BulletEmitter.Emit) == "function" then
     end)
 else
     task.defer(notify, "Silent aim", "The game's bullet module didn't load, so silent aim is off.", 5)
+end
+
+-- Auto shoot: the same call the gun makes on a click (_attemptShoot), which
+-- still checks ammo, reloads and the fire-rate cooldown itself.
+local LastAutoShot = 0
+
+local function autoShootStep()
+    if not on("AutoShoot") or not on("SilentAim") then return end
+    local part = Aim.Part
+    if not part or not part.Parent or not Aim.Character then return end
+    if os.clock() - LastAutoShot < opt("AutoShootDelay", 120) / 1000 then return end
+    if not ItemSystem or type(ItemSystem.GetEquipped) ~= "function" then return end
+    local ok, item = pcall(ItemSystem.GetEquipped, LocalPlayer)
+    if not ok or type(item) ~= "table" or item.BulletEmitter == nil or type(item._attemptShoot) ~= "function" then
+        return
+    end
+    if not isVisible(part, Aim.Character) then return end
+    LastAutoShot = os.clock()
+    pcall(item._attemptShoot, item)
 end
 
 -- Guns turn the mouse into a world point here every frame; it sets the tip
