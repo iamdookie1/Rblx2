@@ -275,7 +275,7 @@ local System = {
         __peak_velocity = 0, __last_ball_id = nil, __show_ping = false,
         __auto_ability_enabled = false, __cooldown_protection = false,
         __total_parries = 0, __ping_compensation = true, __extra_distance = 0,
-        __curve_hotkeys = true, __retry_delay = 0.6,
+        __curve_hotkeys = true, __retry_delay = 1,
         __spam_rate = 100, __auto_spam_enabled = false, __auto_spam_range = 20
     },
     __config = {
@@ -497,7 +497,9 @@ local function curveForFrame()
 end
 function System.parry.execute()
     if not LocalPlayer.Character then return end
-    fireParryRemote(curveForFrame())
+    -- Until the remote is caught, press the block key like the Ui3 update did.
+    -- The game's own parry then goes through the hook and gets caught.
+    if not fireParryRemote(curveForFrame()) then pressBlockKey() end
     System.__properties.__total_parries = System.__properties.__total_parries + 1
 end
 function System.parry.keypress()
@@ -686,7 +688,7 @@ end
 System.manual_spam = {}
 local macroAnimFix = false
 local spam_accumulator = 0
-local MAX_FIRES_PER_FRAME = 10
+local MAX_FIRES_PER_FRAME = 5
 
 function System.manual_spam.start()
     System.__properties.__manual_spam_enabled = true
@@ -716,10 +718,9 @@ function System.manual_spam.clash()
     return target == LocalPlayer.Name or target == closest.Name
 end
 
--- Runs before physics each frame, so a fire goes out as early in the frame as
--- possible. The rate is fires per second, spread across frames; a slow frame
--- catches up by up to MAX_FIRES_PER_FRAME instead of bunching hundreds at once.
-RunService.PreSimulation:Connect(function(dt)
+-- Same pacing as the Ui3 update: Heartbeat, at most 5 fires a frame. The
+-- rate is fires per second, spread across frames.
+RunService.Heartbeat:Connect(function(dt)
     local props = System.__properties
     local active = props.__manual_spam_enabled
     if not active then
@@ -853,9 +854,6 @@ function System.autoparry.step(dt)
         table.insert(balls, ball)
     end
 
-    -- Look one frame ahead: if the ball will be inside the parry range by the
-    -- next check, parry now rather than a frame late.
-    local frame = math.clamp(dt or 1/60, 0, 0.1)
     local now = tick()
     for _, ball in ipairs(balls) do
         local zoomies = ball:FindFirstChild('zoomies')
@@ -879,13 +877,9 @@ function System.autoparry.step(dt)
         if ball:FindFirstChild('ComboCounter') then continue end
         if blocked_by_detection() then return end
 
-        local velocity = zoomies.VectorVelocity
-        local speed = velocity.Magnitude
-        local offset = root.Position - ball.Position
-        local distance = offset.Magnitude
-        -- Only the part of the velocity heading at us closes the gap.
-        local closing = distance > 0 and math.max(velocity:Dot(offset / distance), 0) or speed
-        if distance - closing * frame > System.parry_distance(speed) then continue end
+        local speed = zoomies.VectorVelocity.Magnitude
+        local distance = (root.Position - ball.Position).Magnitude
+        if distance > System.parry_distance(speed) then continue end
 
         state.parried = true
         state.at = now
@@ -1559,7 +1553,7 @@ AP:AddToggle("PingCompensation", {Text = "Ping compensation", Default = true,
     Callback = function(v) System.__properties.__ping_compensation = v end})
 AP:AddSlider("ExtraDistance", {Text = "Extra distance", Default = 0, Min = -10, Max = 30, Rounding = 0, Suffix = " studs",
     Callback = function(v) System.__properties.__extra_distance = v end})
-AP:AddSlider("RetryDelay", {Text = "Retry delay", Default = 0.6, Min = 0.2, Max = 1.5, Rounding = 2, Suffix = "s",
+AP:AddSlider("RetryDelay", {Text = "Retry delay", Default = 1, Min = 0.2, Max = 1.5, Rounding = 2, Suffix = "s",
     Tooltip = "If the ball is still on you this long after a parry, parry again.",
     Callback = function(v) System.__properties.__retry_delay = v end})
 AP:AddToggle("RandomCurve", {Text = "Random curve", Default = false, Callback = function(s)
@@ -1654,7 +1648,7 @@ SP:AddToggle("ManualSpam", {Text = "Manual spam", Default = false, Callback = fu
         System.__properties.__mobile_guis.manual_spam = nil
     end
 end}):AddKeyPicker("ManualSpamKey", {Default = "E", Mode = "Toggle", SyncToggleState = true, Text = "Manual spam"})
-SP:AddSlider("SpamRate", {Text = "Spam speed", Default = 100, Min = 10, Max = 240, Rounding = 0, Suffix = "/s",
+SP:AddSlider("SpamRate", {Text = "Spam speed", Default = 100, Min = 10, Max = 100, Rounding = 0, Suffix = "/s",
     Tooltip = "Parries per second while spamming.",
     Callback = function(v) System.__properties.__spam_rate = v end})
 SP:AddDropdown("SpamMode", {Text = "Mode", Values = {"Remote", "Keypress"}, Default = "Remote", Callback = function(v) getgenv().ManualSpamMode = v end})
