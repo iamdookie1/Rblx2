@@ -189,6 +189,10 @@ local function remoteReady()
     return Remote.token ~= nil and Remote.remote ~= nil and Remote.args ~= nil
 end
 
+-- Presses block once to get the remote captured; defined further down, once
+-- System exists. Declared here so the hook watcher can call it.
+local prime_remote
+
 -- "A place where they can parry" — mirrors the game's own client parry gate. A
 -- block is allowed when the character isn't Stunned and doesn't carry DoNotParry
 -- (server-set attributes the game toggles whenever you can't block) AND it's in a
@@ -225,7 +229,8 @@ else
         end
         installRemoteHooks()
         if Remote.hooked then
-            Notify("Blade Ball", "Block once (F or click) to finish remote setup. Until then parries use the block key.", 6)
+            Notify("Blade Ball", "Remote hook armed. Turning on a parry feature presses block once to grab the remote.", 6)
+            if prime_remote then prime_remote() end
         else
             Notify("Blade Ball", "Couldn't hook remotes. Parries will use the block key.", 6)
         end
@@ -562,6 +567,33 @@ function System.parry.fast()
     if not fireParryRemote(System.curve.get_cframe_fast()) then pressBlockKey() end
     System.__properties.__total_parries = System.__properties.__total_parries + 1
 end
+
+-- Gets the parry remote captured without you blocking by hand. While any parry
+-- feature is on and you're somewhere you can parry, presses block once, then
+-- again every ~1.5s (the game's own parry cooldown) until the game's parry goes
+-- through the hook. Holds off while you're typing so it doesn't type an "f".
+local remote_priming = false
+prime_remote = function()
+    if remote_priming or remoteReady() or not Remote.token then return end
+    remote_priming = true
+    task.spawn(function()
+        local presses = 0
+        while not remoteReady() and presses < 20 and not Library.Unloaded do
+            local props = System.__properties
+            if not (props.__autoparry_enabled or props.__triggerbot_enabled
+                or props.__auto_spam_enabled or props.__manual_spam_enabled) then break end
+            if Remote.hooked and canParryNow() and not UserInputService:GetFocusedTextBox() then
+                pressBlockKey()
+                presses = presses + 1
+                local start = os.clock()
+                repeat task.wait(0.05) until remoteReady() or os.clock() - start > 1.5
+            else
+                task.wait(0.25)
+            end
+        end
+        remote_priming = false
+    end)
+end
 function System.parry.execute_action() System.animation.play_grab_parry(); System.parry.execute() end
 function System.parry.by_mode(mode)
     if mode == "Keypress" then System.parry.keypress() else System.parry.execute_action() end
@@ -786,11 +818,23 @@ local APCfg = {
     close_range = 20,       -- studs
     instant = true,         -- parry straight from the target change
     preparry = true,        -- parry ahead while the ball is on a player next to you
-    preparry_interval = 0.08,
-    last_preparry = 0,
     timeout = 1,            -- far-away re-parry lockout while the ball stays on us
     parry_window = 0.45,    -- how long a parry stays useful (game's own is ~0.5s)
+    cover_time = 0.4,       -- how long we count on one of our parries still being up
 }
+
+-- One record of our last auto parry, shared by every auto parry path (frame
+-- loop, instant retarget, pre-parry, parry-back). Before, each ran on its own
+-- timer, so a single return could get a pre-parry, an instant retarget parry and
+-- a frame-loop retry on top of each other. Now a path only fires when the last
+-- parry won't still be up by the time the ball arrives. A parry that lands
+-- (ParrySuccess, or the ball leaving us) is used up and frees the next at once.
+local ParryCover = {at = 0}
+local function parry_covers(eta)
+    return ParryCover.at > 0 and tick() + (eta or 0) <= ParryCover.at + APCfg.cover_time
+end
+local function mark_parry() ParryCover.at = tick() end
+local function consume_parry() ParryCover.at = 0 end
 
 local function retry_after(distance)
     if distance > APCfg.close_range then return APCfg.timeout end
@@ -815,6 +859,8 @@ local function get_ball_state(ball)
         local swaps = state.swaps
         swaps[#swaps + 1] = {t = os.clock(), from = state.target, to = new}
         if #swaps > BALL_HISTORY then table.remove(swaps, 1) end
+        -- The ball left us: our parry landed, so it's used up.
+        if state.target == LocalPlayer.Name and new ~= LocalPlayer.Name then consume_parry() end
         state.target = new
         state.parried = false
         if new == LocalPlayer.Name and System.autoparry.on_retarget then
@@ -932,11 +978,15 @@ local function try_parry_ball(ball, root, now, curve_hold, training)
     if blocked_by_detection() then return false end
 
     -- Inside the window, or up close and arriving before a parry would expire.
+    local eta = distance / math.max(speed, 1)
     local in_window = distance <= System.parry_distance(speed)
-    if not in_window and not (close and distance / math.max(speed, 1) <= APCfg.parry_window) then return false end
+    if not in_window and not (close and eta <= APCfg.parry_window) then return false end
+    -- Already have a parry up that will still be up when this ball lands.
+    if parry_covers(eta) then return false end
 
     state.parried = true
     state.at = now
+    mark_parry()
     if not try_ability() then
         System.parry.by_mode(getgenv().AutoParryMode)
     end
@@ -947,9 +997,9 @@ local function preparry_now()
     -- Remote only: a block-key press puts the game's own ~1.3s parry cooldown on
     -- you, so pre-parrying by key would burn it right before the ball arrives.
     if getgenv().AutoParryMode == "Keypress" or not remoteReady() then return false end
-    local now = tick()
-    if now - APCfg.last_preparry < APCfg.preparry_interval then return false end
-    APCfg.last_preparry = now
+    -- One pre-parry per cover window, renewed only once it's about to lapse.
+    if ParryCover.at > 0 and tick() - ParryCover.at < APCfg.cover_time * 0.75 then return false end
+    mark_parry()
     System.parry.by_mode(getgenv().AutoParryMode)
     return true
 end
@@ -1002,17 +1052,16 @@ function System.autoparry.on_retarget(ball)
     pcall(try_parry_ball, ball, root, tick(), false, Workspace:FindFirstChild("TrainingBalls"))
 end
 
--- Close-range parry by someone else: shared by auto parry (parry back now) and
--- auto spam (counts toward a clash).
-local CloseParry = {name = nil, at = 0}
+-- Our own parry landed: it's used up, so the next return gets a fresh one.
+Remotes.ParrySuccess.OnClientEvent:Connect(consume_parry)
+
+-- Close-range parry by someone else: the ball is about to be ours, parry back.
 Remotes.ParrySuccessAll.OnClientEvent:Connect(function(_, root)
     if System.__properties.__grab_animation then pcall(function() System.__properties.__grab_animation:Stop() end) end
     local myRoot = getRoot()
     if not myRoot or typeof(root) ~= 'Instance' or not root:IsA('BasePart') or not root.Parent then return end
     local char = root.Parent
     if char == LocalPlayer.Character or (root.Position - myRoot.Position).Magnitude > APCfg.close_range then return end
-    CloseParry.name, CloseParry.at = char.Name, os.clock()
-    -- They just parried next to us: the ball is about to be ours.
     local apRoot = APCfg.preparry and autoparry_can_run()
     if apRoot and not blocked_by_detection() then
         for _, ball in ipairs(get_live_balls()) do
@@ -1061,9 +1110,9 @@ local ManualSpam = {rate = 300}     -- parries per second
 local AutoSpam = {
     rate = 250,
     clash_range = 30,       -- max studs between you and them
-    clash_swaps = 2,        -- swaps between you and them inside the window
-    clash_window = 0.75,    -- seconds
-    point_blank = true,
+    clash_swaps = 2,        -- hand-offs between you and them in one run
+    clash_window = 0.75,    -- max seconds between hand-offs
+    point_blank = false,
     point_blank_range = 14, -- studs
     linger = 0.2,           -- keep going this long after the last detection
     active_until = 0,
@@ -1085,45 +1134,67 @@ local function spam_fire()
     end
 end
 
-local function detect_clash(ball, root, now)
-    local me = LocalPlayer.Name
-    local swaps = get_ball_state(ball).swaps
-    local count, opponent = 0, nil
-    for i = #swaps, 1, -1 do
-        local s = swaps[i]
-        if now - s.t > AutoSpam.clash_window then break end
-        if s.to == me or s.from == me then
-            local other = (s.to == me) and s.from or s.to
-            if type(other) == 'string' and other ~= '' and other ~= me and (opponent == nil or other == opponent) then
-                opponent = other
-                count = count + 1
+-- The ball's recent owners, newest first: one entry per change of hands, with
+-- blank targets dropped (the game can clear the target between owners) and
+-- repeats collapsed. t is when that player got the ball.
+local function ball_owners(state)
+    local owners = {}
+    for i = #state.swaps, 1, -1 do
+        local s = state.swaps[i]
+        if type(s.to) == 'string' and s.to ~= '' then
+            local last = owners[#owners]
+            if last and last.name == s.to then
+                last.t = s.t
+            else
+                owners[#owners + 1] = {name = s.to, t = s.t}
             end
         end
     end
-    -- A close-range parry by the same player counts as part of the exchange.
-    if CloseParry.name and now - CloseParry.at <= AutoSpam.clash_window and (opponent == nil or opponent == CloseParry.name) then
-        opponent = CloseParry.name
-        count = count + 1
-    end
-    if count < AutoSpam.clash_swaps or not opponent then return nil end
-    local their_root = character_root(opponent)
-    if not their_root or (their_root.Position - root.Position).Magnitude > AutoSpam.clash_range then return nil end
-    -- The ball has to be in the exchange, not flying off somewhere else.
-    if (ball.Position - root.Position).Magnitude > AutoSpam.clash_range * 1.5 then return nil end
-    return "clash vs " .. opponent
+    return owners
 end
 
-local function detect_point_blank(ball, root)
-    if not AutoSpam.point_blank then return nil end
-    local target = ball:GetAttribute('target')
-    if type(target) ~= 'string' or target == '' then return nil end
-    if (ball.Position - root.Position).Magnitude > AutoSpam.point_blank_range then return nil end
-    if target == LocalPlayer.Name then return "point blank" end
-    local their_root = character_root(target)
-    if their_root and (their_root.Position - root.Position).Magnitude <= AutoSpam.point_blank_range then
-        return "point blank vs " .. target
+-- A clash is the ball going back and forth between you and one player standing
+-- close. Counts the hand-offs between the two of you in one unbroken run and
+-- engages once that reaches the "clash hits" slider. Each hand-off has to come
+-- within the clash window of the previous one; a long hold (the ball flying in
+-- from someone far away) can start a run but nothing before it counts. Only
+-- real hand-offs count: one parry is one hit, never two.
+local function detect_clash(ball, root, now)
+    local owners = ball_owners(get_ball_state(ball))
+    local newest, second = owners[1], owners[2]
+    if not second or now - newest.t > AutoSpam.clash_window then return nil end
+    local me = LocalPlayer.Name
+    local opponent
+    if newest.name == me then opponent = second.name
+    elseif second.name == me then opponent = newest.name
+    else return nil end -- ball isn't with you or them right now
+
+    local hits = 0
+    for i = 1, #owners - 1 do
+        local cur, prev = owners[i], owners[i + 1]
+        local alternates = (cur.name == me and prev.name == opponent) or (cur.name == opponent and prev.name == me)
+        if not alternates then break end
+        hits = hits + 1
+        if cur.t - prev.t > AutoSpam.clash_window then break end
     end
-    return nil
+    if hits < AutoSpam.clash_swaps then return nil end
+
+    local their_root = character_root(opponent)
+    if not their_root or (their_root.Position - root.Position).Magnitude > AutoSpam.clash_range then return nil end
+    if (ball.Position - root.Position).Magnitude > AutoSpam.clash_range * 1.5 then return nil end
+    return ("clash vs %s (%d hits)"):format(opponent, hits)
+end
+
+-- Ball on you, right on top of you, and actually coming at you.
+local function detect_point_blank(ball, root)
+    if not AutoSpam.point_blank or ball:GetAttribute('target') ~= LocalPlayer.Name then return nil end
+    local offset = root.Position - ball.Position
+    local distance = offset.Magnitude
+    if distance > AutoSpam.point_blank_range then return nil end
+    local zoomies = ball:FindFirstChild('zoomies')
+    local velocity = zoomies and zoomies.VectorVelocity or ball.AssemblyLinearVelocity
+    if distance > 1 and velocity:Dot(offset.Unit) <= 0 then return nil end
+    return "point blank"
 end
 
 -- Once per frame: decide whether auto spam should be firing.
@@ -1832,7 +1903,7 @@ local function remoteStatusText()
         if not canParryNow() then return "Remote: waiting until you can parry. Parries use the block key until then" end
         return "Remote: hook unavailable, parries use the block key"
     end
-    return "Remote: waiting. Block once (F or click) to capture it. Parries use the block key until then"
+    return "Remote: waiting for the first block (pressed for you while a parry feature is on). Parries use the block key until then"
 end
 
 local status_peak, status_ball = 0, nil
@@ -1870,7 +1941,7 @@ local AP = Tabs.Parry:AddLeftGroupbox("Auto Parry", "swords")
 AP:AddToggle("AutoParry", {Text = "Auto parry", Default = false, Callback = function(v)
     System.__properties.__autoparry_enabled = v
     System.__properties.__play_animation = v
-    if v then System.autoparry.start() else System.autoparry.stop() end
+    if v then System.autoparry.start(); prime_remote() else System.autoparry.stop() end
     NotifyToggle("Auto Parry", v)
 end}):AddKeyPicker("AutoParryKey", {Default = "None", Mode = "Toggle", SyncToggleState = true, Text = "Auto parry"})
 AP:AddDropdown("ParryMode", {Text = "Parry mode", Values = {"Remote", "Keypress"}, Default = "Remote",
@@ -1931,6 +2002,7 @@ local TB = Tabs.Parry:AddRightGroupbox("Triggerbot", "crosshair")
 local function setTriggerbot(v)
     System.__properties.__triggerbot_enabled = v
     System.triggerbot.enable(v)
+    if v then prime_remote() end
 end
 TB:AddToggle("Triggerbot", {Text = "Triggerbot", Default = false,
     Tooltip = "Parries the moment the ball targets you, at any distance. Overrides auto parry while on.",
@@ -2004,6 +2076,7 @@ SP:AddToggle("ManualSpam", {Text = "Manual spam", Default = false, Callback = fu
         end
     else
         System.__properties.__manual_spam_enabled = v
+        if v then prime_remote() end
     end
     NotifyToggle("Manual Spam", v)
 end}):AddKeyPicker("ManualSpamKey", {Default = "E", Mode = "Hold", SyncToggleState = true, Text = "Manual spam"})
@@ -2021,7 +2094,7 @@ AS:AddToggle("AutoSpam", {Text = "Auto spam", Default = false,
     Tooltip = "Watches for clashes (the ball bouncing between you and a nearby player) and spams only while one is happening.",
     Callback = function(v)
         System.__properties.__auto_spam_enabled = v
-        if not v then AutoSpam.active_until, AutoSpam.reason = 0, nil end
+        if v then prime_remote() else AutoSpam.active_until, AutoSpam.reason = 0, nil end
         NotifyToggle("Auto Spam", v)
     end})
 local AutoSpamLabel = AS:AddLabel("Status: off", true)
@@ -2031,14 +2104,14 @@ AS:AddSlider("AutoSpamRate", {Text = "Spam rate", Default = 250, Min = 20, Max =
 AS:AddSlider("ClashRange", {Text = "Clash range", Default = 30, Min = 10, Max = 80, Rounding = 0, Suffix = " studs",
     Tooltip = "How close the other player has to be for the exchange to count as a clash.",
     Callback = function(v) AutoSpam.clash_range = v end})
-AS:AddSlider("ClashSwaps", {Text = "Clash sensitivity", Default = 2, Min = 1, Max = 5, Rounding = 0, Suffix = " swaps",
-    Tooltip = "How many times the ball has to go between you and them inside the clash window. Lower kicks in sooner.",
+AS:AddSlider("ClashSwaps", {Text = "Clash hits", Default = 2, Min = 1, Max = 6, Rounding = 0, Suffix = " hits",
+    Tooltip = "Hand-offs between you and the same nearby player before spamming. 1 = as soon as you send it to them, 2 = once they send it back, and so on.",
     Callback = function(v) AutoSpam.clash_swaps = v end})
 AS:AddSlider("ClashWindow", {Text = "Clash window", Default = 0.75, Min = 0.2, Max = 2, Rounding = 2, Suffix = "s",
-    Tooltip = "How far back to look for those swaps.",
+    Tooltip = "Max time between hand-offs for them to count as one exchange. Raise it if slower clashes aren't picked up.",
     Callback = function(v) AutoSpam.clash_window = v end})
-AS:AddToggle("PointBlankSpam", {Text = "Point-blank spam", Default = true,
-    Tooltip = "Also spams when the ball is right on top of you, or on a player standing right next to you.",
+AS:AddToggle("PointBlankSpam", {Text = "Point-blank spam", Default = false,
+    Tooltip = "Also spams when the ball is on you, inside point-blank range and coming at you, even without a clash. Ignores Clash hits.",
     Callback = function(v) AutoSpam.point_blank = v end})
 AS:AddSlider("PointBlankRange", {Text = "Point-blank range", Default = 14, Min = 4, Max = 35, Rounding = 0, Suffix = " studs",
     Callback = function(v) AutoSpam.point_blank_range = v end})
