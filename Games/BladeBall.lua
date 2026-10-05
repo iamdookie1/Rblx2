@@ -429,12 +429,9 @@ pcall(function()
     end)
 end)
 
--- The game's block button (tagged "BlockButton"). Its click handler runs the
--- game's whole parry: its own alive/stun checks, cooldown, hold value, packet
--- and animation, exactly like a real tap on the phone button. Calling that
--- handler is the closest thing to a real parry, so it's used whenever the
--- curve is the plain camera one (the game always sends the camera CFrame).
-local System -- defined further down; read here only once parries start
+-- The game's block button (tagged "BlockButton"), the phone block button.
+-- Its click handler runs the game's own parry. Used by the Keypress mode,
+-- since phones have no F key.
 local _blockHandler, _blockButton = nil, nil
 local function _findBlockHandler()
     if _blockHandler and _blockButton and _blockButton.Parent then return _blockHandler end
@@ -459,29 +456,8 @@ local function _findBlockHandler()
     return nil
 end
 
-local function _isCameraCurve()
-    local names = System and System.__config and System.__config.__curve_names
-    local mode = System and System.__properties and System.__properties.__curve_mode
-    return not names or not mode or names[mode] == "Camera"
-end
-
 local function fireParryRemote(curveCF)
     local cam = workspace.CurrentCamera
-    if _isCameraCurve() then
-        local handler = _findBlockHandler()
-        if handler then
-            -- Same clean thread as the PRY entry: the game's env as both the
-            -- thread globals and the only Lua frame's env.
-            local env, setenv = _gameEnv, _setfenv
-            local caller = function()
-                if env and setenv then pcall(setenv, 0, env) end
-                pcall(handler)
-            end
-            if env and setenv then pcall(setenv, caller, env) end
-            task.spawn(caller)
-            return true
-        end
-    end
     if _pryEntry and _direct then
         -- Locked counts as handled, so nothing falls back to a key press.
         if os.clock() < _parryLockedUntil then return true end
@@ -541,7 +517,7 @@ end
 -- ============================================================
 -- SYSTEM
 -- ============================================================
-System = {
+local System = {
     __properties = {
         __autoparry_enabled = false, __triggerbot_enabled = false,
         __manual_spam_enabled = false, __play_animation = false,
