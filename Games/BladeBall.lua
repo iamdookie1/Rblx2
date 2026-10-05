@@ -106,7 +106,7 @@ if not _tokenFound then
     return
 end
 
-Notify("Blade Ball", "First block yourself", 3)
+Notify("Blade Ball", "Press Capture to hook the parry remote", 3)
 
 function _tokenize(_remote_uid)
     local time = tostring(math.floor(workspace:GetServerTimeNow() * 100))
@@ -125,8 +125,9 @@ local _capturedRemote = nil
 local _capturedArgs = nil
 
 -- Every Instance shares one metatable, so an __index hook runs on every
--- property read in the whole game. It only needs to run until the parry
--- remote is caught, so it's armed while waiting and taken off right after.
+-- property read in the whole game. It's only installed for a short window
+-- after the Capture button presses F, and taken off as soon as the parry
+-- remote is caught (or the window runs out).
 -- Any key other than FireServer / InvokeServer, and any call this script
 -- makes itself, falls straight through.
 local _checkcaller = checkcaller or function() return false end
@@ -146,7 +147,7 @@ local function _unhook()
     end
 end
 
-local _rearm
+local _showCapture
 local _destroyConn
 
 local function _capture(remote, args)
@@ -154,10 +155,15 @@ local function _capture(remote, args)
     -- If the game swaps the remote out, go back to waiting for the new one.
     if _destroyConn then _destroyConn:Disconnect() end
     _destroyConn = remote.AncestryChanged:Connect(function(_, parent)
-        if parent == nil and _capturedRemote == remote then _rearm() end
+        if parent == nil and _capturedRemote == remote then
+            _capturedRemote, _capturedArgs = nil, nil
+            _showCapture()
+            Notify("Blade Ball", "Parry remote changed. Press Capture again.", 4)
+        end
     end)
     task.defer(function()
         _unhook()
+        _showCapture(false)
         Notify("Blade Ball", "Remote hooked", 3)
     end)
 end
@@ -191,21 +197,62 @@ local function _hook()
     setreadonly(_meta, true)
 end
 
--- Drop the caught remote and wait for the next block.
-function _rearm()
+-- How long the hook stays on after a Capture press. Covers the game's block
+-- cooldown and a slow frame; if nothing is caught by then it comes off again.
+local CAPTURE_WINDOW = 1.5
+local _captureGen = 0
+
+local function _captureNow()
     _capturedRemote, _capturedArgs = nil, nil
     if _destroyConn then _destroyConn:Disconnect(); _destroyConn = nil end
+    _captureGen = _captureGen + 1
+    local gen = _captureGen
     _hook()
+    -- VirtualInputManager works the same on phone, so this needs no keyboard.
+    -- A real block (F, click or the game's mobile button) inside the window
+    -- is caught too.
+    pcall(function()
+        VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.F, false, game)
+        VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.F, false, game)
+    end)
+    task.delay(CAPTURE_WINDOW, function()
+        if gen ~= _captureGen or _capturedRemote then return end
+        _unhook()
+        Notify("Blade Ball", "Not caught (block on cooldown?). Press Capture again.", 3)
+    end)
 end
 
-_hook()
+-- On-screen button so this works without a keyboard. It's shown on load and
+-- whenever the remote needs catching again, and hidden once it's caught.
+local CaptureGui = Instance.new('ScreenGui')
+CaptureGui.Name = 'BladeBall_Capture'; CaptureGui.ResetOnSpawn = false
+CaptureGui.IgnoreGuiInset = true; CaptureGui.DisplayOrder = 9999
+local CaptureButton = Instance.new('TextButton')
+CaptureButton.Size = UDim2.new(0, 150, 0, 50)
+CaptureButton.Position = UDim2.new(0.5, 0, 0.18, 0); CaptureButton.AnchorPoint = Vector2.new(0.5, 0)
+CaptureButton.BackgroundColor3 = Color3.fromRGB(40, 40, 40); CaptureButton.AutoButtonColor = true
+CaptureButton.Active = true; CaptureButton.Draggable = true
+CaptureButton.Font = Enum.Font.GothamBold; CaptureButton.TextSize = 16
+CaptureButton.TextColor3 = Color3.fromRGB(255, 255, 255); CaptureButton.Text = "Capture (F)"
+Instance.new('UICorner', CaptureButton).CornerRadius = UDim.new(0, 10)
+local captureStroke = Instance.new('UIStroke', CaptureButton)
+captureStroke.Color = Color3.fromRGB(0, 170, 255); captureStroke.Thickness = 2
+captureStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+CaptureButton.Parent = CaptureGui
+pcall(function() CaptureGui.Parent = gethui and gethui() or CoreGui end)
+if not CaptureGui.Parent then CaptureGui.Parent = LocalPlayer:WaitForChild('PlayerGui') end
+CaptureButton.MouseButton1Click:Connect(_captureNow)
 
--- The hook is live from here, so the rest of the script (and the menu) loads
--- straight away instead of after a fixed 5 second wait. The remote is caught
--- the instant you block; this only warns if that hasn't happened in 30s.
+function _showCapture(visible)
+    CaptureGui.Enabled = visible ~= false
+end
+
+-- Nothing is hooked until the button is pressed.
+_showCapture(true)
+
 task.delay(30, function()
     if not _capturedRemote then
-        Notify("Blade Ball", "Remote not found yet. Block once (F or click).", 5)
+        Notify("Blade Ball", "Remote not caught yet. Press the Capture button.", 5)
     end
 end)
 
@@ -1520,14 +1567,14 @@ local TargetLabel = Overview:AddLabel("Ball target: -", true)
 
 local function remoteStatusText()
     if remoteReady() then return "Remote: hooked" end
-    return "Remote: waiting. Block once yourself to capture it"
+    return "Remote: waiting. Press the Capture button"
 end
 
 Overview:AddButton({Text = "Recapture remote",
-    Tooltip = "Use if parries stop registering. Block once after pressing this.",
+    Tooltip = "Use if parries stop registering. Shows the Capture button again.",
     Func = function()
-        _rearm()
-        Notify("Blade Ball", "Block once to recapture the remote", 3)
+        _showCapture(true)
+        Notify("Blade Ball", "Press Capture to hook the remote again", 3)
     end})
 
 local status_peak, status_ball = 0, nil
@@ -1890,7 +1937,9 @@ end))
 -- UNLOAD
 -- ============================================================
 Library:OnUnload(function()
+    _captureGen = _captureGen + 1
     _unhook()
+    pcall(function() CaptureGui:Destroy() end)
     if _destroyConn then pcall(function() _destroyConn:Disconnect() end) end
     System.autoparry.stop()
     setTriggerbot(false)
