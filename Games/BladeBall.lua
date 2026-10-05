@@ -229,7 +229,9 @@ local System = {
     __properties = {
         __autoparry_enabled = false, __triggerbot_enabled = false,
         __manual_spam_enabled = false, __play_animation = false,
-        __curve_mode = 1, __accuracy = 50, __divisor_multiplier = 1.1,
+        __curve_mode = 1, __accuracy = 50, __accuracy_base = 50, __divisor_multiplier = 1.1,
+        __random_accuracy = false, __random_accuracy_amount = 10, __frame_dt = 1/60,
+        __auto_spam_enabled = false,
         __parried = false, __training_parried = false, __parries = 0,
         __grab_animation = nil, __tornado_time = tick(),
         __connections = {}, __infinity_active = false,
@@ -254,6 +256,19 @@ local function update_divisor()
     System.__properties.__divisor_multiplier = 0.7 + (System.__properties.__accuracy - 1) * (0.9/99)
 end
 update_divisor()
+
+-- Effective accuracy is the slider value, optionally jittered by a random amount
+-- centred on that value. Re-rolled each frame while randomize is on, so the
+-- parry window wanders around the chosen accuracy instead of being fixed.
+local function roll_accuracy()
+    local props = System.__properties
+    local acc = props.__accuracy_base
+    if props.__random_accuracy and props.__random_accuracy_amount > 0 then
+        acc = acc + math.random(-props.__random_accuracy_amount, props.__random_accuracy_amount)
+    end
+    props.__accuracy = math.clamp(acc, 1, 100)
+    update_divisor()
+end
 
 -- Animation
 System.animation = {}
@@ -501,24 +516,51 @@ onNet("RE/TimeHoleDeactivate", function()
 end)
 
 local maxParryCount = 36; local parryDelay = 0.05
+-- One loop at a time, driven locally so it works even if the server is slow to
+-- echo SlashesOfFuryParry back. The old loop only started on Catch (which can
+-- race ahead of Activate) and relied entirely on the server count, so it often
+-- never ran or stopped early. This one starts on either event and keeps its own
+-- count as a safety cap.
+local slashesLoopRunning = false
+local function runSlashesLoop()
+    if slashesLoopRunning then return end
+    if not System.__config.__detections.__slashesoffury then return end
+    if not System.__properties.__slashesoffury_active then return end
+    slashesLoopRunning = true
+    task.spawn(function()
+        local sent = 0
+        while System.__properties.__slashesoffury_active
+            and System.__config.__detections.__slashesoffury
+            and sent < maxParryCount
+            and System.__properties.__slashesoffury_count < maxParryCount
+            and LocalPlayer.Character do
+            System.parry.execute()
+            if System.__properties.__play_animation then
+                pcall(System.animation.play_grab_parry)
+            end
+            sent = sent + 1
+            task.wait(parryDelay)
+        end
+        slashesLoopRunning = false
+    end)
+end
 onNet("RE/SlashesOfFuryActivate", function(player)
     if isLocal(player) then
-        System.__properties.__slashesoffury_active = true; System.__properties.__slashesoffury_count = 0
+        System.__properties.__slashesoffury_active = true
+        System.__properties.__slashesoffury_count = 0
+        runSlashesLoop()
     end
 end)
 onNet("RE/SlashesOfFuryEnd", function()
-    System.__properties.__slashesoffury_active = false; System.__properties.__slashesoffury_count = 0
+    System.__properties.__slashesoffury_active = false
+    System.__properties.__slashesoffury_count = 0
+    slashesLoopRunning = false
 end)
 onNet("RE/SlashesOfFuryParry", function()
     System.__properties.__slashesoffury_count = System.__properties.__slashesoffury_count + 1
 end)
 onNet("RE/SlashesOfFuryCatch", function()
-    task.spawn(function()
-        while System.__properties.__slashesoffury_active and System.__properties.__slashesoffury_count < maxParryCount do
-            if not System.__config.__detections.__slashesoffury then break end
-            System.parry.execute(); task.wait(parryDelay)
-        end
-    end)
+    runSlashesLoop()
 end)
 
 Runtime.ChildAdded:Connect(function(Object)
@@ -623,7 +665,7 @@ end
 System.manual_spam = {}
 local macroAnimFix = false
 local spam_accumulator = 0
-local SPAM_RATE = 0.01
+local SPAM_RATE = 0.01          -- seconds between fires (set by the rate slider)
 
 function System.manual_spam.start()
     System.__properties.__manual_spam_enabled = true
@@ -633,27 +675,88 @@ function System.manual_spam.stop()
     System.__properties.__manual_spam_enabled = false
 end
 
+-- One parry fire for the spam loops, honouring the mode (remote vs keypress)
+-- and the optional animation fix. Shared by manual spam and auto spam.
+local function spam_fire()
+    if getgenv().ManualSpamMode == "Keypress" then
+        pcall(function() System.parry.keypress() end)
+    else
+        pcall(function() System.parry.execute() end)
+        if getgenv().ManualSpamAnimationFix and macroAnimFix then
+            pcall(function() System.animation.play_grab_parry() end)
+        end
+    end
+end
+
 RunService.Heartbeat:Connect(function(dt)
     if not System.__properties.__manual_spam_enabled then
         spam_accumulator = 0
         return
     end
     spam_accumulator = spam_accumulator + dt
-    local maxFires = 5
+    -- Cap fires per frame so a frame spike can't dump a huge burst at once,
+    -- but scale it to the rate so fast rates still keep up.
+    local maxFires = math.clamp(math.ceil(dt / SPAM_RATE) + 2, 5, 30)
     local fired = 0
     while spam_accumulator >= SPAM_RATE and fired < maxFires do
         spam_accumulator = spam_accumulator - SPAM_RATE
         fired = fired + 1
-        if getgenv().ManualSpamMode == "Keypress" then
-            pcall(function() System.parry.keypress() end)
-        else
-            pcall(function() System.parry.execute() end)
-            if getgenv().ManualSpamAnimationFix and macroAnimFix then
-                pcall(function() System.animation.play_grab_parry() end)
-            end
-        end
+        spam_fire()
     end
     if spam_accumulator > SPAM_RATE * 10 then spam_accumulator = 0 end
+end)
+
+-- ============================================================
+-- AUTO SPAM (SMART - ONLY WHEN NEEDED)
+-- ============================================================
+-- Unlike manual spam, this only fires while a ball is actually bearing down on
+-- you (targeting you and inside a danger range) or during Slashes Of Fury, so
+-- it stays idle the rest of the time instead of hammering parries non-stop.
+System.auto_spam = {}
+local AUTO_SPAM_RATE = 0.02     -- seconds between fires while engaged
+local autoSpamRange = 1.6       -- multiplier of the normal parry range for the danger zone
+local auto_spam_accumulator = 0
+
+local function auto_spam_needed()
+    if System.__properties.__slashesoffury_active then return true end
+    local root = getRoot()
+    if not root or root:FindFirstChild('SingularityCape') then return false end
+    local balls = System.ball.get_all()
+    local training = Workspace:FindFirstChild("TrainingBalls")
+    if training then
+        for _, ball in ipairs(training:GetChildren()) do
+            if ball:GetAttribute("realBall") then table.insert(balls, ball) end
+        end
+    end
+    for _, ball in ipairs(balls) do
+        if ball:GetAttribute('target') == LocalPlayer.Name then
+            local zoomies = ball:FindFirstChild('zoomies')
+            local speed = zoomies and zoomies.VectorVelocity.Magnitude or ball.AssemblyLinearVelocity.Magnitude
+            local distance = (root.Position - ball.Position).Magnitude
+            if distance <= System.parry_distance(speed) * autoSpamRange then return true end
+        end
+    end
+    return false
+end
+
+RunService.Heartbeat:Connect(function(dt)
+    if not System.__properties.__auto_spam_enabled then
+        auto_spam_accumulator = 0
+        return
+    end
+    if not auto_spam_needed() then
+        auto_spam_accumulator = 0
+        return
+    end
+    auto_spam_accumulator = auto_spam_accumulator + dt
+    local maxFires = math.clamp(math.ceil(dt / AUTO_SPAM_RATE) + 2, 5, 30)
+    local fired = 0
+    while auto_spam_accumulator >= AUTO_SPAM_RATE and fired < maxFires do
+        auto_spam_accumulator = auto_spam_accumulator - AUTO_SPAM_RATE
+        fired = fired + 1
+        spam_fire()
+    end
+    if auto_spam_accumulator > AUTO_SPAM_RATE * 10 then auto_spam_accumulator = 0 end
 end)
 
 
@@ -664,17 +767,26 @@ System.autoparry = {}
 
 -- How far away (studs) a ball moving at `speed` gets parried.
 function System.parry_distance(speed)
+    local props = System.__properties
     local ping_ms = getPing()
     local ping_threshold = math.clamp(ping_ms / 100, 5, 17)
-    local capped_speed_diff = math.min(math.max(speed - 9.5, 0), 650)
-    local speed_divisor = (2.4 + capped_speed_diff * 0.002) * System.__properties.__divisor_multiplier
+    -- Old code capped the speed term at 650, so past ~660 studs/s the window
+    -- stopped growing and very fast balls were parried too late (or skipped).
+    -- Growth now continues for any speed, just tapering off so it stays sane.
+    local speed_diff = math.max(speed - 9.5, 0)
+    local speed_divisor = (2.4 + speed_diff * 0.0016) * props.__divisor_multiplier
     local distance = ping_threshold + math.max(speed / speed_divisor, 9.5)
-    if System.__properties.__ping_compensation then
+    if props.__ping_compensation then
         -- The parry reaches the server about half a round trip later, and the
         -- ball keeps closing in the meantime.
         distance = distance + speed * (ping_ms / 1000) * 0.5
     end
-    return distance + System.__properties.__extra_distance
+    -- High-speed safety: a ball moving fast enough can jump the whole window in
+    -- a single frame. Guarantee the window is at least a few frames of travel so
+    -- the distance check catches it no matter the frame rate.
+    local frame_travel = speed * math.clamp(props.__frame_dt * 3, 1/120, 0.12)
+    if frame_travel > distance then distance = frame_travel end
+    return distance + props.__extra_distance
 end
 
 -- One state per ball, so with several balls in play parrying one doesn't
@@ -747,6 +859,9 @@ function System.autoparry.step()
     local root = getRoot()
     if not root or root:FindFirstChild('SingularityCape') then return end
 
+    -- Re-roll the jittered accuracy once per frame while randomize is on.
+    if props.__random_accuracy then roll_accuracy() end
+
     -- Called every frame, not only when a ball is on us: it smooths the curve
     -- angle between calls.
     local curved = System.detection.is_curved()
@@ -799,7 +914,8 @@ end
 function System.autoparry.start()
     if System.__properties.__connections.__autoparry then return end
     local last_error
-    System.__properties.__connections.__autoparry = RunService.PreSimulation:Connect(function()
+    System.__properties.__connections.__autoparry = RunService.PreSimulation:Connect(function(dt)
+        if dt then System.__properties.__frame_dt = dt end
         local ok, err = pcall(System.autoparry.step)
         if not ok and err ~= last_error then
             last_error = err
@@ -1213,6 +1329,18 @@ local abilityEspBillboards = {}
 local abilityEspConnections = {}
 local abilityEspPlayerAddedConnection = nil
 
+-- Live-editable Ability ESP settings. The per-player update loop reads these
+-- every frame, so changing any of them from the menu takes effect instantly.
+local AbilityESPConfig = {
+    Color = Color3.fromRGB(255, 255, 255),
+    TextSize = 14,
+    Height = 3.5,          -- studs above the head
+    ShowName = true,       -- show the player's display name
+    ShowDistance = false,  -- append distance in studs
+    OnlyWithAbility = false, -- only show players who have an ability equipped
+    MaxDistance = 0,       -- 0 = unlimited; otherwise hide beyond this many studs
+}
+
 local function create_ability_esp_for_player(player)
     task.spawn(function()
         local character = player.Character
@@ -1223,11 +1351,11 @@ local function create_ability_esp_for_player(player)
         local billboard = Instance.new('BillboardGui')
         billboard.Name = 'AbilityESPGui'; billboard.Adornee = head
         billboard.Size = UDim2.new(0, 220, 0, 60)
-        billboard.StudsOffset = Vector3.new(0, 3.5, 0); billboard.AlwaysOnTop = true
+        billboard.StudsOffset = Vector3.new(0, AbilityESPConfig.Height, 0); billboard.AlwaysOnTop = true
         billboard.Parent = head
         local label = Instance.new('TextLabel')
         label.Size = UDim2.new(1, 0, 1, 0); label.BackgroundTransparency = 1
-        label.TextColor3 = Color3.fromRGB(255, 255, 255); label.TextSize = 14
+        label.TextColor3 = AbilityESPConfig.Color; label.TextSize = AbilityESPConfig.TextSize
         label.TextStrokeTransparency = 0; label.Font = Enum.Font.Roboto
         label.RichText = true; label.TextXAlignment = Enum.TextXAlignment.Center
         label.TextYAlignment = Enum.TextYAlignment.Center; label.Parent = billboard
@@ -1242,12 +1370,33 @@ local function create_ability_esp_for_player(player)
                 pcall(function() billboard:Destroy() end)
                 abilityEspBillboards[player] = nil; return
             end
-            if getgenv().AbilityESP then
-                label.Visible = true
-                local ability = player:GetAttribute('EquippedAbility')
-                if ability then label.Text = '<b>' .. player.DisplayName .. ' [' .. ability .. ']' .. '</b>'
-                else label.Text = '<b>' .. player.DisplayName .. '</b>' end
-            else label.Visible = false end
+            if not getgenv().AbilityESP then label.Visible = false; return end
+
+            local ability = player:GetAttribute('EquippedAbility')
+
+            -- Distance / visibility filters.
+            local myRoot = getRoot()
+            local dist
+            if myRoot then dist = (myRoot.Position - head.Position).Magnitude end
+            if AbilityESPConfig.MaxDistance > 0 and dist and dist > AbilityESPConfig.MaxDistance then
+                label.Visible = false; return
+            end
+            if AbilityESPConfig.OnlyWithAbility and not ability then
+                label.Visible = false; return
+            end
+
+            -- Live-apply appearance.
+            label.TextColor3 = AbilityESPConfig.Color
+            label.TextSize = AbilityESPConfig.TextSize
+            billboard.StudsOffset = Vector3.new(0, AbilityESPConfig.Height, 0)
+            label.Visible = true
+
+            local parts = {}
+            if AbilityESPConfig.ShowName then table.insert(parts, player.DisplayName) end
+            if ability then table.insert(parts, '[' .. ability .. ']') end
+            if AbilityESPConfig.ShowDistance and dist then table.insert(parts, string.format('%.0fm', dist)) end
+            if #parts == 0 then table.insert(parts, player.DisplayName) end
+            label.Text = '<b>' .. table.concat(parts, ' ') .. '</b>'
         end)
         abilityEspConnections[player] = heartbeatConnection
     end)
@@ -1455,7 +1604,17 @@ AP:AddDropdown("CurveMode", {Text = "Curve mode", Values = System.__config.__cur
     end})
 AP:AddSlider("Accuracy", {Text = "Accuracy", Default = 50, Min = 1, Max = 100, Rounding = 0,
     Tooltip = "Higher parries later (closer). Lower parries earlier (further away).",
-    Callback = function(v) System.__properties.__accuracy = v; update_divisor() end})
+    Callback = function(v) System.__properties.__accuracy_base = v; roll_accuracy() end})
+AP:AddToggle("RandomAccuracy", {Text = "Randomize accuracy", Default = false,
+    Tooltip = "Jitters accuracy around your current Accuracy setting each parry, to look less robotic.",
+    Callback = function(v)
+        System.__properties.__random_accuracy = v
+        roll_accuracy() -- snaps back to the base value when turned off
+        NotifyToggle("Randomize Accuracy", v)
+    end})
+AP:AddSlider("RandomAccuracyAmount", {Text = "Randomize amount", Default = 10, Min = 0, Max = 50, Rounding = 0, Suffix = " ±",
+    Tooltip = "How far accuracy can swing above/below your setting, based on the current Accuracy value.",
+    Callback = function(v) System.__properties.__random_accuracy_amount = v; roll_accuracy() end})
 AP:AddToggle("PingCompensation", {Text = "Ping compensation", Default = true,
     Tooltip = "Parries earlier the higher your ping, by how far the ball moves in half a round trip.",
     Callback = function(v) System.__properties.__ping_compensation = v end})
@@ -1533,31 +1692,73 @@ DR:AddSlider("SlashesMax", {Text = "Max parry count", Default = 36, Min = 1, Max
 -- SPAM TAB
 local SP = Tabs.Spam:AddLeftGroupbox("Manual Spam", "zap")
 SP:AddToggle("ManualSpam", {Text = "Manual spam", Default = false, Callback = function(v)
-    System.__properties.__manual_spam_enabled = v
-    NotifyToggle("Manual Spam", v)
-    if not isMobile then return end
-    if v then
-        if not System.__properties.__mobile_guis.manual_spam then
-            local sm = create_mobile_button('Spam', 0.35, Color3.fromRGB(255, 255, 255), 0.15)
-            System.__properties.__mobile_guis.manual_spam = sm
-            sm.button.MouseButton1Click:Connect(function()
-                System.__properties.__manual_spam_enabled = not System.__properties.__manual_spam_enabled
-                local on = System.__properties.__manual_spam_enabled
-                sm.text.Text = on and "ON" or "Spam"
-                sm.text.TextColor3 = on and Color3.fromRGB(0, 255, 100) or Color3.fromRGB(255, 255, 255)
-                Notify("Manual Spam", on and "ON" or "OFF", 1.5)
-            end)
+    if isMobile then
+        -- On mobile the on-screen button is the real control. Arming the toggle
+        -- only shows that button (OFF by default), so enabling the feature no
+        -- longer starts spamming the moment you flip it — you tap the button to
+        -- turn it on, and tap again to turn it off.
+        if v then
+            System.__properties.__manual_spam_enabled = false
+            if not System.__properties.__mobile_guis.manual_spam then
+                local sm = create_mobile_button('Spam', 0.35, Color3.fromRGB(255, 255, 255), 0.15)
+                System.__properties.__mobile_guis.manual_spam = sm
+                sm.button.MouseButton1Click:Connect(function()
+                    System.__properties.__manual_spam_enabled = not System.__properties.__manual_spam_enabled
+                    local on = System.__properties.__manual_spam_enabled
+                    sm.text.Text = on and "ON" or "Spam"
+                    sm.text.TextColor3 = on and Color3.fromRGB(0, 255, 100) or Color3.fromRGB(255, 255, 255)
+                    Notify("Manual Spam", on and "ON" or "OFF", 1.5)
+                end)
+            end
+        else
+            System.__properties.__manual_spam_enabled = false
+            destroy_mobile_gui(System.__properties.__mobile_guis.manual_spam)
+            System.__properties.__mobile_guis.manual_spam = nil
         end
     else
-        destroy_mobile_gui(System.__properties.__mobile_guis.manual_spam)
-        System.__properties.__mobile_guis.manual_spam = nil
+        System.__properties.__manual_spam_enabled = v
     end
-end}):AddKeyPicker("ManualSpamKey", {Default = "E", Mode = "Toggle", SyncToggleState = true, Text = "Manual spam"})
+    NotifyToggle("Manual Spam", v)
+end}):AddKeyPicker("ManualSpamKey", {Default = "E", Mode = "Hold", SyncToggleState = true, Text = "Manual spam"})
 SP:AddDropdown("SpamMode", {Text = "Mode", Values = {"Remote", "Keypress"}, Default = "Remote", Callback = function(v) getgenv().ManualSpamMode = v end})
+SP:AddSlider("SpamRate", {Text = "Spam rate", Default = 100, Min = 10, Max = 250, Rounding = 0, Suffix = " /s",
+    Tooltip = "Parries per second while spamming.",
+    Callback = function(v) SPAM_RATE = 1 / math.max(v, 1) end})
 SP:AddToggle("SpamAnimFix", {Text = "Animation fix", Default = false, Callback = function(v)
     getgenv().ManualSpamAnimationFix = v
     macroAnimFix = v
 end})
+
+local AS = Tabs.Spam:AddRightGroupbox("Auto Spam", "activity")
+AS:AddToggle("AutoSpam", {Text = "Auto spam (smart)", Default = false,
+    Tooltip = "Only spams parries when a ball is targeting you inside the danger range, or during Slashes Of Fury. Idle otherwise.",
+    Callback = function(v)
+        System.__properties.__auto_spam_enabled = v
+        NotifyToggle("Auto Spam", v)
+        if not isMobile then return end
+        if v then
+            if not System.__properties.__mobile_guis.auto_spam then
+                local asb = create_mobile_button('AutoSpam', 0.50, Color3.fromRGB(0, 200, 255), 0.15)
+                System.__properties.__mobile_guis.auto_spam = asb
+                asb.button.MouseButton1Click:Connect(function()
+                    System.__properties.__auto_spam_enabled = not System.__properties.__auto_spam_enabled
+                    local on = System.__properties.__auto_spam_enabled
+                    asb.text.Text = on and "ON" or "AutoSpam"
+                    asb.text.TextColor3 = on and Color3.fromRGB(0, 255, 100) or Color3.fromRGB(255, 255, 255)
+                    Notify("Auto Spam", on and "ON" or "OFF", 1.5)
+                end)
+            end
+        else
+            destroy_mobile_gui(System.__properties.__mobile_guis.auto_spam)
+            System.__properties.__mobile_guis.auto_spam = nil
+        end
+    end}):AddKeyPicker("AutoSpamKey", {Default = "None", Mode = "Toggle", SyncToggleState = true, Text = "Auto spam"})
+AS:AddSlider("AutoSpamRate", {Text = "Spam rate", Default = 50, Min = 10, Max = 250, Rounding = 0, Suffix = " /s",
+    Tooltip = "Parries per second while engaged.",
+    Callback = function(v) AUTO_SPAM_RATE = 1 / math.max(v, 1) end})
+AS:AddSlider("AutoSpamRange", {Text = "Danger range", Default = 160, Min = 100, Max = 400, Rounding = 0, Suffix = "%",
+    Tooltip = "How large the danger zone is, as a percentage of the normal parry range. Higher engages sooner.",
+    Callback = function(v) autoSpamRange = v / 100 end})
 
 -- PLAYER TAB
 local AVC = Tabs.Player:AddLeftGroupbox("Avatar Changer", "user")
@@ -1637,6 +1838,23 @@ AE:AddToggle("AbilityESP", {Text = "Ability ESP", Default = false, Callback = fu
     if s then start_ability_esp() else stop_ability_esp() end
     NotifyToggle("Ability ESP", s)
 end})
+AE:AddToggle("AbilityESPName", {Text = "Show name", Default = true,
+    Callback = function(v) AbilityESPConfig.ShowName = v end})
+AE:AddToggle("AbilityESPDistance", {Text = "Show distance", Default = false,
+    Callback = function(v) AbilityESPConfig.ShowDistance = v end})
+AE:AddToggle("AbilityESPOnlyWith", {Text = "Only players with an ability", Default = false,
+    Callback = function(v) AbilityESPConfig.OnlyWithAbility = v end})
+AE:AddSlider("AbilityESPTextSize", {Text = "Text size", Default = 14, Min = 8, Max = 30, Rounding = 0,
+    Callback = function(v) AbilityESPConfig.TextSize = v end})
+AE:AddSlider("AbilityESPHeight", {Text = "Height offset", Default = 3.5, Min = 0, Max = 15, Rounding = 1, Suffix = " studs",
+    Tooltip = "How far above the head the label sits.",
+    Callback = function(v) AbilityESPConfig.Height = v end})
+AE:AddSlider("AbilityESPMaxDistance", {Text = "Max distance", Default = 0, Min = 0, Max = 2000, Rounding = 0, Suffix = " studs",
+    Tooltip = "Hide labels beyond this distance. 0 = unlimited.",
+    Callback = function(v) AbilityESPConfig.MaxDistance = v end})
+AE:AddLabel("Text color"):AddColorPicker("AbilityESPColor", {
+    Default = Color3.fromRGB(255, 255, 255), Title = "Ability ESP color",
+    Callback = function(v) AbilityESPConfig.Color = v end})
 
 -- MISC TAB
 local SC = Tabs.Misc:AddLeftGroupbox("Skin Changer", "palette")
