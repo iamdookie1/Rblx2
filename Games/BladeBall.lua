@@ -429,8 +429,59 @@ pcall(function()
     end)
 end)
 
+-- The game's block button (tagged "BlockButton"). Its click handler runs the
+-- game's whole parry: its own alive/stun checks, cooldown, hold value, packet
+-- and animation, exactly like a real tap on the phone button. Calling that
+-- handler is the closest thing to a real parry, so it's used whenever the
+-- curve is the plain camera one (the game always sends the camera CFrame).
+local System -- defined further down; read here only once parries start
+local _blockHandler, _blockButton = nil, nil
+local function _findBlockHandler()
+    if _blockHandler and _blockButton and _blockButton.Parent then return _blockHandler end
+    _blockHandler, _blockButton = nil, nil
+    if not getconnections then return nil end
+    local ok, buttons = pcall(function() return game:GetService("CollectionService"):GetTagged("BlockButton") end)
+    if not ok then return nil end
+    for _, button in ipairs(buttons) do
+        for _, signalName in ipairs({"MouseButton1Up", "Activated"}) do
+            local okc, conns = pcall(function() return getconnections(button[signalName]) end)
+            if okc and type(conns) == 'table' then
+                for _, c in ipairs(conns) do
+                    local f = c.Function
+                    if type(f) == 'function' and (not islclosure or islclosure(f)) then
+                        _blockHandler, _blockButton = f, button
+                        return f
+                    end
+                end
+            end
+        end
+    end
+    return nil
+end
+
+local function _isCameraCurve()
+    local names = System and System.__config and System.__config.__curve_names
+    local mode = System and System.__properties and System.__properties.__curve_mode
+    return not names or not mode or names[mode] == "Camera"
+end
+
 local function fireParryRemote(curveCF)
     local cam = workspace.CurrentCamera
+    if _isCameraCurve() then
+        local handler = _findBlockHandler()
+        if handler then
+            -- Same clean thread as the PRY entry: the game's env as both the
+            -- thread globals and the only Lua frame's env.
+            local env, setenv = _gameEnv, _setfenv
+            local caller = function()
+                if env and setenv then pcall(setenv, 0, env) end
+                pcall(handler)
+            end
+            if env and setenv then pcall(setenv, caller, env) end
+            task.spawn(caller)
+            return true
+        end
+    end
     if _pryEntry and _direct then
         -- Locked counts as handled, so nothing falls back to a key press.
         if os.clock() < _parryLockedUntil then return true end
@@ -466,8 +517,20 @@ local function remoteReady()
     return _capturedRemote ~= nil and _capturedArgs ~= nil
 end
 
--- Presses the block key. Only used by the "Keypress" modes.
+-- Presses the block key. Only used by the "Keypress" modes. Phones have no
+-- F key, so the game's block button is pressed instead when it's there.
 local function pressBlockKey()
+    local handler = _findBlockHandler()
+    if handler then
+        local env, setenv = _gameEnv, _setfenv
+        local caller = function()
+            if env and setenv then pcall(setenv, 0, env) end
+            pcall(handler)
+        end
+        if env and setenv then pcall(setenv, caller, env) end
+        task.spawn(caller)
+        return
+    end
     pcall(function()
         VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.F, false, game)
         VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.F, false, game)
@@ -478,7 +541,7 @@ end
 -- ============================================================
 -- SYSTEM
 -- ============================================================
-local System = {
+System = {
     __properties = {
         __autoparry_enabled = false, __triggerbot_enabled = false,
         __manual_spam_enabled = false, __play_animation = false,
