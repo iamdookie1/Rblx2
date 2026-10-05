@@ -413,9 +413,28 @@ local function _callPryEntry(...)
     task.spawn(caller)
 end
 
+-- The game's own parry cooldown (SwordsController): after a parry it won't
+-- parry again until the server answers with ParrySuccess (or
+-- NoobParryHappened), or about 1.3s pass. Parries sent inside that window are
+-- ones the real client never sends, and enough of them got kicked. So the
+-- script keeps the same gate.
+local PARRY_LOCK_TIME = 1.3
+local _parryLockedUntil = 0
+local function _unlockParry() _parryLockedUntil = 0 end
+pcall(function()
+    local remotes = game:GetService("ReplicatedStorage"):WaitForChild("Remotes", 10)
+    remotes:WaitForChild("ParrySuccess", 10).OnClientEvent:Connect(_unlockParry)
+    remotes:WaitForChild("NoobParryHappened", 10).OnClientEvent:Connect(function()
+        task.delay(0.11, _unlockParry)
+    end)
+end)
+
 local function fireParryRemote(curveCF)
     local cam = workspace.CurrentCamera
     if _pryEntry and _direct then
+        -- Locked counts as handled, so nothing falls back to a key press.
+        if os.clock() < _parryLockedUntil then return true end
+        _parryLockedUntil = os.clock() + PARRY_LOCK_TIME
         local aim_target, event_data = screenData()
         _callPryEntry(parryHold(), curveCF or cam.CFrame, event_data, aim_target, false)
         return true
