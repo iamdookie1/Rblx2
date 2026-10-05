@@ -320,6 +320,17 @@ local function _holdValues()
     return base, base
 end
 
+-- The game's lock time after a parry (its n2): 1.5 on the first parry of the
+-- round, 1.3 after that, scaled the same way as `hold` for noob parry.
+local function _lockTime()
+    local times = _dataGet("timesParried") or 0
+    local base = times == 0 and 1.5 or 1.3
+    if not _noobParry then return base end
+    local kills = _dataGet("TotalStats.Kills") or 0
+    if kills < 20 then return kills / 20 * base end
+    return base
+end
+
 -- Called with each real parry packet the hook sees.
 _learnHold = function(hold)
     if type(hold) ~= 'number' or not _data then return end
@@ -371,20 +382,57 @@ local function screenData()
     return aim_target, event_data
 end
 
+-- Parry cooldown, kept the same way the game keeps it (SwordsController).
+-- After a parry the game sends nothing more until the server answers with
+-- ParrySuccess (or NoobParryHappened), or until `hold` + max(0.1, lock - hold)
+-- seconds pass. The server checks this too, and parries sent inside that
+-- window got the account kicked after a few of them. So every remote parry
+-- waits for the same window.
+local _parryLockedUntil = 0
+local _m1Stop = false
+pcall(function()
+    Remotes.ParrySuccess.OnClientEvent:Connect(function() _parryLockedUntil = 0 end)
+end)
+pcall(function()
+    Remotes.NoobParryHappened.OnClientEvent:Connect(function()
+        _parryLockedUntil = math.min(_parryLockedUntil, os.clock() + 0.11)
+    end)
+end)
+pcall(function()
+    Remotes.M1Stop.Event:Connect(function(v) _m1Stop = v end)
+end)
+
+-- The same checks the game makes before it parries.
+local function canParry()
+    if _m1Stop or os.clock() < _parryLockedUntil then return false end
+    local char = LocalPlayer.Character
+    if not char or char:GetAttribute("Stunned") or char:GetAttribute("DoNotParry") then return false end
+    local inLobby = LocalPlayer:GetAttribute("LobbyParry") or LocalPlayer:GetAttribute("LobbyTraining")
+    if char.Parent ~= Alive and not inLobby then return false end
+    if LocalPlayer:GetAttribute("LobbyParry") and LocalPlayer:GetAttribute("InLobbyParryCooldown") then return false end
+    return true
+end
+
+-- Returns false only when the remote isn't caught yet. "cooldown" means the
+-- game itself wouldn't parry right now, so nothing was sent.
 local function fireParryRemote(curveCF)
     if not _capturedRemote or not _capturedArgs then return false end
+    if not canParry() then return "cooldown" end
     if _direct then _capturedArgs[2] = _directUid() end
     local cam = workspace.CurrentCamera
     local aim_target, event_data = screenData()
+    local hold = parryHold()
+    local lock = _data and _lockTime() or hold
+    _parryLockedUntil = os.clock() + hold + math.max(0.1, lock - hold)
     local packet = {
         _capturedArgs[1], _capturedArgs[2], _capturedArgs[2] and _tokenize(_capturedArgs[2]) or "",
-        parryHold(), curveCF or cam.CFrame, event_data, aim_target, false
+        hold, curveCF or cam.CFrame, event_data, aim_target, false
     }
     pcall(function()
         if _capturedRemote:IsA('RemoteEvent') then _capturedRemote:FireServer(unpack(packet, 1, 8))
         elseif _capturedRemote:IsA('RemoteFunction') then _capturedRemote:InvokeServer(unpack(packet, 1, 8)) end
     end)
-    return true
+    return "fired"
 end
 
 local function remoteReady()
@@ -639,21 +687,31 @@ local function curveForFrame()
     end
     return curve_cache.cf
 end
+-- Each returns true if a parry went out (or the key was pressed).
 function System.parry.execute()
-    if not LocalPlayer.Character then return end
+    if not LocalPlayer.Character then return false end
     -- Until the remote is caught, press the block key like the Ui3 update did.
     -- The game's own parry then goes through the hook and gets caught.
-    if not fireParryRemote(curveForFrame()) then pressBlockKey() end
+    local result = fireParryRemote(curveForFrame())
+    if result == "cooldown" then return false end
+    if not result then pressBlockKey() end
     System.__properties.__total_parries = System.__properties.__total_parries + 1
+    return true
 end
 function System.parry.keypress()
-    if not LocalPlayer.Character then return end
+    if not LocalPlayer.Character then return false end
     pressBlockKey()
     System.__properties.__total_parries = System.__properties.__total_parries + 1
+    return true
 end
-function System.parry.execute_action() System.animation.play_grab_parry(); System.parry.execute() end
+function System.parry.execute_action()
+    if remoteReady() and not canParry() then return false end
+    System.animation.play_grab_parry()
+    return System.parry.execute()
+end
 function System.parry.by_mode(mode)
-    if mode == "Keypress" then System.parry.keypress() else System.parry.execute_action() end
+    if mode == "Keypress" then return System.parry.keypress() end
+    return System.parry.execute_action()
 end
 
 local function linear_predict(a,b,t) return a+(b-a)*t end
@@ -1025,10 +1083,10 @@ function System.autoparry.step(dt)
         local distance = (root.Position - ball.Position).Magnitude
         if distance > System.parry_distance(speed) then continue end
 
-        state.parried = true
-        state.at = now
-        if not try_ability() then
-            System.parry.by_mode(getgenv().AutoParryMode)
+        -- On cooldown nothing goes out, so try again next frame.
+        if try_ability() or System.parry.by_mode(getgenv().AutoParryMode) then
+            state.parried = true
+            state.at = now
         end
     end
 end
