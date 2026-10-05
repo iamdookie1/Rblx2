@@ -123,6 +123,7 @@ end
 
 local _capturedRemote = nil
 local _capturedArgs = nil
+local _learnHold -- set below, once the hold value helpers exist
 
 -- Catching the parry remote (same method as the Ui3 update). Both hooks go
 -- on once, at load, and stay on: the game's parry goes through __namecall
@@ -145,6 +146,7 @@ local function _capture(remote, args)
         task.defer(Notify, "Blade Ball", "Remote hooked", 3)
     end
     _capturedRemote, _capturedArgs = remote, args
+    if _learnHold then pcall(_learnHold, args[4]) end
 end
 
 local function _isRemote(self)
@@ -192,8 +194,68 @@ task.delay(30, function()
     end
 end)
 
+-- The packet is built the way the game's own parry builds it
+-- (SwordsController -> PRY):
+--   (id, uid, token, hold, CFrame, {name = screen point}, {mouse x, y}, false)
+-- `hold` isn't a constant. The game picks it from how many times you've
+-- parried this round (1.5, 1.25, 1, 0.75, 0.625, then 0.5), and on accounts
+-- with under 20 kills ("noob parry", casual servers only) scales it by
+-- kills / 20. Sending a flat 0.5 doesn't match what the server expects.
+local HOLD_BY_PARRIES = {[0] = 1.5, [1] = 1.25, [2] = 1, [3] = 0.75, [4] = 0.625}
+
+local _data = nil -- the game's own "Data" replion (timesParried, kills)
+task.spawn(function()
+    pcall(function()
+        local Replion = require(ReplicatedStorage.Packages.Replion)
+        _data = Replion.Client:WaitReplion("Data")
+    end)
+end)
+
+-- Whether noob parry scaling applies here. Guessed from the game's own
+-- checks at load, then corrected by every real parry the hook sees.
+local _noobParry = true
+pcall(function()
+    local ServerInfo = require(ReplicatedStorage.ServerInfo)
+    local Utils = require(ReplicatedStorage.Common.Utils)
+    _noobParry = not ServerInfo.isDungeonsMatchServer() and not ServerInfo.isRankedMatchServer()
+        and not ServerInfo.isMedalServer() and not ServerInfo.isClanWarServer()
+        and not ServerInfo.isTournamentMatchServer()
+        and Utils.FFlag.GetInstantFFlag("NoobParryEnabled", true) and true or false
+end)
+
+local function _dataGet(key)
+    if not _data then return nil end
+    local ok, v = pcall(function() return _data:Get(key) end)
+    return ok and v or nil
+end
+
+local function _holdValues()
+    local base = HOLD_BY_PARRIES[_dataGet("timesParried") or 0] or 0.5
+    local kills = _dataGet("TotalStats.Kills") or 0
+    if kills < 20 then return base, kills / 20 * base end
+    return base, base
+end
+
+-- Called with each real parry packet the hook sees.
+_learnHold = function(hold)
+    if type(hold) ~= 'number' or not _data then return end
+    local normal, noob = _holdValues()
+    if normal == noob then return end
+    if math.abs(hold - noob) < 1e-4 then _noobParry = true
+    elseif math.abs(hold - normal) < 1e-4 then _noobParry = false end
+end
+
+local function parryHold()
+    if not _data then
+        -- No replion: reuse what the game itself last sent.
+        return _capturedArgs and type(_capturedArgs[4]) == 'number' and _capturedArgs[4] or 0.5
+    end
+    local normal, noob = _holdValues()
+    return _noobParry and noob or normal
+end
+
 -- The screen points and aim spot only change between frames, so spam firing
--- several times in one frame builds them once. The packet itself is unchanged.
+-- several times in one frame builds them once.
 local FRAME = 1 / 240
 local screen_cache = {at = 0, aim = nil, data = nil}
 local function screenData()
@@ -202,25 +264,22 @@ local function screenData()
         return screen_cache.aim, screen_cache.data
     end
     local cam = workspace.CurrentCamera
+    -- Like the game: the mouse position as is (not rounded), on every device.
     local aim_target
-    if isMobile then
-        local vp = cam.ViewportSize
-        aim_target = {math.floor(vp.X / 2), math.floor(vp.Y / 2)}
+    local ok, mouse = pcall(function() return UserInputService:GetMouseLocation() end)
+    if ok and mouse then
+        aim_target = {mouse.X, mouse.Y}
     else
-        local ok, mouse = pcall(function() return UserInputService:GetMouseLocation() end)
-        if ok and mouse then
-            aim_target = {math.floor(mouse.X), math.floor(mouse.Y)}
-        else
-            local vp = cam.ViewportSize
-            aim_target = {math.floor(vp.X / 2), math.floor(vp.Y / 2)}
-        end
+        local vp = cam.ViewportSize
+        aim_target = {vp.X / 2, vp.Y / 2}
     end
+    -- Like the game: every Alive model with a HumanoidRootPart, by name.
     local event_data = {}
     if Alive then
-        for _, entity in pairs(Alive:GetChildren()) do
-            if entity.PrimaryPart then
-                local ok, sp = pcall(function() return cam:WorldToScreenPoint(entity.PrimaryPart.Position) end)
-                if ok then event_data[entity.Name] = sp end
+        for _, entity in ipairs(Alive:GetChildren()) do
+            local hrp = entity:FindFirstChild('HumanoidRootPart')
+            if hrp then
+                event_data[entity.Name] = cam:WorldToScreenPoint(hrp.Position)
             end
         end
     end
@@ -234,7 +293,7 @@ local function fireParryRemote(curveCF)
     local aim_target, event_data = screenData()
     local packet = {
         _capturedArgs[1], _capturedArgs[2], _tokenize(_capturedArgs[2]),
-        0.5, curveCF or cam.CFrame, event_data, aim_target, false
+        parryHold(), curveCF or cam.CFrame, event_data, aim_target, false
     }
     pcall(function()
         if _capturedRemote:IsA('RemoteEvent') then _capturedRemote:FireServer(unpack(packet))
