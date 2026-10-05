@@ -67,16 +67,9 @@ local function ensureSaveFolder()
     end)
 end
 
--- Reading the stat is not free, and the parry loop asks for it every frame.
-local ping_cache, ping_at = 0, 0
 local function getPing()
-    local now = os.clock()
-    if now - ping_at > 0.2 then
-        local ok, ping = pcall(function() return Stats.Network.ServerStatsItem['Data Ping']:GetValue() end)
-        if ok and ping then ping_cache = ping end
-        ping_at = now
-    end
-    return ping_cache
+    local ok, ping = pcall(function() return Stats.Network.ServerStatsItem['Data Ping']:GetValue() end)
+    return ok and ping or 0
 end
 
 local function getRoot()
@@ -85,152 +78,35 @@ local function getRoot()
 end
 
 -- ============================================================
--- PARRY REMOTE (read straight from the game, no hooks)
+-- PARRY REMOTE
 -- ============================================================
--- The game's parry lives in SwordsController.PRY. Its send function holds
--- everything a parry needs as upvalues:
---   Net (the remote package), the remote's name, the first argument, the
---   table that holds the current uid, and the token function.
--- It sends: Net:RemoteEvent(name):FireServer(first, uid, token, ...).
--- Reading those directly means nothing in the game is hooked. The anti-cheat
--- (ReplicatedFirst.KeyboardLoader) catches metamethod hooks, and the old
--- __index / __namecall hooks got kicked a little after loading even with no
--- parries sent. PRY also has two decoy remotes among its upvalues that report
--- to the server if fired; those are never touched.
--- Load log. A crash takes the console with it, so each step is appended to
--- BladeBall/load.log; the last line written is the step that crashed.
-local function _log(msg)
-    pcall(function()
-        if not (appendfile and writefile) then return end
-        ensureSaveFolder()
-        appendfile(SAVE_FOLDER .. "/load.log", os.date("%H:%M:%S") .. "  " .. msg .. "\n")
-    end)
-end
-pcall(function() if writefile then ensureSaveFolder(); writefile(SAVE_FOLDER .. "/load.log", "") end end)
-_log("start")
+-- Remote parries need the game's own parry remote and its token function.
+-- If either can't be found, parries fall back to pressing the block key, so
+-- the script keeps working instead of stopping.
+local Remote = {
+    token = nil,        -- the game's key function, from getgc
+    remote = nil,       -- the parry RemoteEvent / RemoteFunction
+    args = nil,         -- the last real parry packet the game sent
+    hooked = false,
+}
 
--- Only plain fields are read (rawget), so no metamethod in the game's
--- obfuscated tables ever runs.
-local function _isNet(v)
-    return type(v) == 'table' and type(rawget(v, 'RemoteEvent')) == 'function'
-end
-
--- The uid holder is read as holder[2][holder[1]]. PRY keeps another table
--- of the same shape that holds the send function itself, so a function
--- there means it's not the uid.
-local function _holderValue(v)
-    if type(v) ~= 'table' then return false end
-    local key, inner = rawget(v, 1), rawget(v, 2)
-    if key == nil or key ~= key or type(inner) ~= 'table' then return false end
-    return true, rawget(inner, key)
-end
-local function _isHolder(v)
-    if _isNet(v) then return false end
-    local ok, value = _holderValue(v)
-    return ok and type(value) ~= 'function'
-end
-
--- The send function is the PRY function that also holds the two decoy
--- RemoteEvents, so only functions with RemoteEvent upvalues are looked at.
-local function _hasRemoteUpvalue(ups)
-    for _, v in pairs(ups) do
-        if typeof(v) == 'Instance' then
-            local ok, isRemote = pcall(function() return v:IsA('RemoteEvent') end)
-            if ok and isRemote then return true end
-        end
-    end
-    return false
-end
-
--- Net:RemoteEvent waits for the remote, so a wrong name would hang forever.
--- Give it a few seconds.
-local function _lookupRemote(net, name)
-    local result, done = nil, false
-    task.spawn(function()
-        local ok, remote = pcall(function() return net:RemoteEvent(name) end)
-        if ok then result = remote end
-        done = true
-    end)
-    local start = os.clock()
-    while not done and os.clock() - start < 3 do task.wait() end
-    if typeof(result) == 'Instance' and result:IsA('RemoteEvent') then return result end
-    return nil
-end
-
-local _token, _direct = nil, nil
-local _tokenFallback = nil
-local _candidate = nil
--- PRY's entry point: the function SwordsController calls as
--- PRY(hold, CFrame, screen points, mouse, false). Besides calling the send
--- function it rolls the uid forward, and the server expects the next uid on
--- every parry. Sending through the send function alone kept reusing the same
--- uid, which got kicked after a few parries.
-local _pryEntry = nil
-local function _isPryFunction(f)
-    if type(f) ~= 'function' then return false end
-    local ok, s = pcall(debug.info, f, 's')
-    return ok and type(s) == 'string' and s:find('PRY', 1, true) ~= nil
-end
-_log("scanning")
-for _, Function in getgc(true) do
-    if type(Function) ~= 'function' then continue end
-    local okSrc, src = pcall(debug.info, Function, 's')
-    if not okSrc or type(src) ~= 'string' then continue end
-    if not src:find('PRY', 1, true) then
-        if not _pryEntry and src:find('SwordsController', 1, true) then
-            local okUp, ups = pcall(debug.getupvalues, Function)
-            if okUp and type(ups) == 'table' then
-                for _, v in pairs(ups) do
-                    if _isPryFunction(v) then _pryEntry = v; break end
+pcall(function()
+    for _, fn in getgc(true) do
+        if type(fn) == 'function' then
+            local ok, src = pcall(debug.info, fn, 's')
+            if ok and src and src:find('PRY', 1, true) then
+                for _, value in debug.getupvalues(fn) do
+                    if type(value) == 'function' then Remote.token = value; break end
                 end
+                if Remote.token then break end
             end
         end
-        continue
     end
-    local okUp, ups = pcall(debug.getupvalues, Function)
-    if not okUp or type(ups) ~= 'table' then continue end
-    -- Same token pick as before: the first function upvalue of a PRY function.
-    if not _tokenFallback then
-        for _, v in pairs(ups) do
-            if type(v) == 'function' then _tokenFallback = v; break end
-        end
-    end
-    if _candidate or not _hasRemoteUpvalue(ups) then continue end
-    local token, netIdx, holder
-    for i = 1, #ups do
-        local v = ups[i]
-        if not token and type(v) == 'function' then token = v end
-        if not netIdx and _isNet(v) then netIdx = i end
-        if not holder and _isHolder(v) then holder = v end
-    end
-    if token and netIdx and holder and type(ups[netIdx + 1]) == 'string' and ups[netIdx + 2] ~= nil then
-        _candidate = {token = token, net = ups[netIdx], name = ups[netIdx + 1], first = ups[netIdx + 2], holder = holder}
-    end
-    if _candidate and _tokenFallback and _pryEntry then break end
-end
-_log("scan done, send function " .. (_candidate and "found" or "not found")
-    .. ", entry " .. (_pryEntry and "found" or "not found"))
+end)
 
--- The remote lookup runs after the scan, outside the getgc loop.
-if _candidate then
-    local remote = _lookupRemote(_candidate.net, _candidate.name)
-    _log("remote lookup " .. (remote and "ok" or "failed"))
-    if remote then
-        _token = _candidate.token
-        _direct = {remote = remote, first = _candidate.first, holder = _candidate.holder,
-            net = _candidate.net, name = _candidate.name}
-    end
-end
-_token = _token or _tokenFallback
-
-if not _token then
-    Notify("Blade Ball", "Remote not found!", 5)
-    return
-end
-
-function _tokenize(_remote_uid)
-    local time = tostring(math.floor(workspace:GetServerTimeNow() * 100))
-    local key = _token(_remote_uid, 'TIME')
+local function tokenize(remote_uid)
+    local time = tostring(math.floor(Workspace:GetServerTimeNow() * 100))
+    local key = Remote.token(remote_uid, 'TIME')
     local characters = table.create(#time)
     for index = 1, #time do
         characters[index] = string.char(bit32.bxor(
@@ -241,278 +117,110 @@ function _tokenize(_remote_uid)
     return table.concat(characters)
 end
 
-local _capturedRemote = nil
-local _capturedArgs = nil
-local _learnHold -- set below, once the hold value helpers exist
-
--- The current uid, read the same way the game reads it when it parries.
-local function _directUid()
-    local _, uid = _holderValue(_direct.holder)
-    return uid
+-- A parry packet is (id, uid, token, number, CFrame, {screen points}, {x, y}, bool).
+-- Checking the shape, not just the length, keeps some other 8-argument remote
+-- from being mistaken for the parry remote.
+local function isParryPacket(args)
+    return type(args) == 'table' and #args >= 8
+        and typeof(args[5]) == 'CFrame'
+        and type(args[6]) == 'table'
+        and type(args[7]) == 'table'
 end
 
-if _direct then
-    _capturedRemote = _direct.remote
-    _capturedArgs = {_direct.first, _directUid()}
-    -- If the game swaps the remote out, look it up again by name.
-    _direct.remote.AncestryChanged:Connect(function(_, parent)
-        if parent then return end
-        task.defer(function()
-            local remote = _lookupRemote(_direct.net, _direct.name)
-            if remote then _direct.remote = remote; _capturedRemote = remote end
-        end)
-    end)
-    Notify("Blade Ball", "Parry remote found. No hook needed.", 4)
-    _log("ready")
-else
-    -- Fallback only if the game's parry layout changed: a __namecall hook,
-    -- wrapped in newcclosure, waiting for one real block. This is the kind of
-    -- hook the anti-cheat can catch.
-    local _newcclosure = newcclosure or function(f) return f end
-    local function _isParryPacket(args)
-        return #args >= 8 and typeof(args[5]) == 'CFrame' and type(args[6]) == 'table' and type(args[7]) == 'table'
+local function capture(remote, args)
+    if not isParryPacket(args) then return end
+    if not Remote.remote then
+        task.defer(Notify, "Blade Ball", "Parry remote found. Remote mode is ready.", 3)
     end
-    local hooked = pcall(function()
+    Remote.remote = remote
+    Remote.args = args
+end
+
+local function isRemote(self)
+    return typeof(self) == 'Instance' and (self.ClassName == 'RemoteEvent' or self.ClassName == 'RemoteFunction')
+end
+
+if Remote.token then
+    -- The game calls its remotes as method calls, which go through __namecall;
+    -- a cached remote.FireServer goes through __index. Both are watched.
+    pcall(function()
+        if not (hookmetamethod and getnamecallmethod) then return end
         local old_namecall
-        old_namecall = hookmetamethod(game, '__namecall', _newcclosure(function(self, ...)
-            if not _capturedRemote and not checkcaller() then
-                local method = getnamecallmethod()
-                if method == 'FireServer' and typeof(self) == 'Instance' and self.ClassName == 'RemoteEvent' then
-                    local args = {...}
-                    if _isParryPacket(args) then
-                        _capturedRemote, _capturedArgs = self, args
-                        if _learnHold then pcall(_learnHold, args[4]) end
-                        task.defer(Notify, "Blade Ball", "Remote hooked", 3)
-                    end
-                end
+        old_namecall = hookmetamethod(game, '__namecall', function(self, ...)
+            local method = getnamecallmethod()
+            if (method == 'FireServer' or method == 'InvokeServer') and not (checkcaller and checkcaller()) and isRemote(self) then
+                capture(self, {...})
             end
             return old_namecall(self, ...)
-        end))
+        end)
+        Remote.hooked = true
     end)
-    Notify("Blade Ball", hooked and "Couldn't read the parry remote. Block once to hook it (risky)."
-        or "Couldn't find the parry remote on this executor.", 6)
-end
-
-task.delay(30, function()
-    if not _capturedRemote then
-        Notify("Blade Ball", "Remote not caught yet. Block once (F or click).", 5)
-    end
-end)
-
--- The packet is built the way the game's own parry builds it
--- (SwordsController -> PRY):
---   (id, uid, token, hold, CFrame, {name = screen point}, {mouse x, y}, false)
--- `hold` isn't a constant. The game picks it from how many times you've
--- parried this round (1.5, 1.25, 1, 0.75, 0.625, then 0.5), and on accounts
--- with under 20 kills ("noob parry", casual servers only) scales it by
--- kills / 20. Sending a flat 0.5 doesn't match what the server expects.
-local HOLD_BY_PARRIES = {[0] = 1.5, [1] = 1.25, [2] = 1, [3] = 0.75, [4] = 0.625}
-
-local _data = nil -- the game's own "Data" replion (timesParried, kills)
-task.spawn(function()
     pcall(function()
-        local Replion = require(ReplicatedStorage.Packages.Replion)
-        _data = Replion.Client:WaitReplion("Data")
-    end)
-end)
-
--- Whether noob parry scaling applies here. Guessed from the game's own
--- checks at load, then corrected by every real parry the hook sees.
-local _noobParry = true
-_log("reading server info")
-pcall(function()
-    local ServerInfo = require(ReplicatedStorage.ServerInfo)
-    local Utils = require(ReplicatedStorage.Common.Utils)
-    _noobParry = not ServerInfo.isDungeonsMatchServer() and not ServerInfo.isRankedMatchServer()
-        and not ServerInfo.isMedalServer() and not ServerInfo.isClanWarServer()
-        and not ServerInfo.isTournamentMatchServer()
-        and Utils.FFlag.GetInstantFFlag("NoobParryEnabled", true) and true or false
-end)
-_log("server info done")
-
-local function _dataGet(key)
-    if not _data then return nil end
-    local ok, v = pcall(function() return _data:Get(key) end)
-    return ok and v or nil
-end
-
-local function _holdValues()
-    local base = HOLD_BY_PARRIES[_dataGet("timesParried") or 0] or 0.5
-    local kills = _dataGet("TotalStats.Kills") or 0
-    if kills < 20 then return base, kills / 20 * base end
-    return base, base
-end
-
--- Called with each real parry packet the hook sees.
-_learnHold = function(hold)
-    if type(hold) ~= 'number' or not _data then return end
-    local normal, noob = _holdValues()
-    if normal == noob then return end
-    if math.abs(hold - noob) < 1e-4 then _noobParry = true
-    elseif math.abs(hold - normal) < 1e-4 then _noobParry = false end
-end
-
-local function parryHold()
-    if not _data then
-        -- No replion: reuse what the game itself last sent.
-        return _capturedArgs and type(_capturedArgs[4]) == 'number' and _capturedArgs[4] or 0.5
-    end
-    local normal, noob = _holdValues()
-    return _noobParry and noob or normal
-end
-
--- The screen points and aim spot only change between frames, so spam firing
--- several times in one frame builds them once.
-local FRAME = 1 / 240
-local screen_cache = {at = 0, aim = nil, data = nil}
-local function screenData()
-    local now = os.clock()
-    if screen_cache.data and now - screen_cache.at < FRAME then
-        return screen_cache.aim, screen_cache.data
-    end
-    local cam = workspace.CurrentCamera
-    -- Like the game: the mouse position as is (not rounded), on every device.
-    local aim_target
-    local ok, mouse = pcall(function() return UserInputService:GetMouseLocation() end)
-    if ok and mouse then
-        aim_target = {mouse.X, mouse.Y}
-    else
-        local vp = cam.ViewportSize
-        aim_target = {vp.X / 2, vp.Y / 2}
-    end
-    -- Like the game: every Alive model with a HumanoidRootPart, by name.
-    local event_data = {}
-    if Alive then
-        for _, entity in ipairs(Alive:GetChildren()) do
-            local hrp = entity:FindFirstChild('HumanoidRootPart')
-            if hrp then
-                event_data[entity.Name] = cam:WorldToScreenPoint(hrp.Position)
-            end
-        end
-    end
-    screen_cache.at, screen_cache.aim, screen_cache.data = now, aim_target, event_data
-    return aim_target, event_data
-end
-
--- The send function looks 10 stack levels up for an env with writefile and
--- reports to a decoy remote ("64565gfdd") if it finds one. getfenv on a C
--- frame (pcall, and the pcall inside that check) returns the thread's globals,
--- and a thread spawned from this script inherits the executor's globals, which
--- have writefile. That report is what got parries kicked. So the entry runs on
--- a fresh thread whose globals and only Lua frame are both the game's env.
-local _gameEnv = (getrenv and getrenv()) or nil
-local _setfenv = setfenv
-local function _callPryEntry(...)
-    local args = table.pack(...)
-    local entry, env, setenv = _pryEntry, _gameEnv, _setfenv
-    local caller = function()
-        if env and setenv then pcall(setenv, 0, env) end
-        pcall(entry, table.unpack(args, 1, args.n))
-    end
-    if env and setenv then pcall(setenv, caller, env) end
-    task.spawn(caller)
-end
-
--- The game's own parry cooldown (SwordsController): after a parry it won't
--- parry again until the server answers with ParrySuccess (or
--- NoobParryHappened), or about 1.3s pass. Parries sent inside that window are
--- ones the real client never sends, and enough of them got kicked. So the
--- script keeps the same gate.
-local PARRY_LOCK_TIME = 1.3
-local _parryLockedUntil = 0
-local function _unlockParry() _parryLockedUntil = 0 end
-pcall(function()
-    local remotes = game:GetService("ReplicatedStorage"):WaitForChild("Remotes", 10)
-    remotes:WaitForChild("ParrySuccess", 10).OnClientEvent:Connect(_unlockParry)
-    remotes:WaitForChild("NoobParryHappened", 10).OnClientEvent:Connect(function()
-        task.delay(0.11, _unlockParry)
-    end)
-end)
-
--- The game's block button (tagged "BlockButton"), the phone block button.
--- Its click handler runs the game's own parry. Used by the Keypress mode,
--- since phones have no F key.
-local _blockHandler, _blockButton = nil, nil
-local function _findBlockHandler()
-    if _blockHandler and _blockButton and _blockButton.Parent then return _blockHandler end
-    _blockHandler, _blockButton = nil, nil
-    if not getconnections then return nil end
-    local ok, buttons = pcall(function() return game:GetService("CollectionService"):GetTagged("BlockButton") end)
-    if not ok then return nil end
-    for _, button in ipairs(buttons) do
-        for _, signalName in ipairs({"MouseButton1Up", "Activated"}) do
-            local okc, conns = pcall(function() return getconnections(button[signalName]) end)
-            if okc and type(conns) == 'table' then
-                for _, c in ipairs(conns) do
-                    local f = c.Function
-                    if type(f) == 'function' and (not islclosure or islclosure(f)) then
-                        _blockHandler, _blockButton = f, button
-                        return f
-                    end
+        local meta = getrawmetatable(game)
+        local old_index = meta.__index
+        setreadonly(meta, false)
+        meta.__index = function(self, key)
+            if (key == 'FireServer' or key == 'InvokeServer') and not (checkcaller and checkcaller()) and isRemote(self) then
+                local real = old_index(self, key)
+                return function(remote, ...)
+                    capture(remote, {...})
+                    return real(remote, ...)
                 end
             end
+            return old_index(self, key)
         end
-    end
-    return nil
-end
-
-local function fireParryRemote(curveCF)
-    local cam = workspace.CurrentCamera
-    if _pryEntry and _direct then
-        -- Locked counts as handled, so nothing falls back to a key press.
-        if os.clock() < _parryLockedUntil then return true end
-        -- The game only parries while alive (or in lobby parry) and not
-        -- stunned. A parry from anywhere else is one the real client never
-        -- sends.
-        local char = LocalPlayer.Character
-        if not char or char:GetAttribute("Stunned") or char:GetAttribute("DoNotParry") then return true end
-        local lobby = LocalPlayer:GetAttribute("LobbyParry")
-            or (LocalPlayer:GetAttribute("LobbyTraining") and char.Parent == workspace:FindFirstChild("Dead"))
-        if char.Parent ~= workspace:FindFirstChild("Alive") and not lobby then return true end
-        if LocalPlayer:GetAttribute("LobbyParry") and LocalPlayer:GetAttribute("InLobbyParryCooldown") then return true end
-        _parryLockedUntil = os.clock() + PARRY_LOCK_TIME
-        local aim_target, event_data = screenData()
-        _callPryEntry(parryHold(), curveCF or cam.CFrame, event_data, aim_target, false)
-        return true
-    end
-    if not _capturedRemote or not _capturedArgs then return false end
-    if _direct then _capturedArgs[2] = _directUid() end
-    local aim_target, event_data = screenData()
-    local packet = {
-        _capturedArgs[1], _capturedArgs[2], _capturedArgs[2] and _tokenize(_capturedArgs[2]) or "",
-        parryHold(), curveCF or cam.CFrame, event_data, aim_target, false
-    }
-    pcall(function()
-        if _capturedRemote:IsA('RemoteEvent') then _capturedRemote:FireServer(unpack(packet, 1, 8))
-        elseif _capturedRemote:IsA('RemoteFunction') then _capturedRemote:InvokeServer(unpack(packet, 1, 8)) end
+        setreadonly(meta, true)
+        Remote.hooked = true
     end)
-    return true
 end
 
 local function remoteReady()
-    return _capturedRemote ~= nil and _capturedArgs ~= nil
+    return Remote.token ~= nil and Remote.remote ~= nil and Remote.args ~= nil
 end
 
--- Presses the block key. Only used by the "Keypress" modes. Phones have no
--- F key, so the game's block button is pressed instead when it's there.
+if not Remote.token then
+    Notify("Blade Ball", "Token not found. Parries will use the block key instead of the remote.", 6)
+elseif not Remote.hooked then
+    Notify("Blade Ball", "Couldn't hook remotes. Parries will use the block key.", 6)
+else
+    Notify("Blade Ball", "Block once (F or click) to finish remote setup. Until then parries use the block key.", 6)
+end
+
+-- Presses the block key. Works without the remote, at the cost of the game's
+-- own parry cooldown and no curve control.
 local function pressBlockKey()
-    local handler = _findBlockHandler()
-    if handler then
-        local env, setenv = _gameEnv, _setfenv
-        local caller = function()
-            if env and setenv then pcall(setenv, 0, env) end
-            pcall(handler)
-        end
-        if env and setenv then pcall(setenv, caller, env) end
-        task.spawn(caller)
-        return
-    end
     pcall(function()
         VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.F, false, game)
         VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.F, false, game)
     end)
 end
 
+local function fireParryRemote(curveCF)
+    if not remoteReady() then return false end
+    local cam = Workspace.CurrentCamera
+    local aim_target
+    local mouseOk, mouse = pcall(function() return UserInputService:GetMouseLocation() end)
+    if not isMobile and mouseOk and mouse then
+        aim_target = {math.floor(mouse.X), math.floor(mouse.Y)}
+    else
+        local vp = cam.ViewportSize
+        aim_target = {math.floor(vp.X / 2), math.floor(vp.Y / 2)}
+    end
+    local event_data = {}
+    for _, entity in pairs(Alive:GetChildren()) do
+        if entity.PrimaryPart then
+            local ok, sp = pcall(function() return cam:WorldToScreenPoint(entity.PrimaryPart.Position) end)
+            if ok then event_data[entity.Name] = sp end
+        end
+    end
+    local args = Remote.args
+    local ok = pcall(function()
+        local packet = {args[1], args[2], tokenize(args[2]), 0.5, curveCF or cam.CFrame, event_data, aim_target, false}
+        if Remote.remote:IsA('RemoteEvent') then Remote.remote:FireServer(unpack(packet))
+        else Remote.remote:InvokeServer(unpack(packet)) end
+    end)
+    return ok
+end
 
 -- ============================================================
 -- SYSTEM
@@ -533,8 +241,7 @@ local System = {
         __peak_velocity = 0, __last_ball_id = nil, __show_ping = false,
         __auto_ability_enabled = false, __cooldown_protection = false,
         __total_parries = 0, __ping_compensation = true, __extra_distance = 0,
-        __curve_hotkeys = true, __retry_delay = 1,
-        __spam_rate = 100, __auto_spam_enabled = false, __auto_spam_range = 20
+        __curve_hotkeys = true
     },
     __config = {
         __curve_names = {'Camera', 'Random', 'Accelerated', 'Backwards', 'Slow', 'High', 'Normal', 'Speed', 'Down', 'Left', 'Right'},
@@ -634,40 +341,19 @@ pcall(function()
 end)
 
 -- Ball
--- Everything asks for the balls several times a frame, so the list is built
--- once per frame. Treat the returned table as read-only.
 System.ball = {}
-local ball_cache = {at = 0, list = {}, training = {}}
-local no_collide = setmetatable({}, {__mode = 'k'})
-local function collectBalls(folder, into)
-    if not folder then return end
-    for _, ball in ipairs(folder:GetChildren()) do
-        if ball:GetAttribute('realBall') then
-            if not no_collide[ball] then no_collide[ball] = true; pcall(function() ball.CanCollide = false end) end
-            table.insert(into, ball)
-        end
-    end
-end
-local function refreshBalls()
-    local now = os.clock()
-    if now - ball_cache.at < FRAME then return end
-    ball_cache.at = now
-    ball_cache.list = {}
-    ball_cache.training = {}
-    collectBalls(Workspace:FindFirstChild('Balls'), ball_cache.list)
-    collectBalls(Workspace:FindFirstChild('TrainingBalls'), ball_cache.training)
-end
 function System.ball.get()
-    refreshBalls()
-    return ball_cache.list[1]
+    local balls = Workspace:FindFirstChild('Balls'); if not balls then return nil end
+    for _, ball in pairs(balls:GetChildren()) do
+        if ball:GetAttribute('realBall') then ball.CanCollide = false; return ball end
+    end; return nil
 end
 function System.ball.get_all()
-    refreshBalls()
-    return ball_cache.list
-end
-function System.ball.get_training()
-    refreshBalls()
-    return ball_cache.training
+    local balls_table = {}; local balls = Workspace:FindFirstChild('Balls')
+    if not balls then return balls_table end
+    for _, ball in pairs(balls:GetChildren()) do
+        if ball:GetAttribute('realBall') then ball.CanCollide = false; table.insert(balls_table, ball) end
+    end; return balls_table
 end
 
 System.player = {}
@@ -741,24 +427,15 @@ end
 
 System.parry = {}
 -- "Remote" fires the parry remote with the chosen curve. "Keypress" presses the
--- block key.
--- The curve is cached for the frame too, so a spam burst doesn't redo the
--- on-screen target search for every fire.
-local curve_cache = {at = 0, cf = nil}
-local function curveForFrame()
-    local now = os.clock()
-    if not curve_cache.cf or now - curve_cache.at >= FRAME then
-        curve_cache.cf = System.curve.get_cframe()
-        curve_cache.at = now
-    end
-    return curve_cache.cf
-end
+-- block key. Remote mode falls back to the key until the remote is captured.
 function System.parry.execute()
-    if not LocalPlayer.Character then return end
-    -- Until the remote is caught, press the block key like the Ui3 update did.
-    -- The game's own parry then goes through the hook and gets caught.
-    if not fireParryRemote(curveForFrame()) then pressBlockKey() end
+    if System.__properties.__parries > 10000 or not LocalPlayer.Character then return end
+    if not fireParryRemote(System.curve.get_cframe()) then pressBlockKey() end
+    System.__properties.__parries = System.__properties.__parries + 1
     System.__properties.__total_parries = System.__properties.__total_parries + 1
+    task.delay(0.5, function()
+        if System.__properties.__parries > 0 then System.__properties.__parries = System.__properties.__parries - 1 end
+    end)
 end
 function System.parry.keypress()
     if not LocalPlayer.Character then return end
@@ -941,12 +618,12 @@ function System.triggerbot.enable(enabled)
 end
 
 -- ============================================================
--- MANUAL SPAM / AUTO SPAM
+-- MANUAL SPAM (HEARTBEAT - ULTRA FAST)
 -- ============================================================
 System.manual_spam = {}
 local macroAnimFix = false
 local spam_accumulator = 0
-local MAX_FIRES_PER_FRAME = 5
+local SPAM_RATE = 0.01
 
 function System.manual_spam.start()
     System.__properties.__manual_spam_enabled = true
@@ -956,56 +633,27 @@ function System.manual_spam.stop()
     System.__properties.__manual_spam_enabled = false
 end
 
--- Auto spam turns spam on by itself during a close-range clash: the ball is
--- moving, it's on you or the nearest player, and both are within range.
-function System.manual_spam.clash()
-    local props = System.__properties
-    if not props.__auto_spam_enabled then return false end
-    local root = getRoot()
-    local ball = System.ball.get()
-    if not root or not ball then return false end
-    local zoomies = ball:FindFirstChild('zoomies')
-    if not zoomies or zoomies.VectorVelocity.Magnitude < 5 then return false end
-    local target = ball:GetAttribute('target')
-    if not target or target == "" then return false end
-    local closest = System.player.get_closest()
-    if not closest or not closest.PrimaryPart then return false end
-    local range = props.__auto_spam_range
-    if (root.Position - closest.PrimaryPart.Position).Magnitude > range then return false end
-    if (root.Position - ball.Position).Magnitude > range then return false end
-    return target == LocalPlayer.Name or target == closest.Name
-end
-
--- Same pacing as the Ui3 update: Heartbeat, at most 5 fires a frame. The
--- rate is fires per second, spread across frames.
 RunService.Heartbeat:Connect(function(dt)
-    local props = System.__properties
-    local active = props.__manual_spam_enabled
-    if not active then
-        local ok, clash = pcall(System.manual_spam.clash)
-        active = ok and clash
-    end
-    if not active or not LocalPlayer.Character then
+    if not System.__properties.__manual_spam_enabled then
         spam_accumulator = 0
         return
     end
-    local interval = 1 / math.max(props.__spam_rate, 1)
-    spam_accumulator = math.min(spam_accumulator + dt, interval * MAX_FIRES_PER_FRAME)
-    local keypress = getgenv().ManualSpamMode == "Keypress"
+    spam_accumulator = spam_accumulator + dt
+    local maxFires = 5
     local fired = 0
-    while spam_accumulator >= interval and fired < MAX_FIRES_PER_FRAME do
-        spam_accumulator = spam_accumulator - interval
+    while spam_accumulator >= SPAM_RATE and fired < maxFires do
+        spam_accumulator = spam_accumulator - SPAM_RATE
         fired = fired + 1
-        if keypress then
-            pcall(System.parry.keypress)
+        if getgenv().ManualSpamMode == "Keypress" then
+            pcall(function() System.parry.keypress() end)
         else
-            pcall(System.parry.execute)
+            pcall(function() System.parry.execute() end)
+            if getgenv().ManualSpamAnimationFix and macroAnimFix then
+                pcall(function() System.animation.play_grab_parry() end)
+            end
         end
     end
-    -- Once per frame is plenty for the animation; it has its own cooldown.
-    if fired > 0 and not keypress and getgenv().ManualSpamAnimationFix and macroAnimFix then
-        pcall(System.animation.play_grab_parry)
-    end
+    if spam_accumulator > SPAM_RATE * 10 then spam_accumulator = 0 end
 end)
 
 
@@ -1030,8 +678,9 @@ function System.parry_distance(speed)
 end
 
 -- One state per ball, so with several balls in play parrying one doesn't
--- block the others. The target listener is made once per ball. If the ball is
--- still on us `__retry_delay` seconds after a parry, it parries again.
+-- block the others. The target listener is made once per ball; the old loop
+-- made a new one every frame for every ball.
+local PARRY_TIMEOUT = 1
 local ball_state = setmetatable({}, {__mode = 'k'})
 local function get_ball_state(ball)
     local state = ball_state[ball]
@@ -1092,7 +741,7 @@ local function blocked_by_detection()
         or (det.__slashesoffury and props.__slashesoffury_active)
 end
 
-function System.autoparry.step(dt)
+function System.autoparry.step()
     local props = System.__properties
     if not props.__autoparry_enabled or System.__triggerbot.__enabled then return end
     local root = getRoot()
@@ -1104,12 +753,12 @@ function System.autoparry.step(dt)
     local one_ball = System.ball.get()
     local curve_hold = curved and one_ball and one_ball:GetAttribute('target') == LocalPlayer.Name
 
-    local balls = table.clone(System.ball.get_all())
-    local training = System.ball.get_training()
-    local is_training = {}
-    for _, ball in ipairs(training) do
-        is_training[ball] = true
-        table.insert(balls, ball)
+    local balls = System.ball.get_all()
+    local training = Workspace:FindFirstChild("TrainingBalls")
+    if training then
+        for _, ball in ipairs(training:GetChildren()) do
+            if ball:GetAttribute("realBall") then table.insert(balls, ball) end
+        end
     end
 
     local now = tick()
@@ -1123,7 +772,7 @@ function System.autoparry.step(dt)
         end
 
         if state.parried then
-            if now - state.at < props.__retry_delay then continue end
+            if now - state.at < PARRY_TIMEOUT then continue end
             state.parried = false
         end
         if props.__parried then continue end
@@ -1131,7 +780,7 @@ function System.autoparry.step(dt)
 
         local tornado = Runtime:FindFirstChild('Tornado')
         if tornado and (now - props.__tornado_time) < (tornado:GetAttribute('TornadoTime') or 1) + 0.314159 then continue end
-        if curve_hold and not is_training[ball] then continue end
+        if curve_hold and ball.Parent ~= training then continue end
         if ball:FindFirstChild('ComboCounter') then continue end
         if blocked_by_detection() then return end
 
@@ -1150,8 +799,8 @@ end
 function System.autoparry.start()
     if System.__properties.__connections.__autoparry then return end
     local last_error
-    System.__properties.__connections.__autoparry = RunService.PreSimulation:Connect(function(dt)
-        local ok, err = pcall(System.autoparry.step, dt)
+    System.__properties.__connections.__autoparry = RunService.PreSimulation:Connect(function()
+        local ok, err = pcall(System.autoparry.step)
         if not ok and err ~= last_error then
             last_error = err
             warn("[Blade Ball] auto parry: " .. tostring(err))
@@ -1282,6 +931,10 @@ getgenv().swordFX = savedSkin.swordModel or ""
 getgenv().slashName = "SlashEffect"
 
 task.spawn(function()
+    -- Wait until the user actually enables skin changer before doing any
+    -- getconnections calls — those loops were causing kicks while standing still.
+    while not getgenv().skinChangerEnabled do task.wait(1) end
+
     local rs = game:GetService("ReplicatedStorage")
     local swordInstancesInstance = rs:WaitForChild("Shared", 9e9):WaitForChild("ReplicatedInstances", 9e9):WaitForChild("Swords", 9e9)
     local swordInstances = require(swordInstancesInstance)
@@ -1583,12 +1236,7 @@ local function create_ability_esp_for_player(player)
         local humanoid = character:FindFirstChild('Humanoid')
         if humanoid then humanoid.DisplayDistanceType = Enum.HumanoidDisplayDistanceType.None end
         local heartbeatConnection
-        -- Text only needs a refresh a few times a second, not every frame.
-        local esp_elapsed = 1
-        heartbeatConnection = RunService.Heartbeat:Connect(function(dt)
-            esp_elapsed = esp_elapsed + dt
-            if esp_elapsed < 0.25 then return end
-            esp_elapsed = 0
+        heartbeatConnection = RunService.Heartbeat:Connect(function()
             if not (character and character.Parent) then
                 if heartbeatConnection then heartbeatConnection:Disconnect() end
                 pcall(function() billboard:Destroy() end)
@@ -1754,8 +1402,10 @@ local RemoteLabel = Overview:AddLabel("Remote: checking...", true)
 local TargetLabel = Overview:AddLabel("Ball target: -", true)
 
 local function remoteStatusText()
-    if remoteReady() then return "Remote: ready" end
-    return "Remote: waiting. Block once (F or click)"
+    if remoteReady() then return "Remote: ready, parries use the remote" end
+    if not Remote.token then return "Remote: token not found, parries use the block key" end
+    if not Remote.hooked then return "Remote: hook unavailable, parries use the block key" end
+    return "Remote: waiting. Block once (F or click) to capture it. Parries use the block key until then"
 end
 
 local status_peak, status_ball = 0, nil
@@ -1811,9 +1461,6 @@ AP:AddToggle("PingCompensation", {Text = "Ping compensation", Default = true,
     Callback = function(v) System.__properties.__ping_compensation = v end})
 AP:AddSlider("ExtraDistance", {Text = "Extra distance", Default = 0, Min = -10, Max = 30, Rounding = 0, Suffix = " studs",
     Callback = function(v) System.__properties.__extra_distance = v end})
-AP:AddSlider("RetryDelay", {Text = "Retry delay", Default = 1, Min = 0.2, Max = 1.5, Rounding = 2, Suffix = "s",
-    Tooltip = "If the ball is still on you this long after a parry, parry again.",
-    Callback = function(v) System.__properties.__retry_delay = v end})
 AP:AddToggle("RandomCurve", {Text = "Random curve", Default = false, Callback = function(s)
     if s then
         if not System.__properties.__connections.__rc then
@@ -1906,25 +1553,11 @@ SP:AddToggle("ManualSpam", {Text = "Manual spam", Default = false, Callback = fu
         System.__properties.__mobile_guis.manual_spam = nil
     end
 end}):AddKeyPicker("ManualSpamKey", {Default = "E", Mode = "Toggle", SyncToggleState = true, Text = "Manual spam"})
-SP:AddSlider("SpamRate", {Text = "Spam speed", Default = 100, Min = 10, Max = 100, Rounding = 0, Suffix = "/s",
-    Tooltip = "Parries per second while spamming.",
-    Callback = function(v) System.__properties.__spam_rate = v end})
 SP:AddDropdown("SpamMode", {Text = "Mode", Values = {"Remote", "Keypress"}, Default = "Remote", Callback = function(v) getgenv().ManualSpamMode = v end})
 SP:AddToggle("SpamAnimFix", {Text = "Animation fix", Default = false, Callback = function(v)
     getgenv().ManualSpamAnimationFix = v
     macroAnimFix = v
 end})
-
-local AS = Tabs.Spam:AddRightGroupbox("Auto Spam", "swords")
-AS:AddToggle("AutoSpam", {Text = "Auto spam", Default = false,
-    Tooltip = "Spams by itself during close-range clashes. Uses the spam speed and mode on the left.",
-    Callback = function(v)
-        System.__properties.__auto_spam_enabled = v
-        NotifyToggle("Auto Spam", v)
-    end}):AddKeyPicker("AutoSpamKey", {Default = "None", Mode = "Toggle", SyncToggleState = true, Text = "Auto spam"})
-AS:AddSlider("AutoSpamRange", {Text = "Clash range", Default = 20, Min = 5, Max = 50, Rounding = 0, Suffix = " studs",
-    Tooltip = "Both the ball and the nearest player have to be this close.",
-    Callback = function(v) System.__properties.__auto_spam_range = v end})
 
 -- PLAYER TAB
 local AVC = Tabs.Player:AddLeftGroupbox("Avatar Changer", "user")
@@ -2122,7 +1755,6 @@ Library:OnUnload(function()
     setTriggerbot(false)
     System.__properties.__autoparry_enabled = false
     System.__properties.__manual_spam_enabled = false
-    System.__properties.__auto_spam_enabled = false
     System.__properties.__show_ping = false
     AutoJump = false
     for _, conn in pairs(System.__properties.__connections) do pcall(function() conn:Disconnect() end) end
@@ -2136,7 +1768,6 @@ Library:OnUnload(function()
 end)
 
 UIReady = true
-_log("loaded")
 Notify("Blade Ball", "Loaded. " .. (isMobile and "Tap the menu button to open." or "LeftControl toggles the menu."), 5)
 
 end)
