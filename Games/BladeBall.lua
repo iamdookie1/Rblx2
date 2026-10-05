@@ -97,21 +97,49 @@ end
 -- __index / __namecall hooks got kicked a little after loading even with no
 -- parries sent. PRY also has two decoy remotes among its upvalues that report
 -- to the server if fired; those are never touched.
+-- Load log. A crash takes the console with it, so each step is appended to
+-- BladeBall/load.log; the last line written is the step that crashed.
+local function _log(msg)
+    pcall(function()
+        if not (appendfile and writefile) then return end
+        ensureSaveFolder()
+        appendfile(SAVE_FOLDER .. "/load.log", os.date("%H:%M:%S") .. "  " .. msg .. "\n")
+    end)
+end
+pcall(function() if writefile then ensureSaveFolder(); writefile(SAVE_FOLDER .. "/load.log", "") end end)
+_log("start")
+
+-- Only plain fields are read (rawget), so no metamethod in the game's
+-- obfuscated tables ever runs.
 local function _isNet(v)
-    if type(v) ~= 'table' then return false end
-    local ok, fn = pcall(function() return v.RemoteEvent end)
-    return ok and type(fn) == 'function'
+    return type(v) == 'table' and type(rawget(v, 'RemoteEvent')) == 'function'
 end
 
 -- The uid holder is read as holder[2][holder[1]]. PRY keeps another table
 -- of the same shape that holds the send function itself, so a function
 -- there means it's not the uid.
+local function _holderValue(v)
+    if type(v) ~= 'table' then return false end
+    local key, inner = rawget(v, 1), rawget(v, 2)
+    if key == nil or key ~= key or type(inner) ~= 'table' then return false end
+    return true, rawget(inner, key)
+end
 local function _isHolder(v)
-    if type(v) ~= 'table' or _isNet(v) then return false end
-    local ok, r = pcall(function()
-        return v[1] ~= nil and type(v[2]) == 'table' and type(v[2][v[1]]) ~= 'function'
-    end)
-    return ok and r
+    if _isNet(v) then return false end
+    local ok, value = _holderValue(v)
+    return ok and type(value) ~= 'function'
+end
+
+-- The send function is the PRY function that also holds the two decoy
+-- RemoteEvents, so only functions with RemoteEvent upvalues are looked at.
+local function _hasRemoteUpvalue(ups)
+    for _, v in pairs(ups) do
+        if typeof(v) == 'Instance' then
+            local ok, isRemote = pcall(function() return v:IsA('RemoteEvent') end)
+            if ok and isRemote then return true end
+        end
+    end
+    return false
 end
 
 -- Net:RemoteEvent waits for the remote, so a wrong name would hang forever.
@@ -131,27 +159,43 @@ end
 
 local _token, _direct = nil, nil
 local _tokenFallback = nil
+local _candidate = nil
+_log("scanning")
 for _, Function in getgc(true) do
     if type(Function) ~= 'function' then continue end
     local okSrc, src = pcall(debug.info, Function, 's')
     if not okSrc or type(src) ~= 'string' or not src:find('PRY', 1, true) then continue end
     local okUp, ups = pcall(debug.getupvalues, Function)
     if not okUp or type(ups) ~= 'table' then continue end
+    -- Same token pick as before: the first function upvalue of a PRY function.
+    if not _tokenFallback then
+        for _, v in pairs(ups) do
+            if type(v) == 'function' then _tokenFallback = v; break end
+        end
+    end
+    if _candidate or not _hasRemoteUpvalue(ups) then continue end
     local token, netIdx, holder
-    for i, v in pairs(ups) do
+    for i = 1, #ups do
+        local v = ups[i]
         if not token and type(v) == 'function' then token = v end
         if not netIdx and _isNet(v) then netIdx = i end
         if not holder and _isHolder(v) then holder = v end
     end
-    if token and not _tokenFallback then _tokenFallback = token end
     if token and netIdx and holder and type(ups[netIdx + 1]) == 'string' and ups[netIdx + 2] ~= nil then
-        local net, name = ups[netIdx], ups[netIdx + 1]
-        local remote = _lookupRemote(net, name)
-        if remote then
-            _token = token
-            _direct = {remote = remote, first = ups[netIdx + 2], holder = holder, net = net, name = name}
-            break
-        end
+        _candidate = {token = token, net = ups[netIdx], name = ups[netIdx + 1], first = ups[netIdx + 2], holder = holder}
+    end
+    if _candidate and _tokenFallback then break end
+end
+_log("scan done, send function " .. (_candidate and "found" or "not found"))
+
+-- The remote lookup runs after the scan, outside the getgc loop.
+if _candidate then
+    local remote = _lookupRemote(_candidate.net, _candidate.name)
+    _log("remote lookup " .. (remote and "ok" or "failed"))
+    if remote then
+        _token = _candidate.token
+        _direct = {remote = remote, first = _candidate.first, holder = _candidate.holder,
+            net = _candidate.net, name = _candidate.name}
     end
 end
 _token = _token or _tokenFallback
@@ -180,8 +224,8 @@ local _learnHold -- set below, once the hold value helpers exist
 
 -- The current uid, read the same way the game reads it when it parries.
 local function _directUid()
-    local ok, uid = pcall(function() return _direct.holder[2][_direct.holder[1]] end)
-    return ok and uid or nil
+    local _, uid = _holderValue(_direct.holder)
+    return uid
 end
 
 if _direct then
@@ -196,6 +240,7 @@ if _direct then
         end)
     end)
     Notify("Blade Ball", "Parry remote found. No hook needed.", 4)
+    _log("ready")
 else
     -- Fallback only if the game's parry layout changed: a __namecall hook,
     -- wrapped in newcclosure, waiting for one real block. This is the kind of
@@ -251,6 +296,7 @@ end)
 -- Whether noob parry scaling applies here. Guessed from the game's own
 -- checks at load, then corrected by every real parry the hook sees.
 local _noobParry = true
+_log("reading server info")
 pcall(function()
     local ServerInfo = require(ReplicatedStorage.ServerInfo)
     local Utils = require(ReplicatedStorage.Common.Utils)
@@ -259,6 +305,7 @@ pcall(function()
         and not ServerInfo.isTournamentMatchServer()
         and Utils.FFlag.GetInstantFFlag("NoobParryEnabled", true) and true or false
 end)
+_log("server info done")
 
 local function _dataGet(key)
     if not _data then return nil end
@@ -1975,6 +2022,7 @@ Library:OnUnload(function()
 end)
 
 UIReady = true
+_log("loaded")
 Notify("Blade Ball", "Loaded. " .. (isMobile and "Tap the menu button to open." or "LeftControl toggles the menu."), 5)
 
 end)
