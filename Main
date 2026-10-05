@@ -56,6 +56,33 @@ local Games = {
     [606849621] = { Name = 'Jailbreak', Script = 'Games/Jailbreak.lua' },
 }
 
+-- Games whose other modes (ranked, duels, events...) each have their own place
+-- id. Rather than list every one, these check for things every mode of the
+-- game has, so detection doesn't depend on a hard-coded place id. Checked only
+-- when the place id itself isn't in Games.
+local Fingerprints = {
+    -- Blade Ball ships as several places (standard, ranked, limited-time
+    -- events...), so instead of chasing every place id we match on things only
+    -- Blade Ball has in every mode: the SwordAPI module under ReplicatedStorage
+    -- .Shared, its parry remotes (ParrySuccessAll + AbilityButtonPress), and the
+    -- Workspace.Alive round folder. No other game in this loader has that combo.
+    {
+        Name = 'Blade Ball',
+        Script = 'Games/BladeBall.lua',
+        Match = function()
+            local ReplicatedStorage = game:GetService('ReplicatedStorage')
+            local remotes = ReplicatedStorage:FindFirstChild('Remotes')
+            local shared = ReplicatedStorage:FindFirstChild('Shared')
+            return remotes ~= nil
+                and remotes:FindFirstChild('ParrySuccessAll') ~= nil
+                and remotes:FindFirstChild('AbilityButtonPress') ~= nil
+                and shared ~= nil
+                and shared:FindFirstChild('SwordAPI') ~= nil
+                and game:GetService('Workspace'):FindFirstChild('Alive') ~= nil
+        end,
+    },
+}
+
 -- Loads Onyx straight from its own repo rather than a vendored copy, since
 -- that's the actual source of truth for the library and it's being actively
 -- developed alongside these scripts - a change there should show up here
@@ -187,20 +214,31 @@ Load:Button({
 local Supported = GamesTab:CreateSection('supported games')
 
 -- Sorted by name so the list is stable between sessions; pairs over a table
--- keyed by PlaceId would shuffle it every run.
+-- keyed by PlaceId would shuffle it every run. Fingerprinted games (detected by
+-- their contents rather than a place id) are listed too, with no place id.
 local ordered = {}
 for placeId, entry in pairs(Games) do
     table.insert(ordered, { PlaceId = placeId, Name = entry.Name, Script = entry.Script })
+end
+for _, entry in ipairs(Fingerprints) do
+    table.insert(ordered, { PlaceId = nil, Name = entry.Name, Script = entry.Script, Match = entry.Match })
 end
 table.sort(ordered, function(a, b)
     return a.Name:lower() < b.Name:lower()
 end)
 
 for _, entry in ipairs(ordered) do
-    local here = entry.PlaceId == game.PlaceId
+    local here
+    if entry.PlaceId then
+        here = entry.PlaceId == game.PlaceId
+    else
+        -- Fingerprinted: highlight it when its contents are present right now.
+        local ok, found = pcall(entry.Match)
+        here = ok and found
+    end
     addStat(Supported, {
         Title = entry.Name,
-        Value = tostring(entry.PlaceId),
+        Value = entry.PlaceId and tostring(entry.PlaceId) or 'any mode',
         Color = here and Color3.fromRGB(126, 217, 87) or nil,
     })
 end
@@ -273,12 +311,6 @@ Menu:Button({
         end
     end,
 })
-
--- Games whose other modes (ranked, duels, events...) each have their own place
--- id. Rather than list every one, these check for things every mode of the
--- game has. Only used when the place id itself isn't in Games.
-local Fingerprints = {
-}
 
 local function findGame()
     local match = Games[game.PlaceId]

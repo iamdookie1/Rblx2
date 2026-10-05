@@ -140,7 +140,11 @@ local function isRemote(self)
     return typeof(self) == 'Instance' and (self.ClassName == 'RemoteEvent' or self.ClassName == 'RemoteFunction')
 end
 
-if Remote.token then
+-- Installs the metamethod hooks that capture the game's parry remote. Held back
+-- (see the watcher below) until the player is actually in a round, so the hook
+-- stays dormant while sitting in the lobby / menu / spectating.
+local function installRemoteHooks()
+    if Remote.hooked or not Remote.token then return end
     -- The game calls its remotes as method calls, which go through __namecall;
     -- a cached remote.FireServer goes through __index. Both are watched.
     pcall(function()
@@ -178,12 +182,33 @@ local function remoteReady()
     return Remote.token ~= nil and Remote.remote ~= nil and Remote.args ~= nil
 end
 
+-- "A place where they can parry": a live character parented under Workspace.Alive,
+-- which is the in-round state the rest of the script already keys off. In the
+-- lobby / between rounds the character isn't under Alive, so the hook stays off.
+local function canParryNow()
+    local char = LocalPlayer.Character
+    return char ~= nil and char.Parent == Alive
+end
+
 if not Remote.token then
     Notify("Blade Ball", "Token not found. Parries will use the block key instead of the remote.", 6)
-elseif not Remote.hooked then
+elseif not (hookmetamethod and getnamecallmethod and getrawmetatable) then
     Notify("Blade Ball", "Couldn't hook remotes. Parries will use the block key.", 6)
 else
-    Notify("Blade Ball", "Block once (F or click) to finish remote setup. Until then parries use the block key.", 6)
+    -- Arm the hook the first time the player enters a round, not at load. Up to
+    -- then (and in the lobby) parries fall back to the block key on their own.
+    task.spawn(function()
+        while not canParryNow() do
+            if Library.Unloaded then return end
+            task.wait(0.25)
+        end
+        installRemoteHooks()
+        if Remote.hooked then
+            Notify("Blade Ball", "Block once (F or click) to finish remote setup. Until then parries use the block key.", 6)
+        else
+            Notify("Blade Ball", "Couldn't hook remotes. Parries will use the block key.", 6)
+        end
+    end)
 end
 
 -- Presses the block key. Works without the remote, at the cost of the game's
@@ -1553,7 +1578,12 @@ local TargetLabel = Overview:AddLabel("Ball target: -", true)
 local function remoteStatusText()
     if remoteReady() then return "Remote: ready, parries use the remote" end
     if not Remote.token then return "Remote: token not found, parries use the block key" end
-    if not Remote.hooked then return "Remote: hook unavailable, parries use the block key" end
+    if not Remote.hooked then
+        -- The hook is deferred until you're in a round. Say so instead of
+        -- calling it unavailable while simply waiting to spawn in.
+        if not canParryNow() then return "Remote: waiting until you're in a round. Parries use the block key until then" end
+        return "Remote: hook unavailable, parries use the block key"
+    end
     return "Remote: waiting. Block once (F or click) to capture it. Parries use the block key until then"
 end
 
