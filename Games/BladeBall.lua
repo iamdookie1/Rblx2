@@ -182,19 +182,18 @@ local function remoteReady()
     return Remote.token ~= nil and Remote.remote ~= nil and Remote.args ~= nil
 end
 
--- "A place where they can parry" — not merely "in a round". Being parented under
--- Workspace.Alive is necessary but not sufficient: during the round intro, while
--- eliminated, or while capped by the Singularity you're in the round yet can't
--- actually block. So require a live character, a sword equipped, and no cape.
+-- "A place where they can parry" — mirrors the game's own parry gate (its client
+-- parry handler only lets a block through when all of these hold): a character
+-- parented under Workspace.Alive, not Stunned, and without the DoNotParry flag.
+-- Stunned / DoNotParry are server-set attributes the game toggles whenever you
+-- can't block (round intro, stun, certain abilities), so they're the authoritative
+-- "can parry" signal rather than just "in a round".
 local function canParryNow()
     local char = LocalPlayer.Character
     if not char or char.Parent ~= Alive then return false end
-    local humanoid = char:FindFirstChildOfClass("Humanoid")
-    if not humanoid or humanoid.Health <= 0 then return false end
-    local root = char.PrimaryPart
-    if not root or root:FindFirstChild('SingularityCape') then return false end
-    local sword = char:GetAttribute("CurrentlyEquippedSword")
-    return sword ~= nil and sword ~= ""
+    if char:GetAttribute("Stunned") then return false end
+    if char:GetAttribute("DoNotParry") then return false end
+    return true
 end
 
 if not Remote.token then
