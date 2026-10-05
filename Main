@@ -52,8 +52,6 @@ local Games = {
     [95898962477575] = { Name = 'Last Letter (wilderness)', Script = 'Games/LastLetter.lua' },
     -- Chapter 1 (Farmhouse) of the needle in a haystack game, from its dump.
     [108628039999641] = { Name = 'Needle in a Haystack', Script = 'Games/NeedleHaystack.lua' },
-    -- Blade Ball's main place. Its other modes are picked up by Fingerprints below.
-    [13772394625] = { Name = 'Blade Ball', Script = 'Games/BladeBall.lua' },
 }
 
 -- Loads Onyx straight from its own repo rather than a vendored copy, since
@@ -278,21 +276,6 @@ Menu:Button({
 -- id. Rather than list every one, these check for things every mode of the
 -- game has. Only used when the place id itself isn't in Games.
 local Fingerprints = {
-    {
-        Name = 'Blade Ball',
-        Script = 'Games/BladeBall.lua',
-        -- Every Blade Ball mode has the Alive folder, the parry remotes and the
-        -- sword API the script itself relies on. Balls isn't required: it can
-        -- be missing between rounds.
-        Match = function()
-            local ReplicatedStorage = game:GetService('ReplicatedStorage')
-            local remotes = ReplicatedStorage:FindFirstChild('Remotes')
-            local shared = ReplicatedStorage:FindFirstChild('Shared')
-            return workspace:FindFirstChild('Alive') ~= nil
-                and remotes ~= nil and remotes:FindFirstChild('ParrySuccessAll') ~= nil
-                and shared ~= nil and shared:FindFirstChild('SwordAPI') ~= nil
-        end,
-    },
 }
 
 local function findGame()
