@@ -434,6 +434,15 @@ local function fireParryRemote(curveCF)
     if _pryEntry and _direct then
         -- Locked counts as handled, so nothing falls back to a key press.
         if os.clock() < _parryLockedUntil then return true end
+        -- The game only parries while alive (or in lobby parry) and not
+        -- stunned. A parry from anywhere else is one the real client never
+        -- sends.
+        local char = LocalPlayer.Character
+        if not char or char:GetAttribute("Stunned") or char:GetAttribute("DoNotParry") then return true end
+        local lobby = LocalPlayer:GetAttribute("LobbyParry")
+            or (LocalPlayer:GetAttribute("LobbyTraining") and char.Parent == workspace:FindFirstChild("Dead"))
+        if char.Parent ~= workspace:FindFirstChild("Alive") and not lobby then return true end
+        if LocalPlayer:GetAttribute("LobbyParry") and LocalPlayer:GetAttribute("InLobbyParryCooldown") then return true end
         _parryLockedUntil = os.clock() + PARRY_LOCK_TIME
         local aim_target, event_data = screenData()
         _callPryEntry(parryHold(), curveCF or cam.CFrame, event_data, aim_target, false)
