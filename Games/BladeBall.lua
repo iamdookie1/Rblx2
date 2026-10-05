@@ -85,28 +85,81 @@ local function getRoot()
 end
 
 -- ============================================================
--- AZURE TOKEN SYSTEM
+-- PARRY REMOTE (read straight from the game, no hooks)
 -- ============================================================
-local _token
-local _tokenFound = false
+-- The game's parry lives in SwordsController.PRY. Its send function holds
+-- everything a parry needs as upvalues:
+--   Net (the remote package), the remote's name, the first argument, the
+--   table that holds the current uid, and the token function.
+-- It sends: Net:RemoteEvent(name):FireServer(first, uid, token, ...).
+-- Reading those directly means nothing in the game is hooked. The anti-cheat
+-- (ReplicatedFirst.KeyboardLoader) catches metamethod hooks, and the old
+-- __index / __namecall hooks got kicked a little after loading even with no
+-- parries sent. PRY also has two decoy remotes among its upvalues that report
+-- to the server if fired; those are never touched.
+local function _isNet(v)
+    if type(v) ~= 'table' then return false end
+    local ok, fn = pcall(function() return v.RemoteEvent end)
+    return ok and type(fn) == 'function'
+end
+
+-- The uid holder is read as holder[2][holder[1]]. PRY keeps another table
+-- of the same shape that holds the send function itself, so a function
+-- there means it's not the uid.
+local function _isHolder(v)
+    if type(v) ~= 'table' or _isNet(v) then return false end
+    local ok, r = pcall(function()
+        return v[1] ~= nil and type(v[2]) == 'table' and type(v[2][v[1]]) ~= 'function'
+    end)
+    return ok and r
+end
+
+-- Net:RemoteEvent waits for the remote, so a wrong name would hang forever.
+-- Give it a few seconds.
+local function _lookupRemote(net, name)
+    local result, done = nil, false
+    task.spawn(function()
+        local ok, remote = pcall(function() return net:RemoteEvent(name) end)
+        if ok then result = remote end
+        done = true
+    end)
+    local start = os.clock()
+    while not done and os.clock() - start < 3 do task.wait() end
+    if typeof(result) == 'Instance' and result:IsA('RemoteEvent') then return result end
+    return nil
+end
+
+local _token, _direct = nil, nil
+local _tokenFallback = nil
 for _, Function in getgc(true) do
-    if type(Function) ~= 'function' or not debug.info(Function, 's'):find('PRY', 1, true) then continue end
-    for _, value in debug.getupvalues(Function) do
-        if type(value) == 'function' then
-            _token = value
-            _tokenFound = true
+    if type(Function) ~= 'function' then continue end
+    local okSrc, src = pcall(debug.info, Function, 's')
+    if not okSrc or type(src) ~= 'string' or not src:find('PRY', 1, true) then continue end
+    local okUp, ups = pcall(debug.getupvalues, Function)
+    if not okUp or type(ups) ~= 'table' then continue end
+    local token, netIdx, holder
+    for i, v in pairs(ups) do
+        if not token and type(v) == 'function' then token = v end
+        if not netIdx and _isNet(v) then netIdx = i end
+        if not holder and _isHolder(v) then holder = v end
+    end
+    if token and not _tokenFallback then _tokenFallback = token end
+    if token and netIdx and holder and type(ups[netIdx + 1]) == 'string' and ups[netIdx + 2] ~= nil then
+        local net, name = ups[netIdx], ups[netIdx + 1]
+        local remote = _lookupRemote(net, name)
+        if remote then
+            _token = token
+            _direct = {remote = remote, first = ups[netIdx + 2], holder = holder, net = net, name = name}
             break
         end
     end
-    if _token then break end
 end
+_token = _token or _tokenFallback
 
-if not _tokenFound then
+if not _token then
     Notify("Blade Ball", "Remote not found!", 5)
     return
 end
-
-Notify("Blade Ball", "Block once (F or click) to hook the remote", 4)
 
 function _tokenize(_remote_uid)
     local time = tostring(math.floor(workspace:GetServerTimeNow() * 100))
@@ -125,67 +178,51 @@ local _capturedRemote = nil
 local _capturedArgs = nil
 local _learnHold -- set below, once the hold value helpers exist
 
--- Catching the parry remote (same method as the Ui3 update). Both hooks go
--- on once, at load, and stay on: the game's parry goes through __namecall
--- (remote:FireServer(...)) or __index (a cached remote.FireServer). Every
--- parry the game sends refreshes the captured remote and arguments, so if
--- the game swaps the remote out the next parry picks up the new one.
--- Only a packet shaped like a parry (id, uid, token, number, CFrame,
--- {screen points}, {x, y}, ...) is taken, and calls this script makes are
--- ignored.
-local function _isParryPacket(args)
-    return #args >= 8
-        and typeof(args[5]) == 'CFrame'
-        and type(args[6]) == 'table'
-        and type(args[7]) == 'table'
+-- The current uid, read the same way the game reads it when it parries.
+local function _directUid()
+    local ok, uid = pcall(function() return _direct.holder[2][_direct.holder[1]] end)
+    return ok and uid or nil
 end
 
-local function _capture(remote, args)
-    if not _isParryPacket(args) then return end
-    if not _capturedRemote then
-        task.defer(Notify, "Blade Ball", "Remote hooked", 3)
-    end
-    _capturedRemote, _capturedArgs = remote, args
-    if _learnHold then pcall(_learnHold, args[4]) end
-end
-
-local function _isRemote(self)
-    return typeof(self) == 'Instance' and (self.ClassName == 'RemoteEvent' or self.ClassName == 'RemoteFunction')
-end
-
-local _hooked = false
-pcall(function()
-    if not (hookmetamethod and getnamecallmethod) then return end
-    local old_namecall
-    old_namecall = hookmetamethod(game, '__namecall', function(self, ...)
-        local method = getnamecallmethod()
-        if (method == 'FireServer' or method == 'InvokeServer') and not (checkcaller and checkcaller()) and _isRemote(self) then
-            _capture(self, {...})
-        end
-        return old_namecall(self, ...)
+if _direct then
+    _capturedRemote = _direct.remote
+    _capturedArgs = {_direct.first, _directUid()}
+    -- If the game swaps the remote out, look it up again by name.
+    _direct.remote.AncestryChanged:Connect(function(_, parent)
+        if parent then return end
+        task.defer(function()
+            local remote = _lookupRemote(_direct.net, _direct.name)
+            if remote then _direct.remote = remote; _capturedRemote = remote end
+        end)
     end)
-    _hooked = true
-end)
-pcall(function()
-    local meta = getrawmetatable(game)
-    local old_index = meta.__index
-    setreadonly(meta, false)
-    meta.__index = function(self, key)
-        if (key == 'FireServer' or key == 'InvokeServer') and not (checkcaller and checkcaller()) and _isRemote(self) then
-            local real = old_index(self, key)
-            return function(remote, ...)
-                _capture(remote, {...})
-                return real(remote, ...)
-            end
-        end
-        return old_index(self, key)
+    Notify("Blade Ball", "Parry remote found. No hook needed.", 4)
+else
+    -- Fallback only if the game's parry layout changed: a __namecall hook,
+    -- wrapped in newcclosure, waiting for one real block. This is the kind of
+    -- hook the anti-cheat can catch.
+    local _newcclosure = newcclosure or function(f) return f end
+    local function _isParryPacket(args)
+        return #args >= 8 and typeof(args[5]) == 'CFrame' and type(args[6]) == 'table' and type(args[7]) == 'table'
     end
-    setreadonly(meta, true)
-    _hooked = true
-end)
-
-if not _hooked then
-    Notify("Blade Ball", "Couldn't hook remotes on this executor.", 6)
+    local hooked = pcall(function()
+        local old_namecall
+        old_namecall = hookmetamethod(game, '__namecall', _newcclosure(function(self, ...)
+            if not _capturedRemote and not checkcaller() then
+                local method = getnamecallmethod()
+                if method == 'FireServer' and typeof(self) == 'Instance' and self.ClassName == 'RemoteEvent' then
+                    local args = {...}
+                    if _isParryPacket(args) then
+                        _capturedRemote, _capturedArgs = self, args
+                        if _learnHold then pcall(_learnHold, args[4]) end
+                        task.defer(Notify, "Blade Ball", "Remote hooked", 3)
+                    end
+                end
+            end
+            return old_namecall(self, ...)
+        end))
+    end)
+    Notify("Blade Ball", hooked and "Couldn't read the parry remote. Block once to hook it (risky)."
+        or "Couldn't find the parry remote on this executor.", 6)
 end
 
 task.delay(30, function()
@@ -289,15 +326,16 @@ end
 
 local function fireParryRemote(curveCF)
     if not _capturedRemote or not _capturedArgs then return false end
+    if _direct then _capturedArgs[2] = _directUid() end
     local cam = workspace.CurrentCamera
     local aim_target, event_data = screenData()
     local packet = {
-        _capturedArgs[1], _capturedArgs[2], _tokenize(_capturedArgs[2]),
+        _capturedArgs[1], _capturedArgs[2], _capturedArgs[2] and _tokenize(_capturedArgs[2]) or "",
         parryHold(), curveCF or cam.CFrame, event_data, aim_target, false
     }
     pcall(function()
-        if _capturedRemote:IsA('RemoteEvent') then _capturedRemote:FireServer(unpack(packet))
-        elseif _capturedRemote:IsA('RemoteFunction') then _capturedRemote:InvokeServer(unpack(packet)) end
+        if _capturedRemote:IsA('RemoteEvent') then _capturedRemote:FireServer(unpack(packet, 1, 8))
+        elseif _capturedRemote:IsA('RemoteFunction') then _capturedRemote:InvokeServer(unpack(packet, 1, 8)) end
     end)
     return true
 end
@@ -1555,7 +1593,7 @@ local RemoteLabel = Overview:AddLabel("Remote: checking...", true)
 local TargetLabel = Overview:AddLabel("Ball target: -", true)
 
 local function remoteStatusText()
-    if remoteReady() then return "Remote: hooked" end
+    if remoteReady() then return "Remote: ready" end
     return "Remote: waiting. Block once (F or click)"
 end
 
