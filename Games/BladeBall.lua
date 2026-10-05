@@ -182,18 +182,25 @@ local function remoteReady()
     return Remote.token ~= nil and Remote.remote ~= nil and Remote.args ~= nil
 end
 
--- "A place where they can parry" — mirrors the game's own parry gate (its client
--- parry handler only lets a block through when all of these hold): a character
--- parented under Workspace.Alive, not Stunned, and without the DoNotParry flag.
--- Stunned / DoNotParry are server-set attributes the game toggles whenever you
--- can't block (round intro, stun, certain abilities), so they're the authoritative
--- "can parry" signal rather than just "in a round".
+-- "A place where they can parry" — mirrors the game's own client parry gate. A
+-- block is allowed when the character isn't Stunned and doesn't carry DoNotParry
+-- (server-set attributes the game toggles whenever you can't block) AND it's in a
+-- spot where parrying happens: a live round (under Workspace.Alive), a lobby
+-- parry (LobbyParry attribute), or training (under Workspace.Dead with the
+-- LobbyTraining attribute). The old version only accepted Alive, so it never
+-- armed during lobby / training parrying.
 local function canParryNow()
     local char = LocalPlayer.Character
-    if not char or char.Parent ~= Alive then return false end
+    if not char then return false end
     if char:GetAttribute("Stunned") then return false end
     if char:GetAttribute("DoNotParry") then return false end
-    return true
+    if char.Parent == Alive then return true end
+    if LocalPlayer:GetAttribute("LobbyParry") then return true end
+    if LocalPlayer:GetAttribute("LobbyTraining") then
+        local Dead = Workspace:FindFirstChild("Dead")
+        if Dead and char.Parent == Dead then return true end
+    end
+    return false
 end
 
 if not Remote.token then
