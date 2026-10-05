@@ -106,7 +106,7 @@ if not _tokenFound then
     return
 end
 
-Notify("Blade Ball", "Parry once when the ball enters the circle to hook the remote", 4)
+Notify("Blade Ball", "Parry once to hook the remote (inside the circle works best)", 4)
 
 function _tokenize(_remote_uid)
     local time = tostring(math.floor(workspace:GetServerTimeNow() * 100))
@@ -124,79 +124,174 @@ end
 local _capturedRemote = nil
 local _capturedArgs = nil
 
--- Every Instance shares one metatable, so an __index hook runs on every
--- property read in the whole game. It's only installed while the ball is
--- inside the capture circle around you (you're about to parry), and taken
--- off as soon as the parry remote is caught or the ball leaves the circle.
--- Any key other than FireServer / InvokeServer, and any call this script
--- makes itself, falls straight through.
+-- Catching the parry remote. The game's parry call has to be seen once to
+-- learn which remote it uses and its first two arguments.
+--
+-- 1. hookfunction on the FireServer / InvokeServer functions themselves.
+--    This only runs when a remote is fired, not on every property read like
+--    an __index hook, so it can stay on until the remote is caught: a parry
+--    anywhere catches it, not just inside the circle.
+-- 2. A __namecall hook (remote:FireServer(...) style calls), which runs on
+--    every method call in the game, so it's only on while a ball is inside
+--    the capture circle and comes off again when it leaves.
+-- 3. If the executor has no hookfunction, the old __index metatable hook is
+--    used instead, also only while a ball is in the circle.
+--
+-- Only a packet shaped like a parry (id, uid, token, number, CFrame,
+-- {screen points}, {x, y}, ...) is taken, so another remote with 8+
+-- arguments can't be mistaken for it. Calls this script makes are ignored.
 local _checkcaller = checkcaller or function() return false end
-local _meta, _old, _hookFn = nil, nil, nil
-local _armed = false
+local _newcclosure = newcclosure or function(f) return f end
+local _armed = false      -- ball inside the circle: per-call hooks are live
+local _unloaded = false
+local _destroyConn
 
-local function _unhook()
-    _armed = false
-    if not _meta then return end
-    -- Only put the old __index back if nothing hooked on top of ours since.
-    -- Otherwise leave ours in place; disarmed, it's a plain pass-through.
-    if rawget(_meta, '__index') == _hookFn then
-        setreadonly(_meta, false)
-        _meta.__index = _old
-        setreadonly(_meta, true)
-        _meta, _old, _hookFn = nil, nil, nil
-    end
+local function _isParryPacket(n, args)
+    return n >= 8
+        and typeof(args[5]) == 'CFrame'
+        and type(args[6]) == 'table'
+        and type(args[7]) == 'table'
 end
 
-local _destroyConn
+local function _isRemote(obj, method)
+    if typeof(obj) ~= 'Instance' then return false end
+    local ok, class = pcall(function() return obj.ClassName end)
+    if not ok then return false end
+    return (method == 'FireServer' and class == 'RemoteEvent')
+        or (method == 'InvokeServer' and class == 'RemoteFunction')
+end
+
+local _unhook
 
 local function _capture(remote, args)
     _capturedRemote, _capturedArgs = remote, args
-    -- If the game swaps the remote out, go back to waiting for the new one.
-    if _destroyConn then _destroyConn:Disconnect() end
-    _destroyConn = remote.AncestryChanged:Connect(function(_, parent)
-        if parent == nil and _capturedRemote == remote then
-            _capturedRemote, _capturedArgs = nil, nil
-            Notify("Blade Ball", "Parry remote changed. Parry once inside the circle.", 4)
-        end
-    end)
     task.defer(function()
         _unhook()
+        -- If the game swaps the remote out, go back to waiting for the new one.
+        if _destroyConn then _destroyConn:Disconnect() end
+        _destroyConn = remote.AncestryChanged:Connect(function(_, parent)
+            if parent == nil and _capturedRemote == remote then
+                _capturedRemote, _capturedArgs = nil, nil
+                Notify("Blade Ball", "Parry remote changed. Parry once to catch the new one.", 4)
+            end
+        end)
         Notify("Blade Ball", "Remote hooked", 3)
     end)
 end
 
-local function _hook()
-    _armed = true
-    if _meta then return end
+-- Called from inside a hook with the game's own arguments. Cheap when there's
+-- nothing to do: one flag check, then out.
+local function _inspect(self, method, ...)
+    if _unloaded or _capturedRemote then return end
+    local n = select('#', ...)
+    if n < 8 or _checkcaller() then return end
+    local args = {...}
+    if not _isParryPacket(n, args) or not _isRemote(self, method) then return end
+    _capture(self, args)
+end
+
+-- 1. hookfunction: on for the whole session, pass-through once caught.
+local _fnHooked = false
+pcall(function()
+    if not hookfunction then return end
+    local probes = {
+        FireServer = Instance.new('RemoteEvent').FireServer,
+        InvokeServer = Instance.new('RemoteFunction').InvokeServer,
+    }
+    for method, fn in pairs(probes) do
+        local old
+        old = hookfunction(fn, _newcclosure(function(self, ...)
+            _inspect(self, method, ...)
+            return old(self, ...)
+        end))
+        _fnHooked = true
+    end
+end)
+
+-- 2 / 3. Per-call metamethod hooks, only while a ball is in the circle.
+local _getnamecallmethod = getnamecallmethod
+local _ncOld, _ncFn = nil, nil
+local _meta, _idxOld, _idxFn = nil, nil, nil
+
+local function _hookNamecall()
+    if _ncFn or not (hookmetamethod and _getnamecallmethod) then return end
+    local old
+    local fn = _newcclosure(function(self, ...)
+        if _armed and not _capturedRemote then
+            local method = _getnamecallmethod()
+            if method == 'FireServer' or method == 'InvokeServer' then
+                _inspect(self, method, ...)
+            end
+        end
+        return old(self, ...)
+    end)
+    local ok = pcall(function() old = hookmetamethod(game, '__namecall', fn) end)
+    if ok and old then _ncOld, _ncFn = old, fn end
+end
+
+local function _unhookNamecall()
+    if not _ncFn then return end
+    -- Only put the old one back if nothing hooked on top of ours since.
+    -- Otherwise leave ours in place; disarmed, it's a plain pass-through.
+    local ok, cur = pcall(function() return getrawmetatable(game).__namecall end)
+    if ok and cur == _ncFn then
+        pcall(hookmetamethod, game, '__namecall', _ncOld)
+        _ncOld, _ncFn = nil, nil
+    end
+end
+
+local function _hookIndex()
+    if _idxFn or not getrawmetatable then return end
     _meta = getrawmetatable(game)
-    _old = _meta.__index
-    local old = _old
-    _hookFn = function(self, key)
-        if not _armed or (key ~= 'FireServer' and key ~= 'InvokeServer') or _checkcaller() then
+    local old = rawget(_meta, '__index')
+    _idxOld = old
+    _idxFn = function(self, key)
+        if not _armed or _capturedRemote or (key ~= 'FireServer' and key ~= 'InvokeServer') or _checkcaller() then
             return old(self, key)
         end
         local method = old(self, key)
-        local class = old(self, 'ClassName')
-        if (key == 'FireServer' and class ~= 'RemoteEvent') or
-           (key == 'InvokeServer' and class ~= 'RemoteFunction') then
-            return method
-        end
+        if not _isRemote(self, key) then return method end
         return function(this, ...)
-            if _armed and select('#', ...) >= 8 then
-                _armed = false
-                _capture(self, {...})
-            end
+            _inspect(self, key, ...)
             return method(this, ...)
         end
     end
     setreadonly(_meta, false)
-    _meta.__index = _hookFn
+    _meta.__index = _idxFn
     setreadonly(_meta, true)
+end
+
+local function _unhookIndex()
+    if not _idxFn then return end
+    if rawget(_meta, '__index') == _idxFn then
+        setreadonly(_meta, false)
+        _meta.__index = _idxOld
+        setreadonly(_meta, true)
+        _meta, _idxOld, _idxFn = nil, nil, nil
+    end
+end
+
+local function _hook()
+    if _unloaded then return end
+    _armed = true
+    _hookNamecall()
+    if not _fnHooked then pcall(_hookIndex) end
+end
+
+_unhook = function()
+    _armed = false
+    pcall(_unhookNamecall)
+    pcall(_unhookIndex)
+end
+
+local function _unhookAll()
+    _unloaded = true
+    _unhook()
 end
 
 task.delay(30, function()
     if not _capturedRemote then
-        Notify("Blade Ball", "Remote not caught yet. Parry once when the ball is in the circle.", 5)
+        Notify("Blade Ball", "Remote not caught yet. Parry once, ideally with the ball in the circle.", 5)
     end
 end)
 
@@ -423,10 +518,10 @@ end
 -- ============================================================
 -- CAPTURE CIRCLE
 -- ============================================================
--- Until the parry remote is caught, a ring is drawn around you. The hook is
--- only on while a ball is inside it, which is when you'd parry anyway, so
--- parrying once in the ring catches the remote. Once caught, the ring goes
--- away and this loop does nothing.
+-- Until the parry remote is caught, a ring is drawn around you. The
+-- per-call hooks (__namecall, or __index without hookfunction) are only on
+-- while a ball is inside it, which is when you'd parry anyway. Once caught,
+-- the ring goes away and this loop does nothing.
 local CAPTURE_RADIUS = 35
 local CaptureRing = Instance.new('Part')
 CaptureRing.Name = 'BladeBall_CaptureRing'; CaptureRing.Shape = Enum.PartType.Cylinder
@@ -1557,7 +1652,7 @@ local TargetLabel = Overview:AddLabel("Ball target: -", true)
 
 local function remoteStatusText()
     if remoteReady() then return "Remote: hooked" end
-    return "Remote: waiting. Parry once inside the circle"
+    return "Remote: waiting. Parry once (inside the circle works best)"
 end
 
 local status_peak, status_ball = 0, nil
@@ -1920,7 +2015,7 @@ end))
 -- UNLOAD
 -- ============================================================
 Library:OnUnload(function()
-    _unhook()
+    _unhookAll()
     pcall(function() CaptureRing:Destroy() end)
     if _destroyConn then pcall(function() _destroyConn:Disconnect() end) end
     System.autoparry.stop()
