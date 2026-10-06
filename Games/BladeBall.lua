@@ -683,7 +683,10 @@ function System.curve.get_cframe()
     local target_pos = targetPart and targetPart.Position or (root_pos + Camera.CFrame.LookVector * 100)
     local Parry_Type = System.__config.__curve_names[System.__properties.__curve_mode]
     local cf
-    if Parry_Type == "Camera" then cf = Camera.CFrame
+    -- "Camera" now shoots straight at whoever Target mode picked (so Target mode
+    -- actually steers the ball). It used to send the raw camera look, which
+    -- ignored the target and always went wherever you were facing.
+    if Parry_Type == "Camera" then cf = CFrame.new(root_pos, target_pos)
     elseif Parry_Type == "Random" then
         local direction = (target_pos - root_pos).Unit
         local random_offset; local attempts = 0
@@ -700,12 +703,12 @@ function System.curve.get_cframe()
         cf = CFrame.new(Camera.CFrame.Position, backwards_pos)
     elseif Parry_Type == "Slow" then cf = CFrame.new(root_pos, target_pos + Vector3.new(0, -9e18, 0))
     elseif Parry_Type == "High" then cf = CFrame.new(root_pos, target_pos + Vector3.new(0, 9e18, 0))
-    elseif Parry_Type == "Normal" then cf = CFrame.new(root_pos, root_pos + (root and root.CFrame.LookVector or Camera.CFrame.LookVector))
+    elseif Parry_Type == "Normal" then cf = CFrame.new(root_pos, target_pos)
     elseif Parry_Type == "Speed" then cf = CFrame.new(Camera.CFrame.Position, Camera.CFrame.Position + Camera.CFrame.UpVector * 5)
     elseif Parry_Type == "Down" then cf = CFrame.new(Camera.CFrame.Position, Camera.CFrame.Position + Camera.CFrame.UpVector * -9e9)
     elseif Parry_Type == "Left" then cf = CFrame.new(Camera.CFrame.Position, Camera.CFrame.Position - Camera.CFrame.RightVector * 9e9)
     elseif Parry_Type == "Right" then cf = CFrame.new(Camera.CFrame.Position, Camera.CFrame.Position + Camera.CFrame.RightVector * 9e9)
-    else cf = Camera.CFrame end
+    else cf = CFrame.new(root_pos, target_pos) end
     return cf
 end
 
