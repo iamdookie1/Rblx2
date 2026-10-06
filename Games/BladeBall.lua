@@ -6,7 +6,7 @@ task.spawn(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.06-3"
+local SCRIPT_VERSION = "2026.10.06-4"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -530,6 +530,18 @@ function System.animation.play_grab_parry()
     end
     Grab_Parry = humanoid.Animator:LoadAnimation(animation)
     GrabParryPlay(Grab_Parry)
+end
+
+-- A swing that plays to the end: only starts a new grab once the last one has
+-- finished (or a parry landed, which the game follows with its own success
+-- animation), so a held spam looks like real swings instead of a stuttering
+-- grab start.
+function System.animation.play_grab_parry_full()
+    if Grab_Parry and not Sword_CP then
+        local ok, playing = pcall(function() return Grab_Parry.IsPlaying end)
+        if ok and playing then return end
+    end
+    System.animation.play_grab_parry()
 end
 
 pcall(function()
@@ -1149,6 +1161,24 @@ local function try_parry_ball(ball, root, now, via)
     if speed < 1 then return hold("ball not moving") end
     local ping_s = math.min(getPing(), 400) / 1000
 
+    -- Instant retarget (inside close range, straight off the target change).
+    -- The ball's velocity still points at its last holder at that moment, so
+    -- heading can't be read yet; it parries if the ball is close enough to
+    -- land within a parry's window. One parry per pass, so it can't double;
+    -- further out it's left to the normal checks a frame later.
+    if via == "instant retarget" then
+        local eta = distance / speed
+        if eta > APCfg.parry_window + ping_s then return hold("too far for instant") end
+        state.parried, state.at = true, now
+        state.pass_parried = true
+        mark_parry(eta)
+        ParryLog.source = via
+        if try_ability() then log_send("ability") else System.parry.by_mode(getgenv().AutoParryMode) end
+        ParryLog.source = nil
+        state.why = "parried (instant)"
+        return true
+    end
+
     -- Already reached us this pass: it hit, or a parry is landing. Nothing left
     -- to parry; firing here was the "parried after getting hit".
     if distance <= APCfg.hit_radius then state.reached_at = now end
@@ -1316,9 +1346,10 @@ local ManualSpam = {rate = 300}     -- parries per second
 -- (plus close-range parries by that player). Optionally also at point blank.
 local AutoSpam = {
     rate = 250,
-    clash_range = 30,       -- max studs between you and them
+    clash_range = 20,       -- max studs between you and them
     clash_swaps = 2,        -- hand-offs between you and them in one run
-    clash_window = 0.75,    -- max seconds between hand-offs
+    clash_window = 0.5,     -- max seconds between hand-offs
+    react_margin = 0.03,    -- seconds on top of ping (a couple of frames) a reactive parry needs
     point_blank = false,
     point_blank_range = 14, -- studs
     linger = 0.2,           -- keep going this long after the last detection
@@ -1330,13 +1361,17 @@ local SPAM_MAX_PER_TICK = 40
 function System.manual_spam.start() System.__properties.__manual_spam_enabled = true end
 function System.manual_spam.stop() System.__properties.__manual_spam_enabled = false end
 
-local function spam_fire()
+local function spam_fire(manual)
     if getgenv().ManualSpamMode == "Keypress" then
         System.parry.keypress()
     else
         System.parry.fast()
         if getgenv().ManualSpamAnimationFix and macroAnimFix then
-            pcall(System.animation.play_grab_parry)
+            -- Manual spam is held for a while: restarting the grab every few
+            -- frames meant you only ever saw the start of it. Each swing now
+            -- plays out before the next. Auto spam bursts are short, so it keeps
+            -- the snappier one.
+            pcall(manual and System.animation.play_grab_parry_full or System.animation.play_grab_parry)
         end
     end
 end
@@ -1366,10 +1401,18 @@ end
 -- within the clash window of the previous one; a long hold (the ball flying in
 -- from someone far away) can start a run but nothing before it counts. Only
 -- real hand-offs count: one parry is one hit, never two.
+-- How fast a return has to be before one reactive parry can't keep up.
+local function reaction_budget()
+    return math.min(getPing(), 400) / 1000 + AutoSpam.react_margin
+end
+
 local function detect_clash(ball, root, now)
     local owners = ball_owners(get_ball_state(ball))
     local newest, second = owners[1], owners[2]
-    if not second or now - newest.t > AutoSpam.clash_window then return nil end
+    -- In a real clash every hand-off is quick too, not just the distance: each
+    -- has to come within a couple of reaction times (capped by the window).
+    local quick = math.min(AutoSpam.clash_window, reaction_budget() * 2.5)
+    if not second or now - newest.t > quick then return nil end
     local me = LocalPlayer.Name
     local opponent
     if newest.name == me then opponent = second.name
@@ -1381,14 +1424,22 @@ local function detect_clash(ball, root, now)
         local cur, prev = owners[i], owners[i + 1]
         local alternates = (cur.name == me and prev.name == opponent) or (cur.name == opponent and prev.name == me)
         if not alternates then break end
+        if cur.t - prev.t > quick then break end
         hits = hits + 1
-        if cur.t - prev.t > AutoSpam.clash_window then break end
     end
     if hits < AutoSpam.clash_swaps then return nil end
 
     local their_root = character_root(opponent)
-    if not their_root or (their_root.Position - root.Position).Magnitude > AutoSpam.clash_range then return nil end
+    if not their_root then return nil end
+    local gap = (their_root.Position - root.Position).Magnitude
+    if gap > AutoSpam.clash_range then return nil end
     if (ball.Position - root.Position).Magnitude > AutoSpam.clash_range * 1.5 then return nil end
+    -- Only a real clash: the ball crosses the gap between you faster than a
+    -- reactive parry can answer (ping + a little). A normal rally with someone
+    -- nearby is slower than that, auto parry handles each pass with one
+    -- parry, and spamming it was the "spam for no reason".
+    local speed = ball_velocity(ball).Magnitude
+    if gap / math.max(speed, 1) > reaction_budget() then return nil end
     return ("clash vs %s (%d hits)"):format(opponent, hits)
 end
 
@@ -1401,7 +1452,16 @@ local function detect_point_blank(ball, root)
     local zoomies = ball:FindFirstChild('zoomies')
     local velocity = zoomies and zoomies.VectorVelocity or ball.AssemblyLinearVelocity
     if distance > 1 and velocity:Dot(offset.Unit) <= 0 then return nil end
+    -- Same rule as clashes: only when it's on you faster than you could react.
+    if distance / math.max(velocity.Magnitude, 1) > reaction_budget() then return nil end
     return "point blank"
+end
+
+-- Lobby training or lobby parry: auto spam never runs there.
+local function in_training()
+    if LocalPlayer:GetAttribute("LobbyTraining") or LocalPlayer:GetAttribute("LobbyParry") then return true end
+    local char, dead = LocalPlayer.Character, Workspace:FindFirstChild("Dead")
+    return char ~= nil and dead ~= nil and char.Parent == dead
 end
 
 -- Once per frame: decide whether auto spam should be firing.
@@ -1412,7 +1472,8 @@ local function auto_spam_evaluate()
     end
     local now = os.clock()
     local root = getRoot()
-    if root and not root:FindFirstChild('SingularityCape') and canParryNow() and not blocked_by_detection() then
+    if root and not root:FindFirstChild('SingularityCape') and canParryNow() and not blocked_by_detection()
+        and not in_training() then
         for _, ball in ipairs(get_live_balls()) do
             local reason = detect_clash(ball, root, now) or detect_point_blank(ball, root)
             if reason then
@@ -1458,7 +1519,8 @@ local function spam_tick()
     if fires > 0 then
         spam_acc = spam_acc - fires * interval
         ParryLog.source = source
-        for _ = 1, fires do spam_fire() end
+        local manual = source == "manual spam"
+        for _ = 1, fires do spam_fire(manual) end
         ParryLog.source = nil
     end
     if spam_acc > interval * 4 then spam_acc = 0 end
@@ -2220,7 +2282,7 @@ AP:AddSlider("CloseRange", {Text = "Close range", Default = 20, Min = 8, Max = 4
     Tooltip = "Instant parry on retarget and pre-parry only work inside this distance.",
     Callback = function(v) APCfg.close_range = v end})
 AP:AddToggle("InstantRetarget", {Text = "Instant parry on retarget", Default = true,
-    Tooltip = "Inside close range, checks the ball the moment it switches to you instead of on the next frame. Same checks as normal auto parry, just a frame sooner.",
+    Tooltip = "Inside close range, parries the moment the ball switches to you if it's close enough to land within a parry. Still one parry per pass.",
     Callback = function(v) APCfg.instant = v end})
 AP:AddToggle("ClosePreParry", {Text = "Close-range pre-parry", Default = false,
     Tooltip = "Off by default. Parries ahead when a player next to you is about to hit the ball and a return would be too fast to react to. It's a guess: if they send it elsewhere or curve it, it was wasted. Auto spam is the better tool for clashes.",
@@ -2338,7 +2400,7 @@ end})
 
 local AS = Tabs.Spam:AddRightGroupbox("Auto Spam", "activity")
 AS:AddToggle("AutoSpam", {Text = "Auto spam", Default = false,
-    Tooltip = "Watches for clashes (the ball bouncing between you and a nearby player) and spams only while one is happening.",
+    Tooltip = "Spams only during a real clash: the ball going back and forth with a nearby player faster than one parry can react to. Normal rallies are left to auto parry. Never runs in training.",
     Callback = function(v)
         System.__properties.__auto_spam_enabled = v
         if v then prime_remote() else AutoSpam.active_until, AutoSpam.reason = 0, nil end
@@ -2348,13 +2410,13 @@ local AutoSpamLabel = AS:AddLabel("Status: off", true)
 AS:AddSlider("AutoSpamRate", {Text = "Spam rate", Default = 250, Min = 20, Max = 1000, Rounding = 0, Suffix = " /s",
     Tooltip = "Parries per second while a clash is detected.",
     Callback = function(v) AutoSpam.rate = v end})
-AS:AddSlider("ClashRange", {Text = "Clash range", Default = 30, Min = 10, Max = 80, Rounding = 0, Suffix = " studs",
+AS:AddSlider("ClashRange", {Text = "Clash range", Default = 20, Min = 8, Max = 60, Rounding = 0, Suffix = " studs",
     Tooltip = "How close the other player has to be for the exchange to count as a clash.",
     Callback = function(v) AutoSpam.clash_range = v end})
 AS:AddSlider("ClashSwaps", {Text = "Clash hits", Default = 2, Min = 1, Max = 6, Rounding = 0, Suffix = " hits",
     Tooltip = "Hand-offs between you and the same nearby player before spamming. 1 = as soon as you send it to them, 2 = once they send it back, and so on.",
     Callback = function(v) AutoSpam.clash_swaps = v end})
-AS:AddSlider("ClashWindow", {Text = "Clash window", Default = 0.75, Min = 0.2, Max = 2, Rounding = 2, Suffix = "s",
+AS:AddSlider("ClashWindow", {Text = "Clash window", Default = 0.5, Min = 0.2, Max = 2, Rounding = 2, Suffix = "s",
     Tooltip = "Max time between hand-offs for them to count as one exchange. Raise it if slower clashes aren't picked up.",
     Callback = function(v) AutoSpam.clash_window = v end})
 AS:AddToggle("PointBlankSpam", {Text = "Point-blank spam", Default = false,
