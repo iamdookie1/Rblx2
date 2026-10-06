@@ -367,28 +367,35 @@ local CollectionService = cloneref(game:GetService('CollectionService'))
 -- Screen points sent with a parry, built the way the game's own parry handler
 -- builds them: everyone under Alive, or in lobby training the other trainees
 -- under Workspace.Dead plus the LobbyTrainingTarget dummies.
+-- Also returns `others`: everyone in that list except us, with world and screen
+-- position, which is what target mode picks from.
 local function build_screen_points(cam)
-    local points = {}
+    local points, others = {}, {}
     local char = LocalPlayer.Character
+    local function add(name, pos)
+        local screen = cam:WorldToScreenPoint(pos)
+        points[name] = screen
+        if not (char and name == char.Name) then
+            others[#others + 1] = {name = name, pos = pos, screen = screen}
+        end
+    end
     local dead = Workspace:FindFirstChild('Dead')
     if dead and char and char.Parent == dead and LocalPlayer:GetAttribute('LobbyTraining') then
         for _, other in ipairs(dead:GetChildren()) do
             local plr = Players:GetPlayerFromCharacter(other)
             local hrp = other:FindFirstChild('HumanoidRootPart')
-            if plr and hrp and plr:GetAttribute('LobbyTraining') then
-                points[other.Name] = cam:WorldToScreenPoint(hrp.Position)
-            end
+            if plr and hrp and plr:GetAttribute('LobbyTraining') then add(other.Name, hrp.Position) end
         end
         for _, dummy in ipairs(CollectionService:GetTagged('LobbyTrainingTarget')) do
-            if dummy:IsA('BasePart') then points[dummy.Name] = cam:WorldToScreenPoint(dummy.Position) end
+            if dummy:IsA('BasePart') then add(dummy.Name, dummy.Position) end
         end
     else
         for _, entity in ipairs(Alive:GetChildren()) do
             local hrp = entity:FindFirstChild('HumanoidRootPart')
-            if hrp then points[entity.Name] = cam:WorldToScreenPoint(hrp.Position) end
+            if hrp then add(entity.Name, hrp.Position) end
         end
     end
-    return points
+    return points, others
 end
 
 -- The game sends the mouse position every time (its keyboard/mouse check is
@@ -403,22 +410,34 @@ end
 -- Screen points and aim only change frame to frame, so parries fired in the
 -- same frame (spam) share one copy instead of re-projecting every player.
 local PACKET_TTL = 1 / 240
-local packet_cache = {at = -1, points = nil, aim = nil}
+local packet_cache = {at = -1, points = nil, aim = nil, others = nil}
 local function packet_parts(cam)
     local now = os.clock()
     if now - packet_cache.at > PACKET_TTL then
-        packet_cache.points = build_screen_points(cam)
+        packet_cache.points, packet_cache.others = build_screen_points(cam)
         packet_cache.aim = aim_point(cam)
         packet_cache.at = now
     end
-    return packet_cache.points, packet_cache.aim
+    return packet_cache.points, packet_cache.aim, packet_cache.others
 end
+
+-- Who the ball gets sent to. Defined further down, once System exists.
+local choose_target
 
 local function fireParryRemote(curveCF)
     if not is_live() then return true end -- replaced copy: send nothing, and don't fall back to the key
     if not remoteReady() then return false end
     local cam = Workspace.CurrentCamera
     local points, aim = packet_parts(cam)
+    -- The server gives the ball to whoever's screen point (arg 6) is nearest the
+    -- aim point (arg 7) -- that's why it always went to the cursor. For any
+    -- target mode but Cursor, aim at the chosen target's own screen point so the
+    -- server picks exactly them. The curve (arg 5) is untouched.
+    if choose_target then
+        local name, _, mode = choose_target(cam)
+        local screen = name and points[name]
+        if screen and mode ~= "Cursor" then aim = {screen.X, screen.Y} end
+    end
     local args, remote = Remote.args, Remote.remote
     local window = type(args[4]) == 'number' and args[4] or 0.5
     local flag = args[8]
@@ -614,64 +633,66 @@ function System.player.get_closest()
     Closest_Entity = closest_entity; return closest_entity
 end
 
--- Who the curve aims the ball at. Target mode (separate from curve mode, which
--- is the *shape* of the shot) decides which enemy is picked:
---   Cursor   -> enemy nearest the mouse on screen (what it always used to do)
---   Camera   -> enemy nearest the middle of the screen
---   Closest  -> enemy physically nearest you
---   Farthest -> enemy physically farthest from you
---   Random   -> a random enemy (fresh pick each parry)
--- Cursor/Camera fall back to the world-closest enemy when nobody's on screen.
-local function pick_target()
-    local Camera = Workspace.CurrentCamera
-    local root = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
-    local root_pos = root and root.Position or Camera.CFrame.Position
-    local parts = {}
-    if Alive then
-        for _, v in pairs(Alive:GetChildren()) do
-            if v ~= LocalPlayer.Character and v.PrimaryPart then parts[#parts + 1] = v.PrimaryPart end
-        end
-    end
-    if #parts == 0 then return nil end
-
+-- Who the ball gets sent to (Target mode). Picks from the same player list the
+-- parry packet sends, so it also works in lobby training against bots:
+--   Cursor   -> nearest the mouse on screen (the game's normal behaviour)
+--   Camera   -> nearest the middle of the screen
+--   Closest  -> physically nearest you
+--   Farthest -> physically farthest from you
+--   Random   -> a random player
+-- Cursor/Camera fall back to the nearest player when nobody's on screen.
+-- Returns name, world position, mode. The pick is held for 0.1s so the curve and
+-- the packet built for the same parry agree (Random would otherwise differ).
+local target_hold = {at = -1, mode = nil, name = nil, pos = nil}
+choose_target = function(cam)
+    cam = cam or Workspace.CurrentCamera
     local mode = System.__config.__target_names[System.__properties.__target_mode] or "Cursor"
-    if mode == "Random" then return parts[math.random(1, #parts)] end
-
-    if mode == "Closest" or mode == "Farthest" then
-        local best, bestDist = nil, (mode == "Closest") and math.huge or -1
-        for _, part in ipairs(parts) do
-            local d = (part.Position - root_pos).Magnitude
-            if (mode == "Closest" and d < bestDist) or (mode == "Farthest" and d > bestDist) then
-                bestDist, best = d, part
+    local now = os.clock()
+    if target_hold.mode == mode and now - target_hold.at < 0.1 then
+        return target_hold.name, target_hold.pos, mode
+    end
+    local _, _, others = packet_parts(cam)
+    local root = getRoot()
+    local origin = root and root.Position or cam.CFrame.Position
+    local name, pos
+    if others and #others > 0 then
+        if mode == "Random" then
+            local t = others[math.random(1, #others)]
+            name, pos = t.name, t.pos
+        elseif mode == "Closest" or mode == "Farthest" then
+            local best = (mode == "Closest") and math.huge or -1
+            for _, t in ipairs(others) do
+                local d = (t.pos - origin).Magnitude
+                if (mode == "Closest" and d < best) or (mode == "Farthest" and d > best) then
+                    best, name, pos = d, t.name, t.pos
+                end
+            end
+        else
+            local vp = cam.ViewportSize
+            local anchor = Vector2.new(vp.X / 2, vp.Y / 2)
+            if mode == "Cursor" and not isMobile then
+                local ok, m = pcall(UserInputService.GetMouseLocation, UserInputService)
+                if ok and m then anchor = m end
+            end
+            local best = math.huge
+            for _, t in ipairs(others) do
+                local s = t.screen
+                if s.Z > 0 and s.X >= 0 and s.Y >= 0 and s.X <= vp.X and s.Y <= vp.Y then
+                    local d = (Vector2.new(s.X, s.Y) - anchor).Magnitude
+                    if d < best then best, name, pos = d, t.name, t.pos end
+                end
+            end
+            if not name then
+                best = math.huge
+                for _, t in ipairs(others) do
+                    local d = (t.pos - origin).Magnitude
+                    if d < best then best, name, pos = d, t.name, t.pos end
+                end
             end
         end
-        return best
     end
-
-    -- Cursor / Camera: nearest enemy to a screen anchor.
-    local anchor
-    if mode == "Camera" or isMobile then
-        anchor = Vector2.new(Camera.ViewportSize.X / 2, Camera.ViewportSize.Y / 2)
-    else
-        local ok, m = pcall(UserInputService.GetMouseLocation, UserInputService)
-        anchor = (ok and m) or Vector2.new(Camera.ViewportSize.X / 2, Camera.ViewportSize.Y / 2)
-    end
-    local best, bestDist = nil, math.huge
-    for _, part in ipairs(parts) do
-        local sp, onScreen = Camera:WorldToScreenPoint(part.Position)
-        if onScreen then
-            local d = (Vector2.new(sp.X, sp.Y) - anchor).Magnitude
-            if d < bestDist then bestDist, best = d, part end
-        end
-    end
-    if best then return best end
-    -- Nobody on screen: fall back to the world-closest enemy.
-    local bd = math.huge
-    for _, part in ipairs(parts) do
-        local d = (part.Position - root_pos).Magnitude
-        if d < bd then bd, best = d, part end
-    end
-    return best
+    target_hold.at, target_hold.mode, target_hold.name, target_hold.pos = now, mode, name, pos
+    return name, pos, mode
 end
 
 System.curve = {}
@@ -679,8 +700,8 @@ function System.curve.get_cframe()
     local Camera = Workspace.CurrentCamera
     local root = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
     local root_pos = root and root.Position or Camera.CFrame.Position
-    local targetPart = pick_target()
-    local target_pos = targetPart and targetPart.Position or (root_pos + Camera.CFrame.LookVector * 100)
+    local _, chosen_pos = choose_target(Camera)
+    local target_pos = chosen_pos or (root_pos + Camera.CFrame.LookVector * 100)
     local Parry_Type = System.__config.__curve_names[System.__properties.__curve_mode]
     local cf
     if Parry_Type == "Camera" then cf = Camera.CFrame
@@ -2315,7 +2336,7 @@ AP:AddDropdown("CurveMode", {Text = "Curve mode", Values = System.__config.__cur
         for i, n in ipairs(System.__config.__curve_names) do if n == v then System.__properties.__curve_mode = i; break end end
     end})
 AP:AddDropdown("TargetMode", {Text = "Target mode", Values = System.__config.__target_names, Default = "Cursor",
-    Tooltip = "Who the curve sends the ball at. Cursor: enemy under your mouse. Camera: enemy nearest screen centre. Closest/Farthest: by distance to you. Random: a random enemy each parry.",
+    Tooltip = "Who the ball goes to (separate from curve). Cursor: player under your mouse. Camera: player nearest screen centre. Closest/Farthest: by distance to you. Random: a random player. Needs remote parry mode.",
     Callback = function(v)
         for i, n in ipairs(System.__config.__target_names) do if n == v then System.__properties.__target_mode = i; break end end
     end})
