@@ -1103,6 +1103,11 @@ local function get_ball_state(ball)
         if type(new) == 'string' and new ~= '' and new ~= LocalPlayer.Name then
             state.pass_parried, state.pass_open, state.preparried = false, false, false
         end
+        -- A new pass at us: any "parry landed" hold left over is from the last
+        -- pass. The success event often arrives after the ball already flipped to
+        -- the other player, which left the hold set and blocked this pass's parry
+        -- -- why instant retarget did nothing in fast exchanges.
+        if new == LocalPlayer.Name and not state.pass_open then ParryCover.landed = false end
         if new == LocalPlayer.Name then open_pass(state) end
         state.target = new
         state.parried = false
@@ -1411,22 +1416,31 @@ function System.autoparry.step()
 end
 
 -- Straight from the ball's target change, a frame before the loop would see it.
--- Inside close range the ball's velocity still points at its old holder, so the
--- distance-only "instant" branch handles it. Beyond close range we run the full
--- heading-aware check immediately instead of waiting a frame: if the ball is
--- already coming it parries now, and if it's still flying to its old holder the
--- normal logic just holds (no early wasted parry). Either way a retarget is
--- acted on the instant it happens, at any range.
+-- At that moment the ball's velocity still points at its old holder, so heading
+-- can't be read; the "instant" branch parries on distance and speed alone. It's
+-- used inside close range, and beyond it whenever the ball would still land inside
+-- one parry window even if it had to travel twice the straight-line distance (so a
+-- curve can't make it arrive after the parry runs out). Anything further gets the
+-- normal heading-aware check right away, which holds until the ball turns in.
 function System.autoparry.on_retarget(ball)
     if not APCfg.instant then return end
     local root = autoparry_can_run()
     if not root then return end
-    local close = (root.Position - ball.Position).Magnitude <= APCfg.close_range
-    pcall(try_parry_ball, ball, root, tick(), close and "instant retarget" or "retarget")
+    local distance = (root.Position - ball.Position).Magnitude
+    local speed = ball_velocity(ball).Magnitude
+    local window = lead_window(speed) + math.min(pingMs(), 400) / 1000
+    local instant = distance <= APCfg.close_range
+        or (speed > 1 and 2 * distance / speed <= window)
+    pcall(try_parry_ball, ball, root, tick(), instant and "instant retarget" or "retarget")
 end
 
--- Our own parry landed: stay locked until the ball actually leaves us.
-Remotes.ParrySuccess.OnClientEvent:Connect(parry_landed)
+-- Our own parry landed: stay locked until the ball actually leaves us. Only while
+-- a ball is still on us -- if it already flipped away there's nothing to hold for.
+Remotes.ParrySuccess.OnClientEvent:Connect(function()
+    for _, ball in ipairs(get_live_balls()) do
+        if ball:GetAttribute('target') == LocalPlayer.Name then parry_landed(); return end
+    end
+end)
 
 Remotes.ParrySuccessAll.OnClientEvent:Connect(function()
     if System.__properties.__grab_animation then pcall(function() System.__properties.__grab_animation:Stop() end) end
@@ -1538,30 +1552,30 @@ local function detect_clash(ball, root, now)
     local gap = (their_root.Position - root.Position).Magnitude
     local speed = math.max(ball_velocity(ball).Magnitude, 1)
     local budget = reaction_budget()
-    -- Clash range, worked out instead of set: the ball crosses the gap between
-    -- you faster than a reactive parry can answer. Faster balls and higher ping
-    -- make that range wider on their own; a normal rally is slower than this and
-    -- left to auto parry, one parry per pass.
-    local cross = gap / speed
-    if cross > budget then return nil end
+    -- Clash range, worked out: close enough that the two of you are trading the
+    -- ball, wider for faster balls (a 300+ studs/s exchange spans more ground).
+    local range = math.clamp(18 + speed * 0.06, 18, 45)
+    if gap > range then return nil end
     -- The ball has to be in the exchange, not flying in from someone else.
-    if (ball.Position - root.Position).Magnitude > gap + speed * budget + 6 then return nil end
-    -- Clash window, worked out: a hand-off every crossing plus a couple of
-    -- reaction times. A long hold breaks the run.
-    local quick = cross + budget * 2 + 0.05
-    if now - newest.t > quick then return nil end
+    if (ball.Position - root.Position).Magnitude > gap + 12 then return nil end
+    -- Clash tempo, worked out: in a clash each hand-off comes about as fast as the
+    -- ball can cross between you plus both reactions. A slow rally (long holds,
+    -- curves) breaks the run and is left to auto parry.
+    local cross = gap / speed
+    local tempo = math.clamp(cross * 2 + budget * 2 + 0.15, 0.3, 0.75)
+    if now - newest.t > tempo then return nil end
 
     local hits = 0
     for i = 1, #owners - 1 do
         local cur, prev = owners[i], owners[i + 1]
         local alternates = (cur.name == me and prev.name == opponent) or (cur.name == opponent and prev.name == me)
-        if not alternates or cur.t - prev.t > quick then break end
+        if not alternates or cur.t - prev.t > tempo then break end
         hits = hits + 1
     end
-    -- Clash hits, worked out: one hand-off is enough when the return is far too
-    -- fast to react to; otherwise wait for a second so one quick pass with a
+    -- Clash hits, worked out: right up close one quick hand-off is enough;
+    -- otherwise wait for the ball to come back once so a single pass with a
     -- nearby player doesn't start spam.
-    local need = (cross <= budget * 0.5) and 1 or 2
+    local need = (gap <= 10 or cross <= budget) and 1 or 2
     if hits < need then return nil end
     return ("clash vs %s (%d hits)"):format(opponent, hits)
 end
@@ -1618,11 +1632,21 @@ function System.auto_spam.status()
     return "watching for clashes"
 end
 
+-- Measures the parries spam really sent per second (shown next to the rate
+-- slider), over a half-second window so it reads steadily.
+local SpamMeter = {count = 0, since = os.clock(), rate = 0}
+function System.spam_actual_rate() return SpamMeter.rate end
+
 local spam_acc, spam_last, spam_active = 0, os.clock(), false
 local function spam_tick()
     local now = os.clock()
     local elapsed = math.min(now - spam_last, 0.1)
     spam_last = now
+    local span = now - SpamMeter.since
+    if span >= 0.5 then
+        SpamMeter.rate = SpamMeter.count / span
+        SpamMeter.count, SpamMeter.since = 0, now
+    end
     local props = System.__properties
     local rate, source
     if props.__manual_spam_enabled then
@@ -1648,7 +1672,10 @@ local function spam_tick()
         local manual = source == "manual spam"
         for _ = 1, fires do spam_fire(manual) end
         ParryLog.source = nil
+        SpamMeter.count = SpamMeter.count + fires
     end
+    -- Don't try to make up a big backlog after a frame hitch; a burst of stale
+    -- parries all at once does nothing useful.
     if spam_acc > interval * 4 then spam_acc = 0 end
 end
 
@@ -1667,8 +1694,13 @@ do
         run(spam_tick)
     end)
     conns.__spam_heartbeat = RunService.Heartbeat:Connect(function() run(spam_tick) end)
+    -- Four points per frame (render, animation, simulation, heartbeat) so a
+    -- frame's parries go out spread across it instead of in two or three clumps.
     pcall(function()
         conns.__spam_render = RunService.PreRender:Connect(function() run(spam_tick) end)
+    end)
+    pcall(function()
+        conns.__spam_anim = RunService.PreAnimation:Connect(function() run(spam_tick) end)
     end)
 end
 
@@ -2569,6 +2601,7 @@ SP:AddDropdown("SpamMode", {Text = "Mode", Values = {"Remote", "Keypress"}, Defa
 SP:AddSlider("SpamRate", {Text = "Spam rate", Default = 300, Min = 20, Max = 1000, Rounding = 0, Suffix = " /s",
     Tooltip = "Parries per second while spamming.",
     Callback = function(v) ManualSpam.rate = v end})
+local ManualSpamLabel = SP:AddLabel("Actual: 0/s", true)
 SP:AddToggle("SpamAnimFix", {Text = "Animation fix", Default = false, Callback = function(v)
     getgenv().ManualSpamAnimationFix = v
     macroAnimFix = v
@@ -2590,7 +2623,16 @@ AS:AddSlider("AutoSpamRate", {Text = "Spam rate", Default = 250, Min = 20, Max =
 task.spawn(function()
     while task.wait(0.1) do
         if Library.Unloaded then break end
-        if Library.Toggled then AutoSpamLabel:SetText("Status: " .. System.auto_spam.status()) end
+        if Library.Toggled then
+            local actual = System.spam_actual_rate()
+            local props = System.__properties
+            local auto_text = "Status: " .. System.auto_spam.status()
+            if not props.__manual_spam_enabled and actual >= 1 then
+                auto_text = auto_text .. ("  |  %d/s"):format(math.floor(actual + 0.5))
+            end
+            AutoSpamLabel:SetText(auto_text)
+            ManualSpamLabel:SetText(("Actual: %d/s"):format(props.__manual_spam_enabled and math.floor(actual + 0.5) or 0))
+        end
     end
 end)
 
