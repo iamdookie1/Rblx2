@@ -118,26 +118,35 @@ end
 -- If either can't be found, parries fall back to pressing the block key, so
 -- the script keeps working instead of stopping.
 local Remote = {
-    token = nil,        -- the game's key function, from getgc
+    token = nil,        -- the game's key function, lifted off the parry call stack
     remote = nil,       -- the parry RemoteEvent / RemoteFunction
     args = nil,         -- the last real parry packet the game sent
     hooked = false,
 }
 
-pcall(function()
-    -- false = functions only. Tables were collected too and thrown away below.
-    for _, fn in getgc(false) do
-        if type(fn) == 'function' then
-            local ok, src = pcall(debug.info, fn, 's')
-            if ok and src and src:find('PRY', 1, true) then
-                for _, value in debug.getupvalues(fn) do
-                    if type(value) == 'function' then Remote.token = value; break end
+-- Find the game's token key function WITHOUT getgc (getgc enumerates the whole
+-- Lua heap and is the classic thing anti-cheats scan for). Instead we lift it off
+-- the call stack at the instant we catch a real parry: the game's own sender (its
+-- source tagged 'PRY') is a few frames up and holds the key function as its first
+-- function upvalue. This only reads frames already on the parry's own stack --
+-- no heap scan, nothing enumerated, so there's no getgc call to flag.
+local function grab_token()
+    if Remote.token then return end
+    for level = 2, 14 do
+        local ok, src = pcall(debug.info, level, 's')
+        if ok and type(src) == 'string' and src:find('PRY', 1, true) then
+            local okf, fn = pcall(debug.info, level, 'f')
+            if okf and type(fn) == 'function' then
+                local oku, ups = pcall(debug.getupvalues, fn)
+                if oku and ups then
+                    for _, v in ups do
+                        if type(v) == 'function' then Remote.token = v; return end
+                    end
                 end
-                if Remote.token then break end
             end
         end
     end
-end)
+end
 
 -- The token only changes when the server time ticks over a centisecond, so a
 -- burst of parries inside one centisecond (spam) reuses it instead of calling
@@ -203,6 +212,7 @@ end
 
 local function capture(remote, args)
     if not isParryPacket(args) then return end
+    grab_token() -- lift the key function off this live parry's stack (no getgc)
     if not Remote.remote then
         task.defer(Notify, "Blade Ball", "Parry remote found. Remote mode is ready.", 3)
     end
@@ -217,7 +227,9 @@ local function isRemoteEvent(self)
 end
 
 local function installRemoteHooks()
-    if Remote.hooked or not Remote.token then return end
+    -- Note: no token check here anymore -- the token is lifted from the stack
+    -- during capture, so the hooks must be allowed to arm before we have it.
+    if Remote.hooked then return end
     Hooks.active = true
     if hookmetamethod and getnamecallmethod then
         pcall(function()
@@ -302,9 +314,7 @@ local function canParryNow()
     return false
 end
 
-if not Remote.token then
-    Notify("Blade Ball", "Token not found. Parries will use the block key instead of the remote.", 6)
-elseif not (hookfunction or hookmetamethod) then
+if not (hookfunction or hookmetamethod) then
     Notify("Blade Ball", "Couldn't hook remotes. Parries will use the block key.", 6)
 end
 
@@ -324,7 +334,7 @@ end
 -- once; otherwise they come off when the window ends. Once the remote is known
 -- it's a plain press.
 local function press_block()
-    if Remote.token and not remoteReady() then
+    if not remoteReady() then
         Hooks.armed_until = os.clock() + 1.2
         if not Remote.hooked then
             installRemoteHooks()
@@ -696,7 +706,7 @@ local function ball_on_me()
     return false
 end
 prime_remote = function()
-    if remote_priming or remoteReady() or not Remote.token then return end
+    if remote_priming or remoteReady() then return end
     remote_priming = true
     task.spawn(function()
         local presses = 0
@@ -2183,9 +2193,8 @@ end)
 
 local function remoteStatusText()
     if remoteReady() then return "Remote: ready, parries use the remote" end
-    if not Remote.token then return "Remote: token not found, parries use the block key" end
     if not (hookfunction or hookmetamethod) then return "Remote: can't hook in this executor, parries use the block key" end
-    return "Remote: not caught yet. It's caught on the first block (pressed for you when a parry feature turns on). Parries use the block key until then"
+    return "Remote: not caught yet. It's caught on the first block (pressed for you when a parry feature turns on); the token is lifted off that parry's stack. Parries use the block key until then"
 end
 
 local status_peak, status_ball = 0, nil
