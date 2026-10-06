@@ -114,33 +114,28 @@ end
 -- ============================================================
 -- PARRY REMOTE
 -- ============================================================
--- How the game itself sends a parry (current Blade Ball): pressing block fires
--- the ParryButtonPress BindableEvent, whose one handler is simply
---     ReplicatedStorage.Remotes.ParryAttempt:FireServer()
--- fired with NO arguments -- no token, no packet, no CFrame. The server checks
--- timing and position on its own side. So the whole parry send is that single
--- argless FireServer, on a remote that is just a normal child of
--- ReplicatedStorage.Remotes.
+-- The game's real, curve-carrying parry is its block ACTION, not a remote we can
+-- fire by hand. Pressing block runs the game's own handler, which reads
+-- Workspace.CurrentCamera.CFrame and sends it to the server as the parry's aim --
+-- that camera CFrame *is* the curve. The game pairs it with the screen points and
+-- a signed token and fires its own remote. (The game also has a bare argless
+-- Remotes.ParryAttempt:FireServer() that carries no aim and so can't curve --
+-- which is why firing it directly felt flat.)
 --
--- We send exactly that, and nothing else: no hook, nothing lifted out of the GC,
--- no synthesised keypress. The call is identical to the one the game makes, so
--- to the server and to any scan it is indistinguishable from a legitimate parry.
--- (The old token / 8-arg-packet path was from an older version, never matched
--- this game, and is gone.)
-local Remote = {
-    event = nil,   -- ReplicatedStorage.Remotes.ParryAttempt, the real parry remote
-    button = nil,  -- ReplicatedStorage.Remotes.ParryButtonPress, the game's "block pressed" bus
-}
-pcall(function() Remote.event = Remotes:FindFirstChild("ParryAttempt") end)
-pcall(function() Remote.button = Remotes:FindFirstChild("ParryButtonPress") end)
+-- So we parry the way the game does: aim the camera, then trigger the block
+-- action with a real input event. The game signs and fires its own remote with
+-- the camera we aimed -- no getgc, no hooks, no forged token, so it's the game's
+-- own send (valid and silent), and curve works because the server reads our aim.
+-- The cost is the game's normal parry cooldown, which is also the legitimate
+-- ceiling, so this stays indistinguishable from a real player.
 
 local function remoteReady()
-    return Remote.event ~= nil
+    return VirtualInputManager ~= nil -- the block action is always available while alive
 end
 
--- Re-resolves the parry remote when a parry feature turns on (in case the
--- Remotes folder populated after load); defined further down, once System
--- exists. Declared here so earlier code can reference it.
+-- No-op kept for existing call sites (parries just trigger the block action now);
+-- defined further down, once System exists. Declared here so earlier code can
+-- reference it.
 local prime_remote
 
 -- "A place where they can parry" — mirrors the game's own client parry gate. A
@@ -165,18 +160,25 @@ local function canParryNow()
 end
 
 if not remoteReady() then
-    Notify("Blade Ball", "Parry remote (ParryAttempt) not found. Autoparry will use the block key instead.", 6)
+    Notify("Blade Ball", "VirtualInputManager unavailable -- this executor can't trigger parries.", 6)
 end
 
--- Presses the block key. Works without the remote, at the cost of the game's
--- own parry cooldown and no curve control.
-local function pressBlockKey()
-    if not is_live() then return end
-    log_send("block key")
+-- The one real input primitive: tap the block key. This is what drives the
+-- game's own parry handler (InputBegan "Block" -> the handler that reads the
+-- camera and fires the signed remote). F is the game's default block bind.
+local function sendBlockInput()
     pcall(function()
         VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.F, false, game)
         VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.F, false, game)
     end)
+end
+
+-- Plain block press (keypress mode / fallback): the game's parry toward your
+-- current aim, no curve override.
+local function pressBlockKey()
+    if not is_live() then return end
+    log_send("block key")
+    sendBlockInput()
 end
 
 -- Fallback for when the parry remote can't be found: press block the normal way
@@ -190,16 +192,20 @@ local CollectionService = cloneref(game:GetService('CollectionService'))
 -- Frame-rate cap shared with the curve cache below.
 local PACKET_TTL = 1 / 240
 
--- Send a parry the exact way the game does: ParryAttempt:FireServer(), no args.
--- curveCF is accepted so the call sites don't change, but it's ignored -- the
--- current game takes no curve or packet from the client, the server decides.
--- Returns true on a send (so callers don't fall back to the block key), false
--- only when the remote isn't available.
+-- Parry with curve. The game's block handler reads Workspace.CurrentCamera.CFrame
+-- and sends it as the parry's aim, so we point the camera at the curve target for
+-- the instant the parry is read, then trigger the block action with a real input
+-- event -- the game signs and fires its own remote with our aim. For "Camera"
+-- curve mode, curveCF is just the current camera, so the set is a harmless no-op;
+-- other modes bend the shot. The default camera script recenters next frame.
+-- Always returns true (callers shouldn't fall back to a second press).
 local function fireParryRemote(curveCF)
-    if not is_live() then return true end -- replaced copy: send nothing, and don't fall back to the key
+    if not is_live() then return true end -- replaced copy: send nothing
     if not remoteReady() then return false end
+    if curveCF then pcall(function() Workspace.CurrentCamera.CFrame = curveCF end) end
     log_send("remote")
-    return (pcall(function() Remote.event:FireServer() end))
+    sendBlockInput()
+    return true
 end
 
 -- ============================================================
@@ -470,13 +476,9 @@ function System.parry.fast()
     System.__properties.__total_parries = System.__properties.__total_parries + 1
 end
 
--- Nothing to "prime" anymore -- the parry remote is just a child of
--- ReplicatedStorage.Remotes. This only re-resolves it if it wasn't present at
--- load, and is a no-op once it's found.
-prime_remote = function()
-    if remoteReady() then return end
-    pcall(function() Remote.event = Remotes:FindFirstChild("ParryAttempt") end)
-end
+-- Nothing to prime anymore -- parries just trigger the game's block action, which
+-- is always available. Kept as a no-op so existing call sites stay valid.
+prime_remote = function() end
 function System.parry.execute_action() System.animation.play_grab_parry(); System.parry.execute() end
 function System.parry.by_mode(mode)
     if mode == "Keypress" then System.parry.keypress() else System.parry.execute_action() end
@@ -1938,8 +1940,8 @@ task.spawn(function()
 end)
 
 local function remoteStatusText()
-    if remoteReady() then return "Remote: ready, parries fire ParryAttempt directly" end
-    return "Remote: ParryAttempt not found, parries use the block key"
+    if remoteReady() then return "Remote: ready, parries trigger the game's block action with camera-aimed curve" end
+    return "Remote: no VirtualInputManager, can't trigger parries"
 end
 
 local status_peak, status_ball = 0, nil
