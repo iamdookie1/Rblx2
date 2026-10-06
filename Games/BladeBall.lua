@@ -135,19 +135,35 @@ local function isParryPacket(args)
         and type(args[7]) == 'table'
 end
 
--- The hooks only live until they catch a parry: then they come off for good so
--- they cost nothing (while on they run on every method call and property read
--- in the whole game). Wrapped in newcclosure: cheaper on most executors, and
--- they read as native like the functions they replace.
+-- Hooks, kept as short-lived and quiet as possible:
+--   * They exist only for about a second around a block press that's meant to
+--     be caught: the automatic press when a parry feature turns on, or a parry
+--     falling back to the block key before the remote is known. Nothing is
+--     hooked at load, in the lobby, while idle, or once the remote is caught.
+--   * The game's sender calls FireServer either as a method (__namecall) or by
+--     fetching remote.FireServer first. That second path is caught by hooking
+--     the shared FireServer function itself (hookfunction), not __index: no
+--     hook on every property read in the game, and remote.FireServer stays the
+--     exact same function (an __index hook hands back a different wrapper each
+--     time, which is easy to spot). __index is only a fallback for executors
+--     without hookfunction, and then hands back one cached wrapper.
+--   * Only FireServer is watched (the parry remote is a RemoteEvent), calls
+--     from this script are ignored, and everything is a newcclosure.
 local hook_wrap = newcclosure or function(f) return f end
-local Hooks = {active = false, old_namecall = nil, old_index = nil}
+local Hooks = {active = false, armed_until = 0}
+
+local function restore_function(fn, old)
+    if restorefunction and pcall(restorefunction, fn) then return end
+    pcall(hookfunction, fn, old)
+end
 
 local function uninstallRemoteHooks()
     if not Remote.hooked then return end
     Hooks.active = false -- pass straight through even if a restore below fails
     if Hooks.old_namecall then pcall(hookmetamethod, game, '__namecall', Hooks.old_namecall) end
     if Hooks.old_index then pcall(hookmetamethod, game, '__index', Hooks.old_index) end
-    Hooks.old_namecall, Hooks.old_index = nil, nil
+    if Hooks.fire_fn and Hooks.old_fire then restore_function(Hooks.fire_fn, Hooks.old_fire) end
+    Hooks.old_namecall, Hooks.old_index, Hooks.fire_fn, Hooks.old_fire = nil, nil, nil, nil
     Remote.hooked = false
 end
 
@@ -158,52 +174,69 @@ local function capture(remote, args)
     end
     Remote.remote = remote
     Remote.args = args
-    -- Caught it: take the hooks off (deferred, not from inside the metamethod).
+    -- Caught it: take the hooks off (deferred, not from inside the hook).
     task.defer(uninstallRemoteHooks)
 end
 
-local function isRemote(self)
-    return typeof(self) == 'Instance' and (self.ClassName == 'RemoteEvent' or self.ClassName == 'RemoteFunction')
+local function isRemoteEvent(self)
+    return typeof(self) == 'Instance' and self.ClassName == 'RemoteEvent'
 end
 
--- The game's parry sender picks one of two paths at random each block: a method
--- call (__namecall) or fetching remote.FireServer and calling it (__index), so
--- both are watched.
 local function installRemoteHooks()
-    if Remote.hooked or not Remote.token or not hookmetamethod then return end
+    if Remote.hooked or not Remote.token then return end
     Hooks.active = true
-    pcall(function()
-        if not getnamecallmethod then return end
-        local old_namecall
-        old_namecall = hookmetamethod(game, '__namecall', hook_wrap(function(self, ...)
-            if Hooks.active then
-                local method = getnamecallmethod()
-                if (method == 'FireServer' or method == 'InvokeServer') and not (checkcaller and checkcaller()) and isRemote(self) then
+    if hookmetamethod and getnamecallmethod then
+        pcall(function()
+            local old_namecall
+            old_namecall = hookmetamethod(game, '__namecall', hook_wrap(function(self, ...)
+                if Hooks.active and getnamecallmethod() == 'FireServer'
+                    and not (checkcaller and checkcaller()) and isRemoteEvent(self) then
                     capture(self, {...})
                 end
-            end
-            return old_namecall(self, ...)
-        end))
-        Hooks.old_namecall = old_namecall
-        Remote.hooked = true
-    end)
-    pcall(function()
-        local old_index
-        old_index = hookmetamethod(game, '__index', hook_wrap(function(self, key)
-            if Hooks.active and (key == 'FireServer' or key == 'InvokeServer') and not (checkcaller and checkcaller()) and isRemote(self) then
-                local real = old_index(self, key)
-                -- What the game gets back in place of FireServer, so it's a C
-                -- closure too.
-                return hook_wrap(function(remote, ...)
-                    capture(remote, {...})
-                    return real(remote, ...)
-                end)
-            end
-            return old_index(self, key)
-        end))
-        Hooks.old_index = old_index
-        Remote.hooked = true
-    end)
+                return old_namecall(self, ...)
+            end))
+            Hooks.old_namecall = old_namecall
+            Remote.hooked = true
+        end)
+    end
+    local fire_fn
+    pcall(function() fire_fn = Instance.new('RemoteEvent').FireServer end)
+    if hookfunction and fire_fn then
+        pcall(function()
+            local old_fire
+            old_fire = hookfunction(fire_fn, hook_wrap(function(self, ...)
+                if Hooks.active and not (checkcaller and checkcaller()) and isRemoteEvent(self) then
+                    capture(self, {...})
+                end
+                return old_fire(self, ...)
+            end))
+            Hooks.fire_fn, Hooks.old_fire = fire_fn, old_fire
+            Remote.hooked = true
+        end)
+    end
+    if not Hooks.old_fire and hookmetamethod then
+        pcall(function()
+            local old_index
+            local wrappers = setmetatable({}, {__mode = 'k'})
+            old_index = hookmetamethod(game, '__index', hook_wrap(function(self, key)
+                if Hooks.active and key == 'FireServer' and not (checkcaller and checkcaller()) and isRemoteEvent(self) then
+                    local real = old_index(self, key)
+                    local wrapped = wrappers[real]
+                    if not wrapped then
+                        wrapped = hook_wrap(function(remote, ...)
+                            if Hooks.active then capture(remote, {...}) end
+                            return real(remote, ...)
+                        end)
+                        wrappers[real] = wrapped
+                    end
+                    return wrapped
+                end
+                return old_index(self, key)
+            end))
+            Hooks.old_index = old_index
+            Remote.hooked = true
+        end)
+    end
 end
 
 local function remoteReady()
@@ -237,25 +270,8 @@ end
 
 if not Remote.token then
     Notify("Blade Ball", "Token not found. Parries will use the block key instead of the remote.", 6)
-elseif not (hookmetamethod and getnamecallmethod) then
+elseif not (hookfunction or hookmetamethod) then
     Notify("Blade Ball", "Couldn't hook remotes. Parries will use the block key.", 6)
-else
-    -- Arm the hook the first time the player can actually parry, not at load.
-    -- Up to then (lobby, round intro, eliminated...) parries fall back to the
-    -- block key on their own. It comes off once it catches a parry.
-    task.spawn(function()
-        while not canParryNow() do
-            if Library.Unloaded then return end
-            task.wait(0.25)
-        end
-        installRemoteHooks()
-        if Remote.hooked then
-            Notify("Blade Ball", "Remote hook armed. Turning on a parry feature presses block once to grab the remote.", 6)
-            if prime_remote then prime_remote() end
-        else
-            Notify("Blade Ball", "Couldn't hook remotes. Parries will use the block key.", 6)
-        end
-    end)
 end
 
 -- Presses the block key. Works without the remote, at the cost of the game's
@@ -265,6 +281,26 @@ local function pressBlockKey()
         VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.F, false, game)
         VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.F, false, game)
     end)
+end
+
+-- A block press that, while the remote isn't known yet, arms the hooks for just
+-- long enough (~1.2s) to catch the parry it sends. A catch takes them off at
+-- once; otherwise they come off when the window ends. Once the remote is known
+-- it's a plain press.
+local function press_block()
+    if Remote.token and not remoteReady() then
+        Hooks.armed_until = os.clock() + 1.2
+        if not Remote.hooked then
+            installRemoteHooks()
+            if Remote.hooked then
+                task.spawn(function()
+                    while Remote.hooked and os.clock() < Hooks.armed_until do task.wait(0.1) end
+                    uninstallRemoteHooks()
+                end)
+            end
+        end
+    end
+    pressBlockKey()
 end
 
 local CollectionService = cloneref(game:GetService('CollectionService'))
@@ -289,18 +325,20 @@ local function build_screen_points(cam)
         end
     else
         for _, entity in ipairs(Alive:GetChildren()) do
-            local hrp = entity:FindFirstChild('HumanoidRootPart') or entity.PrimaryPart
+            local hrp = entity:FindFirstChild('HumanoidRootPart')
             if hrp then points[entity.Name] = cam:WorldToScreenPoint(hrp.Position) end
         end
     end
     return points
 end
 
+-- The game sends the mouse position every time (its keyboard/mouse check is
+-- always true), so this does too.
 local function aim_point(cam)
     local ok, mouse = pcall(UserInputService.GetMouseLocation, UserInputService)
-    if not isMobile and ok and mouse then return {math.floor(mouse.X), math.floor(mouse.Y)} end
+    if ok and mouse then return {mouse.X, mouse.Y} end
     local vp = cam.ViewportSize
-    return {math.floor(vp.X / 2), math.floor(vp.Y / 2)}
+    return {vp.X / 2, vp.Y / 2}
 end
 
 -- Screen points and aim only change frame to frame, so parries fired in the
@@ -322,13 +360,16 @@ local function fireParryRemote(curveCF)
     local cam = Workspace.CurrentCamera
     local points, aim = packet_parts(cam)
     local args, remote = Remote.args, Remote.remote
+    local window = type(args[4]) == 'number' and args[4] or 0.5
+    local flag = args[8]
     return (pcall(function()
         local token = tokenize(args[2])
         if remote.ClassName == 'RemoteEvent' then
-            remote:FireServer(args[1], args[2], token, 0.5, curveCF or cam.CFrame, points, aim, false)
+            -- Same window number and flag the game itself sent, not hard-coded ones.
+            remote:FireServer(args[1], args[2], token, window, curveCF or cam.CFrame, points, aim, flag)
         else
             -- InvokeServer yields; spawn it so a burst never stalls on a reply.
-            task.spawn(remote.InvokeServer, remote, args[1], args[2], token, 0.5, curveCF or cam.CFrame, points, aim, false)
+            task.spawn(remote.InvokeServer, remote, args[1], args[2], token, window, curveCF or cam.CFrame, points, aim, flag)
         end
     end))
 end
@@ -568,7 +609,7 @@ System.parry = {}
 -- block key. Remote mode falls back to the key until the remote is captured.
 function System.parry.execute()
     if System.__properties.__parries > 10000 or not LocalPlayer.Character then return end
-    if not fireParryRemote(System.curve.get_cframe()) then pressBlockKey() end
+    if not fireParryRemote(System.curve.get_cframe()) then press_block() end
     System.__properties.__parries = System.__properties.__parries + 1
     System.__properties.__total_parries = System.__properties.__total_parries + 1
     task.delay(0.5, function()
@@ -577,7 +618,7 @@ function System.parry.execute()
 end
 function System.parry.keypress()
     if not LocalPlayer.Character then return end
-    pressBlockKey()
+    press_block()
     System.__properties.__total_parries = System.__properties.__total_parries + 1
 end
 -- Light parry for spam: same remote and curve as execute, but reuses the frame's
@@ -585,7 +626,7 @@ end
 -- task.delay per call, which piles up into thousands at spam rates).
 function System.parry.fast()
     if not LocalPlayer.Character then return end
-    if not fireParryRemote(System.curve.get_cframe_fast()) then pressBlockKey() end
+    if not fireParryRemote(System.curve.get_cframe_fast()) then press_block() end
     System.__properties.__total_parries = System.__properties.__total_parries + 1
 end
 
@@ -613,8 +654,8 @@ prime_remote = function()
             local props = System.__properties
             if not (props.__autoparry_enabled or props.__triggerbot_enabled
                 or props.__auto_spam_enabled or props.__manual_spam_enabled) then break end
-            if Remote.hooked and canParryNow() and not ball_on_me() and not UserInputService:GetFocusedTextBox() then
-                pressBlockKey()
+            if canParryNow() and not ball_on_me() and not UserInputService:GetFocusedTextBox() then
+                press_block()
                 presses = presses + 1
                 local start = os.clock()
                 repeat task.wait(0.05) until remoteReady() or os.clock() - start > 1.6
@@ -737,35 +778,27 @@ end)
 -- TRIGGERBOT
 -- ============================================================
 System.triggerbot = {}
-local TRIGGERBOT_COOLDOWN = 0.03
-local TRIGGERBOT_PARSE_TIME = 0.02
 
+-- One parry per pass, the moment the ball targets you: re-armed only when the
+-- ball goes to someone else and comes back. (It used to re-arm every 0.02s, so
+-- it kept parrying for as long as the ball stayed on you.)
 function System.triggerbot.trigger(ball)
-    if System.__triggerbot.__is_parrying or System.__triggerbot.__parries > System.__triggerbot.__max_parries then return end
-    if LocalPlayer.Character and LocalPlayer.Character.PrimaryPart and LocalPlayer.Character.PrimaryPart:FindFirstChild('SingularityCape') then return end
-    System.__triggerbot.__is_parrying = true
+    local state = System.ball_state and System.ball_state(ball)
+    if not state or state.pass_parried then return end
+    state.pass_parried = true
     System.__triggerbot.__parries = System.__triggerbot.__parries + 1
     System.parry.execute()
     if System.__properties.__play_animation then System.animation.play_grab_parry() end
-    task.delay(TRIGGERBOT_COOLDOWN, function()
-        if System.__triggerbot.__parries > 0 then System.__triggerbot.__parries = System.__triggerbot.__parries - 1 end
-    end)
-    task.spawn(function()
-        local start_time = tick()
-        repeat RunService.Heartbeat:Wait()
-        until (tick()-start_time >= TRIGGERBOT_PARSE_TIME or not System.__triggerbot.__is_parrying)
-        System.__triggerbot.__is_parrying = false
-    end)
 end
 
 function System.triggerbot.loop()
     if not System.__triggerbot.__enabled then return end
-    if LocalPlayer.Character and LocalPlayer.Character.PrimaryPart and LocalPlayer.Character.PrimaryPart:FindFirstChild('SingularityCape') then return end
+    local root = getRoot()
+    if not root or root:FindFirstChild('SingularityCape') or not canParryNow() then return end
     local balls = Workspace:FindFirstChild('Balls'); if not balls then return end
-    for _, ball in pairs(balls:GetChildren()) do
-        if ball:IsA('BasePart') and ball:GetAttribute('target') == LocalPlayer.Name then
+    for _, ball in ipairs(balls:GetChildren()) do
+        if ball:GetAttribute('realBall') and ball:GetAttribute('target') == LocalPlayer.Name then
             System.triggerbot.trigger(ball)
-            break
         end
     end
 end
@@ -895,6 +928,10 @@ local function get_ball_state(ball)
         if #swaps > BALL_HISTORY then table.remove(swaps, 1) end
         -- The ball left us: our parry landed, so it's used up.
         if state.target == LocalPlayer.Name and new ~= LocalPlayer.Name then parry_released() end
+        -- One parry per pass: the lock lifts only when someone else gets the
+        -- ball, so the next time it's on us is a new pass. A blank target in
+        -- between (me -> "" -> me) is the same pass, not a new one.
+        if type(new) == 'string' and new ~= '' and new ~= LocalPlayer.Name then state.pass_parried = false end
         state.target = new
         state.parried = false
         if new == LocalPlayer.Name then
@@ -911,6 +948,8 @@ local function get_ball_state(ball)
     end)
     return state
 end
+-- For code defined above this (triggerbot) that needs the same per-ball pass lock.
+System.ball_state = get_ball_state
 
 -- Match balls plus lobby training balls.
 local function get_live_balls()
@@ -1038,6 +1077,9 @@ local function try_parry_ball(ball, root, now)
     if ball:GetAttribute('target') ~= LocalPlayer.Name then return false end
     local function hold(why) state.why = why; return false end
 
+    -- One parry per pass: already parried this one, locked until the ball goes
+    -- to someone else and comes back. Only spam and manual parry more.
+    if state.pass_parried then return hold("parried this pass, waiting for next") end
     if props.__parried then return hold("phantom") end
     if parry_busy() then return hold("parry already up") end
     local tornado = Runtime:FindFirstChild('Tornado')
@@ -1076,6 +1118,7 @@ local function try_parry_ball(ball, root, now)
     if miss > APCfg.hit_zone and heading < need then return hold("curving, waiting") end
 
     state.parried, state.at = true, now
+    state.pass_parried = true
     mark_parry(eta)
     if not try_ability() then
         System.parry.by_mode(getgenv().AutoParryMode)
@@ -1983,13 +2026,8 @@ local TargetLabel = Overview:AddLabel("Ball target: -", true)
 local function remoteStatusText()
     if remoteReady() then return "Remote: ready, parries use the remote" end
     if not Remote.token then return "Remote: token not found, parries use the block key" end
-    if not Remote.hooked then
-        -- The hook is deferred until you can actually parry. Say so instead of
-        -- calling it unavailable while simply waiting for that.
-        if not canParryNow() then return "Remote: waiting until you can parry. Parries use the block key until then" end
-        return "Remote: hook unavailable, parries use the block key"
-    end
-    return "Remote: waiting for the first block (pressed for you while a parry feature is on). Parries use the block key until then"
+    if not (hookfunction or hookmetamethod) then return "Remote: can't hook in this executor, parries use the block key" end
+    return "Remote: not caught yet. It's caught on the first block (pressed for you when a parry feature turns on). Parries use the block key until then"
 end
 
 local status_peak, status_ball = 0, nil
