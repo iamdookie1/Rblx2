@@ -4,6 +4,40 @@
 
 task.spawn(function()
 
+-- Bumped on every change, shown in the window footer and the Status tab, so
+-- you always know which build you're testing.
+local SCRIPT_VERSION = "2026.10.06-3"
+
+-- Only one copy runs. Executing the script again shuts the previous copy down
+-- first (otherwise both keep auto parrying, and every pass gets two parries
+-- that no fix inside one copy can stop). Every parry also goes through
+-- is_live(), so a copy that's been replaced can never send one even if
+-- something of it lingers.
+local genv = (getgenv and getgenv()) or _G
+if type(genv.__BladeBallShutdown) == 'function' then pcall(genv.__BladeBallShutdown) end
+local INSTANCE = {}
+genv.__BladeBallInstance = INSTANCE
+local function is_live() return genv.__BladeBallInstance == INSTANCE end
+
+-- Parry log: every parry this copy sends, where it came from, which pass at you
+-- it was for. Spam sources are only counted (they fire hundreds a second).
+local ParryLog = {entries = {}, source = nil, spam = 0, total = 0, doubles = 0, describe = nil}
+local SPAM_SOURCES = {["manual spam"] = true, ["auto spam"] = true, ["slashes of fury"] = true}
+local function log_send(how)
+    local src = ParryLog.source or "unknown"
+    if SPAM_SOURCES[src] then ParryLog.spam = ParryLog.spam + 1; return end
+    ParryLog.total = ParryLog.total + 1
+    local info = ParryLog.describe and ParryLog.describe() or {}
+    local entry = {t = os.clock(), src = src, how = how, pass = info.pass, dist = info.dist, heading = info.heading}
+    local last = ParryLog.entries[#ParryLog.entries]
+    if entry.pass and last and last.pass == entry.pass then
+        entry.double = true
+        ParryLog.doubles = ParryLog.doubles + 1
+    end
+    table.insert(ParryLog.entries, entry)
+    if #ParryLog.entries > 8 then table.remove(ParryLog.entries, 1) end
+end
+
 local Library = loadstring(game:HttpGet("https://raw.githubusercontent.com/iamdookie1/Ui3/main/Ui.lua"))()
 local Options = Library.Options
 local Toggles = Library.Toggles
@@ -14,7 +48,7 @@ local Toggles = Library.Toggles
 -- the callbacks touch exists.
 local Window = Library:CreateWindow({
     Title = "Blade Ball",
-    Footer = "auto parry",
+    Footer = "auto parry  |  v" .. SCRIPT_VERSION,
     Icon = "swords",
     ToggleKeybind = Enum.KeyCode.LeftControl,
     ConfigFolder = "BladeBall",
@@ -277,6 +311,8 @@ end
 -- Presses the block key. Works without the remote, at the cost of the game's
 -- own parry cooldown and no curve control.
 local function pressBlockKey()
+    if not is_live() then return end
+    log_send("block key")
     pcall(function()
         VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.F, false, game)
         VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.F, false, game)
@@ -356,12 +392,14 @@ local function packet_parts(cam)
 end
 
 local function fireParryRemote(curveCF)
+    if not is_live() then return true end -- replaced copy: send nothing, and don't fall back to the key
     if not remoteReady() then return false end
     local cam = Workspace.CurrentCamera
     local points, aim = packet_parts(cam)
     local args, remote = Remote.args, Remote.remote
     local window = type(args[4]) == 'number' and args[4] or 0.5
     local flag = args[8]
+    log_send("remote")
     return (pcall(function()
         local token = tokenize(args[2])
         if remote.ClassName == 'RemoteEvent' then
@@ -655,7 +693,9 @@ prime_remote = function()
             if not (props.__autoparry_enabled or props.__triggerbot_enabled
                 or props.__auto_spam_enabled or props.__manual_spam_enabled) then break end
             if canParryNow() and not ball_on_me() and not UserInputService:GetFocusedTextBox() then
+                ParryLog.source = "remote grab press"
                 press_block()
+                ParryLog.source = nil
                 presses = presses + 1
                 local start = os.clock()
                 repeat task.wait(0.05) until remoteReady() or os.clock() - start > 1.6
@@ -720,7 +760,7 @@ local function runSlashesLoop()
             and sent < maxParryCount
             and System.__properties.__slashesoffury_count < maxParryCount
             and LocalPlayer.Character do
-            System.parry.execute()
+            ParryLog.source = "slashes of fury"; System.parry.execute(); ParryLog.source = nil
             if System.__properties.__play_animation then
                 pcall(System.animation.play_grab_parry)
             end
@@ -787,7 +827,9 @@ function System.triggerbot.trigger(ball)
     if not state or state.pass_parried then return end
     state.pass_parried = true
     System.__triggerbot.__parries = System.__triggerbot.__parries + 1
+    ParryLog.source = "triggerbot"
     System.parry.execute()
+    ParryLog.source = nil
     if System.__properties.__play_animation then System.animation.play_grab_parry() end
 end
 
@@ -916,11 +958,24 @@ end
 -- lockout, and hands a retarget onto us straight to auto parry.
 local BALL_HISTORY = 16
 local ball_state = setmetatable({}, {__mode = 'k'})
+local pass_counter = 0
+-- A pass starts when the ball comes onto us after being on someone else (or is
+-- first seen on us); it ends when someone else gets it. Each gets an id so the
+-- parry log can show which pass a parry was for.
+local function open_pass(state)
+    if state.pass_open then return end
+    pass_counter = pass_counter + 1
+    state.pass_id, state.pass_open = pass_counter, true
+    -- A pre-parry fired while the ball was on its last holder was this pass's parry.
+    if state.preparried then state.pass_parried = true end
+    state.preparried = false
+end
 local function get_ball_state(ball)
     local state = ball_state[ball]
     if state then return state end
     state = {parried = false, at = 0, target = ball:GetAttribute('target'), swaps = {}}
     ball_state[ball] = state
+    if state.target == LocalPlayer.Name then open_pass(state) end
     ball:GetAttributeChangedSignal('target'):Connect(function()
         local new = ball:GetAttribute('target')
         local swaps = state.swaps
@@ -931,7 +986,10 @@ local function get_ball_state(ball)
         -- One parry per pass: the lock lifts only when someone else gets the
         -- ball, so the next time it's on us is a new pass. A blank target in
         -- between (me -> "" -> me) is the same pass, not a new one.
-        if type(new) == 'string' and new ~= '' and new ~= LocalPlayer.Name then state.pass_parried = false end
+        if type(new) == 'string' and new ~= '' and new ~= LocalPlayer.Name then
+            state.pass_parried, state.pass_open, state.preparried = false, false, false
+        end
+        if new == LocalPlayer.Name then open_pass(state) end
         state.target = new
         state.parried = false
         if new == LocalPlayer.Name then
@@ -1071,7 +1129,7 @@ end
 
 -- Parry one ball if it's on us and really coming. Leaves the reason in
 -- state.why for the Status tab.
-local function try_parry_ball(ball, root, now)
+local function try_parry_ball(ball, root, now, via)
     local props = System.__properties
     local state = get_ball_state(ball)
     if ball:GetAttribute('target') ~= LocalPlayer.Name then return false end
@@ -1120,11 +1178,25 @@ local function try_parry_ball(ball, root, now)
     state.parried, state.at = true, now
     state.pass_parried = true
     mark_parry(eta)
-    if not try_ability() then
-        System.parry.by_mode(getgenv().AutoParryMode)
-    end
+    ParryLog.source = via or "auto parry"
+    if try_ability() then log_send("ability") else System.parry.by_mode(getgenv().AutoParryMode) end
+    ParryLog.source = nil
     state.why = "parried"
     return true
+end
+
+-- What the parry log records about the ball on us when a parry goes out.
+ParryLog.describe = function()
+    local root = getRoot()
+    if not root then return {} end
+    for _, ball in ipairs(get_live_balls()) do
+        if ball:GetAttribute('target') == LocalPlayer.Name then
+            local state = get_ball_state(ball)
+            local heading, _, _, distance = read_ball(ball, root)
+            return {pass = state.pass_id, dist = distance, heading = heading}
+        end
+    end
+    return {}
 end
 
 -- Whether a return from a player `gap` studs away is too fast to react to: it
@@ -1144,7 +1216,9 @@ local function preparry_now()
     if getgenv().AutoParryMode == "Keypress" or not remoteReady() then return false end
     if parry_busy() then return false end
     mark_parry()
+    ParryLog.source = "pre-parry"
     System.parry.by_mode(getgenv().AutoParryMode)
+    ParryLog.source = nil
     return true
 end
 
@@ -1165,7 +1239,11 @@ local function try_preparry(ball, root)
     if their_eta > 0.12 + getPing() / 1000 then return false end
     if not return_too_fast((their_root.Position - root.Position).Magnitude, speed) then return false end
     if blocked_by_detection() then return false end
-    return preparry_now()
+    if not preparry_now() then return false end
+    -- Counts as the parry for this ball's next pass at us, so the real pass
+    -- doesn't get a second one on top.
+    get_ball_state(ball).preparried = true
+    return true
 end
 
 function System.autoparry.step()
@@ -1192,7 +1270,7 @@ function System.autoparry.on_retarget(ball)
     if not APCfg.instant then return end
     local root = autoparry_can_run()
     if not root or (root.Position - ball.Position).Magnitude > APCfg.close_range then return end
-    pcall(try_parry_ball, ball, root, tick())
+    pcall(try_parry_ball, ball, root, tick(), "instant retarget")
 end
 
 -- Our own parry landed: stay locked until the ball actually leaves us.
@@ -1359,11 +1437,11 @@ local function spam_tick()
     local elapsed = math.min(now - spam_last, 0.1)
     spam_last = now
     local props = System.__properties
-    local rate
+    local rate, source
     if props.__manual_spam_enabled then
-        rate = ManualSpam.rate
+        rate, source = ManualSpam.rate, "manual spam"
     elseif props.__auto_spam_enabled and now < AutoSpam.active_until then
-        rate = AutoSpam.rate
+        rate, source = AutoSpam.rate, "auto spam"
     end
     if not rate or not LocalPlayer.Character then
         spam_acc, spam_active = 0, false
@@ -1379,7 +1457,9 @@ local function spam_tick()
     local fires = math.min(math.floor(spam_acc / interval), SPAM_MAX_PER_TICK)
     if fires > 0 then
         spam_acc = spam_acc - fires * interval
+        ParryLog.source = source
         for _ = 1, fires do spam_fire() end
+        ParryLog.source = nil
     end
     if spam_acc > interval * 4 then spam_acc = 0 end
 end
@@ -2020,8 +2100,37 @@ local StatCards = Overview:AddStatCards("StatusCards", {
         {Title = "Parries", Value = 0, Icon = "shield"},
     },
 })
+Overview:AddLabel("Version: " .. SCRIPT_VERSION, true)
 local RemoteLabel = Overview:AddLabel("Remote: checking...", true)
 local TargetLabel = Overview:AddLabel("Ball target: -", true)
+
+local LogBox = Tabs.Status:AddLeftGroupbox("Parry log", "list")
+LogBox:AddLabel("Every parry this copy sends: where it came from and which pass at you it was for. Two for the same pass are marked DOUBLE. Spam is only counted.", true)
+local LogCounts = LogBox:AddLabel("Parries: 0  |  doubles: 0  |  spam: 0", true)
+local LogLines = LogBox:AddLabel("(nothing yet)", true)
+LogBox:AddButton({Text = "Clear log", Func = function()
+    ParryLog.entries, ParryLog.total, ParryLog.doubles, ParryLog.spam = {}, 0, 0, 0
+end})
+local function parry_log_text()
+    if #ParryLog.entries == 0 then return "(nothing yet)" end
+    local now, lines = os.clock(), {}
+    for i = #ParryLog.entries, 1, -1 do
+        local e = ParryLog.entries[i]
+        local where = e.pass and string.format("pass %d, %.0f studs, heading %.2f", e.pass, e.dist or 0, e.heading or 0)
+            or "no ball on you"
+        lines[#lines + 1] = string.format("%s%.1fs ago  %s (%s)  %s", e.double and "DOUBLE  " or "", now - e.t, e.src, e.how, where)
+    end
+    return table.concat(lines, "\n")
+end
+task.spawn(function()
+    while task.wait(0.25) do
+        if Library.Unloaded then break end
+        if Library.Toggled then
+            LogCounts:SetText(string.format("Parries: %d  |  doubles: %d  |  spam: %d", ParryLog.total, ParryLog.doubles, ParryLog.spam))
+            LogLines:SetText(parry_log_text())
+        end
+    end
+end)
 
 local function remoteStatusText()
     if remoteReady() then return "Remote: ready, parries use the remote" end
@@ -2473,6 +2582,7 @@ end))
 -- UNLOAD
 -- ============================================================
 Library:OnUnload(function()
+    if genv.__BladeBallInstance == INSTANCE then genv.__BladeBallInstance = nil end
     pcall(uninstallRemoteHooks)
     System.autoparry.stop()
     setTriggerbot(false)
@@ -2490,6 +2600,12 @@ Library:OnUnload(function()
     getgenv().skinChanger = false
     getgenv().skinChangerEnabled = false
 end)
+
+-- The next copy calls this before it starts.
+genv.__BladeBallShutdown = function()
+    pcall(function() Library:Unload() end)
+    if genv.__BladeBallInstance == INSTANCE then genv.__BladeBallInstance = nil end
+end
 
 UIReady = true
 Notify("Blade Ball", "Loaded. " .. (isMobile and "Tap the menu button to open." or "LeftControl toggles the menu."), 5)
