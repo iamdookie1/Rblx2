@@ -424,6 +424,12 @@ end
 -- Who the ball gets sent to. Defined further down, once System exists.
 local choose_target
 
+-- Spam calls fireParryRemote hundreds of times a second, so the hot path avoids
+-- per-call garbage: one shared fire function (no closure per parry), the target
+-- aim table built once per frame per target, and the remote's class read once.
+local function fire_event(remote, ...) remote:FireServer(...) end
+local target_aim = {at = -1, name = nil, aim = nil}
+
 local function fireParryRemote(curveCF)
     if not is_live() then return true end -- replaced copy: send nothing, and don't fall back to the key
     if not remoteReady() then return false end
@@ -436,22 +442,30 @@ local function fireParryRemote(curveCF)
     if choose_target then
         local name, _, mode = choose_target(cam)
         local screen = name and points[name]
-        if screen and mode ~= "Cursor" then aim = {screen.X, screen.Y} end
+        if screen and mode ~= "Cursor" then
+            if target_aim.at ~= packet_cache.at or target_aim.name ~= name then
+                target_aim.at, target_aim.name, target_aim.aim = packet_cache.at, name, {screen.X, screen.Y}
+            end
+            aim = target_aim.aim
+        end
     end
     local args, remote = Remote.args, Remote.remote
     local window = type(args[4]) == 'number' and args[4] or 0.5
     local flag = args[8]
+    local ok, token = pcall(tokenize, args[2])
+    if not ok then return false end
+    if Remote.class_of ~= remote then
+        Remote.class_of, Remote.is_event = remote, remote.ClassName == 'RemoteEvent'
+    end
     log_send("remote")
-    return (pcall(function()
-        local token = tokenize(args[2])
-        if remote.ClassName == 'RemoteEvent' then
-            -- Same window number and flag the game itself sent, not hard-coded ones.
-            remote:FireServer(args[1], args[2], token, window, curveCF or cam.CFrame, points, aim, flag)
-        else
-            -- InvokeServer yields; spawn it so a burst never stalls on a reply.
-            task.spawn(remote.InvokeServer, remote, args[1], args[2], token, window, curveCF or cam.CFrame, points, aim, flag)
-        end
-    end))
+    local cf = curveCF or cam.CFrame
+    if Remote.is_event then
+        -- Same window number and flag the game itself sent, not hard-coded ones.
+        return (pcall(fire_event, remote, args[1], args[2], token, window, cf, points, aim, flag))
+    end
+    -- InvokeServer yields; spawn it so a burst never stalls on a reply.
+    task.spawn(remote.InvokeServer, remote, args[1], args[2], token, window, cf, points, aim, flag)
+    return true
 end
 
 -- ============================================================
@@ -1109,8 +1123,13 @@ end
 -- For code defined above this (triggerbot) that needs the same per-ball pass lock.
 System.ball_state = get_ball_state
 
--- Match balls plus lobby training balls.
+-- Match balls plus lobby training balls. Auto parry, auto spam and the parry
+-- log all ask every frame, so the list is built once per frame and shared
+-- (callers only read it).
+local live_balls_cache = {at = -1, list = {}}
 local function get_live_balls()
+    local now = os.clock()
+    if now - live_balls_cache.at < 1 / 240 then return live_balls_cache.list end
     local balls = System.ball.get_all()
     local training = Workspace:FindFirstChild("TrainingBalls")
     if training then
@@ -1118,6 +1137,7 @@ local function get_live_balls()
             if ball:GetAttribute("realBall") then table.insert(balls, ball) end
         end
     end
+    live_balls_cache.list, live_balls_cache.at = balls, now
     return balls
 end
 
@@ -1222,6 +1242,16 @@ local function read_ball(ball, root)
     return heading, miss, speed, distance
 end
 
+-- How far ahead of the ball's arrival (seconds, before ping) a parry may go out.
+-- Fast balls get the full window. Slow ones are fired closer to arrival: a parry
+-- put up ~0.45s ahead of a ball crawling in at 15 studs/s lands well before the
+-- ball does, so it read as parrying too soon. Scales from the full window at 70+
+-- studs/s down to 0.2s at 15 studs/s and below.
+local function lead_window(speed)
+    local slow = math.clamp((70 - speed) / 55, 0, 1)
+    return APCfg.parry_window - slow * 0.25
+end
+
 -- Higher ping reads the ball sooner, so it's a little more lenient.
 local function curve_threshold()
     return math.clamp(APCfg.curve - math.min(pingMs(), 400) / 1000 * 0.75, -1, 0.95)
@@ -1256,7 +1286,7 @@ local function try_parry_ball(ball, root, now, via)
     -- further out it's left to the normal checks a frame later.
     if via == "instant retarget" then
         local eta = distance / speed
-        if eta > APCfg.parry_window + ping_s then return hold("too far for instant") end
+        if eta > lead_window(speed) + ping_s then return hold("too far for instant") end
         state.parried, state.at = true, now
         state.pass_parried = true
         mark_parry(eta)
@@ -1283,7 +1313,7 @@ local function try_parry_ball(ball, root, now, via)
     if path > System.parry_distance(speed) then return hold("outside window") end
     -- A parry that would run out before the ball gets here is a wasted one.
     local eta = path / speed
-    if eta > APCfg.parry_window + ping_s then return hold("too early") end
+    if eta > lead_window(speed) + ping_s then return hold("too early") end
     -- Anti curve: how straight it has to be heading in, unless its line already
     -- runs through us. The further out it still is, the straighter: half a
     -- second out a ball aimed well off can still go anywhere (that's what bait
@@ -1433,18 +1463,14 @@ System.manual_spam = {}
 System.auto_spam = {}
 local macroAnimFix = false
 local ManualSpam = {rate = 300}     -- parries per second
--- Auto spam fires only while it detects a clash: the ball bouncing between you
--- and one other player who's close, read from the ball's recent target swaps
--- (plus close-range parries by that player). Optionally also at point blank.
+-- Auto spam fires only when one reactive parry can't keep up: a clash (the ball
+-- going back and forth with one player faster than you could react) or a ball
+-- landing on you faster than that. There are no range / hits / window settings
+-- any more: each is worked out from the ball's speed, the gap between players
+-- and your ping, so it adapts to slow and fast balls on its own.
 local AutoSpam = {
     rate = 250,
-    clash_range = 20,       -- max studs between you and them
-    clash_swaps = 2,        -- hand-offs between you and them in one run
-    clash_window = 0.5,     -- max seconds between hand-offs
     react_margin = 0.03,    -- seconds on top of ping (a couple of frames) a reactive parry needs
-    point_blank = false,
-    point_blank_range = 14, -- studs
-    linger = 0.2,           -- keep going this long after the last detection
     active_until = 0,
     reason = nil,
 }
@@ -1487,12 +1513,11 @@ local function ball_owners(state)
     return owners
 end
 
--- A clash is the ball going back and forth between you and one player standing
--- close. Counts the hand-offs between the two of you in one unbroken run and
--- engages once that reaches the "clash hits" slider. Each hand-off has to come
--- within the clash window of the previous one; a long hold (the ball flying in
--- from someone far away) can start a run but nothing before it counts. Only
--- real hand-offs count: one parry is one hit, never two.
+-- A clash is the ball going back and forth between you and one player. Counts
+-- the hand-offs between the two of you in one unbroken run; how close they must
+-- be, how quick each hand-off and how many are needed all come from the ball's
+-- speed and your ping (see detect_clash). Only real hand-offs count: one parry
+-- is one hit, never two.
 -- How fast a return has to be before one reactive parry can't keep up.
 local function reaction_budget()
     return math.min(pingMs(), 400) / 1000 + AutoSpam.react_margin
@@ -1501,51 +1526,59 @@ end
 local function detect_clash(ball, root, now)
     local owners = ball_owners(get_ball_state(ball))
     local newest, second = owners[1], owners[2]
-    -- In a real clash every hand-off is quick too, not just the distance: each
-    -- has to come within a couple of reaction times (capped by the window).
-    local quick = math.min(AutoSpam.clash_window, reaction_budget() * 2.5)
-    if not second or now - newest.t > quick then return nil end
+    if not second then return nil end
     local me = LocalPlayer.Name
     local opponent
     if newest.name == me then opponent = second.name
     elseif second.name == me then opponent = newest.name
     else return nil end -- ball isn't with you or them right now
 
+    local their_root = character_root(opponent)
+    if not their_root then return nil end
+    local gap = (their_root.Position - root.Position).Magnitude
+    local speed = math.max(ball_velocity(ball).Magnitude, 1)
+    local budget = reaction_budget()
+    -- Clash range, worked out instead of set: the ball crosses the gap between
+    -- you faster than a reactive parry can answer. Faster balls and higher ping
+    -- make that range wider on their own; a normal rally is slower than this and
+    -- left to auto parry, one parry per pass.
+    local cross = gap / speed
+    if cross > budget then return nil end
+    -- The ball has to be in the exchange, not flying in from someone else.
+    if (ball.Position - root.Position).Magnitude > gap + speed * budget + 6 then return nil end
+    -- Clash window, worked out: a hand-off every crossing plus a couple of
+    -- reaction times. A long hold breaks the run.
+    local quick = cross + budget * 2 + 0.05
+    if now - newest.t > quick then return nil end
+
     local hits = 0
     for i = 1, #owners - 1 do
         local cur, prev = owners[i], owners[i + 1]
         local alternates = (cur.name == me and prev.name == opponent) or (cur.name == opponent and prev.name == me)
-        if not alternates then break end
-        if cur.t - prev.t > quick then break end
+        if not alternates or cur.t - prev.t > quick then break end
         hits = hits + 1
     end
-    if hits < AutoSpam.clash_swaps then return nil end
-
-    local their_root = character_root(opponent)
-    if not their_root then return nil end
-    local gap = (their_root.Position - root.Position).Magnitude
-    if gap > AutoSpam.clash_range then return nil end
-    if (ball.Position - root.Position).Magnitude > AutoSpam.clash_range * 1.5 then return nil end
-    -- Only a real clash: the ball crosses the gap between you faster than a
-    -- reactive parry can answer (ping + a little). A normal rally with someone
-    -- nearby is slower than that, auto parry handles each pass with one
-    -- parry, and spamming it was the "spam for no reason".
-    local speed = ball_velocity(ball).Magnitude
-    if gap / math.max(speed, 1) > reaction_budget() then return nil end
+    -- Clash hits, worked out: one hand-off is enough when the return is far too
+    -- fast to react to; otherwise wait for a second so one quick pass with a
+    -- nearby player doesn't start spam.
+    local need = (cross <= budget * 0.5) and 1 or 2
+    if hits < need then return nil end
     return ("clash vs %s (%d hits)"):format(opponent, hits)
 end
 
--- Ball on you, right on top of you, and actually coming at you.
+-- Ball on you, heading in, and landing faster than a reactive parry can answer,
+-- with auto parry not having got a parry out for this pass: spam to save it.
+-- Point-blank range is worked out from speed and ping, not set.
 local function detect_point_blank(ball, root)
-    if not AutoSpam.point_blank or ball:GetAttribute('target') ~= LocalPlayer.Name then return nil end
+    if ball:GetAttribute('target') ~= LocalPlayer.Name then return nil end
+    if get_ball_state(ball).pass_parried then return nil end
     local offset = root.Position - ball.Position
     local distance = offset.Magnitude
-    if distance > AutoSpam.point_blank_range then return nil end
-    local zoomies = ball:FindFirstChild('zoomies')
-    local velocity = zoomies and zoomies.VectorVelocity or ball.AssemblyLinearVelocity
-    if distance > 1 and velocity:Dot(offset.Unit) <= 0 then return nil end
-    -- Same rule as clashes: only when it's on you faster than you could react.
-    if distance / math.max(velocity.Magnitude, 1) > reaction_budget() then return nil end
+    local velocity = ball_velocity(ball)
+    local speed = velocity.Magnitude
+    if speed < 1 then return nil end
+    if distance > 1 and velocity:Dot(offset / distance) <= speed * 0.5 then return nil end
+    if distance / speed > reaction_budget() then return nil end
     return "point blank"
 end
 
@@ -1569,7 +1602,8 @@ local function auto_spam_evaluate()
         for _, ball in ipairs(get_live_balls()) do
             local reason = detect_clash(ball, root, now) or detect_point_blank(ball, root)
             if reason then
-                AutoSpam.active_until = now + AutoSpam.linger
+                -- Keep going a couple of reaction times past the last detection.
+                AutoSpam.active_until = now + math.clamp(reaction_budget() * 2, 0.1, 0.35)
                 AutoSpam.reason = reason
                 return
             end
@@ -2019,12 +2053,7 @@ end
 -- ============================================================
 -- ABILITY ESP
 -- ============================================================
-local abilityEspBillboards = {}
-local abilityEspConnections = {}
-local abilityEspPlayerAddedConnection = nil
-
--- Live-editable Ability ESP settings. The per-player update loop reads these
--- every frame, so changing any of them from the menu takes effect instantly.
+-- Live-editable Ability ESP settings, read by the update loop.
 local AbilityESPConfig = {
     Color = Color3.fromRGB(255, 255, 255),
     TextSize = 14,
@@ -2033,14 +2062,111 @@ local AbilityESPConfig = {
     ShowDistance = false,  -- append distance in studs
     OnlyWithAbility = false, -- only show players who have an ability equipped
     MaxDistance = 0,       -- 0 = unlimited; otherwise hide beyond this many studs
+    ShowActive = true,     -- "ACTIVE 2.4s" while their ability is running
+    ShowCooldown = true,   -- "CD 6.1s" / "READY"
 }
+
+-- Scoped so its helpers don't count against the main chunk's 200-local limit;
+-- start_ability_esp / stop_ability_esp are globals used by the menu.
+do
+-- One shared loop (10x a second) updates every label, instead of a Heartbeat
+-- connection per player, and only writes a label's text or style when it
+-- actually changed.
+local abilityEspEntries = {}       -- player -> {billboard, label, character, head, text, color, size, height}
+local abilityEspCharConns = {}     -- player -> CharacterAdded connection
+local abilityEspPlayerAddedConnection = nil
+local abilityEspLoop = nil
+
+local function esp_escape(s)
+    return (tostring(s):gsub('&', '&amp;'):gsub('<', '&lt;'):gsub('>', '&gt;'))
+end
+
+-- The ability line for one player, from what the game itself replicates:
+--   name     player's EquippedAbility (or the character's Ability)
+--   version  player.Upgrades.<ability> level: 1 -> "V1", 2 -> "V2" (0 = base)
+--   active   player's AbilityDurationStart + AbilityDuration (server time), the
+--            same pair the game's own ability duration bar reads; falls back to
+--            the character's AbilityActive flag when there's no duration
+--   cooldown the character's CooldownExpiration (server time)
+local function esp_ability_info(player, character)
+    local ability = player:GetAttribute('EquippedAbility') or (character and character:GetAttribute('Ability'))
+    if not ability or ability == '' then return nil end
+    local name = tostring(ability)
+    local upgrades = player:FindFirstChild('Upgrades')
+    local level_value = upgrades and upgrades:FindFirstChild(name)
+    local level = level_value and level_value.Value
+    if type(level) == 'number' and level > 0 then name = name .. ' V' .. level end
+
+    local now = Workspace:GetServerTimeNow()
+    local status
+    if AbilityESPConfig.ShowActive then
+        local start = player:GetAttribute('AbilityDurationStart') or 0
+        local duration = player:GetAttribute('AbilityDuration') or 0
+        local left = (start > 0 and duration > 0) and (start + duration - now) or 0
+        if left > 0 then
+            status = ('<font color="#5CFF7A">ACTIVE %.1fs</font>'):format(left)
+        elseif character and character:GetAttribute('AbilityActive') then
+            status = '<font color="#5CFF7A">ACTIVE</font>'
+        end
+    end
+    if not status and AbilityESPConfig.ShowCooldown then
+        local expires = (character and character:GetAttribute('CooldownExpiration')) or player:GetAttribute('CooldownExpiration')
+        if type(expires) == 'number' then
+            local left = expires - now
+            if left > 0 and left < 600 then
+                status = ('<font color="#FF6A6A">CD %.1fs</font>'):format(left)
+            else
+                status = '<font color="#B4B4B4">READY</font>'
+            end
+        end
+    end
+    return name, status
+end
+
+local function remove_ability_esp_entry(player)
+    local e = abilityEspEntries[player]
+    if e then pcall(function() e.billboard:Destroy() end) end
+    abilityEspEntries[player] = nil
+end
+
+local function update_ability_esp()
+    local myRoot = getRoot()
+    local cfg = AbilityESPConfig
+    for player, e in pairs(abilityEspEntries) do
+        local character, head = e.character, e.head
+        if not (character and character.Parent and head and head.Parent) then
+            remove_ability_esp_entry(player)
+        else
+            local dist = myRoot and (myRoot.Position - head.Position).Magnitude
+            local name, status = esp_ability_info(player, character)
+            local visible = not (cfg.MaxDistance > 0 and dist and dist > cfg.MaxDistance)
+                and not (cfg.OnlyWithAbility and not name)
+            if e.label.Visible ~= visible then e.label.Visible = visible end
+            if visible then
+                if e.color ~= cfg.Color then e.color = cfg.Color; e.label.TextColor3 = cfg.Color end
+                if e.size ~= cfg.TextSize then e.size = cfg.TextSize; e.label.TextSize = cfg.TextSize end
+                if e.height ~= cfg.Height then e.height = cfg.Height; e.billboard.StudsOffset = Vector3.new(0, cfg.Height, 0) end
+                local parts = {}
+                if cfg.ShowName then parts[#parts + 1] = esp_escape(player.DisplayName) end
+                if name then parts[#parts + 1] = '[' .. esp_escape(name) .. ']' end
+                if cfg.ShowDistance and dist then parts[#parts + 1] = ('%.0fm'):format(dist) end
+                if #parts == 0 then parts[1] = esp_escape(player.DisplayName) end
+                local text = '<b>' .. table.concat(parts, ' ') .. '</b>'
+                if status then text = text .. '\n' .. status end
+                if text ~= e.text then e.text = text; e.label.Text = text end
+            end
+        end
+    end
+end
 
 local function create_ability_esp_for_player(player)
     task.spawn(function()
         local character = player.Character
-        while not character or not character.Parent do task.wait(0.5); character = player.Character end
+        while getgenv().AbilityESP and (not character or not character.Parent) do task.wait(0.5); character = player.Character end
+        if not character then return end
         local head = character:WaitForChild('Head', 10)
         if not head or not getgenv().AbilityESP then return end
+        remove_ability_esp_entry(player)
         local existing = head:FindFirstChild('AbilityESPGui'); if existing then existing:Destroy() end
         local billboard = Instance.new('BillboardGui')
         billboard.Name = 'AbilityESPGui'; billboard.Adornee = head
@@ -2054,85 +2180,52 @@ local function create_ability_esp_for_player(player)
         label.RichText = true; label.TextXAlignment = Enum.TextXAlignment.Center
         label.TextYAlignment = Enum.TextYAlignment.Center; label.Parent = billboard
         label.Visible = false
-        abilityEspBillboards[player] = label
         local humanoid = character:FindFirstChild('Humanoid')
         if humanoid then humanoid.DisplayDistanceType = Enum.HumanoidDisplayDistanceType.None end
-        local heartbeatConnection
-        heartbeatConnection = RunService.Heartbeat:Connect(function()
-            if not (character and character.Parent) then
-                if heartbeatConnection then heartbeatConnection:Disconnect() end
-                pcall(function() billboard:Destroy() end)
-                abilityEspBillboards[player] = nil; return
-            end
-            if not getgenv().AbilityESP then label.Visible = false; return end
-
-            local ability = player:GetAttribute('EquippedAbility')
-
-            -- Distance / visibility filters.
-            local myRoot = getRoot()
-            local dist
-            if myRoot then dist = (myRoot.Position - head.Position).Magnitude end
-            if AbilityESPConfig.MaxDistance > 0 and dist and dist > AbilityESPConfig.MaxDistance then
-                label.Visible = false; return
-            end
-            if AbilityESPConfig.OnlyWithAbility and not ability then
-                label.Visible = false; return
-            end
-
-            -- Live-apply appearance.
-            label.TextColor3 = AbilityESPConfig.Color
-            label.TextSize = AbilityESPConfig.TextSize
-            billboard.StudsOffset = Vector3.new(0, AbilityESPConfig.Height, 0)
-            label.Visible = true
-
-            local parts = {}
-            if AbilityESPConfig.ShowName then table.insert(parts, player.DisplayName) end
-            if ability then table.insert(parts, '[' .. ability .. ']') end
-            if AbilityESPConfig.ShowDistance and dist then table.insert(parts, string.format('%.0fm', dist)) end
-            if #parts == 0 then table.insert(parts, player.DisplayName) end
-            label.Text = '<b>' .. table.concat(parts, ' ') .. '</b>'
-        end)
-        abilityEspConnections[player] = heartbeatConnection
+        abilityEspEntries[player] = {
+            billboard = billboard, label = label, character = character, head = head,
+            color = AbilityESPConfig.Color, size = AbilityESPConfig.TextSize, height = AbilityESPConfig.Height,
+        }
     end)
 end
 
 local function add_ability_esp_player(player)
     if player == LocalPlayer then return end
-    if abilityEspConnections[player] then
-        pcall(function() abilityEspConnections[player]:Disconnect() end)
-        abilityEspConnections[player] = nil
-    end
-    player.CharacterAdded:Connect(function() create_ability_esp_for_player(player) end)
-    if player.Character then task.spawn(function() create_ability_esp_for_player(player) end) end
+    if abilityEspCharConns[player] then pcall(function() abilityEspCharConns[player]:Disconnect() end) end
+    abilityEspCharConns[player] = player.CharacterAdded:Connect(function() create_ability_esp_for_player(player) end)
+    if player.Character then create_ability_esp_for_player(player) end
 end
 
 function start_ability_esp()
-    if abilityEspPlayerAddedConnection and next(abilityEspConnections) then return end
+    if abilityEspLoop then return end
     getgenv().AbilityESP = true
     for _, player in pairs(Players:GetPlayers()) do
         if player ~= LocalPlayer then add_ability_esp_player(player) end
     end
-    if not abilityEspPlayerAddedConnection then
-        abilityEspPlayerAddedConnection = Players.PlayerAdded:Connect(function(player)
-            if getgenv().AbilityESP then add_ability_esp_player(player) end
-        end)
-    end
+    abilityEspPlayerAddedConnection = Players.PlayerAdded:Connect(function(player)
+        if getgenv().AbilityESP then add_ability_esp_player(player) end
+    end)
+    local acc = 0
+    abilityEspLoop = RunService.Heartbeat:Connect(function(dt)
+        acc = acc + dt
+        if acc < 0.1 then return end
+        acc = 0
+        pcall(update_ability_esp)
+    end)
 end
 
 function stop_ability_esp()
-    if not getgenv().AbilityESP then return end
     getgenv().AbilityESP = false
+    if abilityEspLoop then pcall(function() abilityEspLoop:Disconnect() end); abilityEspLoop = nil end
     if abilityEspPlayerAddedConnection then
         pcall(function() abilityEspPlayerAddedConnection:Disconnect() end)
         abilityEspPlayerAddedConnection = nil
     end
-    for _, connection in pairs(abilityEspConnections) do pcall(function() connection:Disconnect() end) end
-    abilityEspConnections = {}
-    for _, label in pairs(abilityEspBillboards) do
-        pcall(function() if label and label.Parent then label.Parent:Destroy() end end)
-    end
-    abilityEspBillboards = {}
+    for _, connection in pairs(abilityEspCharConns) do pcall(function() connection:Disconnect() end) end
+    abilityEspCharConns = {}
+    for player in pairs(abilityEspEntries) do remove_ability_esp_entry(player) end
 end
+end -- ability ESP scope
 
 -- ============================================================
 -- BALL VELOCITY GUI
@@ -2483,7 +2576,7 @@ end})
 
 local AS = Tabs.Spam:AddRightGroupbox("Auto Spam", "activity")
 AS:AddToggle("AutoSpam", {Text = "Auto spam", Default = false,
-    Tooltip = "Spams only during a real clash: the ball going back and forth with a nearby player faster than one parry can react to. Normal rallies are left to auto parry. Never runs in training.",
+    Tooltip = "Spams only when one parry can't keep up: a clash (the ball going back and forth with a player faster than you could react) or a ball landing on you too fast to react to. Range, hits and timing are worked out from ball speed and ping. Normal rallies are left to auto parry. Never runs in training.",
     Callback = function(v)
         System.__properties.__auto_spam_enabled = v
         if v then prime_remote() else AutoSpam.active_until, AutoSpam.reason = 0, nil end
@@ -2493,23 +2586,6 @@ local AutoSpamLabel = AS:AddLabel("Status: off", true)
 AS:AddSlider("AutoSpamRate", {Text = "Spam rate", Default = 250, Min = 20, Max = 1000, Rounding = 0, Suffix = " /s",
     Tooltip = "Parries per second while a clash is detected.",
     Callback = function(v) AutoSpam.rate = v end})
-AS:AddSlider("ClashRange", {Text = "Clash range", Default = 20, Min = 8, Max = 60, Rounding = 0, Suffix = " studs",
-    Tooltip = "How close the other player has to be for the exchange to count as a clash.",
-    Callback = function(v) AutoSpam.clash_range = v end})
-AS:AddSlider("ClashSwaps", {Text = "Clash hits", Default = 2, Min = 1, Max = 6, Rounding = 0, Suffix = " hits",
-    Tooltip = "Hand-offs between you and the same nearby player before spamming. 1 = as soon as you send it to them, 2 = once they send it back, and so on.",
-    Callback = function(v) AutoSpam.clash_swaps = v end})
-AS:AddSlider("ClashWindow", {Text = "Clash window", Default = 0.5, Min = 0.2, Max = 2, Rounding = 2, Suffix = "s",
-    Tooltip = "Max time between hand-offs for them to count as one exchange. Raise it if slower clashes aren't picked up.",
-    Callback = function(v) AutoSpam.clash_window = v end})
-AS:AddToggle("PointBlankSpam", {Text = "Point-blank spam", Default = false,
-    Tooltip = "Also spams when the ball is on you, inside point-blank range and coming at you, even without a clash. Ignores Clash hits.",
-    Callback = function(v) AutoSpam.point_blank = v end})
-AS:AddSlider("PointBlankRange", {Text = "Point-blank range", Default = 14, Min = 4, Max = 35, Rounding = 0, Suffix = " studs",
-    Callback = function(v) AutoSpam.point_blank_range = v end})
-AS:AddSlider("AutoSpamLinger", {Text = "Keep spamming for", Default = 0.2, Min = 0, Max = 1, Rounding = 2, Suffix = "s",
-    Tooltip = "How long to keep spamming after the clash stops being detected.",
-    Callback = function(v) AutoSpam.linger = v end})
 
 task.spawn(function()
     while task.wait(0.1) do
@@ -2602,6 +2678,12 @@ AE:AddToggle("AbilityESPDistance", {Text = "Show distance", Default = false,
     Callback = function(v) AbilityESPConfig.ShowDistance = v end})
 AE:AddToggle("AbilityESPOnlyWith", {Text = "Only players with an ability", Default = false,
     Callback = function(v) AbilityESPConfig.OnlyWithAbility = v end})
+AE:AddToggle("AbilityESPActive", {Text = "Show active time", Default = true,
+    Tooltip = "Shows ACTIVE and the seconds left while their ability is running.",
+    Callback = function(v) AbilityESPConfig.ShowActive = v end})
+AE:AddToggle("AbilityESPCooldown", {Text = "Show cooldown", Default = true,
+    Tooltip = "Shows the seconds left on their ability cooldown, or READY.",
+    Callback = function(v) AbilityESPConfig.ShowCooldown = v end})
 AE:AddSlider("AbilityESPTextSize", {Text = "Text size", Default = 14, Min = 8, Max = 30, Rounding = 0,
     Callback = function(v) AbilityESPConfig.TextSize = v end})
 AE:AddSlider("AbilityESPHeight", {Text = "Height offset", Default = 3.5, Min = 0, Max = 15, Rounding = 1, Suffix = " studs",
