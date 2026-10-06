@@ -1722,67 +1722,102 @@ task.spawn(function()
         end)
     end
     local hookedFuncs = {}
+
+    -- Swaps the sword / slash strings in a visual-effect event's args for the
+    -- chosen skin, then hands off to the game's real handler (callTarget). The
+    -- arg logic is unchanged; only how we splice in differs.
+    local function makeReplacement(getCallTarget)
+        return function(...)
+            local args = { ... }
+            local isLocal = false
+            for _, arg in ipairs(args) do
+                if tostring(arg) == LocalPlayer.Name or (typeof(arg) == "Instance" and (arg == LocalPlayer.Character or arg == LocalPlayer)) then
+                    isLocal = true; break
+                end
+            end
+            if isLocal and getgenv().skinChanger then
+                local fxSword = getgenv().swordFX ~= "" and getgenv().swordFX or getgenv().swordModel
+                refreshSlashName()
+                local swordFound = false; local slashFound = false
+                for i, arg in ipairs(args) do
+                    if type(arg) == "string" then
+                        if fxSword ~= "" and not slashFound and (arg:match("Slash") or arg == "Default" or arg:match("Effect")) then
+                            args[i] = getgenv().slashName; slashFound = true
+                        elseif fxSword ~= "" and not swordFound then
+                            local isSword = false
+                            pcall(function()
+                                if rs.Shared.ReplicatedInstances.Swords:FindFirstChild(arg) then isSword = true end
+                            end)
+                            if isSword or arg == LocalPlayer:GetAttribute("CurrentlyEquippedSword") then
+                                args[i] = fxSword; swordFound = true
+                            end
+                        end
+                    end
+                end
+                if fxSword ~= "" and not slashFound and type(args[1]) == "string" then args[1] = getgenv().slashName end
+                if fxSword ~= "" and not swordFound and type(args[3]) == "string" then args[3] = fxSword end
+            end
+            if setthreadidentity then pcall(setthreadidentity, 2) end
+            pcall(getCallTarget(), unpack(args))
+        end
+    end
+
+    -- Splice our skin swap into one of the game's own visual-effect handlers.
+    -- Quietest path (hookfunction): swap the handler's body in place. The game's
+    -- connection is left exactly as it made it -- enabled, same object, nothing
+    -- added or disabled -- so the connection list never changes. We call the
+    -- pre-hook copy hookfunction hands back, so there's no recursion. Disable +
+    -- reconnect is kept only as a fallback for executors without hookfunction.
+    local function spliceHandler(remote, conn, func)
+        local callTarget = func
+        local replacement = makeReplacement(function() return callTarget end)
+        local wrapped = hook_wrap(replacement)
+        hookedFuncs[func] = true
+        hookedFuncs[replacement] = true
+        hookedFuncs[wrapped] = true
+        if type(hookfunction) == "function" then
+            local ok, original = pcall(hookfunction, func, wrapped)
+            if ok then
+                callTarget = original -- real handler copy; invoking func now runs ours
+                return true
+            end
+        end
+        pcall(function() conn:Disable() end)
+        remote.OnClientEvent:Connect(wrapped)
+        return true
+    end
+
     task.spawn(function()
         local remotesToHook = {"ParrySuccessAll", "ParryAttempt", "ParrySuccess", "PlaySound", "PlayVisuals"}
-        while task.wait(1) do
+        -- Scan only until every target handler is caught, then stop -- no
+        -- forever loop hammering getconnections. A short backoff covers handlers
+        -- that connect a little after load; once spliced in place they persist
+        -- across respawns, so there's nothing to keep re-scanning for.
+        local attempts = 0
+        while attempts < 60 do
+            attempts = attempts + 1
+            local pending = false -- any target remote still without a caught handler?
             for _, remoteName in ipairs(remotesToHook) do
                 local remote = rs.Remotes:FindFirstChild(remoteName)
                 if remote and remote:IsA("RemoteEvent") then
                     local ok, conns = pcall(getconnections, remote.OnClientEvent)
                     if ok and type(conns) == "table" then
+                        if #conns == 0 then pending = true end
                         for _, v in ipairs(conns) do
                             local func = v.Function
                             if func and not hookedFuncs[func] then
-                                hookedFuncs[func] = true
-                                v:Disable()
-                                local targetFunc = func
-                                local ourFunc
-                                ourFunc = function(...)
-                                    local args = { ... }
-                                    local isLocal = false
-                                    for _, arg in ipairs(args) do
-                                        if tostring(arg) == LocalPlayer.Name or (typeof(arg) == "Instance" and (arg == LocalPlayer.Character or arg == LocalPlayer)) then
-                                            isLocal = true; break
-                                        end
-                                    end
-                                    if isLocal and getgenv().skinChanger then
-                                        local fxSword = getgenv().swordFX ~= "" and getgenv().swordFX or getgenv().swordModel
-                                        refreshSlashName()
-                                        local swordFound = false; local slashFound = false
-                                        for i, arg in ipairs(args) do
-                                            if type(arg) == "string" then
-                                                if fxSword ~= "" and not slashFound and (arg:match("Slash") or arg == "Default" or arg:match("Effect")) then
-                                                    args[i] = getgenv().slashName; slashFound = true
-                                                elseif fxSword ~= "" and not swordFound then
-                                                    local isSword = false
-                                                    pcall(function()
-                                                        if rs.Shared.ReplicatedInstances.Swords:FindFirstChild(arg) then isSword = true end
-                                                    end)
-                                                    if isSword or arg == LocalPlayer:GetAttribute("CurrentlyEquippedSword") then
-                                                        args[i] = fxSword; swordFound = true
-                                                    end
-                                                end
-                                            end
-                                        end
-                                        if fxSword ~= "" and not slashFound and type(args[1]) == "string" then args[1] = getgenv().slashName end
-                                        if fxSword ~= "" and not swordFound and type(args[3]) == "string" then args[3] = fxSword end
-                                    end
-                                    if setthreadidentity then pcall(setthreadidentity, 2) end
-                                    pcall(targetFunc, unpack(args))
-                                end
-                                -- Connect as a C closure (newcclosure), the same as
-                                -- the parry hooks: under getconnections our substitute
-                                -- then looks like the game's own native handlers, with
-                                -- no Lua upvalues to scan.
-                                local connFunc = hook_wrap(ourFunc)
-                                hookedFuncs[ourFunc] = true
-                                hookedFuncs[connFunc] = true
-                                remote.OnClientEvent:Connect(connFunc)
+                                spliceHandler(remote, v, func)
                             end
                         end
+                    else
+                        pending = true
                     end
+                else
+                    pending = true
                 end
             end
+            if not pending then break end
+            task.wait(attempts < 10 and 1 or 3)
         end
     end)
     getgenv().updateSword = function()
