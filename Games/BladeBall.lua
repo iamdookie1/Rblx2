@@ -6,7 +6,7 @@ task.spawn(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.06-7"
+local SCRIPT_VERSION = "2026.10.06-8"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -544,7 +544,23 @@ local sword_info_cache = {}  -- sword name -> {collection, sword_type}
 local own_tracks = setmetatable({}, {__mode = 'k'}) -- animator -> {[Animation] = track}
 local r15_clones = {}        -- Animation -> Animation using its R15Id
 local gate = {last = -math.huge, landed = true, landed_at = -math.huge}
-local SWING_SHOW = 0.15      -- seconds of success swing shown before the next block
+local SWING_SHOW = 0.08      -- minimum success swing shown before the next block
+
+-- Any match or training ball currently targeting us. (System.ball is defined
+-- further down; this runs at call time, after it exists.)
+local function ball_on_us()
+    local me = LocalPlayer.Name
+    for _, ball in ipairs(System.ball.get_all()) do
+        if ball:GetAttribute('target') == me then return true end
+    end
+    local training = Workspace:FindFirstChild("TrainingBalls")
+    if training then
+        for _, ball in ipairs(training:GetChildren()) do
+            if ball:GetAttribute("realBall") and ball:GetAttribute('target') == me then return true end
+        end
+    end
+    return false
+end
 
 local function modules()
     if not modules_tried then
@@ -642,13 +658,19 @@ local function play_block()
     if not animator then return end
     local now = os.clock()
     if not gate.landed and now - gate.last < BLOCK_COOLDOWN then return end
-    -- Let the swing show. When our parry lands the game starts its success swing;
-    -- spam fires again within milliseconds, and starting the next block straight
-    -- away (which stops success swings, as the game's block does) cut it off in the
-    -- same frame. Waiting for the whole swing looked sluggish, so hold the next
-    -- block just long enough for the swing's strike to read -- about the rhythm of
-    -- someone actually spamming the key in a clash.
-    if now - gate.landed_at < SWING_SHOW then return end
+    -- Let the swing show the way it does in the real game. When our parry lands the
+    -- game plays its success swing, and the swing lasts until the next block press
+    -- cuts it (the game's block stops success swings) -- there's no fixed delay.
+    -- In a clash you press as the ball comes back, so the swing runs while the ball
+    -- is with the other player and the next block starts when it's on you again.
+    -- Spam fires every few ms, so mirror that: after a landed parry, hold the next
+    -- block until a ball is back on us (with a tiny floor so a near-instant return
+    -- still shows the strike).
+    if gate.landed and gate.landed_at > gate.last then
+        if now - gate.landed_at < SWING_SHOW then return end
+        -- (If the ball never comes back, give up waiting after the game's lockout.)
+        if not ball_on_us() and now - gate.landed_at < BLOCK_COOLDOWN then return end
+    end
     local playing = animator:GetPlayingAnimationTracks()
     gate.last, gate.landed = now, false
     for _, track in ipairs(playing) do
