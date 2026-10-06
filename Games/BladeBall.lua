@@ -106,6 +106,19 @@ local function getPing()
     return ok and ping or 0
 end
 
+-- Ping barely moves between frames, but the parry maths reads it several times
+-- per ball per frame. Cache it so the hot path does one cheap read instead of a
+-- pcall into Stats every time -- keeps the per-frame decision tight.
+local ping_cache = {at = -1, ms = 0}
+local function pingMs()
+    local now = os.clock()
+    if now - ping_cache.at > 0.05 then
+        ping_cache.ms = getPing()
+        ping_cache.at = now
+    end
+    return ping_cache.ms
+end
+
 local function getRoot()
     local char = LocalPlayer.Character
     return char and char.PrimaryPart
@@ -443,10 +456,11 @@ local System = {
         __peak_velocity = 0, __last_ball_id = nil, __show_ping = false,
         __auto_ability_enabled = false, __cooldown_protection = false,
         __total_parries = 0, __ping_compensation = true, __extra_distance = 0,
-        __curve_hotkeys = true
+        __curve_hotkeys = true, __target_mode = 1
     },
     __config = {
         __curve_names = {'Camera', 'Random', 'Accelerated', 'Backwards', 'Slow', 'High', 'Normal', 'Speed', 'Down', 'Left', 'Right'},
+        __target_names = {'Cursor', 'Camera', 'Closest', 'Farthest', 'Random'},
         __detections = {__infinity = false, __deathslash = false, __timehole = false, __slashesoffury = false, __phantom = false}
     },
     __triggerbot = {__enabled = false, __is_parrying = false, __parries = 0, __max_parries = 10000}
@@ -600,29 +614,72 @@ function System.player.get_closest()
     Closest_Entity = closest_entity; return closest_entity
 end
 
+-- Who the curve aims the ball at. Target mode (separate from curve mode, which
+-- is the *shape* of the shot) decides which enemy is picked:
+--   Cursor   -> enemy nearest the mouse on screen (what it always used to do)
+--   Camera   -> enemy nearest the middle of the screen
+--   Closest  -> enemy physically nearest you
+--   Farthest -> enemy physically farthest from you
+--   Random   -> a random enemy (fresh pick each parry)
+-- Cursor/Camera fall back to the world-closest enemy when nobody's on screen.
+local function pick_target()
+    local Camera = Workspace.CurrentCamera
+    local root = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+    local root_pos = root and root.Position or Camera.CFrame.Position
+    local parts = {}
+    if Alive then
+        for _, v in pairs(Alive:GetChildren()) do
+            if v ~= LocalPlayer.Character and v.PrimaryPart then parts[#parts + 1] = v.PrimaryPart end
+        end
+    end
+    if #parts == 0 then return nil end
+
+    local mode = System.__config.__target_names[System.__properties.__target_mode] or "Cursor"
+    if mode == "Random" then return parts[math.random(1, #parts)] end
+
+    if mode == "Closest" or mode == "Farthest" then
+        local best, bestDist = nil, (mode == "Closest") and math.huge or -1
+        for _, part in ipairs(parts) do
+            local d = (part.Position - root_pos).Magnitude
+            if (mode == "Closest" and d < bestDist) or (mode == "Farthest" and d > bestDist) then
+                bestDist, best = d, part
+            end
+        end
+        return best
+    end
+
+    -- Cursor / Camera: nearest enemy to a screen anchor.
+    local anchor
+    if mode == "Camera" or isMobile then
+        anchor = Vector2.new(Camera.ViewportSize.X / 2, Camera.ViewportSize.Y / 2)
+    else
+        local ok, m = pcall(UserInputService.GetMouseLocation, UserInputService)
+        anchor = (ok and m) or Vector2.new(Camera.ViewportSize.X / 2, Camera.ViewportSize.Y / 2)
+    end
+    local best, bestDist = nil, math.huge
+    for _, part in ipairs(parts) do
+        local sp, onScreen = Camera:WorldToScreenPoint(part.Position)
+        if onScreen then
+            local d = (Vector2.new(sp.X, sp.Y) - anchor).Magnitude
+            if d < bestDist then bestDist, best = d, part end
+        end
+    end
+    if best then return best end
+    -- Nobody on screen: fall back to the world-closest enemy.
+    local bd = math.huge
+    for _, part in ipairs(parts) do
+        local d = (part.Position - root_pos).Magnitude
+        if d < bd then bd, best = d, part end
+    end
+    return best
+end
+
 System.curve = {}
 function System.curve.get_cframe()
     local Camera = Workspace.CurrentCamera
     local root = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
     local root_pos = root and root.Position or Camera.CFrame.Position
-    local targetPart
-    do
-        local bestDist = math.huge
-        local mouseLoc = not isMobile and UserInputService:GetMouseLocation() or nil
-        if Alive then
-            for _, v in pairs(Alive:GetChildren()) do
-                if v ~= LocalPlayer.Character and v.PrimaryPart then
-                    local screenPos, onScreen = Camera:WorldToScreenPoint(v.PrimaryPart.Position)
-                    if onScreen then
-                        local dist
-                        if mouseLoc then dist = (Vector2.new(screenPos.X, screenPos.Y) - mouseLoc).Magnitude
-                        else local center = Vector2.new(Camera.ViewportSize.X / 2, Camera.ViewportSize.Y / 2); dist = (Vector2.new(screenPos.X, screenPos.Y) - center).Magnitude end
-                        if dist < bestDist then bestDist = dist; targetPart = v.PrimaryPart end
-                    end
-                end
-            end
-        end
-    end
+    local targetPart = pick_target()
     local target_pos = targetPart and targetPart.Position or (root_pos + Camera.CFrame.LookVector * 100)
     local Parry_Type = System.__config.__curve_names[System.__properties.__curve_mode]
     local cf
@@ -892,7 +949,7 @@ System.autoparry = {}
 function System.parry_distance(speed)
     local props = System.__properties
     -- Capped so a lag spike can't blow the window up to the whole map.
-    local ping_ms = math.min(getPing(), 400)
+    local ping_ms = math.min(pingMs(), 400)
     local ping_threshold = math.clamp(ping_ms / 100, 5, 17)
     -- Old code capped the speed term at 650, so past ~660 studs/s the window
     -- stopped growing and very fast balls were parried too late (or skipped).
@@ -952,7 +1009,7 @@ local APCfg = {
 --   * the ball leaving us frees the next parry at once.
 local ParryCover = {at = 0, busy_until = 0, landed = false, landed_at = 0}
 local function parry_up_for()
-    return APCfg.parry_lasts + getPing() / 1000 + 0.03
+    return APCfg.parry_lasts + pingMs() / 1000 + 0.03
 end
 local function parry_busy()
     local now = tick()
@@ -963,7 +1020,7 @@ end
 local function mark_parry(eta)
     local now = tick()
     ParryCover.at, ParryCover.landed = now, false
-    ParryCover.busy_until = now + math.max(parry_up_for(), (eta or 0) + getPing() / 2000 + 0.05)
+    ParryCover.busy_until = now + math.max(parry_up_for(), (eta or 0) + pingMs() / 2000 + 0.05)
 end
 local function parry_landed()
     ParryCover.landed, ParryCover.landed_at = true, tick()
@@ -1146,7 +1203,7 @@ end
 
 -- Higher ping reads the ball sooner, so it's a little more lenient.
 local function curve_threshold()
-    return math.clamp(APCfg.curve - math.min(getPing(), 400) / 1000 * 0.75, -1, 0.95)
+    return math.clamp(APCfg.curve - math.min(pingMs(), 400) / 1000 * 0.75, -1, 0.95)
 end
 
 -- Parry one ball if it's on us and really coming. Leaves the reason in
@@ -1169,7 +1226,7 @@ local function try_parry_ball(ball, root, now, via)
 
     local heading, miss, speed, distance = read_ball(ball, root)
     if speed < 1 then return hold("ball not moving") end
-    local ping_s = math.min(getPing(), 400) / 1000
+    local ping_s = math.min(pingMs(), 400) / 1000
 
     -- Instant retarget (inside close range, straight off the target change).
     -- The ball's velocity still points at its last holder at that moment, so
@@ -1245,7 +1302,7 @@ end
 -- are left to the normal timing, which sees the real path; pre-parrying those
 -- just runs out before the ball arrives and costs a second parry.
 local function return_too_fast(gap, speed)
-    local budget = getPing() / 1000 + System.__properties.__frame_dt * 2 + 0.02
+    local budget = pingMs() / 1000 + System.__properties.__frame_dt * 2 + 0.02
     -- Each hit speeds the ball up a little.
     return gap / math.max(speed * 1.1, 1) <= budget
 end
@@ -1276,7 +1333,7 @@ local function try_preparry(ball, root)
     local zoomies = ball:FindFirstChild('zoomies')
     local speed = zoomies and zoomies.VectorVelocity.Magnitude or 0
     local their_eta = (ball.Position - their_root.Position).Magnitude / math.max(speed, 1)
-    if their_eta > 0.12 + getPing() / 1000 then return false end
+    if their_eta > 0.12 + pingMs() / 1000 then return false end
     if not return_too_fast((their_root.Position - root.Position).Magnitude, speed) then return false end
     if blocked_by_detection() then return false end
     if not preparry_now() then return false end
@@ -1302,15 +1359,19 @@ function System.autoparry.step()
     end
 end
 
--- Straight from the ball's target change: runs the same decision a frame
--- sooner, inside close range where that frame matters. It's the same heading-
--- aware check as the frame loop, so a ball still flying to its last holder is
--- left alone instead of getting an early parry that runs out.
+-- Straight from the ball's target change, a frame before the loop would see it.
+-- Inside close range the ball's velocity still points at its old holder, so the
+-- distance-only "instant" branch handles it. Beyond close range we run the full
+-- heading-aware check immediately instead of waiting a frame: if the ball is
+-- already coming it parries now, and if it's still flying to its old holder the
+-- normal logic just holds (no early wasted parry). Either way a retarget is
+-- acted on the instant it happens, at any range.
 function System.autoparry.on_retarget(ball)
     if not APCfg.instant then return end
     local root = autoparry_can_run()
-    if not root or (root.Position - ball.Position).Magnitude > APCfg.close_range then return end
-    pcall(try_parry_ball, ball, root, tick(), "instant retarget")
+    if not root then return end
+    local close = (root.Position - ball.Position).Magnitude <= APCfg.close_range
+    pcall(try_parry_ball, ball, root, tick(), close and "instant retarget" or "retarget")
 end
 
 -- Our own parry landed: stay locked until the ball actually leaves us.
@@ -1413,7 +1474,7 @@ end
 -- real hand-offs count: one parry is one hit, never two.
 -- How fast a return has to be before one reactive parry can't keep up.
 local function reaction_budget()
-    return math.min(getPing(), 400) / 1000 + AutoSpam.react_margin
+    return math.min(pingMs(), 400) / 1000 + AutoSpam.react_margin
 end
 
 local function detect_clash(ball, root, now)
@@ -2252,6 +2313,11 @@ AP:AddDropdown("ParryMode", {Text = "Parry mode", Values = {"Remote", "Keypress"
 AP:AddDropdown("CurveMode", {Text = "Curve mode", Values = System.__config.__curve_names, Default = "Camera",
     Callback = function(v)
         for i, n in ipairs(System.__config.__curve_names) do if n == v then System.__properties.__curve_mode = i; break end end
+    end})
+AP:AddDropdown("TargetMode", {Text = "Target mode", Values = System.__config.__target_names, Default = "Cursor",
+    Tooltip = "Who the curve sends the ball at. Cursor: enemy under your mouse. Camera: enemy nearest screen centre. Closest/Farthest: by distance to you. Random: a random enemy each parry.",
+    Callback = function(v)
+        for i, n in ipairs(System.__config.__target_names) do if n == v then System.__properties.__target_mode = i; break end end
     end})
 AP:AddSlider("Accuracy", {Text = "Accuracy", Default = 50, Min = 1, Max = 100, Rounding = 0,
     Tooltip = "Higher parries later (closer). Lower parries earlier (further away).",
