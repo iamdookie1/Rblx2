@@ -6,7 +6,7 @@ task.spawn(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.06-5"
+local SCRIPT_VERSION = "2026.10.06-6"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -633,6 +633,15 @@ local function load_track(animator, humanoid, anim)
     return track
 end
 
+-- A success swing the game is playing (tagged SuccessParry, or SuccessParry1..N
+-- for sets with variants).
+local function is_success_swing(track)
+    for key, value in pairs(track:GetAttributes()) do
+        if value == true and key:sub(1, 12) == "SuccessParry" then return true end
+    end
+    return false
+end
+
 local function play_block()
     local char = LocalPlayer.Character
     if not char or char:GetAttribute("InOverdriveMech") then return end
@@ -641,8 +650,18 @@ local function play_block()
     if not animator then return end
     local now = os.clock()
     if not gate.landed and now - gate.last < BLOCK_COOLDOWN then return end
+    local playing = animator:GetPlayingAnimationTracks()
+    -- Let the swing play. When our parry lands the game starts its success swing;
+    -- spam fires again within milliseconds, and starting the next block then (which
+    -- stops success swings, as the game's block does) cut the swing off in the same
+    -- frame, so only the block grab was ever visible. A held key can't re-block that
+    -- fast, so in the real game the swing shows. Wait until it has nearly finished.
+    for _, track in ipairs(playing) do
+        local length = track.Length
+        if length > 0 and track.TimePosition < length - 0.05 and is_success_swing(track) then return end
+    end
     gate.last, gate.landed = now, false
-    for _, track in ipairs(animator:GetPlayingAnimationTracks()) do
+    for _, track in ipairs(playing) do
         if track:GetAttribute("SuccessParry") or track:GetAttribute("Parry") then
             track:Stop(track:GetAttribute("StopFadeTime"))
         end
