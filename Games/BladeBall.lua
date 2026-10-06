@@ -1721,113 +1721,49 @@ task.spawn(function()
             end)
         end)
     end
-    local hookedFuncs = {}
+    -- ========================================================================
+    -- SKIN RENDERING -- resolver remap (completely different: no handler hooks)
+    -- ========================================================================
+    -- The old approach caught the game's five visual-effect handlers
+    -- (ParrySuccessAll, ParryAttempt, ParrySuccess, PlaySound, PlayVisuals) with
+    -- getconnections and replaced each one -- the loops that were causing kicks.
+    -- This touches none of that. Every effect the game plays turns a sword *name*
+    -- into its visual data through one shared resolver, Swords:GetSword (the same
+    -- one this script already uses at load). We make that resolver hand back the
+    -- chosen skin's data whenever it is asked for the sword we actually have
+    -- equipped; the game's own, untouched effect code then renders the skin by
+    -- itself. No getconnections on the effect remotes, nothing disabled, nothing
+    -- added -- and it is a plain field write on a module table we legitimately
+    -- require, not a closure hook, so there is no C/Lua-closure tell and nothing
+    -- for a hook scan to find. The connection list stays a clean client's.
 
-    -- Swaps the sword / slash strings in a visual-effect event's args for the
-    -- chosen skin, then hands off to the game's real handler (callTarget). The
-    -- arg logic is unchanged; only how we splice in differs.
-    local function makeReplacement(getCallTarget)
-        return function(...)
-            local args = { ... }
-            local isLocal = false
-            for _, arg in ipairs(args) do
-                if tostring(arg) == LocalPlayer.Name or (typeof(arg) == "Instance" and (arg == LocalPlayer.Character or arg == LocalPlayer)) then
-                    isLocal = true; break
-                end
-            end
-            if isLocal and getgenv().skinChanger then
-                local fxSword = getgenv().swordFX ~= "" and getgenv().swordFX or getgenv().swordModel
-                refreshSlashName()
-                local swordFound = false; local slashFound = false
-                for i, arg in ipairs(args) do
-                    if type(arg) == "string" then
-                        if fxSword ~= "" and not slashFound and (arg:match("Slash") or arg == "Default" or arg:match("Effect")) then
-                            args[i] = getgenv().slashName; slashFound = true
-                        elseif fxSword ~= "" and not swordFound then
-                            local isSword = false
-                            pcall(function()
-                                if rs.Shared.ReplicatedInstances.Swords:FindFirstChild(arg) then isSword = true end
-                            end)
-                            if isSword or arg == LocalPlayer:GetAttribute("CurrentlyEquippedSword") then
-                                args[i] = fxSword; swordFound = true
-                            end
-                        end
-                    end
-                end
-                if fxSword ~= "" and not slashFound and type(args[1]) == "string" then args[1] = getgenv().slashName end
-                if fxSword ~= "" and not swordFound and type(args[3]) == "string" then args[3] = fxSword end
-            end
-            if setthreadidentity then pcall(setthreadidentity, 2) end
-            pcall(getCallTarget(), unpack(args))
-        end
+    -- The server fires our effects under the sword we really have equipped, so
+    -- remap only that name; every other player's sword resolves untouched.
+    local function isOurEquippedSword(name)
+        if type(name) ~= "string" or name == "" then return false end
+        return name == LocalPlayer:GetAttribute("CurrentlyEquippedSword")
+            or name == getgenv().swordModel
     end
 
-    -- Splice our skin swap into one of the game's own visual-effect handlers.
-    -- Quietest path (hookfunction): swap the handler's body in place. The game's
-    -- connection is left exactly as it made it -- enabled, same object, nothing
-    -- added or disabled -- so the connection list never changes. We call the
-    -- pre-hook copy hookfunction hands back, so there's no recursion. Disable +
-    -- reconnect is kept only as a fallback for executors without hookfunction.
-    local function spliceHandler(remote, conn, func)
-        local callTarget = func
-        local replacement = makeReplacement(function() return callTarget end)
-        -- Be the SAME kind of closure as the handler we replace, so ours reads
-        -- as native under iscclosure / islclosure. The game's OnClientEvent
-        -- handlers are Lua closures, so keep ours a Lua closure too -- a
-        -- newcclosure here would come back as a C closure, a dead giveaway that
-        -- this one handler isn't the game's. Only mirror a C closure in the
-        -- unlikely case the original is one. (The parry hooks DO use newcclosure
-        -- because there they replace C functions, where a C closure is the match.)
-        local hookBody = replacement
-        if islclosure and not islclosure(func) then
-            hookBody = hook_wrap(replacement)
-        end
-        hookedFuncs[func] = true
-        hookedFuncs[replacement] = true
-        hookedFuncs[hookBody] = true
-        if type(hookfunction) == "function" then
-            local ok, original = pcall(hookfunction, func, hookBody)
-            if ok then
-                callTarget = original -- real handler copy; invoking func now runs ours
-                return true
-            end
-        end
-        pcall(function() conn:Disable() end)
-        remote.OnClientEvent:Connect(hookBody)
-        return true
-    end
-
-    task.spawn(function()
-        local remotesToHook = {"ParrySuccessAll", "ParryAttempt", "ParrySuccess", "PlaySound", "PlayVisuals"}
-        -- Scan only until every target handler is caught, then stop -- no
-        -- forever loop hammering getconnections. A short backoff covers handlers
-        -- that connect a little after load; once spliced in place they persist
-        -- across respawns, so there's nothing to keep re-scanning for.
-        local attempts = 0
-        while attempts < 60 do
-            attempts = attempts + 1
-            local pending = false -- any target remote still without a caught handler?
-            for _, remoteName in ipairs(remotesToHook) do
-                local remote = rs.Remotes:FindFirstChild(remoteName)
-                if remote and remote:IsA("RemoteEvent") then
-                    local ok, conns = pcall(getconnections, remote.OnClientEvent)
-                    if ok and type(conns) == "table" then
-                        if #conns == 0 then pending = true end
-                        for _, v in ipairs(conns) do
-                            local func = v.Function
-                            if func and not hookedFuncs[func] then
-                                spliceHandler(remote, v, func)
-                            end
-                        end
-                    else
-                        pending = true
+    -- Swap the resolver in place on the required module table. require() hands
+    -- every script the same cached table, so the game's effect code reads this
+    -- raw field too. We call the original for the real lookup -- and crucially
+    -- recurse the real one under the SKIN'S name, so the returned data is a
+    -- genuine game sword-data table (right SlashName / AnimationType / fields),
+    -- never a hand-built one that would read as foreign.
+    pcall(function()
+        local realGetSword = swordInstances.GetSword
+        if type(realGetSword) == "function" then
+            rawset(swordInstances, "GetSword", function(self, name, ...)
+                if getgenv().skinChanger then
+                    local fx = getgenv().swordFX ~= "" and getgenv().swordFX or getgenv().swordModel
+                    if fx ~= "" and fx ~= name and isOurEquippedSword(name) then
+                        local ok, skinData = pcall(realGetSword, self, fx, ...)
+                        if ok and type(skinData) == "table" then return skinData end
                     end
-                else
-                    pending = true
                 end
-            end
-            if not pending then break end
-            task.wait(attempts < 10 and 1 or 3)
+                return realGetSword(self, name, ...)
+            end)
         end
     end)
     getgenv().updateSword = function()
