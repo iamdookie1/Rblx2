@@ -620,32 +620,6 @@ function System.parry.by_mode(mode)
     if mode == "Keypress" then System.parry.keypress() else System.parry.execute_action() end
 end
 
-local function linear_predict(a,b,t) return a+(b-a)*t end
-System.detection = { __ball_properties = {__aerodynamic_time=tick(),__last_warping=tick(),__lerp_radians=0,__curving=tick()} }
-function System.detection.is_curved()
-    local props = System.detection.__ball_properties
-    local ball = System.ball.get(); if not ball then return false end
-    local zoomies = ball:FindFirstChild("zoomies"); if not zoomies then return false end
-    local velocity = zoomies.VectorVelocity; local speed = velocity.Magnitude
-    if speed < 1 then return false end
-    local ball_dir = velocity.Unit; local char = LocalPlayer.Character
-    if not char or not char.PrimaryPart then return false end
-    local pos = char.PrimaryPart.Position; local direction = (pos-ball.Position).Unit
-    local dot = direction:Dot(ball_dir)
-    local ping = getPing()/1000
-    local distance = (pos-ball.Position).Magnitude; local reach_time = distance/speed-ping
-    local dot_threshold = math.clamp(0.55-(ping*0.75),-1,0.45)
-    local speed_threshold = math.min(speed/100,45)
-    local ball_distance_threshold = 15-math.min(distance/1000,15)+speed_threshold
-    local clamped_dot = math.clamp(dot,-1,1); local radians = math.asin(clamped_dot)
-    props.__lerp_radians = linear_predict(props.__lerp_radians,radians,0.85)
-    if props.__lerp_radians < 0.016 then props.__last_warping = tick() end
-    if distance < (ball_distance_threshold*0.85) then return false end
-    if (tick()-props.__last_warping) < (reach_time/1.4) then return true end
-    if (tick()-props.__curving) < (reach_time/1.1) then return true end
-    return dot < dot_threshold
-end
-
 -- ============================================================
 -- DETECTION EVENTS
 -- ============================================================
@@ -845,6 +819,8 @@ local APCfg = {
     close_range = 20,       -- studs
     instant = true,         -- parry straight from the target change
     preparry = true,        -- parry ahead when a player next to you is about to hit it back
+    point_blank = 0.5,      -- fraction of close range where the ball's path is ignored
+    hit_radius = 2.5,       -- studs from our root that count as the ball landing
     parry_window = 0.45,    -- parry once the ball lands within this (+ ping); a bit under the real window
     parry_lasts = 0.5,      -- how long the game keeps a parry up
     landed_hold = 0.75,     -- max wait for the ball to leave us after a parry lands
@@ -999,9 +975,103 @@ local function autoparry_can_run()
     return root
 end
 
--- Parry one ball if it's on us and inside the window. `curve_hold` comes from
--- the frame loop; it never applies up close.
-local function try_parry_ball(ball, root, now, curve_hold, training)
+-- ------------------------------------------------------------
+-- Anti curve: per-ball turn rate and predicted landing time
+-- ------------------------------------------------------------
+-- Balls home in on their target, bending their path to it. Instead of treating
+-- every ball as flying straight at us (distance / speed), each ball's real turn
+-- rate is measured frame to frame and its homing path is simulated forward to
+-- get when it actually lands on us. Straight-in balls time exactly as before;
+-- a curving ball waits until it's really coming, and one curving away isn't
+-- parried at all until it turns back.
+local PREDICT_STEP = 1 / 120
+local MAX_TURN_RATE = 25 -- rad/s; anything above is noise
+local UP_AXIS = Vector3.new(0, 1, 0)
+
+-- Called once per frame per ball.
+local function track_motion(state, velocity, now)
+    local speed = velocity.Magnitude
+    if speed < 1 then return end
+    local dir = velocity / speed
+    local prev, prev_t = state.dir, state.dir_t
+    state.dir, state.dir_t = dir, now
+    if not prev or now - prev_t <= 1e-3 or now - prev_t > 0.25 then return end
+    local angle = math.acos(math.clamp(prev:Dot(dir), -1, 1))
+    -- A snap this big in one frame is a retarget or a warp, not the ball
+    -- turning; it mustn't read as a huge turn rate.
+    if angle > 1.2 then
+        state.warped_at = now
+        return
+    end
+    local rate = math.min(angle / (now - prev_t), MAX_TURN_RATE)
+    state.turn_rate = state.turn_rate and (state.turn_rate * 0.6 + rate * 0.4) or rate
+end
+
+-- Simulates the ball homing in on us at its observed turn rate. Returns the
+-- seconds until it lands, or nil if it doesn't within `horizon`.
+local function simulate_homing(state, from, velocity, target, horizon)
+    local speed = velocity.Magnitude
+    local dir = velocity / speed
+    local turn = (state.turn_rate or 0) * PREDICT_STEP
+    local pos, t = from, 0
+    local radius = APCfg.hit_radius
+    while t < horizon do
+        local to = target - pos
+        local dist = to.Magnitude
+        if dist <= radius then return t end
+        if turn > 0 then
+            local want = to / dist
+            local angle = math.acos(math.clamp(dir:Dot(want), -1, 1))
+            if angle <= turn then
+                dir = want
+            else
+                local s = math.sin(angle)
+                if s < 1e-3 then
+                    -- Dead away from us: bend out to one side to come around.
+                    local side = dir:Cross(UP_AXIS)
+                    if side.Magnitude < 1e-3 then side = dir:Cross(Vector3.new(1, 0, 0)) end
+                    want = (want + side.Unit * 0.05).Unit
+                    angle = math.acos(math.clamp(dir:Dot(want), -1, 1))
+                    s = math.sin(angle)
+                end
+                dir = (dir * math.sin(angle - turn) + want * math.sin(turn)) / s
+            end
+        end
+        local step = dir * (speed * PREDICT_STEP)
+        -- Closest approach along this step, so fast balls can't skip past us.
+        local along = math.clamp(to:Dot(step) / step:Dot(step), 0, 1)
+        if (to - step * along).Magnitude <= radius then return t + PREDICT_STEP * along end
+        pos = pos + step
+        t = t + PREDICT_STEP
+    end
+    return nil
+end
+
+-- When the ball lands on us, or nil if it isn't coming within `horizon`.
+local function predict_arrival(state, ball, root, velocity, horizon)
+    local speed = velocity.Magnitude
+    local to = root.Position - ball.Position
+    local distance = to.Magnitude
+    if distance <= APCfg.hit_radius then return 0 end
+    if speed < 1 then return nil end
+    local eta = simulate_homing(state, ball.Position, velocity, root.Position, horizon)
+    if eta then return eta end
+    -- A turn was measured and the path still doesn't reach us in time (curving
+    -- away, or circling): trust it and wait.
+    if (state.turn_rate or 0) > 0.5 then return nil end
+    -- No turn seen yet but it's roughly facing us: a homing ball bends in along
+    -- about the smoothest arc, tangent to its heading and through us. Facing
+    -- away, wait until it actually turns.
+    local heading = math.acos(math.clamp((velocity / speed):Dot(to / distance), -1, 1))
+    if heading > math.rad(100) then return nil end
+    local path = heading < 1e-3 and distance or distance * heading / math.sin(heading)
+    eta = math.max(path - APCfg.hit_radius, 0) / speed
+    return eta <= horizon and eta or nil
+end
+
+-- Parry one ball if it's on us and due to land inside the window. `instant`
+-- comes from the target change at point blank.
+local function try_parry_ball(ball, root, now, instant)
     local props = System.__properties
     local zoomies = ball:FindFirstChild('zoomies')
     if not zoomies then return false end
@@ -1011,23 +1081,50 @@ local function try_parry_ball(ball, root, now, curve_hold, training)
     -- A parry is already up (or just landed and the ball hasn't left yet).
     if parry_busy() then return false end
 
-    local speed = zoomies.VectorVelocity.Magnitude
-    local distance = (root.Position - ball.Position).Magnitude
-    local close = distance <= APCfg.close_range
-
     local tornado = Runtime:FindFirstChild('Tornado')
     if tornado and (now - props.__tornado_time) < (tornado:GetAttribute('TornadoTime') or 1) + 0.314159 then return false end
-    if curve_hold and not close and ball.Parent ~= training then return false end
     if ball:FindFirstChild('ComboCounter') then return false end
     if blocked_by_detection() then return false end
 
-    -- Inside the window, or up close and arriving before a parry would expire.
-    -- Inside the window (or up close), and only once the ball will land while
-    -- the parry is still up. Parrying earlier (slow balls get a wide window) just
-    -- has it expire before the ball arrives and need a second one.
-    local eta = distance / math.max(speed, 1)
-    if not (distance <= System.parry_distance(speed) or close) then return false end
-    if eta > APCfg.parry_window + getPing() / 1000 then return false end
+    local velocity = zoomies.VectorVelocity
+    local speed = velocity.Magnitude
+    local distance = (root.Position - ball.Position).Magnitude
+    local ping_s = getPing() / 1000
+
+    -- The accuracy setting's window, as time: when a ball flying straight in at
+    -- this speed gets parried. Up close at least the whole parry window. And
+    -- never so early that the parry runs out before the ball lands.
+    local lead = System.parry_distance(speed) / math.max(speed, 1)
+    if distance <= APCfg.close_range then lead = math.max(lead, APCfg.parry_window + ping_s) end
+    lead = math.min(lead, APCfg.parry_window + ping_s)
+
+    -- 1 = flying straight at us, 0 = sideways, -1 = straight away.
+    local heading = 1
+    if speed > 1 and distance > 0.01 then
+        heading = (velocity / speed):Dot((root.Position - ball.Position) / distance)
+    end
+
+    local eta
+    if instant then
+        -- Straight off the target change at point blank: no time to read its
+        -- path, it can be back on us almost at once. Unless it's still flying
+        -- away: then it hasn't been sent back yet (or it's being curved), and
+        -- the next frame sees which and times it properly.
+        if heading < 0 then return false end
+        eta = distance / math.max(speed, 1)
+    else
+        eta = predict_arrival(state, ball, root, velocity, lead + 0.05)
+        -- Point blank with nothing to go on (no turn measured yet, not flying
+        -- away): assume it's coming. With a measured turn the prediction is
+        -- trusted even this close, or a ball still swinging round gets parried
+        -- too early.
+        if not eta and heading >= 0 and distance <= APCfg.close_range * APCfg.point_blank
+            and (state.turn_rate or 0) <= 0.5 then
+            eta = distance / math.max(speed, 1)
+        end
+    end
+    state.eta = eta
+    if not eta or eta > lead then return false end
 
     state.parried = true
     state.at = now
@@ -1036,6 +1133,17 @@ local function try_parry_ball(ball, root, now, curve_hold, training)
         System.parry.by_mode(getgenv().AutoParryMode)
     end
     return true
+end
+
+-- Whether a return from a player `gap` studs away is too fast to react to: it
+-- covers the gap in under a round trip (plus a couple of frames), so only a
+-- parry that's already up can catch it. Slower returns, or ones they curve,
+-- are left to the normal timing, which sees the real path; pre-parrying those
+-- just runs out before the ball arrives and costs a second parry.
+local function return_too_fast(gap, speed)
+    local budget = getPing() / 1000 + System.__properties.__frame_dt * 2 + 0.02
+    -- Each hit speeds the ball up a little.
+    return gap / math.max(speed * 1.1, 1) <= budget
 end
 
 local function preparry_now()
@@ -1048,10 +1156,10 @@ local function preparry_now()
     return true
 end
 
--- Ball is on a player standing next to us and about to reach them: their parry
--- will send it straight back faster than we can react, so put ours up first.
--- Only when they're about to hit it, not just whenever they hold it, so one
--- return gets one parry.
+-- Ball is on a player standing next to us and about to reach them, and their
+-- return would be too fast to react to: put our parry up first. Only when
+-- they're about to hit it, and only when reacting can't work, so one return
+-- gets one parry.
 local function try_preparry(ball, root)
     if not APCfg.preparry then return false end
     local target = ball:GetAttribute('target')
@@ -1063,6 +1171,7 @@ local function try_preparry(ball, root)
     local speed = zoomies and zoomies.VectorVelocity.Magnitude or 0
     local their_eta = (ball.Position - their_root.Position).Magnitude / math.max(speed, 1)
     if their_eta > 0.12 + getPing() / 1000 then return false end
+    if not return_too_fast((their_root.Position - root.Position).Magnitude, speed) then return false end
     if blocked_by_detection() then return false end
     return preparry_now()
 end
@@ -1075,31 +1184,31 @@ function System.autoparry.step()
     -- Re-roll the jittered accuracy once per frame while randomize is on.
     if props.__random_accuracy then roll_accuracy() end
 
-    -- Called every frame, not only when a ball is on us: it smooths the curve
-    -- angle between calls.
-    local curved = System.detection.is_curved()
-    local one_ball = System.ball.get()
-    local curve_hold = curved and one_ball and one_ball:GetAttribute('target') == LocalPlayer.Name
-
-    local training = Workspace:FindFirstChild("TrainingBalls")
     local now = tick()
     for _, ball in ipairs(get_live_balls()) do
         if ball:FindFirstChild('AeroDynamicSlashVFX') then
             ball.AeroDynamicSlashVFX:Destroy(); props.__tornado_time = now
         end
-        if not try_parry_ball(ball, root, now, curve_hold, training) then
+        -- Every frame, even while the ball is on someone else, so its turn rate
+        -- is already known the moment it comes to us.
+        local zoomies = ball:FindFirstChild('zoomies')
+        if zoomies then track_motion(get_ball_state(ball), zoomies.VectorVelocity, now) end
+        if not try_parry_ball(ball, root, now) then
             try_preparry(ball, root)
         end
     end
 end
 
--- Straight from the ball's target change: a point-blank return gets answered
--- the moment it replicates, not on the next frame.
+-- Straight from the ball's target change, point blank only: there the ball is
+-- back on us before the next frame, so waiting a frame loses. Further out it's
+-- left to the frame loop, which times it off the ball's real path. (When this
+-- covered the whole close range it fired before the ball had even turned around,
+-- the parry ran out before it arrived, and auto parry then fired a second one.)
 function System.autoparry.on_retarget(ball)
     if not APCfg.instant then return end
     local root = autoparry_can_run()
-    if not root or (root.Position - ball.Position).Magnitude > APCfg.close_range then return end
-    pcall(try_parry_ball, ball, root, tick(), false, Workspace:FindFirstChild("TrainingBalls"))
+    if not root or (root.Position - ball.Position).Magnitude > APCfg.close_range * APCfg.point_blank then return end
+    pcall(try_parry_ball, ball, root, tick(), true)
 end
 
 -- Our own parry landed: stay locked until the ball actually leaves us.
@@ -1114,8 +1223,11 @@ Remotes.ParrySuccessAll.OnClientEvent:Connect(function(_, root)
     if char == LocalPlayer.Character or (root.Position - myRoot.Position).Magnitude > APCfg.close_range then return end
     local apRoot = APCfg.preparry and autoparry_can_run()
     if apRoot and not blocked_by_detection() then
+        local gap = (root.Position - apRoot.Position).Magnitude
         for _, ball in ipairs(get_live_balls()) do
-            if (ball.Position - apRoot.Position).Magnitude <= APCfg.close_range * 1.5 then
+            local zoomies = ball:FindFirstChild('zoomies')
+            local speed = zoomies and zoomies.VectorVelocity.Magnitude or 0
+            if (ball.Position - apRoot.Position).Magnitude <= APCfg.close_range * 1.5 and return_too_fast(gap, speed) then
                 preparry_now()
                 break
             end
@@ -1981,7 +2093,22 @@ task.spawn(function()
             StatCards:SetValue("Parries", System.__properties.__total_parries)
             RemoteLabel:SetText(remoteStatusText())
             local target = ball and ball:GetAttribute('target')
-            TargetLabel:SetText("Ball target: " .. ((target == nil or target == "") and "-" or tostring(target)))
+            local text = "Ball target: " .. ((target == nil or target == "") and "-" or tostring(target))
+            -- Curve readout: how straight it's heading at you (1 = dead on), how
+            -- fast it's turning, and when it's predicted to land while on you.
+            if ball and root and zoomies and speed > 1 then
+                local to = root.Position - ball.Position
+                if to.Magnitude > 0.01 then
+                    local st = ball_state[ball]
+                    text = text .. string.format("  |  heading %.2f  |  turning %.1f rad/s",
+                        (zoomies.VectorVelocity / speed):Dot(to.Unit), st and st.turn_rate or 0)
+                    if target == LocalPlayer.Name then
+                        local eta = st and st.eta
+                        text = text .. (eta and string.format("  |  lands in %.2fs", eta) or "  |  not coming yet")
+                    end
+                end
+            end
+            TargetLabel:SetText(text)
         end
     end
 end)
@@ -2020,13 +2147,13 @@ AP:AddToggle("PingCompensation", {Text = "Ping compensation", Default = true,
 AP:AddSlider("ExtraDistance", {Text = "Extra distance", Default = 0, Min = -10, Max = 30, Rounding = 0, Suffix = " studs",
     Callback = function(v) System.__properties.__extra_distance = v end})
 AP:AddSlider("CloseRange", {Text = "Close range", Default = 20, Min = 8, Max = 45, Rounding = 0, Suffix = " studs",
-    Tooltip = "Inside this distance auto parry switches to close-range rules (instant retarget parry, fast retries, pre-parry).",
+    Tooltip = "Inside this distance auto parry uses close-range rules (wider timing, pre-parry). Inside half of it is point blank: the ball's path is ignored and instant retarget applies.",
     Callback = function(v) APCfg.close_range = v end})
 AP:AddToggle("InstantRetarget", {Text = "Instant parry on retarget", Default = true,
-    Tooltip = "Up close, parries the moment the ball switches to you instead of waiting for the next frame.",
+    Tooltip = "At point blank (half the close range), parries the moment the ball switches to you instead of waiting for the next frame. Further out normal timing handles it.",
     Callback = function(v) APCfg.instant = v end})
 AP:AddToggle("ClosePreParry", {Text = "Close-range pre-parry", Default = true,
-    Tooltip = "When the ball is on a player standing next to you, parries ahead of time so your parry is already up when they send it back.",
+    Tooltip = "When a player next to you is about to hit the ball and their return would be too fast to react to, parries ahead so yours is already up. If they curve it instead, a second parry follows.",
     Callback = function(v) APCfg.preparry = v end})
 AP:AddToggle("RandomCurve", {Text = "Random curve", Default = false, Callback = function(s)
     if s then
