@@ -6,7 +6,7 @@ task.spawn(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.06-4"
+local SCRIPT_VERSION = "2026.10.06-5"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -518,101 +518,167 @@ local function roll_accuracy()
 end
 
 -- Animation
+-- Mirrors the game's own block action (its parry controller, read from the game
+-- source) so remote parries and spam look like real ones:
+--   * which tracks: every animation in the sword's animation set tagged Parry or
+--     GrabParry, picked by attribute through the game's SwordAPI:GetAnimations
+--     (not by child name, which missed sets like Scissors that only have Parry);
+--   * how they load: through the game's AnimationController, which copies the
+--     Animation's attributes (GrabParry, PlaySpeed, PlayFadeTime, StopFadeTime...)
+--     onto the track and keeps one track per animation. The game's own success
+--     handler finds what to stop by those attributes, so tracks loaded straight
+--     from the Animator were never stopped and the block and success swings played
+--     on top of each other (and a fresh track was created on every play);
+--   * how they play: stop playing Parry / SuccessParry tracks, then Play with the
+--     track's own fade/weight/speed, and record ParryTime on the character;
+--   * when: like the game, a new block only starts once the last one landed (our
+--     ParrySuccess) or its 1.3s cooldown ran out. Held spam then reads as block,
+--     success swing, block, success swing -- what spamming the key in a clash
+--     looks like. The success swing itself is played by the game when it lands.
 System.animation = {}
-local SwordAPI = ReplicatedStorage:WaitForChild("Shared"):WaitForChild("SwordAPI")
-local LastPlayedd = 0
-local Sword_CP = false
-local Sword_Spped = 1
-local Grab_Parry = nil
-local AnimFix_Cache = {}
+do
+local SwordAPIFolder = ReplicatedStorage:WaitForChild("Shared"):WaitForChild("SwordAPI")
+local BLOCK_COOLDOWN = 1.3   -- the game's block lockout when a block doesn't land
+local game_api, game_anim, modules_tried
+local sword_info_cache = {}  -- sword name -> {collection, sword_type}
+local own_tracks = setmetatable({}, {__mode = 'k'}) -- animator -> {[Animation] = track}
+local r15_clones = {}        -- Animation -> Animation using its R15Id
+local gate = {last = -math.huge, landed = true}
 
-local function GetParryAnimation(swordName)
-    if not swordName or swordName == "" then return SwordAPI.Collection.Default:FindFirstChild("GrabParry") end
-    if AnimFix_Cache[swordName] then return AnimFix_Cache[swordName] end
-    local ok, swordData = pcall(function()
-        return ReplicatedStorage.Shared.ReplicatedInstances.Swords.GetSword:Invoke(swordName)
-    end)
-    if not ok or not swordData or type(swordData) ~= "table" or not swordData.AnimationType then
-        AnimFix_Cache[swordName] = SwordAPI.Collection.Default:FindFirstChild("GrabParry")
-        return AnimFix_Cache[swordName]
+local function modules()
+    if not modules_tried then
+        modules_tried = true
+        pcall(function() game_api = require(SwordAPIFolder) end)
+        pcall(function() game_anim = require(ReplicatedStorage.Controllers.AnimationController) end)
+        if type(game_api) ~= 'table' or type(game_api.GetAnimations) ~= 'function' then game_api = nil end
+        if type(game_anim) ~= 'table' or type(game_anim.LoadAnimation) ~= 'function' then game_anim = nil end
     end
-    for _, obj in pairs(SwordAPI.Collection:GetChildren()) do
-        if obj.Name == swordData.AnimationType then
-            local anim = obj:FindFirstChild("GrabParry") or obj:FindFirstChild("Grab")
-            if anim then AnimFix_Cache[swordName] = anim; return anim end
+    return game_api, game_anim
+end
+
+local function current_sword(char)
+    if getgenv().skinChangerEnabled then
+        return (getgenv().swordAnimations ~= "" and getgenv().swordAnimations)
+            or (getgenv().swordModel ~= "" and getgenv().swordModel)
+            or char:GetAttribute("CurrentlyEquippedSword")
+    end
+    return char:GetAttribute("CurrentlyEquippedSword")
+end
+
+local function sword_info(name)
+    name = name or ""
+    local info = sword_info_cache[name]
+    if info then return info end
+    info = {collection = "Default", sword_type = "Single"}
+    if name ~= "" then
+        local ok, data = pcall(function()
+            return ReplicatedStorage.Shared.ReplicatedInstances.Swords.GetSword:Invoke(name)
+        end)
+        if ok and type(data) == "table" then
+            info.collection = data.AnimationType or info.collection
+            info.sword_type = data.SwordType or info.sword_type
         end
     end
-    AnimFix_Cache[swordName] = SwordAPI.Collection.Default:FindFirstChild("GrabParry")
-    return AnimFix_Cache[swordName]
+    sword_info_cache[name] = info
+    return info
 end
 
-local function GrabParryPlay(track)
-    if not track then return end
-    pcall(function()
-        track:Play(track:GetAttribute("PlayFadeTime") or 0, track:GetAttribute("PlayWeight") or 1, track:GetAttribute("PlaySpeed") or 1)
-    end)
+local function find_animations(char, names, info)
+    local api = modules()
+    if api then
+        local ok, list = pcall(api.GetAnimations, api, char, names, info.collection, info.sword_type)
+        if ok and type(list) == "table" and #list > 0 then return list end
+    end
+    -- Fallback: the same pick by attribute from the set's folder (or Default).
+    local collection = SwordAPIFolder:FindFirstChild("Collection")
+    local folder = collection and (collection:FindFirstChild(info.collection) or collection:FindFirstChild("Default"))
+    local list = {}
+    if folder then
+        for _, anim in ipairs(folder:GetChildren()) do
+            if anim:IsA("Animation") then
+                for _, n in ipairs(names) do
+                    if anim:GetAttribute(n) then list[#list + 1] = anim; break end
+                end
+            end
+        end
+    end
+    return list
 end
 
-local function GrabParryStop(track)
-    if not track then return end
-    pcall(function() track:Stop(track:GetAttribute("StopFadeTime") or 0.1) end)
+local function load_track(animator, humanoid, anim)
+    local _, ctrl = modules()
+    if ctrl then
+        local ok, track = pcall(ctrl.LoadAnimation, ctrl, animator, anim, true)
+        if ok and track then return track end
+    end
+    -- Fallback, same as the game's loader: one track per animation per
+    -- animator, with the Animation's attributes copied onto it.
+    local per = own_tracks[animator]
+    if not per then per = {}; own_tracks[animator] = per end
+    local track = per[anim]
+    if track then return track end
+    local source = anim
+    local r15 = anim:GetAttribute("R15Id")
+    if r15 and humanoid.RigType == Enum.HumanoidRigType.R15 then
+        source = r15_clones[anim]
+        if not source then
+            source = Instance.new("Animation")
+            source.AnimationId = r15
+            r15_clones[anim] = source
+        end
+    end
+    track = animator:LoadAnimation(source)
+    for k, v in pairs(anim:GetAttributes()) do pcall(track.SetAttribute, track, k, v) end
+    per[anim] = track
+    return track
 end
 
+local function play_block()
+    local char = LocalPlayer.Character
+    if not char or char:GetAttribute("InOverdriveMech") then return end
+    local humanoid = char:FindFirstChildOfClass("Humanoid")
+    local animator = humanoid and humanoid:FindFirstChildOfClass("Animator")
+    if not animator then return end
+    local now = os.clock()
+    if not gate.landed and now - gate.last < BLOCK_COOLDOWN then return end
+    gate.last, gate.landed = now, false
+    for _, track in ipairs(animator:GetPlayingAnimationTracks()) do
+        if track:GetAttribute("SuccessParry") or track:GetAttribute("Parry") then
+            track:Stop(track:GetAttribute("StopFadeTime"))
+        end
+    end
+    local parry_time = char:GetAttribute("ParryTime") or 0
+    for _, anim in ipairs(find_animations(char, {"Parry", "GrabParry"}, sword_info(current_sword(char)))) do
+        local ok, track = pcall(load_track, animator, humanoid, anim)
+        if ok and track then
+            local speed = track:GetAttribute("PlaySpeed") or 1
+            track:Play(track:GetAttribute("PlayFadeTime"), track:GetAttribute("PlayWeight"), speed)
+            System.__properties.__grab_animation = track
+            local left = track.Length == 0 and 1 or (track.Length - track.TimePosition) * speed
+            if left > parry_time then parry_time = left end
+        end
+    end
+    pcall(char.SetAttribute, char, "ParryTime", parry_time)
+end
+
+-- Our own block landed: the next block can start straight away (the game plays
+-- the success swing itself).
+pcall(function()
+    Remotes.ParrySuccess.OnClientEvent:Connect(function() gate.landed = true end)
+end)
+LocalPlayer.CharacterAdded:Connect(function() gate.last, gate.landed = -math.huge, true end)
+
+-- Auto parry, triggerbot, slashes of fury: only when parry animations are on.
 function System.animation.play_grab_parry()
     if not System.__properties.__play_animation then return end
-    if not ((os.clock() - LastPlayedd) >= (Sword_Spped - 0.8) or Sword_CP) then return end
-    LastPlayedd = os.clock()
-    Sword_CP = false
-    local char = LocalPlayer.Character
-    if not char then return end
-    local humanoid = char:FindFirstChildOfClass("Humanoid")
-    if not humanoid then return end
-    local currentSword
-    if getgenv().skinChangerEnabled then
-        currentSword = (getgenv().swordAnimations ~= "" and getgenv().swordAnimations)
-                    or (getgenv().swordModel ~= "" and getgenv().swordModel)
-                    or char:GetAttribute("CurrentlyEquippedSword")
-    else
-        currentSword = char:GetAttribute("CurrentlyEquippedSword")
-    end
-    local animation = GetParryAnimation(currentSword)
-    if not animation then return end
-    for _, track in pairs(humanoid.Animator:GetPlayingAnimationTracks()) do
-        if track.Name == "GrabParry" or track.Name == "Grab" then
-            track.TimePosition = 0
-            GrabParryStop(track)
-        elseif track.Name == "SuccessParry" or track.Name == "Success" then
-            GrabParryStop(track)
-        end
-    end
-    Grab_Parry = humanoid.Animator:LoadAnimation(animation)
-    GrabParryPlay(Grab_Parry)
+    pcall(play_block)
 end
-
--- A swing that plays to the end: only starts a new grab once the last one has
--- finished (or a parry landed, which the game follows with its own success
--- animation), so a held spam looks like real swings instead of a stuttering
--- grab start.
-function System.animation.play_grab_parry_full()
-    if Grab_Parry and not Sword_CP then
-        local ok, playing = pcall(function() return Grab_Parry.IsPlaying end)
-        if ok and playing then return end
-    end
-    System.animation.play_grab_parry()
+-- Spam with "Animation fix" on: always, gated like a real held key.
+function System.animation.play_block()
+    pcall(play_block)
 end
-
-pcall(function()
-    Remotes.ParrySuccessAll.OnClientEvent:Connect(function()
-        Sword_CP = true
-        local char = LocalPlayer.Character
-        if not char then return end
-        local humanoid = char:FindFirstChildOfClass("Humanoid")
-        if not humanoid then return end
-        for _, track in pairs(humanoid.Animator:GetPlayingAnimationTracks()) do
-            if track.Name == "GrabParry" or track.Name == "Grab" then GrabParryStop(track) end
-        end
-    end)
-end)
+System.animation.play_grab_parry_full = System.animation.play_block
+end -- animation scope
 
 -- Ball
 System.ball = {}
@@ -1248,13 +1314,49 @@ local function read_ball(ball, root)
 end
 
 -- How far ahead of the ball's arrival (seconds, before ping) a parry may go out.
--- Fast balls get the full window. Slow ones are fired closer to arrival: a parry
--- put up ~0.45s ahead of a ball crawling in at 15 studs/s lands well before the
--- ball does, so it read as parrying too soon. Scales from the full window at 70+
--- studs/s down to 0.2s at 15 studs/s and below.
+-- Arrival is now measured to contact (see time_to_contact), so this is the real
+-- lead. Fast balls get the full window (parry_distance usually fires them later
+-- anyway). Slow ones aim to land ~0.3s into the ~0.5s parry, leaving room on both
+-- sides for a curve or a change of pace: 0.45s at 80+ studs/s down to 0.3s at 20.
 local function lead_window(speed)
-    local slow = math.clamp((70 - speed) / 55, 0, 1)
-    return APCfg.parry_window - slow * 0.25
+    local slow = math.clamp((80 - speed) / 60, 0, 1)
+    return APCfg.parry_window - slow * 0.15
+end
+
+-- The ball hits you when its surface reaches you, not when its centre reaches
+-- your root: that's its radius plus about half a body further out. On a fast ball
+-- the difference is a few milliseconds; on a 15 studs/s ball it's ~0.25s, which
+-- is why slow balls landed before the parry went up.
+local function contact_gap(ball)
+    local ok, size = pcall(function() return ball.Size end)
+    if not ok or not size then return 3 end
+    return math.max(size.X, size.Y, size.Z) * 0.5 + 1.5
+end
+
+-- How fast the ball is gaining speed on its way in (studs/s per second), read
+-- over ~80ms steps so replication jitter doesn't swing it. Reset each pass.
+local function speed_gain(state, speed, now)
+    local s = state.spd
+    if not s or s.pass ~= state.pass_id then
+        state.spd = {pass = state.pass_id, t = now, v = speed, a = 0}
+        return 0
+    end
+    local dt = now - s.t
+    if dt >= 0.08 then
+        s.a = s.a * 0.5 + ((speed - s.v) / dt) * 0.5
+        s.t, s.v = now, speed
+    end
+    return math.clamp(s.a, 0, speed * 4)
+end
+
+-- Seconds until the ball's surface reaches us along `path`, starting at `speed`
+-- and gaining `accel`.
+local function time_to_contact(path, ball, speed, accel)
+    local gap = math.max(path - contact_gap(ball), 0)
+    if accel > 1 then
+        return (math.sqrt(speed * speed + 2 * accel * gap) - speed) / accel
+    end
+    return gap / speed
 end
 
 -- Higher ping reads the ball sooner, so it's a little more lenient.
@@ -1283,6 +1385,7 @@ local function try_parry_ball(ball, root, now, via)
     local heading, miss, speed, distance = read_ball(ball, root)
     if speed < 1 then return hold("ball not moving") end
     local ping_s = math.min(pingMs(), 400) / 1000
+    local accel = speed_gain(state, speed, now)
 
     -- Instant retarget (inside close range, straight off the target change).
     -- The ball's velocity still points at its last holder at that moment, so
@@ -1290,7 +1393,7 @@ local function try_parry_ball(ball, root, now, via)
     -- land within a parry's window. One parry per pass, so it can't double;
     -- further out it's left to the normal checks a frame later.
     if via == "instant retarget" then
-        local eta = distance / speed
+        local eta = time_to_contact(distance, ball, speed, accel)
         if eta > lead_window(speed) + ping_s then return hold("too far for instant") end
         state.parried, state.at = true, now
         state.pass_parried = true
@@ -1317,7 +1420,9 @@ local function try_parry_ball(ball, root, now, via)
     local path = angle < 0.01 and distance or distance * angle / math.sin(angle)
     if path > System.parry_distance(speed) then return hold("outside window") end
     -- A parry that would run out before the ball gets here is a wasted one.
-    local eta = path / speed
+    -- Timed to when the ball actually touches us, including any speed it's
+    -- gaining on the way in.
+    local eta = time_to_contact(path, ball, speed, accel)
     if eta > lead_window(speed) + ping_s then return hold("too early") end
     -- Anti curve: how straight it has to be heading in, unless its line already
     -- runs through us. The further out it still is, the straighter: half a
@@ -1499,11 +1604,10 @@ local function spam_fire(manual)
     else
         System.parry.fast()
         if getgenv().ManualSpamAnimationFix and macroAnimFix then
-            -- Manual spam is held for a while: restarting the grab every few
-            -- frames meant you only ever saw the start of it. Each swing now
-            -- plays out before the next. Auto spam bursts are short, so it keeps
-            -- the snappier one.
-            pcall(manual and System.animation.play_grab_parry_full or System.animation.play_grab_parry)
+            -- Played the way the game plays a held block key: a block swing, then
+            -- (once it lands) the game's success swing, then the next block. It
+            -- no longer depends on auto parry's animation setting being on.
+            System.animation.play_block()
         end
     end
 end
