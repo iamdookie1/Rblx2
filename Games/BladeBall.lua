@@ -114,28 +114,171 @@ end
 -- ============================================================
 -- PARRY REMOTE
 -- ============================================================
--- The game's real, curve-carrying parry is its block ACTION, not a remote we can
--- fire by hand. Pressing block runs the game's own handler, which reads
--- Workspace.CurrentCamera.CFrame and sends it to the server as the parry's aim --
--- that camera CFrame *is* the curve. The game pairs it with the screen points and
--- a signed token and fires its own remote. (The game also has a bare argless
--- Remotes.ParryAttempt:FireServer() that carries no aim and so can't curve --
--- which is why firing it directly felt flat.)
---
--- So we parry the way the game does: aim the camera, then trigger the block
--- action with a real input event. The game signs and fires its own remote with
--- the camera we aimed -- no getgc, no hooks, no forged token, so it's the game's
--- own send (valid and silent), and curve works because the server reads our aim.
--- The cost is the game's normal parry cooldown, which is also the legitimate
--- ceiling, so this stays indistinguishable from a real player.
+-- Remote parries need the game's own parry remote and its token function.
+-- If either can't be found, parries fall back to pressing the block key, so
+-- the script keeps working instead of stopping.
+local Remote = {
+    token = nil,        -- the game's key function, from getgc
+    remote = nil,       -- the parry RemoteEvent / RemoteFunction
+    args = nil,         -- the last real parry packet the game sent
+    hooked = false,
+}
 
-local function remoteReady()
-    return VirtualInputManager ~= nil -- the block action is always available while alive
+pcall(function()
+    -- false = functions only. Tables were collected too and thrown away below.
+    for _, fn in getgc(false) do
+        if type(fn) == 'function' then
+            local ok, src = pcall(debug.info, fn, 's')
+            if ok and src and src:find('PRY', 1, true) then
+                for _, value in debug.getupvalues(fn) do
+                    if type(value) == 'function' then Remote.token = value; break end
+                end
+                if Remote.token then break end
+            end
+        end
+    end
+end)
+
+-- The token only changes when the server time ticks over a centisecond, so a
+-- burst of parries inside one centisecond (spam) reuses it instead of calling
+-- the game's key function and rebuilding the string every time.
+local token_cache = {uid = nil, time = nil, out = nil}
+local function tokenize(remote_uid)
+    local time = tostring(math.floor(Workspace:GetServerTimeNow() * 100))
+    if token_cache.uid == remote_uid and token_cache.time == time then return token_cache.out end
+    local key = Remote.token(remote_uid, 'TIME')
+    local characters = table.create(#time)
+    for index = 1, #time do
+        characters[index] = string.char(bit32.bxor(
+            (string.byte(time, index) + index) % 256,
+            string.byte(key, (index - 1) % #key + 1)
+        ))
+    end
+    local out = table.concat(characters)
+    token_cache.uid, token_cache.time, token_cache.out = remote_uid, time, out
+    return out
 end
 
--- No-op kept for existing call sites (parries just trigger the block action now);
--- defined further down, once System exists. Declared here so earlier code can
--- reference it.
+-- A parry packet is (id, uid, token, number, CFrame, {screen points}, {x, y}, bool).
+-- Checking the shape, not just the length, keeps some other 8-argument remote
+-- from being mistaken for the parry remote.
+local function isParryPacket(args)
+    return type(args) == 'table' and #args >= 8
+        and typeof(args[5]) == 'CFrame'
+        and type(args[6]) == 'table'
+        and type(args[7]) == 'table'
+end
+
+-- Hooks, kept as short-lived and quiet as possible:
+--   * They exist only for about a second around a block press that's meant to
+--     be caught: the automatic press when a parry feature turns on, or a parry
+--     falling back to the block key before the remote is known. Nothing is
+--     hooked at load, in the lobby, while idle, or once the remote is caught.
+--   * The game's sender calls FireServer either as a method (__namecall) or by
+--     fetching remote.FireServer first. That second path is caught by hooking
+--     the shared FireServer function itself (hookfunction), not __index: no
+--     hook on every property read in the game, and remote.FireServer stays the
+--     exact same function (an __index hook hands back a different wrapper each
+--     time, which is easy to spot). __index is only a fallback for executors
+--     without hookfunction, and then hands back one cached wrapper.
+--   * Only FireServer is watched (the parry remote is a RemoteEvent), calls
+--     from this script are ignored, and everything is a newcclosure.
+local hook_wrap = newcclosure or function(f) return f end
+local Hooks = {active = false, armed_until = 0}
+
+local function restore_function(fn, old)
+    if restorefunction and pcall(restorefunction, fn) then return end
+    pcall(hookfunction, fn, old)
+end
+
+local function uninstallRemoteHooks()
+    if not Remote.hooked then return end
+    Hooks.active = false -- pass straight through even if a restore below fails
+    if Hooks.old_namecall then pcall(hookmetamethod, game, '__namecall', Hooks.old_namecall) end
+    if Hooks.old_index then pcall(hookmetamethod, game, '__index', Hooks.old_index) end
+    if Hooks.fire_fn and Hooks.old_fire then restore_function(Hooks.fire_fn, Hooks.old_fire) end
+    Hooks.old_namecall, Hooks.old_index, Hooks.fire_fn, Hooks.old_fire = nil, nil, nil, nil
+    Remote.hooked = false
+end
+
+local function capture(remote, args)
+    if not isParryPacket(args) then return end
+    if not Remote.remote then
+        task.defer(Notify, "Blade Ball", "Parry remote found. Remote mode is ready.", 3)
+    end
+    Remote.remote = remote
+    Remote.args = args
+    -- Caught it: take the hooks off (deferred, not from inside the hook).
+    task.defer(uninstallRemoteHooks)
+end
+
+local function isRemoteEvent(self)
+    return typeof(self) == 'Instance' and self.ClassName == 'RemoteEvent'
+end
+
+local function installRemoteHooks()
+    if Remote.hooked or not Remote.token then return end
+    Hooks.active = true
+    if hookmetamethod and getnamecallmethod then
+        pcall(function()
+            local old_namecall
+            old_namecall = hookmetamethod(game, '__namecall', hook_wrap(function(self, ...)
+                if Hooks.active and getnamecallmethod() == 'FireServer'
+                    and not (checkcaller and checkcaller()) and isRemoteEvent(self) then
+                    capture(self, {...})
+                end
+                return old_namecall(self, ...)
+            end))
+            Hooks.old_namecall = old_namecall
+            Remote.hooked = true
+        end)
+    end
+    local fire_fn
+    pcall(function() fire_fn = Instance.new('RemoteEvent').FireServer end)
+    if hookfunction and fire_fn then
+        pcall(function()
+            local old_fire
+            old_fire = hookfunction(fire_fn, hook_wrap(function(self, ...)
+                if Hooks.active and not (checkcaller and checkcaller()) and isRemoteEvent(self) then
+                    capture(self, {...})
+                end
+                return old_fire(self, ...)
+            end))
+            Hooks.fire_fn, Hooks.old_fire = fire_fn, old_fire
+            Remote.hooked = true
+        end)
+    end
+    if not Hooks.old_fire and hookmetamethod then
+        pcall(function()
+            local old_index
+            local wrappers = setmetatable({}, {__mode = 'k'})
+            old_index = hookmetamethod(game, '__index', hook_wrap(function(self, key)
+                if Hooks.active and key == 'FireServer' and not (checkcaller and checkcaller()) and isRemoteEvent(self) then
+                    local real = old_index(self, key)
+                    local wrapped = wrappers[real]
+                    if not wrapped then
+                        wrapped = hook_wrap(function(remote, ...)
+                            if Hooks.active then capture(remote, {...}) end
+                            return real(remote, ...)
+                        end)
+                        wrappers[real] = wrapped
+                    end
+                    return wrapped
+                end
+                return old_index(self, key)
+            end))
+            Hooks.old_index = old_index
+            Remote.hooked = true
+        end)
+    end
+end
+
+local function remoteReady()
+    return Remote.token ~= nil and Remote.remote ~= nil and Remote.args ~= nil
+end
+
+-- Presses block once to get the remote captured; defined further down, once
+-- System exists. Declared here so the hook watcher can call it.
 local prime_remote
 
 -- "A place where they can parry" — mirrors the game's own client parry gate. A
@@ -159,53 +302,114 @@ local function canParryNow()
     return false
 end
 
-if not remoteReady() then
-    Notify("Blade Ball", "VirtualInputManager unavailable -- this executor can't trigger parries.", 6)
+if not Remote.token then
+    Notify("Blade Ball", "Token not found. Parries will use the block key instead of the remote.", 6)
+elseif not (hookfunction or hookmetamethod) then
+    Notify("Blade Ball", "Couldn't hook remotes. Parries will use the block key.", 6)
 end
 
--- The one real input primitive: tap the block key. This is what drives the
--- game's own parry handler (InputBegan "Block" -> the handler that reads the
--- camera and fires the signed remote). F is the game's default block bind.
-local function sendBlockInput()
+-- Presses the block key. Works without the remote, at the cost of the game's
+-- own parry cooldown and no curve control.
+local function pressBlockKey()
+    if not is_live() then return end
+    log_send("block key")
     pcall(function()
         VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.F, false, game)
         VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.F, false, game)
     end)
 end
 
--- Plain block press (keypress mode / fallback): the game's parry toward your
--- current aim, no curve override.
-local function pressBlockKey()
-    if not is_live() then return end
-    log_send("block key")
-    sendBlockInput()
-end
-
--- Fallback for when the parry remote can't be found: press block the normal way
--- (the game's own parry, with its cooldown).
+-- A block press that, while the remote isn't known yet, arms the hooks for just
+-- long enough (~1.2s) to catch the parry it sends. A catch takes them off at
+-- once; otherwise they come off when the window ends. Once the remote is known
+-- it's a plain press.
 local function press_block()
+    if Remote.token and not remoteReady() then
+        Hooks.armed_until = os.clock() + 1.2
+        if not Remote.hooked then
+            installRemoteHooks()
+            if Remote.hooked then
+                task.spawn(function()
+                    while Remote.hooked and os.clock() < Hooks.armed_until do task.wait(0.1) end
+                    uninstallRemoteHooks()
+                end)
+            end
+        end
+    end
     pressBlockKey()
 end
 
 local CollectionService = cloneref(game:GetService('CollectionService'))
 
--- Frame-rate cap shared with the curve cache below.
-local PACKET_TTL = 1 / 240
+-- Screen points sent with a parry, built the way the game's own parry handler
+-- builds them: everyone under Alive, or in lobby training the other trainees
+-- under Workspace.Dead plus the LobbyTrainingTarget dummies.
+local function build_screen_points(cam)
+    local points = {}
+    local char = LocalPlayer.Character
+    local dead = Workspace:FindFirstChild('Dead')
+    if dead and char and char.Parent == dead and LocalPlayer:GetAttribute('LobbyTraining') then
+        for _, other in ipairs(dead:GetChildren()) do
+            local plr = Players:GetPlayerFromCharacter(other)
+            local hrp = other:FindFirstChild('HumanoidRootPart')
+            if plr and hrp and plr:GetAttribute('LobbyTraining') then
+                points[other.Name] = cam:WorldToScreenPoint(hrp.Position)
+            end
+        end
+        for _, dummy in ipairs(CollectionService:GetTagged('LobbyTrainingTarget')) do
+            if dummy:IsA('BasePart') then points[dummy.Name] = cam:WorldToScreenPoint(dummy.Position) end
+        end
+    else
+        for _, entity in ipairs(Alive:GetChildren()) do
+            local hrp = entity:FindFirstChild('HumanoidRootPart')
+            if hrp then points[entity.Name] = cam:WorldToScreenPoint(hrp.Position) end
+        end
+    end
+    return points
+end
 
--- Parry with curve. The game's block handler reads Workspace.CurrentCamera.CFrame
--- and sends it as the parry's aim, so we point the camera at the curve target for
--- the instant the parry is read, then trigger the block action with a real input
--- event -- the game signs and fires its own remote with our aim. For "Camera"
--- curve mode, curveCF is just the current camera, so the set is a harmless no-op;
--- other modes bend the shot. The default camera script recenters next frame.
--- Always returns true (callers shouldn't fall back to a second press).
+-- The game sends the mouse position every time (its keyboard/mouse check is
+-- always true), so this does too.
+local function aim_point(cam)
+    local ok, mouse = pcall(UserInputService.GetMouseLocation, UserInputService)
+    if ok and mouse then return {mouse.X, mouse.Y} end
+    local vp = cam.ViewportSize
+    return {vp.X / 2, vp.Y / 2}
+end
+
+-- Screen points and aim only change frame to frame, so parries fired in the
+-- same frame (spam) share one copy instead of re-projecting every player.
+local PACKET_TTL = 1 / 240
+local packet_cache = {at = -1, points = nil, aim = nil}
+local function packet_parts(cam)
+    local now = os.clock()
+    if now - packet_cache.at > PACKET_TTL then
+        packet_cache.points = build_screen_points(cam)
+        packet_cache.aim = aim_point(cam)
+        packet_cache.at = now
+    end
+    return packet_cache.points, packet_cache.aim
+end
+
 local function fireParryRemote(curveCF)
-    if not is_live() then return true end -- replaced copy: send nothing
+    if not is_live() then return true end -- replaced copy: send nothing, and don't fall back to the key
     if not remoteReady() then return false end
-    if curveCF then pcall(function() Workspace.CurrentCamera.CFrame = curveCF end) end
+    local cam = Workspace.CurrentCamera
+    local points, aim = packet_parts(cam)
+    local args, remote = Remote.args, Remote.remote
+    local window = type(args[4]) == 'number' and args[4] or 0.5
+    local flag = args[8]
     log_send("remote")
-    sendBlockInput()
-    return true
+    return (pcall(function()
+        local token = tokenize(args[2])
+        if remote.ClassName == 'RemoteEvent' then
+            -- Same window number and flag the game itself sent, not hard-coded ones.
+            remote:FireServer(args[1], args[2], token, window, curveCF or cam.CFrame, points, aim, flag)
+        else
+            -- InvokeServer yields; spawn it so a burst never stalls on a reply.
+            task.spawn(remote.InvokeServer, remote, args[1], args[2], token, window, curveCF or cam.CFrame, points, aim, flag)
+        end
+    end))
 end
 
 -- ============================================================
@@ -476,9 +680,47 @@ function System.parry.fast()
     System.__properties.__total_parries = System.__properties.__total_parries + 1
 end
 
--- Nothing to prime anymore -- parries just trigger the game's block action, which
--- is always available. Kept as a no-op so existing call sites stay valid.
-prime_remote = function() end
+-- Gets the parry remote captured without you blocking by hand: presses block
+-- once while a parry feature is on and you're somewhere you can parry. Only
+-- while no ball is on you, so the press can't land at a bad moment, and at
+-- most 3 tries (spaced past the game's ~1.3s block cooldown); if those don't
+-- catch it, parries just use the block key. Holds off while you're typing.
+local remote_priming = false
+local function ball_on_me()
+    local balls = System.ball.get_all()
+    local training = Workspace:FindFirstChild("TrainingBalls")
+    if training then for _, b in ipairs(training:GetChildren()) do table.insert(balls, b) end end
+    for _, ball in ipairs(balls) do
+        if ball:GetAttribute('target') == LocalPlayer.Name then return true end
+    end
+    return false
+end
+prime_remote = function()
+    if remote_priming or remoteReady() or not Remote.token then return end
+    remote_priming = true
+    task.spawn(function()
+        local presses = 0
+        while not remoteReady() and presses < 3 and not Library.Unloaded do
+            local props = System.__properties
+            if not (props.__autoparry_enabled or props.__triggerbot_enabled
+                or props.__auto_spam_enabled or props.__manual_spam_enabled) then break end
+            if canParryNow() and not ball_on_me() and not UserInputService:GetFocusedTextBox() then
+                ParryLog.source = "remote grab press"
+                press_block()
+                ParryLog.source = nil
+                presses = presses + 1
+                local start = os.clock()
+                repeat task.wait(0.05) until remoteReady() or os.clock() - start > 1.6
+            else
+                task.wait(0.25)
+            end
+        end
+        if presses >= 3 and not remoteReady() then
+            Notify("Blade Ball", "Couldn't catch the parry remote. Parries use the block key; it'll catch it on a block.", 5)
+        end
+        remote_priming = false
+    end)
+end
 function System.parry.execute_action() System.animation.play_grab_parry(); System.parry.execute() end
 function System.parry.by_mode(mode)
     if mode == "Keypress" then System.parry.keypress() else System.parry.execute_action() end
@@ -1940,8 +2182,10 @@ task.spawn(function()
 end)
 
 local function remoteStatusText()
-    if remoteReady() then return "Remote: ready, parries trigger the game's block action with camera-aimed curve" end
-    return "Remote: no VirtualInputManager, can't trigger parries"
+    if remoteReady() then return "Remote: ready, parries use the remote" end
+    if not Remote.token then return "Remote: token not found, parries use the block key" end
+    if not (hookfunction or hookmetamethod) then return "Remote: can't hook in this executor, parries use the block key" end
+    return "Remote: not caught yet. It's caught on the first block (pressed for you when a parry feature turns on). Parries use the block key until then"
 end
 
 local status_peak, status_ball = 0, nil
@@ -2388,6 +2632,7 @@ end))
 -- ============================================================
 Library:OnUnload(function()
     if genv.__BladeBallInstance == INSTANCE then genv.__BladeBallInstance = nil end
+    pcall(uninstallRemoteHooks)
     System.autoparry.stop()
     setTriggerbot(false)
     System.__properties.__autoparry_enabled = false
