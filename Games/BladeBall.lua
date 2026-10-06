@@ -119,25 +119,14 @@ end
 -- the script keeps working instead of stopping.
 local Remote = {
     token = nil,        -- the game's key function, from getgc
-    remote = nil,       -- the parry RemoteEvent / RemoteFunction
-    args = nil,         -- the last real parry packet the game sent
-    hooked = false,
+    remote = nil,       -- the parry RemoteEvent / RemoteFunction, from getgc
+    args = nil,         -- a reference to the game's own parry packet table, from getgc
 }
 
-pcall(function()
-    -- false = functions only. Tables were collected too and thrown away below.
-    for _, fn in getgc(false) do
-        if type(fn) == 'function' then
-            local ok, src = pcall(debug.info, fn, 's')
-            if ok and src and src:find('PRY', 1, true) then
-                for _, value in debug.getupvalues(fn) do
-                    if type(value) == 'function' then Remote.token = value; break end
-                end
-                if Remote.token then break end
-            end
-        end
-    end
-end)
+-- The token, the remote and a packet template are all discovered hook-free,
+-- straight out of the game's own parry module in the GC -- see PARRY REMOTE
+-- DISCOVERY below (it needs isParryPacket, defined further down, so it lives
+-- there rather than here).
 
 -- The token only changes when the server time ticks over a centisecond, so a
 -- burst of parries inside one centisecond (spam) reuses it instead of calling
@@ -169,116 +158,117 @@ local function isParryPacket(args)
         and type(args[7]) == 'table'
 end
 
--- Hooks, kept as short-lived and quiet as possible:
---   * They exist only for about a second around a block press that's meant to
---     be caught: the automatic press when a parry feature turns on, or a parry
---     falling back to the block key before the remote is known. Nothing is
---     hooked at load, in the lobby, while idle, or once the remote is caught.
---   * The game's sender calls FireServer either as a method (__namecall) or by
---     fetching remote.FireServer first. That second path is caught by hooking
---     the shared FireServer function itself (hookfunction), not __index: no
---     hook on every property read in the game, and remote.FireServer stays the
---     exact same function (an __index hook hands back a different wrapper each
---     time, which is easy to spot). __index is only a fallback for executors
---     without hookfunction, and then hands back one cached wrapper.
---   * Only FireServer is watched (the parry remote is a RemoteEvent), calls
---     from this script are ignored, and everything is a newcclosure.
-local hook_wrap = newcclosure or function(f) return f end
-local Hooks = {active = false, armed_until = 0}
+-- ============================================================
+-- PARRY REMOTE DISCOVERY (hook-free)
+-- ============================================================
+-- No FireServer / __namecall / __index hook is ever installed -- nothing on the
+-- fire path is touched, so to the game and to any hook scan nothing has been
+-- hooked, because nothing has. Everything the autoparry needs is read straight
+-- out of the game's own parry module, which is sitting in the Lua GC: the module
+-- whose source is tagged 'PRY' holds the token function and the parry
+-- RemoteEvent as upvalues, and it reuses a single args table for its fires. We
+-- lift references to all three. The args table is the key trick -- because it is
+-- the SAME table the game fills on every real parry, once you parry naturally it
+-- holds a genuine, valid packet (real id / uid / window / flag), and we are
+-- already pointing at it. So the template is the game's own, never fabricated.
+local parry_discovery_stop = false
 
-local function restore_function(fn, old)
-    if restorefunction and pcall(restorefunction, fn) then return end
-    pcall(hookfunction, fn, old)
+local function looks_like_remote(v)
+    if typeof(v) ~= 'Instance' then return false end
+    local ok, cls = pcall(function() return v.ClassName end)
+    return ok and (cls == 'RemoteEvent' or cls == 'UnreliableRemoteEvent' or cls == 'RemoteFunction')
 end
 
-local function uninstallRemoteHooks()
-    if not Remote.hooked then return end
-    Hooks.active = false -- pass straight through even if a restore below fails
-    if Hooks.old_namecall then pcall(hookmetamethod, game, '__namecall', Hooks.old_namecall) end
-    if Hooks.old_index then pcall(hookmetamethod, game, '__index', Hooks.old_index) end
-    if Hooks.fire_fn and Hooks.old_fire then restore_function(Hooks.fire_fn, Hooks.old_fire) end
-    Hooks.old_namecall, Hooks.old_index, Hooks.fire_fn, Hooks.old_fire = nil, nil, nil, nil
-    Remote.hooked = false
-end
-
-local function capture(remote, args)
-    if not isParryPacket(args) then return end
-    if not Remote.remote then
-        task.defer(Notify, "Blade Ball", "Parry remote found. Remote mode is ready.", 3)
+-- Read a function's upvalues: first function upvalue is the token (as the old
+-- getgc scan did), any RemoteEvent is the parry remote, any table is a candidate
+-- for the reused args packet.
+local arg_candidates = setmetatable({}, {__mode = 'k'})
+local function consider_fn(fn)
+    local ok, ups = pcall(debug.getupvalues, fn)
+    if not ok then return end
+    for _, v in ups do
+        local t = type(v)
+        if t == 'function' then
+            if not Remote.token then Remote.token = v end
+        elseif t == 'table' then
+            arg_candidates[v] = true
+            if not Remote.args and isParryPacket(v) then Remote.args = v end
+        elseif not Remote.remote and looks_like_remote(v) then
+            Remote.remote = v
+        end
     end
-    Remote.remote = remote
-    Remote.args = args
-    -- Caught it: take the hooks off (deferred, not from inside the hook).
-    task.defer(uninstallRemoteHooks)
 end
 
-local function isRemoteEvent(self)
-    return typeof(self) == 'Instance' and self.ClassName == 'RemoteEvent'
-end
-
-local function installRemoteHooks()
-    if Remote.hooked or not Remote.token then return end
-    Hooks.active = true
-    if hookmetamethod and getnamecallmethod then
-        pcall(function()
-            local old_namecall
-            old_namecall = hookmetamethod(game, '__namecall', hook_wrap(function(self, ...)
-                if Hooks.active and getnamecallmethod() == 'FireServer'
-                    and not (checkcaller and checkcaller()) and isRemoteEvent(self) then
-                    capture(self, {...})
-                end
-                return old_namecall(self, ...)
-            end))
-            Hooks.old_namecall = old_namecall
-            Remote.hooked = true
-        end)
-    end
-    local fire_fn
-    pcall(function() fire_fn = Instance.new('RemoteEvent').FireServer end)
-    if hookfunction and fire_fn then
-        pcall(function()
-            local old_fire
-            old_fire = hookfunction(fire_fn, hook_wrap(function(self, ...)
-                if Hooks.active and not (checkcaller and checkcaller()) and isRemoteEvent(self) then
-                    capture(self, {...})
-                end
-                return old_fire(self, ...)
-            end))
-            Hooks.fire_fn, Hooks.old_fire = fire_fn, old_fire
-            Remote.hooked = true
-        end)
-    end
-    if not Hooks.old_fire and hookmetamethod then
-        pcall(function()
-            local old_index
-            local wrappers = setmetatable({}, {__mode = 'k'})
-            old_index = hookmetamethod(game, '__index', hook_wrap(function(self, key)
-                if Hooks.active and key == 'FireServer' and not (checkcaller and checkcaller()) and isRemoteEvent(self) then
-                    local real = old_index(self, key)
-                    local wrapped = wrappers[real]
-                    if not wrapped then
-                        wrapped = hook_wrap(function(remote, ...)
-                            if Hooks.active then capture(remote, {...}) end
-                            return real(remote, ...)
-                        end)
-                        wrappers[real] = wrapped
+-- Walk the GC for the parry module and harvest token + remote + arg candidates.
+local function discover_parry_module()
+    pcall(function()
+        for _, fn in getgc(false) do
+            if type(fn) == 'function' then
+                local ok, src = pcall(debug.info, fn, 's')
+                if ok and src and src:find('PRY', 1, true) then
+                    consider_fn(fn)
+                    -- The remote often lives one level in, inside a nested closure.
+                    local ok2, ups = pcall(debug.getupvalues, fn)
+                    if ok2 then
+                        for _, v in ups do
+                            if type(v) == 'function' then consider_fn(v) end
+                        end
                     end
-                    return wrapped
+                    if Remote.token and Remote.remote and Remote.args then break end
                 end
-                return old_index(self, key)
-            end))
-            Hooks.old_index = old_index
-            Remote.hooked = true
-        end)
+            end
+        end
+    end)
+end
+
+-- Promote the first candidate table that currently holds a valid packet. Cheap
+-- (no getgc) -- it just re-checks tables we already point at, which fill in by
+-- themselves as the game parries.
+local function promote_args()
+    if Remote.args then return true end
+    for tbl in arg_candidates do
+        if isParryPacket(tbl) then Remote.args = tbl; return true end
     end
+    return false
+end
+
+-- Heavier sweep: look through every live table for one shaped like a parry
+-- packet, for modules that build a fresh table each fire instead of reusing one.
+local function scan_live_packet()
+    pcall(function()
+        for _, v in getgc(true) do
+            if type(v) == 'table' and isParryPacket(v) then Remote.args = v; return end
+        end
+    end)
+    return Remote.args ~= nil
 end
 
 local function remoteReady()
     return Remote.token ~= nil and Remote.remote ~= nil and Remote.args ~= nil
 end
 
--- Presses block once to get the remote captured; defined further down, once
--- System exists. Declared here so the hook watcher can call it.
+-- Run discovery now, then keep trying in the background until a real packet
+-- template appears. The getgc sweeps taper off fast; after that it's just the
+-- cheap candidate re-check (no getgc), which resolves on its own the moment you
+-- parry naturally -- the game fills the very table we already hold a reference
+-- to. No block press, no hook, nothing on the fire path.
+discover_parry_module()
+task.spawn(function()
+    local tries = 0
+    while not Remote.args and not parry_discovery_stop do
+        tries = tries + 1
+        if not (Remote.token and Remote.remote) and tries <= 30 then discover_parry_module() end
+        if not promote_args() and tries <= 15 and tries % 3 == 0 then scan_live_packet() end
+        if Remote.args then break end
+        task.wait(tries <= 30 and 1 or 2)
+    end
+    if Remote.args and is_live() then
+        task.defer(Notify, "Blade Ball", "Parry remote ready. Autoparry uses the remote.", 3)
+    end
+end)
+
+-- Re-kicks discovery when a parry feature turns on; defined further down, once
+-- System exists. Declared here so earlier code can reference it.
 local prime_remote
 
 -- "A place where they can parry" — mirrors the game's own client parry gate. A
@@ -302,11 +292,13 @@ local function canParryNow()
     return false
 end
 
-if not Remote.token then
-    Notify("Blade Ball", "Token not found. Parries will use the block key instead of the remote.", 6)
-elseif not (hookfunction or hookmetamethod) then
-    Notify("Blade Ball", "Couldn't hook remotes. Parries will use the block key.", 6)
-end
+-- Give discovery a few seconds before warning -- the parry module can appear in
+-- the GC a little after the script loads, and the background loop keeps looking.
+task.delay(8, function()
+    if not Remote.token and is_live() then
+        Notify("Blade Ball", "Parry token not found. Autoparry will use the block key instead of the remote.", 6)
+    end
+end)
 
 -- Presses the block key. Works without the remote, at the cost of the game's
 -- own parry cooldown and no curve control.
@@ -319,23 +311,10 @@ local function pressBlockKey()
     end)
 end
 
--- A block press that, while the remote isn't known yet, arms the hooks for just
--- long enough (~1.2s) to catch the parry it sends. A catch takes them off at
--- once; otherwise they come off when the window ends. Once the remote is known
--- it's a plain press.
+-- Remote not ready yet -> press the block key (the game's own parry, with its
+-- cooldown). No hooks involved: the remote and packet template fill in on their
+-- own via discovery, so this is just a plain key press.
 local function press_block()
-    if Remote.token and not remoteReady() then
-        Hooks.armed_until = os.clock() + 1.2
-        if not Remote.hooked then
-            installRemoteHooks()
-            if Remote.hooked then
-                task.spawn(function()
-                    while Remote.hooked and os.clock() < Hooks.armed_until do task.wait(0.1) end
-                    uninstallRemoteHooks()
-                end)
-            end
-        end
-    end
     pressBlockKey()
 end
 
@@ -680,46 +659,14 @@ function System.parry.fast()
     System.__properties.__total_parries = System.__properties.__total_parries + 1
 end
 
--- Gets the parry remote captured without you blocking by hand: presses block
--- once while a parry feature is on and you're somewhere you can parry. Only
--- while no ball is on you, so the press can't land at a bad moment, and at
--- most 3 tries (spaced past the game's ~1.3s block cooldown); if those don't
--- catch it, parries just use the block key. Holds off while you're typing.
-local remote_priming = false
-local function ball_on_me()
-    local balls = System.ball.get_all()
-    local training = Workspace:FindFirstChild("TrainingBalls")
-    if training then for _, b in ipairs(training:GetChildren()) do table.insert(balls, b) end end
-    for _, ball in ipairs(balls) do
-        if ball:GetAttribute('target') == LocalPlayer.Name then return true end
-    end
-    return false
-end
+-- Discovery is hook-free and runs on its own from load (see PARRY REMOTE
+-- DISCOVERY), so turning a parry feature on no longer needs a block press to
+-- catch anything. All this does now is give discovery a nudge in case the parry
+-- module only just appeared in the GC -- cheap, and a no-op once the remote is
+-- ready. The packet template still fills itself in from your next natural parry.
 prime_remote = function()
-    if remote_priming or remoteReady() or not Remote.token then return end
-    remote_priming = true
-    task.spawn(function()
-        local presses = 0
-        while not remoteReady() and presses < 3 and not Library.Unloaded do
-            local props = System.__properties
-            if not (props.__autoparry_enabled or props.__triggerbot_enabled
-                or props.__auto_spam_enabled or props.__manual_spam_enabled) then break end
-            if canParryNow() and not ball_on_me() and not UserInputService:GetFocusedTextBox() then
-                ParryLog.source = "remote grab press"
-                press_block()
-                ParryLog.source = nil
-                presses = presses + 1
-                local start = os.clock()
-                repeat task.wait(0.05) until remoteReady() or os.clock() - start > 1.6
-            else
-                task.wait(0.25)
-            end
-        end
-        if presses >= 3 and not remoteReady() then
-            Notify("Blade Ball", "Couldn't catch the parry remote. Parries use the block key; it'll catch it on a block.", 5)
-        end
-        remote_priming = false
-    end)
+    if remoteReady() then return end
+    if not (Remote.token and Remote.remote) then pcall(discover_parry_module) end
 end
 function System.parry.execute_action() System.animation.play_grab_parry(); System.parry.execute() end
 function System.parry.by_mode(mode)
@@ -2184,8 +2131,8 @@ end)
 local function remoteStatusText()
     if remoteReady() then return "Remote: ready, parries use the remote" end
     if not Remote.token then return "Remote: token not found, parries use the block key" end
-    if not (hookfunction or hookmetamethod) then return "Remote: can't hook in this executor, parries use the block key" end
-    return "Remote: not caught yet. It's caught on the first block (pressed for you when a parry feature turns on). Parries use the block key until then"
+    if not Remote.remote then return "Remote: parry module not found yet, parries use the block key" end
+    return "Remote: found, waiting on a packet template. It fills in from your next parry; parries use the block key until then"
 end
 
 local status_peak, status_ball = 0, nil
@@ -2632,7 +2579,7 @@ end))
 -- ============================================================
 Library:OnUnload(function()
     if genv.__BladeBallInstance == INSTANCE then genv.__BladeBallInstance = nil end
-    pcall(uninstallRemoteHooks)
+    parry_discovery_stop = true
     System.autoparry.stop()
     setTriggerbot(false)
     System.__properties.__autoparry_enabled = false
