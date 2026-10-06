@@ -6,7 +6,7 @@ task.spawn(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.06-6"
+local SCRIPT_VERSION = "2026.10.06-7"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -543,7 +543,8 @@ local game_api, game_anim, modules_tried
 local sword_info_cache = {}  -- sword name -> {collection, sword_type}
 local own_tracks = setmetatable({}, {__mode = 'k'}) -- animator -> {[Animation] = track}
 local r15_clones = {}        -- Animation -> Animation using its R15Id
-local gate = {last = -math.huge, landed = true}
+local gate = {last = -math.huge, landed = true, landed_at = -math.huge}
+local SWING_SHOW = 0.15      -- seconds of success swing shown before the next block
 
 local function modules()
     if not modules_tried then
@@ -633,15 +634,6 @@ local function load_track(animator, humanoid, anim)
     return track
 end
 
--- A success swing the game is playing (tagged SuccessParry, or SuccessParry1..N
--- for sets with variants).
-local function is_success_swing(track)
-    for key, value in pairs(track:GetAttributes()) do
-        if value == true and key:sub(1, 12) == "SuccessParry" then return true end
-    end
-    return false
-end
-
 local function play_block()
     local char = LocalPlayer.Character
     if not char or char:GetAttribute("InOverdriveMech") then return end
@@ -650,16 +642,14 @@ local function play_block()
     if not animator then return end
     local now = os.clock()
     if not gate.landed and now - gate.last < BLOCK_COOLDOWN then return end
+    -- Let the swing show. When our parry lands the game starts its success swing;
+    -- spam fires again within milliseconds, and starting the next block straight
+    -- away (which stops success swings, as the game's block does) cut it off in the
+    -- same frame. Waiting for the whole swing looked sluggish, so hold the next
+    -- block just long enough for the swing's strike to read -- about the rhythm of
+    -- someone actually spamming the key in a clash.
+    if now - gate.landed_at < SWING_SHOW then return end
     local playing = animator:GetPlayingAnimationTracks()
-    -- Let the swing play. When our parry lands the game starts its success swing;
-    -- spam fires again within milliseconds, and starting the next block then (which
-    -- stops success swings, as the game's block does) cut the swing off in the same
-    -- frame, so only the block grab was ever visible. A held key can't re-block that
-    -- fast, so in the real game the swing shows. Wait until it has nearly finished.
-    for _, track in ipairs(playing) do
-        local length = track.Length
-        if length > 0 and track.TimePosition < length - 0.05 and is_success_swing(track) then return end
-    end
     gate.last, gate.landed = now, false
     for _, track in ipairs(playing) do
         if track:GetAttribute("SuccessParry") or track:GetAttribute("Parry") then
@@ -683,9 +673,13 @@ end
 -- Our own block landed: the next block can start straight away (the game plays
 -- the success swing itself).
 pcall(function()
-    Remotes.ParrySuccess.OnClientEvent:Connect(function() gate.landed = true end)
+    Remotes.ParrySuccess.OnClientEvent:Connect(function()
+        gate.landed, gate.landed_at = true, os.clock()
+    end)
 end)
-LocalPlayer.CharacterAdded:Connect(function() gate.last, gate.landed = -math.huge, true end)
+LocalPlayer.CharacterAdded:Connect(function()
+    gate.last, gate.landed, gate.landed_at = -math.huge, true, -math.huge
+end)
 
 -- Auto parry, triggerbot, slashes of fury: only when parry animations are on.
 function System.animation.play_grab_parry()
