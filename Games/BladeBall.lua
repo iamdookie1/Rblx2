@@ -6,7 +6,7 @@ task.spawn(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.06-8"
+local SCRIPT_VERSION = "2026.10.06-9"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -1223,6 +1223,9 @@ local function get_ball_state(ball)
         if new == LocalPlayer.Name and System.autoparry.on_retarget then
             System.autoparry.on_retarget(ball)
         end
+        if new == LocalPlayer.Name and System.spam_on_retarget then
+            System.spam_on_retarget()
+        end
     end)
     return state
 end
@@ -1628,7 +1631,17 @@ local AutoSpam = {
     active_until = 0,
     reason = nil,
 }
-local SPAM_MAX_PER_TICK = 40
+-- One parry per send point (four per frame). Parries sent at the same instant
+-- reach the server in the same frame and only the first counts; the rest just
+-- fill your upload, and once it's full your character's movement queues behind
+-- them -- the "I'm ahead of where I really am" desync.
+local SPAM_MAX_PER_TICK = 1
+local SpamNet = {
+    idle_rate = 20,       -- parries/s while no ball is on or near you
+    budget_kbps = 350,    -- keep upload under this (Roblox is comfortable to ~400)
+    guard_at = -1,        -- upload guard: last check
+    factor = 1,           -- upload guard: current rate multiplier
+}
 
 function System.manual_spam.start() System.__properties.__manual_spam_enabled = true end
 function System.manual_spam.stop() System.__properties.__manual_spam_enabled = false end
@@ -1776,6 +1789,38 @@ end
 local SpamMeter = {count = 0, since = os.clock(), rate = 0}
 function System.spam_actual_rate() return SpamMeter.rate end
 
+-- A ball on us, or close enough to reach us within about a reaction time (in a
+-- clash that's the whole exchange). That's when every parry counts; the rest of
+-- the time a low keep-alive rate is all spam needs, and the saved upload keeps
+-- your movement in sync.
+local function spam_focus()
+    local root = getRoot()
+    if not root then return false end
+    local me = LocalPlayer.Name
+    local horizon = reaction_budget() + 0.25
+    for _, ball in ipairs(get_live_balls()) do
+        get_ball_state(ball) -- makes sure its retarget listener exists (instant fire)
+        if ball:GetAttribute('target') == me then return true end
+        local speed = ball_velocity(ball).Magnitude
+        if speed > 1 and (ball.Position - root.Position).Magnitude / speed <= horizon then return true end
+    end
+    return false
+end
+
+-- Upload guard: reads the client's real send rate and eases spam down while it's
+-- over budget, back up once it's clear -- as fast as your connection allows
+-- without flooding it.
+local function bandwidth_factor(now)
+    if now - SpamNet.guard_at < 0.25 then return SpamNet.factor end
+    SpamNet.guard_at = now
+    local ok, kbps = pcall(function() return Stats.DataSendKbps end)
+    if ok and type(kbps) == 'number' and kbps > 0 then
+        local step = math.clamp(SpamNet.budget_kbps / kbps, 0.6, 1.15)
+        SpamNet.factor = math.clamp(SpamNet.factor * step, 0.25, 1)
+    end
+    return SpamNet.factor
+end
+
 local spam_acc, spam_last, spam_active = 0, os.clock(), false
 local function spam_tick()
     local now = os.clock()
@@ -1797,6 +1842,8 @@ local function spam_tick()
         spam_acc, spam_active = 0, false
         return
     end
+    if not spam_focus() then rate = math.min(rate, SpamNet.idle_rate) end
+    rate = rate * bandwidth_factor(now)
     local interval = 1 / math.max(rate, 1)
     if spam_active then
         spam_acc = spam_acc + elapsed
@@ -1817,6 +1864,23 @@ local function spam_tick()
     -- parries all at once does nothing useful.
     if spam_acc > interval * 4 then spam_acc = 0 end
 end
+
+-- The two moments a fresh parry matters most in a clash: our parry just landed
+-- (the ball is on its way back), and the ball has just flipped back to us. Fire
+-- one straight away from the event itself instead of waiting for the next tick --
+-- faster where it counts, for a single packet.
+local function spam_instant()
+    local props = System.__properties
+    local manual = props.__manual_spam_enabled
+    if not (manual or (props.__auto_spam_enabled and os.clock() < AutoSpam.active_until)) then return end
+    if not LocalPlayer.Character then return end
+    ParryLog.source = manual and "manual spam" or "auto spam"
+    spam_fire(manual)
+    ParryLog.source = nil
+    SpamMeter.count = SpamMeter.count + 1
+end
+Remotes.ParrySuccess.OnClientEvent:Connect(function() pcall(spam_instant) end)
+System.spam_on_retarget = function() pcall(spam_instant) end
 
 do
     local last_error
@@ -2738,7 +2802,7 @@ SP:AddToggle("ManualSpam", {Text = "Manual spam", Default = false, Callback = fu
 end}):AddKeyPicker("ManualSpamKey", {Default = "E", Mode = "Hold", SyncToggleState = true, Text = "Manual spam"})
 SP:AddDropdown("SpamMode", {Text = "Mode", Values = {"Remote", "Keypress"}, Default = "Remote", Callback = function(v) getgenv().ManualSpamMode = v end})
 SP:AddSlider("SpamRate", {Text = "Spam rate", Default = 300, Min = 20, Max = 1000, Rounding = 0, Suffix = " /s",
-    Tooltip = "Parries per second while spamming.",
+    Tooltip = "Parries per second while a ball is on or near you (20/s otherwise). Tops out at one per send point (4 per frame): more than that lands in the same server frame and only floods your upload, which desyncs your movement. Eases off automatically if your upload gets too high.",
     Callback = function(v) ManualSpam.rate = v end})
 local ManualSpamLabel = SP:AddLabel("Actual: 0/s", true)
 SP:AddToggle("SpamAnimFix", {Text = "Animation fix", Default = false, Callback = function(v)
@@ -2756,7 +2820,7 @@ AS:AddToggle("AutoSpam", {Text = "Auto spam", Default = false,
     end})
 local AutoSpamLabel = AS:AddLabel("Status: off", true)
 AS:AddSlider("AutoSpamRate", {Text = "Spam rate", Default = 250, Min = 20, Max = 1000, Rounding = 0, Suffix = " /s",
-    Tooltip = "Parries per second while a clash is detected.",
+    Tooltip = "Parries per second while a clash is detected. Tops out at one per send point (4 per frame) and eases off automatically if your upload gets too high, so your movement stays in sync.",
     Callback = function(v) AutoSpam.rate = v end})
 
 task.spawn(function()
