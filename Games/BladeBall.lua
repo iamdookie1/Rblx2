@@ -1771,19 +1771,29 @@ task.spawn(function()
     local function spliceHandler(remote, conn, func)
         local callTarget = func
         local replacement = makeReplacement(function() return callTarget end)
-        local wrapped = hook_wrap(replacement)
+        -- Be the SAME kind of closure as the handler we replace, so ours reads
+        -- as native under iscclosure / islclosure. The game's OnClientEvent
+        -- handlers are Lua closures, so keep ours a Lua closure too -- a
+        -- newcclosure here would come back as a C closure, a dead giveaway that
+        -- this one handler isn't the game's. Only mirror a C closure in the
+        -- unlikely case the original is one. (The parry hooks DO use newcclosure
+        -- because there they replace C functions, where a C closure is the match.)
+        local hookBody = replacement
+        if islclosure and not islclosure(func) then
+            hookBody = hook_wrap(replacement)
+        end
         hookedFuncs[func] = true
         hookedFuncs[replacement] = true
-        hookedFuncs[wrapped] = true
+        hookedFuncs[hookBody] = true
         if type(hookfunction) == "function" then
-            local ok, original = pcall(hookfunction, func, wrapped)
+            local ok, original = pcall(hookfunction, func, hookBody)
             if ok then
                 callTarget = original -- real handler copy; invoking func now runs ours
                 return true
             end
         end
         pcall(function() conn:Disable() end)
-        remote.OnClientEvent:Connect(wrapped)
+        remote.OnClientEvent:Connect(hookBody)
         return true
     end
 
