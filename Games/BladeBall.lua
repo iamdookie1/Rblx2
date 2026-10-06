@@ -1770,8 +1770,14 @@ task.spawn(function()
                                     if setthreadidentity then pcall(setthreadidentity, 2) end
                                     pcall(targetFunc, unpack(args))
                                 end
+                                -- Connect as a C closure (newcclosure), the same as
+                                -- the parry hooks: under getconnections our substitute
+                                -- then looks like the game's own native handlers, with
+                                -- no Lua upvalues to scan.
+                                local connFunc = hook_wrap(ourFunc)
                                 hookedFuncs[ourFunc] = true
-                                remote.OnClientEvent:Connect(ourFunc)
+                                hookedFuncs[connFunc] = true
+                                remote.OnClientEvent:Connect(connFunc)
                             end
                         end
                     end
