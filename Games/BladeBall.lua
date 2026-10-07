@@ -6,7 +6,7 @@ task.spawn(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.07-13"
+local SCRIPT_VERSION = "2026.10.07-14"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -520,9 +520,27 @@ local function fireParryRemote(curveCF)
         local origin, look = cf.Position, curveCF.LookVector
         if look == look and look.Magnitude > 0.5 then cf = CFrame.lookAt(origin, origin + look) end
     end
-    local sent
-    if Remote.is_event then
-        -- Same window number and flag the game itself sent, not hard-coded ones.
+    -- Reproduce the PRY send closure's EXACT sends (minus its two tamper-report
+    -- lines, which a legit client never fires). Every parry the game sends the
+    -- v659 remote (the one that carries the full targeting packet, always), plus
+    -- exactly one of v663/v661 chosen at random. Sending only one remote -- and
+    -- always the same one -- is both a non-parry (the registering remote never
+    -- fires) and a pattern no real client produces, which is what got the packet
+    -- kicked. Matching the game's own mix makes our traffic indistinguishable.
+    local g = Remote.gc
+    local sent = false
+    if g then
+        local u1035 = math.random(1, 2)
+        if u1035 == 1 then
+            if pcall(fire_event, g.primary, g.primaryId, uid, token, window, cf, points, aim, flag) then sent = true end
+        end
+        if g.netRemote then
+            if pcall(fire_event, g.netRemote, g.netId, uid, token, window, cf, points, aim, flag) then sent = true end
+        end
+        if u1035 == 2 then
+            if pcall(fire_event, g.short, g.shortId, uid, token) then sent = true end
+        end
+    elseif Remote.is_event then
         sent = pcall(fire_event, remote, args[1], uid, token, window, cf, points, aim, flag)
     else
         -- InvokeServer yields; spawn it so a burst never stalls on a reply.
@@ -542,17 +560,15 @@ end
 -- nothing for the anti-cheat to find: not a hooked function, not our environment
 -- on its stack, nothing.
 --
--- The send closure (ReplicatedStorage.Controllers."SwordsController ".PRY) holds,
--- as upvalues: the two parry RemoteEvents, the key/token function, a table that
--- holds the uid (t[2][t[1]]), the Net object, and several ids. We identify it
--- EXACTLY by its constants (it is the only .PRY function whose constant pool has
--- "TIME", used to build the token), then pull each piece by ROLE rather than a
--- fixed upvalue index (that was brittle): first function upvalue = key fn, first
--- RemoteEvent = the parry remote, first scalar = its id, the table whose
--- t[2][t[1]] resolves = the uid holder. Source order puts the remotes and key
--- function ahead of the first id, so "first of each" lands on the full-packet
--- set. window is 0.5 and flag is false -- exactly what the game sends for a
--- normal established parry (every v190() call passes no arg -> flag = false).
+-- We identify the send closure EXACTLY by its constants (it is the only .PRY
+-- function whose constant pool has "TIME", used to build the token), then read
+-- ALL of its upvalues -- both parry RemoteEvents, the Net object + remote name,
+-- the key/token function, the uid holder (t[2][t[1]]), and the three ids -- so
+-- fireParryRemote can reproduce the closure's own multi-remote send verbatim.
+-- The layout is validated by type before use (and the key function by actually
+-- calling it), so a wrong closure is rejected rather than fired blindly. window
+-- is 0.5 and flag is false -- what the game sends for a normal established parry
+-- (every v190() call passes no arg -> flag = false).
 Remote.armed_info = nil
 local function fn_has_time_const(fn)
     local getc = (debug and debug.getconstants) or getconstants
@@ -583,34 +599,52 @@ local function arm_via_gc()
                 if fn_has_time_const(fn) then
                     local ok_u, ups = pcall(getups, fn)
                     if ok_u and type(ups) == 'table' then
-                        local keyfn, remote, id, holder
-                        for i = 1, #ups do
-                            local v = ups[i]
-                            local tv = type(v)
-                            if not keyfn and tv == 'function' then keyfn = v end
-                            if not remote and isRemoteEvent(v) then remote = v end
-                            if not id and (tv == 'number' or tv == 'string') then id = v end
-                            if not holder and tv == 'table' then
-                                local ok_h = pcall(function()
-                                    assert(type(v[2]) == 'table' and v[2][v[1]] ~= nil)
-                                end)
-                                if ok_h then holder = v end
-                            end
+                        -- Faithful layout of the PRY send closure (confirmed by the
+                        -- "TIME" constant above), in upvalue/source order:
+                        --  [1] v663 full-packet RemoteEvent   [6] v659 Net object
+                        --  [2] v661 short-packet RemoteEvent  [7] v662 remote name
+                        --  [3] v667 uid holder (t[2][t[1]])   [8] v660 id for [6]
+                        --  [4] v658 key function              [9] v665 id for [2]
+                        --  [5] v666 id for [1]
+                        local g = {
+                            primary = ups[1], short = ups[2], holder = ups[3], keyfn = ups[4],
+                            primaryId = ups[5], netObj = ups[6], netName = ups[7],
+                            netId = ups[8], shortId = ups[9],
+                        }
+                        local function holder_ok(t)
+                            local ok = pcall(function() assert(type(t[2]) == 'table' and t[2][t[1]] ~= nil) end)
+                            return ok
                         end
-                        if keyfn and remote and id ~= nil and holder then
-                            local ok_uid, uid = pcall(function() return holder[2][holder[1]] end)
-                            if ok_uid and uid ~= nil then
-                                Remote.token, Remote.remote, Remote.uid_holder = keyfn, remote, holder
-                                Remote.args = {id, uid, "", 0.5, "", "", "", false}
-                                local ok_t, tok = pcall(tokenize, uid)
-                                if ok_t and type(tok) == 'string' and #tok > 0 then
-                                    local rn = pcall(function() return remote.Name end) and remote.Name or "?"
-                                    Remote.armed_info = ("remote=%s id=%s(%s) uid=%s"):format(
-                                        tostring(rn), tostring(id), type(id), tostring(uid))
-                                    return true
-                                end
-                                -- wrong pieces; clear and keep scanning
-                                Remote.token, Remote.remote, Remote.uid_holder, Remote.args = nil, nil, nil, nil
+                        local function net_ok(o)
+                            local ok, r = pcall(function() return o:RemoteEvent(g.netName) end)
+                            return ok and isRemoteEvent(r), r
+                        end
+                        local scalar = {number = true, string = true}
+                        local valid = isRemoteEvent(g.primary) and isRemoteEvent(g.short)
+                            and type(g.keyfn) == 'function' and type(g.holder) == 'table' and holder_ok(g.holder)
+                            and scalar[type(g.primaryId)] and scalar[type(g.netId)] and scalar[type(g.shortId)]
+                        local net_remote
+                        if valid then
+                            local ok_net; ok_net, net_remote = net_ok(g.netObj)
+                            valid = ok_net
+                        end
+                        if valid then
+                            -- validate the key function directly (keyfn(uid,'TIME')
+                            -- must return a non-empty string) without touching the
+                            -- token cache
+                            local ok_uid, uid = pcall(function() return g.holder[2][g.holder[1]] end)
+                            local key_ok, key = false, nil
+                            if ok_uid and uid ~= nil then key_ok, key = pcall(g.keyfn, uid, 'TIME') end
+                            if ok_uid and uid ~= nil and key_ok and type(key) == 'string' and #key > 0 then
+                                g.netRemote = net_remote
+                                Remote.gc = g
+                                Remote.token, Remote.remote, Remote.uid_holder = g.keyfn, g.primary, g.holder
+                                Remote.args = {g.primaryId, uid, "", 0.5, "", "", "", false}
+                                local rn = (pcall(function() return g.primary.Name end) and g.primary.Name) or "?"
+                                Remote.armed_info = ("primary=%s id=%s(%s) uid=%s net=%s"):format(
+                                    tostring(rn), tostring(g.primaryId), type(g.primaryId), tostring(uid),
+                                    (pcall(function() return net_remote.Name end) and net_remote.Name) or "?")
+                                return true
                             end
                         end
                     end
