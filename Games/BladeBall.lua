@@ -6,7 +6,7 @@ task.spawn(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.07-1"
+local SCRIPT_VERSION = "2026.10.07-2"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -472,7 +472,10 @@ local function fireParryRemote(curveCF)
         end
     end
     local args, remote = Remote.args, Remote.remote
-    local window = type(args[4]) == 'number' and args[4] or 0.5
+    -- The window the game sends: 0.5 for an established player. A packet caught
+    -- during the game's first-parries boost carries more (up to 1.5) that the
+    -- game itself stops sending after a few parries, so never send above 0.5.
+    local window = type(args[4]) == 'number' and math.min(args[4], 0.5) or 0.5
     local flag = args[8]
     local ok, token = pcall(tokenize, args[2])
     if not ok then return false end
@@ -480,14 +483,28 @@ local function fireParryRemote(curveCF)
         Remote.class_of, Remote.is_event = remote, remote.ClassName == 'RemoteEvent'
     end
     log_send("remote")
-    local cf = curveCF or cam.CFrame
+    -- The game sends CurrentCamera.CFrame: the camera's own position, looking
+    -- where you aim. Keep the curve's direction but put it on the camera, so the
+    -- packet looks like the game's (curve modes used to build it at your root,
+    -- some with 9e18-stud targets).
+    local cf = cam.CFrame
+    if curveCF then
+        local origin, look = cf.Position, curveCF.LookVector
+        if look == look and look.Magnitude > 0.5 then cf = CFrame.lookAt(origin, origin + look) end
+    end
+    local sent
     if Remote.is_event then
         -- Same window number and flag the game itself sent, not hard-coded ones.
-        return (pcall(fire_event, remote, args[1], args[2], token, window, cf, points, aim, flag))
+        sent = pcall(fire_event, remote, args[1], args[2], token, window, cf, points, aim, flag)
+    else
+        -- InvokeServer yields; spawn it so a burst never stalls on a reply.
+        task.spawn(remote.InvokeServer, remote, args[1], args[2], token, window, cf, points, aim, flag)
+        sent = true
     end
-    -- InvokeServer yields; spawn it so a burst never stalls on a reply.
-    task.spawn(remote.InvokeServer, remote, args[1], args[2], token, window, cf, points, aim, flag)
-    return true
+    -- For the block gate (Smart spam): a block is up until it lands or the
+    -- game's lockout runs out.
+    if sent then Remote.sent_at, Remote.landed = os.clock(), false end
+    return sent
 end
 
 -- ============================================================
@@ -1145,7 +1162,8 @@ local APCfg = {
     close_range = 20,       -- studs; instant retarget and pre-parry work inside this
     instant = true,         -- run the decision straight from the target change
     preparry = false,       -- opt-in: parry ahead when a player next to you is about to hit it back
-    curve = 0.5,            -- anti curve: how straight a ball must head at you (dot) before parrying
+    sim_dt = 1 / 120,       -- anti curve: step size when flying the ball forward
+    block_lockout = 1.3,    -- the game's block lockout when a block doesn't land
     hit_zone = 4,           -- studs: a ball whose line passes this close to us is coming at us
     hit_radius = 3,         -- studs: the ball has reached us
     parry_window = 0.45,    -- parry once the ball lands within this (+ ping); a bit under the real window
@@ -1361,16 +1379,75 @@ local function ball_velocity(ball)
     return zoomies and zoomies.VectorVelocity or ball.AssemblyLinearVelocity
 end
 
--- heading, miss (closest its straight line passes us), speed, distance
+-- heading, miss (closest its straight line passes us), speed, distance, velocity
 local function read_ball(ball, root)
     local velocity = ball_velocity(ball)
     local speed = velocity.Magnitude
     local offset = root.Position - ball.Position
     local distance = offset.Magnitude
-    if speed < 1 or distance < 0.01 then return 0, math.huge, speed, distance end
+    if speed < 1 or distance < 0.01 then return 0, math.huge, speed, distance, velocity end
     local heading = (velocity / speed):Dot(offset / distance)
     local miss = heading > 0 and distance * math.sqrt(math.max(0, 1 - heading * heading)) or math.huge
-    return heading, miss, speed, distance
+    return heading, miss, speed, distance, velocity
+end
+
+-- How fast the ball's flight direction is swinging round (radians/s), read over
+-- ~50ms steps and smoothed. A ball homing on us turns at its homing rate; one
+-- already flying straight at us reads ~0. Reset each pass.
+local function turn_rate(state, velocity, now)
+    local speed = velocity.Magnitude
+    if speed < 1 then return 0 end
+    local dir = velocity / speed
+    local s = state.trn
+    if not s or s.pass ~= state.pass_id then
+        state.trn = {pass = state.pass_id, t = now, dir = dir, w = 0, n = 0}
+        return 0
+    end
+    local dt = now - s.t
+    if dt >= 0.05 then
+        local w = math.acos(math.clamp(s.dir:Dot(dir), -1, 1)) / dt
+        s.w = s.n == 0 and w or (s.w * 0.6 + w * 0.4)
+        s.n = s.n + 1
+        s.t, s.dir = now, dir
+    end
+    return s.w
+end
+
+-- Anti curve, by prediction instead of a threshold: fly the ball forward the way
+-- it really moves -- its velocity swinging toward us at the rate it's been turning,
+-- its speed rising at the rate it's been gaining -- and return the seconds until
+-- its surface reaches us, or nil if it won't within `horizon`. Bait and wide
+-- curves are then timed by where the ball will actually be, not guessed at.
+local function predict_contact(ball_pos, velocity, target, gap, turn, accel, horizon)
+    local speed = velocity.Magnitude
+    if speed < 1 then return nil end
+    local step = APCfg.sim_dt
+    local pos, dir, t = ball_pos, velocity / speed, 0
+    while t < horizon do
+        local to = target - pos
+        local dist = to.Magnitude
+        if dist <= gap then return t end
+        local want = to / dist
+        local cos = math.clamp(dir:Dot(want), -1, 1)
+        local angle = math.acos(cos)
+        if angle > 1e-3 and turn > 0 then
+            local swing = turn * step
+            if swing >= angle then
+                dir = want
+            else
+                local mixed = dir:Lerp(want, swing / angle)
+                if mixed.Magnitude < 1e-3 then mixed = dir:Cross(Vector3.yAxis) end
+                dir = mixed.Unit
+            end
+        end
+        speed = speed + accel * step
+        local move = speed * step
+        -- Reaches the contact distance during this step: finish exactly.
+        if dir:Dot(want) > 0 and move >= dist - gap then return t + (dist - gap) / speed end
+        pos = pos + dir * move
+        t = t + step
+    end
+    return nil
 end
 
 -- How far ahead of the ball's arrival (seconds, before ping) a parry may go out.
@@ -1419,9 +1496,23 @@ local function time_to_contact(path, ball, speed, accel)
     return gap / speed
 end
 
--- Higher ping reads the ball sooner, so it's a little more lenient.
-local function curve_threshold()
-    return math.clamp(APCfg.curve - math.min(pingMs(), 400) / 1000 * 0.75, -1, 0.95)
+-- When a ball on us makes contact, with anti curve built in: straight in if its
+-- line already runs through us, otherwise flown forward along its real homing
+-- curve. Returns eta (nil if it won't land within the parry window), the window,
+-- and the reading it was based on. Shared by auto parry and Smart spam.
+local function ball_contact_eta(ball, root, state, now)
+    local heading, miss, speed, distance, velocity = read_ball(ball, root)
+    if speed < 1 then return nil, 0, speed, distance, heading end
+    local accel = speed_gain(state, speed, now)
+    local turn = turn_rate(state, velocity, now)
+    local window = lead_window(speed) + math.min(pingMs(), 400) / 1000
+    local eta
+    if miss <= APCfg.hit_zone then
+        eta = time_to_contact(distance, ball, speed, accel)
+    else
+        eta = predict_contact(ball.Position, velocity, root.Position, contact_gap(ball), turn, accel, window + 0.05)
+    end
+    return eta, window, speed, distance, heading, accel
 end
 
 -- Parry one ball if it's on us and really coming. Leaves the reason in
@@ -1442,10 +1533,9 @@ local function try_parry_ball(ball, root, now, via)
     if ball:FindFirstChild('ComboCounter') then return hold("combo") end
     if blocked_by_detection() then return hold("ability detected") end
 
-    local heading, miss, speed, distance = read_ball(ball, root)
+    local eta, window, speed, distance, heading, accel = ball_contact_eta(ball, root, state, now)
     if speed < 1 then return hold("ball not moving") end
     local ping_s = math.min(pingMs(), 400) / 1000
-    local accel = speed_gain(state, speed, now)
 
     -- Instant retarget (inside close range, straight off the target change).
     -- The ball's velocity still points at its last holder at that moment, so
@@ -1453,8 +1543,8 @@ local function try_parry_ball(ball, root, now, via)
     -- land within a parry's window. One parry per pass, so it can't double;
     -- further out it's left to the normal checks a frame later.
     if via == "instant retarget" then
-        local eta = time_to_contact(distance, ball, speed, accel)
-        if eta > lead_window(speed) + ping_s then return hold("too far for instant") end
+        eta = time_to_contact(distance, ball, speed, accel)
+        if eta > window then return hold("too far for instant") end
         state.parried, state.at = true, now
         state.pass_parried = true
         mark_parry(eta)
@@ -1470,28 +1560,14 @@ local function try_parry_ball(ball, root, now, via)
     if distance <= APCfg.hit_radius then state.reached_at = now end
     if state.reached_at and now - state.reached_at < ping_s + 0.3 then return hold("already reached you") end
 
-    if heading < 0 then return hold("flying away") end
-    -- A ball that isn't heading straight in still has to bend round to reach us,
-    -- so it travels further than the straight line: about the arc tangent to
-    -- its heading that ends on us (d * angle / sin(angle)). Timing uses that, so
-    -- a curving ball isn't parried early and left to land after the parry ends.
-    -- Straight in (angle 0) it's just the distance, same as always.
-    local angle = math.acos(math.clamp(heading, -1, 1))
-    local path = angle < 0.01 and distance or distance * angle / math.sin(angle)
-    if path > System.parry_distance(speed) then return hold("outside window") end
+    -- Anti curve: eta comes from flying the ball forward along its real curve
+    -- (ball_contact_eta). No eta means it won't land inside a parry from here --
+    -- flying away, or still swinging round (bait) -- so hold until it will.
+    if not eta then return hold(heading < 0 and "flying away" or "curving, waiting") end
+    -- The accuracy window, on the distance it will really travel to reach us.
+    if speed * eta + contact_gap(ball) > System.parry_distance(speed) then return hold("outside window") end
     -- A parry that would run out before the ball gets here is a wasted one.
-    -- Timed to when the ball actually touches us, including any speed it's
-    -- gaining on the way in.
-    local eta = time_to_contact(path, ball, speed, accel)
-    if eta > lead_window(speed) + ping_s then return hold("too early") end
-    -- Anti curve: how straight it has to be heading in, unless its line already
-    -- runs through us. The further out it still is, the straighter: half a
-    -- second out a ball aimed well off can still go anywhere (that's what bait
-    -- is), so committing the parry then wastes it. Close in, the setting itself.
-    local need = curve_threshold()
-    local far = math.clamp((eta - ping_s - 0.15) / 0.3, 0, 1)
-    need = need + (math.max(need, 0.85) - need) * far
-    if miss > APCfg.hit_zone and heading < need then return hold("curving, waiting") end
+    if eta > window then return hold("too early") end
 
     state.parried, state.at = true, now
     state.pass_parried = true
@@ -1659,6 +1735,7 @@ local AutoSpam = {
 -- them -- the "I'm ahead of where I really am" desync.
 local SPAM_MAX_PER_TICK = 1
 local SpamNet = {
+    style = "Smart",      -- "Smart": the game's own block cadence; "Flood": rate-based
     idle_rate = 20,       -- parries/s while no ball is on or near you
     budget_kbps = 350,    -- keep upload under this (Roblox is comfortable to ~400)
     guard_at = -1,        -- upload guard: last check
@@ -1843,6 +1920,39 @@ local function bandwidth_factor(now)
     return SpamNet.factor
 end
 
+-- Smart spam: the game's own block gate (SwordsController). A block that lands
+-- (ParrySuccess) unlocks the next one straight away; one that doesn't locks
+-- blocking for 1.3s. A real player mashing the key therefore sends exactly one
+-- parry per landed block -- anything faster is something no real client can
+-- send, so the server has every reason to drop it (and to flag it). Smart spam
+-- sends the parry a real client would, at the best moment: the instant it's
+-- unlocked and the ball is inside the parry window. One last-chance parry per
+-- pass is still allowed while locked if the ball is about to land.
+local function smart_spam_fire(source, now)
+    local root = getRoot()
+    if not root then return false end
+    local locked = Remote.landed == false and now - (Remote.sent_at or -math.huge) < APCfg.block_lockout
+    local me = LocalPlayer.Name
+    for _, ball in ipairs(get_live_balls()) do
+        if ball:GetAttribute('target') == me then
+            local state = get_ball_state(ball)
+            local eta, window = ball_contact_eta(ball, root, state, now)
+            if eta and eta <= window then
+                if locked then
+                    if state.spam_rescue == state.pass_id or eta > reaction_budget() then return false end
+                    state.spam_rescue = state.pass_id
+                end
+                ParryLog.source = source
+                spam_fire(source == "manual spam")
+                ParryLog.source = nil
+                SpamMeter.count = SpamMeter.count + 1
+                return true
+            end
+        end
+    end
+    return false
+end
+
 local spam_acc, spam_last, spam_active = 0, os.clock(), false
 local function spam_tick()
     local now = os.clock()
@@ -1862,6 +1972,11 @@ local function spam_tick()
     end
     if not rate or not LocalPlayer.Character then
         spam_acc, spam_active = 0, false
+        return
+    end
+    if SpamNet.style ~= "Flood" and getgenv().ManualSpamMode ~= "Keypress" then
+        spam_acc, spam_active = 0, false
+        smart_spam_fire(source, now)
         return
     end
     if not spam_focus() then rate = math.min(rate, SpamNet.idle_rate) end
@@ -1891,18 +2006,28 @@ end
 -- (the ball is on its way back), and the ball has just flipped back to us. Fire
 -- one straight away from the event itself instead of waiting for the next tick --
 -- faster where it counts, for a single packet.
-local function spam_instant()
+-- Smart spam only takes the retarget: right after our parry lands the ball is
+-- heading away, so a parry then is a miss that would lock us out.
+local function spam_instant(on_success)
     local props = System.__properties
     local manual = props.__manual_spam_enabled
     if not (manual or (props.__auto_spam_enabled and os.clock() < AutoSpam.active_until)) then return end
     if not LocalPlayer.Character then return end
-    ParryLog.source = manual and "manual spam" or "auto spam"
+    local source = manual and "manual spam" or "auto spam"
+    if SpamNet.style ~= "Flood" and getgenv().ManualSpamMode ~= "Keypress" then
+        if not on_success then smart_spam_fire(source, os.clock()) end
+        return
+    end
+    ParryLog.source = source
     spam_fire(manual)
     ParryLog.source = nil
     SpamMeter.count = SpamMeter.count + 1
 end
-Remotes.ParrySuccess.OnClientEvent:Connect(function() pcall(spam_instant) end)
-System.spam_on_retarget = function() pcall(spam_instant) end
+Remotes.ParrySuccess.OnClientEvent:Connect(function()
+    Remote.landed = true -- the game's gate: a landed block unlocks the next one
+    pcall(spam_instant, true)
+end)
+System.spam_on_retarget = function() pcall(spam_instant, false) end
 
 do
     local last_error
@@ -2708,9 +2833,6 @@ AP:AddToggle("PingCompensation", {Text = "Ping compensation", Default = true,
     Callback = function(v) System.__properties.__ping_compensation = v end})
 AP:AddSlider("ExtraDistance", {Text = "Extra distance", Default = 0, Min = -10, Max = 30, Rounding = 0, Suffix = " studs",
     Callback = function(v) System.__properties.__extra_distance = v end})
-AP:AddSlider("AntiCurve", {Text = "Anti curve", Default = 50, Min = 0, Max = 95, Rounding = 0, Suffix = "%",
-    Tooltip = "How straight the ball has to be heading at you before it's parried (unless its line already runs through you). Higher waits out curves and bait longer; lower parries sooner. 0 only waits while it's flying away.",
-    Callback = function(v) APCfg.curve = v / 100 end})
 AP:AddSlider("CloseRange", {Text = "Close range", Default = 20, Min = 8, Max = 45, Rounding = 0, Suffix = " studs",
     Tooltip = "Instant parry on retarget and pre-parry only work inside this distance.",
     Callback = function(v) APCfg.close_range = v end})
@@ -2823,8 +2945,11 @@ SP:AddToggle("ManualSpam", {Text = "Manual spam", Default = false, Callback = fu
     NotifyToggle("Manual Spam", v)
 end}):AddKeyPicker("ManualSpamKey", {Default = "E", Mode = "Hold", SyncToggleState = true, Text = "Manual spam"})
 SP:AddDropdown("SpamMode", {Text = "Mode", Values = {"Remote", "Keypress"}, Default = "Remote", Callback = function(v) getgenv().ManualSpamMode = v end})
+SP:AddDropdown("SpamStyle", {Text = "Spam style", Values = {"Smart", "Flood"}, Default = "Smart",
+    Tooltip = "Smart (manual and auto spam): follows the game's own block gate. A parry is sent the moment you're unlocked (your last block landed, or 1.3s passed) and the ball is inside the parry window -- exactly what a real client mashing block can send, so none get dropped and nothing stands out. Flood: the old rate-based spam (uses the rate sliders).",
+    Callback = function(v) SpamNet.style = v end})
 SP:AddSlider("SpamRate", {Text = "Spam rate", Default = 300, Min = 20, Max = 1000, Rounding = 0, Suffix = " /s",
-    Tooltip = "Parries per second while a ball is on or near you (20/s otherwise). Tops out at one per send point (4 per frame): more than that lands in the same server frame and only floods your upload, which desyncs your movement. Eases off automatically if your upload gets too high.",
+    Tooltip = "Flood style only. Parries per second while a ball is on or near you (20/s otherwise). Tops out at one per send point (4 per frame) and eases off automatically if your upload gets too high.",
     Callback = function(v) ManualSpam.rate = v end})
 local ManualSpamLabel = SP:AddLabel("Actual: 0/s", true)
 SP:AddToggle("SpamAnimFix", {Text = "Animation fix", Default = false, Callback = function(v)
@@ -2842,7 +2967,7 @@ AS:AddToggle("AutoSpam", {Text = "Auto spam", Default = false,
     end})
 local AutoSpamLabel = AS:AddLabel("Status: off", true)
 AS:AddSlider("AutoSpamRate", {Text = "Spam rate", Default = 250, Min = 20, Max = 1000, Rounding = 0, Suffix = " /s",
-    Tooltip = "Parries per second while a clash is detected. Tops out at one per send point (4 per frame) and eases off automatically if your upload gets too high, so your movement stays in sync.",
+    Tooltip = "Flood style only (see Spam style). Parries per second while a clash is detected. Tops out at one per send point (4 per frame) and eases off automatically if your upload gets too high, so your movement stays in sync.",
     Callback = function(v) AutoSpam.rate = v end})
 
 task.spawn(function()
