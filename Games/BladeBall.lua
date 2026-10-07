@@ -6,7 +6,7 @@ task.spawn(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.07-27"
+local SCRIPT_VERSION = "2026.10.07-28"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -28,6 +28,8 @@ local flight
 do
     local PATH, t0, started, buf = "BladeBall/flight.txt", os.clock(), false, {}
     flight = function(msg)
+        -- getgenv().BladeBallNoLog = true: no file is touched at all.
+        if genv.BladeBallNoLog then return end
         pcall(function()
             local line = ("[%9.3f] %s\n"):format(os.clock() - t0, tostring(msg))
             if not started then
@@ -3561,8 +3563,8 @@ do
             end
             beat = beat + 1
             if beat % 5 == 0 or ParryLog.spam ~= last_spam then
-                flight(("beat: %s | sends %d, spam sends %d | modes parry=%s spam=%s | remote %s"):format(
-                    where(), ParryLog.total, ParryLog.spam, tostring(getgenv().AutoParryMode),
+                flight(("beat: %s | heap %dKB | sends %d, spam sends %d | modes parry=%s spam=%s | remote %s"):format(
+                    where(), math.floor(gcinfo()), ParryLog.total, ParryLog.spam, tostring(getgenv().AutoParryMode),
                     tostring(getgenv().ManualSpamMode), remoteReady() and "armed" or tostring(Sender.info)))
                 last_spam = ParryLog.spam
             end
