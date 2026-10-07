@@ -6,7 +6,7 @@ task.spawn(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.07-23"
+local SCRIPT_VERSION = "2026.10.07-24"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -1182,6 +1182,14 @@ end
 local arming = false
 prime_remote = function()
     if remoteReady() or arming or Sender.gave_up then return end
+    -- Test switch: getgenv().BladeBallNoArm = true before loading never touches
+    -- PRY at all (no require, no probe), so an idle run shows whether arming is
+    -- what BAC reacts to.
+    if genv.BladeBallNoArm then
+        if not Sender.no_arm_logged then Sender.no_arm_logged = true; flight("NO-ARM TEST: PRY never touched") end
+        Sender.info = "not armed (BladeBallNoArm test)"
+        return
+    end
     if getgenv().AutoParryMode == "Keypress" and getgenv().ManualSpamMode == "Keypress" then return end
     arming = true
     task.spawn(function()
