@@ -6,7 +6,7 @@ task.spawn(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.07-18"
+local SCRIPT_VERSION = "2026.10.07-19"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -477,6 +477,72 @@ local choose_target
 local function fire_event(remote, ...) remote:FireServer(...) end
 local target_aim = {at = -1, name = nil, aim = nil}
 
+-- ============================================================
+-- PARRY WINDOW (packet arg 4) -- computed exactly like the game
+-- ============================================================
+-- The window is NOT a constant. SwordsController computes it per account on
+-- every parry (dump, SwordsController parry handler):
+--   n6 = 0.5; timesParried 0/1/2/3/4 -> 1.5/1.25/1.0/0.75/0.625
+--   if the noob boost is on (normal servers + FFlag NoobParryEnabled):
+--     TotalStats.Kills >= 20 -> boost switches off for good
+--     otherwise            -> n6 = kills/20 * n6
+-- The server knows your timesParried and kills too, so it knows exactly what
+-- window your client is allowed to send. Every hookless build before this sent
+-- a hard-coded 0.5 -- on a low-kill account that's claiming a far bigger window
+-- than the game would ever send for you. We read the same replicated stats the
+-- game reads (Replion "Data", via the same plain require the game's own modules
+-- use -- no getgc, no hook) and reproduce its arithmetic exactly.
+local Win = {data = nil, noob = false}
+task.spawn(function()
+    local function srv(info, name)
+        local ok, r = pcall(function() return info[name]() end)
+        return ok and r == true
+    end
+    local info, utils
+    pcall(function() info = require(ReplicatedStorage:WaitForChild("ServerInfo", 10)) end)
+    pcall(function() utils = require(ReplicatedStorage:WaitForChild("Common", 10):WaitForChild("Utils", 10)) end)
+    local flag_on = true
+    pcall(function() flag_on = utils.FFlag.GetInstantFFlag("NoobParryEnabled", true) end)
+    if info then
+        Win.noob = flag_on and not srv(info, "isDungeonsMatchServer") and not srv(info, "isRankedMatchServer")
+            and not srv(info, "isMedalServer") and not srv(info, "isClanWarServer")
+            and not srv(info, "isTournamentMatchServer") and true or false
+    end
+    task.spawn(function()
+        pcall(function()
+            local Replion = require(ReplicatedStorage:WaitForChild("Packages", 10):WaitForChild("Replion", 10))
+            Win.data = Replion.Client:WaitReplion("Data")
+        end)
+        Win.done = true
+    end)
+    -- Never block Remote forever: if the stats can't be read within 10s, give
+    -- up waiting and let fireParryRemote use its fallback.
+    task.delay(10, function() Win.done = true end)
+end)
+
+local function parry_window()
+    local data = Win.data
+    if not data then return nil end
+    local ok_tp, tp = pcall(data.Get, data, "timesParried")
+    if not ok_tp or type(tp) ~= 'number' then tp = 0 end
+    local n6 = 0.5
+    if tp == 0 then n6 = 1.5
+    elseif tp == 1 then n6 = 1.25
+    elseif tp == 2 then n6 = 1
+    elseif tp == 3 then n6 = 0.75
+    elseif tp == 4 then n6 = 0.625 end
+    if Win.noob then
+        local ok_k, kills = pcall(data.Get, data, "TotalStats.Kills")
+        if not ok_k or type(kills) ~= 'number' then kills = 0 end
+        if kills >= 20 then
+            Win.noob = false -- the game turns the boost off for good at 20 kills
+        else
+            n6 = kills / 20 * n6
+        end
+    end
+    return n6
+end
+
 local function fireParryRemote(curveCF)
     if not is_live() then return true end -- replaced copy: send nothing, and don't fall back to the key
     if not remoteReady() then return false end
@@ -504,10 +570,16 @@ local function fireParryRemote(curveCF)
         local ok_uid, fresh = pcall(function() return Remote.uid_holder[2][Remote.uid_holder[1]] end)
         if ok_uid and fresh ~= nil then uid = fresh end
     end
-    -- The window the game sends: 0.5 for an established player. A packet caught
-    -- during the game's first-parries boost carries more (up to 1.5) that the
-    -- game itself stops sending after a few parries, so never send above 0.5.
-    local window = type(args[4]) == 'number' and math.min(args[4], 0.5) or 0.5
+    -- The window: exactly what the game would send for this account right now
+    -- (see parry_window). Only if the replicated data isn't available yet do we
+    -- fall back to the stored value.
+    local window = parry_window()
+    if window == nil then
+        -- stats not read yet: don't send a guessed window, wait (a few seconds at
+        -- most -- Win.done flips after 10s even if the read never lands)
+        if not Win.done then return false end
+        window = type(args[4]) == 'number' and args[4] or 0.5
+    end
     local flag = args[8]
     local ok, token = pcall(tokenize, uid)
     if not ok then return false end
@@ -1080,13 +1152,9 @@ end
 local arming = false
 prime_remote = function()
     if remoteReady() or arming then return end
-    -- The getgc arm is the ONLY detection risk left, and it is ONLY needed for
-    -- Remote mode (firing the remote ourselves). If no active mode is Remote --
-    -- i.e. you're on Keypress -- never touch getgc. Keypress lets the GAME send
-    -- the parry (its own valid token, no tampering), so it needs no remote and
-    -- stays fully clean: no hook, no getgc, nothing for the anti-cheat to read.
-    if (getgenv().AutoParryMode or "Keypress") ~= "Remote"
-        and (getgenv().ManualSpamMode or "Keypress") ~= "Remote" then return end
+    -- The getgc arm is only needed for Remote mode. If every active mode is
+    -- Keypress, don't touch getgc at all.
+    if getgenv().AutoParryMode == "Keypress" and getgenv().ManualSpamMode == "Keypress" then return end
     arming = true
     task.spawn(function()
         local tries = 0
@@ -1116,10 +1184,8 @@ prime_remote = function()
 end
 function System.parry.execute_action() System.animation.play_grab_parry(); System.parry.execute() end
 function System.parry.by_mode(mode)
-    -- Only an explicit "Remote" uses the remote (needs the getgc arm). Anything
-    -- else -- "Keypress", or unset/nil -- presses block and lets the game parry,
-    -- which is the clean, undetected default.
-    if mode == "Remote" then System.parry.execute_action() else System.parry.keypress() end
+    -- Remote is the default: only an explicit "Keypress" presses the block key.
+    if mode == "Keypress" then System.parry.keypress() else System.parry.execute_action() end
 end
 
 -- ============================================================
@@ -1898,8 +1964,7 @@ function System.manual_spam.start() System.__properties.__manual_spam_enabled = 
 function System.manual_spam.stop() System.__properties.__manual_spam_enabled = false end
 
 local function spam_fire(manual)
-    if getgenv().ManualSpamMode ~= "Remote" then
-        -- default/Keypress: let the game send it (clean, no getgc)
+    if getgenv().ManualSpamMode == "Keypress" then
         System.parry.keypress()
     else
         System.parry.fast()
@@ -2854,13 +2919,14 @@ task.spawn(function()
 end)
 
 local function remoteStatusText()
-    local apm = getgenv().AutoParryMode or "Keypress"
-    if apm ~= "Remote" then
-        return "Mode: Keypress (recommended) -- the game sends the parry, no hook and no getgc, undetected. Remote mode is opt-in; it needs getgc to arm, which this game's anti-cheat detects."
+    if getgenv().AutoParryMode == "Keypress" then return "Mode: Keypress (presses the block key)" end
+    local w = parry_window()
+    local wtxt = w and ("%.3f"):format(w) or (Win.done and "fallback" or "reading stats...")
+    if remoteReady() then
+        return "Remote: armed [" .. tostring(Remote.armed_info) .. "] window=" .. wtxt .. (Win.noob and " (noob boost on)" or "")
     end
-    if remoteReady() then return "Remote: armed [" .. tostring(Remote.armed_info) .. "]. WARNING: Remote arms via getgc, which this game's anti-cheat has been detecting -- use Keypress if you're getting kicked." end
-    if type(getgc) ~= 'function' then return "Remote: needs getgc (missing here). Use Keypress mode." end
-    return "Remote: arming via getgc... NOTE: getgc is what's been getting detected on this game. Keypress mode avoids it entirely."
+    if type(getgc) ~= 'function' then return "Remote: needs getgc (missing in this executor)" end
+    return "Remote: arming... window=" .. wtxt
 end
 
 local status_peak, status_ball = 0, nil
@@ -2912,8 +2978,8 @@ AP:AddToggle("AutoParry", {Text = "Auto parry", Default = false, Callback = func
     if v then System.autoparry.start(); prime_remote() else System.autoparry.stop() end
     NotifyToggle("Auto Parry", v)
 end}):AddKeyPicker("AutoParryKey", {Default = "None", Mode = "Toggle", SyncToggleState = true, Text = "Auto parry"})
-AP:AddDropdown("ParryMode", {Text = "Parry mode", Values = {"Remote", "Keypress"}, Default = "Keypress",
-    Tooltip = "Keypress (recommended, undetected): the GAME sends the parry when we press block -- no hook, no getgc, nothing for the anti-cheat to read. Remote fires the parry remote yourself with curve/target control, but arming it requires reading the game's memory (getgc), which this game's anti-cheat detects.",
+AP:AddDropdown("ParryMode", {Text = "Parry mode", Values = {"Remote", "Keypress"}, Default = "Remote",
+    Tooltip = "Remote fires the parry remote with your curve (hookless, sends exactly what the game sends). Keypress presses the block key (F).",
     Callback = function(v) getgenv().AutoParryMode = v end})
 AP:AddDropdown("CurveMode", {Text = "Curve mode", Values = System.__config.__curve_names, Default = "Camera",
     Callback = function(v)
@@ -3053,7 +3119,7 @@ SP:AddToggle("ManualSpam", {Text = "Manual spam", Default = false, Callback = fu
     end
     NotifyToggle("Manual Spam", v)
 end}):AddKeyPicker("ManualSpamKey", {Default = "E", Mode = "Hold", SyncToggleState = true, Text = "Manual spam"})
-SP:AddDropdown("SpamMode", {Text = "Mode", Values = {"Remote", "Keypress"}, Default = "Keypress", Tooltip = "Keypress (recommended, undetected). Remote needs getgc to arm, which this game's anti-cheat detects.", Callback = function(v) getgenv().ManualSpamMode = v end})
+SP:AddDropdown("SpamMode", {Text = "Mode", Values = {"Remote", "Keypress"}, Default = "Remote", Callback = function(v) getgenv().ManualSpamMode = v end})
 SP:AddSlider("SpamRate", {Text = "Spam rate", Default = 300, Min = 20, Max = 1000, Rounding = 0, Suffix = " /s",
     Tooltip = "Parries per second while a ball is on or near you (20/s otherwise). Tops out at one per send point (4 per frame) and eases off automatically if your upload gets too high.",
     Callback = function(v) ManualSpam.rate = v end})
