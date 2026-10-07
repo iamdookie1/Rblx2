@@ -6,7 +6,7 @@ task.spawn(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.07-17"
+local SCRIPT_VERSION = "2026.10.07-18"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -387,9 +387,9 @@ local function canParryNow()
     return false
 end
 
-if type(getgc) ~= 'function' then
-    Notify("Blade Ball", "No getgc in this executor, so the hookless arm can't run. Use Keypress mode (note: Keypress is detectable).", 6)
-end
+-- No load-time hook/arm. Default is Keypress (the game sends the parry -- no
+-- hook, no getgc). Remote mode is opt-in and only then does the getgc arm run
+-- (and warn if getgc is missing), via prime_remote.
 -- NOTE: nothing is hooked, ever. Remote mode arms by reading the parry closure
 -- out of getgc (arm_via_gc / prime_remote) -- no FireServer hook, no metamethod
 -- hook, no block press -- so the game's sender never runs on our account and
@@ -1080,6 +1080,13 @@ end
 local arming = false
 prime_remote = function()
     if remoteReady() or arming then return end
+    -- The getgc arm is the ONLY detection risk left, and it is ONLY needed for
+    -- Remote mode (firing the remote ourselves). If no active mode is Remote --
+    -- i.e. you're on Keypress -- never touch getgc. Keypress lets the GAME send
+    -- the parry (its own valid token, no tampering), so it needs no remote and
+    -- stays fully clean: no hook, no getgc, nothing for the anti-cheat to read.
+    if (getgenv().AutoParryMode or "Keypress") ~= "Remote"
+        and (getgenv().ManualSpamMode or "Keypress") ~= "Remote" then return end
     arming = true
     task.spawn(function()
         local tries = 0
@@ -1109,7 +1116,10 @@ prime_remote = function()
 end
 function System.parry.execute_action() System.animation.play_grab_parry(); System.parry.execute() end
 function System.parry.by_mode(mode)
-    if mode == "Keypress" then System.parry.keypress() else System.parry.execute_action() end
+    -- Only an explicit "Remote" uses the remote (needs the getgc arm). Anything
+    -- else -- "Keypress", or unset/nil -- presses block and lets the game parry,
+    -- which is the clean, undetected default.
+    if mode == "Remote" then System.parry.execute_action() else System.parry.keypress() end
 end
 
 -- ============================================================
@@ -1888,7 +1898,8 @@ function System.manual_spam.start() System.__properties.__manual_spam_enabled = 
 function System.manual_spam.stop() System.__properties.__manual_spam_enabled = false end
 
 local function spam_fire(manual)
-    if getgenv().ManualSpamMode == "Keypress" then
+    if getgenv().ManualSpamMode ~= "Remote" then
+        -- default/Keypress: let the game send it (clean, no getgc)
         System.parry.keypress()
     else
         System.parry.fast()
@@ -2843,9 +2854,13 @@ task.spawn(function()
 end)
 
 local function remoteStatusText()
-    if remoteReady() then return "Remote: armed (hookless) [" .. tostring(Remote.armed_info) .. "]. Parries fire direct -- nothing is hooked" end
-    if type(getgc) ~= 'function' then return "Remote: needs getgc (missing in this executor). Use Keypress mode (note: Keypress is detectable)" end
-    return "Remote: arming hooklessly -- reading the parry closure out of getgc, no hook and no block press. Done the moment you're in a match. Parries fire direct once armed"
+    local apm = getgenv().AutoParryMode or "Keypress"
+    if apm ~= "Remote" then
+        return "Mode: Keypress (recommended) -- the game sends the parry, no hook and no getgc, undetected. Remote mode is opt-in; it needs getgc to arm, which this game's anti-cheat detects."
+    end
+    if remoteReady() then return "Remote: armed [" .. tostring(Remote.armed_info) .. "]. WARNING: Remote arms via getgc, which this game's anti-cheat has been detecting -- use Keypress if you're getting kicked." end
+    if type(getgc) ~= 'function' then return "Remote: needs getgc (missing here). Use Keypress mode." end
+    return "Remote: arming via getgc... NOTE: getgc is what's been getting detected on this game. Keypress mode avoids it entirely."
 end
 
 local status_peak, status_ball = 0, nil
@@ -2897,8 +2912,8 @@ AP:AddToggle("AutoParry", {Text = "Auto parry", Default = false, Callback = func
     if v then System.autoparry.start(); prime_remote() else System.autoparry.stop() end
     NotifyToggle("Auto Parry", v)
 end}):AddKeyPicker("AutoParryKey", {Default = "None", Mode = "Toggle", SyncToggleState = true, Text = "Auto parry"})
-AP:AddDropdown("ParryMode", {Text = "Parry mode", Values = {"Remote", "Keypress"}, Default = "Remote",
-    Tooltip = "Remote fires the parry remote with your curve. Keypress presses the block key (F).",
+AP:AddDropdown("ParryMode", {Text = "Parry mode", Values = {"Remote", "Keypress"}, Default = "Keypress",
+    Tooltip = "Keypress (recommended, undetected): the GAME sends the parry when we press block -- no hook, no getgc, nothing for the anti-cheat to read. Remote fires the parry remote yourself with curve/target control, but arming it requires reading the game's memory (getgc), which this game's anti-cheat detects.",
     Callback = function(v) getgenv().AutoParryMode = v end})
 AP:AddDropdown("CurveMode", {Text = "Curve mode", Values = System.__config.__curve_names, Default = "Camera",
     Callback = function(v)
@@ -3038,7 +3053,7 @@ SP:AddToggle("ManualSpam", {Text = "Manual spam", Default = false, Callback = fu
     end
     NotifyToggle("Manual Spam", v)
 end}):AddKeyPicker("ManualSpamKey", {Default = "E", Mode = "Hold", SyncToggleState = true, Text = "Manual spam"})
-SP:AddDropdown("SpamMode", {Text = "Mode", Values = {"Remote", "Keypress"}, Default = "Remote", Callback = function(v) getgenv().ManualSpamMode = v end})
+SP:AddDropdown("SpamMode", {Text = "Mode", Values = {"Remote", "Keypress"}, Default = "Keypress", Tooltip = "Keypress (recommended, undetected). Remote needs getgc to arm, which this game's anti-cheat detects.", Callback = function(v) getgenv().ManualSpamMode = v end})
 SP:AddSlider("SpamRate", {Text = "Spam rate", Default = 300, Min = 20, Max = 1000, Rounding = 0, Suffix = " /s",
     Tooltip = "Parries per second while a ball is on or near you (20/s otherwise). Tops out at one per send point (4 per frame) and eases off automatically if your upload gets too high.",
     Callback = function(v) ManualSpam.rate = v end})
