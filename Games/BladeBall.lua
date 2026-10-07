@@ -6,7 +6,7 @@ task.spawn(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.07-46"
+local SCRIPT_VERSION = "2026.10.07-47"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -915,49 +915,38 @@ local function frame_dt() return math.clamp(props.__frame_dt or 1 / 60, 1 / 240,
 -- The game's sender picks one of two shapes at random for every parry:
 --   remote:FireServer(...)                       -> __namecall
 --   local f = remote.FireServer; f(remote, ...)  -> the FireServer function
--- So the capture press has one hook per shape. Both exist only while a capture
--- press is in flight (0.35s at most) and both come off inside the very call
--- that delivers the packet. While they're up:
+-- Only the second is hooked. A __namecall hook is up during the game's whole
+-- block press, including the namecall probe its press handler runs right before
+-- sending (PluginManager():CreatePlugin() in an xpcall), and metamethod hooks
+-- are what this anti-cheat has caught before. The FireServer hook only ever runs
+-- inside the FireServer call itself -- after the sender's checks are done -- and
+-- never during that probe. The cost: half the game's sends go the namecall way,
+-- so capture takes about two presses (1.4s apart) instead of one. Once per
+-- server; after it nothing is hooked. The hook exists only while a capture
+-- press is in flight (0.35s at most) and comes off inside the very call that
+-- delivers the packet. While it's up:
 --   * our own calls are waved through before anything else (checkcaller);
---   * every other namecall / FireServer goes straight to the original;
+--   * every other FireServer call goes straight to the original;
 --   * nothing is altered or dropped -- the packet reaches the server untouched;
 --   * the decoy report remotes (JobId first) are never learned from.
 -- Nothing is read from the game's memory: the token key comes from the packet
 -- itself, token[i] = bxor((time[i] + i) % 256, key[i]), time = floor(now * 100).
-local hookmetamethod_, getnamecallmethod_ = hookmetamethod, getnamecallmethod
 local hookfunction_, restore_ = hookfunction, restorefunction
 local checkcaller_ = checkcaller or function() return false end
 local newcclosure_ = newcclosure or function(f) return f end
 local select_, type_, typeof_, tostring_, floor_, byte_, bxor_, pcall_ =
     select, type, typeof, tostring, math.floor, string.byte, bit32.bxor, pcall
 local JOB_ID = game.JobId
-local getrawmetatable_, setreadonly_ = getrawmetatable, setreadonly or make_writeable
 -- The shared FireServer function, read off a remote the game already has
 -- (every RemoteEvent hands back the same one) -- no instance is created for it.
 local FIRE_FN
 pcall(function() FIRE_FN = Remotes.ParrySuccess.FireServer end)
 if type(FIRE_FN) ~= 'function' then pcall(function() FIRE_FN = Instance.new("RemoteEvent").FireServer end) end
-local H = {nc = nil, fire = nil, want = false, until_t = 0}
-
--- Puts the game's own __namecall back exactly: the original function object is
--- written straight into its metatable, so nothing of ours is left wrapped around
--- it. (Restoring through hookmetamethod re-wraps it on some executors -- a
--- wrapper that stays for the rest of the session.)
-local function restore_namecall(original)
-    local ok = pcall_(function()
-        local mt = getrawmetatable_(game)
-        local was_ro = isreadonly and isreadonly(mt)
-        setreadonly_(mt, false)
-        rawset(mt, "__namecall", original)
-        if was_ro ~= false then setreadonly_(mt, true) end
-    end)
-    if not ok then pcall_(hookmetamethod_, game, "__namecall", original) end
-end
+local H = {fire = nil, want = false, until_t = 0}
 
 local function unhook()
-    local nc, fire = H.nc, H.fire
-    H.nc, H.fire, H.want = nil, nil, false
-    if nc then restore_namecall(nc) end
+    local fire = H.fire
+    H.fire, H.want = nil, false
     if fire and not (restore_ and pcall_(restore_, FIRE_FN)) then pcall_(hookfunction_, FIRE_FN, fire) end
 end
 Core.unhook = unhook
@@ -985,14 +974,6 @@ local function inspect(self, a1, a2, a3, a4, a5)
     end
 end
 
-local function on_namecall(self, ...)
-    local old = H.nc
-    if H.want and not checkcaller_() and getnamecallmethod_() == "FireServer" and select_('#', ...) >= 6 then
-        pcall_(inspect, self, ...)
-        if not H.want then unhook() end
-    end
-    return old(self, ...)
-end
 local function on_fire(self, ...)
     local old = H.fire
     if H.want and not checkcaller_() and select_('#', ...) >= 6 then
@@ -1007,18 +988,14 @@ end
 local function arm()
     if Core.cap or not is_live() then return false end
     H.want, H.until_t = true, clock_() + 0.35
-    if H.nc or H.fire then return true end
-    if hookmetamethod_ and getnamecallmethod_ then
-        local ok, old = pcall(hookmetamethod_, game, "__namecall", newcclosure_(on_namecall))
-        if ok and type(old) == 'function' then H.nc = old end
-    end
+    if H.fire then return true end
     if hookfunction_ and FIRE_FN then
         local ok, old = pcall(hookfunction_, FIRE_FN, newcclosure_(on_fire))
         if ok and type(old) == 'function' then H.fire = old end
     end
-    if not (H.nc or H.fire) then H.want = false; return false end
+    if not H.fire then H.want = false; return false end
     task.spawn(function()
-        while (H.nc or H.fire) and clock_() < H.until_t do task.wait() end
+        while H.fire and clock_() < H.until_t do task.wait() end
         unhook()
     end)
     return true
