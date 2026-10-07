@@ -6,7 +6,7 @@ task.spawn(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.07-22"
+local SCRIPT_VERSION = "2026.10.07-23"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -110,6 +110,10 @@ local CoreGui = cloneref(game:GetService('CoreGui'))
 local HttpService = cloneref(game:GetService('HttpService'))
 local Workspace = cloneref(game:GetService('Workspace'))
 local VirtualInputManager = cloneref(game:GetService('VirtualInputManager'))
+-- Every GUI we make goes in the executor's hidden container, never anywhere the
+-- game's own scripts can look (Workspace, characters, PlayerGui).
+local HUI = CoreGui
+pcall(function() local h = gethui and gethui(); if typeof(h) == 'Instance' then HUI = h end end)
 
 local LocalPlayer = Players.LocalPlayer
 
@@ -2302,7 +2306,7 @@ local function create_mobile_button(name, position_y, color, x_pos)
     local gui = Instance.new('ScreenGui')
     gui.Name = 'BladeBall_' .. name .. '_Mobile'; gui.ResetOnSpawn = false
     gui.IgnoreGuiInset = true; gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-    gui.DisplayOrder = 9998; gui.Parent = CoreGui
+    gui.DisplayOrder = 9998; gui.Parent = HUI
     local button = Instance.new('TextButton')
     button.Size = UDim2.new(0, 130, 0, 55)
     button.Position = UDim2.new(x_pos or 0.15, 0, position_y, 0)
@@ -2738,12 +2742,14 @@ local function create_ability_esp_for_player(player)
         local head = character:WaitForChild('Head', 10)
         if not head or not getgenv().AbilityESP then return end
         remove_ability_esp_entry(player)
-        local existing = head:FindFirstChild('AbilityESPGui'); if existing then existing:Destroy() end
+        -- The billboard lives in our hidden container and only points at the head
+        -- (Adornee). Parenting it INTO the head put a foreign BillboardGui in
+        -- another player's character in Workspace, where the game can see it.
         local billboard = Instance.new('BillboardGui')
         billboard.Name = 'AbilityESPGui'; billboard.Adornee = head
         billboard.Size = UDim2.new(0, 220, 0, 60)
         billboard.StudsOffset = Vector3.new(0, AbilityESPConfig.Height, 0); billboard.AlwaysOnTop = true
-        billboard.Parent = head
+        billboard.Parent = HUI
         local label = Instance.new('TextLabel')
         label.Size = UDim2.new(1, 0, 1, 0); label.BackgroundTransparency = 1
         label.TextColor3 = AbilityESPConfig.Color; label.TextSize = AbilityESPConfig.TextSize
@@ -2751,8 +2757,6 @@ local function create_ability_esp_for_player(player)
         label.RichText = true; label.TextXAlignment = Enum.TextXAlignment.Center
         label.TextYAlignment = Enum.TextYAlignment.Center; label.Parent = billboard
         label.Visible = false
-        local humanoid = character:FindFirstChild('Humanoid')
-        if humanoid then humanoid.DisplayDistanceType = Enum.HumanoidDisplayDistanceType.None end
         abilityEspEntries[player] = {
             billboard = billboard, label = label, character = character, head = head,
             color = AbilityESPConfig.Color, size = AbilityESPConfig.TextSize, height = AbilityESPConfig.Height,
@@ -2819,7 +2823,7 @@ function System.create_ball_velocity_gui()
     local pl = Instance.new("TextLabel", frame); pl.Size = UDim2.new(1,-10,0,22); pl.Position = UDim2.new(0,5,0,46)
     pl.BackgroundTransparency = 1; pl.Text = "Peak: 0"; pl.TextColor3 = Color3.fromRGB(255,255,255)
     pl.Font = Enum.Font.GothamBold; pl.TextSize = 15; pl.TextXAlignment = Enum.TextXAlignment.Left
-    frame.Parent = gui; gui.Parent = CoreGui
+    frame.Parent = gui; gui.Parent = HUI
     System.__properties.__ball_velocity_gui = {gui=gui, frame=frame, currentSpeedLabel=cl, peakSpeedLabel=pl}
 end
 
@@ -2865,7 +2869,7 @@ PingLabel.Size = UDim2.new(1, 0, 1, 0); PingLabel.Text = "Ping: 0ms"
 PingLabel.TextColor3 = Color3.fromRGB(255, 255, 255); PingLabel.BackgroundTransparency = 1
 PingLabel.Font = Enum.Font.GothamBold; PingLabel.TextSize = 14; PingLabel.RichText = true
 PingLabel.TextXAlignment = Enum.TextXAlignment.Center
-PingGui.Parent = CoreGui
+PingGui.Parent = HUI
 
 task.spawn(function()
     while task.wait(0.5) do
