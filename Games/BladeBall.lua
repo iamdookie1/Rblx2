@@ -6,7 +6,7 @@ task.spawn(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.07-8"
+local SCRIPT_VERSION = "2026.10.07-9"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -263,10 +263,8 @@ end
 local function uninstallRemoteHooks()
     if not Hooks.installed then return end
     Hooks.installed = false -- pass straight through even if a restore fails
-    if Hooks.old_namecall then pcall(hookmetamethod, game, '__namecall', Hooks.old_namecall) end
-    if Hooks.old_index then pcall(hookmetamethod, game, '__index', Hooks.old_index) end
     if Hooks.fire_fn and Hooks.old_fire then restore_function(Hooks.fire_fn, Hooks.old_fire) end
-    Hooks.old_namecall, Hooks.old_index, Hooks.fire_fn, Hooks.old_fire = nil, nil, nil, nil
+    Hooks.fire_fn, Hooks.old_fire = nil, nil
     Remote.hooked = false
 end
 
@@ -308,38 +306,30 @@ local function shared_fire_fn()
     return fire_fn_cache
 end
 
--- Installed once, then left up for the whole session. Each FireServer that
--- reaches a hook does one of two things: if it is the game's PRY parry and we
--- still need the packet, it is captured (then passed on unchanged); otherwise it
--- passes straight through untouched. The hooks are read-only -- they never drop
--- or alter a send -- and they come down the instant a packet is captured. What
--- proves a send is the real one is the PRY sender being on the live stack
--- (capture() checks), so our own fireParryRemote (which never routes through
--- PRY) is ignored and only a genuine send from your natural block is read.
+-- ONE hook, and deliberately only one: hookfunction on the shared FireServer C
+-- function. Why not __namecall / __index metamethods, which earlier builds also
+-- installed -- that was the bug. BAC's check (b) scans getfenv(1..10) for an
+-- executor env from INSIDE the parry sender, right before it sends. A metamethod
+-- hook wraps calls all over the game, so our hook closure can sit on the stack as
+-- an ANCESTOR of that sender (within the 10 levels) while it scans -- and our env
+-- has writefile, so it reports us "a bit after hooking". A plain function hook on
+-- FireServer can't: it only ever runs DURING a FireServer call, which is a child
+-- of the sender and happens AFTER the scan, so it is never on the stack while the
+-- scan runs. The sender always dot-calls v663/v661.FireServer (the same C
+-- function we patch) for the full packet, so this still catches a real parry
+-- within a block or two. The hook is read-only (never drops/alters a send) and
+-- comes down the instant a packet is captured.
 local function installRemoteHooks()
     if Hooks.installed then return end
-    -- remote:FireServer(...) path.
-    if hookmetamethod and getnamecallmethod then
-        pcall(function()
-            local old_namecall
-            old_namecall = hookmetamethod(game, '__namecall', hook_wrap(function(self, ...)
-                if capture_armed() and getnamecallmethod() == 'FireServer'
-                    and isRemoteEvent(self) and parry_shaped(...) then
-                    pcall(capture, self, ...)
-                end
-                return old_namecall(self, ...)
-            end))
-            Hooks.old_namecall = old_namecall
-            Remote.hooked = true
-        end)
-    end
-    -- local f = remote.FireServer; f(remote, ...) path, patched in place so
-    -- remote.FireServer stays the same C function.
     local fire_fn = hookfunction and shared_fire_fn()
     if fire_fn then
         pcall(function()
             local old_fire
             old_fire = hookfunction(fire_fn, hook_wrap(function(self, ...)
+                -- Runs only during an actual FireServer call -> never on the
+                -- sender's stack during its getfenv scan. capture() further
+                -- confirms the PRY sender is live, so our own fireParryRemote
+                -- (which never routes through PRY) is never mistaken for a parry.
                 if capture_armed() and isRemoteEvent(self) and parry_shaped(...) then
                     pcall(capture, self, ...)
                 end
@@ -349,34 +339,7 @@ local function installRemoteHooks()
             Remote.hooked = true
         end)
     end
-    -- No hookfunction: catch the fetched path through __index instead, handing
-    -- back one cached wrapper.
-    if not Hooks.old_fire and hookmetamethod then
-        pcall(function()
-            local old_index
-            local wrappers = setmetatable({}, {__mode = 'k'})
-            old_index = hookmetamethod(game, '__index', hook_wrap(function(self, key)
-                if capture_armed() and key == 'FireServer' and isRemoteEvent(self)
-                    and not (checkcaller and checkcaller()) then
-                    local real = old_index(self, key)
-                    local wrapped = wrappers[real]
-                    if not wrapped then
-                        wrapped = hook_wrap(function(remote, ...)
-                            if capture_armed() and parry_shaped(...) then pcall(capture, remote, ...) end
-                            return real(remote, ...)
-                        end)
-                        wrappers[real] = wrapped
-                    end
-                    return wrapped
-                end
-                return old_index(self, key)
-            end))
-            Hooks.old_index = old_index
-            Remote.hooked = true
-        end)
-    end
-    -- Only count as installed if something actually took, so a failed attempt
-    -- can be retried.
+    -- Only count as installed if the hook actually took.
     Hooks.installed = Remote.hooked == true
 end
 
@@ -409,12 +372,13 @@ local function canParryNow()
     return false
 end
 
-if not (hookfunction or hookmetamethod) then
-    Notify("Blade Ball", "Couldn't hook remotes. Parries will use the block key.", 6)
+if not hookfunction then
+    Notify("Blade Ball", "No hookfunction in this executor. Remote mode can't arm; use Keypress mode (it's detectable).", 6)
 else
-    -- Up now so the next natural block press is read. The hooks are read-only and
-    -- come down the instant that packet is captured -- after that nothing of ours
-    -- is installed and parries go out as direct remote fires.
+    -- Up now so your next natural block press is read. One read-only FireServer
+    -- hook, nothing on any metamethod, so it can never sit on the sender's stack
+    -- during its scan. It comes down the instant the packet is captured -- after
+    -- that nothing of ours is installed and parries go out as direct remote fires.
     installRemoteHooks()
 end
 
@@ -2723,7 +2687,7 @@ end)
 
 local function remoteStatusText()
     if remoteReady() then return "Remote: armed. Parries fire the remote directly -- hooks removed, nothing for the anti-cheat to see" end
-    if not (hookfunction or hookmetamethod) then return "Remote: can't hook in this executor. Use Keypress mode (note: Keypress is detectable)" end
+    if not hookfunction then return "Remote: needs hookfunction (missing in this executor). Use Keypress mode (note: Keypress is detectable)" end
     return "Remote: not armed yet. Press block (F) ONCE to arm it -- we read that one real parry and remove the hooks. We never press block for you, so the anti-cheat's check never sees us. Until you block once, Remote-mode parries do nothing"
 end
 
