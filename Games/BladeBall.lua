@@ -6,7 +6,7 @@ task.spawn(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.07-24"
+local SCRIPT_VERSION = "2026.10.07-25"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -673,10 +673,21 @@ local function find_pry_module()
     return nil
 end
 
+-- Stage test (getgenv().BladeBallStageTest = true): arming runs one step at a
+-- time with a long idle gap after each, logged to flight.txt, so the step a
+-- kick follows is the one BAC catches.
+local function stage(n, what)
+    if not genv.BladeBallStageTest then return end
+    flight(("STAGE %d done: %s -- idling %ds before the next step"):format(n, what, 75))
+    Sender.info = ("stage test: step %d (%s) done, waiting"):format(n, what)
+    task.wait(75)
+end
+
 arm_sender = function()
     if Sender.fn then return true end
     local mod = find_pry_module()
     if not mod then Sender.info = "PRY module not loaded yet"; return false end
+    stage(1, "found the PRY ModuleScript (reads only)")
     -- A module the game already required comes back from the cache in well under
     -- a millisecond. A long require means the module body ran again (a second
     -- copy of PRY initialising), which is worth knowing if a kick follows.
@@ -688,6 +699,7 @@ arm_sender = function()
         Sender.info = "require(PRY) gave " .. (ok and type(fn) or "an error") .. " -- not firing"
         return false
     end
+    stage(2, "require(PRY)")
     CLEAN_ENV.script = mod.Parent -- game envs carry their script; the sender lives in SwordsController
     local clean, why, probe = env_is_clean()
     flight(("clean-thread probe: %s, depth=%s, identity=%s"):format(
@@ -696,8 +708,10 @@ arm_sender = function()
         Sender.info = "can't make a clean call thread (" .. tostring(why) .. ") -- not firing"
         return false
     end
+    stage(3, "clean-thread probe (setfenv / identity 2 on our own threads)")
     local src = debug.info(fn, "s") or "?"
     local np, va = debug.info(fn, "a")
+    stage(4, "debug.info on the sender")
     Sender.fn = fn
     Sender.info = ("game sender %s (%s params%s), base frame=%s, identity %s, require %.1fms"):format(
         src:match("[^%.]+%.[^%.]+$") or src, tostring(np), va and " + varargs" or "",
