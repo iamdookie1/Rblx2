@@ -6,7 +6,7 @@ task.spawn(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.07-47"
+local SCRIPT_VERSION = "2026.10.07-48"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -915,23 +915,21 @@ local function frame_dt() return math.clamp(props.__frame_dt or 1 / 60, 1 / 240,
 -- The game's sender picks one of two shapes at random for every parry:
 --   remote:FireServer(...)                       -> __namecall
 --   local f = remote.FireServer; f(remote, ...)  -> the FireServer function
--- Only the second is hooked. A __namecall hook is up during the game's whole
--- block press, including the namecall probe its press handler runs right before
--- sending (PluginManager():CreatePlugin() in an xpcall), and metamethod hooks
--- are what this anti-cheat has caught before. The FireServer hook only ever runs
--- inside the FireServer call itself -- after the sender's checks are done -- and
--- never during that probe. The cost: half the game's sends go the namecall way,
--- so capture takes about two presses (1.4s apart) instead of one. Once per
--- server; after it nothing is hooked. The hook exists only while a capture
--- press is in flight (0.35s at most) and comes off inside the very call that
--- delivers the packet. While it's up:
+-- Which one is hooked is the "Capture hook" setting (Namecall by default,
+-- FireServer, or Both). Each alone sees about half the sends, so capture can take
+-- two presses (1.4s apart); Both arms in one. Either way the hook exists only
+-- while a capture press is in flight (0.35s at most), comes off inside the very
+-- call that delivers the packet, and puts the original back exactly. Once per
+-- server; after it nothing is hooked. While it's up:
 --   * our own calls are waved through before anything else (checkcaller);
---   * every other FireServer call goes straight to the original;
+--   * every other call goes straight to the original;
 --   * nothing is altered or dropped -- the packet reaches the server untouched;
 --   * the decoy report remotes (JobId first) are never learned from.
 -- Nothing is read from the game's memory: the token key comes from the packet
 -- itself, token[i] = bxor((time[i] + i) % 256, key[i]), time = floor(now * 100).
 local hookfunction_, restore_ = hookfunction, restorefunction
+local hookmetamethod_, getnamecallmethod_ = hookmetamethod, getnamecallmethod
+local getrawmetatable_, setreadonly_ = getrawmetatable, setreadonly or make_writeable
 local checkcaller_ = checkcaller or function() return false end
 local newcclosure_ = newcclosure or function(f) return f end
 local select_, type_, typeof_, tostring_, floor_, byte_, bxor_, pcall_ =
@@ -942,12 +940,34 @@ local JOB_ID = game.JobId
 local FIRE_FN
 pcall(function() FIRE_FN = Remotes.ParrySuccess.FireServer end)
 if type(FIRE_FN) ~= 'function' then pcall(function() FIRE_FN = Instance.new("RemoteEvent").FireServer end) end
-local H = {fire = nil, want = false, until_t = 0}
+local H = {fire = nil, nc = nil, want = false, until_t = 0}
+
+-- Which hook(s) a capture press uses (Parry tab -> "Capture hook"):
+--   "Namecall"  -- __namecall only (catches remote:FireServer sends)
+--   "FireServer"-- the FireServer function only (catches f(remote, ...) sends)
+--   "Both"      -- both, so every press captures
+-- Each alone sees about half the game's sends, so it can take two presses.
+local function capture_method() return getgenv().CaptureHook or "Namecall" end
+Core.capture_method = capture_method
+
+-- __namecall goes back exactly: the original function object written straight
+-- into the metatable (hookmetamethod can re-wrap it on some executors).
+local function restore_namecall(original)
+    local ok = pcall_(function()
+        local mt = getrawmetatable_(game)
+        local was_ro = isreadonly and isreadonly(mt)
+        setreadonly_(mt, false)
+        rawset(mt, "__namecall", original)
+        if was_ro ~= false then setreadonly_(mt, true) end
+    end)
+    if not ok then pcall_(hookmetamethod_, game, "__namecall", original) end
+end
 
 local function unhook()
-    local fire = H.fire
-    H.fire, H.want = nil, false
+    local fire, nc = H.fire, H.nc
+    H.fire, H.nc, H.want = nil, nil, false
     if fire and not (restore_ and pcall_(restore_, FIRE_FN)) then pcall_(hookfunction_, FIRE_FN, fire) end
+    if nc then restore_namecall(nc) end
 end
 Core.unhook = unhook
 
@@ -982,20 +1002,33 @@ local function on_fire(self, ...)
     end
     return old(self, ...)
 end
+local function on_namecall(self, ...)
+    local old = H.nc
+    if H.want and not checkcaller_() and getnamecallmethod_() == "FireServer" and select_('#', ...) >= 6 then
+        pcall_(inspect, self, ...)
+        if not H.want then unhook() end
+    end
+    return old(self, ...)
+end
 
 -- Up for one capture press. A key press reaches the game's handler on the next
 -- frame and the send happens inside it, so 0.35s is plenty.
 local function arm()
     if Core.cap or not is_live() then return false end
     H.want, H.until_t = true, clock_() + 0.35
-    if H.fire then return true end
-    if hookfunction_ and FIRE_FN then
+    if H.fire or H.nc then return true end
+    local method = capture_method()
+    if method ~= "Namecall" and hookfunction_ and FIRE_FN then
         local ok, old = pcall(hookfunction_, FIRE_FN, newcclosure_(on_fire))
         if ok and type(old) == 'function' then H.fire = old end
     end
-    if not H.fire then H.want = false; return false end
+    if method ~= "FireServer" and hookmetamethod_ and getnamecallmethod_ then
+        local ok, old = pcall(hookmetamethod_, game, "__namecall", newcclosure_(on_namecall))
+        if ok and type(old) == 'function' then H.nc = old end
+    end
+    if not (H.fire or H.nc) then H.want = false; return false end
     task.spawn(function()
-        while H.fire and clock_() < H.until_t do task.wait() end
+        while (H.fire or H.nc) and clock_() < H.until_t do task.wait() end
         unhook()
     end)
     return true
@@ -1738,7 +1771,7 @@ RunService.Heartbeat:Connect(function()
             if table.concat(prev.key, ",") ~= keystr then list[#list + 1] = "KEY" end
             changed = table.concat(list, " ")
         end
-        flight(("CAPTURED: remote %s, id %s, %s server%s"):format(tostring(cap.remote.Name), tostring(cap.uid),
+        flight(("CAPTURED (%s hook): remote %s, id %s, %s server%s"):format(capture_method(), tostring(cap.remote.Name), tostring(cap.uid),
             cap.ball2 and "UseBall2" or "normal",
             prev and (changed ~= "" and (" -- CHANGED since last capture: " .. changed) or " -- same as last capture") or ""))
     end
@@ -2806,6 +2839,9 @@ AP:AddToggle("AutoParry", {Text = "Auto parry", Default = false, Callback = func
     if v then System.autoparry.start(); prime_remote() else System.autoparry.stop() end
     NotifyToggle("Auto Parry", v)
 end}):AddKeyPicker("AutoParryKey", {Default = "None", Mode = "Toggle", SyncToggleState = true, Text = "Auto parry"})
+AP:AddDropdown("CaptureHook", {Text = "Capture hook", Values = {"Namecall", "FireServer", "Both"}, Default = "Namecall",
+    Tooltip = "Which hook catches the one parry packet Remote mode needs (up for that press only). Namecall or FireServer alone may take two presses; Both arms in one. The flight log notes which one was on for every capture and kick.",
+    Callback = function(v) getgenv().CaptureHook = v end})
 AP:AddDropdown("ParryMode", {Text = "Parry mode", Values = {"Remote", "Keypress"}, Default = "Remote",
     Tooltip = "Remote fires the parry remote with your curve (hookless, sends exactly what the game sends). Keypress presses the block key (F).",
     Callback = function(v) getgenv().AutoParryMode = v end})
@@ -3242,7 +3278,8 @@ do
     local conns = {}
     table.insert(conns, GuiService.ErrorMessageChanged:Connect(function(msg)
         local reason = tostring(msg):match("BAC%s+%w-X(%d%d)")
-        flight("!!!! KICK / ERROR MESSAGE: " .. tostring(msg) .. (reason and (" [reason " .. reason .. "]") or ""))
+        flight("!!!! KICK / ERROR MESSAGE: " .. tostring(msg) .. (reason and (" [reason " .. reason .. "]") or "")
+            .. " [capture hook " .. tostring(getgenv().CaptureHook or "Namecall") .. "]")
     end))
     table.insert(conns, Remotes.ParrySuccess.OnClientEvent:Connect(function() flight("ParrySuccess received") end))
     local function where()
