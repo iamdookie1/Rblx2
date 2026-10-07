@@ -6,7 +6,7 @@ task.spawn(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.07-39"
+local SCRIPT_VERSION = "2026.10.07-40"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -158,7 +158,7 @@ end
 
 -- The parry core's shared state (see "PARRY CORE" further down). Declared here
 -- so the animation code and the UI, defined before the core, can reach it.
-local Core = {cap = nil, info = "not armed yet", told = false,
+local Core = {cap = nil, info = "not armed yet", told = false, interp = 0.14,
     cfg = {close_range = 20, instant = true, preparry = false, hit_zone = 4, instant_range = 8, sim_dt = 1 / 120}}
 local function remoteReady() return Core.cap ~= nil end
 -- Arms Remote mode by auto pressing block; defined in the parry core.
@@ -1224,8 +1224,19 @@ Remotes.ParrySuccess.OnClientEvent:Connect(function()
     local char = LocalPlayer.Character
     if not (char and char:IsDescendantOf(Workspace)) then return end
     G.active, G.cool = false, false
-    if Core.pending and Core.last_parry then
-        flight(("  -> landed %.3fs after the %s"):format(clock_() - Core.last_parry.t, Core.last_parry.via))
+    local lp = Core.last_parry
+    if Core.pending and lp then
+        local took = clock_() - lp.t
+        -- The success comes back half a round trip after the server saw the ball
+        -- touch us, so: server contact came (took - ping/2) after our send, while
+        -- we saw it due eta after it. The difference, less half a round trip
+        -- (the server sees the ball that much ahead anyway), is the interpolation
+        -- delay. Smoothed, clamped to sane bounds.
+        local sample = lp.info.eta - took
+        if lp.info.eta < 0.9 and took < 1 then
+            Core.interp = math.clamp(Core.interp * 0.7 + sample * 0.3, 0.02, 0.3)
+        end
+        flight(("  -> landed %.3fs after the %s (view lag now %.3fs)"):format(took, lp.via, Core.interp))
     end
     Core.pending, Core.misses = nil, 0
     for _, st in pairs(tracked) do
@@ -1382,23 +1393,27 @@ local function predict_contact(ball_pos, velocity, target, gap, turn, accel, hor
     return nil
 end
 
--- When to fire: `lead` seconds before contact (as we see it). The server sees
--- the ball half a round trip ahead of us and gets our parry half a round trip
--- late, so a parry sent `eta` before contact catches the ball when
---   ping <= eta <= ping + window          (window = this account's real n6)
--- The Accuracy slider picks where in that window contact lands: 1 = early in
--- the parry (85% of the window ahead), 100 = late (30%). Slow balls are held to
--- the middle (50%) -- their path and pace change most before they land, and an
--- early parry on a slow ball runs out and leaves you in the 1.3s lockout.
+-- When to fire: `lead` seconds before contact (as we see it). The ball we see
+-- is behind the server's by half a round trip PLUS Roblox's interpolation delay
+-- (it shows other objects slightly in the past so they move smoothly), and our
+-- parry reaches the server half a round trip late. So a parry sent `eta` before
+-- contact catches the ball when
+--   ping + interp <= eta <= ping + interp + window      (window = real n6)
+-- interp is measured from our own landed parries (Core.interp, see the
+-- ParrySuccess handler): the first logs showed ~0.12-0.18s on top of ping, and
+-- every parry fired with less lead than that went unanswered.
+-- The Accuracy slider picks where in the window contact lands: 1 = early in
+-- the parry (80% of the window ahead), 100 = late (25%). Slow balls are held to
+-- 45% -- their path and pace change most before they land.
 local function fire_lead(speed)
     local n6 = parry_window() or 0.5
     local acc = math.clamp(props.__accuracy or 50, 1, 100)
-    local frac = 0.85 - (acc - 1) / 99 * 0.55
-    frac = math.min(frac, 0.5 + 0.35 * math.clamp((speed - 40) / 120, 0, 1))
+    local frac = 0.8 - (acc - 1) / 99 * 0.55
+    frac = math.min(frac, 0.45 + 0.35 * math.clamp((speed - 40) / 120, 0, 1))
     local ping_term = props.__ping_compensation and ping_s() or ping_s() * 0.5
     local extra = math.clamp((props.__extra_distance or 0) / math.max(speed, 1), -0.15, 0.15)
     -- half a frame: the packet goes out at the end of the frame we decide in
-    return ping_term + n6 * frac + extra + frame_dt() * 0.5
+    return ping_term + Core.interp + n6 * frac + extra + frame_dt() * 0.5
 end
 -- Shown on the Status tab: how far out a ball at `speed` gets parried.
 function System.parry_distance(speed)
@@ -1468,9 +1483,9 @@ local function fire_for(st, now, via, info)
     if not ok then st.why = "couldn't send yet, retrying"; return false end
     if info then
         Core.last_parry = {t = now, via = via, info = info}
-        flight(("%s: eta %.3fs, fires at %.3fs, %.0f st/s, %.1f studs, ping %.0fms, window %.3f%s"):format(
-            via, info.eta, info.lead, info.speed, info.dist, pingMs(), parry_window() or -1,
-            Core.refresh and " (refresh press)" or ""))
+        flight(("%s: eta %.3fs, fires at %.3fs, %.0f st/s, %.1f studs, heading %.2f, line %.1f, ping %.0fms, window %.3f, view lag %.3f%s"):format(
+            via, info.eta, info.lead, info.speed, info.dist, info.heading or 0, math.min(info.miss or 0, 999), pingMs(),
+            parry_window() or -1, Core.interp, Core.refresh and " (refresh press)" or ""))
     end
     mark_parried(st, now)
     st.why = via == "auto parry" and "parried" or ("parried (" .. via .. ")")
@@ -1540,7 +1555,7 @@ local function decide(ball, st, root, now, via)
     end
     if eta > lead then return hold(("lands in %.2fs, firing at %.2fs"):format(eta, lead)) end
     return fire_for(st, now, via == "retarget" and "instant retarget" or "auto parry",
-        {eta = eta, lead = lead, speed = speed, dist = distance})
+        {eta = eta, lead = lead, speed = speed, dist = distance, heading = heading, miss = miss})
 end
 
 -- Pre-parry: the ball is on a player right next to us, about to reach them, and
