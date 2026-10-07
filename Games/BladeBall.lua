@@ -6,7 +6,7 @@ task.spawn(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.07-11"
+local SCRIPT_VERSION = "2026.10.07-12"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -383,13 +383,13 @@ local function canParryNow()
     return false
 end
 
-if not hookfunction then
-    Notify("Blade Ball", "No hookfunction in this executor. Remote mode can't arm; use Keypress mode (it's detectable).", 6)
+if type(getgc) ~= 'function' then
+    Notify("Blade Ball", "No getgc in this executor, so the hookless arm can't run. Use Keypress mode (note: Keypress is detectable).", 6)
 end
--- NOTE: we do NOT install at load. A hook that sits installed while idle is a
--- hook the anti-cheat's scan has all the time in the world to find. Instead the
--- hook goes up only for the few frames of a capture burst (see prime_remote),
--- then comes straight back down -- the smallest possible window.
+-- NOTE: nothing is hooked, ever. Remote mode arms by reading the parry closure
+-- out of getgc (arm_via_gc / prime_remote) -- no FireServer hook, no metamethod
+-- hook, no block press -- so the game's sender never runs on our account and
+-- there is nothing installed for the anti-cheat to scan for.
 
 -- Presses the block key via VirtualInputManager, which makes the game run its
 -- own PRY sender (and thus send a real parry). Used by Keypress mode every
@@ -493,12 +493,19 @@ local function fireParryRemote(curveCF)
         end
     end
     local args, remote = Remote.args, Remote.remote
+    -- uid: read live from the game's own holder when we have it (the game reads
+    -- it fresh every send and it can change per round), else the stored value.
+    local uid = args[2]
+    if Remote.uid_holder then
+        local ok_uid, fresh = pcall(function() return Remote.uid_holder[2][Remote.uid_holder[1]] end)
+        if ok_uid and fresh ~= nil then uid = fresh end
+    end
     -- The window the game sends: 0.5 for an established player. A packet caught
     -- during the game's first-parries boost carries more (up to 1.5) that the
     -- game itself stops sending after a few parries, so never send above 0.5.
     local window = type(args[4]) == 'number' and math.min(args[4], 0.5) or 0.5
     local flag = args[8]
-    local ok, token = pcall(tokenize, args[2])
+    local ok, token = pcall(tokenize, uid)
     if not ok then return false end
     if Remote.class_of ~= remote then
         Remote.class_of, Remote.is_event = remote, remote.ClassName == 'RemoteEvent'
@@ -516,13 +523,67 @@ local function fireParryRemote(curveCF)
     local sent
     if Remote.is_event then
         -- Same window number and flag the game itself sent, not hard-coded ones.
-        sent = pcall(fire_event, remote, args[1], args[2], token, window, cf, points, aim, flag)
+        sent = pcall(fire_event, remote, args[1], uid, token, window, cf, points, aim, flag)
     else
         -- InvokeServer yields; spawn it so a burst never stalls on a reply.
-        task.spawn(remote.InvokeServer, remote, args[1], args[2], token, window, cf, points, aim, flag)
+        task.spawn(remote.InvokeServer, remote, args[1], uid, token, window, cf, points, aim, flag)
         sent = true
     end
     return sent
+end
+
+-- ============================================================
+-- HOOKLESS ARM (getgc) -- nothing installed, nothing to detect
+-- ============================================================
+-- Read the parry packet's ingredients straight out of the live PRY send closure
+-- instead of hooking anything. One pass over getgc, done once, then we fire the
+-- remote ourselves forever after. No FireServer hook, no metamethod hook, no
+-- block press -- so the game's sender never runs on our account and there is
+-- nothing for the anti-cheat to find: not a hooked function, not our environment
+-- on its stack, nothing.
+--
+-- The send closure (ReplicatedStorage.Controllers."SwordsController ".PRY) is the
+-- one PRY function whose upvalues are, in source order:
+--   [1] parry RemoteEvent (full packet)   [4] key function (token)   [7] remote name
+--   [2] parry RemoteEvent (short packet)   [5] id for [1]             [8] id
+--   [3] table holding the uid: t[2][t[1]]  [6] Net object             [9] id
+-- We take [1] remote, [3] uid holder, [4] key fn, [5] id. window is 0.5 and flag
+-- is false -- exactly what the game sends for a normal established parry
+-- (every v190() call passes no argument, so flag = not not nil = false).
+local function looks_like_sender(ups)
+    return isRemoteEvent(ups[1]) and isRemoteEvent(ups[2])
+        and type(ups[3]) == 'table' and type(ups[4]) == 'function' and ups[5] ~= nil
+end
+local function arm_via_gc()
+    if remoteReady() then return true end
+    if type(getgc) ~= 'function' then return false end
+    local getups = (debug and debug.getupvalues) or getupvalues
+    if type(getups) ~= 'function' then return false end
+    local ok_scan, objs = pcall(getgc)
+    if not ok_scan or type(objs) ~= 'table' then return false end
+    for _, fn in ipairs(objs) do
+        if type(fn) == 'function' then
+            local ok_s, src = pcall(debug.info, fn, 's')
+            if ok_s and type(src) == 'string' and src:sub(-4) == '.PRY' then
+                local ok_u, ups = pcall(getups, fn)
+                if ok_u and type(ups) == 'table' and looks_like_sender(ups) then
+                    local remote, holder, keyfn, id = ups[1], ups[3], ups[4], ups[5]
+                    local ok_uid, uid = pcall(function() return holder[2][holder[1]] end)
+                    if ok_uid and uid ~= nil then
+                        Remote.token, Remote.remote, Remote.uid_holder = keyfn, remote, holder
+                        Remote.args = {id, uid, "", 0.5, "", "", "", false}
+                        local ok_t, tok = pcall(tokenize, uid)
+                        if ok_t and type(tok) == 'string' and #tok > 0 then
+                            return true
+                        end
+                        -- not the real sender after all; clear and keep scanning
+                        Remote.token, Remote.remote, Remote.uid_holder, Remote.args = nil, nil, nil, nil
+                    end
+                end
+            end
+        end
+    end
+    return false
 end
 
 -- ============================================================
@@ -944,57 +1005,35 @@ function System.parry.fast()
     System.__properties.__total_parries = System.__properties.__total_parries + 1
 end
 
--- FAST capture. The anti-cheat finds the hook if it is installed long enough for
--- its scan to run, so we keep the hook up for the shortest possible time:
---   install -> hammer the block key for a few frames to force the game to send a
---   parry -> the FireServer hook reads that one packet -> capture() tears the
---   hook down the instant it has it.
--- A whole burst is a fraction of a second, and the hook is gone the moment the
--- packet lands (usually the first or second frame). If a burst misses, we drop
--- the hook anyway, wait out the block cooldown, and try again -- the hook is
--- never left sitting idle. Once armed we never do this again: parries are direct
--- remote fires with nothing hooked.
-local fast_capturing = false
+-- Arm the remote WITHOUT hooking or pressing: read it straight from the live PRY
+-- closure via getgc (arm_via_gc). Retries while a parry feature is on and we
+-- haven't got it yet -- the closure exists as soon as SwordsController has run,
+-- so this usually succeeds on the first try, the instant the script loads into a
+-- match. Nothing is installed at any point, so there is no hook for the
+-- anti-cheat to find and nothing of ours ever touches the game's parry sender.
+local arming = false
 prime_remote = function()
-    if remoteReady() or not hookfunction or fast_capturing then return end
-    fast_capturing = true
+    if remoteReady() or arming then return end
+    arming = true
     task.spawn(function()
-        local rounds = 0
-        while not remoteReady() and not Library.Unloaded and rounds < 30 do
+        local tries = 0
+        while not remoteReady() and not Library.Unloaded and tries < 40 do
             local props = System.__properties
             if not (props.__autoparry_enabled or props.__triggerbot_enabled
                 or props.__auto_spam_enabled or props.__manual_spam_enabled) then break end
-            if canParryNow() and not UserInputService:GetFocusedTextBox() then
-                installRemoteHooks()
-                if Hooks.installed then
-                    -- One press forces one send; the hook reads it within a frame
-                    -- or two. We don't hammer -- fewer sends is fewer chances for
-                    -- the sender's own check to run with our press on its stack.
-                    ParryLog.source = "remote grab press"
-                    pressBlockKey()
-                    ParryLog.source = nil
-                    local deadline = os.clock() + 0.2
-                    while not remoteReady() and Hooks.installed and os.clock() < deadline
-                        and not Library.Unloaded do
-                        RunService.RenderStepped:Wait()
-                    end
-                    if Hooks.installed then uninstallRemoteHooks() end -- never leave it up
-                end
-                rounds = rounds + 1
-                -- If we missed, a real parry still went out, so we're in the
-                -- game's ~1.3s block cooldown -- pressing sooner just sends
-                -- nothing. Wait it out before the next try.
-                if not remoteReady() then task.wait(1.3) end
-            else
-                task.wait(0.2)
+            local ok, got = pcall(arm_via_gc)
+            if ok and got and remoteReady() then
+                Notify("Blade Ball", "Remote armed (hookless). Parries fire direct -- nothing is hooked.", 3)
+                break
             end
+            tries = tries + 1
+            task.wait(0.5)
         end
-        fast_capturing = false
+        if not remoteReady() and (type(getgc) ~= 'function') then
+            Notify("Blade Ball", "This executor has no getgc, so the hookless arm can't run. Remote mode is unavailable here.", 6)
+        end
+        arming = false
     end)
-end
-function System.parry.execute_action() System.animation.play_grab_parry(); System.parry.execute() end
-function System.parry.by_mode(mode)
-    if mode == "Keypress" then System.parry.keypress() else System.parry.execute_action() end
 end
 function System.parry.execute_action() System.animation.play_grab_parry(); System.parry.execute() end
 function System.parry.by_mode(mode)
@@ -2732,9 +2771,9 @@ task.spawn(function()
 end)
 
 local function remoteStatusText()
-    if remoteReady() then return "Remote: armed. Parries fire the remote directly -- hooks removed, nothing for the anti-cheat to see" end
-    if not hookfunction then return "Remote: needs hookfunction (missing in this executor). Use Keypress mode (note: Keypress is detectable)" end
-    return "Remote: arming... the hook goes up for a split second, forces one parry to read the packet, then comes straight down. Minimal window for the anti-cheat to catch it. Parries fire direct once armed"
+    if remoteReady() then return "Remote: armed (hookless). Parries fire the remote directly -- nothing is hooked, nothing for the anti-cheat to see" end
+    if type(getgc) ~= 'function' then return "Remote: needs getgc (missing in this executor). Use Keypress mode (note: Keypress is detectable)" end
+    return "Remote: arming hooklessly -- reading the parry closure out of getgc, no hook and no block press. Done the moment you're in a match. Parries fire direct once armed"
 end
 
 local status_peak, status_ball = 0, nil
