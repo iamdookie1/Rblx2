@@ -6,7 +6,7 @@ task.spawn(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.07-28"
+local SCRIPT_VERSION = "2026.10.07-29"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -689,7 +689,7 @@ local ARM_AFTER, ARM_GAP = 40, 10
 local function stage(n, what)
     local gap = genv.BladeBallStageTest and 75 or ARM_GAP
     flight(("arm step %d done: %s -- next step in %ds"):format(n, what, gap))
-    Sender.info = ("arming: step %d of 4 done (%s)"):format(n, what)
+    Sender.info = ("arming: step %d of 3 done (%s)"):format(n, what)
     task.wait(gap)
 end
 
@@ -725,13 +725,11 @@ arm_sender = function()
         return false
     end
     stage(3, "clean-thread probe (setfenv / identity 2 on our own threads)")
-    local src = debug.info(fn, "s") or "?"
-    local np, va = debug.info(fn, "a")
-    stage(4, "debug.info on the sender")
+    -- Nothing reads the sender itself (no debug.info on it): it was only used for
+    -- this status text, so it's gone.
     Sender.fn = fn
-    Sender.info = ("game sender %s (%s params%s), base frame=%s, identity %s, require %.1fms"):format(
-        src:match("[^%.]+%.[^%.]+$") or src, tostring(np), va and " + varargs" or "",
-        probe.depth == 1 and "yes" or ("no, depth " .. tostring(probe.depth)), tostring(probe.ident), ms)
+    Sender.info = ("game sender from %s.PRY, base frame=%s, identity %s, require %.1fms"):format(
+        mod.Parent.Name, probe.depth == 1 and "yes" or ("no, depth " .. tostring(probe.depth)), tostring(probe.ident), ms)
     return true
 end
 
