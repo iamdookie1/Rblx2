@@ -6,7 +6,7 @@ task.spawn(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.07-50"
+local SCRIPT_VERSION = "2026.10.07-51"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -963,17 +963,10 @@ local function restore_namecall(original)
     if not ok then pcall_(hookmetamethod_, game, "__namecall", original) end
 end
 
-local function unhook()
-    local fire, nc = H.fire, H.nc
-    H.fire, H.nc, H.want = nil, nil, false
-    if fire and not (restore_ and pcall_(restore_, FIRE_FN)) then pcall_(hookfunction_, FIRE_FN, fire) end
-    if nc then restore_namecall(nc) end
-end
-Core.unhook = unhook
-
--- Runs inside the game's own send: copies values, nothing else.
-local function learn(remote, hash, uid, token, a4)
-    local text = tostring_(floor_(Workspace:GetServerTimeNow() * 100))
+-- Builds the capture from a send, on OUR thread (never inside the game's call).
+-- t is the server time the hook read at the moment of the send.
+local function learn(remote, hash, uid, token, a4, t)
+    local text = tostring_(floor_(t * 100))
     if #token ~= #text then return end
     local key = {}
     for i = 1, #text do key[i] = bxor_(byte_(token, i), (byte_(text, i) + i) % 256) end
@@ -981,55 +974,134 @@ local function learn(remote, hash, uid, token, a4)
     Core.cap = {remote = remote, hash = hash, uid = uid, key = key, len = #text, ball2 = typeof_(a4) == "CFrame"}
     Core.misses, Core.pending = 0, nil
     Core.new_capture = {prev = prev}
-    H.want = false
 end
 
 -- A real parry: (hash, id, token, window, cameraCF, points, aim, flag), or on
--- UseBall2 servers (hash, id, token, cameraCF, mouseCF, flag).
-local function inspect(self, a1, a2, a3, a4, a5)
+-- UseBall2 servers (hash, id, token, cameraCF, mouseCF, flag). Decoy reports
+-- (JobId first) never match.
+local function inspect(entry)
+    local self, a = entry[1], entry[3]
+    local a1, a2, a3, a4, a5 = a[1], a[2], a[3], a[4], a[5]
     if typeof_(self) == 'Instance' and self.ClassName == 'RemoteEvent'
         and type_(a1) == 'string' and #a1 == 36 and a1 ~= JOB_ID and type_(a2) == 'string' and type_(a3) == 'string'
         and ((type_(a4) == 'number' and typeof_(a5) == 'CFrame') or (typeof_(a4) == 'CFrame' and typeof_(a5) == 'CFrame')) then
-        learn(self, a1, a2, a3, a4)
+        learn(self, a1, a2, a3, a4, entry[4])
+        return true
+    end
+    return false
+end
+
+-- ISOLATED HOOK BODIES. While a hook is running it sits on the game's call
+-- stack, where the game can look at it (getfenv / debug.info -- its press
+-- handler's namecall probe errors on purpose with our namecall hook on the
+-- stack). So the body is:
+--   * compiled with loadstring under the chunk name of the game's own Net
+--     module, so debug.info shows a game path, not our script;
+--   * run in a clean game environment (getrenv's globals, no writefile, nothing
+--     of ours), so getfenv on its frame shows nothing of ours;
+--   * cut off from us: it calls none of our functions -- it drops the send into
+--     `box` (a plain table) and passes the call straight on. Our own thread
+--     picks the box up a frame later, works out the key and takes the hook down.
+--   * free of namecalls: it reads the server time with a dot-call
+--     (GetServerTimeNow(ws)), because a namecall inside a __namecall hook
+--     overwrites the method the game's call is waiting on -- the old body did
+--     that (Workspace:GetServerTimeNow() via learn), which could turn the
+--     game's FireServer into GetServerTimeNow on the remote mid-send.
+local box = {want = false, nc = nil, fire = nil, list = {}, ws = Workspace, now = Workspace.GetServerTimeNow}
+local HOOK_NAME = "=ReplicatedStorage.Packages._Index.sleitnick_net@0.1.0.net"
+local NC_SRC = [[
+local box, getncm, sel = ...
+return function(self, ...)
+    local l = box.list
+    if box.want and #l < 4 and getncm() == "FireServer" and sel("#", ...) >= 6 then
+        l[#l + 1] = {self, sel("#", ...), {...}, box.now(box.ws)}
+    end
+    return box.nc(self, ...)
+end]]
+local FIRE_SRC = [[
+local box, sel = ...
+return function(self, ...)
+    local l = box.list
+    if box.want and #l < 4 and sel("#", ...) >= 6 then
+        l[#l + 1] = {self, sel("#", ...), {...}, box.now(box.ws)}
+    end
+    return box.fire(self, ...)
+end]]
+local CLEAN_ENV
+do
+    local ok, renv = pcall(function() return getrenv and getrenv() end)
+    CLEAN_ENV = (ok and type(renv) == 'table' and renv.writefile == nil) and setmetatable({}, {__index = renv}) or {}
+end
+local function build_body(src, ...)
+    local args = table.pack(...)
+    local ok, fn = pcall(function()
+        local factory = loadstring(src, HOOK_NAME)
+        if setfenv then setfenv(factory, CLEAN_ENV) end
+        return factory(table.unpack(args, 1, args.n))
+    end)
+    return ok and type(fn) == 'function' and fn or nil
+end
+local NC_BODY = build_body(NC_SRC, box, getnamecallmethod_ or function() return nil end, select)
+local FIRE_BODY = build_body(FIRE_SRC, box, select)
+Core.isolated = NC_BODY ~= nil and FIRE_BODY ~= nil
+-- No loadstring on this executor: same bodies, just not disguised.
+if not NC_BODY then
+    NC_BODY = function(self, ...)
+        local l = box.list
+        if box.want and #l < 4 and getnamecallmethod_() == "FireServer" and select_("#", ...) >= 6 then
+            l[#l + 1] = {self, select_("#", ...), {...}, box.now(box.ws)}
+        end
+        return box.nc(self, ...)
+    end
+end
+if not FIRE_BODY then
+    FIRE_BODY = function(self, ...)
+        local l = box.list
+        if box.want and #l < 4 and select_("#", ...) >= 6 then
+            l[#l + 1] = {self, select_("#", ...), {...}, box.now(box.ws)}
+        end
+        return box.fire(self, ...)
     end
 end
 
-local function on_fire(self, ...)
-    local old = H.fire
-    if H.want and not checkcaller_() and select_('#', ...) >= 6 then
-        pcall_(inspect, self, ...)
-        if not H.want then unhook() end
-    end
-    return old(self, ...)
+local function unhook()
+    local fire, nc = H.fire, H.nc
+    H.fire, H.nc, H.want, box.want = nil, nil, false, false
+    if fire and not (restore_ and pcall_(restore_, FIRE_FN)) then pcall_(hookfunction_, FIRE_FN, fire) end
+    if nc then restore_namecall(nc) end
+    box.nc, box.fire = nil, nil
 end
-local function on_namecall(self, ...)
-    local old = H.nc
-    if H.want and not checkcaller_() and getnamecallmethod_() == "FireServer" and select_('#', ...) >= 6 then
-        pcall_(inspect, self, ...)
-        if not H.want then unhook() end
-    end
-    return old(self, ...)
-end
+Core.unhook = unhook
 
--- Up for one capture press. A key press reaches the game's handler on the next
--- frame and the send happens inside it, so 0.35s is plenty.
+-- Up for one capture press (0.35s at most). Our thread watches the box every
+-- frame: the first real parry in it becomes the capture and the hook comes off.
 local function arm()
     if Core.cap or not is_live() then return false end
     H.want, H.until_t = true, clock_() + 0.35
     if H.fire or H.nc then return true end
+    box.list = {}
     local method = capture_method()
     if method ~= "Namecall" and hookfunction_ and FIRE_FN then
-        local ok, old = pcall(hookfunction_, FIRE_FN, newcclosure_(on_fire))
-        if ok and type(old) == 'function' then H.fire = old end
+        local ok, old = pcall(hookfunction_, FIRE_FN, newcclosure_(FIRE_BODY))
+        if ok and type(old) == 'function' then H.fire, box.fire = old, old end
     end
     if method ~= "FireServer" and hookmetamethod_ and getnamecallmethod_ then
-        local ok, old = pcall(hookmetamethod_, game, "__namecall", newcclosure_(on_namecall))
-        if ok and type(old) == 'function' then H.nc = old end
+        local ok, old = pcall(hookmetamethod_, game, "__namecall", newcclosure_(NC_BODY))
+        if ok and type(old) == 'function' then H.nc, box.nc = old, old end
     end
     if not (H.fire or H.nc) then H.want = false; return false end
+    box.want = true
     task.spawn(function()
-        while (H.fire or H.nc) and clock_() < H.until_t do task.wait() end
+        while (H.fire or H.nc) and clock_() < H.until_t do
+            task.wait()
+            local l = box.list
+            for i = 1, #l do
+                if pcall_(inspect, l[i]) and Core.cap then break end
+            end
+            if Core.cap then break end
+        end
         unhook()
+        box.list = {}
     end)
     return true
 end
@@ -2050,7 +2122,7 @@ RunService.Heartbeat:Connect(function()
             if table.concat(prev.key, ",") ~= keystr then list[#list + 1] = "KEY" end
             changed = table.concat(list, " ")
         end
-        flight(("CAPTURED (%s hook): remote %s, id %s, %s server%s"):format(capture_method(), tostring(cap.remote.Name), tostring(cap.uid),
+        flight(("CAPTURED (%s hook%s): remote %s, id %s, %s server%s"):format(capture_method(), Core.isolated and ", isolated" or ", NOT isolated", tostring(cap.remote.Name), tostring(cap.uid),
             cap.ball2 and "UseBall2" or "normal",
             prev and (changed ~= "" and (" -- CHANGED since last capture: " .. changed) or " -- same as last capture") or ""))
     end
