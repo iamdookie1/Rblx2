@@ -6,7 +6,7 @@ task.spawn(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.07-35"
+local SCRIPT_VERSION = "2026.10.07-36"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -1869,12 +1869,29 @@ local function try_parry_ball(ball, root, now, via)
 
     -- Already reached us this pass: it hit, or a parry is landing. Nothing left
     -- to parry; firing here was the "parried after getting hit".
-    if distance <= APCfg.hit_radius then state.reached_at = now end
-    if state.reached_at and now - state.reached_at < ping_s + 0.3 then return hold("already reached you") end
+    -- Only once it has gone past us (moving away): right up close an unparried
+    -- ball is still ours to parry, and holding there was the close-range blind
+    -- spot (anything within 3 studs sat out ping + 0.3s).
+    if distance <= APCfg.hit_radius and heading < 0 then state.reached_at = now end
+    if state.reached_at and heading < 0 and now - state.reached_at < ping_s + 0.3 then return hold("already reached you") end
 
     -- Anti curve: eta comes from flying the ball forward along its real curve
     -- (ball_contact_eta). No eta means it won't land inside a parry from here --
     -- flying away, or still swinging round (bait) -- so hold until it will.
+    -- Close range: no waiting for the accuracy window. A ball coming in from
+    -- close that lands inside one parry is parried on the spot -- up close a curve
+    -- has no room to matter and every frame waited is reaction time lost.
+    if distance <= APCfg.close_range and heading > 0.2 then
+        local straight = time_to_contact(distance, ball, speed, accel)
+        if straight <= window then
+            if not fire_parry(via or "close range") then return hold("press gate shut, retrying next frame") end
+            state.parried, state.at = true, now
+            state.pass_parried = true
+            mark_parry(straight)
+            state.why = "parried (close range)"
+            return true
+        end
+    end
     -- Safety net: a curve wrapped in so tight it's about to touch us gets parried
     -- now, whatever the prediction says.
     if not eta and heading > -0.3 and distance <= contact_gap(ball) + speed * (ping_s + props.__frame_dt * 2) then eta = 0 end
@@ -1983,9 +2000,14 @@ function System.autoparry.on_retarget(ball)
     if not root then return end
     local distance = (root.Position - ball.Position).Magnitude
     local speed = ball_velocity(ball).Magnitude
-    local window = lead_window(speed) + math.min(pingMs(), 400) / 1000
-    local instant = distance <= APCfg.close_range
-        or (speed > 1 and 2 * distance / speed <= window)
+    -- Instant only when there's no time to look: the ball reaches us within a
+    -- round trip plus a couple of frames (or it's point blank). Anything with
+    -- more time than that goes through the normal checks right now, which time
+    -- it properly instead of parrying early -- instant retarget was taking balls
+    -- auto parry should have had, and the early parry ran out before they landed.
+    local react = math.min(pingMs(), 400) / 1000 + System.__properties.__frame_dt * 2 + 0.03
+    local reach = speed > 1 and math.max(distance - contact_gap(ball), 0) / speed or math.huge
+    local instant = distance <= 8 or reach <= react
     pcall(try_parry_ball, ball, root, tick(), instant and "instant retarget" or "retarget")
 end
 
@@ -2001,24 +2023,40 @@ Remotes.ParrySuccessAll.OnClientEvent:Connect(function()
     if System.__properties.__grab_animation then pcall(function() System.__properties.__grab_animation:Stop() end) end
 end)
 
+-- Checked at four points of every frame (simulation, heartbeat, render,
+-- animation), not once: the ball's newest replicated position is acted on at
+-- the first point after it lands, so a parry goes out up to a frame sooner.
+-- One parry per pass, so the extra checks can't double up.
+local AP_SIGNALS = {"PreSimulation", "Heartbeat", "PreRender", "PreAnimation"}
 function System.autoparry.start()
-    if System.__properties.__connections.__autoparry then return end
+    local conns = System.__properties.__connections
+    if conns.__autoparry then return end
     local last_error
-    System.__properties.__connections.__autoparry = RunService.PreSimulation:Connect(function(dt)
-        if dt then System.__properties.__frame_dt = dt end
+    local function run()
         local ok, err = pcall(System.autoparry.step)
         if not ok and err ~= last_error then
             last_error = err
             warn("[Blade Ball] auto parry: " .. tostring(err))
         end
+    end
+    conns.__autoparry = RunService.PreSimulation:Connect(function(dt)
+        if dt then System.__properties.__frame_dt = dt end
+        run()
     end)
+    conns.__autoparry_extra = {}
+    for i = 2, #AP_SIGNALS do
+        pcall(function() table.insert(conns.__autoparry_extra, RunService[AP_SIGNALS[i]]:Connect(run)) end)
+    end
 end
 
 function System.autoparry.stop()
-    if System.__properties.__connections.__autoparry then
-        System.__properties.__connections.__autoparry:Disconnect()
-        System.__properties.__connections.__autoparry = nil
+    local conns = System.__properties.__connections
+    if conns.__autoparry then
+        conns.__autoparry:Disconnect()
+        conns.__autoparry = nil
     end
+    for _, c in ipairs(conns.__autoparry_extra or {}) do pcall(function() c:Disconnect() end) end
+    conns.__autoparry_extra = nil
 end
 
 -- ============================================================
@@ -3481,7 +3519,13 @@ Library:OnUnload(function()
     System.__properties.__auto_spam_enabled = false
     System.__properties.__show_ping = false
     AutoJump = false
-    for _, conn in pairs(System.__properties.__connections) do pcall(function() conn:Disconnect() end) end
+    for _, conn in pairs(System.__properties.__connections) do
+        if type(conn) == 'table' then
+            for _, c in ipairs(conn) do pcall(function() c:Disconnect() end) end
+        else
+            pcall(function() conn:Disconnect() end)
+        end
+    end
     for _, conn in pairs(Connections_Manager) do pcall(function() conn:Disconnect() end) end
     for _, gui in pairs(System.__properties.__mobile_guis) do destroy_mobile_gui(gui) end
     if System.__properties.__ball_velocity_gui then pcall(function() System.__properties.__ball_velocity_gui.gui:Destroy() end) end
