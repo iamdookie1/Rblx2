@@ -6,7 +6,7 @@ task.spawn(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.07-21"
+local SCRIPT_VERSION = "2026.10.07-22"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -19,6 +19,31 @@ local INSTANCE = {}
 genv.__BladeBallInstance = INSTANCE
 local function is_live() return genv.__BladeBallInstance == INSTANCE end
 
+-- Flight recorder: a timestamped timeline of what this copy did, written to
+-- BladeBall/flight.txt as it happens (a fresh file each run). When a kick comes,
+-- its message lands in the same file, so the lines right above it show exactly
+-- what ran before it. Writing a file is executor-side only; the game can't see it.
+local flight
+do
+    local PATH, t0, started, buf = "BladeBall/flight.txt", os.clock(), false, {}
+    flight = function(msg)
+        pcall(function()
+            local line = ("[%9.3f] %s\n"):format(os.clock() - t0, tostring(msg))
+            if not started then
+                started = true
+                if isfolder and makefolder and not isfolder("BladeBall") then makefolder("BladeBall") end
+                writefile(PATH, line)
+            elseif appendfile then
+                appendfile(PATH, line)
+            else
+                table.insert(buf, line)
+                if #buf > 400 then table.remove(buf, 1) end
+                writefile(PATH, table.concat(buf))
+            end
+        end)
+    end
+end
+
 -- Parry log: every parry this copy sends, where it came from, which pass at you
 -- it was for. Spam sources are only counted (they fire hundreds a second).
 local ParryLog = {entries = {}, source = nil, spam = 0, total = 0, doubles = 0, describe = nil}
@@ -27,6 +52,7 @@ local function log_send(how)
     local src = ParryLog.source or "unknown"
     if SPAM_SOURCES[src] then ParryLog.spam = ParryLog.spam + 1; return end
     ParryLog.total = ParryLog.total + 1
+    flight(("send #%d (%s via %s)"):format(ParryLog.total, src, tostring(how)))
     local info = ParryLog.describe and ParryLog.describe() or {}
     local entry = {t = os.clock(), src = src, how = how, pass = info.pass, dist = info.dist, heading = info.heading}
     local last = ParryLog.entries[#ParryLog.entries]
@@ -577,45 +603,58 @@ end
 -- Everything the clean-thread code touches is captured as an upvalue, so it
 -- never needs a global from the clean environment.
 local setfenv_, getfenv_, pcall_, spawn_, type_, debug_ = setfenv, getfenv, pcall, task.spawn, type, debug
+local tostring_ = tostring
+-- Game scripts run at thread identity 2; executor threads run far higher, and a
+-- privileged-access probe inside the virtualized sender would see that. Threads
+-- copy their parent's identity, so the launcher drops to 2 before spawning.
+local setident_ = setthreadidentity or setidentity or set_thread_identity
+local getident_ = getthreadidentity or getidentity or get_thread_identity
 
+-- The launcher only prepares the thread: clean globals (setfenv(0)) and identity
+-- 2. Then it task.spawns the game's sender, so the sender is the BASE frame of
+-- its own new thread -- that thread copies the launcher's globals and identity,
+-- and has no function of ours anywhere on its stack, at any level.
 local function call_clean(fn, a, b, c, d, e)
-    local runner = function()
+    spawn_(function()
         if not pcall_(setfenv_, 0, CLEAN_ENV) then return end
-        fn(a, b, c, d, e)
-    end
-    if not pcall_(setfenv_, runner, CLEAN_ENV) then return false end
-    spawn_(runner)
+        if setident_ then pcall_(setident_, 2) end
+        spawn_(fn, a, b, c, d, e)
+    end)
     return true
 end
 
--- Replica of the sender's check, run on a thread built exactly like call_clean's:
--- anon closure -> pcall (C) -> sender stand-in -> runner. The stand-in gets a
--- clean env like the real sender's, and closures it creates inherit it.
+-- Replica of the sender's check, run on a thread built exactly like call_clean's,
+-- with a stand-in for the sender as the base frame: anon closure -> pcall (C) ->
+-- stand-in. The stand-in gets a clean env like the real sender's game env, and
+-- closures it creates inherit it. Also reports what the sender will see: its
+-- stack depth (1 = nothing under it) and its thread identity.
 local function env_is_clean()
-    local res = {done = false, clean = false, info_c = false}
+    local res = {done = false, clean = false, info_c = false, depth = -1, ident = "?"}
     local stand_in = function()
         local dirty = false
         for i = 1, 10 do
             local ok, r = pcall_(function() return getfenv_(i) end)
             if ok and type_(r) == 'table' and r.writefile then dirty = true end
         end
-        return not dirty
-    end
-    local runner = function()
-        if not pcall_(setfenv_, 0, CLEAN_ENV) then return end
-        res.clean = stand_in()
+        res.clean = not dirty
         local dbg = CLEAN_ENV.debug or debug_
         local okc, isC = pcall_(function() return dbg.info(dbg.info, "s") == "[C]" end)
         res.info_c = okc and isC
+        local depth = 1
+        while depth < 12 and debug_.info(depth + 1, "f") do depth = depth + 1 end
+        res.depth = depth
+        if getident_ then
+            local oki, id = pcall_(getident_)
+            if oki then res.ident = tostring_(id) end
+        end
         res.done = true
     end
-    if not pcall_(setfenv_, stand_in, CLEAN_ENV) then return false, "setfenv blocked" end
-    if not pcall_(setfenv_, runner, CLEAN_ENV) then return false, "setfenv blocked" end
-    spawn_(runner) -- task.spawn runs it immediately, up to its first yield (none)
-    if not res.done then return false, "setfenv(0) blocked" end
-    if not res.clean then return false, "a stack level still shows writefile" end
-    if not res.info_c then return false, "debug.info isn't a C function here" end
-    return true
+    if not pcall_(setfenv_, stand_in, CLEAN_ENV) then return false, "setfenv blocked", res end
+    call_clean(stand_in) -- task.spawn runs both threads immediately (neither yields)
+    if not res.done then return false, "setfenv(0) blocked", res end
+    if not res.clean then return false, "a stack level still shows writefile", res end
+    if not res.info_c then return false, "debug.info isn't a C function here", res end
+    return true, nil, res
 end
 
 local function find_pry_module()
@@ -634,12 +673,21 @@ arm_sender = function()
     if Sender.fn then return true end
     local mod = find_pry_module()
     if not mod then Sender.info = "PRY module not loaded yet"; return false end
+    -- A module the game already required comes back from the cache in well under
+    -- a millisecond. A long require means the module body ran again (a second
+    -- copy of PRY initialising), which is worth knowing if a kick follows.
+    local t = os.clock()
     local ok, fn = pcall(require, mod)
+    local ms = (os.clock() - t) * 1000
+    flight(("require(PRY): %s in %.2f ms"):format(ok and type(fn) or ("error " .. tostring(fn)), ms))
     if not ok or type(fn) ~= 'function' then
         Sender.info = "require(PRY) gave " .. (ok and type(fn) or "an error") .. " -- not firing"
         return false
     end
-    local clean, why = env_is_clean()
+    CLEAN_ENV.script = mod.Parent -- game envs carry their script; the sender lives in SwordsController
+    local clean, why, probe = env_is_clean()
+    flight(("clean-thread probe: %s, depth=%s, identity=%s"):format(
+        clean and "clean" or tostring(why), tostring(probe.depth), tostring(probe.ident)))
     if not clean then
         Sender.info = "can't make a clean call thread (" .. tostring(why) .. ") -- not firing"
         return false
@@ -647,8 +695,9 @@ arm_sender = function()
     local src = debug.info(fn, "s") or "?"
     local np, va = debug.info(fn, "a")
     Sender.fn = fn
-    Sender.info = ("game sender %s (%s params%s), clean thread verified"):format(
-        src:match("[^%.]+%.[^%.]+$") or src, tostring(np), va and " + varargs" or "")
+    Sender.info = ("game sender %s (%s params%s), base frame=%s, identity %s, require %.1fms"):format(
+        src:match("[^%.]+%.[^%.]+$") or src, tostring(np), va and " + varargs" or "",
+        probe.depth == 1 and "yes" or ("no, depth " .. tostring(probe.depth)), tostring(probe.ident), ms)
     return true
 end
 
@@ -955,14 +1004,14 @@ System.ball = {}
 function System.ball.get()
     local balls = Workspace:FindFirstChild('Balls'); if not balls then return nil end
     for _, ball in pairs(balls:GetChildren()) do
-        if ball:GetAttribute('realBall') then ball.CanCollide = false; return ball end
+        if ball:GetAttribute('realBall') then return ball end
     end; return nil
 end
 function System.ball.get_all()
     local balls_table = {}; local balls = Workspace:FindFirstChild('Balls')
     if not balls then return balls_table end
     for _, ball in pairs(balls:GetChildren()) do
-        if ball:GetAttribute('realBall') then ball.CanCollide = false; table.insert(balls_table, ball) end
+        if ball:GetAttribute('realBall') then table.insert(balls_table, ball) end
     end; return balls_table
 end
 
@@ -1137,6 +1186,7 @@ prime_remote = function()
             local ok, got = pcall(arm_sender)
             if ok and got then
                 Notify("Blade Ball", "Remote armed: " .. tostring(Sender.info), 4)
+                flight("ARMED: " .. tostring(Sender.info))
                 break
             end
             -- a missing module is worth waiting for; anything else won't fix itself
@@ -1146,6 +1196,7 @@ prime_remote = function()
         end
         if not remoteReady() then
             Notify("Blade Ball", "Remote not armed: " .. tostring(Sender.info), 8)
+            flight("NOT ARMED: " .. tostring(Sender.info))
         end
         arming = false
     end)
@@ -3363,6 +3414,48 @@ end)
 genv.__BladeBallShutdown = function()
     pcall(function() Library:Unload() end)
     if genv.__BladeBallInstance == INSTANCE then genv.__BladeBallInstance = nil end
+end
+
+-- Flight recorder: kick message, a heartbeat, and every toggle change.
+do
+    local GuiService = cloneref(game:GetService('GuiService'))
+    local exec = "?"
+    pcall(function() exec = table.concat({identifyexecutor()}, " ") end)
+    flight(("==== v%s loaded | executor %s | place %s | userId %s"):format(
+        SCRIPT_VERSION, exec, tostring(game.PlaceId), tostring(LocalPlayer.UserId)))
+    local conns = {}
+    table.insert(conns, GuiService.ErrorMessageChanged:Connect(function(msg)
+        flight("!!!! KICK / ERROR MESSAGE: " .. tostring(msg))
+    end))
+    table.insert(conns, Remotes.ParrySuccess.OnClientEvent:Connect(function() flight("ParrySuccess received") end))
+    local function where()
+        local char = LocalPlayer.Character
+        local alive = char and char.Parent == Alive
+        local balls = Workspace:FindFirstChild('Balls')
+        return ("%s, %d ball(s)"):format(alive and "in match" or "lobby/dead", balls and #balls:GetChildren() or 0)
+    end
+    task.spawn(function()
+        local on, last_spam, beat = {}, 0, 0
+        while is_live() and not Library.Unloaded do
+            for name, t in pairs(Toggles) do
+                local v = type(t) == 'table' and t.Value == true
+                if v ~= (on[name] == true) then
+                    on[name] = v
+                    flight(("toggle %s = %s"):format(tostring(name), v and "ON" or "OFF"))
+                end
+            end
+            beat = beat + 1
+            if beat % 5 == 0 or ParryLog.spam ~= last_spam then
+                flight(("beat: %s | sends %d, spam sends %d | modes parry=%s spam=%s | remote %s"):format(
+                    where(), ParryLog.total, ParryLog.spam, tostring(getgenv().AutoParryMode),
+                    tostring(getgenv().ManualSpamMode), remoteReady() and "armed" or tostring(Sender.info)))
+                last_spam = ParryLog.spam
+            end
+            task.wait(1)
+        end
+        for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
+        flight("==== unloaded")
+    end)
 end
 
 UIReady = true
