@@ -1,19 +1,23 @@
 -- Blade Ball Lite: auto parry and nothing else.
--- No UI library, no ESP, no spam, no file writes, no hooks, no getgc.
--- A baseline: if this stays clean where the full script gets kicked, the kick
--- comes from something the full script adds, not from how it parries.
+-- No UI library, no ESP, no spam, no file writes, no getgc, no upvalue reads,
+-- and the game's own code is never called to parry.
 --
--- Parries through the game's own sender (require of SwordsController's PRY,
--- the cached module value), called the way the game calls it:
---   * on its own thread, at identity 2, with clean thread globals
---   * the game's press gate (window / lockout / landed-parry reset)
---   * the game's parry swing played right after each send
---   * the real per-account parry window
--- Re-executing stops the previous copy.
+-- How it parries (lite-2), the way first-parry auto parries do it:
+--   1. YOU block once. The instant you touch the screen or press a key, a hook
+--      goes on the remote's FireServer. The game's own parry packet passes
+--      through it; the hook copies the remote, the BAC hash and your id, works
+--      out the token key from the packet and the server time, and takes itself
+--      off in that same call. If no parry comes within 0.4s it comes off anyway.
+--      Nothing stays hooked, and debug.info is never touched.
+--   2. From then on every parry is just that remote, fired with a fresh token,
+--      the real window for your account, the game's press gate, and the game's
+--      parry swing. Never the decoy remotes.
+-- If the server stops accepting our parries, it forgets the capture and asks
+-- for one more block. Re-executing stops the previous copy.
 
 task.spawn(function()
 
-local VERSION = "lite-1"
+local VERSION = "lite-2"
 local genv = (getgenv and getgenv()) or _G
 if type(genv.__BBLiteStop) == 'function' then pcall(genv.__BBLiteStop) end
 local alive = true
@@ -40,45 +44,70 @@ local function notify(text)
 end
 
 -- ------------------------------------------------------------
--- The game's own sender and a clean thread to call it on
+-- One-shot capture of a real parry packet
 -- ------------------------------------------------------------
-local Sender
-local CLEAN_ENV
-do
-    local ok, renv = pcall(function() return getrenv and getrenv() end)
-    CLEAN_ENV = (ok and type(renv) == 'table' and renv.writefile == nil) and setmetatable({}, {__index = renv}) or {}
-end
-local setfenv_, pcall_, spawn_, unpack_ = setfenv, pcall, task.spawn, table.unpack
-local setident_ = setthreadidentity or setidentity or set_thread_identity
+local Cap -- {remote, hash, uid, key = {bytes}, len, ball2}
+local hookfunction_, restore_ = hookfunction, restorefunction
+local newcclosure_ = newcclosure or function(f) return f end
+local select_, type_, typeof_, tostring_, floor_, byte_, bxor_, pcall_ = select, type, typeof, tostring, math.floor, string.byte, bit32.bxor, pcall
+local JOB_ID = game.JobId
+local FIRE_FN
+pcall(function() FIRE_FN = Instance.new("RemoteEvent").FireServer end)
+local hook = {fn = nil, old = nil, until_t = 0}
 
--- The sender becomes the base frame of a fresh thread with clean globals and
--- identity 2: nothing of ours is anywhere on its stack.
-local function call_clean(fn, ...)
-    local n, args = select('#', ...), {...}
-    spawn_(function()
-        if not pcall_(setfenv_, 0, CLEAN_ENV) then return end
-        if setident_ then pcall_(setident_, 2) end
-        spawn_(fn, unpack_(args, 1, n))
+local function unhook()
+    local fn, old = hook.fn, hook.old
+    if not fn then return end
+    hook.fn, hook.old = nil, nil
+    if not (restore_ and pcall_(restore_, fn)) then pcall_(hookfunction_, fn, old) end
+end
+
+-- token[i] = bxor((time_text[i] + i) % 256, key[i]), time_text = floor(server time * 100),
+-- so key[i] = bxor(token[i], (time_text[i] + i) % 256).
+local function learn(remote, hash, uid, token, a4)
+    local text = tostring_(floor_(Workspace:GetServerTimeNow() * 100))
+    if #token ~= #text then return end
+    local key = {}
+    for i = 1, #text do key[i] = bxor_(byte_(token, i), (byte_(text, i) + i) % 256) end
+    Cap = {remote = remote, hash = hash, uid = uid, key = key, len = #text, ball2 = typeof_(a4) == "CFrame"}
+end
+
+-- Real parry: (hash, id, token, window, cameraCF, points, aim, flag) or on UseBall2
+-- servers (hash, id, token, cameraCF, mouseCF, flag). The decoys send the
+-- JobId first; they pass straight through.
+local function hooked(self, ...)
+    local old = hook.old
+    if not Cap and select_('#', ...) >= 6 then
+        pcall_(function(a1, a2, a3, a4, a5)
+            if type_(a1) == 'string' and #a1 == 36 and a1 ~= JOB_ID and type_(a2) == 'string' and type_(a3) == 'string'
+                and ((type_(a4) == 'number' and typeof_(a5) == 'CFrame') or (typeof_(a4) == 'CFrame' and typeof_(a5) == 'CFrame')) then
+                learn(self, a1, a2, a3, a4)
+            end
+        end, ...)
+    end
+    if Cap then unhook() end
+    return old(self, ...)
+end
+
+local function arm_hook()
+    if Cap or not hookfunction_ or not FIRE_FN then return end
+    hook.until_t = os.clock() + 0.4
+    if hook.fn then return end
+    local ok, old = pcall(hookfunction_, FIRE_FN, newcclosure_(hooked))
+    if not ok or type(old) ~= 'function' then return end
+    hook.fn, hook.old = FIRE_FN, old
+    task.spawn(function()
+        while hook.fn and os.clock() < hook.until_t do task.wait(0.05) end
+        unhook()
     end)
 end
 
-local function get_sender()
-    if Sender then return Sender end
-    local ctrls = ReplicatedStorage:FindFirstChild("Controllers")
-    if not ctrls then return nil end
-    for _, c in ipairs(ctrls:GetChildren()) do
-        if c.Name:match("^SwordsController") then
-            local mod = c:FindFirstChild("PRY")
-            if mod and mod:IsA("ModuleScript") then
-                local ok, fn = pcall(require, mod)
-                if ok and type(fn) == 'function' then
-                    CLEAN_ENV.script = c
-                    Sender = fn
-                end
-            end
-        end
-    end
-    return Sender
+local function make_token()
+    local text = tostring(math.floor(Workspace:GetServerTimeNow() * 100))
+    if #text ~= Cap.len then return nil end
+    local out = table.create(#text)
+    for i = 1, #text do out[i] = string.char(bit32.bxor((string.byte(text, i) + i) % 256, Cap.key[i])) end
+    return table.concat(out)
 end
 
 -- ------------------------------------------------------------
@@ -124,6 +153,10 @@ end
 -- The game's press gate (u40 window, u38 lockout, u39 after a landed parry)
 -- ------------------------------------------------------------
 local G = {active = false, cool = false, recent = false, m1 = false, n1 = 1.3}
+-- Did the server take our parries? A sent parry with no ParrySuccess within
+-- 0.6s is a miss; four in a row means the capture is stale.
+local Check = {pending = nil, misses = 0}
+local can_parry_ref
 local conns = {}
 local function on(sig, fn) local ok, c = pcall(function() return sig:Connect(fn) end); if ok then table.insert(conns, c) end end
 pcall(function()
@@ -131,6 +164,7 @@ pcall(function()
         local char = LocalPlayer.Character
         if not (char and char:IsDescendantOf(Workspace)) then return end
         G.active, G.cool = false, false
+        Check.pending, Check.misses = nil, 0
         task.spawn(function() G.recent = true; task.wait(G.n1); G.recent = false end)
     end)
 end)
@@ -141,6 +175,22 @@ pcall(function()
     end)
 end)
 pcall(function() on(Remotes.M1Stop.Event, function(v) G.m1 = v end) end)
+
+-- Your own press arms the one-shot hook: input reaches us before the game sends.
+on(UserInputService.InputBegan, function(input)
+    if Cap or not alive then return end
+    local t = input.UserInputType
+    if t == Enum.UserInputType.Touch or t == Enum.UserInputType.Keyboard or t == Enum.UserInputType.MouseButton1
+        or t == Enum.UserInputType.MouseButton2 or t == Enum.UserInputType.Gamepad1 then
+        -- only while a ball is in play, so random taps elsewhere never hook
+        local live = false
+        for _, name in ipairs({"Balls", "TrainingBalls"}) do
+            local f = Workspace:FindFirstChild(name)
+            if f and #f:GetChildren() > 0 then live = true end
+        end
+        if live and can_parry_ref and can_parry_ref(LocalPlayer.Character) then arm_hook() end
+    end
+end)
 
 -- The game's own parry conditions (SwordsController).
 local function can_parry(char)
@@ -154,6 +204,7 @@ local function can_parry(char)
     if LocalPlayer:GetAttribute("LobbyParry") and LocalPlayer:GetAttribute("InLobbyParryCooldown") then return false end
     return true
 end
+can_parry_ref = can_parry
 
 -- ------------------------------------------------------------
 -- The parry swing, as the game plays it around each send
@@ -228,8 +279,10 @@ end
 local function parry()
     local char = LocalPlayer.Character
     if not can_parry(char) or G.m1 or G.active or G.cool then return false end
-    local fn = get_sender()
-    if not fn then return false end
+    if not Cap then return false end
+    if not Cap.remote.Parent then Cap = nil; return false end
+    local tok = make_token()
+    if not tok then Cap = nil; return false end
     local humanoid = char:FindFirstChildOfClass("Humanoid")
     local animator = humanoid and humanoid:FindFirstChildOfClass("Animator")
     if not animator then return false end
@@ -242,15 +295,22 @@ local function parry()
     end)
     swing_stop(animator)
     local cam = Workspace.CurrentCamera
-    local use_ball2 = false
-    pcall(function() use_ball2 = require(ReplicatedStorage.Shared.UseBall2)() == true end)
     local mouse = UserInputService:GetMouseLocation()
-    if use_ball2 then
+    local r, args = Cap.remote, nil
+    if Cap.ball2 then
         local ray = cam:ScreenPointToRay(mouse.X, mouse.Y, 0)
-        call_clean(fn, cam.CFrame, CFrame.lookAt(ray.Origin, ray.Origin + ray.Direction), false)
+        args = {Cap.hash, Cap.uid, tok, cam.CFrame, CFrame.lookAt(ray.Origin, ray.Origin + ray.Direction), false}
     else
-        call_clean(fn, n6, cam.CFrame, screen_points(cam, char), {mouse.X, mouse.Y}, false)
+        args = {Cap.hash, Cap.uid, tok, n6, cam.CFrame, screen_points(cam, char), {mouse.X, mouse.Y}, false}
     end
+    -- both call shapes the game's sender uses, 50/50
+    if math.random(1, 2) == 1 then
+        r:FireServer(table.unpack(args))
+    else
+        local f = r.FireServer
+        f(r, table.unpack(args))
+    end
+    Check.pending = os.clock()
     swing_play(char, animator, fresh, tp)
     return true
 end
@@ -277,8 +337,17 @@ local function balls()
     return list
 end
 
+local told_armed = false
 local hb = RunService.Heartbeat:Connect(function()
     if not alive then return end
+    if Cap and not told_armed then told_armed = true; notify("Armed from your block. Auto parry is live.") end
+    if Check.pending and os.clock() - Check.pending > 0.6 then
+        Check.pending, Check.misses = nil, Check.misses + 1
+        if Check.misses >= 4 then
+            Cap, told_armed, Check.misses = nil, false, 0
+            notify("Parries stopped landing. Block once more to re-arm.")
+        end
+    end
     local char = LocalPlayer.Character
     local root = char and char:FindFirstChild("HumanoidRootPart")
     if not root then return end
@@ -304,9 +373,14 @@ table.insert(conns, hb)
 
 genv.__BBLiteStop = function()
     alive = false
+    unhook()
     for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
 end
 
-notify("Loaded (" .. VERSION .. "). Auto parry is on; re-execute to restart.")
+if not hookfunction_ then
+    notify("This executor has no hookfunction, so lite-2 can't arm.")
+else
+    notify("Loaded (" .. VERSION .. "). Block once yourself to arm auto parry.")
+end
 
 end)
