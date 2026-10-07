@@ -6,7 +6,7 @@ task.spawn(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.07-6"
+local SCRIPT_VERSION = "2026.10.07-7"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -148,9 +148,9 @@ end
 --     (capture() checks), NOT checkcaller -- our own fireParryRemote never
 --     routes through PRY so it is never caught, and a genuine send is caught
 --     even when it runs on our thread (see below).
---   * REPORT SUPPRESSION -- always on, UNCONDITIONAL. Any FireServer whose first
---     two args are (game.JobId, one of the two magic strings) is dropped; the
---     real parry and every other FireServer pass through untouched. This is the
+--   * REPORT SUPPRESSION -- always on, UNCONDITIONAL. Any FireServer carrying a
+--     known BAC token in any argument (see BAC_TOKENS) is dropped; the real
+--     parry and every other FireServer pass through untouched. This is the
 --     part that must not be gated on checkcaller. Many executors run
 --     VirtualInputManager input on the CALLER'S thread, so a block press we send
 --     runs the game's PRY sender synchronously on OUR stack. That trips check
@@ -178,16 +178,47 @@ local hook_wrap = newcclosure or function(f) return f end
 -- whole session -- the hooks only come down on unload.
 local Hooks = {armed_until = 0, installed = false}
 
--- A detection report the PRY sender fires home: FireServer(game.JobId, magic,
--- ...) on the parry remote. JobId is the server GUID (never a real parry's id)
--- and the magic strings are the sender's own, so matching both is exact -- a
--- real parry (id, uid, ...) or any other FireServer never looks like one.
+-- Cheap test on the raw arguments, before anything is copied: a parry packet is
+-- (id, uid, token string, window number, CFrame, {points}, {x, y}, flag).
+local function parry_shaped(...)
+    local n = select('#', ...)
+    if n < 8 or n > 9 then return false end
+    local _, _, token, window, cf, points, aim = ...
+    return typeof(cf) == 'CFrame' and type(token) == 'string' and type(window) == 'number'
+        and type(points) == 'table' and type(aim) == 'table'
+end
+
+-- BAC (Blade Anti-Cheat) reports a tamper trip home over the parry remote as a
+-- FireServer carrying one of its magic tokens. In the Oct-4 dump that was
+-- FireServer(game.JobId, "494kjkdf"/"64565gfdd", ...); the live build added
+-- "HfdX24KleuYH". Two token-independent facts make a report easy to tell from a
+-- real parry: the tokens are random strings that appear in nothing else, and a
+-- report carries our own game.JobId as a direct argument while a real parry
+-- (id, uid, token, ...) never does. So we drop a FireServer when any argument is
+-- a known token, OR it carries game.JobId and isn't shaped like a parry -- the
+-- JobId rule keeps catching reports even if BAC rotates the token again. Only
+-- real tokens are listed: the BAC_FAKE_* UUIDs look like honeypots (a decoy the
+-- server expects to receive), so dropping those would itself be a tell. Nested
+-- tables aren't scanned, so a legit {jobId = game.JobId, ...} payload is safe.
 local JOB_ID
-local REPORT_MAGIC = {["494kjkdf"] = true, ["64565gfdd"] = true}
+local BAC_TOKENS = {
+    ["494kjkdf"] = true,
+    ["64565gfdd"] = true,
+    ["HfdX24KleuYH"] = true,
+}
 local function is_report(...)
     if JOB_ID == nil then JOB_ID = game.JobId or false end
-    local first, second = ...
-    return first == JOB_ID and type(second) == 'string' and REPORT_MAGIC[second] == true
+    local n = select('#', ...)
+    if n > 10 then n = 10 end -- reports are short; cap the scan so real sends stay cheap
+    local saw_jobid = false
+    for i = 1, n do
+        local a = select(i, ...)
+        if type(a) == 'string' then
+            if BAC_TOKENS[a] then return true end
+            if JOB_ID and a == JOB_ID then saw_jobid = true end
+        end
+    end
+    return saw_jobid and not parry_shaped(...)
 end
 -- Capture runs only while armed and only until the remote is known.
 local function capture_armed()
@@ -272,17 +303,6 @@ local function uninstallRemoteHooks()
     Remote.hooked = false
 end
 
--- Cheap test on the raw arguments, before anything is copied: a parry packet is
--- (id, uid, token string, window number, CFrame, {points}, {x, y}, flag). Every
--- other FireServer while the hooks are up passes straight through.
-local function parry_shaped(...)
-    local n = select('#', ...)
-    if n < 8 or n > 9 then return false end
-    local _, _, token, window, cf, points, aim = ...
-    return typeof(cf) == 'CFrame' and type(token) == 'string' and type(window) == 'number'
-        and type(points) == 'table' and type(aim) == 'table'
-end
-
 local function isRemoteEvent(self)
     return typeof(self) == 'Instance' and self.ClassName == 'RemoteEvent'
 end
@@ -320,7 +340,7 @@ end
 
 -- Installed once, then left up for the whole session. Each FireServer that
 -- reaches a hook is, in order:
---   * a detection report (game.JobId + magic) -> dropped, send nothing, NO
+--   * a detection report (a BAC token in any arg) -> dropped, send nothing, NO
 --     MATTER who fired it or on which thread. This is the part that has to be
 --     unconditional: many executors run VirtualInputManager input on the
 --     caller's thread, so our block press runs the game's PRY sender on OUR
