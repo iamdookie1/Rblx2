@@ -6,7 +6,7 @@ task.spawn(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.07-45"
+local SCRIPT_VERSION = "2026.10.07-46"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -931,14 +931,33 @@ local newcclosure_ = newcclosure or function(f) return f end
 local select_, type_, typeof_, tostring_, floor_, byte_, bxor_, pcall_ =
     select, type, typeof, tostring, math.floor, string.byte, bit32.bxor, pcall
 local JOB_ID = game.JobId
+local getrawmetatable_, setreadonly_ = getrawmetatable, setreadonly or make_writeable
+-- The shared FireServer function, read off a remote the game already has
+-- (every RemoteEvent hands back the same one) -- no instance is created for it.
 local FIRE_FN
-pcall(function() FIRE_FN = Instance.new("RemoteEvent").FireServer end)
+pcall(function() FIRE_FN = Remotes.ParrySuccess.FireServer end)
+if type(FIRE_FN) ~= 'function' then pcall(function() FIRE_FN = Instance.new("RemoteEvent").FireServer end) end
 local H = {nc = nil, fire = nil, want = false, until_t = 0}
+
+-- Puts the game's own __namecall back exactly: the original function object is
+-- written straight into its metatable, so nothing of ours is left wrapped around
+-- it. (Restoring through hookmetamethod re-wraps it on some executors -- a
+-- wrapper that stays for the rest of the session.)
+local function restore_namecall(original)
+    local ok = pcall_(function()
+        local mt = getrawmetatable_(game)
+        local was_ro = isreadonly and isreadonly(mt)
+        setreadonly_(mt, false)
+        rawset(mt, "__namecall", original)
+        if was_ro ~= false then setreadonly_(mt, true) end
+    end)
+    if not ok then pcall_(hookmetamethod_, game, "__namecall", original) end
+end
 
 local function unhook()
     local nc, fire = H.nc, H.fire
     H.nc, H.fire, H.want = nil, nil, false
-    if nc then pcall_(hookmetamethod_, game, "__namecall", nc) end
+    if nc then restore_namecall(nc) end
     if fire and not (restore_ and pcall_(restore_, FIRE_FN)) then pcall_(hookfunction_, FIRE_FN, fire) end
 end
 Core.unhook = unhook
@@ -1029,16 +1048,37 @@ prime_remote = function()
     if arm() then pressBlockKey() end
 end
 
--- Your own press arms it too, whenever it would parry. On a phone the block
--- button fires when your finger lifts, so a touch arms the hooks when it starts
--- and again when it ends (each time for 0.35s), covering however long you hold.
+-- Your own block press arms it too -- only a real block press, not any input:
+-- the F key, a left click, a gamepad button, or a touch on the game's block
+-- button. (Arming on every touch/key put the hooks up for moving the camera and
+-- walking.) The mobile button fires when your finger lifts, so a touch on it
+-- arms when it starts and again when it ends, covering however long you hold.
+local function on_block_button(pos)
+    local ok, hit = pcall(function()
+        local inset = GuiService:GetGuiInset()
+        for _, b in ipairs(CollectionService:GetTagged("BlockButton")) do
+            if b:IsA("GuiObject") and b.Visible and b.AbsoluteSize.X > 1 then
+                local gui = b:FindFirstAncestorWhichIsA("ScreenGui")
+                local p = Vector2.new(pos.X, pos.Y)
+                if not (gui and gui.IgnoreGuiInset) then p = p - inset end
+                local a, size = b.AbsolutePosition, b.AbsoluteSize
+                if p.X >= a.X and p.Y >= a.Y and p.X <= a.X + size.X and p.Y <= a.Y + size.Y then return true end
+            end
+        end
+        return false
+    end)
+    return ok and hit
+end
+local function is_block_press(input)
+    local t = input.UserInputType
+    if t == Enum.UserInputType.Keyboard then return input.KeyCode == Enum.KeyCode.F end
+    if t == Enum.UserInputType.MouseButton1 or t == Enum.UserInputType.Gamepad1 then return true end
+    if t == Enum.UserInputType.Touch then return on_block_button(input.Position) end
+    return false
+end
 local function own_input(input)
     if Core.cap or not is_live() or keypress_only() then return end
-    local t = input.UserInputType
-    if (t == Enum.UserInputType.Touch or t == Enum.UserInputType.Keyboard or t == Enum.UserInputType.MouseButton1
-        or t == Enum.UserInputType.MouseButton2 or t == Enum.UserInputType.Gamepad1) and canParryNow() then
-        arm()
-    end
+    if is_block_press(input) and canParryNow() then arm() end
 end
 UserInputService.InputBegan:Connect(own_input)
 UserInputService.InputEnded:Connect(function(input)
