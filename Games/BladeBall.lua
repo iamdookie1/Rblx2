@@ -6,7 +6,7 @@ task.spawn(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.07-12"
+local SCRIPT_VERSION = "2026.10.07-13"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -542,17 +542,27 @@ end
 -- nothing for the anti-cheat to find: not a hooked function, not our environment
 -- on its stack, nothing.
 --
--- The send closure (ReplicatedStorage.Controllers."SwordsController ".PRY) is the
--- one PRY function whose upvalues are, in source order:
---   [1] parry RemoteEvent (full packet)   [4] key function (token)   [7] remote name
---   [2] parry RemoteEvent (short packet)   [5] id for [1]             [8] id
---   [3] table holding the uid: t[2][t[1]]  [6] Net object             [9] id
--- We take [1] remote, [3] uid holder, [4] key fn, [5] id. window is 0.5 and flag
--- is false -- exactly what the game sends for a normal established parry
--- (every v190() call passes no argument, so flag = not not nil = false).
-local function looks_like_sender(ups)
-    return isRemoteEvent(ups[1]) and isRemoteEvent(ups[2])
-        and type(ups[3]) == 'table' and type(ups[4]) == 'function' and ups[5] ~= nil
+-- The send closure (ReplicatedStorage.Controllers."SwordsController ".PRY) holds,
+-- as upvalues: the two parry RemoteEvents, the key/token function, a table that
+-- holds the uid (t[2][t[1]]), the Net object, and several ids. We identify it
+-- EXACTLY by its constants (it is the only .PRY function whose constant pool has
+-- "TIME", used to build the token), then pull each piece by ROLE rather than a
+-- fixed upvalue index (that was brittle): first function upvalue = key fn, first
+-- RemoteEvent = the parry remote, first scalar = its id, the table whose
+-- t[2][t[1]] resolves = the uid holder. Source order puts the remotes and key
+-- function ahead of the first id, so "first of each" lands on the full-packet
+-- set. window is 0.5 and flag is false -- exactly what the game sends for a
+-- normal established parry (every v190() call passes no arg -> flag = false).
+Remote.armed_info = nil
+local function fn_has_time_const(fn)
+    local getc = (debug and debug.getconstants) or getconstants
+    if type(getc) ~= 'function' then return true end -- can't check -> don't exclude
+    local ok, consts = pcall(getc, fn)
+    if not ok or type(consts) ~= 'table' then return false end
+    for _, c in pairs(consts) do
+        if c == "TIME" then return true end
+    end
+    return false
 end
 local function arm_via_gc()
     if remoteReady() then return true end
@@ -560,29 +570,55 @@ local function arm_via_gc()
     local getups = (debug and debug.getupvalues) or getupvalues
     if type(getups) ~= 'function' then return false end
     local ok_scan, objs = pcall(getgc)
-    if not ok_scan or type(objs) ~= 'table' then return false end
+    if not ok_scan or type(objs) ~= 'table' then
+        ok_scan, objs = pcall(getgc, true) -- some executors need the include-tables arg
+        if not ok_scan or type(objs) ~= 'table' then return false end
+    end
+    local seen_pry = 0
     for _, fn in ipairs(objs) do
         if type(fn) == 'function' then
             local ok_s, src = pcall(debug.info, fn, 's')
             if ok_s and type(src) == 'string' and src:sub(-4) == '.PRY' then
-                local ok_u, ups = pcall(getups, fn)
-                if ok_u and type(ups) == 'table' and looks_like_sender(ups) then
-                    local remote, holder, keyfn, id = ups[1], ups[3], ups[4], ups[5]
-                    local ok_uid, uid = pcall(function() return holder[2][holder[1]] end)
-                    if ok_uid and uid ~= nil then
-                        Remote.token, Remote.remote, Remote.uid_holder = keyfn, remote, holder
-                        Remote.args = {id, uid, "", 0.5, "", "", "", false}
-                        local ok_t, tok = pcall(tokenize, uid)
-                        if ok_t and type(tok) == 'string' and #tok > 0 then
-                            return true
+                seen_pry = seen_pry + 1
+                if fn_has_time_const(fn) then
+                    local ok_u, ups = pcall(getups, fn)
+                    if ok_u and type(ups) == 'table' then
+                        local keyfn, remote, id, holder
+                        for i = 1, #ups do
+                            local v = ups[i]
+                            local tv = type(v)
+                            if not keyfn and tv == 'function' then keyfn = v end
+                            if not remote and isRemoteEvent(v) then remote = v end
+                            if not id and (tv == 'number' or tv == 'string') then id = v end
+                            if not holder and tv == 'table' then
+                                local ok_h = pcall(function()
+                                    assert(type(v[2]) == 'table' and v[2][v[1]] ~= nil)
+                                end)
+                                if ok_h then holder = v end
+                            end
                         end
-                        -- not the real sender after all; clear and keep scanning
-                        Remote.token, Remote.remote, Remote.uid_holder, Remote.args = nil, nil, nil, nil
+                        if keyfn and remote and id ~= nil and holder then
+                            local ok_uid, uid = pcall(function() return holder[2][holder[1]] end)
+                            if ok_uid and uid ~= nil then
+                                Remote.token, Remote.remote, Remote.uid_holder = keyfn, remote, holder
+                                Remote.args = {id, uid, "", 0.5, "", "", "", false}
+                                local ok_t, tok = pcall(tokenize, uid)
+                                if ok_t and type(tok) == 'string' and #tok > 0 then
+                                    local rn = pcall(function() return remote.Name end) and remote.Name or "?"
+                                    Remote.armed_info = ("remote=%s id=%s(%s) uid=%s"):format(
+                                        tostring(rn), tostring(id), type(id), tostring(uid))
+                                    return true
+                                end
+                                -- wrong pieces; clear and keep scanning
+                                Remote.token, Remote.remote, Remote.uid_holder, Remote.args = nil, nil, nil, nil
+                            end
+                        end
                     end
                 end
             end
         end
     end
+    Remote.armed_info = ("no match (pry closures seen: %d)"):format(seen_pry)
     return false
 end
 
@@ -1023,14 +1059,20 @@ prime_remote = function()
                 or props.__auto_spam_enabled or props.__manual_spam_enabled) then break end
             local ok, got = pcall(arm_via_gc)
             if ok and got and remoteReady() then
-                Notify("Blade Ball", "Remote armed (hookless). Parries fire direct -- nothing is hooked.", 3)
+                Notify("Blade Ball", "Remote armed (hookless): " .. tostring(Remote.armed_info), 4)
                 break
             end
             tries = tries + 1
             task.wait(0.5)
         end
-        if not remoteReady() and (type(getgc) ~= 'function') then
-            Notify("Blade Ball", "This executor has no getgc, so the hookless arm can't run. Remote mode is unavailable here.", 6)
+        if not remoteReady() then
+            if type(getgc) ~= 'function' then
+                Notify("Blade Ball", "This executor has no getgc, so the hookless arm can't run. Remote mode is unavailable here.", 6)
+            else
+                -- Surfaces why it couldn't arm (e.g. "no match (pry closures seen: N)")
+                -- so it can be pinned down. Not armed = parries won't fire.
+                Notify("Blade Ball", "Couldn't arm hooklessly: " .. tostring(Remote.armed_info), 8)
+            end
         end
         arming = false
     end)
@@ -2771,7 +2813,7 @@ task.spawn(function()
 end)
 
 local function remoteStatusText()
-    if remoteReady() then return "Remote: armed (hookless). Parries fire the remote directly -- nothing is hooked, nothing for the anti-cheat to see" end
+    if remoteReady() then return "Remote: armed (hookless) [" .. tostring(Remote.armed_info) .. "]. Parries fire direct -- nothing is hooked" end
     if type(getgc) ~= 'function' then return "Remote: needs getgc (missing in this executor). Use Keypress mode (note: Keypress is detectable)" end
     return "Remote: arming hooklessly -- reading the parry closure out of getgc, no hook and no block press. Done the moment you're in a match. Parries fire direct once armed"
 end
