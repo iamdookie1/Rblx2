@@ -6,7 +6,7 @@ task.spawn(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.07-36"
+local SCRIPT_VERSION = "2026.10.07-37"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -464,9 +464,30 @@ local function build_screen_points(cam)
             if dummy:IsA('BasePart') then add(dummy.Name, dummy.Position) end
         end
     else
-        for _, entity in ipairs(Alive:GetChildren()) do
-            local hrp = entity:FindFirstChild('HumanoidRootPart')
-            if hrp then add(entity.Name, hrp.Position) end
+        local mode = Workspace:GetAttribute("CurrentlySelectedMode")
+        if mode == "Hovergoal" or mode == "Soccer" then
+            -- Like the game in these modes: the other team's goal, plus any
+            -- Rising Zombie -- not every player.
+            pcall(function()
+                local helper = require(ReplicatedStorage.Shared.ThreadSafeTargetingHelper)
+                local team = helper.GetPlayerTeam(LocalPlayer)
+                local want = ("Goal%s"):format(tostring(team == 1 and 2 or 1))
+                for _, goal in ipairs(CollectionService:GetTagged("HovergoalGoal")) do
+                    if goal.Name == want and goal:FindFirstChild("Target") then
+                        add(goal.Name, goal.Target.Position)
+                        break
+                    end
+                end
+            end)
+            for _, entity in ipairs(Alive:GetChildren()) do
+                local hrp = entity:FindFirstChild('HumanoidRootPart')
+                if hrp and entity:GetAttribute("IsTheRisingZombie") then add(entity.Name, hrp.Position) end
+            end
+        else
+            for _, entity in ipairs(Alive:GetChildren()) do
+                local hrp = entity:FindFirstChild('HumanoidRootPart')
+                if hrp then add(entity.Name, hrp.Position) end
+            end
         end
     end
     return points, others
@@ -621,6 +642,7 @@ local function learn(remote, hash, uid, token, a4)
     local key = {}
     for i = 1, #text do key[i] = bxor_(byte_(token, i), (byte_(text, i) + i) % 256) end
     Sender.cap = {remote = remote, hash = hash, uid = uid, key = key, len = #text, ball2 = typeof_(a4) == "CFrame"}
+    Sender.want, Sender.refresh, Sender.misses, Sender.pending = false, false, 0, nil
 end
 
 -- Real parry: (hash, id, token, window, cameraCF, points, aim, flag), or on
@@ -640,24 +662,27 @@ end
 -- arms it.
 local function hooked_nc(self, ...)
     local old = Sender.hook_old
-    if not Sender.cap and not checkcaller_() and getnamecallmethod_() == "FireServer" and select_('#', ...) >= 6 then
+    if Sender.want and not checkcaller_() and getnamecallmethod_() == "FireServer" and select_('#', ...) >= 6 then
         pcall_(check, self, ...)
-        if Sender.cap then unhook() end
+        if not Sender.want then unhook() end
     end
     return old(self, ...)
 end
 local function hooked_fire(self, ...)
     local old = Sender.fire_old
-    if not Sender.cap and not checkcaller_() and select_('#', ...) >= 6 then
+    if Sender.want and not checkcaller_() and select_('#', ...) >= 6 then
         pcall_(check, self, ...)
-        if Sender.cap then unhook() end
+        if not Sender.want then unhook() end
     end
     return old(self, ...)
 end
 
+-- Up only for one capture press. A key press reaches the game's handler on the
+-- next frame and the send happens in that same call, so 0.35s is plenty.
 arm_hook = function()
-    if Sender.cap or not is_live() then return false end
-    Sender.until_t = os.clock() + 0.6
+    if (Sender.cap and not Sender.refresh) or not is_live() then return false end
+    Sender.want = true
+    Sender.until_t = os.clock() + 0.35
     if Sender.hook_old or Sender.fire_old then return true end
     if hookmetamethod_ and getnamecallmethod_ then
         local ok, old = pcall(hookmetamethod_, game, "__namecall", newcclosure_(hooked_nc))
@@ -671,6 +696,7 @@ arm_hook = function()
     task.spawn(function()
         while (Sender.hook_old or Sender.fire_old) and os.clock() < Sender.until_t do task.wait(0.05) end
         unhook()
+        Sender.want = false
     end)
     return true
 end
@@ -705,6 +731,13 @@ RunService.Heartbeat:Connect(function()
         if prime_remote and canParryNow() then prime_remote() end
         return
     end
+    if Sender.pending and os.clock() > Sender.pending then
+        Sender.pending, Sender.misses = nil, (Sender.misses or 0) + 1
+        if Sender.misses >= 3 and not Sender.refresh then
+            Sender.refresh = true
+            flight("3 parries in a row unanswered: next parry refreshes the capture")
+        end
+    end
     if Sender.told then return end
     Sender.told = true
     Sender.info = "armed (" .. (Sender.cap.ball2 and "UseBall2" or "normal") .. " server)"
@@ -727,11 +760,31 @@ end
 -- inside the lockout unless the first one landed -- and now neither can we,
 -- spam included: every packet we send is one a real client could have sent.
 local PG = {active = false, cool = false, recent = false, m1 = false, n1 = 1.3}
+-- Start the game's window/lockout timers, exactly like its press handler. Every
+-- parry the server sees starts them -- ours, spam's, and the game's own presses
+-- (your block button, tap to block, the capture press) -- so all of them come
+-- here. Before, only our auto parries did: a spam packet or your own tap had
+-- the server in its lockout while we thought it was clear, so auto parry fired
+-- into it -- the swing played, the server ignored it, and the pass was used up.
+local function pg_start()
+    if PG.active or PG.cool then return end -- inside the lockout a press starts nothing
+    local window, lockout = parry_window()
+    window, lockout = window or 0.5, lockout or 1.3
+    PG.active, PG.cool, PG.n1 = true, true, lockout
+    task.delay(window, function()
+        PG.active = false
+        task.wait(math.max(0.1, lockout - window))
+        if not PG.recent then PG.cool = false end
+    end)
+end
+Sender.pg_start = pg_start
+Sender.pg_open = function() return not (PG.m1 or PG.active or PG.cool) end
 pcall(function()
     Remotes.ParrySuccess.OnClientEvent:Connect(function()
         local char = LocalPlayer.Character
         if not (char and char:IsDescendantOf(Workspace)) then return end
         PG.active, PG.cool = false, false
+        Sender.pending, Sender.misses = nil, 0
         task.spawn(function()
             PG.recent = true
             task.wait(PG.n1)
@@ -762,6 +815,14 @@ fireParryRemote = function(curveCF, spam)
     if not canParryNow() then return nil end -- the game wouldn't parry here either
     if not cap.remote.Parent then Sender.cap, Sender.told = nil, false; return false end
     if not spam and (PG.m1 or PG.active or PG.cool) then return nil end -- the game ignores this press too
+    -- Captured id gone stale (three of our parries in a row went unanswered):
+    -- this parry is a real block press instead, with the capture hooks up for it,
+    -- so it parries through the game and refreshes the capture in one go.
+    if Sender.refresh and not spam then
+        if arm_hook() then pressBlockKey() end
+        pg_start()
+        return true
+    end
     local tok = make_token(cap)
     if not tok then Sender.cap, Sender.told = nil, false; return false end
     -- The game reads the window/lockout before sending; wait for the stats once.
@@ -770,13 +831,11 @@ fireParryRemote = function(curveCF, spam)
         if not Win.done then return false end -- stats not read yet: wait, don't guess
         window, lockout, fresh, tp = 0.5, 1.3, false, nil
     end
+    pg_start() -- spam too: the server's lockout starts on any parry it sees
     if not spam then
-        PG.active, PG.cool, PG.n1 = true, true, lockout
-        task.delay(window, function()
-            PG.active = false
-            task.wait(math.max(0.1, lockout - window))
-            if not PG.recent then PG.cool = false end
-        end)
+        -- Answered by a ParrySuccess within the window plus a round trip, or it
+        -- counts as unanswered (three in a row -> refresh the capture, silently).
+        Sender.pending = os.clock() + window + math.min(pingMs(), 400) / 1000 + 0.25
     end
     local cam = Workspace.CurrentCamera
     local points, aim = packet_parts(cam)
@@ -999,6 +1058,28 @@ local function load_track(animator, humanoid, anim)
     return track
 end
 
+-- The game's own presses (your block button, tap to block, the capture press)
+-- start its parry swing; seeing that swing start is how we know the server's
+-- lockout started without us. Our own swings are told apart by when we played
+-- them. No hooks: Animator.AnimationPlayed.
+local own_swing = setmetatable({}, {__mode = 'k'}) -- track -> when we played it
+local function watch_presses(char)
+    task.spawn(function()
+        local humanoid = char:WaitForChild("Humanoid", 10)
+        local animator = humanoid and humanoid:WaitForChild("Animator", 10)
+        if not animator then return end
+        animator.AnimationPlayed:Connect(function(track)
+            if track:GetAttribute("SuccessParry") then return end -- a landed parry's swing, not a press
+            if not (track:GetAttribute("Parry") or track:GetAttribute("GrabParry")) then return end
+            local at = own_swing[track]
+            if at and os.clock() - at < 0.25 then return end
+            if Sender.pg_start then Sender.pg_start() end
+        end)
+    end)
+end
+if LocalPlayer.Character then watch_presses(LocalPlayer.Character) end
+LocalPlayer.CharacterAdded:Connect(watch_presses)
+
 local function play_block()
     local char = LocalPlayer.Character
     if not char or char:GetAttribute("InOverdriveMech") then return end
@@ -1032,6 +1113,7 @@ local function play_block()
         local ok, track = pcall(load_track, animator, humanoid, anim)
         if ok and track then
             local speed = track:GetAttribute("PlaySpeed") or 1
+            own_swing[track] = os.clock()
             track:Play(track:GetAttribute("PlayFadeTime"), track:GetAttribute("PlayWeight"), speed)
             System.__properties.__grab_animation = track
             local left = track.Length == 0 and 1 or (track.Length - track.TimePosition) * speed
@@ -1810,6 +1892,13 @@ local function ball_contact_eta(ball, root, state, now)
     local accel = speed_gain(state, speed, now)
     local turn = turn_rate(state, velocity, now)
     local window = lead_window(speed) + math.min(pingMs(), 400) / 1000
+    -- Never longer than this account's real parry window allows: aim the landing
+    -- at half of it for slow balls (their path and pace change most before they
+    -- land, and an early parry on a slow ball runs out and leaves you in the 1.3s
+    -- lockout when it arrives) up to 85% of it for fast ones.
+    local n6 = parry_window() or 0.5
+    local frac = 0.5 + 0.35 * math.clamp((speed - 40) / 120, 0, 1)
+    window = math.min(window, n6 * frac + math.min(pingMs(), 400) / 1000)
     local eta
     if miss <= APCfg.hit_zone then
         eta = time_to_contact(distance, ball, speed, accel)
@@ -1881,7 +1970,7 @@ local function try_parry_ball(ball, root, now, via)
     -- Close range: no waiting for the accuracy window. A ball coming in from
     -- close that lands inside one parry is parried on the spot -- up close a curve
     -- has no room to matter and every frame waited is reaction time lost.
-    if distance <= APCfg.close_range and heading > 0.2 then
+    if distance <= APCfg.close_range and heading > 0.85 and speed >= 40 then
         local straight = time_to_contact(distance, ball, speed, accel)
         if straight <= window then
             if not fire_parry(via or "close range") then return hold("press gate shut, retrying next frame") end
@@ -2104,8 +2193,8 @@ local function spam_fire(manual)
     if getgenv().ManualSpamMode == "Keypress" then
         System.parry.keypress()
     else
-        System.parry.fast()
-        if getgenv().ManualSpamAnimationFix and macroAnimFix then
+        local sent = System.parry.fast()
+        if sent and getgenv().ManualSpamAnimationFix and macroAnimFix then
             -- Played the way the game plays a held block key: a block swing, then
             -- (once it lands) the game's success swing, then the next block. It
             -- no longer depends on auto parry's animation setting being on.
