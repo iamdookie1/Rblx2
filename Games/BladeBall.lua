@@ -6,7 +6,7 @@ task.spawn(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.07-43"
+local SCRIPT_VERSION = "2026.10.07-44"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -204,51 +204,26 @@ end
 local CollectionService = cloneref(game:GetService('CollectionService'))
 local GuiService = cloneref(game:GetService('GuiService'))
 
--- On a touch device a keyboard press is the wrong input: the game's
--- DeviceListener watches LastInputTypeChanged, so one fake F key flips the
--- phone into "keyboard" mode and the game rewires its on-screen block button
--- (MouseButton1Up on mobile, Activated otherwise) -- the "breaks the block
--- button" bug. So on touch-only devices the press is a virtual TOUCH on the
--- game's own block button (tagged "BlockButton"): the input type stays Touch
--- and the game's own button handler does the parry, exactly like your thumb.
+-- On a touch-only device the script never fakes input. A virtual F key flips
+-- the game's DeviceListener into keyboard mode and it rewires the on-screen block
+-- button; a virtual touch on the button breaks it too. So on phones there is no
+-- pressing at all: Remote arms from your own first block press (the capture
+-- hooks go up when your finger touches the screen), and Keypress modes can't
+-- press for you.
 local function touch_only()
     return UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled
         and not UserInputService.GamepadEnabled
 end
-local function block_button_point()
-    for _, b in ipairs(CollectionService:GetTagged("BlockButton")) do
-        if b:IsA("GuiButton") and b.Visible and b.AbsoluteSize.X > 1 then
-            local gui = b:FindFirstAncestorWhichIsA("ScreenGui")
-            if not gui or gui.Enabled then
-                local pos = b.AbsolutePosition + b.AbsoluteSize / 2
-                if not (gui and gui.IgnoreGuiInset) then
-                    local inset = GuiService:GetGuiInset()
-                    pos = pos + inset
-                end
-                return pos
-            end
-        end
-    end
-    return nil
-end
 
 local function pressBlockKey()
-    if not is_live() then return end
-    if touch_only() then
-        local pos = block_button_point()
-        if not pos then return end -- no block button on screen: nothing to press
-        log_send("block button")
-        pcall(function()
-            VirtualInputManager:SendTouchEvent(7, 0, pos.X, pos.Y) -- begin
-            VirtualInputManager:SendTouchEvent(7, 2, pos.X, pos.Y) -- end (fires MouseButton1Up)
-        end)
-        return
-    end
+    if not is_live() then return false end
+    if touch_only() then return false end -- never fake input on a phone (see above)
     log_send("block key")
     pcall(function()
         VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.F, false, game)
         VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.F, false, game)
     end)
+    return true
 end
 
 -- Screen points sent with a parry, built the way the game's own parry handler
@@ -1057,19 +1032,33 @@ prime_remote = function()
     if Core.cap or not is_live() or keypress_only() or not remote_features_on() then return end
     if not canParryNow() then return end
     local now = clock_()
+    if touch_only() then
+        -- no fake presses on a phone: your own first block arms it
+        if now - last_press > 20 then
+            last_press = now
+            Notify("Blade Ball", "Press block once to arm Remote parry.", 4)
+        end
+        return
+    end
     if now - last_press < 1.4 then return end
     last_press = now
     if arm() then pressBlockKey() end
 end
 
--- Your own press arms it too, whenever it would parry.
-UserInputService.InputBegan:Connect(function(input)
+-- Your own press arms it too, whenever it would parry. On a phone the block
+-- button fires when your finger lifts, so a touch arms the hooks when it starts
+-- and again when it ends (each time for 0.35s), covering however long you hold.
+local function own_input(input)
     if Core.cap or not is_live() or keypress_only() then return end
     local t = input.UserInputType
     if (t == Enum.UserInputType.Touch or t == Enum.UserInputType.Keyboard or t == Enum.UserInputType.MouseButton1
         or t == Enum.UserInputType.MouseButton2 or t == Enum.UserInputType.Gamepad1) and canParryNow() then
         arm()
     end
+end
+UserInputService.InputBegan:Connect(own_input)
+UserInputService.InputEnded:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.Touch then own_input(input) end
 end)
 
 -- ------------------------------------------------------------
@@ -1293,7 +1282,7 @@ end)
 local function count() props.__total_parries = props.__total_parries + 1 end
 function System.parry.keypress()
     if not LocalPlayer.Character then return false end
-    pressBlockKey()
+    if not pressBlockKey() then return false end
     count()
     return true
 end
