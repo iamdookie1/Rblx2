@@ -6,7 +6,7 @@ task.spawn(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.07-32"
+local SCRIPT_VERSION = "2026.10.07-33"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -574,16 +574,17 @@ local function parry_window()
 end
 
 -- ============================================================
--- PARRY REMOTE: captured from one block with a one-shot __namecall hook
+-- PARRY REMOTE: captured from one block with a one-shot FireServer hook
 -- ============================================================
 -- The capture idea is the first Ui3 build's (ba4c6a6): take the parry packet
 -- the game sends on a real block, then fire that remote ourselves.
---   * A __namecall hook catches the game's remote:FireServer(...) send. It goes
---     up only for a capture press -- ours (auto, see prime_remote) or yours --
---     and only when canParryNow() and a ball is in play, and comes off in the
---     same call that sees the packet (or 0.6s after the last press). Every
---     other namecall passes straight through untouched, and our own calls are
---     skipped (checkcaller).
+--   * hookfunction on the remote's FireServer (never __namecall: the game's
+--     block handler probes namecall on every press). It catches the game's
+--     dot-call sends (local f = remote.FireServer; f(remote, ...)), about half
+--     of them, so auto press may take a second press to arm. It goes up only
+--     for a capture press -- ours (auto, see prime_remote) or yours -- and only
+--     when canParryNow() and a ball is in play, and comes off in the same call
+--     that sees the packet (or 0.6s after the last press).
 --   * No getgc, no upvalue reads, no debug.info, no game code called. The
 --     token key is worked out from the captured packet and the server time
 --     (token[i] = bxor((time[i] + i) % 256, key[i]), time = floor(now * 100)).
@@ -594,9 +595,11 @@ Sender = {cap = nil, info = "not armed yet", hook_old = nil, until_t = 0, told =
 -- Only these leave this block (the main function is near Luau's 200-local cap).
 local arm_hook, fireParryRemote
 do
-local hookmetamethod_, getnamecallmethod_ = hookmetamethod, getnamecallmethod
+local hookfunction_, restore_ = hookfunction, restorefunction
 local checkcaller_ = checkcaller or function() return false end
 local newcclosure_ = newcclosure or function(f) return f end
+local FIRE_FN
+pcall(function() FIRE_FN = Instance.new("RemoteEvent").FireServer end)
 local select_, type_, typeof_, tostring_, floor_, byte_, bxor_, pcall_ = select, type, typeof, tostring, math.floor, string.byte, bit32.bxor, pcall
 local JOB_ID = game.JobId
 
@@ -604,7 +607,7 @@ local function unhook()
     local old = Sender.hook_old
     if not old then return end
     Sender.hook_old = nil
-    pcall_(hookmetamethod_, game, "__namecall", old)
+    if not (restore_ and pcall_(restore_, FIRE_FN)) then pcall_(hookfunction_, FIRE_FN, old) end
 end
 Sender.unhook = unhook
 
@@ -622,7 +625,7 @@ end
 -- UseBall2 servers (hash, id, token, cameraCF, mouseCF, flag).
 local function hooked(self, ...)
     local old = Sender.hook_old
-    if not Sender.cap and not checkcaller_() and getnamecallmethod_() == "FireServer" and select_('#', ...) >= 6 then
+    if not Sender.cap and not checkcaller_() and select_('#', ...) >= 6 then
         pcall_(function(a1, a2, a3, a4, a5)
             if typeof_(self) == 'Instance' and self.ClassName == 'RemoteEvent'
                 and type_(a1) == 'string' and #a1 == 36 and a1 ~= JOB_ID and type_(a2) == 'string' and type_(a3) == 'string'
@@ -636,10 +639,10 @@ local function hooked(self, ...)
 end
 
 arm_hook = function()
-    if Sender.cap or not hookmetamethod_ or not getnamecallmethod_ or not is_live() then return false end
+    if Sender.cap or not hookfunction_ or not FIRE_FN or not is_live() then return false end
     Sender.until_t = os.clock() + 0.6
     if Sender.hook_old then return true end
-    local ok, old = pcall(hookmetamethod_, game, "__namecall", newcclosure_(hooked))
+    local ok, old = pcall(hookfunction_, FIRE_FN, newcclosure_(hooked))
     if not ok or type(old) ~= 'function' then return false end
     Sender.hook_old = old
     task.spawn(function()
