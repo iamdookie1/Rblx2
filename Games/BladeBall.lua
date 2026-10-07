@@ -6,7 +6,7 @@ task.spawn(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.06-9"
+local SCRIPT_VERSION = "2026.10.07-1"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -223,20 +223,38 @@ local function uninstallRemoteHooks()
     Remote.hooked = false
 end
 
+-- The game's parry sender (the PRY module) can also fire a decoy 8-argument
+-- packet at another remote *before* the real one, and a 3-argument one after it.
+-- Capturing the first match could lock onto the decoy, so every match in one
+-- send is noted and the LAST full packet (the real one) is kept once the send has
+-- finished. The hooks come off at that same point, outside the hook itself.
 local function capture(remote, args)
     if not isParryPacket(args) then return end
     grab_token() -- lift the key function off this live parry's stack (no getgc)
-    if not Remote.remote then
-        task.defer(Notify, "Blade Ball", "Parry remote found. Remote mode is ready.", 3)
-    end
-    Remote.remote = remote
-    Remote.args = args
-    -- Caught it: take the hooks off (deferred, not from inside the hook).
-    task.defer(uninstallRemoteHooks)
+    Hooks.pending_remote, Hooks.pending_args = remote, args
+    if Hooks.finalizing then return end
+    Hooks.finalizing = true
+    task.defer(function()
+        Hooks.finalizing = false
+        local remote_found, args_found = Hooks.pending_remote, Hooks.pending_args
+        Hooks.pending_remote, Hooks.pending_args = nil, nil
+        if not remote_found then return end
+        local first = Remote.remote == nil
+        Remote.remote, Remote.args = remote_found, args_found
+        uninstallRemoteHooks()
+        if first then Notify("Blade Ball", "Parry remote found. Remote mode is ready.", 3) end
+    end)
 end
 
 local function isRemoteEvent(self)
     return typeof(self) == 'Instance' and self.ClassName == 'RemoteEvent'
+end
+
+-- Shape test straight on the arguments, before anything is copied: a parry packet
+-- is 8+ arguments with a CFrame 5th. Every other FireServer the game makes while
+-- the hooks are up passes through untouched, with nothing allocated.
+local function parry_shaped(...)
+    return select('#', ...) >= 8 and typeof((select(5, ...))) == 'CFrame'
 end
 
 local function installRemoteHooks()
@@ -248,9 +266,11 @@ local function installRemoteHooks()
         pcall(function()
             local old_namecall
             old_namecall = hookmetamethod(game, '__namecall', hook_wrap(function(self, ...)
-                if Hooks.active and getnamecallmethod() == 'FireServer'
+                -- Cheapest checks first; capture is pcall'd so nothing of ours can
+                -- ever error into the game's own parry.
+                if Hooks.active and getnamecallmethod() == 'FireServer' and parry_shaped(...)
                     and not (checkcaller and checkcaller()) and isRemoteEvent(self) then
-                    capture(self, {...})
+                    pcall(capture, self, {...})
                 end
                 return old_namecall(self, ...)
             end))
@@ -264,8 +284,8 @@ local function installRemoteHooks()
         pcall(function()
             local old_fire
             old_fire = hookfunction(fire_fn, hook_wrap(function(self, ...)
-                if Hooks.active and not (checkcaller and checkcaller()) and isRemoteEvent(self) then
-                    capture(self, {...})
+                if Hooks.active and parry_shaped(...) and not (checkcaller and checkcaller()) and isRemoteEvent(self) then
+                    pcall(capture, self, {...})
                 end
                 return old_fire(self, ...)
             end))
@@ -283,7 +303,7 @@ local function installRemoteHooks()
                     local wrapped = wrappers[real]
                     if not wrapped then
                         wrapped = hook_wrap(function(remote, ...)
-                            if Hooks.active then capture(remote, {...}) end
+                            if Hooks.active and parry_shaped(...) then pcall(capture, remote, {...}) end
                             return real(remote, ...)
                         end)
                         wrappers[real] = wrapped
@@ -348,7 +368,9 @@ end
 -- it's a plain press.
 local function press_block()
     if not remoteReady() then
-        Hooks.armed_until = os.clock() + 1.2
+        -- The game's sender runs within a frame of the block press; 0.6s covers a
+        -- slow frame or input step without leaving the hooks up longer than needed.
+        Hooks.armed_until = os.clock() + 0.6
         if not Remote.hooked then
             installRemoteHooks()
             if Remote.hooked then
