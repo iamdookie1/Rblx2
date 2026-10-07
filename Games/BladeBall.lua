@@ -6,7 +6,7 @@ task.spawn(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.07-40"
+local SCRIPT_VERSION = "2026.10.07-41"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -201,16 +201,55 @@ end
 -- parry, and by the fast capture burst to force the one parry we read the packet
 -- from. It can't curve and pays the game's parry cooldown, so Remote mode uses
 -- it only to arm, never to parry.
+local CollectionService = cloneref(game:GetService('CollectionService'))
+local GuiService = cloneref(game:GetService('GuiService'))
+
+-- On a touch device a keyboard press is the wrong input: the game's
+-- DeviceListener watches LastInputTypeChanged, so one fake F key flips the
+-- phone into "keyboard" mode and the game rewires its on-screen block button
+-- (MouseButton1Up on mobile, Activated otherwise) -- the "breaks the block
+-- button" bug. So on touch-only devices the press is a virtual TOUCH on the
+-- game's own block button (tagged "BlockButton"): the input type stays Touch
+-- and the game's own button handler does the parry, exactly like your thumb.
+local function touch_only()
+    return UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled
+        and not UserInputService.GamepadEnabled
+end
+local function block_button_point()
+    for _, b in ipairs(CollectionService:GetTagged("BlockButton")) do
+        if b:IsA("GuiButton") and b.Visible and b.AbsoluteSize.X > 1 then
+            local gui = b:FindFirstAncestorWhichIsA("ScreenGui")
+            if not gui or gui.Enabled then
+                local pos = b.AbsolutePosition + b.AbsoluteSize / 2
+                if not (gui and gui.IgnoreGuiInset) then
+                    local inset = GuiService:GetGuiInset()
+                    pos = pos + inset
+                end
+                return pos
+            end
+        end
+    end
+    return nil
+end
+
 local function pressBlockKey()
     if not is_live() then return end
+    if touch_only() then
+        local pos = block_button_point()
+        if not pos then return end -- no block button on screen: nothing to press
+        log_send("block button")
+        pcall(function()
+            VirtualInputManager:SendTouchEvent(7, 0, pos.X, pos.Y) -- begin
+            VirtualInputManager:SendTouchEvent(7, 2, pos.X, pos.Y) -- end (fires MouseButton1Up)
+        end)
+        return
+    end
     log_send("block key")
     pcall(function()
         VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.F, false, game)
         VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.F, false, game)
     end)
 end
-
-local CollectionService = cloneref(game:GetService('CollectionService'))
 
 -- Screen points sent with a parry, built the way the game's own parry handler
 -- builds them: everyone under Alive, or in lobby training the other trainees
