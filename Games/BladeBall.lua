@@ -6,7 +6,7 @@ task.spawn(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.07-30"
+local SCRIPT_VERSION = "2026.10.07-31"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -574,49 +574,42 @@ local function parry_window()
 end
 
 -- ============================================================
--- PARRY REMOTE: captured from YOUR block with a one-shot hook
+-- PARRY REMOTE: captured from one block with a one-shot __namecall hook
 -- ============================================================
--- The capture idea is the first Ui3 build's (ba4c6a6): wait for one real
--- block, take the parry packet the game sends, then fire that remote ourselves.
--- What changed, to leave less to find and capture faster:
---   * hookfunction on the remote's FireServer, never a __namecall hook. The
---     game's block handler runs a namecall probe on EVERY press
---     (xpcall(function() PluginManager():CreatePlugin():Deactivate() end, ...))
---     -- the exact moment that old __namecall hook was up.
---   * Up only for your own press, and only when a press would really parry:
---     canParryNow() and a ball in play. Your touch/key reaches us before the
---     game sends, so it goes on just in time and comes off in the same call
---     that sees the packet, or after 0.4s if no parry came. Nothing stays hooked.
+-- The capture idea is the first Ui3 build's (ba4c6a6): take the parry packet
+-- the game sends on a real block, then fire that remote ourselves.
+--   * A __namecall hook catches the game's remote:FireServer(...) send. It goes
+--     up only for a capture press -- ours (auto, see prime_remote) or yours --
+--     and only when canParryNow() and a ball is in play, and comes off in the
+--     same call that sees the packet (or 0.6s after the last press). Every
+--     other namecall passes straight through untouched, and our own calls are
+--     skipped (checkcaller).
 --   * No getgc, no upvalue reads, no debug.info, no game code called. The
 --     token key is worked out from the captured packet and the server time
 --     (token[i] = bxor((time[i] + i) % 256, key[i]), time = floor(now * 100)).
---   * The decoy remotes (JobId first) pass through untouched; we only learn
---     from, and only fire, the real parry remote.
--- The hook sees the dot-call half of the game's sends (its other half goes
--- through __namecall, which we leave alone), so arming takes one or two blocks.
--- If the server stops answering our parries the capture is dropped and the
--- next block re-arms.
-Sender = {cap = nil, info = "block once to arm", hook_fn = nil, hook_old = nil, until_t = 0,
-    pending = nil, misses = 0, told = false, told_at = -100} -- forward-declared above remoteReady
+--   * The decoy remotes (JobId first) pass through; only the real parry remote
+--     is learned from and fired.
+Sender = {cap = nil, info = "not armed yet", hook_old = nil, until_t = 0, told = false,
+    last_press = -100} -- forward-declared above remoteReady
 -- Only these leave this block (the main function is near Luau's 200-local cap).
 local arm_hook, fireParryRemote
 do
-local hookfunction_, restore_ = hookfunction, restorefunction
+local hookmetamethod_, getnamecallmethod_ = hookmetamethod, getnamecallmethod
+local checkcaller_ = checkcaller or function() return false end
 local newcclosure_ = newcclosure or function(f) return f end
 local select_, type_, typeof_, tostring_, floor_, byte_, bxor_, pcall_ = select, type, typeof, tostring, math.floor, string.byte, bit32.bxor, pcall
 local JOB_ID = game.JobId
-local FIRE_FN
-pcall(function() FIRE_FN = Instance.new("RemoteEvent").FireServer end)
 
 local function unhook()
-    local fn, old = Sender.hook_fn, Sender.hook_old
-    if not fn then return end
-    Sender.hook_fn, Sender.hook_old = nil, nil
-    if not (restore_ and pcall_(restore_, fn)) then pcall_(hookfunction_, fn, old) end
+    local old = Sender.hook_old
+    if not old then return end
+    Sender.hook_old = nil
+    pcall_(hookmetamethod_, game, "__namecall", old)
 end
+Sender.unhook = unhook
 
--- Runs inside the game's own send, so it only copies values; anything else
--- (notifications, logging) happens later from our own loop.
+-- Runs inside the game's own send, so it only copies values; notifying and
+-- logging happen later from our own loop.
 local function learn(remote, hash, uid, token, a4)
     local text = tostring_(floor_(Workspace:GetServerTimeNow() * 100))
     if #token ~= #text then return end
@@ -629,31 +622,32 @@ end
 -- UseBall2 servers (hash, id, token, cameraCF, mouseCF, flag).
 local function hooked(self, ...)
     local old = Sender.hook_old
-    if not Sender.cap and select_('#', ...) >= 6 then
+    if not Sender.cap and not checkcaller_() and getnamecallmethod_() == "FireServer" and select_('#', ...) >= 6 then
         pcall_(function(a1, a2, a3, a4, a5)
-            if type_(a1) == 'string' and #a1 == 36 and a1 ~= JOB_ID and type_(a2) == 'string' and type_(a3) == 'string'
+            if typeof_(self) == 'Instance' and self.ClassName == 'RemoteEvent'
+                and type_(a1) == 'string' and #a1 == 36 and a1 ~= JOB_ID and type_(a2) == 'string' and type_(a3) == 'string'
                 and ((type_(a4) == 'number' and typeof_(a5) == 'CFrame') or (typeof_(a4) == 'CFrame' and typeof_(a5) == 'CFrame')) then
                 learn(self, a1, a2, a3, a4)
             end
         end, ...)
+        if Sender.cap then unhook() end
     end
-    if Sender.cap then unhook() end
     return old(self, ...)
 end
 
 arm_hook = function()
-    if Sender.cap or not hookfunction_ or not FIRE_FN or not is_live() then return end
-    Sender.until_t = os.clock() + 0.4
-    if Sender.hook_fn then return end
-    local ok, old = pcall(hookfunction_, FIRE_FN, newcclosure_(hooked))
-    if not ok or type(old) ~= 'function' then return end
-    Sender.hook_fn, Sender.hook_old = FIRE_FN, old
+    if Sender.cap or not hookmetamethod_ or not getnamecallmethod_ or not is_live() then return false end
+    Sender.until_t = os.clock() + 0.6
+    if Sender.hook_old then return true end
+    local ok, old = pcall(hookmetamethod_, game, "__namecall", newcclosure_(hooked))
+    if not ok or type(old) ~= 'function' then return false end
+    Sender.hook_old = old
     task.spawn(function()
-        while Sender.hook_fn and os.clock() < Sender.until_t do task.wait(0.05) end
+        while Sender.hook_old and os.clock() < Sender.until_t do task.wait(0.05) end
         unhook()
     end)
+    return true
 end
-Sender.unhook = unhook
 
 local function ball_in_play()
     for _, name in ipairs({"Balls", "TrainingBalls"}) do
@@ -662,9 +656,10 @@ local function ball_in_play()
     end
     return false
 end
+Sender.ball_in_play = ball_in_play
 
--- Your own press arms it: touch (mobile block button / tap to block), keys,
--- mouse, gamepad -- but only when that press would really make the game parry.
+-- Your own press arms it too (touch / tap to block, keys, mouse, gamepad),
+-- under the same conditions.
 UserInputService.InputBegan:Connect(function(input)
     if Sender.cap or not is_live() then return end
     if getgenv().AutoParryMode == "Keypress" and getgenv().ManualSpamMode == "Keypress" then return end
@@ -675,26 +670,13 @@ UserInputService.InputBegan:Connect(function(input)
     end
 end)
 
--- Our own loop: report the capture, and drop it if parries stop landing
--- (four sent with no ParrySuccess within 0.6s each).
+-- Report the capture from our own thread (the hook itself only copies values).
 RunService.Heartbeat:Connect(function()
-    if not is_live() then return end
-    if Sender.cap and not Sender.told then
-        Sender.told = true
-        Sender.misses, Sender.pending = 0, nil
-        Sender.info = "armed from your block (" .. (Sender.cap.ball2 and "UseBall2" or "normal") .. " server)"
-        flight("ARMED: captured the parry remote from your block")
-        Notify("Blade Ball", "Remote armed from your block. Auto parry is live.", 4)
-    end
-    if Sender.pending and os.clock() - Sender.pending > 0.6 then
-        Sender.pending, Sender.misses = nil, Sender.misses + 1
-        if Sender.misses >= 4 then
-            Sender.cap, Sender.told, Sender.misses = nil, false, 0
-            Sender.info = "parries stopped landing: block once to re-arm"
-            flight("capture dropped: 4 parries in a row got no ParrySuccess")
-            Notify("Blade Ball", "Parries stopped landing. Block once to re-arm.", 5)
-        end
-    end
+    if not is_live() or not Sender.cap or Sender.told then return end
+    Sender.told = true
+    Sender.info = "armed (" .. (Sender.cap.ball2 and "UseBall2" or "normal") .. " server)"
+    flight("ARMED: captured the parry remote")
+    Notify("Blade Ball", "Remote armed. Auto parry is live.", 3)
 end)
 
 local function make_token(cap)
@@ -717,7 +699,6 @@ pcall(function()
         local char = LocalPlayer.Character
         if not (char and char:IsDescendantOf(Workspace)) then return end
         PG.active, PG.cool = false, false
-        Sender.pending, Sender.misses = nil, 0
         task.spawn(function()
             PG.recent = true
             task.wait(PG.n1)
@@ -784,18 +765,14 @@ fireParryRemote = function(curveCF)
     end
     log_send("remote")
     local r = cap.remote
-    -- Same packet as the game's sender, and either of its two call shapes.
+    -- Same packet as the game's sender, sent with a namecall like its own.
     if cap.ball2 then
         local ray = cam:ScreenPointToRay(aim[1], aim[2], 0)
-        local mouse_cf = CFrame.lookAt(ray.Origin, ray.Origin + ray.Direction)
-        if math.random(1, 2) == 1 then r:FireServer(cap.hash, cap.uid, tok, cf, mouse_cf, false)
-        else local f = r.FireServer; f(r, cap.hash, cap.uid, tok, cf, mouse_cf, false) end
+        r:FireServer(cap.hash, cap.uid, tok, cf, CFrame.lookAt(ray.Origin, ray.Origin + ray.Direction), false)
     else
         -- flag is false: every real parry calls v190() with no argument (not not nil).
-        if math.random(1, 2) == 1 then r:FireServer(cap.hash, cap.uid, tok, window, cf, points, aim, false)
-        else local f = r.FireServer; f(r, cap.hash, cap.uid, tok, window, cf, points, aim, false) end
+        r:FireServer(cap.hash, cap.uid, tok, window, cf, points, aim, false)
     end
-    Sender.pending = os.clock()
     -- Then the parry swing, as the game plays it right after sending. The server
     -- sees your character's animations, so every parry packet now comes with the
     -- swing a real block press always plays.
@@ -1252,16 +1229,18 @@ function System.parry.fast()
     System.__properties.__total_parries = System.__properties.__total_parries + 1
 end
 
--- Remote mode arms itself from your own block (see "PARRY REMOTE" above).
--- Until then a parry attempt just reminds you, at most every 20s.
+-- Arms Remote mode by pressing block itself: the namecall hook goes up, the
+-- key press makes the game send a real parry, the hook copies it and comes off.
+-- Only when that press would really parry (canParryNow, ball in play), at most
+-- one press every 0.15s. A press that lands also parries, so nothing is wasted.
 prime_remote = function()
-    if remoteReady() then return end
+    if remoteReady() or not is_live() then return end
     if getgenv().AutoParryMode == "Keypress" and getgenv().ManualSpamMode == "Keypress" then return end
+    if not canParryNow() or not Sender.ball_in_play() then return end
     local now = os.clock()
-    if now - Sender.told_at > 20 then
-        Sender.told_at = now
-        Notify("Blade Ball", "Block once yourself to arm Remote parry.", 4)
-    end
+    if now - Sender.last_press < 0.15 then return end
+    Sender.last_press = now
+    if arm_hook() then pressBlockKey() end
 end
 function System.parry.execute_action() System.animation.play_grab_parry(); System.parry.execute() end
 function System.parry.by_mode(mode)
