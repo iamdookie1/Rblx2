@@ -6,7 +6,7 @@ task.spawn(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.07-25"
+local SCRIPT_VERSION = "2026.10.07-26"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -550,22 +550,25 @@ local function parry_window()
     if not data then return nil end
     local ok_tp, tp = pcall(data.Get, data, "timesParried")
     if not ok_tp or type(tp) ~= 'number' then tp = 0 end
-    local n6 = 0.5
-    if tp == 0 then n6 = 1.5
-    elseif tp == 1 then n6 = 1.25
-    elseif tp == 2 then n6 = 1
-    elseif tp == 3 then n6 = 0.75
-    elseif tp == 4 then n6 = 0.625 end
+    -- n6 = the window, n2 = the press lockout, fresh = the game's u120 (it plays
+    -- the parry swing faster for its first five parries).
+    local n6, n2, fresh = 0.5, 1.3, false
+    if tp == 0 then n6, n2, fresh = 1.5, 1.5, true
+    elseif tp == 1 then n6, n2, fresh = 1.25, 1.3, true
+    elseif tp == 2 then n6, n2, fresh = 1, 1.3, true
+    elseif tp == 3 then n6, fresh = 0.75, true
+    elseif tp == 4 then n6, fresh = 0.625, true end
     if Win.noob then
         local ok_k, kills = pcall(data.Get, data, "TotalStats.Kills")
         if not ok_k or type(kills) ~= 'number' then kills = 0 end
         if kills >= 20 then
             Win.noob = false -- the game turns the boost off for good at 20 kills
         else
+            n2 = kills / 20 * n2
             n6 = kills / 20 * n6
         end
     end
-    return n6
+    return n6, n2, fresh, tp
 end
 
 -- ============================================================
@@ -727,9 +730,55 @@ local function use_ball2()
     return Sender.ball2
 end
 
+-- The game's own press gate (SwordsController v50 / OnParrySuccess), copied
+-- exactly. A press is ignored while the last one's window is open (u40) or its
+-- lockout runs (u38); a landed parry clears both at once, and NoobParryHappened
+-- clears everything. So a real client can never send a second parry packet
+-- inside the lockout unless the first one landed -- and now neither can we,
+-- spam included: every packet we send is one a real client could have sent.
+local PG = {active = false, cool = false, recent = false, m1 = false, n1 = 1.3}
+pcall(function()
+    Remotes.ParrySuccess.OnClientEvent:Connect(function()
+        local char = LocalPlayer.Character
+        if not (char and char:IsDescendantOf(Workspace)) then return end
+        PG.active, PG.cool = false, false
+        task.spawn(function()
+            PG.recent = true
+            task.wait(PG.n1)
+            PG.recent = false
+        end)
+    end)
+end)
+pcall(function()
+    Remotes.NoobParryHappened.OnClientEvent:Connect(function()
+        task.wait(0.11)
+        PG.cool, PG.recent, PG.active = false, false, false
+    end)
+end)
+pcall(function()
+    Remotes.M1Stop.Event:Connect(function(v) PG.m1 = v end)
+end)
+
 fireParryRemote = function(curveCF)
     if not is_live() then return true end -- replaced copy: send nothing, and don't fall back to the key
     if not Sender.fn then return false end
+    if PG.m1 or PG.active or PG.cool then return true end -- the game ignores this press too
+    -- The game reads the window/lockout before sending; wait for the stats once.
+    local window, lockout, fresh, tp = parry_window()
+    if window == nil then
+        if not Win.done then return false end -- stats not read yet: wait, don't guess
+        window, lockout, fresh, tp = 0.5, 1.3, false, nil
+    end
+    -- No animator, no parry (the game returns there too). Stops the parry and
+    -- success swings that are playing, exactly as the game does before sending.
+    local anim = Sender.anim_pre and Sender.anim_pre()
+    if not anim then return true end
+    PG.active, PG.cool, PG.n1 = true, true, lockout
+    task.delay(window, function()
+        PG.active = false
+        task.wait(math.max(0.1, lockout - window))
+        if not PG.recent then PG.cool = false end
+    end)
     local cam = Workspace.CurrentCamera
     local points, aim = packet_parts(cam)
     -- The server gives the ball to whoever's screen point (arg 3 here) is nearest
@@ -752,21 +801,20 @@ fireParryRemote = function(curveCF)
         local origin, look = cf.Position, curveCF.LookVector
         if look == look and look.Magnitude > 0.5 then cf = CFrame.lookAt(origin, origin + look) end
     end
+    log_send("remote")
     if use_ball2() then
         -- UseBall2 servers: v31(currentCameraCFrame, mouse-ray CFrame, flag)
         local ray = cam:ScreenPointToRay(aim[1], aim[2], 0)
-        log_send("remote")
-        return call_clean(Sender.fn, cf, CFrame.lookAt(ray.Origin, ray.Origin + ray.Direction), false)
+        call_clean(Sender.fn, cf, CFrame.lookAt(ray.Origin, ray.Origin + ray.Direction), false)
+    else
+        -- flag is false: every real parry calls v190() with no argument (not not nil).
+        call_clean(Sender.fn, window, cf, points, aim, false)
     end
-    -- The window: exactly what the game computes for this account (parry_window).
-    local window = parry_window()
-    if window == nil then
-        if not Win.done then return false end -- stats not read yet: wait, don't guess
-        window = 0.5
-    end
-    log_send("remote")
-    -- flag is false: every real parry calls v190() with no argument (not not nil).
-    return call_clean(Sender.fn, window, cf, points, aim, false)
+    -- Then the parry swing, as the game plays it right after sending. The server
+    -- sees your character's animations, so every parry packet now comes with the
+    -- swing a real block press always plays.
+    if Sender.anim_post then pcall(Sender.anim_post, anim, fresh, tp) end
+    return true
 end
 end -- sender block
 
@@ -1005,15 +1053,44 @@ LocalPlayer.CharacterAdded:Connect(function()
     gate.last, gate.landed, gate.landed_at = -math.huge, true, -math.huge
 end)
 
--- Auto parry, triggerbot, slashes of fury: only when parry animations are on.
-function System.animation.play_grab_parry()
-    if not System.__properties.__play_animation then return end
-    pcall(play_block)
+-- The swing that goes with every remote parry (fireParryRemote), copied from the
+-- game's press handler: before sending, stop the parry/success swings playing;
+-- after sending, play the Parry/GrabParry swing (fast for an account's first
+-- five parries, the game's u120) and stretch the ParryTime attribute over it.
+Sender.anim_pre = function()
+    local char = LocalPlayer.Character
+    local humanoid = char and char:FindFirstChildOfClass("Humanoid")
+    local animator = humanoid and humanoid:FindFirstChildOfClass("Animator")
+    if not animator then return nil end
+    for _, track in ipairs(animator:GetPlayingAnimationTracks()) do
+        if track:GetAttribute("SuccessParry") or track:GetAttribute("Parry") then
+            track:Stop(track:GetAttribute("StopFadeTime"))
+        end
+    end
+    return {char = char, humanoid = humanoid, animator = animator}
 end
--- Spam with "Animation fix" on: always, gated like a real held key.
-function System.animation.play_block()
-    pcall(play_block)
+Sender.anim_post = function(a, fresh, tp)
+    local char = a.char
+    if char:GetAttribute("InOverdriveMech") then return end
+    for _, anim in ipairs(find_animations(char, {"Parry", "GrabParry"}, sword_info(current_sword(char)))) do
+        local ok, track = pcall(load_track, a.animator, a.humanoid, anim)
+        if ok and track then
+            local speed = (fresh and tp and tp / 5 + 1) or track:GetAttribute("PlaySpeed") or 1
+            local fade = fresh and 0.05 or track:GetAttribute("PlayFadeTime")
+            local weight = fresh and 1 or track:GetAttribute("PlayWeight")
+            track:Play(fade, weight, speed)
+            System.__properties.__grab_animation = track
+            local left = track.Length == 0 and 1 or (track.Length - track.TimePosition) * speed
+            pcall(char.SetAttribute, char, "ParryTime", math.max(char:GetAttribute("ParryTime") or 0, left))
+        end
+    end
 end
+
+-- Every remote parry now plays its own swing (above) and Keypress goes through
+-- the game's handler, which plays it -- so the old optional extra swings are off,
+-- or each parry would swing twice.
+function System.animation.play_grab_parry() end
+function System.animation.play_block() end
 System.animation.play_grab_parry_full = System.animation.play_block
 end -- animation scope
 
