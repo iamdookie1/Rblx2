@@ -6,7 +6,7 @@ task.spawn(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.07-9"
+local SCRIPT_VERSION = "2026.10.07-10"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -374,20 +374,17 @@ end
 
 if not hookfunction then
     Notify("Blade Ball", "No hookfunction in this executor. Remote mode can't arm; use Keypress mode (it's detectable).", 6)
-else
-    -- Up now so your next natural block press is read. One read-only FireServer
-    -- hook, nothing on any metamethod, so it can never sit on the sender's stack
-    -- during its scan. It comes down the instant the packet is captured -- after
-    -- that nothing of ours is installed and parries go out as direct remote fires.
-    installRemoteHooks()
 end
+-- NOTE: we do NOT install at load. A hook that sits installed while idle is a
+-- hook the anti-cheat's scan has all the time in the world to find. Instead the
+-- hook goes up only for the few frames of a capture burst (see prime_remote),
+-- then comes straight back down -- the smallest possible window.
 
--- Presses the block key via VirtualInputManager. This runs the game's own PRY
--- sender -- and on executors that handle VIM input on the caller's thread, it
--- runs it on OUR stack, which is exactly what trips BAC's getfenv/writefile
--- check. So this is used ONLY by explicit Keypress mode, which the user opts
--- into; Remote mode never calls it. It also can't curve and pays the game's
--- parry cooldown.
+-- Presses the block key via VirtualInputManager, which makes the game run its
+-- own PRY sender (and thus send a real parry). Used by Keypress mode every
+-- parry, and by the fast capture burst to force the one parry we read the packet
+-- from. It can't curve and pays the game's parry cooldown, so Remote mode uses
+-- it only to arm, never to parry.
 local function pressBlockKey()
     if not is_live() then return end
     log_send("block key")
@@ -907,20 +904,15 @@ function System.curve.get_cframe_fast()
 end
 
 System.parry = {}
--- "Remote" fires the parry remote with the chosen curve -- never a key press, so
--- the game's sender (with its checks) never runs on our account. Until your
--- first natural block arms the remote it simply does nothing but ask you to block
--- once. "Keypress" presses the block key (VirtualInputManager); that runs the
--- game's sender and is the one mode BAC can see, so it's opt-in only.
-local arm_notified = false
-local function arm_notice()
-    if arm_notified then return end
-    arm_notified = true
-    Notify("Blade Ball", "Press block (F) once to arm Remote mode. After that, parries are untraceable.", 6)
-end
+-- "Remote" fires the parry remote with the chosen curve -- no key press, so the
+-- game's sender never runs for our parries. The remote is armed by a FAST
+-- capture burst (prime_remote below) the first time a parry feature is on: the
+-- hook is up only for the few frames it takes to grab one packet. "Keypress"
+-- presses the block key (VirtualInputManager) every time, so it runs the game's
+-- sender constantly and is the one mode BAC watches -- opt-in only.
 function System.parry.execute()
     if System.__properties.__parries > 10000 or not LocalPlayer.Character then return end
-    if not fireParryRemote(System.curve.get_cframe()) then arm_notice(); return end
+    if not fireParryRemote(System.curve.get_cframe()) then prime_remote(); return end
     System.__properties.__parries = System.__properties.__parries + 1
     System.__properties.__total_parries = System.__properties.__total_parries + 1
     task.delay(0.5, function()
@@ -937,18 +929,58 @@ end
 -- task.delay per call, which piles up into thousands at spam rates).
 function System.parry.fast()
     if not LocalPlayer.Character then return end
-    if not fireParryRemote(System.curve.get_cframe_fast()) then arm_notice(); return end
+    if not fireParryRemote(System.curve.get_cframe_fast()) then prime_remote(); return end
     System.__properties.__total_parries = System.__properties.__total_parries + 1
 end
 
--- We no longer press block ourselves to grab the remote -- doing that ran the
--- game's sender on our stack and is what BAC caught. Instead the read-only hooks
--- (installed at load) wait for your own natural block, read the packet once, and
--- come down. All this does is nudge you to block once if a parry feature is on
--- and the remote isn't armed yet.
+-- FAST capture. The anti-cheat finds the hook if it is installed long enough for
+-- its scan to run, so we keep the hook up for the shortest possible time:
+--   install -> hammer the block key for a few frames to force the game to send a
+--   parry -> the FireServer hook reads that one packet -> capture() tears the
+--   hook down the instant it has it.
+-- A whole burst is a fraction of a second, and the hook is gone the moment the
+-- packet lands (usually the first or second frame). If a burst misses, we drop
+-- the hook anyway, wait out the block cooldown, and try again -- the hook is
+-- never left sitting idle. Once armed we never do this again: parries are direct
+-- remote fires with nothing hooked.
+local fast_capturing = false
 prime_remote = function()
-    if remoteReady() then return end
-    arm_notice()
+    if remoteReady() or not hookfunction or fast_capturing then return end
+    fast_capturing = true
+    task.spawn(function()
+        local rounds = 0
+        while not remoteReady() and not Library.Unloaded and rounds < 30 do
+            local props = System.__properties
+            if not (props.__autoparry_enabled or props.__triggerbot_enabled
+                or props.__auto_spam_enabled or props.__manual_spam_enabled) then break end
+            if canParryNow() and not UserInputService:GetFocusedTextBox() then
+                installRemoteHooks()
+                if Hooks.installed then
+                    -- One press forces one send; the hook reads it within a frame
+                    -- or two. We don't hammer -- fewer sends is fewer chances for
+                    -- the sender's own check to run with our press on its stack.
+                    ParryLog.source = "remote grab press"
+                    pressBlockKey()
+                    ParryLog.source = nil
+                    local deadline = os.clock() + 0.2
+                    while not remoteReady() and Hooks.installed and os.clock() < deadline
+                        and not Library.Unloaded do
+                        RunService.RenderStepped:Wait()
+                    end
+                    if Hooks.installed then uninstallRemoteHooks() end -- never leave it up
+                end
+                rounds = rounds + 1
+                if not remoteReady() then task.wait(0.6) end -- block cooldown, then retry
+            else
+                task.wait(0.2)
+            end
+        end
+        fast_capturing = false
+    end)
+end
+function System.parry.execute_action() System.animation.play_grab_parry(); System.parry.execute() end
+function System.parry.by_mode(mode)
+    if mode == "Keypress" then System.parry.keypress() else System.parry.execute_action() end
 end
 function System.parry.execute_action() System.animation.play_grab_parry(); System.parry.execute() end
 function System.parry.by_mode(mode)
@@ -2688,7 +2720,7 @@ end)
 local function remoteStatusText()
     if remoteReady() then return "Remote: armed. Parries fire the remote directly -- hooks removed, nothing for the anti-cheat to see" end
     if not hookfunction then return "Remote: needs hookfunction (missing in this executor). Use Keypress mode (note: Keypress is detectable)" end
-    return "Remote: not armed yet. Press block (F) ONCE to arm it -- we read that one real parry and remove the hooks. We never press block for you, so the anti-cheat's check never sees us. Until you block once, Remote-mode parries do nothing"
+    return "Remote: arming... the hook goes up for a split second, forces one parry to read the packet, then comes straight down. Minimal window for the anti-cheat to catch it. Parries fire direct once armed"
 end
 
 local status_peak, status_ball = 0, nil
