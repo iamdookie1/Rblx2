@@ -6,7 +6,7 @@ task.spawn(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.07-14"
+local SCRIPT_VERSION = "2026.10.07-15"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -520,26 +520,18 @@ local function fireParryRemote(curveCF)
         local origin, look = cf.Position, curveCF.LookVector
         if look == look and look.Magnitude > 0.5 then cf = CFrame.lookAt(origin, origin + look) end
     end
-    -- Reproduce the PRY send closure's EXACT sends (minus its two tamper-report
-    -- lines, which a legit client never fires). Every parry the game sends the
-    -- v659 remote (the one that carries the full targeting packet, always), plus
-    -- exactly one of v663/v661 chosen at random. Sending only one remote -- and
-    -- always the same one -- is both a non-parry (the registering remote never
-    -- fires) and a pattern no real client produces, which is what got the packet
-    -- kicked. Matching the game's own mix makes our traffic indistinguishable.
+    -- Fire ONLY the remote the real game fires. The PRY send closure LOOKS like
+    -- it also fires v663 and v661, but those sit behind `if u1035 == 1` / `== 2`
+    -- where u1035 is a BOOLEAN (`math.random(1,2) == 1`) -- so both comparisons
+    -- are always false and the game NEVER sends them. It's a trap: reproduce the
+    -- decompiled code literally and you fire two remotes no legit client touches,
+    -- which is exactly what the anti-cheat guards for (v14 parried via the real
+    -- remote AND got kicked for the trap ones). A real parry only ever sends
+    -- v659:RemoteEvent(v662), every time, with the full packet.
     local g = Remote.gc
     local sent = false
-    if g then
-        local u1035 = math.random(1, 2)
-        if u1035 == 1 then
-            if pcall(fire_event, g.primary, g.primaryId, uid, token, window, cf, points, aim, flag) then sent = true end
-        end
-        if g.netRemote then
-            if pcall(fire_event, g.netRemote, g.netId, uid, token, window, cf, points, aim, flag) then sent = true end
-        end
-        if u1035 == 2 then
-            if pcall(fire_event, g.short, g.shortId, uid, token) then sent = true end
-        end
+    if g and g.netRemote then
+        sent = pcall(fire_event, g.netRemote, g.netId, uid, token, window, cf, points, aim, flag)
     elseif Remote.is_event then
         sent = pcall(fire_event, remote, args[1], uid, token, window, cf, points, aim, flag)
     else
@@ -638,12 +630,13 @@ local function arm_via_gc()
                             if ok_uid and uid ~= nil and key_ok and type(key) == 'string' and #key > 0 then
                                 g.netRemote = net_remote
                                 Remote.gc = g
-                                Remote.token, Remote.remote, Remote.uid_holder = g.keyfn, g.primary, g.holder
-                                Remote.args = {g.primaryId, uid, "", 0.5, "", "", "", false}
-                                local rn = (pcall(function() return g.primary.Name end) and g.primary.Name) or "?"
-                                Remote.armed_info = ("primary=%s id=%s(%s) uid=%s net=%s"):format(
-                                    tostring(rn), tostring(g.primaryId), type(g.primaryId), tostring(uid),
-                                    (pcall(function() return net_remote.Name end) and net_remote.Name) or "?")
+                                -- Remote.remote is the ONE the game really fires (the
+                                -- v659 remote), so remoteReady/class checks use it.
+                                Remote.token, Remote.remote, Remote.uid_holder = g.keyfn, net_remote, g.holder
+                                Remote.args = {g.netId, uid, "", 0.5, "", "", "", false}
+                                Remote.armed_info = ("net=%s netId=%s(%s) uid=%s"):format(
+                                    (pcall(function() return net_remote.Name end) and net_remote.Name) or "?",
+                                    tostring(g.netId), type(g.netId), tostring(uid))
                                 return true
                             end
                         end
