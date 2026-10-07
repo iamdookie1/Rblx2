@@ -6,7 +6,7 @@ task.spawn(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.07-38"
+local SCRIPT_VERSION = "2026.10.07-39"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -946,8 +946,10 @@ local function learn(remote, hash, uid, token, a4)
     if #token ~= #text then return end
     local key = {}
     for i = 1, #text do key[i] = bxor_(byte_(token, i), (byte_(text, i) + i) % 256) end
+    local prev = Core.cap
     Core.cap = {remote = remote, hash = hash, uid = uid, key = key, len = #text, ball2 = typeof_(a4) == "CFrame"}
     Core.refresh, Core.misses, Core.pending = false, 0, nil
+    Core.new_capture = {prev = prev}
     H.want = false
 end
 
@@ -1167,6 +1169,7 @@ local function send(curveCF, spam)
     if Core.refresh and not spam and arm() then
         pressBlockKey()
         gate_start()
+        Core.pending = clock_() + (parry_window() or 0.5) + ping_s() + 0.25
         return "sent"
     end
     local window = parry_window()
@@ -1221,6 +1224,9 @@ Remotes.ParrySuccess.OnClientEvent:Connect(function()
     local char = LocalPlayer.Character
     if not (char and char:IsDescendantOf(Workspace)) then return end
     G.active, G.cool = false, false
+    if Core.pending and Core.last_parry then
+        flight(("  -> landed %.3fs after the %s"):format(clock_() - Core.last_parry.t, Core.last_parry.via))
+    end
     Core.pending, Core.misses = nil, 0
     for _, st in pairs(tracked) do
         if st.target == me and st.pass_open then st.landed = true end
@@ -1453,13 +1459,19 @@ local function mark_parried(st, now)
     st.parried, st.parry_until = true, now + (parry_window() or 0.5) + ping_s() + 0.15
 end
 
-local function fire_for(st, now, via)
+local function fire_for(st, now, via, info)
     ParryLog.source = via
     local ok
     if try_ability() then log_send("ability"); ok = true
     else ok = System.parry.by_mode(getgenv().AutoParryMode) end
     ParryLog.source = nil
     if not ok then st.why = "couldn't send yet, retrying"; return false end
+    if info then
+        Core.last_parry = {t = now, via = via, info = info}
+        flight(("%s: eta %.3fs, fires at %.3fs, %.0f st/s, %.1f studs, ping %.0fms, window %.3f%s"):format(
+            via, info.eta, info.lead, info.speed, info.dist, pingMs(), parry_window() or -1,
+            Core.refresh and " (refresh press)" or ""))
+    end
     mark_parried(st, now)
     st.why = via == "auto parry" and "parried" or ("parried (" .. via .. ")")
     return true
@@ -1527,7 +1539,8 @@ local function decide(ball, st, root, now, via)
         if not eta then return hold(heading < 0 and "flying away" or "curving, waiting") end
     end
     if eta > lead then return hold(("lands in %.2fs, firing at %.2fs"):format(eta, lead)) end
-    return fire_for(st, now, via == "retarget" and "instant retarget" or "auto parry")
+    return fire_for(st, now, via == "retarget" and "instant retarget" or "auto parry",
+        {eta = eta, lead = lead, speed = speed, dist = distance})
 end
 
 -- Pre-parry: the ball is on a player right next to us, about to reach them, and
@@ -1655,8 +1668,18 @@ function System.triggerbot.enable(enabled)
     end
 end
 
+-- A new round can hand out a new parry remote or id. The first parry of every
+-- round is a real block press with the capture hooks up, so the capture is
+-- always that round's.
+Alive.ChildAdded:Connect(function(child)
+    if child == LocalPlayer.Character and Core.cap then
+        Core.refresh = true
+        flight("new round: first parry refreshes the capture")
+    end
+end)
+
 -- Housekeeping, once a frame: auto press while not armed, report the capture,
--- and refresh it silently if three parries in a row went unanswered.
+-- and refresh it silently if two parries in a row went unanswered.
 RunService.Heartbeat:Connect(function()
     if not is_live() then return end
     if not Core.cap then
@@ -1667,14 +1690,33 @@ RunService.Heartbeat:Connect(function()
     if not Core.told then
         Core.told = true
         Core.info = "armed (" .. (Core.cap.ball2 and "UseBall2" or "normal") .. " server)"
-        flight("ARMED: captured the parry remote")
         Notify("Blade Ball", "Remote armed. Auto parry is live.", 3)
+    end
+    local nc = Core.new_capture
+    if nc then
+        Core.new_capture = nil
+        local cap, prev = Core.cap, nc.prev
+        local keystr = table.concat(cap.key, ",")
+        local changed
+        if prev then
+            local list = {}
+            if prev.remote ~= cap.remote then list[#list + 1] = "REMOTE" end
+            if prev.uid ~= cap.uid then list[#list + 1] = "ID" end
+            if prev.hash ~= cap.hash then list[#list + 1] = "HASH" end
+            if table.concat(prev.key, ",") ~= keystr then list[#list + 1] = "KEY" end
+            changed = table.concat(list, " ")
+        end
+        flight(("CAPTURED: remote %s, id %s, %s server%s"):format(tostring(cap.remote.Name), tostring(cap.uid),
+            cap.ball2 and "UseBall2" or "normal",
+            prev and (changed ~= "" and (" -- CHANGED since last capture: " .. changed) or " -- same as last capture") or ""))
     end
     if Core.pending and clock_() > Core.pending then
         Core.pending, Core.misses = nil, (Core.misses or 0) + 1
-        if Core.misses >= 3 and not Core.refresh then
+        local lp = Core.last_parry
+        flight(("  -> NO answer to the %s (miss %d in a row)"):format(lp and lp.via or "parry", Core.misses))
+        if Core.misses >= 2 and not Core.refresh then
             Core.refresh = true
-            flight("3 parries in a row unanswered: next parry refreshes the capture")
+            flight("2 parries in a row unanswered: next parry refreshes the capture")
         end
     end
 end)
