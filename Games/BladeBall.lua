@@ -6,7 +6,7 @@ task.spawn(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.07-52"
+local SCRIPT_VERSION = "2026.10.07-53"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -2213,7 +2213,9 @@ end -- parry core
 -- one it can. What it is held by is your connection: every parry packet carries
 -- every player's screen point, and once upload backs up your movement queues
 -- behind it (the "I'm ahead of where I really am" desync). So:
---   * never more than SpamNet.hard_max a second, whatever the slider says;
+--   * never more than SpamNet.hard_max a second, whatever the slider says
+--     (120; 90 if your upload rate can't be read, since then the guard below
+--     is blind);
 --   * at most per_frame() per frame -- the server counts one parry per frame,
 --     the rest only fill upload;
 --   * the upload guard eases off while the client's real send rate is over
@@ -2228,10 +2230,12 @@ local ManualSpam = {rate = 300} -- parries per second (slider)
 local AutoSpam = {rate = 250, active_until = 0, reason = nil, was_active = false}
 local SpamNet = {
     idle_rate = 20,
-    hard_max = 90,
+    hard_max = 120,
+    blind_max = 90,
     budget_kbps = 220,
     guard_at = -1,
     factor = 1,
+    readable = false,
 }
 
 function System.manual_spam.start() System.__properties.__manual_spam_enabled = true end
@@ -2396,13 +2400,17 @@ local function spam_focus()
     return false
 end
 
+-- Upload guard, checked 10x a second: over budget it cuts the rate hard
+-- (down to half per check), under budget it climbs back gently. Spam can run
+-- faster because this reacts before upload has time to queue movement.
 local function bandwidth_factor(now)
-    if now - SpamNet.guard_at < 0.25 then return SpamNet.factor end
+    if now - SpamNet.guard_at < 0.1 then return SpamNet.factor end
     SpamNet.guard_at = now
     local ok, kbps = pcall(function() return Stats.DataSendKbps end)
-    if ok and type(kbps) == 'number' and kbps > 0 then
-        local step = math.clamp(SpamNet.budget_kbps / kbps, 0.6, 1.15)
-        SpamNet.factor = math.clamp(SpamNet.factor * step, 0.25, 1)
+    SpamNet.readable = ok and type(kbps) == 'number' and kbps > 0
+    if SpamNet.readable then
+        local step = math.clamp(SpamNet.budget_kbps / kbps, 0.5, 1.1)
+        SpamNet.factor = math.clamp(SpamNet.factor * step, 0.2, 1)
     end
     return SpamNet.factor
 end
@@ -2414,9 +2422,10 @@ local function current_source(now)
     return nil
 end
 local function effective_rate(rate, now)
-    rate = math.min(rate, SpamNet.hard_max)
+    local factor = bandwidth_factor(now)
+    rate = math.min(rate, SpamNet.readable and SpamNet.hard_max or SpamNet.blind_max)
     if not spam_focus() then rate = math.min(rate, SpamNet.idle_rate) end
-    return math.max(rate * bandwidth_factor(now), 1)
+    return math.max(rate * factor, 1)
 end
 local function per_frame(rate)
     return math.max(1, math.ceil(rate * math.clamp(props.__frame_dt or 1 / 60, 1 / 240, 0.1) - 1e-6))
@@ -2452,7 +2461,7 @@ local function spam_tick()
     else
         Pump.credit, Pump.on = 1, true -- a burst's first parry goes straight away
     end
-    if Pump.credit < 1 then return end
+    if Pump.credit < 1 - 1e-6 then return end -- (float error would drop one a frame)
     if Pump.fired_frame == Pump.frame and Pump.frame_fires >= per_frame(rate) then return end
     Pump.credit = Pump.credit - 1
     fire_one(source)
