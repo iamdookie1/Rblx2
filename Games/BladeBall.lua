@@ -6,7 +6,7 @@ task.spawn(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.07-10"
+local SCRIPT_VERSION = "2026.10.07-11"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -352,19 +352,30 @@ end
 local prime_remote
 
 -- "A place where they can parry" — mirrors the game's own client parry gate. A
--- block is allowed when the character isn't Stunned and doesn't carry DoNotParry
--- (server-set attributes the game toggles whenever you can't block) AND it's in a
--- spot where parrying happens: a live round (under Workspace.Alive), a lobby
--- parry (LobbyParry attribute), or training (under Workspace.Dead with the
--- LobbyTraining attribute). The old version only accepted Alive, so it never
--- armed during lobby / training parrying.
+-- Mirrors the game's OWN parry gate (SwordsController, dump line 225837): the
+-- exact conditions under which a block press actually makes the game send a
+-- parry. Matching it matters for the capture burst -- we install the hook and
+-- press only when a press truly fires the sender, so the hook is never left up
+-- for a press the game would swallow. A send is allowed when:
+--   * not DoNotParry, and not Stunned (server-set when you can't block), and
+--   * not (charging adrenaline with Qi-Charge < 2) -- the game blocks it then,
+--   * AND you're somewhere parrying happens: a live round (Workspace.Alive), a
+--     lobby parry (LobbyParry attr, but NOT while InLobbyParryCooldown -- a press
+--     then sends nothing), or training (Workspace.Dead with LobbyTraining).
 local function canParryNow()
     local char = LocalPlayer.Character
     if not char then return false end
     if char:GetAttribute("Stunned") then return false end
     if char:GetAttribute("DoNotParry") then return false end
+    if char:GetAttribute("ChargingAdrenaline") then
+        local ok, qi = pcall(function() return LocalPlayer.Upgrades["Qi-Charge"].Value end)
+        if ok and type(qi) == "number" and qi < 2 then return false end
+    end
     if char.Parent == Alive then return true end
-    if LocalPlayer:GetAttribute("LobbyParry") then return true end
+    if LocalPlayer:GetAttribute("LobbyParry") then
+        -- lobby parry's own cooldown: a press during it is a no-op send
+        return not LocalPlayer:GetAttribute("InLobbyParryCooldown")
+    end
     if LocalPlayer:GetAttribute("LobbyTraining") then
         local Dead = Workspace:FindFirstChild("Dead")
         if Dead and char.Parent == Dead then return true end
@@ -970,7 +981,10 @@ prime_remote = function()
                     if Hooks.installed then uninstallRemoteHooks() end -- never leave it up
                 end
                 rounds = rounds + 1
-                if not remoteReady() then task.wait(0.6) end -- block cooldown, then retry
+                -- If we missed, a real parry still went out, so we're in the
+                -- game's ~1.3s block cooldown -- pressing sooner just sends
+                -- nothing. Wait it out before the next try.
+                if not remoteReady() then task.wait(1.3) end
             else
                 task.wait(0.2)
             end
