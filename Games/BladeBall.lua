@@ -6,7 +6,7 @@ task.spawn(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.07-19"
+local SCRIPT_VERSION = "2026.10.07-20"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -543,6 +543,85 @@ local function parry_window()
     return n6
 end
 
+-- ============================================================
+-- NONCE WATCH (diagnostic) -- does packet arg 2 roll, and how?
+-- ============================================================
+-- Packet arg 2 is read from the PRY sender's first upvalue cell. The same PRY
+-- module has two closures that advance a cell like that with an LCG mod 2^24:
+--   b: 31 chained steps (constants below)     v: one step (675675, 16049232)
+-- If arg 2 is that rolling value, a real client advances it as it parries and
+-- the server checks the sequence -- and we, reading it but never advancing it,
+-- would be sending stale/repeated values (accepted parry, then a kick). The
+-- VM's control flow is in encrypted (Luraph) bytecode, so WHICH advance runs,
+-- and whether before or after the send, can't be read from the dump -- and
+-- guessing wrong desyncs it for certain. So this watches the live value with
+-- plain table reads (no hook, no calls), logs every change with context, and
+-- matches each change against b / v / their compositions. One session of that
+-- log tells us the exact rule. Written to <workspace>/BladeBall/nonce_log.txt.
+local Nonce = {last = nil, last_sent = nil, last_send_t = -1, last_send_log = -1,
+    last_success_t = -1, last_key_t = -1, changes = 0, sends = 0, repeats = 0,
+    recent = {}, log_ok = nil, conns = {}}
+local LCG31 = {
+    {730241, 13441240}, {584189, 3904912}, {494935, 14367833}, {249547, 12187082},
+    {487253, 14477246}, {197557, 10662819}, {396009, 9901053}, {516185, 11650066},
+    {396691, 5666219}, {744297, 5863687}, {700387, 746908}, {980611, 1496019},
+    {231861, 612246}, {192425, 3044158}, {517263, 11458136}, {305639, 772070},
+    {191359, 4719214}, {110967, 16426167}, {399951, 8152444}, {131701, 2118298},
+    {473427, 2825740}, {172015, 15717807}, {837761, 13830150}, {137159, 16342958},
+    {692823, 7611480}, {796987, 6868551}, {509797, 4468341}, {66661, 12443023},
+    {976207, 14784698}, {245243, 1783269}, {72601, 7413973},
+}
+local function lcg1(s) return (675675 * s + 16049232) % 16777216 end
+local function lcg31(s)
+    for i = 1, #LCG31 do
+        local p = LCG31[i]
+        s = (p[1] * s + p[2]) % 16777216
+    end
+    return s
+end
+local function nonce_log(line)
+    table.insert(Nonce.recent, line)
+    if #Nonce.recent > 6 then table.remove(Nonce.recent, 1) end
+    if Nonce.log_ok == false then return end
+    Nonce.log_ok = pcall(function()
+        ensureSaveFolder()
+        local path = SAVE_FOLDER .. "/nonce_log.txt"
+        local text = ("[%.3f] %s\n"):format(os.clock(), line)
+        if appendfile then
+            appendfile(path, text)
+        else
+            local prev = (isfile and isfile(path) and readfile(path)) or ""
+            writefile(path, prev .. text)
+        end
+    end)
+end
+-- Which known advance (or short composition) turns old into new.
+local function nonce_match(old, new)
+    if type(old) ~= 'number' or type(new) ~= 'number' then return "non-numeric" end
+    local a = lcg1(old)
+    if new == a then return "v (1 step)" end
+    if new == lcg1(a) then return "v x2" end
+    if new == lcg1(lcg1(a)) then return "v x3" end
+    local b = lcg31(old)
+    if new == b then return "b (31 steps)" end
+    if new == lcg1(b) then return "v after b" end
+    if new == lcg31(a) then return "b after v" end
+    if new == lcg31(b) then return "b x2" end
+    return "unknown"
+end
+local function nonce_note_send(value)
+    Nonce.sends = Nonce.sends + 1
+    local now = os.clock()
+    local rep = (Nonce.last_sent ~= nil and value == Nonce.last_sent)
+    if rep then Nonce.repeats = Nonce.repeats + 1 end
+    Nonce.last_sent, Nonce.last_send_t = value, now
+    -- spam fires hundreds a second: log a repeat at most twice a second
+    if rep and now - Nonce.last_send_log < 0.5 then return end
+    Nonce.last_send_log = now
+    nonce_log(("SEND #%d arg2=%s (%s)%s"):format(Nonce.sends, tostring(value), type(value),
+        rep and (" [same as previous send, %d repeats so far]"):format(Nonce.repeats) or ""))
+end
+
 local function fireParryRemote(curveCF)
     if not is_live() then return true end -- replaced copy: send nothing, and don't fall back to the key
     if not remoteReady() then return false end
@@ -613,7 +692,10 @@ local function fireParryRemote(curveCF)
         local nr = g.netRemote
         local ok_r, fresh = pcall(function() return g.netObj:RemoteEvent(g.netName) end)
         if ok_r and fresh ~= nil then nr = fresh end
-        if nr then sent = pcall(fire_event, nr, g.netId, uid, token, window, cf, points, aim, flag) end
+        if nr then
+            nonce_note_send(uid)
+            sent = pcall(fire_event, nr, g.netId, uid, token, window, cf, points, aim, flag)
+        end
     elseif Remote.is_event then
         sent = pcall(fire_event, remote, args[1], uid, token, window, cf, points, aim, flag)
     else
@@ -722,6 +804,47 @@ local function arm_via_gc()
     end
     Remote.armed_info = ("no match (pry closures seen: %d)"):format(seen_pry)
     return false
+end
+
+-- Nonce watcher: once armed, read packet arg 2's live value every frame (a
+-- plain table read on the cell we already hold -- no hook, nothing called) and
+-- log each change with what happened just before it.
+do
+    local function ago(now, t) return t < 0 and "never" or ("%dms"):format(math.floor((now - t) * 1000)) end
+    pcall(function()
+        table.insert(Nonce.conns, Remotes.ParrySuccess.OnClientEvent:Connect(function()
+            Nonce.last_success_t = os.clock()
+            if Remote.gc then nonce_log("ParrySuccess received") end
+        end))
+    end)
+    table.insert(Nonce.conns, UserInputService.InputBegan:Connect(function(input, gp)
+        if gp then return end
+        if input.KeyCode == Enum.KeyCode.F or input.UserInputType == Enum.UserInputType.MouseButton1 then
+            Nonce.last_key_t = os.clock()
+            if Remote.gc then
+                nonce_log("REAL block input (" .. (input.KeyCode ~= Enum.KeyCode.Unknown and input.KeyCode.Name or input.UserInputType.Name) .. ")")
+            end
+        end
+    end))
+    table.insert(Nonce.conns, RunService.Heartbeat:Connect(function()
+        local g = Remote.gc
+        if not g or not is_live() then return end
+        local ok, val = pcall(function() return g.holder[2][g.holder[1]] end)
+        if not ok then return end
+        if Nonce.last == nil then
+            Nonce.last = val
+            nonce_log(("==== v%s ARMED: arg2=%s (%s) [%s]"):format(SCRIPT_VERSION, tostring(val), type(val), tostring(Remote.armed_info)))
+            return
+        end
+        if val ~= Nonce.last then
+            Nonce.changes = Nonce.changes + 1
+            local now = os.clock()
+            nonce_log(("CHANGE #%d %s -> %s match=%s | since our send %s, since ParrySuccess %s, since real block %s"):format(
+                Nonce.changes, tostring(Nonce.last), tostring(val), nonce_match(Nonce.last, val),
+                ago(now, Nonce.last_send_t), ago(now, Nonce.last_success_t), ago(now, Nonce.last_key_t)))
+            Nonce.last = val
+        end
+    end))
 end
 
 -- ============================================================
@@ -2923,7 +3046,11 @@ local function remoteStatusText()
     local w = parry_window()
     local wtxt = w and ("%.3f"):format(w) or (Win.done and "fallback" or "reading stats...")
     if remoteReady() then
-        return "Remote: armed [" .. tostring(Remote.armed_info) .. "] window=" .. wtxt .. (Win.noob and " (noob boost on)" or "")
+        return ("Remote: armed [%s] window=%s%s\nArg2 watch: now=%s changes=%d sends=%d repeated=%d log=%s\nLast: %s"):format(
+            tostring(Remote.armed_info), wtxt, Win.noob and " (noob boost on)" or "",
+            tostring(Nonce.last), Nonce.changes, Nonce.sends, Nonce.repeats,
+            Nonce.log_ok == false and "FAILED (no file access)" or "BladeBall/nonce_log.txt",
+            tostring(Nonce.recent[#Nonce.recent] or "-"))
     end
     if type(getgc) ~= 'function' then return "Remote: needs getgc (missing in this executor)" end
     return "Remote: arming... window=" .. wtxt
@@ -3384,6 +3511,7 @@ Library:OnUnload(function()
     AutoJump = false
     for _, conn in pairs(System.__properties.__connections) do pcall(function() conn:Disconnect() end) end
     for _, conn in pairs(Connections_Manager) do pcall(function() conn:Disconnect() end) end
+    for _, conn in ipairs(Nonce.conns) do pcall(function() conn:Disconnect() end) end
     for _, gui in pairs(System.__properties.__mobile_guis) do destroy_mobile_gui(gui) end
     if System.__properties.__ball_velocity_gui then pcall(function() System.__properties.__ball_velocity_gui.gui:Destroy() end) end
     pcall(function() PingGui:Destroy() end)
