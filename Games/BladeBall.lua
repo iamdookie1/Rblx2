@@ -6,7 +6,7 @@ task.spawn(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.07-15"
+local SCRIPT_VERSION = "2026.10.07-16"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -530,8 +530,14 @@ local function fireParryRemote(curveCF)
     -- v659:RemoteEvent(v662), every time, with the full packet.
     local g = Remote.gc
     local sent = false
-    if g and g.netRemote then
-        sent = pcall(fire_event, g.netRemote, g.netId, uid, token, window, cf, points, aim, flag)
+    if g then
+        -- Resolve the remote fresh every send, exactly as the game does
+        -- (`v659:RemoteEvent(v662):FireServer(...)`), rather than reusing a cached
+        -- handle -- same object, but identical to the game's own call shape.
+        local nr = g.netRemote
+        local ok_r, fresh = pcall(function() return g.netObj:RemoteEvent(g.netName) end)
+        if ok_r and fresh ~= nil then nr = fresh end
+        if nr then sent = pcall(fire_event, nr, g.netId, uid, token, window, cf, points, aim, flag) end
     elseif Remote.is_event then
         sent = pcall(fire_event, remote, args[1], uid, token, window, cf, points, aim, flag)
     else
