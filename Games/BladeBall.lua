@@ -6,7 +6,7 @@ task.spawn(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.07-42"
+local SCRIPT_VERSION = "2026.10.07-43"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -1081,19 +1081,24 @@ end)
 -- Every parry the server sees starts it: ours, spam's, and the game's own
 -- presses (block button, tap to block, the capture press -- seen through the
 -- parry swing starting, no hook). Inside the lockout a press starts nothing.
-local G = {active = false, cool = false, recent = false, m1 = false, n1 = 1.3}
+-- Plain timestamps, so it can never stick: the lockout always ends on time.
+-- (The copy of the game's flag logic could stay shut for good -- if a parry
+-- went out within 1.3s of a landed one and nothing landed after, the lockout
+-- never cleared, and auto parry sat on "game lockout" while spam, which skips
+-- the gate, kept working.)
+local G = {until_t = 0, m1 = false, m1_at = 0}
 local function gate_start()
-    if G.active or G.cool then return end
+    local now = clock_()
+    if now < G.until_t then return end -- inside the lockout a press starts nothing
     local n6, n2 = parry_window()
     n6, n2 = n6 or 0.5, n2 or 1.3
-    G.active, G.cool, G.n1 = true, true, n2
-    task.delay(n6, function()
-        G.active = false
-        task.wait(math.max(0.1, n2 - n6))
-        if not G.recent then G.cool = false end
-    end)
+    G.until_t = now + math.max(n6 + 0.1, n2)
 end
-local function gate_open() return not (G.m1 or G.active or G.cool) end
+local function gate_open()
+    -- M1Stop blocks pressing while the game holds it; never longer than 3s
+    if G.m1 and clock_() - G.m1_at < 3 then return false end
+    return clock_() >= G.until_t
+end
 Core.gate_start, Core.gate_open = gate_start, gate_open
 
 -- ------------------------------------------------------------
@@ -1253,7 +1258,7 @@ Core.send = send
 Remotes.ParrySuccess.OnClientEvent:Connect(function()
     local char = LocalPlayer.Character
     if not (char and char:IsDescendantOf(Workspace)) then return end
-    G.active, G.cool = false, false
+    G.until_t = 0 -- a landed parry clears the lockout at once (the game's OnParrySuccess)
     local lp = Core.last_parry
     if Core.pending and lp then
         local took = clock_() - lp.t
@@ -1272,19 +1277,14 @@ Remotes.ParrySuccess.OnClientEvent:Connect(function()
     for _, st in pairs(tracked) do
         if st.target == me and st.pass_open then st.landed = true end
     end
-    task.spawn(function()
-        G.recent = true
-        task.wait(G.n1)
-        G.recent = false
-    end)
 end)
 pcall(function()
     Remotes.NoobParryHappened.OnClientEvent:Connect(function()
         task.wait(0.11)
-        G.cool, G.recent, G.active = false, false, false
+        G.until_t = 0
     end)
 end)
-pcall(function() Remotes.M1Stop.Event:Connect(function(v) G.m1 = v end) end)
+pcall(function() Remotes.M1Stop.Event:Connect(function(v) G.m1, G.m1_at = v and true or false, clock_() end) end)
 Remotes.ParrySuccessAll.OnClientEvent:Connect(function()
     if props.__grab_animation then pcall(function() props.__grab_animation:Stop() end) end
 end)
