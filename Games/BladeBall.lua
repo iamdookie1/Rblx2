@@ -6,7 +6,7 @@ task.spawn(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.07-20"
+local SCRIPT_VERSION = "2026.10.07-21"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -343,12 +343,11 @@ local function installRemoteHooks()
     Hooks.installed = Remote.hooked == true
 end
 
+-- Ready once we hold the game's own parry sender (see arm_sender). Sender is
+-- defined further down; this only runs at call time, after it exists.
+local Sender
 local function remoteReady()
-    -- Hookless (getgc) arm stores everything in Remote.gc and resolves the remote
-    -- at fire time, so a set Remote.gc counts as ready. The legacy path needs the
-    -- individual fields.
-    if Remote.gc ~= nil then return true end
-    return Remote.token ~= nil and Remote.remote ~= nil and Remote.args ~= nil
+    return Sender ~= nil and Sender.fn ~= nil
 end
 
 -- Presses block once to get the remote captured; defined further down, once
@@ -387,13 +386,9 @@ local function canParryNow()
     return false
 end
 
--- No load-time hook/arm. Default is Keypress (the game sends the parry -- no
--- hook, no getgc). Remote mode is opt-in and only then does the getgc arm run
--- (and warn if getgc is missing), via prime_remote.
--- NOTE: nothing is hooked, ever. Remote mode arms by reading the parry closure
--- out of getgc (arm_via_gc / prime_remote) -- no FireServer hook, no metamethod
--- hook, no block press -- so the game's sender never runs on our account and
--- there is nothing installed for the anti-cheat to scan for.
+-- Nothing is hooked and no memory is read, ever. Remote mode gets the game's
+-- own parry sender with require(PRY) and calls it on a clean thread (see "THE
+-- GAME'S OWN SENDER" below). The old hook code further up is never called.
 
 -- Presses the block key via VirtualInputManager, which makes the game run its
 -- own PRY sender (and thus send a real parry). Used by Keypress mode every
@@ -544,93 +539,135 @@ local function parry_window()
 end
 
 -- ============================================================
--- NONCE WATCH (diagnostic) -- does packet arg 2 roll, and how?
+-- THE GAME'S OWN SENDER, CALLED CLEAN -- no getgc, no upvalues, no hook
 -- ============================================================
--- Packet arg 2 is read from the PRY sender's first upvalue cell. The same PRY
--- module has two closures that advance a cell like that with an LCG mod 2^24:
---   b: 31 chained steps (constants below)     v: one step (675675, 16049232)
--- If arg 2 is that rolling value, a real client advances it as it parries and
--- the server checks the sequence -- and we, reading it but never advancing it,
--- would be sending stale/repeated values (accepted parry, then a kick). The
--- VM's control flow is in encrypted (Luraph) bytecode, so WHICH advance runs,
--- and whether before or after the send, can't be read from the dump -- and
--- guessing wrong desyncs it for certain. So this watches the live value with
--- plain table reads (no hook, no calls), logs every change with context, and
--- matches each change against b / v / their compositions. One session of that
--- log tells us the exact rule. Written to <workspace>/BladeBall/nonce_log.txt.
-local Nonce = {last = nil, last_sent = nil, last_send_t = -1, last_send_log = -1,
-    last_success_t = -1, last_key_t = -1, changes = 0, sends = 0, repeats = 0,
-    recent = {}, log_ok = nil, conns = {}}
-local LCG31 = {
-    {730241, 13441240}, {584189, 3904912}, {494935, 14367833}, {249547, 12187082},
-    {487253, 14477246}, {197557, 10662819}, {396009, 9901053}, {516185, 11650066},
-    {396691, 5666219}, {744297, 5863687}, {700387, 746908}, {980611, 1496019},
-    {231861, 612246}, {192425, 3044158}, {517263, 11458136}, {305639, 772070},
-    {191359, 4719214}, {110967, 16426167}, {399951, 8152444}, {131701, 2118298},
-    {473427, 2825740}, {172015, 15717807}, {837761, 13830150}, {137159, 16342958},
-    {692823, 7611480}, {796987, 6868551}, {509797, 4468341}, {66661, 12443023},
-    {976207, 14784698}, {245243, 1783269}, {72601, 7413973},
-}
-local function lcg1(s) return (675675 * s + 16049232) % 16777216 end
-local function lcg31(s)
-    for i = 1, #LCG31 do
-        local p = LCG31[i]
-        s = (p[1] * s + p[2]) % 16777216
+-- SwordsController gets its parry sender with a plain require(script.PRY) and
+-- parries by calling it: v31(window, CurrentCamera.CFrame, points, aim, flag)
+-- (UseBall2 servers: v31(cameraCF, mouseRayCF, flag)). Requiring a module that
+-- is already loaded just hands back the cached function -- the exact sender the
+-- game uses, with no memory scan at all. The scan is what got detected: PRY is
+-- Luraph-virtualized, so its real checks run inside encrypted bytecode the dump
+-- can't show, and v20's log had zero sends yet still kicked standing still.
+--
+-- And instead of rebuilding the packet we CALL the game's sender, so it builds
+-- everything itself: the real token, the real BAC hash, the real arg 2, the
+-- real remote. Nothing about the packet can differ from a real parry.
+--
+-- The sender's only gate is its two checks: debug.info must still be a C
+-- function (we never touch it), and no function within 10 stack levels may run
+-- in an environment holding writefile. We call it on a fresh thread whose
+-- globals (setfenv(0, ...)) and wrapper environment are a clean game
+-- environment. Luau reports a C frame's environment (the check's own pcall) as
+-- the thread's globals, so every level the check walks comes back clean. Before
+-- the first real call, env_is_clean() runs an exact replica of that check on
+-- such a thread; if anything there still shows writefile, we never fire.
+Sender = {fn = nil, info = "not armed", ball2 = nil, ball2_at = -1} -- forward-declared above remoteReady
+-- Only these two leave this block (the main function is near Luau's 200-local cap).
+local arm_sender, fireParryRemote
+do
+local CLEAN_ENV
+do
+    local ok, renv = pcall(function() return getrenv and getrenv() end)
+    if ok and type(renv) == 'table' and renv.writefile == nil then
+        CLEAN_ENV = setmetatable({}, {__index = renv})
+    else
+        CLEAN_ENV = {}
     end
-    return s
 end
-local function nonce_log(line)
-    table.insert(Nonce.recent, line)
-    if #Nonce.recent > 6 then table.remove(Nonce.recent, 1) end
-    if Nonce.log_ok == false then return end
-    Nonce.log_ok = pcall(function()
-        ensureSaveFolder()
-        local path = SAVE_FOLDER .. "/nonce_log.txt"
-        local text = ("[%.3f] %s\n"):format(os.clock(), line)
-        if appendfile then
-            appendfile(path, text)
-        else
-            local prev = (isfile and isfile(path) and readfile(path)) or ""
-            writefile(path, prev .. text)
-        end
-    end)
-end
--- Which known advance (or short composition) turns old into new.
-local function nonce_match(old, new)
-    if type(old) ~= 'number' or type(new) ~= 'number' then return "non-numeric" end
-    local a = lcg1(old)
-    if new == a then return "v (1 step)" end
-    if new == lcg1(a) then return "v x2" end
-    if new == lcg1(lcg1(a)) then return "v x3" end
-    local b = lcg31(old)
-    if new == b then return "b (31 steps)" end
-    if new == lcg1(b) then return "v after b" end
-    if new == lcg31(a) then return "b after v" end
-    if new == lcg31(b) then return "b x2" end
-    return "unknown"
-end
-local function nonce_note_send(value)
-    Nonce.sends = Nonce.sends + 1
-    local now = os.clock()
-    local rep = (Nonce.last_sent ~= nil and value == Nonce.last_sent)
-    if rep then Nonce.repeats = Nonce.repeats + 1 end
-    Nonce.last_sent, Nonce.last_send_t = value, now
-    -- spam fires hundreds a second: log a repeat at most twice a second
-    if rep and now - Nonce.last_send_log < 0.5 then return end
-    Nonce.last_send_log = now
-    nonce_log(("SEND #%d arg2=%s (%s)%s"):format(Nonce.sends, tostring(value), type(value),
-        rep and (" [same as previous send, %d repeats so far]"):format(Nonce.repeats) or ""))
+-- Everything the clean-thread code touches is captured as an upvalue, so it
+-- never needs a global from the clean environment.
+local setfenv_, getfenv_, pcall_, spawn_, type_, debug_ = setfenv, getfenv, pcall, task.spawn, type, debug
+
+local function call_clean(fn, a, b, c, d, e)
+    local runner = function()
+        if not pcall_(setfenv_, 0, CLEAN_ENV) then return end
+        fn(a, b, c, d, e)
+    end
+    if not pcall_(setfenv_, runner, CLEAN_ENV) then return false end
+    spawn_(runner)
+    return true
 end
 
-local function fireParryRemote(curveCF)
+-- Replica of the sender's check, run on a thread built exactly like call_clean's:
+-- anon closure -> pcall (C) -> sender stand-in -> runner. The stand-in gets a
+-- clean env like the real sender's, and closures it creates inherit it.
+local function env_is_clean()
+    local res = {done = false, clean = false, info_c = false}
+    local stand_in = function()
+        local dirty = false
+        for i = 1, 10 do
+            local ok, r = pcall_(function() return getfenv_(i) end)
+            if ok and type_(r) == 'table' and r.writefile then dirty = true end
+        end
+        return not dirty
+    end
+    local runner = function()
+        if not pcall_(setfenv_, 0, CLEAN_ENV) then return end
+        res.clean = stand_in()
+        local dbg = CLEAN_ENV.debug or debug_
+        local okc, isC = pcall_(function() return dbg.info(dbg.info, "s") == "[C]" end)
+        res.info_c = okc and isC
+        res.done = true
+    end
+    if not pcall_(setfenv_, stand_in, CLEAN_ENV) then return false, "setfenv blocked" end
+    if not pcall_(setfenv_, runner, CLEAN_ENV) then return false, "setfenv blocked" end
+    spawn_(runner) -- task.spawn runs it immediately, up to its first yield (none)
+    if not res.done then return false, "setfenv(0) blocked" end
+    if not res.clean then return false, "a stack level still shows writefile" end
+    if not res.info_c then return false, "debug.info isn't a C function here" end
+    return true
+end
+
+local function find_pry_module()
+    local ctrls = ReplicatedStorage:FindFirstChild("Controllers")
+    if not ctrls then return nil end
+    for _, c in ipairs(ctrls:GetChildren()) do
+        if c.Name:match("^SwordsController") then
+            local p = c:FindFirstChild("PRY")
+            if p and p:IsA("ModuleScript") then return p end
+        end
+    end
+    return nil
+end
+
+arm_sender = function()
+    if Sender.fn then return true end
+    local mod = find_pry_module()
+    if not mod then Sender.info = "PRY module not loaded yet"; return false end
+    local ok, fn = pcall(require, mod)
+    if not ok or type(fn) ~= 'function' then
+        Sender.info = "require(PRY) gave " .. (ok and type(fn) or "an error") .. " -- not firing"
+        return false
+    end
+    local clean, why = env_is_clean()
+    if not clean then
+        Sender.info = "can't make a clean call thread (" .. tostring(why) .. ") -- not firing"
+        return false
+    end
+    local src = debug.info(fn, "s") or "?"
+    local np, va = debug.info(fn, "a")
+    Sender.fn = fn
+    Sender.info = ("game sender %s (%s params%s), clean thread verified"):format(
+        src:match("[^%.]+%.[^%.]+$") or src, tostring(np), va and " + varargs" or "")
+    return true
+end
+
+local function use_ball2()
+    local now = os.clock()
+    if Sender.ball2 ~= nil and now - Sender.ball2_at < 2 then return Sender.ball2 end
+    local ok, r = pcall(function() return require(ReplicatedStorage.Shared.UseBall2)() end)
+    Sender.ball2, Sender.ball2_at = (ok and r == true), now
+    return Sender.ball2
+end
+
+fireParryRemote = function(curveCF)
     if not is_live() then return true end -- replaced copy: send nothing, and don't fall back to the key
-    if not remoteReady() then return false end
+    if not Sender.fn then return false end
     local cam = Workspace.CurrentCamera
     local points, aim = packet_parts(cam)
-    -- The server gives the ball to whoever's screen point (arg 6) is nearest the
-    -- aim point (arg 7) -- that's why it always went to the cursor. For any
-    -- target mode but Cursor, aim at the chosen target's own screen point so the
-    -- server picks exactly them. The curve (arg 5) is untouched.
+    -- The server gives the ball to whoever's screen point (arg 3 here) is nearest
+    -- the aim point (arg 4). For any target mode but Cursor, aim at the chosen
+    -- target's own screen point so the server picks exactly them.
     if choose_target then
         local name, _, mode = choose_target(cam)
         local screen = name and points[name]
@@ -641,211 +678,30 @@ local function fireParryRemote(curveCF)
             aim = target_aim.aim
         end
     end
-    local args, remote = Remote.args, Remote.remote
-    -- uid: read live from the game's own holder when we have it (the game reads
-    -- it fresh every send and it can change per round), else the stored value.
-    local uid = args[2]
-    if Remote.uid_holder then
-        local ok_uid, fresh = pcall(function() return Remote.uid_holder[2][Remote.uid_holder[1]] end)
-        if ok_uid and fresh ~= nil then uid = fresh end
-    end
-    -- The window: exactly what the game would send for this account right now
-    -- (see parry_window). Only if the replicated data isn't available yet do we
-    -- fall back to the stored value.
-    local window = parry_window()
-    if window == nil then
-        -- stats not read yet: don't send a guessed window, wait (a few seconds at
-        -- most -- Win.done flips after 10s even if the read never lands)
-        if not Win.done then return false end
-        window = type(args[4]) == 'number' and args[4] or 0.5
-    end
-    local flag = args[8]
-    local ok, token = pcall(tokenize, uid)
-    if not ok then return false end
-    if remote and Remote.class_of ~= remote then
-        Remote.class_of, Remote.is_event = remote, remote.ClassName == 'RemoteEvent'
-    end
-    log_send("remote")
-    -- The game sends CurrentCamera.CFrame: the camera's own position, looking
-    -- where you aim. Keep the curve's direction but put it on the camera, so the
-    -- packet looks like the game's (curve modes used to build it at your root,
-    -- some with 9e18-stud targets).
+    -- The game passes CurrentCamera.CFrame. Keep the curve's direction but put it
+    -- on the camera, so it's a camera CFrame like the game's.
     local cf = cam.CFrame
     if curveCF then
         local origin, look = cf.Position, curveCF.LookVector
         if look == look and look.Magnitude > 0.5 then cf = CFrame.lookAt(origin, origin + look) end
     end
-    -- Fire ONLY the remote the real game fires. The PRY send closure LOOKS like
-    -- it also fires v663 and v661, but those sit behind `if u1035 == 1` / `== 2`
-    -- where u1035 is a BOOLEAN (`math.random(1,2) == 1`) -- so both comparisons
-    -- are always false and the game NEVER sends them. It's a trap: reproduce the
-    -- decompiled code literally and you fire two remotes no legit client touches,
-    -- which is exactly what the anti-cheat guards for (v14 parried via the real
-    -- remote AND got kicked for the trap ones). A real parry only ever sends
-    -- v659:RemoteEvent(v662), every time, with the full packet.
-    local g = Remote.gc
-    local sent = false
-    if g then
-        -- Resolve the remote fresh every send, exactly as the game does
-        -- (`v659:RemoteEvent(v662):FireServer(...)`), rather than reusing a cached
-        -- handle -- same object, but identical to the game's own call shape.
-        local nr = g.netRemote
-        local ok_r, fresh = pcall(function() return g.netObj:RemoteEvent(g.netName) end)
-        if ok_r and fresh ~= nil then nr = fresh end
-        if nr then
-            nonce_note_send(uid)
-            sent = pcall(fire_event, nr, g.netId, uid, token, window, cf, points, aim, flag)
-        end
-    elseif Remote.is_event then
-        sent = pcall(fire_event, remote, args[1], uid, token, window, cf, points, aim, flag)
-    else
-        -- InvokeServer yields; spawn it so a burst never stalls on a reply.
-        task.spawn(remote.InvokeServer, remote, args[1], uid, token, window, cf, points, aim, flag)
-        sent = true
+    if use_ball2() then
+        -- UseBall2 servers: v31(currentCameraCFrame, mouse-ray CFrame, flag)
+        local ray = cam:ScreenPointToRay(aim[1], aim[2], 0)
+        log_send("remote")
+        return call_clean(Sender.fn, cf, CFrame.lookAt(ray.Origin, ray.Origin + ray.Direction), false)
     end
-    return sent
-end
-
--- ============================================================
--- HOOKLESS ARM (getgc) -- nothing installed, nothing to detect
--- ============================================================
--- Read the parry packet's ingredients straight out of the live PRY send closure
--- instead of hooking anything. One pass over getgc, done once, then we fire the
--- remote ourselves forever after. No FireServer hook, no metamethod hook, no
--- block press -- so the game's sender never runs on our account and there is
--- nothing for the anti-cheat to find: not a hooked function, not our environment
--- on its stack, nothing.
---
--- We identify the send closure EXACTLY by its constants (it is the only .PRY
--- function whose constant pool has "TIME", used to build the token), then read
--- ALL of its upvalues -- both parry RemoteEvents, the Net object + remote name,
--- the key/token function, the uid holder (t[2][t[1]]), and the three ids -- so
--- fireParryRemote can reproduce the closure's own multi-remote send verbatim.
--- The layout is validated by type before use (and the key function by actually
--- calling it), so a wrong closure is rejected rather than fired blindly. window
--- is 0.5 and flag is false -- what the game sends for a normal established parry
--- (every v190() call passes no arg -> flag = false).
-Remote.armed_info = nil
-local function fn_has_time_const(fn)
-    local getc = (debug and debug.getconstants) or getconstants
-    if type(getc) ~= 'function' then return true end -- can't check -> don't exclude
-    local ok, consts = pcall(getc, fn)
-    if not ok or type(consts) ~= 'table' then return false end
-    for _, c in pairs(consts) do
-        if c == "TIME" then return true end
+    -- The window: exactly what the game computes for this account (parry_window).
+    local window = parry_window()
+    if window == nil then
+        if not Win.done then return false end -- stats not read yet: wait, don't guess
+        window = 0.5
     end
-    return false
+    log_send("remote")
+    -- flag is false: every real parry calls v190() with no argument (not not nil).
+    return call_clean(Sender.fn, window, cf, points, aim, false)
 end
-local function arm_via_gc()
-    if remoteReady() then return true end
-    if type(getgc) ~= 'function' then return false end
-    local getups = (debug and debug.getupvalues) or getupvalues
-    if type(getups) ~= 'function' then return false end
-    local ok_scan, objs = pcall(getgc)
-    if not ok_scan or type(objs) ~= 'table' then
-        ok_scan, objs = pcall(getgc, true) -- some executors need the include-tables arg
-        if not ok_scan or type(objs) ~= 'table' then return false end
-    end
-    local seen_pry = 0
-    for _, fn in ipairs(objs) do
-        if type(fn) == 'function' then
-            local ok_s, src = pcall(debug.info, fn, 's')
-            if ok_s and type(src) == 'string' and src:sub(-4) == '.PRY' then
-                seen_pry = seen_pry + 1
-                if fn_has_time_const(fn) then
-                    local ok_u, ups = pcall(getups, fn)
-                    if ok_u and type(ups) == 'table' then
-                        -- Faithful layout of the PRY send closure (confirmed by the
-                        -- "TIME" constant above), in upvalue/source order:
-                        --  [1] v663 full-packet RemoteEvent   [6] v659 Net object
-                        --  [2] v661 short-packet RemoteEvent  [7] v662 remote name
-                        --  [3] v667 uid holder (t[2][t[1]])   [8] v660 id for [6]
-                        --  [4] v658 key function              [9] v665 id for [2]
-                        --  [5] v666 id for [1]
-                        local g = {
-                            primary = ups[1], short = ups[2], holder = ups[3], keyfn = ups[4],
-                            primaryId = ups[5], netObj = ups[6], netName = ups[7],
-                            netId = ups[8], shortId = ups[9],
-                        }
-                        -- VALIDATE BY TYPE ONLY -- never CALL a game function, and
-                        -- never INDEX a game object (indexing could run a metatable
-                        -- __index, i.e. game code). Standing-still kicks pinned the
-                        -- arm step to the game calls a successful match used to make
-                        -- (the key function and netObj:RemoteEvent). So here we only
-                        -- check types -- isRemoteEvent reads the native ClassName (C,
-                        -- not game Lua), type() runs nothing -- and we defer every
-                        -- call AND every index into g.holder / g.netObj to fire time,
-                        -- the exact moment a real parry makes those same accesses.
-                        -- The "TIME" constant plus this full type layout pins the
-                        -- send closure on its own; no runtime probe of the values is
-                        -- needed to be sure.
-                        local scalar = {number = true, string = true}
-                        local netT = type(g.netObj)
-                        local valid = isRemoteEvent(g.primary) and isRemoteEvent(g.short)
-                            and type(g.keyfn) == 'function'
-                            and type(g.holder) == 'table' and (netT == 'table' or netT == 'userdata')
-                            and scalar[type(g.primaryId)] and scalar[type(g.netId)]
-                            and scalar[type(g.shortId)] and scalar[type(g.netName)]
-                        if valid then
-                            Remote.gc = g
-                            -- Remote.token holds the key function (a reference, NOT
-                            -- called here). Remote.remote stays nil until fire resolves
-                            -- it; remoteReady() treats a set Remote.gc as ready.
-                            Remote.token, Remote.uid_holder = g.keyfn, g.holder
-                            Remote.args = {g.netId, nil, "", 0.5, "", "", "", false}
-                            Remote.armed_info = ("netName=%s netId=%s(%s) [read-only arm]"):format(
-                                tostring(g.netName), tostring(g.netId), type(g.netId))
-                            return true
-                        end
-                    end
-                end
-            end
-        end
-    end
-    Remote.armed_info = ("no match (pry closures seen: %d)"):format(seen_pry)
-    return false
-end
-
--- Nonce watcher: once armed, read packet arg 2's live value every frame (a
--- plain table read on the cell we already hold -- no hook, nothing called) and
--- log each change with what happened just before it.
-do
-    local function ago(now, t) return t < 0 and "never" or ("%dms"):format(math.floor((now - t) * 1000)) end
-    pcall(function()
-        table.insert(Nonce.conns, Remotes.ParrySuccess.OnClientEvent:Connect(function()
-            Nonce.last_success_t = os.clock()
-            if Remote.gc then nonce_log("ParrySuccess received") end
-        end))
-    end)
-    table.insert(Nonce.conns, UserInputService.InputBegan:Connect(function(input, gp)
-        if gp then return end
-        if input.KeyCode == Enum.KeyCode.F or input.UserInputType == Enum.UserInputType.MouseButton1 then
-            Nonce.last_key_t = os.clock()
-            if Remote.gc then
-                nonce_log("REAL block input (" .. (input.KeyCode ~= Enum.KeyCode.Unknown and input.KeyCode.Name or input.UserInputType.Name) .. ")")
-            end
-        end
-    end))
-    table.insert(Nonce.conns, RunService.Heartbeat:Connect(function()
-        local g = Remote.gc
-        if not g or not is_live() then return end
-        local ok, val = pcall(function() return g.holder[2][g.holder[1]] end)
-        if not ok then return end
-        if Nonce.last == nil then
-            Nonce.last = val
-            nonce_log(("==== v%s ARMED: arg2=%s (%s) [%s]"):format(SCRIPT_VERSION, tostring(val), type(val), tostring(Remote.armed_info)))
-            return
-        end
-        if val ~= Nonce.last then
-            Nonce.changes = Nonce.changes + 1
-            local now = os.clock()
-            nonce_log(("CHANGE #%d %s -> %s match=%s | since our send %s, since ParrySuccess %s, since real block %s"):format(
-                Nonce.changes, tostring(Nonce.last), tostring(val), nonce_match(Nonce.last, val),
-                ago(now, Nonce.last_send_t), ago(now, Nonce.last_success_t), ago(now, Nonce.last_key_t)))
-            Nonce.last = val
-        end
-    end))
-end
+end -- sender block
 
 -- ============================================================
 -- SYSTEM
@@ -1266,41 +1122,30 @@ function System.parry.fast()
     System.__properties.__total_parries = System.__properties.__total_parries + 1
 end
 
--- Arm the remote WITHOUT hooking or pressing: read it straight from the live PRY
--- closure via getgc (arm_via_gc). Retries while a parry feature is on and we
--- haven't got it yet -- the closure exists as soon as SwordsController has run,
--- so this usually succeeds on the first try, the instant the script loads into a
--- match. Nothing is installed at any point, so there is no hook for the
--- anti-cheat to find and nothing of ours ever touches the game's parry sender.
+-- Arm Remote mode: get the game's own parry sender with require(PRY) (the cached
+-- module value -- no memory scan, no upvalue reads, no hook) and verify a clean
+-- call thread can be built (arm_sender). Retries only until the PRY module has
+-- loaded, which is normally already true by the time a feature is turned on.
 local arming = false
 prime_remote = function()
-    if remoteReady() or arming then return end
-    -- The getgc arm is only needed for Remote mode. If every active mode is
-    -- Keypress, don't touch getgc at all.
+    if remoteReady() or arming or Sender.gave_up then return end
     if getgenv().AutoParryMode == "Keypress" and getgenv().ManualSpamMode == "Keypress" then return end
     arming = true
     task.spawn(function()
         local tries = 0
         while not remoteReady() and not Library.Unloaded and tries < 40 do
-            local props = System.__properties
-            if not (props.__autoparry_enabled or props.__triggerbot_enabled
-                or props.__auto_spam_enabled or props.__manual_spam_enabled) then break end
-            local ok, got = pcall(arm_via_gc)
-            if ok and got and remoteReady() then
-                Notify("Blade Ball", "Remote armed (hookless): " .. tostring(Remote.armed_info), 4)
+            local ok, got = pcall(arm_sender)
+            if ok and got then
+                Notify("Blade Ball", "Remote armed: " .. tostring(Sender.info), 4)
                 break
             end
+            -- a missing module is worth waiting for; anything else won't fix itself
+            if Sender.info ~= "PRY module not loaded yet" then Sender.gave_up = true; break end
             tries = tries + 1
             task.wait(0.5)
         end
         if not remoteReady() then
-            if type(getgc) ~= 'function' then
-                Notify("Blade Ball", "This executor has no getgc, so the hookless arm can't run. Remote mode is unavailable here.", 6)
-            else
-                -- Surfaces why it couldn't arm (e.g. "no match (pry closures seen: N)")
-                -- so it can be pinned down. Not armed = parries won't fire.
-                Notify("Blade Ball", "Couldn't arm hooklessly: " .. tostring(Remote.armed_info), 8)
-            end
+            Notify("Blade Ball", "Remote not armed: " .. tostring(Sender.info), 8)
         end
         arming = false
     end)
@@ -3046,14 +2891,9 @@ local function remoteStatusText()
     local w = parry_window()
     local wtxt = w and ("%.3f"):format(w) or (Win.done and "fallback" or "reading stats...")
     if remoteReady() then
-        return ("Remote: armed [%s] window=%s%s\nArg2 watch: now=%s changes=%d sends=%d repeated=%d log=%s\nLast: %s"):format(
-            tostring(Remote.armed_info), wtxt, Win.noob and " (noob boost on)" or "",
-            tostring(Nonce.last), Nonce.changes, Nonce.sends, Nonce.repeats,
-            Nonce.log_ok == false and "FAILED (no file access)" or "BladeBall/nonce_log.txt",
-            tostring(Nonce.recent[#Nonce.recent] or "-"))
+        return ("Remote: armed -- %s. window=%s, no memory reads, no hooks"):format(tostring(Sender.info), wtxt)
     end
-    if type(getgc) ~= 'function' then return "Remote: needs getgc (missing in this executor)" end
-    return "Remote: arming... window=" .. wtxt
+    return "Remote: " .. tostring(Sender.info) .. " (window=" .. wtxt .. ")"
 end
 
 local status_peak, status_ball = 0, nil
@@ -3511,7 +3351,6 @@ Library:OnUnload(function()
     AutoJump = false
     for _, conn in pairs(System.__properties.__connections) do pcall(function() conn:Disconnect() end) end
     for _, conn in pairs(Connections_Manager) do pcall(function() conn:Disconnect() end) end
-    for _, conn in ipairs(Nonce.conns) do pcall(function() conn:Disconnect() end) end
     for _, gui in pairs(System.__properties.__mobile_guis) do destroy_mobile_gui(gui) end
     if System.__properties.__ball_velocity_gui then pcall(function() System.__properties.__ball_velocity_gui.gui:Destroy() end) end
     pcall(function() PingGui:Destroy() end)
