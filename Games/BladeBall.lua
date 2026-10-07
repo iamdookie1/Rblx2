@@ -6,7 +6,7 @@ task.spawn(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.07-7"
+local SCRIPT_VERSION = "2026.10.07-8"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -125,44 +125,39 @@ local function getRoot()
 end
 
 -- ============================================================
--- PARRY CAPTURE + UNTRACEABLE REPORT SUPPRESSION
+-- PARRY CAPTURE (read-only, then no hooks) -- UNTRACEABLE
 -- ============================================================
 -- What the game's parry sender (the PRY module under SwordsController) does on
 -- every block, from the dump:
 --   1. its only client checks, both BEFORE it sends:
 --        a. debug.info(debug.info, 's') ~= '[C]'  -- debug.info was hooked
 --        b. any function within 10 stack levels runs in an env with writefile
---      Neither kicks locally. Each instead *reports home* over the SAME parry
---      RemoteEvent, as a plain dot-call FireServer(game.JobId, <magic>, ...):
---        "494kjkdf"  for check (a),  "64565gfdd"  for check (b).
---      The server decides what to do with those reports. No report, no trace.
+--      Neither kicks locally. Each instead *reports home* over the parry remote
+--      with a per-trip random token, and the server acts on the report.
 --   2. builds the token from its key function (first function upvalue).
 --   3. sends (id, uid, token, window, camera CFrame, {screen points}, {x, y},
---      flag) to that RemoteEvent, as remote:FireServer(...) or via a fetched
+--      flag) to that RemoteEvent, as remote:FireServer(...) or a fetched
 --      remote.FireServer (50/50).
--- Two jobs, one thin hook layer over FireServer (both send paths):
---   * CAPTURE -- read the real parry packet once, so we can fire it ourselves.
---     Armed only for the 0.6s around a block press and only until the remote is
---     known; after that the capture branch never runs again. What proves a send
---     is the game's own is that the PRY sender is on the live call stack
---     (capture() checks), NOT checkcaller -- our own fireParryRemote never
---     routes through PRY so it is never caught, and a genuine send is caught
---     even when it runs on our thread (see below).
---   * REPORT SUPPRESSION -- always on, UNCONDITIONAL. Any FireServer carrying a
---     known BAC token in any argument (see BAC_TOKENS) is dropped; the real
---     parry and every other FireServer pass through untouched. This is the
---     part that must not be gated on checkcaller. Many executors run
---     VirtualInputManager input on the CALLER'S thread, so a block press we send
---     runs the game's PRY sender synchronously on OUR stack. That trips check
---     (b) -- our writefile-env functions are now within its 10-level getfenv
---     scan -- and fires the report, and because it is our thread checkcaller()
---     is true at that call. An earlier build gated the drop on checkcaller, so
---     that report slipped through and the player was kicked (reproduced in the
---     training area). Dropping on signature alone closes that hole; the report
---     is the one channel a trip can reach the server, so killing it makes the
---     hooks untraceable whatever the client concludes, now or after an update.
--- Once the remote is captured we fire it directly and never press block again,
--- so the game's sender (and its checks) stop running on our account entirely.
+-- Why earlier builds were still caught: chasing the report token is hopeless
+-- (it is random per trip) and suppressing the report treats the symptom. The
+-- real trigger is check (b): our auto-parry/prime pressed block through
+-- VirtualInputManager, and on executors that run VIM input on the caller's
+-- thread that runs the sender SYNCHRONOUSLY ON OUR STACK -- so our
+-- writefile-carrying functions sit inside the sender's 10-level getfenv scan and
+-- it reports us. We don't hook debug.info, so check (a) never fires.
+-- So the design here never lets the sender run on our account at all:
+--   * We NEVER press block ourselves. Not to parry, not to "prime".
+--   * A thin, READ-ONLY hook over FireServer (both send paths) waits for YOUR
+--     own natural block press -- where our code is nowhere near the sender's
+--     stack -- reads that one real packet, and then uninstalls for good. It only
+--     reads; it never drops or alters a send. A send is taken only when the PRY
+--     sender is on the live stack (capture() checks), so our own fireParryRemote
+--     is never mistaken for it.
+--   * From then on every parry is a direct remote fire that bypasses PRY
+--     entirely, so neither check ever runs on our account -- nothing to report,
+--     nothing to trace, whatever token BAC rotates to.
+-- Keypress mode is the sole exception: it presses block on purpose, which runs
+-- the sender, so it is the one mode BAC can see and it is opt-in only.
 -- Each closure is a newcclosure and every capture is pcall'd, so nothing of ours
 -- can error into the parry.
 local Remote = {
@@ -173,10 +168,9 @@ local Remote = {
 }
 
 local hook_wrap = newcclosure or function(f) return f end
--- `armed_until` is the capture window (set by a block press); report suppression
--- is always on while the hooks are installed. `installed` stays true for the
--- whole session -- the hooks only come down on unload.
-local Hooks = {armed_until = 0, installed = false}
+-- `installed` is true only while the read-only capture hooks are up: from load
+-- until your first natural block is read, then never again.
+local Hooks = {installed = false}
 
 -- Cheap test on the raw arguments, before anything is copied: a parry packet is
 -- (id, uid, token string, window number, CFrame, {points}, {x, y}, flag).
@@ -188,41 +182,14 @@ local function parry_shaped(...)
         and type(points) == 'table' and type(aim) == 'table'
 end
 
--- BAC (Blade Anti-Cheat) reports a tamper trip home over the parry remote as a
--- FireServer carrying one of its magic tokens. In the Oct-4 dump that was
--- FireServer(game.JobId, "494kjkdf"/"64565gfdd", ...); the live build added
--- "HfdX24KleuYH". Two token-independent facts make a report easy to tell from a
--- real parry: the tokens are random strings that appear in nothing else, and a
--- report carries our own game.JobId as a direct argument while a real parry
--- (id, uid, token, ...) never does. So we drop a FireServer when any argument is
--- a known token, OR it carries game.JobId and isn't shaped like a parry -- the
--- JobId rule keeps catching reports even if BAC rotates the token again. Only
--- real tokens are listed: the BAC_FAKE_* UUIDs look like honeypots (a decoy the
--- server expects to receive), so dropping those would itself be a tell. Nested
--- tables aren't scanned, so a legit {jobId = game.JobId, ...} payload is safe.
-local JOB_ID
-local BAC_TOKENS = {
-    ["494kjkdf"] = true,
-    ["64565gfdd"] = true,
-    ["HfdX24KleuYH"] = true,
-}
-local function is_report(...)
-    if JOB_ID == nil then JOB_ID = game.JobId or false end
-    local n = select('#', ...)
-    if n > 10 then n = 10 end -- reports are short; cap the scan so real sends stay cheap
-    local saw_jobid = false
-    for i = 1, n do
-        local a = select(i, ...)
-        if type(a) == 'string' then
-            if BAC_TOKENS[a] then return true end
-            if JOB_ID and a == JOB_ID then saw_jobid = true end
-        end
-    end
-    return saw_jobid and not parry_shaped(...)
-end
--- Capture runs only while armed and only until the remote is known.
+-- Capture is armed until we have the remote -- there is no timed window. We wait
+-- for a NATURAL block press (yours, on the keyboard) to read the real packet; we
+-- never press block ourselves, so our writefile-carrying functions are never on
+-- the game sender's call stack when its getfenv check runs, and the check never
+-- reports us. The moment a packet is read the hooks come down for good (see
+-- capture()), so after one block there is nothing left hooked to find.
 local function capture_armed()
-    return Remote.remote == nil and os.clock() < Hooks.armed_until
+    return Remote.remote == nil
 end
 
 -- The game's PRY sender if it's on the live call stack, else nil. Its chunk is
@@ -290,12 +257,12 @@ local function restore_function(fn, old)
     pcall(hookfunction, fn, old)
 end
 
--- Restores every original and takes the layer down for good. Called on unload
--- so a replaced or disabled copy leaves no trace behind; not called in normal
--- play -- the hooks stay up to keep suppressing reports.
+-- Restores every original and takes the hooks down for good. Called the instant
+-- a packet is captured (so nothing stays hooked once we have what we need) and
+-- again on unload, so a replaced or disabled copy leaves no trace behind.
 local function uninstallRemoteHooks()
     if not Hooks.installed then return end
-    Hooks.installed, Hooks.armed_until = false, 0 -- pass straight through even if a restore fails
+    Hooks.installed = false -- pass straight through even if a restore fails
     if Hooks.old_namecall then pcall(hookmetamethod, game, '__namecall', Hooks.old_namecall) end
     if Hooks.old_index then pcall(hookmetamethod, game, '__index', Hooks.old_index) end
     if Hooks.fire_fn and Hooks.old_fire then restore_function(Hooks.fire_fn, Hooks.old_fire) end
@@ -321,11 +288,14 @@ local function capture(remote, ...)
         local remote_found, args_found, sender_found = Hooks.pending_remote, Hooks.pending_args, Hooks.pending_sender
         Hooks.pending_remote, Hooks.pending_args, Hooks.pending_sender = nil, nil, nil
         if not remote_found then return end
-        Hooks.armed_until = 0 -- captured: close the window; the hooks stay up for report suppression
         Remote.token = Remote.token or key_function(sender_found)
         local first = Remote.remote == nil
         Remote.remote, Remote.args = remote_found, args_found
-        if first then Notify("Blade Ball", "Parry remote found. Remote mode is ready.", 3) end
+        -- Got the packet from a natural block. Tear the hooks down now -- from
+        -- here we fire the remote ourselves and the game's sender (with its
+        -- checks) never runs on our account, so there is nothing left to detect.
+        uninstallRemoteHooks()
+        if first then Notify("Blade Ball", "Parry remote armed. Remote mode is ready (hooks removed).", 3) end
     end)
 end
 
@@ -339,32 +309,23 @@ local function shared_fire_fn()
 end
 
 -- Installed once, then left up for the whole session. Each FireServer that
--- reaches a hook is, in order:
---   * a detection report (a BAC token in any arg) -> dropped, send nothing, NO
---     MATTER who fired it or on which thread. This is the part that has to be
---     unconditional: many executors run VirtualInputManager input on the
---     caller's thread, so our block press runs the game's PRY sender on OUR
---     stack -- which both trips the sender's 10-level writefile getfenv check
---     (our functions are now within it) AND makes checkcaller() true at the
---     report call. Gating the drop on checkcaller (as a previous build did) let
---     that very report through and got the player kicked.
---   * the game's PRY parry, while we're armed and still need the packet ->
---     captured, then passed on. What proves a send is the real one is that the
---     PRY sender is on the live stack (capture() checks), not checkcaller --
---     our own fireParryRemote never routes through PRY, so it is never caught,
---     and genuine sends are caught even when they run on our thread.
---   * anything else -> passed straight through untouched.
+-- reaches a hook does one of two things: if it is the game's PRY parry and we
+-- still need the packet, it is captured (then passed on unchanged); otherwise it
+-- passes straight through untouched. The hooks are read-only -- they never drop
+-- or alter a send -- and they come down the instant a packet is captured. What
+-- proves a send is the real one is the PRY sender being on the live stack
+-- (capture() checks), so our own fireParryRemote (which never routes through
+-- PRY) is ignored and only a genuine send from your natural block is read.
 local function installRemoteHooks()
     if Hooks.installed then return end
-    -- remote:FireServer(...) path. Reports are dot-calls so they don't arrive
-    -- here, but the drop is kept for safety if the sender ever uses a namecall.
+    -- remote:FireServer(...) path.
     if hookmetamethod and getnamecallmethod then
         pcall(function()
             local old_namecall
             old_namecall = hookmetamethod(game, '__namecall', hook_wrap(function(self, ...)
-                if getnamecallmethod() == 'FireServer' and isRemoteEvent(self) then
-                    if is_report(...) then return end
-                    if capture_armed() and parry_shaped(...) then pcall(capture, self, ...) end
+                if capture_armed() and getnamecallmethod() == 'FireServer'
+                    and isRemoteEvent(self) and parry_shaped(...) then
+                    pcall(capture, self, ...)
                 end
                 return old_namecall(self, ...)
             end))
@@ -372,16 +333,15 @@ local function installRemoteHooks()
             Remote.hooked = true
         end)
     end
-    -- local f = remote.FireServer; f(remote, ...) path -- how the reports are
-    -- sent, patched in place so remote.FireServer stays the same C function.
+    -- local f = remote.FireServer; f(remote, ...) path, patched in place so
+    -- remote.FireServer stays the same C function.
     local fire_fn = hookfunction and shared_fire_fn()
     if fire_fn then
         pcall(function()
             local old_fire
             old_fire = hookfunction(fire_fn, hook_wrap(function(self, ...)
-                if isRemoteEvent(self) then
-                    if is_report(...) then return end
-                    if capture_armed() and parry_shaped(...) then pcall(capture, self, ...) end
+                if capture_armed() and isRemoteEvent(self) and parry_shaped(...) then
+                    pcall(capture, self, ...)
                 end
                 return old_fire(self, ...)
             end))
@@ -390,23 +350,19 @@ local function installRemoteHooks()
         end)
     end
     -- No hookfunction: catch the fetched path through __index instead, handing
-    -- back one cached wrapper. The wrapper is returned for every RemoteEvent
-    -- .FireServer read (not gated on checkcaller) so a report sent from our own
-    -- thread still goes through it and is dropped.
+    -- back one cached wrapper.
     if not Hooks.old_fire and hookmetamethod then
         pcall(function()
             local old_index
             local wrappers = setmetatable({}, {__mode = 'k'})
             old_index = hookmetamethod(game, '__index', hook_wrap(function(self, key)
-                if key == 'FireServer' and isRemoteEvent(self) then
+                if capture_armed() and key == 'FireServer' and isRemoteEvent(self)
+                    and not (checkcaller and checkcaller()) then
                     local real = old_index(self, key)
                     local wrapped = wrappers[real]
                     if not wrapped then
                         wrapped = hook_wrap(function(remote, ...)
-                            if isRemoteEvent(remote) then
-                                if is_report(...) then return end
-                                if capture_armed() and parry_shaped(...) then pcall(capture, remote, ...) end
-                            end
+                            if capture_armed() and parry_shaped(...) then pcall(capture, remote, ...) end
                             return real(remote, ...)
                         end)
                         wrappers[real] = wrapped
@@ -420,7 +376,7 @@ local function installRemoteHooks()
         end)
     end
     -- Only count as installed if something actually took, so a failed attempt
-    -- can be retried on the next block press.
+    -- can be retried.
     Hooks.installed = Remote.hooked == true
 end
 
@@ -456,13 +412,18 @@ end
 if not (hookfunction or hookmetamethod) then
     Notify("Blade Ball", "Couldn't hook remotes. Parries will use the block key.", 6)
 else
-    -- Up once, for the whole session: report suppression starts immediately and
-    -- the capture branch is dormant until a block press arms it.
+    -- Up now so the next natural block press is read. The hooks are read-only and
+    -- come down the instant that packet is captured -- after that nothing of ours
+    -- is installed and parries go out as direct remote fires.
     installRemoteHooks()
 end
 
--- Presses the block key. Works without the remote, at the cost of the game's
--- own parry cooldown and no curve control.
+-- Presses the block key via VirtualInputManager. This runs the game's own PRY
+-- sender -- and on executors that handle VIM input on the caller's thread, it
+-- runs it on OUR stack, which is exactly what trips BAC's getfenv/writefile
+-- check. So this is used ONLY by explicit Keypress mode, which the user opts
+-- into; Remote mode never calls it. It also can't curve and pays the game's
+-- parry cooldown.
 local function pressBlockKey()
     if not is_live() then return end
     log_send("block key")
@@ -470,21 +431,6 @@ local function pressBlockKey()
         VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.F, false, game)
         VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.F, false, game)
     end)
-end
-
--- A block press that, while the remote isn't known yet, arms the capture for
--- just long enough (0.6s at most) to read the parry it sends. The capture branch
--- goes quiet the moment that press is read, or when the window ends -- the hooks
--- themselves stay up either way (report suppression). Once the remote is known
--- it's a plain press.
-local function press_block()
-    if not remoteReady() then
-        if not Hooks.installed then installRemoteHooks() end -- in case the startup install didn't take
-        -- The game's sender runs within a frame of the block press; 0.6s covers a
-        -- slow frame or input step without arming the capture longer than needed.
-        Hooks.armed_until = os.clock() + 0.6
-    end
-    pressBlockKey()
 end
 
 local CollectionService = cloneref(game:GetService('CollectionService'))
@@ -997,11 +943,20 @@ function System.curve.get_cframe_fast()
 end
 
 System.parry = {}
--- "Remote" fires the parry remote with the chosen curve. "Keypress" presses the
--- block key. Remote mode falls back to the key until the remote is captured.
+-- "Remote" fires the parry remote with the chosen curve -- never a key press, so
+-- the game's sender (with its checks) never runs on our account. Until your
+-- first natural block arms the remote it simply does nothing but ask you to block
+-- once. "Keypress" presses the block key (VirtualInputManager); that runs the
+-- game's sender and is the one mode BAC can see, so it's opt-in only.
+local arm_notified = false
+local function arm_notice()
+    if arm_notified then return end
+    arm_notified = true
+    Notify("Blade Ball", "Press block (F) once to arm Remote mode. After that, parries are untraceable.", 6)
+end
 function System.parry.execute()
     if System.__properties.__parries > 10000 or not LocalPlayer.Character then return end
-    if not fireParryRemote(System.curve.get_cframe()) then press_block() end
+    if not fireParryRemote(System.curve.get_cframe()) then arm_notice(); return end
     System.__properties.__parries = System.__properties.__parries + 1
     System.__properties.__total_parries = System.__properties.__total_parries + 1
     task.delay(0.5, function()
@@ -1010,7 +965,7 @@ function System.parry.execute()
 end
 function System.parry.keypress()
     if not LocalPlayer.Character then return end
-    press_block()
+    pressBlockKey()
     System.__properties.__total_parries = System.__properties.__total_parries + 1
 end
 -- Light parry for spam: same remote and curve as execute, but reuses the frame's
@@ -1018,50 +973,18 @@ end
 -- task.delay per call, which piles up into thousands at spam rates).
 function System.parry.fast()
     if not LocalPlayer.Character then return end
-    if not fireParryRemote(System.curve.get_cframe_fast()) then press_block() end
+    if not fireParryRemote(System.curve.get_cframe_fast()) then arm_notice(); return end
     System.__properties.__total_parries = System.__properties.__total_parries + 1
 end
 
--- Gets the parry remote captured without you blocking by hand: presses block
--- once while a parry feature is on and you're somewhere you can parry. Only
--- while no ball is on you, so the press can't land at a bad moment, and at
--- most 3 tries (spaced past the game's ~1.3s block cooldown); if those don't
--- catch it, parries just use the block key. Holds off while you're typing.
-local remote_priming = false
-local function ball_on_me()
-    local balls = System.ball.get_all()
-    local training = Workspace:FindFirstChild("TrainingBalls")
-    if training then for _, b in ipairs(training:GetChildren()) do table.insert(balls, b) end end
-    for _, ball in ipairs(balls) do
-        if ball:GetAttribute('target') == LocalPlayer.Name then return true end
-    end
-    return false
-end
+-- We no longer press block ourselves to grab the remote -- doing that ran the
+-- game's sender on our stack and is what BAC caught. Instead the read-only hooks
+-- (installed at load) wait for your own natural block, read the packet once, and
+-- come down. All this does is nudge you to block once if a parry feature is on
+-- and the remote isn't armed yet.
 prime_remote = function()
-    if remote_priming or remoteReady() then return end
-    remote_priming = true
-    task.spawn(function()
-        local presses = 0
-        while not remoteReady() and presses < 3 and not Library.Unloaded do
-            local props = System.__properties
-            if not (props.__autoparry_enabled or props.__triggerbot_enabled
-                or props.__auto_spam_enabled or props.__manual_spam_enabled) then break end
-            if canParryNow() and not ball_on_me() and not UserInputService:GetFocusedTextBox() then
-                ParryLog.source = "remote grab press"
-                press_block()
-                ParryLog.source = nil
-                presses = presses + 1
-                local start = os.clock()
-                repeat task.wait(0.05) until remoteReady() or os.clock() - start > 1.6
-            else
-                task.wait(0.25)
-            end
-        end
-        if presses >= 3 and not remoteReady() then
-            Notify("Blade Ball", "Couldn't catch the parry remote. Parries use the block key; it'll catch it on a block.", 5)
-        end
-        remote_priming = false
-    end)
+    if remoteReady() then return end
+    arm_notice()
 end
 function System.parry.execute_action() System.animation.play_grab_parry(); System.parry.execute() end
 function System.parry.by_mode(mode)
@@ -2799,9 +2722,9 @@ task.spawn(function()
 end)
 
 local function remoteStatusText()
-    if remoteReady() then return "Remote: ready, parries use the remote" end
-    if not (hookfunction or hookmetamethod) then return "Remote: can't hook in this executor, parries use the block key" end
-    return "Remote: not caught yet. It's caught on the first block (pressed for you when a parry feature turns on); the token is lifted off that parry's stack. Parries use the block key until then"
+    if remoteReady() then return "Remote: armed. Parries fire the remote directly -- hooks removed, nothing for the anti-cheat to see" end
+    if not (hookfunction or hookmetamethod) then return "Remote: can't hook in this executor. Use Keypress mode (note: Keypress is detectable)" end
+    return "Remote: not armed yet. Press block (F) ONCE to arm it -- we read that one real parry and remove the hooks. We never press block for you, so the anti-cheat's check never sees us. Until you block once, Remote-mode parries do nothing"
 end
 
 local status_peak, status_ball = 0, nil
