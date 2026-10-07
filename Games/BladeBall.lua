@@ -6,7 +6,7 @@ task.spawn(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.07-26"
+local SCRIPT_VERSION = "2026.10.07-27"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -16,6 +16,7 @@ local SCRIPT_VERSION = "2026.10.07-26"
 local genv = (getgenv and getgenv()) or _G
 if type(genv.__BladeBallShutdown) == 'function' then pcall(genv.__BladeBallShutdown) end
 local INSTANCE = {}
+local LOADED_AT = os.clock()
 genv.__BladeBallInstance = INSTANCE
 local function is_live() return genv.__BladeBallInstance == INSTANCE end
 
@@ -676,18 +677,28 @@ local function find_pry_module()
     return nil
 end
 
--- Stage test (getgenv().BladeBallStageTest = true): arming runs one step at a
--- time with a long idle gap after each, logged to flight.txt, so the step a
--- kick follows is the one BAC catches.
+-- Arming is spread out, the way the v25 staged run did it. That run is the
+-- only one that never got a reason-24 kick (the "X24" in "BAC fhb44X24774"):
+-- every build that did all of arming in the first second after load got one
+-- about 27s later, with or without parries. So arming waits until ARM_AFTER
+-- seconds after load and leaves ARM_GAP seconds between its steps.
+-- getgenv().BladeBallStageTest = true stretches the gaps to 75s for testing.
+local ARM_AFTER, ARM_GAP = 40, 10
 local function stage(n, what)
-    if not genv.BladeBallStageTest then return end
-    flight(("STAGE %d done: %s -- idling %ds before the next step"):format(n, what, 75))
-    Sender.info = ("stage test: step %d (%s) done, waiting"):format(n, what)
-    task.wait(75)
+    local gap = genv.BladeBallStageTest and 75 or ARM_GAP
+    flight(("arm step %d done: %s -- next step in %ds"):format(n, what, gap))
+    Sender.info = ("arming: step %d of 4 done (%s)"):format(n, what)
+    task.wait(gap)
 end
 
 arm_sender = function()
     if Sender.fn then return true end
+    local wait_for = ARM_AFTER - (os.clock() - LOADED_AT)
+    if wait_for > 0 then
+        Sender.info = ("arming in %ds (spread out to avoid BAC reason 24)"):format(math.ceil(wait_for))
+        flight(("arming waits %.0fs (starts %ds after load)"):format(wait_for, ARM_AFTER))
+        task.wait(wait_for)
+    end
     local mod = find_pry_module()
     if not mod then Sender.info = "PRY module not loaded yet"; return false end
     stage(1, "found the PRY ModuleScript (reads only)")
@@ -3528,7 +3539,8 @@ do
         SCRIPT_VERSION, exec, tostring(game.PlaceId), tostring(LocalPlayer.UserId)))
     local conns = {}
     table.insert(conns, GuiService.ErrorMessageChanged:Connect(function(msg)
-        flight("!!!! KICK / ERROR MESSAGE: " .. tostring(msg))
+        local reason = tostring(msg):match("BAC%s+%w-X(%d%d)")
+        flight("!!!! KICK / ERROR MESSAGE: " .. tostring(msg) .. (reason and (" [reason " .. reason .. "]") or ""))
     end))
     table.insert(conns, Remotes.ParrySuccess.OnClientEvent:Connect(function() flight("ParrySuccess received") end))
     local function where()
