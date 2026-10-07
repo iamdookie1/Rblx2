@@ -6,7 +6,7 @@ task.spawn(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.07-48"
+local SCRIPT_VERSION = "2026.10.07-49"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -1736,6 +1736,120 @@ function System.triggerbot.enable(enabled)
     end
 end
 
+-- ------------------------------------------------------------
+-- HOOK-FREE PROBE (research)
+-- ------------------------------------------------------------
+-- The goal is to need no hook at all: find everything a parry packet needs
+-- without watching the game send. Each capture hands us the true values, so
+-- once per session (from our own thread, nothing hooked, nothing changed) this
+-- checks every hook-free source against them and writes what it finds to the
+-- flight log:
+--   remote : is it the only hashed-name remote in the game's Net folder?
+--   hash   : is it getrenv()._G.BAC_HASH?
+--   id     : is it readable anywhere -- attributes, values, the game's _G, the
+--            Data replion -- and does the server ever send it (every incoming
+--            remote event is watched for it for the rest of the session)?
+--   key    : id + key bytes, so the id -> key function can be worked out
+--            from a few sessions' worth.
+local probed = false
+local function hookless_probe(cap)
+    if probed then return end
+    probed = true
+    task.spawn(function()
+        local uid, out = cap.uid, {}
+        local function note(s) out[#out + 1] = s end
+        -- remote
+        pcall(function()
+            local net = ReplicatedStorage.Packages._Index["sleitnick_net@0.1.0"].net
+            local hashed, names = 0, {}
+            for _, r in ipairs(net:GetChildren()) do
+                if r:IsA("RemoteEvent") and r.Name:match("^RE/%x+$") and #r.Name >= 36 then
+                    hashed = hashed + 1
+                    names[#names + 1] = r.Name:sub(1, 12)
+                end
+            end
+            note(("remote: %d hashed-name RemoteEvent(s) in Net [%s]; captured %s, %s"):format(hashed,
+                table.concat(names, ","), cap.remote.Name:sub(1, 12),
+                cap.remote.Parent == net and "lives in Net" or ("lives in " .. cap.remote.Parent:GetFullName())))
+        end)
+        -- hash
+        pcall(function()
+            local g = getrenv and getrenv()._G
+            local hit = {}
+            if type(g) == 'table' then
+                for k, v in pairs(g) do if v == cap.hash then hit[#hit + 1] = tostring(k) end end
+            end
+            note("hash: captured " .. cap.hash .. " == _G." .. (#hit > 0 and table.concat(hit, ", _G.") or "(not in _G)"))
+        end)
+        -- id: everywhere readable
+        local where = {}
+        local function check(label, v)
+            if type(v) == 'string' and v ~= '' and (v == uid or v:find(uid, 1, true)) then where[#where + 1] = label end
+        end
+        local function scan_inst(root, depth)
+            pcall(function()
+                for k, v in pairs(root:GetAttributes()) do check(root:GetFullName() .. "@" .. k, v) end
+                if root:IsA("StringValue") then check(root:GetFullName(), root.Value) end
+            end)
+            if depth <= 0 then return end
+            for i, c in ipairs(root:GetChildren()) do
+                scan_inst(c, depth - 1)
+                if i % 200 == 0 then task.wait() end
+            end
+        end
+        scan_inst(LocalPlayer, 6)
+        if LocalPlayer.Character then scan_inst(LocalPlayer.Character, 3) end
+        scan_inst(ReplicatedStorage, 5)
+        scan_inst(Workspace, 1)
+        pcall(function()
+            local g = getrenv and getrenv()._G
+            if type(g) == 'table' then for k, v in pairs(g) do check("_G." .. tostring(k), v) end end
+        end)
+        pcall(function()
+            local function walk(t, path, depth)
+                if depth > 4 then return end
+                for k, v in pairs(t) do
+                    if type(v) == 'table' then walk(v, path .. "." .. tostring(k), depth + 1)
+                    else check(path .. "." .. tostring(k), v) end
+                end
+            end
+            if Win.data then walk(Win.data:Get(), "Data", 0) end
+        end)
+        note("id " .. uid .. ": " .. (#where > 0 and ("FOUND at " .. table.concat(where, " | ")) or "not readable anywhere scanned"))
+        -- key
+        local hex = {}
+        for i, b in ipairs(cap.key) do hex[i] = ("%02x"):format(b) end
+        note(("key: id %s -> %s (bytes for time digits 1-%d)"):format(uid, table.concat(hex, " "), #cap.key))
+        for _, line in ipairs(out) do flight("PROBE " .. line) end
+        -- watch incoming remote traffic for the id for the rest of the session
+        local function has_uid(v, depth)
+            if type(v) == 'string' then return v == uid or v:find(uid, 1, true) ~= nil end
+            if type(v) == 'table' and depth < 3 then
+                for k, x in pairs(v) do if has_uid(k, depth + 1) or has_uid(x, depth + 1) then return true end end
+            end
+            return false
+        end
+        local seen = {}
+        for i, r in ipairs(ReplicatedStorage:GetDescendants()) do
+            if r:IsA("RemoteEvent") then
+                pcall(function()
+                    r.OnClientEvent:Connect(function(...)
+                        if seen[r] then return end
+                        for j = 1, select('#', ...) do
+                            if has_uid((select(j, ...)), 0) then
+                                seen[r] = true
+                                flight(("PROBE id %s RECEIVED from %s (arg %d)"):format(uid, r:GetFullName(), j))
+                                return
+                            end
+                        end
+                    end)
+                end)
+            end
+            if i % 300 == 0 then task.wait() end
+        end
+    end)
+end
+
 -- Housekeeping, once a frame: auto press while not armed (the only time the
 -- block button/key is ever pressed in Remote mode -- once captured, every parry
 -- is a remote parry; it presses again only if the game deletes the remote),
@@ -1761,6 +1875,7 @@ RunService.Heartbeat:Connect(function()
     if nc then
         Core.new_capture = nil
         local cap, prev = Core.cap, nc.prev
+        hookless_probe(cap)
         local keystr = table.concat(cap.key, ",")
         local changed
         if prev then
