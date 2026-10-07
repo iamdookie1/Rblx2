@@ -6,7 +6,7 @@ task.spawn(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.07-53"
+local SCRIPT_VERSION = "2026.10.07-54"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -2226,13 +2226,12 @@ System.auto_spam = {}
 local props = System.__properties
 local me = LocalPlayer.Name
 local macroAnimFix = false
-local ManualSpam = {rate = 300} -- parries per second (slider)
-local AutoSpam = {rate = 250, active_until = 0, reason = nil, was_active = false}
+local AutoSpam = {active_until = 0, reason = nil, was_active = false}
 local SpamNet = {
     idle_rate = 20,
     hard_max = 120,
     blind_max = 90,
-    budget_kbps = 220,
+    budget_kbps = 220,    -- "Max upload" slider
     guard_at = -1,
     factor = 1,
     readable = false,
@@ -2417,8 +2416,10 @@ end
 
 local Pump = {credit = 0, last = os.clock(), on = false, frame = 0, frame_fires = 0, fired_frame = -1}
 local function current_source(now)
-    if props.__manual_spam_enabled then return ManualSpam.rate, "manual spam" end
-    if props.__auto_spam_enabled and now < AutoSpam.active_until then return AutoSpam.rate, "auto spam" end
+    -- no rate setting: both run flat out; the caps and the Max upload slider
+    -- (SpamNet.budget_kbps) are what hold them back
+    if props.__manual_spam_enabled then return SpamNet.hard_max, "manual spam" end
+    if props.__auto_spam_enabled and now < AutoSpam.active_until then return SpamNet.hard_max, "auto spam" end
     return nil
 end
 local function effective_rate(rate, now)
@@ -3411,9 +3412,9 @@ SP:AddToggle("ManualSpam", {Text = "Manual spam", Default = false, Callback = fu
     NotifyToggle("Manual Spam", v)
 end}):AddKeyPicker("ManualSpamKey", {Default = "E", Mode = "Hold", SyncToggleState = true, Text = "Manual spam"})
 SP:AddDropdown("SpamMode", {Text = "Mode", Values = {"Remote", "Keypress"}, Default = "Remote", Callback = function(v) getgenv().ManualSpamMode = v end})
-SP:AddSlider("SpamRate", {Text = "Spam rate", Default = 300, Min = 20, Max = 1000, Rounding = 0, Suffix = " /s",
-    Tooltip = "Parries per second while a ball is on or near you (20/s otherwise). Tops out at one per send point (4 per frame) and eases off automatically if your upload gets too high.",
-    Callback = function(v) ManualSpam.rate = v end})
+SP:AddSlider("SpamMaxKbps", {Text = "Max upload", Default = 220, Min = 60, Max = 600, Rounding = 0, Suffix = " kbps",
+    Tooltip = "Manual and auto spam both run as fast as they can (up to 120/s) and slow down only when your upload goes over this. Higher = more spam but more risk of your movement lagging behind (desync). Lower = smoother movement, less spam. If you rubber-band while spamming, lower it.",
+    Callback = function(v) SpamNet.budget_kbps = v end})
 local ManualSpamLabel = SP:AddLabel("Actual: 0/s", true)
 SP:AddToggle("SpamAnimFix", {Text = "Animation fix", Default = false, Callback = function(v)
     getgenv().ManualSpamAnimationFix = v
@@ -3429,9 +3430,6 @@ AS:AddToggle("AutoSpam", {Text = "Auto spam", Default = false,
         NotifyToggle("Auto Spam", v)
     end})
 local AutoSpamLabel = AS:AddLabel("Status: off", true)
-AS:AddSlider("AutoSpamRate", {Text = "Spam rate", Default = 250, Min = 20, Max = 1000, Rounding = 0, Suffix = " /s",
-    Tooltip = "Parries per second while a clash is detected. Tops out at one per send point (4 per frame) and eases off automatically if your upload gets too high, so your movement stays in sync.",
-    Callback = function(v) AutoSpam.rate = v end})
 
 task.spawn(function()
     while task.wait(0.1) do
