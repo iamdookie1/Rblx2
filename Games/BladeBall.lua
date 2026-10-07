@@ -6,7 +6,7 @@ task.spawn(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.07-51"
+local SCRIPT_VERSION = "2026.10.07-52"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -159,7 +159,7 @@ end
 -- The parry core's shared state (see "PARRY CORE" further down). Declared here
 -- so the animation code and the UI, defined before the core, can reach it.
 local Core = {cap = nil, info = "not armed yet", told = false, interp = 0.14,
-    cfg = {close_range = 20, instant = true, preparry = false, hit_zone = 4, instant_range = 8, sim_dt = 1 / 120}}
+    cfg = {close_range = 20, instant = true, preparry = false, hp_close = true, hit_zone = 4, instant_range = 8, sim_dt = 1 / 120}}
 local function remoteReady() return Core.cap ~= nil end
 -- Arms Remote mode by auto pressing block; defined in the parry core.
 local prime_remote
@@ -376,7 +376,7 @@ local System = {
     __properties = {
         __autoparry_enabled = false, __triggerbot_enabled = false,
         __manual_spam_enabled = false, __play_animation = false,
-        __curve_mode = 1, __accuracy = 50, __accuracy_base = 50, __divisor_multiplier = 1.1,
+        __curve_mode = 1, __accuracy = 50, __accuracy_base = 50, __divisor_multiplier = 1.1, __timing_mult = 1,
         __random_accuracy = false, __random_accuracy_amount = 10, __frame_dt = 1/60,
         __auto_spam_enabled = false,
         __parried = false, __training_parried = false, __parries = 0,
@@ -1518,28 +1518,73 @@ local function predict_contact(ball_pos, velocity, target, gap, turn, accel, hor
     return nil
 end
 
--- When to fire: `lead` seconds before contact (as we see it). The ball we see
--- is behind the server's by half a round trip PLUS Roblox's interpolation delay
--- (it shows other objects slightly in the past so they move smoothly), and our
--- parry reaches the server half a round trip late. So a parry sent `eta` before
--- contact catches the ball when
---   ping + interp <= eta <= ping + interp + window      (window = real n6)
--- interp is measured from our own landed parries (Core.interp, see the
--- ParrySuccess handler): the first logs showed ~0.12-0.18s on top of ping, and
--- every parry fired with less lead than that went unanswered.
--- The Accuracy slider picks where in the window contact lands: 1 = early in
--- the parry (80% of the window ahead), 100 = late (25%). Slow balls are held to
--- 45% -- their path and pace change most before they land.
-local function fire_lead(speed)
-    local n6 = parry_window() or 0.5
-    local acc = math.clamp(props.__accuracy or 50, 1, 100)
-    local frac = 0.8 - (acc - 1) / 99 * 0.55
-    frac = math.min(frac, 0.45 + 0.35 * math.clamp((speed - 40) / 120, 0, 1))
-    local ping_term = props.__ping_compensation and ping_s() or ping_s() * 0.5
-    local extra = math.clamp((props.__extra_distance or 0) / math.max(speed, 1), -0.15, 0.15)
-    -- half a frame: the packet goes out at the end of the frame we decide in
-    return ping_term + Core.interp + n6 * frac + extra + frame_dt() * 0.5
+-- TIMING. A parry sent now is up on the server `reach` seconds later in the
+-- timeline of the ball we see: the ball on screen trails the server's by half
+-- a round trip plus Roblox's interpolation delay (Core.interp, learned from our
+-- own landed parries), and the parry takes another half round trip to arrive.
+-- It then stays up for the window W (n6). So the parry catches the ball when
+--   reach <= eta <= reach + W
+-- and we fire at eta = reach + cushion: `cushion` is how far into the window
+-- contact lands.
+--
+-- Lag: ping is sampled 10x a second into an average and a jitter (how far it
+-- swings). reach uses the average plus twice the jitter, so a lag spike at the
+-- wrong moment still finds the parry up -- at high or unstable ping that's what
+-- keeps close-range parries landing.
+local Lag = {avg = nil, jit = 0.005, at = -1}
+local function sample_lag()
+    local now = clock_()
+    if now - Lag.at < 0.1 then return end
+    Lag.at = now
+    local p = ping_s()
+    if not Lag.avg then Lag.avg = p; return end
+    Lag.jit = Lag.jit + (math.abs(p - Lag.avg) - Lag.jit) * 0.15
+    Lag.avg = Lag.avg + (p - Lag.avg) * 0.3
 end
+Core.lag = Lag
+local function jitter() return math.clamp(Lag.jit * 2, 0.005, 0.12) end
+-- Seconds from "fire now" until the parry is up, against the ball we see.
+local function reach_time()
+    sample_lag()
+    local ping = math.max(Lag.avg or ping_s(), ping_s())
+    local ping_term = props.__ping_compensation and ping or ping * 0.5
+    -- half a frame: the packet leaves at the end of the frame we decide in
+    return ping_term + jitter() + Core.interp + frame_dt() * 0.5
+end
+Core.reach_time = reach_time
+
+-- Accuracy (1-100): how tight the parry is to the ball.
+--   100 = contact lands just after the parry comes up, with only the measured
+--         lag jitter as cushion -- the latest parry that still lands;
+--   1   = contact lands 60% into the window, the most room for a lag spike or
+--         the ball speeding up.
+-- Timing multiplier (0-2): moves that pick. 1 = exactly what Accuracy picks;
+-- toward 0 later, down to the very last moment the parry still comes up in
+-- time; toward 2 earlier, up to the earliest point that still lands before the
+-- parry runs out. Works the same at any Accuracy.
+-- Whatever the settings, contact is kept inside the window: never so late the
+-- ball lands before the parry is up, never so early the parry runs out first.
+-- Slow balls are held earlier in the window -- their pace and path change the
+-- most before they arrive.
+local function cushion_for(speed, W)
+    local a = (math.clamp(props.__accuracy or 50, 1, 100) - 1) / 99
+    local latest = 0.01
+    -- slow balls: the earliest point is pulled in
+    local earliest = math.max(math.min(W - jitter() - 0.03, W * (0.45 + 0.4 * math.clamp((speed - 40) / 120, 0, 1))), latest)
+    local tight, loose = jitter(), W * 0.6
+    local c = math.clamp(loose + (tight - loose) * a, latest, earliest)
+    local m = math.clamp(props.__timing_mult or 1, 0, 2)
+    if m <= 1 then c = latest + (c - latest) * m
+    else c = c + (earliest - c) * (m - 1) end
+    return c
+end
+
+local function fire_lead(speed)
+    local W = parry_window() or 0.5
+    local extra = math.clamp((props.__extra_distance or 0) / math.max(speed, 1), -0.15, 0.15)
+    return reach_time() + cushion_for(speed, W) + extra
+end
+Core.fire_lead = fire_lead
 -- Shown on the Status tab: how far out a ball at `speed` gets parried.
 function System.parry_distance(speed)
     return speed * fire_lead(speed) + 3
@@ -1665,8 +1710,9 @@ local function decide(ball, st, root, now, via)
         -- read yet. Go now only if there's no time to look: even its earliest
         -- arrival is inside a round trip and a couple of frames, or it's point
         -- blank. Anything else is timed by the frame checks a moment later.
+        -- (reach includes the view lag, so at high ping more of these go at once)
         local earliest = math.max(distance - gap, 0) / speed
-        if not (earliest <= ping + frame_dt() * 2 + 0.03 or distance <= cfg.instant_range) then
+        if not (earliest <= reach_time() + frame_dt() * 1.5 + 0.02 or distance <= cfg.instant_range) then
             return hold("just retargeted, timing it")
         end
         eta = earliest
@@ -1683,11 +1729,17 @@ local function decide(ball, st, root, now, via)
         {eta = eta, lead = lead, speed = speed, dist = distance, heading = heading, miss = miss})
 end
 
--- Pre-parry: the ball is on a player right next to us, about to reach them, and
--- their return would beat a reaction -- put our parry up first. It counts as
--- the parry for the pass that follows.
+-- Pre-parry: the ball is on a player right next to us and their return would
+-- reach us faster than our reach (ping + view lag) -- a parry sent after the
+-- ball turns to us lands too late, so the return is timed as if it were already
+-- coming: fired when (ball -> them) + (them -> us) is down to our fire lead.
+-- It counts as the parry for the pass that follows.
+-- Runs when "Close-range pre-parry" is on, and on its own at high ping (80ms+)
+-- with "High ping close range" on -- that's where reacting can't keep up.
+local function high_ping() return (Lag.avg or ping_s()) >= 0.08 end
 local function try_preparry(ball, st, root, now)
-    if not cfg.preparry or st.preparried then return end
+    if st.preparried then return end
+    if not (cfg.preparry or (cfg.hp_close and high_ping())) then return end
     local target = st.target
     if type(target) ~= 'string' or target == '' or target == me then return end
     if getgenv().AutoParryMode == "Keypress" or not Core.cap or not gate_open() then return end
@@ -1695,15 +1747,28 @@ local function try_preparry(ball, st, root, now)
     if not their_root then return end
     local gap = (their_root.Position - root.Position).Magnitude
     if gap > cfg.close_range then return end
-    local speed = ball_velocity(ball).Magnitude
+    local velocity = ball_velocity(ball)
+    local speed = velocity.Magnitude
     if speed < 1 then return end
-    if (ball.Position - their_root.Position).Magnitude / speed > 0.12 + ping_s() then return end
-    if gap / (speed * 1.1) > ping_s() + frame_dt() * 2 + 0.02 then return end
+    local to_them = their_root.Position - ball.Position
+    local d_them = to_them.Magnitude
+    -- heading into them (or already on them), not flying off
+    if d_them > 3 and velocity:Dot(to_them / d_them) < speed * 0.3 then return end
+    local back = gap / (speed * 1.1) -- their return speeds the ball up
+    local reach = reach_time()
+    if back > reach + frame_dt() * 2 then return end -- we'd have time to react to it
+    local eta = d_them / speed + back
+    local lead = fire_lead(speed)
+    if eta > lead then return end
     if blocked_by_detection() then return end
     ParryLog.source = "pre-parry"
     local ok = System.parry.execute()
     ParryLog.source = nil
-    if ok then st.preparried, st.preparry_until = true, now + (parry_window() or 0.5) + ping_s() + 0.15 end
+    if ok then
+        st.preparried, st.preparry_until = true, now + (parry_window() or 0.5) + reach + 0.15
+        flight(("pre-parry: return in %.3fs (to them %.3f, back %.3f), fires at %.3fs, gap %.1f, ping %.0fms"):format(
+            eta, d_them / speed, back, lead, gap, pingMs()))
+    end
 end
 
 -- Triggerbot: parries the moment the ball is on us, any distance, one per pass
@@ -2078,8 +2143,9 @@ end
 -- Housekeeping, once a frame: auto press while not armed (the only time the
 -- block button/key is ever pressed in Remote mode -- once captured, every parry
 -- is a remote parry; it presses again only if the game deletes the remote),
--- report the capture, and log unanswered parries.
+-- report the capture, log unanswered parries, and sample ping.
 RunService.Heartbeat:Connect(function()
+    sample_lag() -- keep the ping average current between balls too
     if not is_live() then return end
     if not Core.cap then
         Core.told = false
@@ -2140,146 +2206,140 @@ end)
 end -- parry core
 
 -- ============================================================
--- SPAM ENGINE (MANUAL + AUTO)
+-- SPAM ENGINE (rewritten)
 -- ============================================================
--- One engine drives both. It ticks at three points of every frame
--- (PreSimulation, Heartbeat, PreRender) so parries are spread through the frame
--- instead of dumped at one point, starts a burst on the very first tick, and
--- uses System.parry.fast, which reuses the frame's curve/packet/token.
+-- Manual and auto spam share one pump. Spam isn't held by the parry gate (the
+-- game's cooldown): it keeps sending through it, and the server takes the first
+-- one it can. What it is held by is your connection: every parry packet carries
+-- every player's screen point, and once upload backs up your movement queues
+-- behind it (the "I'm ahead of where I really am" desync). So:
+--   * never more than SpamNet.hard_max a second, whatever the slider says;
+--   * at most per_frame() per frame -- the server counts one parry per frame,
+--     the rest only fill upload;
+--   * the upload guard eases off while the client's real send rate is over
+--     budget and comes back once it's clear;
+--   * manual spam with no ball on or near you drops to a keep-alive rate.
 System.manual_spam = {}
 System.auto_spam = {}
+local props = System.__properties
+local me = LocalPlayer.Name
 local macroAnimFix = false
-local ManualSpam = {rate = 300}     -- parries per second
--- Auto spam fires only when one reactive parry can't keep up: a clash (the ball
--- going back and forth with one player faster than you could react) or a ball
--- landing on you faster than that. There are no range / hits / window settings
--- any more: each is worked out from the ball's speed, the gap between players
--- and your ping, so it adapts to slow and fast balls on its own.
-local AutoSpam = {
-    rate = 250,
-    react_margin = 0.03,    -- seconds on top of ping (a couple of frames) a reactive parry needs
-    active_until = 0,
-    reason = nil,
-}
--- One parry per send point (four per frame). Parries sent at the same instant
--- reach the server in the same frame and only the first counts; the rest just
--- fill your upload, and once it's full your character's movement queues behind
--- them -- the "I'm ahead of where I really am" desync.
-local SPAM_MAX_PER_TICK = 1
+local ManualSpam = {rate = 300} -- parries per second (slider)
+local AutoSpam = {rate = 250, active_until = 0, reason = nil, was_active = false}
 local SpamNet = {
-    idle_rate = 20,       -- parries/s while no ball is on or near you
-    hard_max = 90,        -- never more than this: each packet carries every player's
-                          -- screen point, and past this the upload backs up and your
-                          -- character lags behind (desync). The server counts one
-                          -- parry per frame anyway.
-    budget_kbps = 220,    -- keep upload under this, well clear of where movement queues
-    guard_at = -1,        -- upload guard: last check
-    factor = 1,           -- upload guard: current rate multiplier
+    idle_rate = 20,
+    hard_max = 90,
+    budget_kbps = 220,
+    guard_at = -1,
+    factor = 1,
 }
 
 function System.manual_spam.start() System.__properties.__manual_spam_enabled = true end
 function System.manual_spam.stop() System.__properties.__manual_spam_enabled = false end
 
-local function spam_fire(manual)
+local function spam_fire()
     if getgenv().ManualSpamMode == "Keypress" then
         System.parry.keypress()
-    else
-        local sent = System.parry.fast()
-        if sent and getgenv().ManualSpamAnimationFix and macroAnimFix then
-            -- Played the way the game plays a held block key: a block swing, then
-            -- (once it lands) the game's success swing, then the next block. It
-            -- no longer depends on auto parry's animation setting being on.
-            System.animation.play_block()
-        end
+        return true
     end
+    local sent = System.parry.fast()
+    if sent and getgenv().ManualSpamAnimationFix and macroAnimFix then
+        -- a block swing per landed parry, the way a held block key plays
+        System.animation.play_block()
+    end
+    return sent
 end
 
--- The ball's recent owners, newest first: one entry per change of hands, with
--- blank targets dropped (the game can clear the target between owners) and
--- repeats collapsed. t is when that player got the ball.
+-- ---------- auto spam: when does one timed parry stop being enough? ----------
+-- reach = how long a parry sent now takes to be up, against the ball we see
+-- (ping + view lag + jitter, see TIMING). React = a couple of frames to notice.
+local function spam_reach() return Core.reach_time() end
+local function react_time() return math.clamp(props.__frame_dt or 1 / 60, 1 / 240, 0.1) * 2 + 0.02 end
+
+-- The ball's recent owners, newest first (blank targets dropped, repeats merged).
 local function ball_owners(state)
     local owners = {}
     for i = #state.swaps, 1, -1 do
         local s = state.swaps[i]
         if type(s.to) == 'string' and s.to ~= '' then
             local last = owners[#owners]
-            if last and last.name == s.to then
-                last.t = s.t
-            else
-                owners[#owners + 1] = {name = s.to, t = s.t}
-            end
+            if last and last.name == s.to then last.t = s.t
+            else owners[#owners + 1] = {name = s.to, t = s.t} end
         end
     end
     return owners
 end
 
--- A clash is the ball going back and forth between you and one player. Counts
--- the hand-offs between the two of you in one unbroken run; how close they must
--- be, how quick each hand-off and how many are needed all come from the ball's
--- speed and your ping (see detect_clash). Only real hand-offs count: one parry
--- is one hit, never two.
--- How fast a return has to be before one reactive parry can't keep up.
-local function reaction_budget()
-    return math.min(pingMs(), 400) / 1000 + AutoSpam.react_margin
-end
+-- Clash range grows with ball speed: a 300 st/s exchange spans more ground.
+local function clash_range(speed) return math.clamp(18 + speed * 0.06, 18, 45) end
 
-local function detect_clash(ball, root, now)
-    local owners = ball_owners(get_ball_state(ball))
+-- A clash: the ball traded back and forth between you and one player, each
+-- hand-off about as quick as the ball crossing plus both reactions. Returns the
+-- opponent and how many quick hand-offs in a row.
+local function clash_with(st, root, speed, now)
+    local owners = ball_owners(st)
     local newest, second = owners[1], owners[2]
     if not second then return nil end
-    local me = LocalPlayer.Name
     local opponent
     if newest.name == me then opponent = second.name
     elseif second.name == me then opponent = newest.name
-    else return nil end -- ball isn't with you or them right now
-
-    local their_root = character_root(opponent)
-    if not their_root then return nil end
-    local gap = (their_root.Position - root.Position).Magnitude
-    local speed = math.max(ball_velocity(ball).Magnitude, 1)
-    local budget = reaction_budget()
-    -- Clash range, worked out: close enough that the two of you are trading the
-    -- ball, wider for faster balls (a 300+ studs/s exchange spans more ground).
-    local range = math.clamp(18 + speed * 0.06, 18, 45)
-    if gap > range then return nil end
-    -- The ball has to be in the exchange, not flying in from someone else.
-    if (ball.Position - root.Position).Magnitude > gap + 12 then return nil end
-    -- Clash tempo, worked out: in a clash each hand-off comes about as fast as the
-    -- ball can cross between you plus both reactions. A slow rally (long holds,
-    -- curves) breaks the run and is left to auto parry.
-    local cross = gap / speed
-    local tempo = math.clamp(cross * 2 + budget * 2 + 0.15, 0.3, 0.75)
+    else return nil end
+    local their = character_root(opponent)
+    if not their then return nil end
+    local gap = (their.Position - root.Position).Magnitude
+    if gap > clash_range(speed) then return nil end
+    local tempo = math.clamp(gap / speed * 2 + spam_reach() * 2 + 0.15, 0.3, 0.8)
     if now - newest.t > tempo then return nil end
-
     local hits = 0
     for i = 1, #owners - 1 do
         local cur, prev = owners[i], owners[i + 1]
-        local alternates = (cur.name == me and prev.name == opponent) or (cur.name == opponent and prev.name == me)
-        if not alternates or cur.t - prev.t > tempo then break end
+        local alt = (cur.name == me and prev.name == opponent) or (cur.name == opponent and prev.name == me)
+        if not alt or cur.t - prev.t > tempo then break end
         hits = hits + 1
     end
-    -- Clash hits, worked out: right up close one quick hand-off is enough;
-    -- otherwise wait for the ball to come back once so a single pass with a
-    -- nearby player doesn't start spam.
-    local need = (gap <= 10 or cross <= budget) and 1 or 2
+    -- right up close (or the ball crosses faster than you react) one hand-off
+    -- is enough; otherwise it has to come back once
+    local need = (gap <= 10 or gap / speed <= spam_reach()) and 1 or 2
     if hits < need then return nil end
-    return ("clash vs %s (%d hits)"):format(opponent, hits)
+    return opponent, hits
 end
 
--- Ball on you, heading in, and landing faster than a reactive parry can answer,
--- with auto parry not having got a parry out for this pass: spam to save it.
--- Point-blank range is worked out from speed and ping, not set.
-local function detect_point_blank(ball, root)
-    if ball:GetAttribute('target') ~= LocalPlayer.Name then return nil end
-    if get_ball_state(ball).parried then return nil end
-    local offset = root.Position - ball.Position
-    local distance = offset.Magnitude
-    local velocity = ball_velocity(ball)
-    local speed = velocity.Magnitude
+-- Why auto spam should run for this ball right now, or nil.
+local function spam_reason(ball, root, now)
+    local st = get_ball_state(ball)
+    local heading, _, speed, distance, velocity = read_ball(ball, root)
     if speed < 1 then return nil end
-    if distance > 1 and velocity:Dot(offset / distance) <= speed * 0.5 then return nil end
-    if distance / speed > reaction_budget() then return nil end
-    return "point blank"
+    local reach, react = spam_reach(), react_time()
+
+    local opponent, hits = clash_with(st, root, speed, now)
+    if opponent and (st.target == me or st.target == opponent) then
+        return ("clash vs %s (%d hits)"):format(opponent, hits)
+    end
+
+    if st.target == me then
+        -- coming in faster than a parry sent now could be up for, and auto parry
+        -- hasn't got one up for this pass
+        if heading <= 0.3 and distance > 6 then return nil end
+        if st.parried and now < (st.parry_until or 0) then return nil end
+        if math.max(distance - 3, 0) / speed <= reach + react then return "point blank" end
+        return nil
+    end
+
+    -- On a player next to you whose return would beat your reach (this is most
+    -- of what high ping loses at close range): spam through their hit.
+    local target = st.target
+    if type(target) ~= 'string' or target == '' then return nil end
+    local their = character_root(target)
+    if not their then return nil end
+    local gap = (their.Position - root.Position).Magnitude
+    if gap > clash_range(speed) then return nil end
+    local back = gap / (speed * 1.1)
+    if back > reach + react then return nil end
+    local to = their.Position - ball.Position
+    local d = to.Magnitude
+    if d > 3 and velocity:Dot(to / d) < speed * 0.3 then return nil end
+    if d / speed + back <= reach + react + 0.1 then return "close return from " .. target end
+    return nil
 end
 
 -- Lobby training or lobby parry: auto spam never runs there.
@@ -2289,9 +2349,10 @@ local function in_training()
     return char ~= nil and dead ~= nil and char.Parent == dead
 end
 
--- Once per frame: decide whether auto spam should be firing.
+-- Once per frame. Keeps spam on a short tail past the last reason (about a
+-- round trip), so it covers the hit it was started for.
 local function auto_spam_evaluate()
-    if not System.__properties.__auto_spam_enabled then
+    if not props.__auto_spam_enabled then
         AutoSpam.active_until, AutoSpam.reason = 0, nil
         return
     end
@@ -2300,10 +2361,9 @@ local function auto_spam_evaluate()
     if root and not root:FindFirstChild('SingularityCape') and canParryNow() and not blocked_by_detection()
         and not in_training() then
         for _, ball in ipairs(get_live_balls()) do
-            local reason = detect_clash(ball, root, now) or detect_point_blank(ball, root)
+            local reason = spam_reason(ball, root, now)
             if reason then
-                -- Keep going a couple of reaction times past the last detection.
-                AutoSpam.active_until = now + math.clamp(reaction_budget() * 2, 0.1, 0.35)
+                AutoSpam.active_until = now + math.clamp(spam_reach() * 1.5 + 0.05, 0.12, 0.45)
                 AutoSpam.reason = reason
                 return
             end
@@ -2313,25 +2373,20 @@ local function auto_spam_evaluate()
 end
 
 function System.auto_spam.status()
-    if not System.__properties.__auto_spam_enabled then return "off" end
+    if not props.__auto_spam_enabled then return "off" end
     if os.clock() < AutoSpam.active_until then return "SPAMMING (" .. tostring(AutoSpam.reason or "clash") .. ")" end
-    return "watching for clashes"
+    return "watching"
 end
 
--- Measures the parries spam really sent per second (shown next to the rate
--- slider), over a half-second window so it reads steadily.
+-- ---------- the pump ----------
 local SpamMeter = {count = 0, since = os.clock(), rate = 0}
 function System.spam_actual_rate() return SpamMeter.rate end
 
--- A ball on us, or close enough to reach us within about a reaction time (in a
--- clash that's the whole exchange). That's when every parry counts; the rest of
--- the time a low keep-alive rate is all spam needs, and the saved upload keeps
--- your movement in sync.
+-- A ball on you or able to reach you within about a reach: every parry counts.
 local function spam_focus()
     local root = getRoot()
     if not root then return false end
-    local me = LocalPlayer.Name
-    local horizon = reaction_budget() + 0.25
+    local horizon = spam_reach() + 0.25
     for _, ball in ipairs(get_live_balls()) do
         get_ball_state(ball) -- makes sure its retarget listener exists (instant fire)
         if ball:GetAttribute('target') == me then return true end
@@ -2341,9 +2396,6 @@ local function spam_focus()
     return false
 end
 
--- Upload guard: reads the client's real send rate and eases spam down while it's
--- over budget, back up once it's clear -- as fast as your connection allows
--- without flooding it.
 local function bandwidth_factor(now)
     if now - SpamNet.guard_at < 0.25 then return SpamNet.factor end
     SpamNet.guard_at = now
@@ -2355,64 +2407,69 @@ local function bandwidth_factor(now)
     return SpamNet.factor
 end
 
-local spam_acc, spam_last, spam_active = 0, os.clock(), false
+local Pump = {credit = 0, last = os.clock(), on = false, frame = 0, frame_fires = 0, fired_frame = -1}
+local function current_source(now)
+    if props.__manual_spam_enabled then return ManualSpam.rate, "manual spam" end
+    if props.__auto_spam_enabled and now < AutoSpam.active_until then return AutoSpam.rate, "auto spam" end
+    return nil
+end
+local function effective_rate(rate, now)
+    rate = math.min(rate, SpamNet.hard_max)
+    if not spam_focus() then rate = math.min(rate, SpamNet.idle_rate) end
+    return math.max(rate * bandwidth_factor(now), 1)
+end
+local function per_frame(rate)
+    return math.max(1, math.ceil(rate * math.clamp(props.__frame_dt or 1 / 60, 1 / 240, 0.1) - 1e-6))
+end
+
+local function fire_one(source)
+    if Pump.fired_frame ~= Pump.frame then Pump.fired_frame, Pump.frame_fires = Pump.frame, 0 end
+    ParryLog.source = source
+    local ok = spam_fire()
+    ParryLog.source = nil
+    Pump.frame_fires = Pump.frame_fires + 1
+    SpamMeter.count = SpamMeter.count + 1
+    return ok
+end
+
 local function spam_tick()
     local now = os.clock()
-    local elapsed = math.min(now - spam_last, 0.1)
-    spam_last = now
+    local elapsed = math.min(now - Pump.last, 0.1)
+    Pump.last = now
     local span = now - SpamMeter.since
     if span >= 0.5 then
         SpamMeter.rate = SpamMeter.count / span
         SpamMeter.count, SpamMeter.since = 0, now
     end
-    local props = System.__properties
-    local rate, source
-    if props.__manual_spam_enabled then
-        rate, source = ManualSpam.rate, "manual spam"
-    elseif props.__auto_spam_enabled and now < AutoSpam.active_until then
-        rate, source = AutoSpam.rate, "auto spam"
-    end
+    local rate, source = current_source(now)
     if not rate or not LocalPlayer.Character then
-        spam_acc, spam_active = 0, false
+        Pump.credit, Pump.on = 0, false
         return
     end
-    rate = math.min(rate, SpamNet.hard_max)
-    if not spam_focus() then rate = math.min(rate, SpamNet.idle_rate) end
-    rate = rate * bandwidth_factor(now)
-    local interval = 1 / math.max(rate, 1)
-    if spam_active then
-        spam_acc = spam_acc + elapsed
+    rate = effective_rate(rate, now)
+    if Pump.on then
+        Pump.credit = math.min(Pump.credit + elapsed * rate, 2) -- no backlog after a hitch
     else
-        -- First tick of a burst fires right away instead of waiting an interval.
-        spam_acc, spam_active = interval, true
+        Pump.credit, Pump.on = 1, true -- a burst's first parry goes straight away
     end
-    local fires = math.min(math.floor(spam_acc / interval), SPAM_MAX_PER_TICK)
-    if fires > 0 then
-        spam_acc = spam_acc - fires * interval
-        ParryLog.source = source
-        local manual = source == "manual spam"
-        for _ = 1, fires do spam_fire(manual) end
-        ParryLog.source = nil
-        SpamMeter.count = SpamMeter.count + fires
-    end
-    -- Don't try to make up a big backlog after a frame hitch; a burst of stale
-    -- parries all at once does nothing useful.
-    if spam_acc > interval * 4 then spam_acc = 0 end
+    if Pump.credit < 1 then return end
+    if Pump.fired_frame == Pump.frame and Pump.frame_fires >= per_frame(rate) then return end
+    Pump.credit = Pump.credit - 1
+    fire_one(source)
 end
 
--- The two moments a fresh parry matters most in a clash: our parry just landed
--- (the ball is on its way back), and the ball has just flipped back to us. Fire
--- one straight away from the event itself instead of waiting for the next tick --
--- faster where it counts, for a single packet.
+-- The moments a fresh parry matters most: ours just landed (the ball is on its
+-- way back) and the ball has just turned to us. Fire one from the event itself,
+-- inside the same caps, rather than waiting for the next tick.
 local function spam_instant()
-    local props = System.__properties
-    local manual = props.__manual_spam_enabled
-    if not (manual or (props.__auto_spam_enabled and os.clock() < AutoSpam.active_until)) then return end
-    if not LocalPlayer.Character then return end
-    ParryLog.source = manual and "manual spam" or "auto spam"
-    spam_fire(manual)
-    ParryLog.source = nil
-    SpamMeter.count = SpamMeter.count + 1
+    local now = os.clock()
+    local rate, source = current_source(now)
+    if not rate or not LocalPlayer.Character then return end
+    rate = effective_rate(rate, now)
+    if Pump.fired_frame == Pump.frame and Pump.frame_fires >= per_frame(rate) then return end
+    Pump.credit = math.max(Pump.credit - 1, -1)
+    Pump.on = true
+    fire_one(source)
 end
 Remotes.ParrySuccess.OnClientEvent:Connect(function() pcall(spam_instant) end)
 System.spam_on_retarget = function() pcall(spam_instant) end
@@ -2426,20 +2483,19 @@ do
             warn("[Blade Ball] spam: " .. tostring(err))
         end
     end
-    local conns = System.__properties.__connections
+    local conns = props.__connections
     conns.__spam_pre = RunService.PreSimulation:Connect(function()
+        Pump.frame = Pump.frame + 1
         run(auto_spam_evaluate)
+        -- auto spam just switched on: its first parry goes now, not next point
+        local active = os.clock() < AutoSpam.active_until
+        if active and not AutoSpam.was_active and not props.__manual_spam_enabled then run(spam_instant) end
+        AutoSpam.was_active = active
         run(spam_tick)
     end)
     conns.__spam_heartbeat = RunService.Heartbeat:Connect(function() run(spam_tick) end)
-    -- Four points per frame (render, animation, simulation, heartbeat) so a
-    -- frame's parries go out spread across it instead of in two or three clumps.
-    pcall(function()
-        conns.__spam_render = RunService.PreRender:Connect(function() run(spam_tick) end)
-    end)
-    pcall(function()
-        conns.__spam_anim = RunService.PreAnimation:Connect(function() run(spam_tick) end)
-    end)
+    pcall(function() conns.__spam_render = RunService.PreRender:Connect(function() run(spam_tick) end) end)
+    pcall(function() conns.__spam_anim = RunService.PreAnimation:Connect(function() run(spam_tick) end) end)
 end
 
 -- ============================================================
@@ -3211,8 +3267,11 @@ AP:AddDropdown("TargetMode", {Text = "Target mode", Values = System.__config.__t
         for i, n in ipairs(System.__config.__target_names) do if n == v then System.__properties.__target_mode = i; break end end
     end})
 AP:AddSlider("Accuracy", {Text = "Accuracy", Default = 50, Min = 1, Max = 100, Rounding = 0,
-    Tooltip = "Where in your parry window the ball lands. Higher parries later, lower parries earlier. Slow balls are always held to the middle.",
+    Tooltip = "How tight the parry is to the ball. 100: the ball lands just after your parry comes up, with only your measured lag swings as cushion. 1: it lands 60% into your parry, the most room for a lag spike or the ball speeding up. Always kept inside the parry.",
     Callback = function(v) System.__properties.__accuracy_base = v; roll_accuracy() end})
+AP:AddSlider("TimingMultiplier", {Text = "Timing multiplier", Default = 1, Min = 0, Max = 2, Rounding = 2, Suffix = "x",
+    Tooltip = "Moves the parry from what Accuracy picks. 1 = Accuracy's pick. Higher parries earlier (2 = the earliest that still lands), lower parries later (0 = the last moment that still lands). Never pushed outside your parry window.",
+    Callback = function(v) System.__properties.__timing_mult = v end})
 AP:AddToggle("RandomAccuracy", {Text = "Randomize accuracy", Default = false,
     Tooltip = "Jitters accuracy around your current Accuracy setting each parry, to look less robotic.",
     Callback = function(v)
@@ -3234,6 +3293,9 @@ AP:AddSlider("CloseRange", {Text = "Pre-parry range", Default = 20, Min = 8, Max
 AP:AddToggle("InstantRetarget", {Text = "Instant parry on retarget", Default = true,
     Tooltip = "Parries straight off the ball switching to you when there's no time to wait: it lands within a round trip, or it's point blank. Anything with more time is timed normally.",
     Callback = function(v) Core.cfg.instant = v end})
+AP:AddToggle("HighPingClose", {Text = "High ping close range", Default = true,
+    Tooltip = "At 80ms+ ping: when a player next to you is about to hit the ball and their return would beat your ping, parries ahead so it's up in time (only then). Timed by Accuracy / Timing multiplier like any parry.",
+    Callback = function(v) Core.cfg.hp_close = v end})
 AP:AddToggle("ClosePreParry", {Text = "Close-range pre-parry", Default = false,
     Tooltip = "Off by default. Parries ahead when a player next to you is about to hit the ball and a return would be too fast to react to. It's a guess: if they send it elsewhere or curve it, it was wasted. Auto spam is the better tool for clashes.",
     Callback = function(v) Core.cfg.preparry = v end})
@@ -3351,7 +3413,7 @@ end})
 
 local AS = Tabs.Spam:AddRightGroupbox("Auto Spam", "activity")
 AS:AddToggle("AutoSpam", {Text = "Auto spam", Default = false,
-    Tooltip = "Spams only when one parry can't keep up: a clash (the ball going back and forth with a player faster than you could react) or a ball landing on you too fast to react to. Range, hits and timing are worked out from ball speed and ping. Normal rallies are left to auto parry. Never runs in training.",
+    Tooltip = "Spams only when one timed parry can't keep up: a clash (the ball traded back and forth with a player), a ball on you closer than your ping lets a parry come up in time, or a player next to you about to hit a ball whose return would beat your ping. Worked out from ball speed, your ping and its swings. Capped so it never backs up your upload (no desync). Never runs in training.",
     Callback = function(v)
         System.__properties.__auto_spam_enabled = v
         if v then prime_remote() else AutoSpam.active_until, AutoSpam.reason = 0, nil end
