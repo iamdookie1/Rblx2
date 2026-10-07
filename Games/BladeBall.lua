@@ -6,7 +6,7 @@ task.spawn(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.07-41"
+local SCRIPT_VERSION = "2026.10.07-42"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -987,7 +987,7 @@ local function learn(remote, hash, uid, token, a4)
     for i = 1, #text do key[i] = bxor_(byte_(token, i), (byte_(text, i) + i) % 256) end
     local prev = Core.cap
     Core.cap = {remote = remote, hash = hash, uid = uid, key = key, len = #text, ball2 = typeof_(a4) == "CFrame"}
-    Core.refresh, Core.misses, Core.pending = false, 0, nil
+    Core.misses, Core.pending = 0, nil
     Core.new_capture = {prev = prev}
     H.want = false
 end
@@ -1022,7 +1022,7 @@ end
 -- Up for one capture press. A key press reaches the game's handler on the next
 -- frame and the send happens inside it, so 0.35s is plenty.
 local function arm()
-    if (Core.cap and not Core.refresh) or not is_live() then return false end
+    if Core.cap or not is_live() then return false end
     H.want, H.until_t = true, clock_() + 0.35
     if H.nc or H.fire then return true end
     if hookmetamethod_ and getnamecallmethod_ then
@@ -1202,15 +1202,6 @@ local function send(curveCF, spam)
     if not canParryNow() then return "blocked" end
     if not cap.remote.Parent then Core.cap = nil; return "unarmed" end
     if not spam and not gate_open() then return "blocked" end
-    -- Captured id gone stale (three parries in a row unanswered): this parry is a
-    -- real block press with the capture hooks up -- it parries through the game
-    -- and refreshes the capture in the same go.
-    if Core.refresh and not spam and arm() then
-        pressBlockKey()
-        gate_start()
-        Core.pending = clock_() + (parry_window() or 0.5) + ping_s() + 0.25
-        return "sent"
-    end
     local window = parry_window()
     if window == nil then
         if not Win.done then return "blocked" end -- stats not read yet
@@ -1522,9 +1513,9 @@ local function fire_for(st, now, via, info)
     if not ok then st.why = "couldn't send yet, retrying"; return false end
     if info then
         Core.last_parry = {t = now, via = via, info = info}
-        flight(("%s: eta %.3fs, fires at %.3fs, %.0f st/s, %.1f studs, heading %.2f, line %.1f, ping %.0fms, window %.3f, view lag %.3f%s"):format(
+        flight(("%s: eta %.3fs, fires at %.3fs, %.0f st/s, %.1f studs, heading %.2f, line %.1f, ping %.0fms, window %.3f, view lag %.3f"):format(
             via, info.eta, info.lead, info.speed, info.dist, info.heading or 0, math.min(info.miss or 0, 999), pingMs(),
-            parry_window() or -1, Core.interp, Core.refresh and " (refresh press)" or ""))
+            parry_window() or -1, Core.interp))
     end
     mark_parried(st, now)
     st.why = via == "auto parry" and "parried" or ("parried (" .. via .. ")")
@@ -1722,18 +1713,10 @@ function System.triggerbot.enable(enabled)
     end
 end
 
--- A new round can hand out a new parry remote or id. The first parry of every
--- round is a real block press with the capture hooks up, so the capture is
--- always that round's.
-Alive.ChildAdded:Connect(function(child)
-    if child == LocalPlayer.Character and Core.cap then
-        Core.refresh = true
-        flight("new round: first parry refreshes the capture")
-    end
-end)
-
--- Housekeeping, once a frame: auto press while not armed, report the capture,
--- and refresh it silently if two parries in a row went unanswered.
+-- Housekeeping, once a frame: auto press while not armed (the only time the
+-- block button/key is ever pressed in Remote mode -- once captured, every parry
+-- is a remote parry; it presses again only if the game deletes the remote),
+-- report the capture, and log unanswered parries.
 RunService.Heartbeat:Connect(function()
     if not is_live() then return end
     if not Core.cap then
@@ -1768,10 +1751,6 @@ RunService.Heartbeat:Connect(function()
         Core.pending, Core.misses = nil, (Core.misses or 0) + 1
         local lp = Core.last_parry
         flight(("  -> NO answer to the %s (miss %d in a row)"):format(lp and lp.via or "parry", Core.misses))
-        if Core.misses >= 2 and not Core.refresh then
-            Core.refresh = true
-            flight("2 parries in a row unanswered: next parry refreshes the capture")
-        end
     end
 end)
 end -- parry core
