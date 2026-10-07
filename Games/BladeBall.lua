@@ -6,7 +6,7 @@ task.spawn(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.07-5"
+local SCRIPT_VERSION = "2026.10.07-6"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -143,21 +143,28 @@ end
 -- Two jobs, one thin hook layer over FireServer (both send paths):
 --   * CAPTURE -- read the real parry packet once, so we can fire it ourselves.
 --     Armed only for the 0.6s around a block press and only until the remote is
---     known; after that the capture branch never runs again. It takes only a
---     call made from inside the game's own PRY sender (checked on the live
---     stack), never from this script, so nothing else is mistaken for it.
---   * REPORT SUPPRESSION -- always on. Any FireServer whose first two args are
---     (game.JobId, one of the two magic strings) is dropped: the real parry and
---     every other FireServer pass straight through untouched. We never trip
---     either check (we don't touch debug.info, and nothing of ours is on the
---     sender's stack when it looks -- VirtualInputManager input is processed off
---     our stack, and our hook only runs during the send, after the checks). But
---     a report is the single channel by which a trip could ever reach the
---     server, so dropping exactly those packets makes the hooks untraceable no
---     matter what the client concludes now or after a game update.
--- The hook layer is invisible to both checks: it is not debug.info, and it is
--- never on the sender's stack during either check. Each closure is a newcclosure
--- and every capture is pcall'd, so nothing of ours can error into the parry.
+--     known; after that the capture branch never runs again. What proves a send
+--     is the game's own is that the PRY sender is on the live call stack
+--     (capture() checks), NOT checkcaller -- our own fireParryRemote never
+--     routes through PRY so it is never caught, and a genuine send is caught
+--     even when it runs on our thread (see below).
+--   * REPORT SUPPRESSION -- always on, UNCONDITIONAL. Any FireServer whose first
+--     two args are (game.JobId, one of the two magic strings) is dropped; the
+--     real parry and every other FireServer pass through untouched. This is the
+--     part that must not be gated on checkcaller. Many executors run
+--     VirtualInputManager input on the CALLER'S thread, so a block press we send
+--     runs the game's PRY sender synchronously on OUR stack. That trips check
+--     (b) -- our writefile-env functions are now within its 10-level getfenv
+--     scan -- and fires the report, and because it is our thread checkcaller()
+--     is true at that call. An earlier build gated the drop on checkcaller, so
+--     that report slipped through and the player was kicked (reproduced in the
+--     training area). Dropping on signature alone closes that hole; the report
+--     is the one channel a trip can reach the server, so killing it makes the
+--     hooks untraceable whatever the client concludes, now or after an update.
+-- Once the remote is captured we fire it directly and never press block again,
+-- so the game's sender (and its checks) stop running on our account entirely.
+-- Each closure is a newcclosure and every capture is pcall'd, so nothing of ours
+-- can error into the parry.
 local Remote = {
     token = nil,        -- the game's key function, read off the sender's upvalues
     remote = nil,       -- the parry RemoteEvent
@@ -312,10 +319,21 @@ local function shared_fire_fn()
 end
 
 -- Installed once, then left up for the whole session. Each FireServer that
--- reaches a hook is, in order: a detection report from the game -> dropped (send
--- nothing); the game's PRY parry, while we're armed and still need it ->
--- captured, then passed on; anything else -> passed straight through. Our own
--- parries (checkcaller true) skip both branches and just pass through.
+-- reaches a hook is, in order:
+--   * a detection report (game.JobId + magic) -> dropped, send nothing, NO
+--     MATTER who fired it or on which thread. This is the part that has to be
+--     unconditional: many executors run VirtualInputManager input on the
+--     caller's thread, so our block press runs the game's PRY sender on OUR
+--     stack -- which both trips the sender's 10-level writefile getfenv check
+--     (our functions are now within it) AND makes checkcaller() true at the
+--     report call. Gating the drop on checkcaller (as a previous build did) let
+--     that very report through and got the player kicked.
+--   * the game's PRY parry, while we're armed and still need the packet ->
+--     captured, then passed on. What proves a send is the real one is that the
+--     PRY sender is on the live stack (capture() checks), not checkcaller --
+--     our own fireParryRemote never routes through PRY, so it is never caught,
+--     and genuine sends are caught even when they run on our thread.
+--   * anything else -> passed straight through untouched.
 local function installRemoteHooks()
     if Hooks.installed then return end
     -- remote:FireServer(...) path. Reports are dot-calls so they don't arrive
@@ -324,8 +342,7 @@ local function installRemoteHooks()
         pcall(function()
             local old_namecall
             old_namecall = hookmetamethod(game, '__namecall', hook_wrap(function(self, ...)
-                if getnamecallmethod() == 'FireServer' and isRemoteEvent(self)
-                    and not (checkcaller and checkcaller()) then
+                if getnamecallmethod() == 'FireServer' and isRemoteEvent(self) then
                     if is_report(...) then return end
                     if capture_armed() and parry_shaped(...) then pcall(capture, self, ...) end
                 end
@@ -342,7 +359,7 @@ local function installRemoteHooks()
         pcall(function()
             local old_fire
             old_fire = hookfunction(fire_fn, hook_wrap(function(self, ...)
-                if isRemoteEvent(self) and not (checkcaller and checkcaller()) then
+                if isRemoteEvent(self) then
                     if is_report(...) then return end
                     if capture_armed() and parry_shaped(...) then pcall(capture, self, ...) end
                 end
@@ -353,18 +370,20 @@ local function installRemoteHooks()
         end)
     end
     -- No hookfunction: catch the fetched path through __index instead, handing
-    -- back one cached wrapper.
+    -- back one cached wrapper. The wrapper is returned for every RemoteEvent
+    -- .FireServer read (not gated on checkcaller) so a report sent from our own
+    -- thread still goes through it and is dropped.
     if not Hooks.old_fire and hookmetamethod then
         pcall(function()
             local old_index
             local wrappers = setmetatable({}, {__mode = 'k'})
             old_index = hookmetamethod(game, '__index', hook_wrap(function(self, key)
-                if key == 'FireServer' and isRemoteEvent(self) and not (checkcaller and checkcaller()) then
+                if key == 'FireServer' and isRemoteEvent(self) then
                     local real = old_index(self, key)
                     local wrapped = wrappers[real]
                     if not wrapped then
                         wrapped = hook_wrap(function(remote, ...)
-                            if isRemoteEvent(remote) and not (checkcaller and checkcaller()) then
+                            if isRemoteEvent(remote) then
                                 if is_report(...) then return end
                                 if capture_armed() and parry_shaped(...) then pcall(capture, remote, ...) end
                             end
