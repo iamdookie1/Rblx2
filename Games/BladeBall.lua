@@ -6,7 +6,7 @@ task.spawn(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.07-29"
+local SCRIPT_VERSION = "2026.10.07-30"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -16,7 +16,6 @@ local SCRIPT_VERSION = "2026.10.07-29"
 local genv = (getgenv and getgenv()) or _G
 if type(genv.__BladeBallShutdown) == 'function' then pcall(genv.__BladeBallShutdown) end
 local INSTANCE = {}
-local LOADED_AT = os.clock()
 genv.__BladeBallInstance = INSTANCE
 local function is_live() return genv.__BladeBallInstance == INSTANCE end
 
@@ -376,11 +375,11 @@ local function installRemoteHooks()
     Hooks.installed = Remote.hooked == true
 end
 
--- Ready once we hold the game's own parry sender (see arm_sender). Sender is
--- defined further down; this only runs at call time, after it exists.
+-- Ready once a parry packet has been captured from your own block (see
+-- "PARRY REMOTE"). Sender is filled in further down; this only runs at call time.
 local Sender
 local function remoteReady()
-    return Sender ~= nil and Sender.fn ~= nil
+    return Sender ~= nil and Sender.cap ~= nil
 end
 
 -- Presses block once to get the remote captured; defined further down, once
@@ -419,9 +418,9 @@ local function canParryNow()
     return false
 end
 
--- Nothing is hooked and no memory is read, ever. Remote mode gets the game's
--- own parry sender with require(PRY) and calls it on a clean thread (see "THE
--- GAME'S OWN SENDER" below). The old hook code further up is never called.
+-- Remote mode: captured once from your own block by a hook that is up only for
+-- that press (see "PARRY REMOTE"); then the remote is fired directly. No memory
+-- reads. The old FireServer hook code further up is never called.
 
 -- Presses the block key via VirtualInputManager, which makes the game run its
 -- own PRY sender (and thus send a real parry). Used by Keypress mode every
@@ -575,170 +574,135 @@ local function parry_window()
 end
 
 -- ============================================================
--- THE GAME'S OWN SENDER, CALLED CLEAN -- no getgc, no upvalues, no hook
+-- PARRY REMOTE: captured from YOUR block with a one-shot hook
 -- ============================================================
--- SwordsController gets its parry sender with a plain require(script.PRY) and
--- parries by calling it: v31(window, CurrentCamera.CFrame, points, aim, flag)
--- (UseBall2 servers: v31(cameraCF, mouseRayCF, flag)). Requiring a module that
--- is already loaded just hands back the cached function -- the exact sender the
--- game uses, with no memory scan at all. The scan is what got detected: PRY is
--- Luraph-virtualized, so its real checks run inside encrypted bytecode the dump
--- can't show, and v20's log had zero sends yet still kicked standing still.
---
--- And instead of rebuilding the packet we CALL the game's sender, so it builds
--- everything itself: the real token, the real BAC hash, the real arg 2, the
--- real remote. Nothing about the packet can differ from a real parry.
---
--- The sender's only gate is its two checks: debug.info must still be a C
--- function (we never touch it), and no function within 10 stack levels may run
--- in an environment holding writefile. We call it on a fresh thread whose
--- globals (setfenv(0, ...)) and wrapper environment are a clean game
--- environment. Luau reports a C frame's environment (the check's own pcall) as
--- the thread's globals, so every level the check walks comes back clean. Before
--- the first real call, env_is_clean() runs an exact replica of that check on
--- such a thread; if anything there still shows writefile, we never fire.
-Sender = {fn = nil, info = "not armed", ball2 = nil, ball2_at = -1} -- forward-declared above remoteReady
--- Only these two leave this block (the main function is near Luau's 200-local cap).
-local arm_sender, fireParryRemote
+-- The capture idea is the first Ui3 build's (ba4c6a6): wait for one real
+-- block, take the parry packet the game sends, then fire that remote ourselves.
+-- What changed, to leave less to find and capture faster:
+--   * hookfunction on the remote's FireServer, never a __namecall hook. The
+--     game's block handler runs a namecall probe on EVERY press
+--     (xpcall(function() PluginManager():CreatePlugin():Deactivate() end, ...))
+--     -- the exact moment that old __namecall hook was up.
+--   * Up only for your own press, and only when a press would really parry:
+--     canParryNow() and a ball in play. Your touch/key reaches us before the
+--     game sends, so it goes on just in time and comes off in the same call
+--     that sees the packet, or after 0.4s if no parry came. Nothing stays hooked.
+--   * No getgc, no upvalue reads, no debug.info, no game code called. The
+--     token key is worked out from the captured packet and the server time
+--     (token[i] = bxor((time[i] + i) % 256, key[i]), time = floor(now * 100)).
+--   * The decoy remotes (JobId first) pass through untouched; we only learn
+--     from, and only fire, the real parry remote.
+-- The hook sees the dot-call half of the game's sends (its other half goes
+-- through __namecall, which we leave alone), so arming takes one or two blocks.
+-- If the server stops answering our parries the capture is dropped and the
+-- next block re-arms.
+Sender = {cap = nil, info = "block once to arm", hook_fn = nil, hook_old = nil, until_t = 0,
+    pending = nil, misses = 0, told = false, told_at = -100} -- forward-declared above remoteReady
+-- Only these leave this block (the main function is near Luau's 200-local cap).
+local arm_hook, fireParryRemote
 do
-local CLEAN_ENV
-do
-    local ok, renv = pcall(function() return getrenv and getrenv() end)
-    if ok and type(renv) == 'table' and renv.writefile == nil then
-        CLEAN_ENV = setmetatable({}, {__index = renv})
-    else
-        CLEAN_ENV = {}
-    end
-end
--- Everything the clean-thread code touches is captured as an upvalue, so it
--- never needs a global from the clean environment.
-local setfenv_, getfenv_, pcall_, spawn_, type_, debug_ = setfenv, getfenv, pcall, task.spawn, type, debug
-local tostring_ = tostring
--- Game scripts run at thread identity 2; executor threads run far higher, and a
--- privileged-access probe inside the virtualized sender would see that. Threads
--- copy their parent's identity, so the launcher drops to 2 before spawning.
-local setident_ = setthreadidentity or setidentity or set_thread_identity
-local getident_ = getthreadidentity or getidentity or get_thread_identity
+local hookfunction_, restore_ = hookfunction, restorefunction
+local newcclosure_ = newcclosure or function(f) return f end
+local select_, type_, typeof_, tostring_, floor_, byte_, bxor_, pcall_ = select, type, typeof, tostring, math.floor, string.byte, bit32.bxor, pcall
+local JOB_ID = game.JobId
+local FIRE_FN
+pcall(function() FIRE_FN = Instance.new("RemoteEvent").FireServer end)
 
--- The launcher only prepares the thread: clean globals (setfenv(0)) and identity
--- 2. Then it task.spawns the game's sender, so the sender is the BASE frame of
--- its own new thread -- that thread copies the launcher's globals and identity,
--- and has no function of ours anywhere on its stack, at any level.
-local function call_clean(fn, a, b, c, d, e)
-    spawn_(function()
-        if not pcall_(setfenv_, 0, CLEAN_ENV) then return end
-        if setident_ then pcall_(setident_, 2) end
-        spawn_(fn, a, b, c, d, e)
+local function unhook()
+    local fn, old = Sender.hook_fn, Sender.hook_old
+    if not fn then return end
+    Sender.hook_fn, Sender.hook_old = nil, nil
+    if not (restore_ and pcall_(restore_, fn)) then pcall_(hookfunction_, fn, old) end
+end
+
+-- Runs inside the game's own send, so it only copies values; anything else
+-- (notifications, logging) happens later from our own loop.
+local function learn(remote, hash, uid, token, a4)
+    local text = tostring_(floor_(Workspace:GetServerTimeNow() * 100))
+    if #token ~= #text then return end
+    local key = {}
+    for i = 1, #text do key[i] = bxor_(byte_(token, i), (byte_(text, i) + i) % 256) end
+    Sender.cap = {remote = remote, hash = hash, uid = uid, key = key, len = #text, ball2 = typeof_(a4) == "CFrame"}
+end
+
+-- Real parry: (hash, id, token, window, cameraCF, points, aim, flag), or on
+-- UseBall2 servers (hash, id, token, cameraCF, mouseCF, flag).
+local function hooked(self, ...)
+    local old = Sender.hook_old
+    if not Sender.cap and select_('#', ...) >= 6 then
+        pcall_(function(a1, a2, a3, a4, a5)
+            if type_(a1) == 'string' and #a1 == 36 and a1 ~= JOB_ID and type_(a2) == 'string' and type_(a3) == 'string'
+                and ((type_(a4) == 'number' and typeof_(a5) == 'CFrame') or (typeof_(a4) == 'CFrame' and typeof_(a5) == 'CFrame')) then
+                learn(self, a1, a2, a3, a4)
+            end
+        end, ...)
+    end
+    if Sender.cap then unhook() end
+    return old(self, ...)
+end
+
+arm_hook = function()
+    if Sender.cap or not hookfunction_ or not FIRE_FN or not is_live() then return end
+    Sender.until_t = os.clock() + 0.4
+    if Sender.hook_fn then return end
+    local ok, old = pcall(hookfunction_, FIRE_FN, newcclosure_(hooked))
+    if not ok or type(old) ~= 'function' then return end
+    Sender.hook_fn, Sender.hook_old = FIRE_FN, old
+    task.spawn(function()
+        while Sender.hook_fn and os.clock() < Sender.until_t do task.wait(0.05) end
+        unhook()
     end)
-    return true
 end
+Sender.unhook = unhook
 
--- Replica of the sender's check, run on a thread built exactly like call_clean's,
--- with a stand-in for the sender as the base frame: anon closure -> pcall (C) ->
--- stand-in. The stand-in gets a clean env like the real sender's game env, and
--- closures it creates inherit it. Also reports what the sender will see: its
--- stack depth (1 = nothing under it) and its thread identity.
-local function env_is_clean()
-    local res = {done = false, clean = false, info_c = false, depth = -1, ident = "?"}
-    local stand_in = function()
-        local dirty = false
-        for i = 1, 10 do
-            local ok, r = pcall_(function() return getfenv_(i) end)
-            if ok and type_(r) == 'table' and r.writefile then dirty = true end
-        end
-        res.clean = not dirty
-        local dbg = CLEAN_ENV.debug or debug_
-        local okc, isC = pcall_(function() return dbg.info(dbg.info, "s") == "[C]" end)
-        res.info_c = okc and isC
-        local depth = 1
-        while depth < 12 and debug_.info(depth + 1, "f") do depth = depth + 1 end
-        res.depth = depth
-        if getident_ then
-            local oki, id = pcall_(getident_)
-            if oki then res.ident = tostring_(id) end
-        end
-        res.done = true
+local function ball_in_play()
+    for _, name in ipairs({"Balls", "TrainingBalls"}) do
+        local f = Workspace:FindFirstChild(name)
+        if f and #f:GetChildren() > 0 then return true end
     end
-    if not pcall_(setfenv_, stand_in, CLEAN_ENV) then return false, "setfenv blocked", res end
-    call_clean(stand_in) -- task.spawn runs both threads immediately (neither yields)
-    if not res.done then return false, "setfenv(0) blocked", res end
-    if not res.clean then return false, "a stack level still shows writefile", res end
-    if not res.info_c then return false, "debug.info isn't a C function here", res end
-    return true, nil, res
+    return false
 end
 
-local function find_pry_module()
-    local ctrls = ReplicatedStorage:FindFirstChild("Controllers")
-    if not ctrls then return nil end
-    for _, c in ipairs(ctrls:GetChildren()) do
-        if c.Name:match("^SwordsController") then
-            local p = c:FindFirstChild("PRY")
-            if p and p:IsA("ModuleScript") then return p end
+-- Your own press arms it: touch (mobile block button / tap to block), keys,
+-- mouse, gamepad -- but only when that press would really make the game parry.
+UserInputService.InputBegan:Connect(function(input)
+    if Sender.cap or not is_live() then return end
+    if getgenv().AutoParryMode == "Keypress" and getgenv().ManualSpamMode == "Keypress" then return end
+    local t = input.UserInputType
+    if t == Enum.UserInputType.Touch or t == Enum.UserInputType.Keyboard or t == Enum.UserInputType.MouseButton1
+        or t == Enum.UserInputType.MouseButton2 or t == Enum.UserInputType.Gamepad1 then
+        if canParryNow() and ball_in_play() then arm_hook() end
+    end
+end)
+
+-- Our own loop: report the capture, and drop it if parries stop landing
+-- (four sent with no ParrySuccess within 0.6s each).
+RunService.Heartbeat:Connect(function()
+    if not is_live() then return end
+    if Sender.cap and not Sender.told then
+        Sender.told = true
+        Sender.misses, Sender.pending = 0, nil
+        Sender.info = "armed from your block (" .. (Sender.cap.ball2 and "UseBall2" or "normal") .. " server)"
+        flight("ARMED: captured the parry remote from your block")
+        Notify("Blade Ball", "Remote armed from your block. Auto parry is live.", 4)
+    end
+    if Sender.pending and os.clock() - Sender.pending > 0.6 then
+        Sender.pending, Sender.misses = nil, Sender.misses + 1
+        if Sender.misses >= 4 then
+            Sender.cap, Sender.told, Sender.misses = nil, false, 0
+            Sender.info = "parries stopped landing: block once to re-arm"
+            flight("capture dropped: 4 parries in a row got no ParrySuccess")
+            Notify("Blade Ball", "Parries stopped landing. Block once to re-arm.", 5)
         end
     end
-    return nil
-end
+end)
 
--- Arming is spread out, the way the v25 staged run did it. That run is the
--- only one that never got a reason-24 kick (the "X24" in "BAC fhb44X24774"):
--- every build that did all of arming in the first second after load got one
--- about 27s later, with or without parries. So arming waits until ARM_AFTER
--- seconds after load and leaves ARM_GAP seconds between its steps.
--- getgenv().BladeBallStageTest = true stretches the gaps to 75s for testing.
-local ARM_AFTER, ARM_GAP = 40, 10
-local function stage(n, what)
-    local gap = genv.BladeBallStageTest and 75 or ARM_GAP
-    flight(("arm step %d done: %s -- next step in %ds"):format(n, what, gap))
-    Sender.info = ("arming: step %d of 3 done (%s)"):format(n, what)
-    task.wait(gap)
-end
-
-arm_sender = function()
-    if Sender.fn then return true end
-    local wait_for = ARM_AFTER - (os.clock() - LOADED_AT)
-    if wait_for > 0 then
-        Sender.info = ("arming in %ds (spread out to avoid BAC reason 24)"):format(math.ceil(wait_for))
-        flight(("arming waits %.0fs (starts %ds after load)"):format(wait_for, ARM_AFTER))
-        task.wait(wait_for)
-    end
-    local mod = find_pry_module()
-    if not mod then Sender.info = "PRY module not loaded yet"; return false end
-    stage(1, "found the PRY ModuleScript (reads only)")
-    -- A module the game already required comes back from the cache in well under
-    -- a millisecond. A long require means the module body ran again (a second
-    -- copy of PRY initialising), which is worth knowing if a kick follows.
-    local t = os.clock()
-    local ok, fn = pcall(require, mod)
-    local ms = (os.clock() - t) * 1000
-    flight(("require(PRY): %s in %.2f ms"):format(ok and type(fn) or ("error " .. tostring(fn)), ms))
-    if not ok or type(fn) ~= 'function' then
-        Sender.info = "require(PRY) gave " .. (ok and type(fn) or "an error") .. " -- not firing"
-        return false
-    end
-    stage(2, "require(PRY)")
-    CLEAN_ENV.script = mod.Parent -- game envs carry their script; the sender lives in SwordsController
-    local clean, why, probe = env_is_clean()
-    flight(("clean-thread probe: %s, depth=%s, identity=%s"):format(
-        clean and "clean" or tostring(why), tostring(probe.depth), tostring(probe.ident)))
-    if not clean then
-        Sender.info = "can't make a clean call thread (" .. tostring(why) .. ") -- not firing"
-        return false
-    end
-    stage(3, "clean-thread probe (setfenv / identity 2 on our own threads)")
-    -- Nothing reads the sender itself (no debug.info on it): it was only used for
-    -- this status text, so it's gone.
-    Sender.fn = fn
-    Sender.info = ("game sender from %s.PRY, base frame=%s, identity %s, require %.1fms"):format(
-        mod.Parent.Name, probe.depth == 1 and "yes" or ("no, depth " .. tostring(probe.depth)), tostring(probe.ident), ms)
-    return true
-end
-
-local function use_ball2()
-    local now = os.clock()
-    if Sender.ball2 ~= nil and now - Sender.ball2_at < 2 then return Sender.ball2 end
-    local ok, r = pcall(function() return require(ReplicatedStorage.Shared.UseBall2)() end)
-    Sender.ball2, Sender.ball2_at = (ok and r == true), now
-    return Sender.ball2
+local function make_token(cap)
+    local text = tostring(math.floor(Workspace:GetServerTimeNow() * 100))
+    if #text ~= cap.len then return nil end
+    local out = table.create(#text)
+    for i = 1, #text do out[i] = string.char(bit32.bxor((string.byte(text, i) + i) % 256, cap.key[i])) end
+    return table.concat(out)
 end
 
 -- The game's own press gate (SwordsController v50 / OnParrySuccess), copied
@@ -753,6 +717,7 @@ pcall(function()
         local char = LocalPlayer.Character
         if not (char and char:IsDescendantOf(Workspace)) then return end
         PG.active, PG.cool = false, false
+        Sender.pending, Sender.misses = nil, 0
         task.spawn(function()
             PG.recent = true
             task.wait(PG.n1)
@@ -772,8 +737,13 @@ end)
 
 fireParryRemote = function(curveCF)
     if not is_live() then return true end -- replaced copy: send nothing, and don't fall back to the key
-    if not Sender.fn then return false end
+    local cap = Sender.cap
+    if not cap then return false end
+    if not canParryNow() then return true end -- the game wouldn't parry here either
+    if not cap.remote.Parent then Sender.cap, Sender.told = nil, false; return false end
     if PG.m1 or PG.active or PG.cool then return true end -- the game ignores this press too
+    local tok = make_token(cap)
+    if not tok then Sender.cap, Sender.told = nil, false; return false end
     -- The game reads the window/lockout before sending; wait for the stats once.
     local window, lockout, fresh, tp = parry_window()
     if window == nil then
@@ -813,14 +783,19 @@ fireParryRemote = function(curveCF)
         if look == look and look.Magnitude > 0.5 then cf = CFrame.lookAt(origin, origin + look) end
     end
     log_send("remote")
-    if use_ball2() then
-        -- UseBall2 servers: v31(currentCameraCFrame, mouse-ray CFrame, flag)
+    local r = cap.remote
+    -- Same packet as the game's sender, and either of its two call shapes.
+    if cap.ball2 then
         local ray = cam:ScreenPointToRay(aim[1], aim[2], 0)
-        call_clean(Sender.fn, cf, CFrame.lookAt(ray.Origin, ray.Origin + ray.Direction), false)
+        local mouse_cf = CFrame.lookAt(ray.Origin, ray.Origin + ray.Direction)
+        if math.random(1, 2) == 1 then r:FireServer(cap.hash, cap.uid, tok, cf, mouse_cf, false)
+        else local f = r.FireServer; f(r, cap.hash, cap.uid, tok, cf, mouse_cf, false) end
     else
         -- flag is false: every real parry calls v190() with no argument (not not nil).
-        call_clean(Sender.fn, window, cf, points, aim, false)
+        if math.random(1, 2) == 1 then r:FireServer(cap.hash, cap.uid, tok, window, cf, points, aim, false)
+        else local f = r.FireServer; f(r, cap.hash, cap.uid, tok, window, cf, points, aim, false) end
     end
+    Sender.pending = os.clock()
     -- Then the parry swing, as the game plays it right after sending. The server
     -- sees your character's animations, so every parry packet now comes with the
     -- swing a real block press always plays.
@@ -1277,43 +1252,16 @@ function System.parry.fast()
     System.__properties.__total_parries = System.__properties.__total_parries + 1
 end
 
--- Arm Remote mode: get the game's own parry sender with require(PRY) (the cached
--- module value -- no memory scan, no upvalue reads, no hook) and verify a clean
--- call thread can be built (arm_sender). Retries only until the PRY module has
--- loaded, which is normally already true by the time a feature is turned on.
-local arming = false
+-- Remote mode arms itself from your own block (see "PARRY REMOTE" above).
+-- Until then a parry attempt just reminds you, at most every 20s.
 prime_remote = function()
-    if remoteReady() or arming or Sender.gave_up then return end
-    -- Test switch: getgenv().BladeBallNoArm = true before loading never touches
-    -- PRY at all (no require, no probe), so an idle run shows whether arming is
-    -- what BAC reacts to.
-    if genv.BladeBallNoArm then
-        if not Sender.no_arm_logged then Sender.no_arm_logged = true; flight("NO-ARM TEST: PRY never touched") end
-        Sender.info = "not armed (BladeBallNoArm test)"
-        return
-    end
+    if remoteReady() then return end
     if getgenv().AutoParryMode == "Keypress" and getgenv().ManualSpamMode == "Keypress" then return end
-    arming = true
-    task.spawn(function()
-        local tries = 0
-        while not remoteReady() and not Library.Unloaded and tries < 40 do
-            local ok, got = pcall(arm_sender)
-            if ok and got then
-                Notify("Blade Ball", "Remote armed: " .. tostring(Sender.info), 4)
-                flight("ARMED: " .. tostring(Sender.info))
-                break
-            end
-            -- a missing module is worth waiting for; anything else won't fix itself
-            if Sender.info ~= "PRY module not loaded yet" then Sender.gave_up = true; break end
-            tries = tries + 1
-            task.wait(0.5)
-        end
-        if not remoteReady() then
-            Notify("Blade Ball", "Remote not armed: " .. tostring(Sender.info), 8)
-            flight("NOT ARMED: " .. tostring(Sender.info))
-        end
-        arming = false
-    end)
+    local now = os.clock()
+    if now - Sender.told_at > 20 then
+        Sender.told_at = now
+        Notify("Blade Ball", "Block once yourself to arm Remote parry.", 4)
+    end
 end
 function System.parry.execute_action() System.animation.play_grab_parry(); System.parry.execute() end
 function System.parry.by_mode(mode)
@@ -3056,7 +3004,7 @@ local function remoteStatusText()
     local w = parry_window()
     local wtxt = w and ("%.3f"):format(w) or (Win.done and "fallback" or "reading stats...")
     if remoteReady() then
-        return ("Remote: armed -- %s. window=%s, no memory reads, no hooks"):format(tostring(Sender.info), wtxt)
+        return ("Remote: %s. window=%s. No hook up, no memory reads"):format(tostring(Sender.info), wtxt)
     end
     return "Remote: " .. tostring(Sender.info) .. " (window=" .. wtxt .. ")"
 end
@@ -3526,6 +3474,7 @@ end)
 
 -- The next copy calls this before it starts.
 genv.__BladeBallShutdown = function()
+    pcall(function() Sender.unhook() end)
     pcall(function() Library:Unload() end)
     if genv.__BladeBallInstance == INSTANCE then genv.__BladeBallInstance = nil end
 end
