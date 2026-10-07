@@ -6,7 +6,7 @@ task.spawn(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.07-44"
+local SCRIPT_VERSION = "2026.10.07-45"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -204,20 +204,9 @@ end
 local CollectionService = cloneref(game:GetService('CollectionService'))
 local GuiService = cloneref(game:GetService('GuiService'))
 
--- On a touch-only device the script never fakes input. A virtual F key flips
--- the game's DeviceListener into keyboard mode and it rewires the on-screen block
--- button; a virtual touch on the button breaks it too. So on phones there is no
--- pressing at all: Remote arms from your own first block press (the capture
--- hooks go up when your finger touches the screen), and Keypress modes can't
--- press for you.
-local function touch_only()
-    return UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled
-        and not UserInputService.GamepadEnabled
-end
-
+-- The press is the F key on every device.
 local function pressBlockKey()
     if not is_live() then return false end
-    if touch_only() then return false end -- never fake input on a phone (see above)
     log_send("block key")
     pcall(function()
         VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.F, false, game)
@@ -1032,14 +1021,9 @@ prime_remote = function()
     if Core.cap or not is_live() or keypress_only() or not remote_features_on() then return end
     if not canParryNow() then return end
     local now = clock_()
-    if touch_only() then
-        -- no fake presses on a phone: your own first block arms it
-        if now - last_press > 20 then
-            last_press = now
-            Notify("Blade Ball", "Press block once to arm Remote parry.", 4)
-        end
-        return
-    end
+    -- F, 1s after you became able to parry (so it never lands the instant a
+    -- round or respawn starts), then every 1.4s until it's armed
+    if not Core.can_since or now - Core.can_since < 1 then return end
     if now - last_press < 1.4 then return end
     last_press = now
     if arm() then pressBlockKey() end
@@ -1710,7 +1694,12 @@ RunService.Heartbeat:Connect(function()
     if not is_live() then return end
     if not Core.cap then
         Core.told = false
-        if canParryNow() then prime_remote() end
+        if canParryNow() then
+            Core.can_since = Core.can_since or clock_()
+            prime_remote()
+        else
+            Core.can_since = nil
+        end
         return
     end
     if not Core.told then
