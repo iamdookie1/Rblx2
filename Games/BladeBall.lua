@@ -6,7 +6,7 @@ task.spawn(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.07-16"
+local SCRIPT_VERSION = "2026.10.07-17"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -344,6 +344,10 @@ local function installRemoteHooks()
 end
 
 local function remoteReady()
+    -- Hookless (getgc) arm stores everything in Remote.gc and resolves the remote
+    -- at fire time, so a set Remote.gc counts as ready. The legacy path needs the
+    -- individual fields.
+    if Remote.gc ~= nil then return true end
     return Remote.token ~= nil and Remote.remote ~= nil and Remote.args ~= nil
 end
 
@@ -507,7 +511,7 @@ local function fireParryRemote(curveCF)
     local flag = args[8]
     local ok, token = pcall(tokenize, uid)
     if not ok then return false end
-    if Remote.class_of ~= remote then
+    if remote and Remote.class_of ~= remote then
         Remote.class_of, Remote.is_event = remote, remote.ClassName == 'RemoteEvent'
     end
     log_send("remote")
@@ -609,42 +613,35 @@ local function arm_via_gc()
                             primaryId = ups[5], netObj = ups[6], netName = ups[7],
                             netId = ups[8], shortId = ups[9],
                         }
-                        local function holder_ok(t)
-                            local ok = pcall(function() assert(type(t[2]) == 'table' and t[2][t[1]] ~= nil) end)
-                            return ok
-                        end
-                        local function net_ok(o)
-                            local ok, r = pcall(function() return o:RemoteEvent(g.netName) end)
-                            return ok and isRemoteEvent(r), r
-                        end
+                        -- VALIDATE BY TYPE ONLY -- never CALL a game function, and
+                        -- never INDEX a game object (indexing could run a metatable
+                        -- __index, i.e. game code). Standing-still kicks pinned the
+                        -- arm step to the game calls a successful match used to make
+                        -- (the key function and netObj:RemoteEvent). So here we only
+                        -- check types -- isRemoteEvent reads the native ClassName (C,
+                        -- not game Lua), type() runs nothing -- and we defer every
+                        -- call AND every index into g.holder / g.netObj to fire time,
+                        -- the exact moment a real parry makes those same accesses.
+                        -- The "TIME" constant plus this full type layout pins the
+                        -- send closure on its own; no runtime probe of the values is
+                        -- needed to be sure.
                         local scalar = {number = true, string = true}
+                        local netT = type(g.netObj)
                         local valid = isRemoteEvent(g.primary) and isRemoteEvent(g.short)
-                            and type(g.keyfn) == 'function' and type(g.holder) == 'table' and holder_ok(g.holder)
-                            and scalar[type(g.primaryId)] and scalar[type(g.netId)] and scalar[type(g.shortId)]
-                        local net_remote
+                            and type(g.keyfn) == 'function'
+                            and type(g.holder) == 'table' and (netT == 'table' or netT == 'userdata')
+                            and scalar[type(g.primaryId)] and scalar[type(g.netId)]
+                            and scalar[type(g.shortId)] and scalar[type(g.netName)]
                         if valid then
-                            local ok_net; ok_net, net_remote = net_ok(g.netObj)
-                            valid = ok_net
-                        end
-                        if valid then
-                            -- validate the key function directly (keyfn(uid,'TIME')
-                            -- must return a non-empty string) without touching the
-                            -- token cache
-                            local ok_uid, uid = pcall(function() return g.holder[2][g.holder[1]] end)
-                            local key_ok, key = false, nil
-                            if ok_uid and uid ~= nil then key_ok, key = pcall(g.keyfn, uid, 'TIME') end
-                            if ok_uid and uid ~= nil and key_ok and type(key) == 'string' and #key > 0 then
-                                g.netRemote = net_remote
-                                Remote.gc = g
-                                -- Remote.remote is the ONE the game really fires (the
-                                -- v659 remote), so remoteReady/class checks use it.
-                                Remote.token, Remote.remote, Remote.uid_holder = g.keyfn, net_remote, g.holder
-                                Remote.args = {g.netId, uid, "", 0.5, "", "", "", false}
-                                Remote.armed_info = ("net=%s netId=%s(%s) uid=%s"):format(
-                                    (pcall(function() return net_remote.Name end) and net_remote.Name) or "?",
-                                    tostring(g.netId), type(g.netId), tostring(uid))
-                                return true
-                            end
+                            Remote.gc = g
+                            -- Remote.token holds the key function (a reference, NOT
+                            -- called here). Remote.remote stays nil until fire resolves
+                            -- it; remoteReady() treats a set Remote.gc as ready.
+                            Remote.token, Remote.uid_holder = g.keyfn, g.holder
+                            Remote.args = {g.netId, nil, "", 0.5, "", "", "", false}
+                            Remote.armed_info = ("netName=%s netId=%s(%s) [read-only arm]"):format(
+                                tostring(g.netName), tostring(g.netId), type(g.netId))
+                            return true
                         end
                     end
                 end
