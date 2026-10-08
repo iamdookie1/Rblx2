@@ -6,7 +6,7 @@ task.spawn(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.08-66"
+local SCRIPT_VERSION = "2026.10.08-67"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -159,6 +159,7 @@ end
 -- The parry core's shared state (see "PARRY CORE" further down). Declared here
 -- so the animation code and the UI, defined before the core, can reach it.
 local Core = {cap = nil, info = "not armed yet", told = false, interp = 0.14,
+    ev = {}, -- last time of: hook_up, hook_down, press, remote, spam (for the kick report)
     cfg = {close_range = 20, instant = true, preparry = false, hp_close = false, hit_zone = 4, instant_range = 8, sim_dt = 1 / 120}}
 local function remoteReady() return Core.cap ~= nil end
 -- Arms Remote mode by auto pressing block; defined in the parry core.
@@ -208,6 +209,7 @@ local GuiService = cloneref(game:GetService('GuiService'))
 local function pressBlockKey()
     if not is_live() then return false end
     log_send("block key")
+    Core.ev.press = os.clock()
     pcall(function()
         VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.F, false, game)
         VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.F, false, game)
@@ -1115,11 +1117,13 @@ local function arm(hold)
     if not (H.fire or H.nc) then H.want = false; return false end
     box.want = true
     local up_at = clock_()
+    Core.ev.hook_up = up_at
     local done = false
     local function finish()
         if done then return end
         done = true
         unhook()
+        Core.ev.hook_down = clock_()
         box.list = {}
         pcall(flight, ("hook (%s) was up %.1fms -- %s"):format(capture_method(), (clock_() - up_at) * 1000,
             Core.cap and "caught the parry" or "nothing caught"))
@@ -1156,8 +1160,25 @@ end
 -- remote is on. Presses are 1.4s apart, so each one clears the game's 1.3s
 -- lockout and really sends. The press is a real parry, so it's never wasted.
 local last_press = -100
+-- Capture press: "Auto" presses F itself; "Own" waits for your own tap on the
+-- block button (no synthetic input at all -- the fake F is a keyboard event
+-- on a phone with no keyboard). Default: Own on mobile, Auto elsewhere.
+local function capture_press_mode()
+    local m = getgenv().CapturePress
+    if m == "Auto" or m == "Own" then return m end
+    return isMobile and "Own" or "Auto"
+end
+Core.capture_press_mode = capture_press_mode
 prime_remote = function()
     if Core.cap or not is_live() or keypress_only() or not remote_features_on() then return end
+    if capture_press_mode() == "Own" then
+        if not Core.own_told and canParryNow() then
+            Core.own_told = true
+            Core.info = "tap block once to arm"
+            Notify("Blade Ball", "Tap the block button once to arm Remote mode for this server.", 6)
+        end
+        return
+    end
     if not canParryNow() then return end
     local now = clock_()
     -- F, 1s after you became able to parry (so it never lands the instant a
@@ -1380,6 +1401,7 @@ local function send(curveCF, spam)
     end
     gate_start()
     log_send("remote")
+    Core.ev[spam and "spam" or "remote"] = clock_()
     local r = cap.remote
     if cap.ball2 then
         local ray = cam:ScreenPointToRay(aim[1], aim[2], 0)
@@ -2240,45 +2262,35 @@ local function hashed_remotes()
     return list
 end
 
--- SAVED CAPTURE: hook once per account, not once per server. The parry's id
--- (packet arg 2) is a fixed string per account and its key comes from it;
--- the hash is the server's _G.BAC_HASH and the remote is the one hashed
--- RemoteEvent in Net -- both readable without a hook. So after a hook capture
--- the id and key are saved (BladeBall/capture.json), and every later server
--- arms from them with no hook and no press. If its first parries go
--- unanswered twice before one lands, that server falls back to the hook
--- capture (which then saves the new values).
+-- SAVED CAPTURE, per server: the packet's id/key change from server to
+-- server, so a capture is saved with the server's JobId and reused only in
+-- that same server (rejoining it, re-running the script) -- no hook, no press.
+-- Never used in another server: stale values there would only send parries
+-- the server rejects.
 local CAPTURE_FILE = SAVE_FOLDER .. "/capture.json"
 local function load_saved()
     local ok, r = pcall(function() return HttpService:JSONDecode(readfile(CAPTURE_FILE)) end)
-    if ok and type(r) == 'table' and type(r.uid) == 'string' and type(r.key) == 'table' and #r.key >= 8 then return r end
+    if ok and type(r) == 'table' and r.job == game.JobId and type(r.uid) == 'string' and type(r.key) == 'table'
+        and type(r.hash) == 'string' and type(r.remote) == 'string' and #r.key >= 8 then return r end
     return nil
 end
 Core.saved = load_saved()
 local function save_capture(cap)
     if cap.hookfree or getgenv().BladeBallNoLog then return end
-    local hash_is_bac = false
-    pcall(function() hash_is_bac = getrenv()._G.BAC_HASH == cap.hash end)
-    local hr = hashed_remotes()
-    if not hash_is_bac or #hr ~= 1 or hr[1] ~= cap.remote then
-        flight("capture NOT saved: the hash or remote can't be found without the hook on this server")
-        return
-    end
-    local rec = {uid = cap.uid, key = cap.key, ball2 = cap.ball2, t = os.time()}
+    local rec = {job = game.JobId, uid = cap.uid, key = cap.key, hash = cap.hash, remote = cap.remote.Name,
+        ball2 = cap.ball2, t = os.time()}
     pcall(function() ensureSaveFolder(); writefile(CAPTURE_FILE, HttpService:JSONEncode(rec)) end)
     Core.saved = rec
 end
 local function build_from_saved()
     local sv = Core.saved
-    if not sv or Core.saved_off then return nil end
-    local hr = hashed_remotes()
-    if #hr ~= 1 then return nil end
-    local hash
-    pcall(function() hash = getrenv()._G.BAC_HASH end)
-    if type(hash) ~= 'string' or #hash ~= 36 then return nil end
+    if not sv or Core.saved_off or sv.job ~= game.JobId then return nil end
+    local remote
+    for _, r in ipairs(hashed_remotes()) do if r.Name == sv.remote then remote = r end end
+    if not remote then return nil end
     local text = tostring(math.floor(Workspace:GetServerTimeNow() * 100))
     if #text ~= #sv.key then return nil end
-    return {remote = hr[1], hash = hash, uid = sv.uid, key = sv.key, len = #sv.key, ball2 = sv.ball2 == true,
+    return {remote = remote, hash = sv.hash, uid = sv.uid, key = sv.key, len = #sv.key, ball2 = sv.ball2 == true,
         hookfree = true, saved = true}
 end
 
@@ -2433,7 +2445,7 @@ RunService.Heartbeat:Connect(function()
             if cap then
                 Core.cap = cap
                 Core.misses, Core.pending = 0, nil
-                flight(("ARMED FROM SAVED CAPTURE (no hook): remote %s, id %s"):format(cap.remote.Name:sub(1, 12), cap.uid))
+                flight(("ARMED FROM THIS SERVER'S SAVED CAPTURE (no hook): remote %s, id %s"):format(cap.remote.Name:sub(1, 12), cap.uid))
                 return
             end
         end
@@ -2471,11 +2483,6 @@ RunService.Heartbeat:Connect(function()
         -- version that got kicked least, and it never found the key anyway.
         -- A recipe file that is already complete is still used.)
         local keystr = table.concat(cap.key, ",")
-        local sv = Core.saved
-        if sv and not cap.hookfree then
-            local same_id, same_key = sv.uid == cap.uid, table.concat(sv.key, ",") == keystr
-            flight(("vs the saved capture: id %s, key %s"):format(same_id and "SAME" or "CHANGED", same_key and "SAME" or "CHANGED"))
-        end
         save_capture(cap)
         local changed
         if prev then
@@ -3547,6 +3554,9 @@ end}):AddKeyPicker("AutoParryKey", {Default = "None", Mode = "Toggle", SyncToggl
 AP:AddDropdown("CaptureHook", {Text = "Capture hook", Values = {"Namecall", "FireServer", "Both"}, Default = "Namecall",
     Tooltip = "Which hook catches the one parry packet Remote mode needs (up for that press only). Namecall or FireServer alone may take two presses; Both arms in one. The flight log notes which one was on for every capture and kick.",
     Callback = function(v) getgenv().CaptureHook = v end})
+AP:AddDropdown("CapturePress", {Text = "Capture press", Values = {"Own", "Auto"}, Default = isMobile and "Own" or "Auto",
+    Tooltip = "How the one capture per server is triggered. Own: your own tap on the block button (no fake input at all). Auto: the script presses F for you (a fake keyboard event -- on a phone that's keyboard input from a device with no keyboard).",
+    Callback = function(v) getgenv().CapturePress = v end})
 AP:AddDropdown("ParryMode", {Text = "Parry mode", Values = {"Remote", "Keypress"}, Default = "Remote",
     Tooltip = "Remote fires the parry remote with your curve (hookless, sends exactly what the game sends). Keypress presses the block key (F).",
     Callback = function(v) getgenv().AutoParryMode = v end})
@@ -3984,11 +3994,41 @@ do
     flight(("==== v%s loaded | executor %s | place %s | userId %s"):format(
         SCRIPT_VERSION, exec, tostring(game.PlaceId), tostring(LocalPlayer.UserId)))
     local conns = {}
+    -- What happened just before a kick, in seconds: the capture hook (up /
+    -- down), the fake F press, our last remote parry and spam send. Saved to
+    -- BladeBall/lastkick.txt and shown on screen the next time you load.
+    local function kick_context()
+        local now, ev, parts = os.clock(), Core.ev or {}, {}
+        local function ago(label, t) if t then parts[#parts + 1] = ("%s %.1fs ago"):format(label, now - t) end end
+        ago("hook up", ev.hook_up); ago("hook down", ev.hook_down); ago("fake F press", ev.press)
+        ago("remote parry", ev.remote); ago("spam send", ev.spam)
+        local hooked_now = ev.hook_up and (not ev.hook_down or ev.hook_down < ev.hook_up)
+        return (#parts > 0 and table.concat(parts, ", ") or "nothing sent or hooked yet")
+            .. (hooked_now and " -- HOOK WAS UP" or "")
+            .. (" | capture: %s hook, %s press, disguise %s, armed %s"):format(tostring(getgenv().CaptureHook or "Namecall"),
+                Core.capture_press_mode and Core.capture_press_mode() or "?", getgenv().HookDisguise == false and "off" or "on",
+                Core.cap and (Core.cap.saved and "from save" or "by hook") or "no")
+    end
     table.insert(conns, GuiService.ErrorMessageChanged:Connect(function(msg)
         local reason = tostring(msg):match("BAC%s+%w-X(%d%d)")
-        flight("!!!! KICK / ERROR MESSAGE: " .. tostring(msg) .. (reason and (" [reason " .. reason .. "]") or "")
-            .. " [capture hook " .. tostring(getgenv().CaptureHook or "Namecall") .. "]")
+        local ctx = kick_context()
+        flight("!!!! KICK / ERROR MESSAGE: " .. tostring(msg) .. (reason and (" [reason " .. reason .. "]") or "") .. " | " .. ctx)
+        if not getgenv().BladeBallNoLog then
+            pcall(function()
+                ensureSaveFolder()
+                writefile(SAVE_FOLDER .. "/lastkick.txt", ("v%s reason %s: %s"):format(SCRIPT_VERSION, reason or "?", ctx))
+            end)
+        end
     end))
+    -- the last session's kick, shown once
+    pcall(function()
+        local last = readfile(SAVE_FOLDER .. "/lastkick.txt")
+        if type(last) == 'string' and last ~= "" then
+            flight("last session's kick: " .. last)
+            task.delay(4, function() Notify("Last kick", last, 15) end)
+            if not getgenv().BladeBallNoLog then writefile(SAVE_FOLDER .. "/lastkick.txt", "") end
+        end
+    end)
     table.insert(conns, Remotes.ParrySuccess.OnClientEvent:Connect(function() flight("ParrySuccess received") end))
     local function where()
         local char = LocalPlayer.Character
