@@ -6,7 +6,7 @@ task.spawn(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.08-76"
+local SCRIPT_VERSION = "2026.10.08-77"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -946,6 +946,15 @@ local hookmetamethod_, getnamecallmethod_ = hookmetamethod, getnamecallmethod
 local getrawmetatable_, setreadonly_ = getrawmetatable, setreadonly or make_writeable
 local checkcaller_ = checkcaller or function() return false end
 local newcclosure_ = newcclosure or function(f) return f end
+-- oth: Delta's on-another-thread hook library. oth.hook(target, hook) -> original
+-- runs the hook on a separate thread, makes an l-closure pass is_c_closure
+-- scans, and unhooks with no footprint -- so it's the stealthiest way to hook
+-- FireServer for the capture, and the default when it's present (the frameless
+-- coroutine stays as the fallback for executors without it). oth.unhook takes
+-- the target function.
+local oth_lib = rawget(getgenv(), "oth"); if type(oth_lib) ~= 'table' then pcall(function() oth_lib = oth end) end
+local oth_hook = type(oth_lib) == 'table' and type(oth_lib.hook) == 'function' and oth_lib.hook or nil
+local oth_unhook = type(oth_lib) == 'table' and type(oth_lib.unhook) == 'function' and oth_lib.unhook or nil
 local select_, type_, typeof_, tostring_, floor_, byte_, bxor_, pcall_ =
     select, type, typeof, tostring, math.floor, string.byte, bit32.bxor, pcall
 local JOB_ID = game.JobId
@@ -1147,9 +1156,17 @@ Core.stack_hiding = stack_hidden ~= nil
 hide(NC_BODY); hide(FIRE_BODY); hide(FRAMELESS)
 
 local function unhook()
-    local fire, nc = H.fire, H.nc
-    H.fire, H.nc, H.want, box.want = nil, nil, false, false
-    if fire and not (restore_ and pcall_(restore_, FIRE_FN)) then pcall_(hookfunction_, FIRE_FN, fire) end
+    local fire, nc, fire_oth = H.fire, H.nc, H.fire_oth
+    H.fire, H.nc, H.want, box.want, H.fire_oth = nil, nil, false, false, nil
+    if fire then
+        if fire_oth then
+            -- oth cleans itself up with no footprint; even if unhook is missing,
+            -- box.want is false now so the body just passes every call through.
+            if oth_unhook then pcall_(oth_unhook, FIRE_FN) end
+        elseif not (restore_ and pcall_(restore_, FIRE_FN)) then
+            pcall_(hookfunction_, FIRE_FN, fire)
+        end
+    end
     if nc then restore_namecall(nc) end
     box.nc, box.fire = nil, nil
 end
@@ -1166,27 +1183,42 @@ local function arm(hold)
     if H.fire or H.nc then return true end
     box.list = {}
     local method = capture_method()
-    if method ~= "Namecall" and hookfunction_ and FIRE_FN then
-        -- a fresh coroutine each time: a C function, no Lua frame on their stack
+    if method ~= "Namecall" and FIRE_FN and (oth_hook or hookfunction_) then
+        -- a fresh coroutine each time (frameless fallback only): a C function,
+        -- no Lua frame on their stack. oth re-arms itself, so this is a no-op
+        -- for the oth path.
         box.rearm = function()
-            if H.fire then pcall(hookfunction_, FIRE_FN, hide(coroutine.wrap(FRAMELESS))) end
+            if H.fire and not H.fire_oth and hookfunction_ then
+                pcall(hookfunction_, FIRE_FN, hide(coroutine.wrap(FRAMELESS)))
+            end
         end
-        -- Default: the frameless coroutine. The game's call runs a single C
-        -- frame (coroutine.wrap) and the hook body runs on its OWN thread, so
-        -- the game's stack / traceback / getfenv never see a frame of ours --
-        -- the whole point of "another thread, disguised, no contact back to us".
-        -- The packet is handed over indirectly: the body drops it in `box`
-        -- (a plain table) and passes the real call straight on; our watcher
-        -- reads the box a frame later. The framed newcclosure path is only for
-        -- getgenv().FramelessHook == false (it puts a visible Lua frame on the
-        -- game's stack, so it's opt-in and reported as such below).
-        local framed = getgenv().FramelessHook == false
-        local hook_fn = hide(framed and newcclosure_(FIRE_BODY) or coroutine.wrap(FRAMELESS))
-        local ok, old = pcall(hookfunction_, FIRE_FN, hook_fn)
-        if ok and type(old) == 'function' then
-            H.fire, box.fire = old, old
-            Core.hook_path = framed and "framed newcclosure (VISIBLE on the game's stack)"
-                or (Core.isolated and "frameless coroutine, disguised" or "frameless coroutine (disguise unavailable)")
+        -- PREFERRED: oth.hook. It runs our body on ANOTHER thread, makes the
+        -- l-closure pass is_c_closure scans, and unhooks with no footprint --
+        -- the stealthiest path, so it's the default whenever oth is present.
+        -- The body (FIRE_BODY) only records into `box` while box.want is set and
+        -- always passes the real call straight on through box.fire (the original
+        -- oth.hook hands back); the packet reaches us indirectly through the box.
+        if oth_hook then
+            local ok, old = pcall(oth_hook, FIRE_FN, FIRE_BODY)
+            if ok and type(old) == 'function' then
+                H.fire, box.fire, H.fire_oth = old, old, true
+                Core.hook_path = "oth.hook (another thread, passes is_c_closure, no footprint)"
+            end
+        end
+        -- FALLBACK (no oth): the frameless coroutine. The game's call runs a
+        -- single C frame (coroutine.wrap) and the body runs on its own thread,
+        -- so the game's stack / traceback / getfenv never see a frame of ours.
+        -- The framed newcclosure path is only for getgenv().FramelessHook ==
+        -- false (it puts a visible Lua frame on the game's stack).
+        if not H.fire and hookfunction_ then
+            local framed = getgenv().FramelessHook == false
+            local hook_fn = hide(framed and newcclosure_(FIRE_BODY) or coroutine.wrap(FRAMELESS))
+            local ok, old = pcall(hookfunction_, FIRE_FN, hook_fn)
+            if ok and type(old) == 'function' then
+                H.fire, box.fire = old, old
+                Core.hook_path = framed and "framed newcclosure (VISIBLE on the game's stack)"
+                    or (Core.isolated and "frameless coroutine, disguised" or "frameless coroutine (disguise unavailable)")
+            end
         end
     end
     -- The __namecall hook can't be frameless (the method name is thread-local to
@@ -1252,12 +1284,12 @@ end
 -- remote is on. Presses are 1.4s apart, so each one clears the game's 1.3s
 -- lockout and really sends. The press is a real parry, so it's never wasted.
 local last_press = -100
--- Capture press: "Auto" presses F itself; "Own" waits for your own tap on the
--- block button (no synthetic input). Default: Auto (F) on every device.
+-- Capture press: "Keypress" presses the block key itself (default); "Own" waits
+-- for your own tap on the block button (no synthetic input). The old "Game"
+-- method (running the game's own block function to capture) is gone -- it maps
+-- to "Keypress" so old configs keep working.
 local function capture_press_mode()
-    local m = getgenv().CapturePress
-    if m == "Auto" or m == "Own" or m == "Game" then return m end
-    return "Auto"
+    return getgenv().CapturePress == "Own" and "Own" or "Keypress"
 end
 Core.capture_press_mode = capture_press_mode
 
@@ -1354,7 +1386,7 @@ prime_remote = function()
     if Core.gate_open and not Core.gate_open() then return end
     last_press = now
     if arm(0.2) then
-        if not (capture_press_mode() == "Game" and game_press()) then pressBlockKey() end
+        pressBlockKey() -- keypress: the capture press is always a real block-key press now
         -- if the game sent inside the press itself, the hook comes down right
         -- here, before the frame ends
         if H.check then H.check() end
@@ -3735,10 +3767,10 @@ AP:AddToggle("AutoParry", {Text = "Auto parry", Default = false, Callback = func
     NotifyToggle("Auto Parry", v)
 end}):AddKeyPicker("AutoParryKey", {Default = "None", Mode = "Toggle", SyncToggleState = true, Text = "Auto parry"})
 AP:AddDropdown("CaptureHook", {Text = "Capture hook", Values = {"FireServer", "Namecall", "Both"}, Default = "FireServer",
-    Tooltip = "FireServer (default): frameless -- the hook is a real C function and its code runs on a separate coroutine, so nothing of ours is ever on the game's call stack. Catches the game's dot-call sends, so a capture can take a second press. Namecall / Both also catch the namecall sends but put a (disguised) Lua frame on the stack while up.",
+    Tooltip = "FireServer (default): hooks the parry remote's FireServer. When the executor has oth (Delta), the hook is installed with oth.hook -- it runs on another thread, passes is_c_closure scans and unhooks with no footprint; otherwise it falls back to a frameless coroutine (a real C function whose body runs on a separate coroutine), so nothing of ours is on the game's call stack either way. Catches the game's dot-call sends, so a capture can take a second press. Namecall / Both also catch the namecall sends but put a (disguised) Lua frame on the stack while up.",
     Callback = function(v) getgenv().CaptureHook = v end})
-AP:AddDropdown("CapturePress", {Text = "Capture press", Values = {"Auto", "Game", "Own"}, Default = "Auto",
-    Tooltip = "How the one capture per server is triggered. Auto: the script presses F (a fake keyboard event). Game: runs the game's own block function the way a real press does, at the game's identity on a clean thread -- no keyboard event at all (falls back to F if it can't be found). Own: waits for your own tap on the block button.",
+AP:AddDropdown("CapturePress", {Text = "Capture press", Values = {"Keypress", "Own"}, Default = "Keypress",
+    Tooltip = "How the one capture per server is triggered. Keypress (default): the script presses the block key so the game sends one real parry for the hook to read. Own: waits for your own tap on the block button (no synthetic input). (The old Game-call capture method has been removed.)",
     Callback = function(v) getgenv().CapturePress = v end})
 AP:AddDropdown("ParryMode", {Text = "Parry mode", Values = {"Remote", "Game", "Keypress"}, Default = "Remote",
     Tooltip = "Remote: fires the captured parry remote (needs the one capture hook per server). Game: NO hook, NO capture -- every parry is the game's own block press run like a real one, curve applied through the camera; the game's cooldown applies and target mode isn't. Keypress: presses F.",
@@ -4220,7 +4252,7 @@ do
         local now, ev, parts = os.clock(), Core.ev or {}, {}
         local function ago(label, t) if t then parts[#parts + 1] = ("%s %.1fs ago"):format(label, now - t) end end
         ago("hook up", ev.hook_up); ago("hook down", ev.hook_down)
-        ago((Core.capture_press_mode and Core.capture_press_mode() == "Game") and "game press" or "fake F press", ev.press)
+        ago("block-key press", ev.press)
         ago("remote parry", ev.remote); ago("spam send", ev.spam)
         local hooked_now = ev.hook_up and (not ev.hook_down or ev.hook_down < ev.hook_up)
         return (#parts > 0 and table.concat(parts, ", ") or "nothing sent or hooked yet")
