@@ -6,7 +6,7 @@ task.spawn(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.08-60.1"
+local SCRIPT_VERSION = "2026.10.08-60.2"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -356,14 +356,28 @@ local function parry_window()
     elseif tp == 2 then n6, n2, fresh = 1, 1.3, true
     elseif tp == 3 then n6, fresh = 0.75, true
     elseif tp == 4 then n6, fresh = 0.625, true end
+    -- The game's own window wins. The capture holds the window the game itself
+    -- sent (packet arg 4), worked out from your real stats. The first Ui3 build
+    -- replayed the game's packet as-is (0.5) and its parries landed; v60 only
+    -- ever used its own sum, and when "TotalStats.Kills" couldn't be read it
+    -- took kills as 0 -> window 0 (and lockout 0). A 0 window is a parry the
+    -- server never counts unless the ball is touching you that very instant:
+    -- swing plays, no parry, and only now and then one lands.
+    local cw = Core.cap and Core.cap.win
+    if cw and cw > 0 and not fresh then
+        n2 = n2 * math.min(cw / n6, 1)
+        return cw, n2, fresh, tp
+    end
     if Win.noob then
         local ok_k, kills = pcall(data.Get, data, "TotalStats.Kills")
-        if not ok_k or type(kills) ~= 'number' then kills = 0 end
-        if kills >= 20 then
-            Win.noob = false -- the game turns the boost off for good at 20 kills
-        else
-            n2 = kills / 20 * n2
-            n6 = kills / 20 * n6
+        -- unreadable kills: leave the window alone rather than scale it to 0
+        if ok_k and type(kills) == 'number' then
+            if kills >= 20 then
+                Win.noob = false -- the game turns the boost off for good at 20 kills
+            else
+                n2 = kills / 20 * n2
+                n6 = kills / 20 * n6
+            end
         end
     end
     return n6, n2, fresh, tp
@@ -983,7 +997,8 @@ local function learn(remote, hash, uid, token, a4, t)
     local key = {}
     for i = 1, #text do key[i] = bxor_(byte_(token, i), (byte_(text, i) + i) % 256) end
     local prev = Core.cap
-    Core.cap = {remote = remote, hash = hash, uid = uid, key = key, len = #text, ball2 = typeof_(a4) == "CFrame"}
+    Core.cap = {remote = remote, hash = hash, uid = uid, key = key, len = #text, ball2 = typeof_(a4) == "CFrame",
+        win = type_(a4) == "number" and a4 or nil} -- the window the game itself sent
     Core.misses, Core.pending = 0, nil
     Core.new_capture = {prev = prev}
 end
@@ -1333,8 +1348,9 @@ local function send(curveCF, spam)
     if not spam and not gate_open() then return "blocked" end
     local window = parry_window()
     if window == nil then
-        if not Win.done then return "blocked" end -- stats not read yet
-        window = 0.5
+        if cap.win and cap.win > 0 then window = cap.win -- the game's own, from the capture
+        elseif not Win.done then return "blocked" -- stats not read yet
+        else window = 0.5 end
     end
     local tok = make_token(cap)
     if not tok then Core.cap = nil; return "unarmed" end
@@ -2282,6 +2298,7 @@ RunService.Heartbeat:Connect(function()
         flight(("CAPTURED (%s hook%s): remote %s, id %s, %s server%s"):format(capture_method(), Core.isolated and ", isolated" or ", NOT isolated", tostring(cap.remote.Name), tostring(cap.uid),
             cap.ball2 and "UseBall2" or "normal",
             prev and (changed ~= "" and (" -- CHANGED since last capture: " .. changed) or " -- same as last capture") or ""))
+        flight(("  game's window %s, we send %s"):format(tostring(cap.win), tostring(parry_window())))
     end
     if Core.pending and clock_() > Core.pending then
         Core.pending, Core.misses = nil, (Core.misses or 0) + 1
