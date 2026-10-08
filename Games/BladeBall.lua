@@ -6,7 +6,7 @@ task.spawn(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.08-90"
+local SCRIPT_VERSION = "2026.10.08-91"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -164,6 +164,33 @@ end
 local Core = {cap = nil, info = "not armed yet", told = false, interp = 0.14,
     ev = {}, -- last time of: hook_up, hook_down, press, remote, spam (for the kick report)
     cfg = {close_range = 20, instant = true, preparry = false, hp_close = false, hit_zone = 4, instant_range = 8, sim_dt = 1 / 120}}
+-- ROUND-ONLY LISTENERS. The lobby kick (reason 24) was bisected to the
+-- listeners attached at load between BBStop 0 (clean) and 1 (kicks): the
+-- AnimationPlayed watcher + CharacterAdded hooks, ParrySuccess, DeathBall /
+-- InfinityBall, the TimeHole / SlashesOfFury net events, Runtime.ChildAdded.
+-- Every one of them only matters mid-round, so none of them is attached in the
+-- lobby any more: sites register an attacher with Core.on_round, and
+-- Core.round_sync (driven from the heartbeat) attaches them all when your
+-- character enters Alive (or lobby training) and disconnects them all the
+-- moment it leaves. Core.round_add keeps a connection only while in a round.
+Core.round = {attachers = {}, conns = {}, on = false}
+function Core.on_round(attach) table.insert(Core.round.attachers, attach) end
+function Core.round_add(c)
+    if Core.round.on then table.insert(Core.round.conns, c) else pcall(function() c:Disconnect() end) end
+end
+function Core.round_sync()
+    local R = Core.round
+    local char = LocalPlayer.Character
+    local want = char ~= nil and (char.Parent == Alive or LocalPlayer:GetAttribute("LobbyTraining") == true)
+    if want == R.on then return end
+    R.on = want
+    if want then
+        for _, attach in ipairs(R.attachers) do pcall(attach) end
+    else
+        for _, c in ipairs(R.conns) do pcall(function() c:Disconnect() end) end
+        R.conns = {}
+    end
+end
 local function remoteReady() return Core.cap ~= nil end
 -- Arms Remote mode by auto pressing block; defined in the parry core.
 local prime_remote
@@ -583,15 +610,15 @@ local own_swing = setmetatable({}, {__mode = 'k'}) -- track -> when we played it
 -- faster than that was held on "game lockout" and fired too late -- the swing
 -- with no parry. Tracks that start right after a ParrySuccess are skipped.
 local success_at = -math.huge
-pcall(function()
-    Remotes.ParrySuccess.OnClientEvent:Connect(function() success_at = os.clock() end)
+Core.on_round(function()
+    Core.round_add(Remotes.ParrySuccess.OnClientEvent:Connect(function() success_at = os.clock() end))
 end)
 local function watch_presses(char)
     task.spawn(function()
         local humanoid = char:WaitForChild("Humanoid", 10)
         local animator = humanoid and humanoid:WaitForChild("Animator", 10)
-        if not animator then return end
-        animator.AnimationPlayed:Connect(function(track)
+        if not animator or not Core.round.on then return end
+        Core.round_add(animator.AnimationPlayed:Connect(function(track)
             if track:GetAttribute("SuccessParry") then return end -- a landed parry's swing, not a press
             if not (track:GetAttribute("Parry") or track:GetAttribute("GrabParry")) then return end
             local now = os.clock()
@@ -599,11 +626,13 @@ local function watch_presses(char)
             local at = own_swing[track]
             if at and now - at < 0.25 then return end
             if Core.gate_start then Core.gate_start() end
-        end)
+        end))
     end)
 end
-if LocalPlayer.Character then watch_presses(LocalPlayer.Character) end
-LocalPlayer.CharacterAdded:Connect(watch_presses)
+Core.on_round(function()
+    if LocalPlayer.Character then watch_presses(LocalPlayer.Character) end
+    Core.round_add(LocalPlayer.CharacterAdded:Connect(watch_presses))
+end)
 
 local function play_block()
     local char = LocalPlayer.Character
@@ -650,13 +679,14 @@ end
 
 -- Our own block landed: the next block can start straight away (the game plays
 -- the success swing itself).
-pcall(function()
-    Remotes.ParrySuccess.OnClientEvent:Connect(function()
+Core.on_round(function()
+    gate.last, gate.landed, gate.landed_at = -math.huge, true, -math.huge -- fresh round
+    Core.round_add(Remotes.ParrySuccess.OnClientEvent:Connect(function()
         gate.landed, gate.landed_at = true, os.clock()
-    end)
-end)
-LocalPlayer.CharacterAdded:Connect(function()
-    gate.last, gate.landed, gate.landed_at = -math.huge, true, -math.huge
+    end))
+    Core.round_add(LocalPlayer.CharacterAdded:Connect(function()
+        gate.last, gate.landed, gate.landed_at = -math.huge, true, -math.huge
+    end))
 end)
 
 -- The block swing that goes with our parries, through play_block's gate (the
@@ -825,11 +855,14 @@ local function isLocal(player)
     return player == LocalPlayer or player == LocalPlayer.Name or (typeof(player) == 'Instance' and player.Name == LocalPlayer.Name)
 end
 
-pcall(function()
-    Remotes.DeathBall.OnClientEvent:Connect(function(c, d) System.__properties.__deathslash_active = d or false end)
-end)
-pcall(function()
-    Remotes.InfinityBall.OnClientEvent:Connect(function(a, b) System.__properties.__infinity_active = b or false end)
+Core.on_round(function()
+    System.__properties.__deathslash_active, System.__properties.__infinity_active = false, false -- fresh round
+    pcall(function()
+        Core.round_add(Remotes.DeathBall.OnClientEvent:Connect(function(c, d) System.__properties.__deathslash_active = d or false end))
+    end)
+    pcall(function()
+        Core.round_add(Remotes.InfinityBall.OnClientEvent:Connect(function(a, b) System.__properties.__infinity_active = b or false end))
+    end)
 end)
 
 -- BBStop checkpoint 1b (diagnostic).
@@ -838,7 +871,9 @@ if genv.BBStop == "1b" then flight("BBStop 1b: stopped after the DeathBall/Infin
 local net
 pcall(function() net = ReplicatedStorage.Packages._Index["sleitnick_net@0.1.0"].net end)
 local function onNet(name, fn)
-    pcall(function() net[name].OnClientEvent:Connect(fn) end)
+    Core.on_round(function()
+        pcall(function() Core.round_add(net[name].OnClientEvent:Connect(fn)) end)
+    end)
 end
 
 onNet("RE/TimeHoleActivate", function(player)
@@ -900,7 +935,7 @@ end)
 -- BBStop checkpoint 1c (diagnostic).
 if genv.BBStop == "1c" then flight("BBStop 1c: stopped after the onNet (TimeHole/SlashesOfFury) listeners, before Runtime.ChildAdded + the ParrySuccess listener") return end
 
-Runtime.ChildAdded:Connect(function(Object)
+Core.on_round(function() Core.round_add(Runtime.ChildAdded:Connect(function(Object)
     if not System.__config.__detections.__phantom then return end
     if Object.Name ~= "maxTransmission" and Object.Name ~= "transmissionpart" then return end
     local Weld = Object:FindFirstChildWhichIsA("WeldConstraint")
@@ -918,12 +953,12 @@ Runtime.ChildAdded:Connect(function(Object)
         elseif Highlighted == false then FocusConnection:Disconnect() end
     end)
     task.delay(3, function() if FocusConnection and FocusConnection.Connected then FocusConnection:Disconnect() end end)
-end)
+end)) end)
 
-Remotes.ParrySuccess.OnClientEvent:Connect(function()
+Core.on_round(function() Core.round_add(Remotes.ParrySuccess.OnClientEvent:Connect(function()
     if not LocalPlayer.Character or LocalPlayer.Character.Parent ~= Alive then return end
     if System.__properties.__grab_animation then System.__properties.__grab_animation:Stop() end
-end)
+end)) end)
 
 -- BBStop checkpoint 1 (diagnostic): getgenv().BBStop = 1 stops loading here.
 if genv.BBStop == 1 then flight("BBStop 1: stopped before the parry core (UI, services, animation hooks, ability listeners ran)") return end
@@ -2654,6 +2689,8 @@ RunService.Heartbeat:Connect(function()
     -- time you can actually parry -- never in the lobby, where requiring a game
     -- module with our frame on its stack is a needless kick risk
     if not Win.started and canParryNow() then Win.load() end
+    -- attach the round-only listeners when you enter a round, drop them in the lobby
+    Core.round_sync()
     if not Core.cap then
         Core.told = false
         -- a hook-free recipe, if one was ever completed
@@ -4209,6 +4246,10 @@ end)
 -- The next copy calls this before it starts.
 genv.__BladeBallShutdown = function()
     pcall(function() Core.unhook() end)
+    pcall(function()
+        for _, c in ipairs(Core.round.conns) do pcall(function() c:Disconnect() end) end
+        Core.round.conns, Core.round.on, Core.round.attachers = {}, false, {}
+    end)
     pcall(function() Library:Unload() end)
     if genv.__BladeBallInstance == INSTANCE then genv.__BladeBallInstance = nil end
 end
