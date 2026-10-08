@@ -6,7 +6,7 @@ task.spawn(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.08-63"
+local SCRIPT_VERSION = "2026.10.08-64"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -1053,10 +1053,13 @@ local function build_body(src, ...)
     end)
     return ok and type(fn) == 'function' and fn or nil
 end
-local NC_BODY = build_body(NC_SRC, box, getnamecallmethod_ or function() return nil end, select)
-local FIRE_BODY = build_body(FIRE_SRC, box, select)
+-- The loadstring / chunk-name / setfenv disguise is opt-in now
+-- (getgenv().HookDisguise = true): it wasn't in the version that got kicked
+-- least, so by default the bodies are plain closures (same logic, below).
+local NC_BODY = getgenv().HookDisguise and build_body(NC_SRC, box, getnamecallmethod_ or function() return nil end, select) or nil
+local FIRE_BODY = getgenv().HookDisguise and build_body(FIRE_SRC, box, select) or nil
 Core.isolated = NC_BODY ~= nil and FIRE_BODY ~= nil
--- No loadstring on this executor: same bodies, just not disguised.
+-- Plain bodies (default; also when there's no loadstring).
 if not NC_BODY then
     NC_BODY = function(self, ...)
         if select_("#", ...) >= 6 and box.want and getnamecallmethod_() == "FireServer" then
@@ -1338,10 +1341,11 @@ local function send(curveCF, spam)
     if not cap then return "unarmed" end
     if not canParryNow() then return "blocked" end
     if not cap.remote.Parent then Core.cap = nil; return "unarmed" end
-    -- No client-side lockout check (the first UI3 build had none and fired
-    -- reliably): our guess of the game's lockout is what held parries until
-    -- they were too late. Keypress mode still checks it (a press inside the
-    -- game's lockout does nothing).
+    -- The game's lockout: a parry that didn't land locks parrying for n2
+    -- (1.3s); one sent inside it plays the swing and does nothing. (The old
+    -- false lockout after every landed parry is fixed -- see watch_presses.)
+    -- Spam still goes through it.
+    if not spam and not gate_open() then return "blocked" end
     local window = parry_window()
     if window == nil then
         if not Win.done then return "blocked" end -- stats not read yet
@@ -1795,6 +1799,11 @@ local function decide(ball, st, root, now, via)
     if (clash and clash.ball == ball and clock_() < clash.until_t) or (Core.clash_check and Core.clash_check(ball)) then
         return hold("clash: auto spam has it")
     end
+    -- inside the game's lockout a parry does nothing: wait, and fire the
+    -- moment it ends if the ball is due (or already overdue)
+    if getgenv().AutoParryMode ~= "Keypress" and Core.cap and not gate_open() then
+        return hold(("game lockout, %.2fs left"):format(math.max(G.until_t - clock_(), 0)))
+    end
 
     local heading, _, speed, distance, velocity = read_ball(ball, root)
     if speed < 1 then return hold("ball not moving") end
@@ -1861,7 +1870,7 @@ local function try_preparry(ball, st, root, now)
     if not (cfg.preparry or (cfg.hp_close and high_ping())) then return end
     local target = st.target
     if type(target) ~= 'string' or target == '' or target == me then return end
-    if getgenv().AutoParryMode == "Keypress" or not Core.cap then return end
+    if getgenv().AutoParryMode == "Keypress" or not Core.cap or not gate_open() then return end
     local their_root = character_root(target)
     if not their_root then return end
     local gap = (their_root.Position - root.Position).Magnitude
@@ -1898,6 +1907,7 @@ local function trigger(ball, st)
     if not root or root:FindFirstChild('SingularityCape') or not canParryNow() then return end
     local now = clock_()
     if pass_busy(st, now) or blocked_by_detection() then return end
+    if getgenv().AutoParryMode ~= "Keypress" and Core.cap and not gate_open() then return end
     if fire_for(st, now, "triggerbot") then
         System.__triggerbot.__parries = System.__triggerbot.__parries + 1
     end
@@ -2295,7 +2305,11 @@ RunService.Heartbeat:Connect(function()
     if nc then
         Core.new_capture = nil
         local cap, prev = Core.cap, nc.prev
-        learn_hookfree(cap)
+        -- (The hook-free learning walk -- player / ReplicatedStorage / Workspace
+        -- / the game's _G with its BAC_FAKE bait entries / a listener on every
+        -- remote -- no longer runs after a capture: none of it existed in the
+        -- version that got kicked least, and it never found the key anyway.
+        -- A recipe file that is already complete is still used.)
         local keystr = table.concat(cap.key, ",")
         local changed
         if prev then
