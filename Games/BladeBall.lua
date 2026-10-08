@@ -6,7 +6,7 @@ task.spawn(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.08-80"
+local SCRIPT_VERSION = "2026.10.08-81"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -1979,6 +1979,32 @@ local function mark_parried(st, now)
     st.parried, st.parry_until = true, now + reach_time() + (parry_window() or 0.5) + 0.03
 end
 
+-- PARRY BURST. A single remote shot is sometimes a hair outside the SERVER's
+-- real accept window even when our model says it was inside it (the miss check
+-- logs REFUSED) -- which is exactly why manual spam lands the same packet fine:
+-- it blankets that window instead of betting on one perfectly placed shot. So
+-- after an auto parry's first remote shot we keep sending on the spam path (same
+-- captured packet, skips our gate) for a few frames, stopping the instant a
+-- ParrySuccess lands (it clears Core.pending). The server takes one parry and
+-- ignores the rest, so this can't double-land -- it's what spam already does,
+-- just bounded to the moment of the parry. Off with getgenv().ParryBurst=false;
+-- length is getgenv().ParryBurstSeconds (default 0.12s, clamped to 0.4).
+local bursting = false
+local function parry_burst()
+    if bursting or not Core.cap then return end
+    bursting = true
+    task.spawn(function()
+        local deadline = os.clock() + math.clamp(tonumber(getgenv().ParryBurstSeconds) or 0.12, 0, 0.4)
+        while is_live() and os.clock() < deadline and Core.pending and Core.cap do
+            ParryLog.source = "auto spam" -- counted like spam, no per-shot log spam
+            pcall(Core.send, System.curve.get_cframe_fast(), true)
+            ParryLog.source = nil
+            task.wait()
+        end
+        bursting = false
+    end)
+end
+
 local function fire_for(st, now, via, info)
     local held_by = st.why -- what the last frame was waiting on
     ParryLog.source = via
@@ -1987,6 +2013,11 @@ local function fire_for(st, now, via, info)
     else ok = System.parry.by_mode(getgenv().AutoParryMode) end
     ParryLog.source = nil
     if not ok then st.why = "couldn't send yet, retrying"; return false end
+    -- blanket the server's real window like manual spam does (Remote mode only;
+    -- Keypress can't burst, and with no capture there's nothing to send)
+    if getgenv().AutoParryMode ~= "Keypress" and Core.cap and getgenv().ParryBurst ~= false then
+        parry_burst()
+    end
     if info and info.ball and getgenv().AutoParryMode ~= "Keypress" then
         -- an earlier shot at this ball that the ball still hasn't reached: early
         for _, old in ipairs(open_shots) do
@@ -3686,6 +3717,9 @@ AP:AddDropdown("CapturePress", {Text = "Capture press", Values = {"Keypress", "O
 AP:AddDropdown("ParryMode", {Text = "Parry mode", Values = {"Remote", "Keypress"}, Default = "Remote",
     Tooltip = "Remote: fires the captured parry remote (needs the one capture hook per server) -- curve and target mode apply. Keypress: presses the block key (no curve/target). (Game mode has been removed.)",
     Callback = function(v) getgenv().AutoParryMode = v end})
+AP:AddToggle("ParryBurst", {Text = "Parry burst", Default = true,
+    Tooltip = "After an auto parry's first remote shot, keep sending on the spam path for a few frames (stopping the instant it lands). A single shot can land a hair outside the server's real window even when it looks in-window (logged REFUSED) -- this blankets that window the way manual spam does, which is why spam lands when a single parry doesn't. Turn off for exactly one packet per parry.",
+    Callback = function(v) getgenv().ParryBurst = v end})
 AP:AddDropdown("CurveMode", {Text = "Curve mode", Values = System.__config.__curve_names, Default = "Camera",
     Callback = function(v)
         for i, n in ipairs(System.__config.__curve_names) do if n == v then System.__properties.__curve_mode = i; break end end
