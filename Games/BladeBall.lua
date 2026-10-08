@@ -6,7 +6,7 @@ task.spawn(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.08-85"
+local SCRIPT_VERSION = "2026.10.08-86"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -2610,6 +2610,9 @@ RunService.Heartbeat:Connect(function()
     -- time you can actually parry -- never in the lobby, where requiring a game
     -- module with our frame on its stack is a needless kick risk
     if not Win.started and canParryNow() then Win.load() end
+    -- attach/detach the spam loop with the round, so nothing spam-related is
+    -- connected while idle in the lobby (that was the start-up kick)
+    if Core.spam_sync then Core.spam_sync() end
     if not Core.cap then
         Core.told = false
         -- a hook-free recipe, if one was ever completed
@@ -2933,11 +2936,28 @@ local function spam_instant()
 end
 System.spam_on_retarget = function() pcall(spam_instant) end
 
--- spam loop connections (RunService + the spam_instant on ParrySuccess) are a
--- feature, so BBCoreOnly / BBNoSpam skip them entirely.
-if not (genv.BBCoreOnly or genv.BBNoSpam) then
-Remotes.ParrySuccess.OnClientEvent:Connect(function() pcall(spam_instant) end)
-do
+-- Spam loop connections. These used to be bound at LOAD, unconditionally -- 4
+-- RunService signals + a ParrySuccess listener -- whether or not you ever
+-- spammed. That is exactly what tripped the start-up kick: idle in the lobby
+-- with the spam toggles even OFF, they were still attached (the one thing
+-- BBCoreOnly removed that turning the toggles off did NOT, which is why "all
+-- off" still kicked but core-only didn't). Now they're attached only while spam
+-- is actually usable -- a spam toggle on AND you can parry (in a round) -- and
+-- torn down the instant you're back in the lobby / dead. Driven once a frame
+-- from the heartbeat (Core.spam_sync); nothing spam-related is connected in the
+-- lobby.
+local spam_connected = false
+local function spam_disconnect()
+    if not spam_connected then return end
+    spam_connected = false
+    local conns = props.__connections
+    for _, k in ipairs({"__spam_evt", "__spam_pre", "__spam_heartbeat", "__spam_render", "__spam_anim"}) do
+        if conns[k] then pcall(function() conns[k]:Disconnect() end); conns[k] = nil end
+    end
+end
+local function spam_connect()
+    if spam_connected then return end
+    spam_connected = true
     local last_error
     local function run(fn)
         local ok, err = pcall(fn)
@@ -2947,6 +2967,7 @@ do
         end
     end
     local conns = props.__connections
+    conns.__spam_evt = Remotes.ParrySuccess.OnClientEvent:Connect(function() pcall(spam_instant) end)
     conns.__spam_pre = RunService.PreSimulation:Connect(function()
         Pump.frame = Pump.frame + 1
         run(auto_spam_evaluate)
@@ -2960,7 +2981,12 @@ do
     pcall(function() conns.__spam_render = RunService.PreRender:Connect(function() run(spam_tick) end) end)
     pcall(function() conns.__spam_anim = RunService.PreAnimation:Connect(function() run(spam_tick) end) end)
 end
-end -- if not genv.BBCoreOnly (spam loop)
+function Core.spam_sync()
+    local want = not (genv.BBCoreOnly or genv.BBNoSpam)
+        and (props.__auto_spam_enabled or props.__manual_spam_enabled)
+        and canParryNow()
+    if want then spam_connect() else spam_disconnect() end
+end
 
 -- ============================================================
 -- HEADLESS & KORBLOX
