@@ -6,7 +6,7 @@ task.spawn(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.08-89"
+local SCRIPT_VERSION = "2026.10.08-90"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -673,6 +673,9 @@ function System.animation.play_block() pcall(play_block) end
 System.animation.play_grab_parry_full = System.animation.play_block
 end -- animation scope
 
+-- BBStop checkpoint 1a (diagnostic).
+if genv.BBStop == "1a" then flight("BBStop 1a: stopped after the animation block (AnimationPlayed watcher, CharacterAdded hooks, its ParrySuccess listeners)") return end
+
 -- Ball
 System.ball = {}
 function System.ball.get()
@@ -829,6 +832,9 @@ pcall(function()
     Remotes.InfinityBall.OnClientEvent:Connect(function(a, b) System.__properties.__infinity_active = b or false end)
 end)
 
+-- BBStop checkpoint 1b (diagnostic).
+if genv.BBStop == "1b" then flight("BBStop 1b: stopped after the DeathBall/InfinityBall listeners, before the onNet listeners") return end
+
 local net
 pcall(function() net = ReplicatedStorage.Packages._Index["sleitnick_net@0.1.0"].net end)
 local function onNet(name, fn)
@@ -890,6 +896,9 @@ end)
 onNet("RE/SlashesOfFuryCatch", function()
     runSlashesLoop()
 end)
+
+-- BBStop checkpoint 1c (diagnostic).
+if genv.BBStop == "1c" then flight("BBStop 1c: stopped after the onNet (TimeHole/SlashesOfFury) listeners, before Runtime.ChildAdded + the ParrySuccess listener") return end
 
 Runtime.ChildAdded:Connect(function(Object)
     if not System.__config.__detections.__phantom then return end
