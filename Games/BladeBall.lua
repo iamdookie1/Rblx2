@@ -6,7 +6,7 @@ task.spawn(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.08-59"
+local SCRIPT_VERSION = "2026.10.08-60"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -159,7 +159,7 @@ end
 -- The parry core's shared state (see "PARRY CORE" further down). Declared here
 -- so the animation code and the UI, defined before the core, can reach it.
 local Core = {cap = nil, info = "not armed yet", told = false, interp = 0.14,
-    cfg = {close_range = 20, instant = true, preparry = false, hp_close = true, hit_zone = 4, instant_range = 8, sim_dt = 1 / 120}}
+    cfg = {close_range = 20, instant = true, preparry = false, hp_close = false, hit_zone = 4, instant_range = 8, sim_dt = 1 / 120}}
 local function remoteReady() return Core.cap ~= nil end
 -- Arms Remote mode by auto pressing block; defined in the parry core.
 local prime_remote
@@ -1664,8 +1664,14 @@ end
 
 -- One parry per pass (per target change), like the first UI3 build: if the
 -- ball is still on us Retry delay seconds after it, parry again.
+-- The retry never comes inside the game's lockout: a parry that didn't land
+-- locks parrying for n2 (1.3s normally), and a press inside it plays the swing
+-- and does nothing -- the "animation but no parry". So the retry waits at least
+-- n2 plus a little for the round trip, whatever Retry delay says.
 local function mark_parried(st, now)
-    st.parried, st.parry_until = true, now + math.clamp(props.__retry_delay or 1, 0.2, 1.5)
+    local _, n2 = parry_window()
+    local wait = math.max(math.clamp(props.__retry_delay or 1, 0.2, 1.5), (n2 or 1.3) + 0.08)
+    st.parried, st.parry_until = true, now + wait
 end
 
 local function fire_for(st, now, via, info)
@@ -1719,11 +1725,9 @@ end
 --   * swinging AWAY (its angle to you opening up fast) is a wide curve or a
 --     bait: wait, unless it's already close enough that waiting is fatal.
 -- All times are against the ball we see, like the parry distance's.
-local function arc_time(distance, theta, speed, accel)
+local function arc_time(distance, theta, speed)
     local k = theta < 1e-3 and 1 or math.min(theta / math.sin(math.min(theta, 3.0)), 8)
-    local path = distance * k
-    if accel > 1 then return (math.sqrt(speed * speed + 2 * accel * path) - speed) / accel end
-    return path / speed
+    return distance * k / speed
 end
 
 -- How fast the angle between the ball's direction and you is changing (rad/s,
@@ -1762,9 +1766,15 @@ local function decide(ball, st, root, now, via)
     if speed < 1 then return hold("ball not moving") end
     local range = System.parry_distance(speed)
     local lead = range / speed
+    -- Keep the ball's arrival inside the parry: never so early that the
+    -- window (n6) runs out before it gets here. (On a small window -- the
+    -- game's noob boost shrinks it on low-kill accounts -- the distance alone
+    -- fired too early.)
+    local W = parry_window() or 0.5
+    local reach = reach_time()
+    local latest = reach + W * 0.7
+    if lead > latest then lead, range = latest, latest * speed end
     local theta = math.acos(math.clamp(heading, -1, 1))
-    local accel = speed_gain(st, speed, now)
-    local turn = turn_rate(st, velocity, now)
     local opening = angle_trend(st, theta, now)
     local info = {speed = speed, dist = distance, heading = heading, lead = lead}
 
@@ -1784,12 +1794,7 @@ local function decide(ball, st, root, now, via)
         return hold(("curving away (%.0f deg, opening %.1f rad/s)"):format(math.deg(theta), opening))
     end
 
-    local eta = arc_time(distance, theta, speed, accel)
-    if theta > 0.05 and turn > 0 then
-        local gap = contact_gap(ball)
-        local sim = predict_contact(ball.Position, velocity, root.Position, gap, turn, accel, lead + 0.15)
-        if sim then eta = math.min(eta, sim + gap / speed) end
-    end
+    local eta = arc_time(distance, theta, speed)
     info.eta = eta
     if point_blank or eta <= lead then
         st.why = nil
@@ -1835,7 +1840,10 @@ local function try_preparry(ball, st, root, now)
     local ok = System.parry.execute()
     ParryLog.source = nil
     if ok then
-        st.preparried, st.preparry_until = true, now + (parry_window() or 0.5) + reach + 0.15
+        -- held at least the game's lockout: if this guess misses, a parry
+        -- inside that lockout would only play the swing
+        local _, n2 = parry_window()
+        st.preparried, st.preparry_until = true, now + math.max((parry_window() or 0.5) + reach + 0.15, (n2 or 1.3) + 0.08)
         flight(("pre-parry: return in %.3fs (to them %.3f, back %.3f), fires at %.3fs, gap %.1f, ping %.0fms"):format(
             eta, d_them / speed, back, lead, gap, pingMs()))
     end
@@ -3356,7 +3364,7 @@ AP:AddSlider("CloseRange", {Text = "Pre-parry range", Default = 20, Min = 8, Max
 AP:AddToggle("InstantRetarget", {Text = "Instant parry on retarget", Default = true,
     Tooltip = "Parries straight off the ball switching to you when there's no time to wait: it lands within a round trip, or it's point blank. Anything with more time is timed normally.",
     Callback = function(v) Core.cfg.instant = v end})
-AP:AddToggle("HighPingClose", {Text = "High ping close range", Default = true,
+AP:AddToggle("HighPingClose", {Text = "High ping close range", Default = false,
     Tooltip = "At 80ms+ ping: when a player next to you is about to hit the ball and their return would beat your ping, parries ahead so it's up in time (only then). Timed by Accuracy / Timing multiplier like any parry.",
     Callback = function(v) Core.cfg.hp_close = v end})
 AP:AddToggle("ClosePreParry", {Text = "Close-range pre-parry", Default = false,
