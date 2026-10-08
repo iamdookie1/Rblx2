@@ -6,7 +6,7 @@ task.spawn(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.08-60.3"
+local SCRIPT_VERSION = "2026.10.08-60.4"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -999,6 +999,12 @@ local function learn(remote, hash, uid, token, a4, t)
     local prev = Core.cap
     Core.cap = {remote = remote, hash = hash, uid = uid, key = key, len = #text, ball2 = typeof_(a4) == "CFrame",
         win = type_(a4) == "number" and a4 or nil} -- the window the game itself sent
+    -- Where the hash lives (the game's _G.BAC_HASH), so every send can use the
+    -- current one: the first Ui3 build replayed fresh values, v60 froze them.
+    pcall_(function()
+        local g = getrenv()._G
+        if rawget(g, "BAC_HASH") == hash then Core.cap.hash_g = g end
+    end)
     Core.misses, Core.pending = 0, nil
     Core.new_capture = {prev = prev}
 end
@@ -1376,6 +1382,17 @@ local function send(curveCF, spam)
     end
     gate_start()
     log_send("remote")
+    -- STALE PACKET (no answer): the hash can change mid-server, and a parry
+    -- with the old one is refused -- the swing plays, nothing happens. Read
+    -- the current one each send (a plain table read, nothing called).
+    local hg = cap.hash_g
+    if hg then
+        local h = rawget(hg, "BAC_HASH")
+        if type(h) == 'string' and #h == 36 and h ~= cap.hash then
+            flight("hash changed mid-server -- sending with the new one")
+            cap.hash = h
+        end
+    end
     local r = cap.remote
     if cap.ball2 then
         local ray = cam:ScreenPointToRay(aim[1], aim[2], 0)
@@ -2304,7 +2321,13 @@ RunService.Heartbeat:Connect(function()
         Core.pending, Core.misses = nil, (Core.misses or 0) + 1
         local lp = Core.last_parry
         flight(("  -> NO answer to the %s (miss %d in a row)"):format(lp and lp.via or "parry", Core.misses))
-        if Core.cap.hookfree and Core.misses >= 2 then
+        -- Two unanswered in a row on a hook capture: the id/key went stale (the
+        -- first Ui3 build never froze them). Drop it; the next capture press
+        -- takes a fresh one, and the CAPTURED line says what CHANGED.
+        if not Core.cap.hookfree and Core.misses >= 2 then
+            Core.cap, Core.misses = nil, 0
+            flight("2 parries in a row got no answer: capture went stale -- taking a fresh one")
+        elseif Core.cap.hookfree and Core.misses >= 2 then
             Core.hookfree_off, Core.cap, learned = true, nil, false
             flight("hook-free parries unanswered twice: back to the hook capture for this server (re-learning)")
             Notify("Blade Ball", "No-hook mode didn't work on this server; capturing with the hook instead.", 5)
