@@ -6,7 +6,7 @@ task.spawn(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.08-93"
+local SCRIPT_VERSION = "2026.10.08-60.1"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -124,9 +124,6 @@ if not LocalPlayer.Character then LocalPlayer.CharacterAdded:Wait() end
 local Alive = Workspace:FindFirstChild("Alive") or Workspace:WaitForChild("Alive")
 local Runtime = Workspace:FindFirstChild("Runtime") or Workspace:WaitForChild("Runtime")
 local Remotes = ReplicatedStorage:WaitForChild("Remotes")
--- BBStop checkpoint 0 (diagnostic): getgenv().BBStop = 0 stops loading here.
-if genv.BBStop == 0 then flight("BBStop 0: stopped right after the UI window + services") return end
-
 
 -- Every file this script writes goes under one folder.
 local SAVE_FOLDER = "BladeBall"
@@ -162,26 +159,7 @@ end
 -- The parry core's shared state (see "PARRY CORE" further down). Declared here
 -- so the animation code and the UI, defined before the core, can reach it.
 local Core = {cap = nil, info = "not armed yet", told = false, interp = 0.14,
-    ev = {}, -- last time of: hook_up, hook_down, press, remote, spam (for the kick report)
     cfg = {close_range = 20, instant = true, preparry = false, hp_close = false, hit_zone = 4, instant_range = 8, sim_dt = 1 / 120}}
--- NO LISTENERS ON THE GAME'S OBJECTS. The lobby kick (reason 24) was bisected
--- to the listeners attached at load between BBStop 0 (clean) and 1 (kicks).
--- Every one of them is replaced by POLLING the state those events leave
--- behind, from the main heartbeat (the same kind of RunService connection the
--- clean Ui3 test made) -- plain property/attribute reads, nothing connected to
--- an animator, a remote or a folder of the game's:
---   AnimationPlayed + ParrySuccess -> new tracks in GetPlayingAnimationTracks()
---   CharacterAdded                 -> LocalPlayer.Character changing
---   Runtime.ChildAdded             -> Runtime:FindFirstChild(transmission part)
---   DeathBall / InfinityBall       -> the effect the game parents into the ball
---   TimeHole / SlashesOfFury       -> your character's AbilityActive + ability
--- Each site adds a function to Core.polls; they run once a frame while you're
--- in a round (character in Alive, or lobby training) and never in the lobby.
-Core.polls = {}
-function Core.in_round()
-    local char = LocalPlayer.Character
-    return char ~= nil and (char.Parent == Alive or LocalPlayer:GetAttribute("LobbyTraining") == true)
-end
 local function remoteReady() return Core.cap ~= nil end
 -- Arms Remote mode by auto pressing block; defined in the parry core.
 local prime_remote
@@ -230,7 +208,6 @@ local GuiService = cloneref(game:GetService('GuiService'))
 local function pressBlockKey()
     if not is_live() then return false end
     log_send("block key")
-    Core.ev.press = os.clock()
     pcall(function()
         VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.F, false, game)
         VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.F, false, game)
@@ -339,47 +316,32 @@ local target_aim = {at = -1, name = nil, aim = nil}
 -- game reads (Replion "Data", via the same plain require the game's own modules
 -- use -- no getgc, no hook) and reproduce its arithmetic exactly.
 local Win = {data = nil, noob = false}
--- These REQUIRE the game's own ModuleScripts (ServerInfo, Utils, Replion) and
--- call their functions -- that runs the game's code with our frame on the call
--- stack, which a caller-identity check inside them can flag. It used to run at
--- load (in the lobby, before anything else), and the data it reads (server
--- type, the parry-window stats) is only ever used once you're actually parrying
--- -- never in the lobby. So it's deferred: load_game_data() runs the first time
--- you can actually parry (fired from the heartbeat below), and nothing touches
--- a game module at startup any more.
--- Stored on Win (not a new local) to stay under the main chunk's local limit.
--- Win.load() runs once, the first time you can actually parry (fired from the
--- heartbeat), so nothing requires a game module in the lobby.
-function Win.load()
-    if Win.started then return end
-    Win.started = true
+task.spawn(function()
+    local function srv(info, name)
+        local ok, r = pcall(function() return info[name]() end)
+        return ok and r == true
+    end
+    local info, utils
+    pcall(function() info = require(ReplicatedStorage:WaitForChild("ServerInfo", 10)) end)
+    pcall(function() utils = require(ReplicatedStorage:WaitForChild("Common", 10):WaitForChild("Utils", 10)) end)
+    local flag_on = true
+    pcall(function() flag_on = utils.FFlag.GetInstantFFlag("NoobParryEnabled", true) end)
+    if info then
+        Win.noob = flag_on and not srv(info, "isDungeonsMatchServer") and not srv(info, "isRankedMatchServer")
+            and not srv(info, "isMedalServer") and not srv(info, "isClanWarServer")
+            and not srv(info, "isTournamentMatchServer") and true or false
+    end
     task.spawn(function()
-        local function srv(info, name)
-            local ok, r = pcall(function() return info[name]() end)
-            return ok and r == true
-        end
-        local info, utils
-        pcall(function() info = require(ReplicatedStorage:WaitForChild("ServerInfo", 10)) end)
-        pcall(function() utils = require(ReplicatedStorage:WaitForChild("Common", 10):WaitForChild("Utils", 10)) end)
-        local flag_on = true
-        pcall(function() flag_on = utils.FFlag.GetInstantFFlag("NoobParryEnabled", true) end)
-        if info then
-            Win.noob = flag_on and not srv(info, "isDungeonsMatchServer") and not srv(info, "isRankedMatchServer")
-                and not srv(info, "isMedalServer") and not srv(info, "isClanWarServer")
-                and not srv(info, "isTournamentMatchServer") and true or false
-        end
-        task.spawn(function()
-            pcall(function()
-                local Replion = require(ReplicatedStorage:WaitForChild("Packages", 10):WaitForChild("Replion", 10))
-                Win.data = Replion.Client:WaitReplion("Data")
-            end)
-            Win.done = true
+        pcall(function()
+            local Replion = require(ReplicatedStorage:WaitForChild("Packages", 10):WaitForChild("Replion", 10))
+            Win.data = Replion.Client:WaitReplion("Data")
         end)
-        -- Never block Remote forever: if the stats can't be read within 10s, give
-        -- up waiting and let the parry sender use its fallback.
-        task.delay(10, function() Win.done = true end)
+        Win.done = true
     end)
-end
+    -- Never block Remote forever: if the stats can't be read within 10s, give
+    -- up waiting and let the parry sender use its fallback.
+    task.delay(10, function() Win.done = true end)
+end)
 
 local function parry_window()
     local data = Win.data
@@ -592,7 +554,7 @@ end
 -- The game's own presses (your block button, tap to block, the capture press)
 -- start its parry swing; seeing that swing start is how we know the server's
 -- lockout started without us. Our own swings are told apart by when we played
--- them. No hooks, no listeners: the animator is polled (Core.polls).
+-- them. No hooks: Animator.AnimationPlayed.
 local own_swing = setmetatable({}, {__mode = 'k'}) -- track -> when we played it
 -- When a parry lands, the game's OnParrySuccess plays {"Parry", "SuccessParryN"}:
 -- the success swing includes a track marked "Parry". That is NOT a press and
@@ -601,62 +563,27 @@ local own_swing = setmetatable({}, {__mode = 'k'}) -- track -> when we played it
 -- faster than that was held on "game lockout" and fired too late -- the swing
 -- with no parry. Tracks that start right after a ParrySuccess are skipped.
 local success_at = -math.huge
--- POLLED, no listeners (see Core.polls): once a frame in a round, look at the
--- animator's playing tracks. A track that just started (wasn't playing last
--- frame, or restarted -- its TimePosition went backwards) is either the game's
--- landed-parry swing (tagged SuccessParry -- what ParrySuccess makes the game
--- play) or a press (Parry / GrabParry). Success swings are handled first so
--- their own Parry track is skipped, exactly like the old ParrySuccess listener.
--- A new character (the old CharacterAdded hook) resets the block gate.
-local last_pos = setmetatable({}, {__mode = 'k'}) -- track -> TimePosition last frame
-local polled_char
--- The game's OnParrySuccess plays {"Parry", "SuccessParry"} -- or, for swords
--- with variants, "SuccessParry<N>" -- so any of those tags means a landed parry.
-local function is_success_track(track)
-    if track:GetAttribute("SuccessParry") then return true end
-    for i = 1, 8 do if track:GetAttribute("SuccessParry" .. i) then return true end end
-    return false
-end
-table.insert(Core.polls, function()
-    local char = LocalPlayer.Character
-    if char ~= polled_char then
-        polled_char = char
-        gate.last, gate.landed, gate.landed_at = -math.huge, true, -math.huge
-    end
-    local humanoid = char and char:FindFirstChildOfClass("Humanoid")
-    local animator = humanoid and humanoid:FindFirstChildOfClass("Animator")
-    if not animator then return end
-    local fresh, playing = {}, {}
-    for _, track in ipairs(animator:GetPlayingAnimationTracks()) do
-        local pos, before = track.TimePosition, last_pos[track]
-        if before == nil or pos + 0.02 < before then fresh[#fresh + 1] = track end
-        playing[track] = pos
-    end
-    for track in pairs(last_pos) do if playing[track] == nil then last_pos[track] = nil end end
-    for track, pos in pairs(playing) do last_pos[track] = pos end
-    if #fresh == 0 then return end
-    local now = os.clock()
-    local landed = false
-    for _, track in ipairs(fresh) do
-        if is_success_track(track) then landed = true end
-    end
-    if landed then -- a parry landed: everything the ParrySuccess listeners used to do
-        success_at = now
-        gate.landed, gate.landed_at = true, now
-        local grab = System.__properties.__grab_animation
-        if grab then pcall(function() grab:Stop() end) end
-        if Core.on_landed then pcall(Core.on_landed) end           -- parry core: gate, timing, passes
-        if System.spam_landed then pcall(System.spam_landed) end   -- spam: next one goes now
-    end
-    for _, track in ipairs(fresh) do
-        if not is_success_track(track) and (track:GetAttribute("Parry") or track:GetAttribute("GrabParry")) then
-            local at = own_swing[track]
-            if now - success_at >= 0.35 and not (at and now - at < 0.25) then
-                if Core.gate_start then Core.gate_start() end
-            end
-        end
-    end
+pcall(function()
+    Remotes.ParrySuccess.OnClientEvent:Connect(function() success_at = os.clock() end)
 end)
+local function watch_presses(char)
+    task.spawn(function()
+        local humanoid = char:WaitForChild("Humanoid", 10)
+        local animator = humanoid and humanoid:WaitForChild("Animator", 10)
+        if not animator then return end
+        animator.AnimationPlayed:Connect(function(track)
+            if track:GetAttribute("SuccessParry") then return end -- a landed parry's swing, not a press
+            if not (track:GetAttribute("Parry") or track:GetAttribute("GrabParry")) then return end
+            local now = os.clock()
+            if now - success_at < 0.35 then return end -- the success swing's Parry track
+            local at = own_swing[track]
+            if at and now - at < 0.25 then return end
+            if Core.gate_start then Core.gate_start() end
+        end)
+    end)
+end
+if LocalPlayer.Character then watch_presses(LocalPlayer.Character) end
+LocalPlayer.CharacterAdded:Connect(watch_presses)
 
 local function play_block()
     local char = LocalPlayer.Character
@@ -703,8 +630,14 @@ end
 
 -- Our own block landed: the next block can start straight away (the game plays
 -- the success swing itself).
--- (Our block landing / a new character resetting this gate are read by the
--- animation poll above -- no ParrySuccess or CharacterAdded listener.)
+pcall(function()
+    Remotes.ParrySuccess.OnClientEvent:Connect(function()
+        gate.landed, gate.landed_at = true, os.clock()
+    end)
+end)
+LocalPlayer.CharacterAdded:Connect(function()
+    gate.last, gate.landed, gate.landed_at = -math.huge, true, -math.huge
+end)
 
 -- The block swing that goes with our parries, through play_block's gate (the
 -- fix from 54757b6 / a7882af / 760eaa1): it never cuts the game's success swing
@@ -719,9 +652,6 @@ function System.animation.play_grab_parry() end
 function System.animation.play_block() pcall(play_block) end
 System.animation.play_grab_parry_full = System.animation.play_block
 end -- animation scope
-
--- BBStop checkpoint 1a (diagnostic).
-if genv.BBStop == "1a" then flight("BBStop 1a: stopped after the animation block (AnimationPlayed watcher, CharacterAdded hooks, its ParrySuccess listeners)") return end
 
 -- Ball
 System.ball = {}
@@ -872,37 +802,25 @@ local function isLocal(player)
     return player == LocalPlayer or player == LocalPlayer.Name or (typeof(player) == 'Instance' and player.Name == LocalPlayer.Name)
 end
 
--- Death Slash / Infinity, POLLED (no DeathBall / InfinityBall listener): while
--- either is active the game parents its effect into the ball --
--- DEATHSLASHHHHH / WEMAZOOKIEGO (BallReplicationHandler) -- so read that.
-table.insert(Core.polls, function()
-    local death, inf = false, false
-    for _, name in ipairs({"Balls", "TrainingBalls"}) do
-        local folder = Workspace:FindFirstChild(name)
-        if folder then
-            for _, ball in ipairs(folder:GetChildren()) do
-                if ball:FindFirstChild("DEATHSLASHHHHH") then death = true end
-                if ball:FindFirstChild("WEMAZOOKIEGO") then inf = true end
-            end
-        end
-    end
-    System.__properties.__deathslash_active, System.__properties.__infinity_active = death, inf
+pcall(function()
+    Remotes.DeathBall.OnClientEvent:Connect(function(c, d) System.__properties.__deathslash_active = d or false end)
+end)
+pcall(function()
+    Remotes.InfinityBall.OnClientEvent:Connect(function(a, b) System.__properties.__infinity_active = b or false end)
 end)
 
--- BBStop checkpoint 1b (diagnostic).
-if genv.BBStop == "1b" then flight("BBStop 1b: stopped after the DeathBall/InfinityBall listeners, before the onNet listeners") return end
-
--- Time Hole / Slashes of Fury are YOUR abilities: the server sets AbilityActive
--- on your character for the ability's duration (Shared.Abilities), so poll that
--- with your equipped ability instead of listening to the TimeHole /
--- SlashesOfFury net events.
-local function own_ability_active(name)
-    local char = LocalPlayer.Character
-    if not (char and char:GetAttribute("AbilityActive")) then return false end
-    local equipped = LocalPlayer:GetAttribute("AbilityOverride") or LocalPlayer:GetAttribute("EquippedAbility")
-        or char:GetAttribute("Ability")
-    return equipped == name
+local net
+pcall(function() net = ReplicatedStorage.Packages._Index["sleitnick_net@0.1.0"].net end)
+local function onNet(name, fn)
+    pcall(function() net[name].OnClientEvent:Connect(fn) end)
 end
+
+onNet("RE/TimeHoleActivate", function(player)
+    if isLocal(player) then System.__properties.__timehole_active = true end
+end)
+onNet("RE/TimeHoleDeactivate", function()
+    System.__properties.__timehole_active = false
+end)
 
 local maxParryCount = 36; local parryDelay = 0.05
 -- One loop at a time, driven locally so it works even if the server is slow to
@@ -934,30 +852,28 @@ local function runSlashesLoop()
         slashesLoopRunning = false
     end)
 end
--- Polled each frame in a round: Time Hole on/off, and Slashes of Fury's start
--- (runs the loop, which caps itself at maxParryCount) and end.
-table.insert(Core.polls, function()
-    local props = System.__properties
-    props.__timehole_active = own_ability_active("Time Hole")
-    local slashes = own_ability_active("Slashes of Fury")
-    if slashes and not props.__slashesoffury_active then
-        props.__slashesoffury_active, props.__slashesoffury_count = true, 0
+onNet("RE/SlashesOfFuryActivate", function(player)
+    if isLocal(player) then
+        System.__properties.__slashesoffury_active = true
+        System.__properties.__slashesoffury_count = 0
         runSlashesLoop()
-    elseif not slashes and props.__slashesoffury_active then
-        props.__slashesoffury_active, props.__slashesoffury_count = false, 0
-        slashesLoopRunning = false
     end
 end)
+onNet("RE/SlashesOfFuryEnd", function()
+    System.__properties.__slashesoffury_active = false
+    System.__properties.__slashesoffury_count = 0
+    slashesLoopRunning = false
+end)
+onNet("RE/SlashesOfFuryParry", function()
+    System.__properties.__slashesoffury_count = System.__properties.__slashesoffury_count + 1
+end)
+onNet("RE/SlashesOfFuryCatch", function()
+    runSlashesLoop()
+end)
 
--- BBStop checkpoint 1c (diagnostic).
-if genv.BBStop == "1c" then flight("BBStop 1c: stopped after the onNet (TimeHole/SlashesOfFury) listeners, before Runtime.ChildAdded + the ParrySuccess listener") return end
-
--- Phantom, POLLED (no Runtime.ChildAdded listener): the transmission part shows
--- up in Runtime welded to you; once its weld is destroyed it's never re-matched.
-table.insert(Core.polls, function()
+Runtime.ChildAdded:Connect(function(Object)
     if not System.__config.__detections.__phantom then return end
-    local Object = Runtime:FindFirstChild("maxTransmission") or Runtime:FindFirstChild("transmissionpart")
-    if not Object then return end
+    if Object.Name ~= "maxTransmission" and Object.Name ~= "transmissionpart" then return end
     local Weld = Object:FindFirstChildWhichIsA("WeldConstraint")
     local root = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
     if not Weld or not root or Weld.Part1 ~= root then return end
@@ -974,11 +890,11 @@ table.insert(Core.polls, function()
     end)
     task.delay(3, function() if FocusConnection and FocusConnection.Connected then FocusConnection:Disconnect() end end)
 end)
--- (Stopping our grab swing when a parry lands is done by the animation poll --
--- no ParrySuccess listener here.)
 
--- BBStop checkpoint 1 (diagnostic): getgenv().BBStop = 1 stops loading here.
-if genv.BBStop == 1 then flight("BBStop 1: stopped before the parry core (UI, services, animation hooks, ability listeners ran)") return end
+Remotes.ParrySuccess.OnClientEvent:Connect(function()
+    if not LocalPlayer.Character or LocalPlayer.Character.Parent ~= Alive then return end
+    if System.__properties.__grab_animation then System.__properties.__grab_animation:Stop() end
+end)
 
 -- ============================================================
 -- PARRY CORE (rewritten): capture, gate, sender, ball tracking, timing,
@@ -1028,15 +944,6 @@ local hookmetamethod_, getnamecallmethod_ = hookmetamethod, getnamecallmethod
 local getrawmetatable_, setreadonly_ = getrawmetatable, setreadonly or make_writeable
 local checkcaller_ = checkcaller or function() return false end
 local newcclosure_ = newcclosure or function(f) return f end
--- oth: Delta's on-another-thread hook library. oth.hook(target, hook) -> original
--- runs the hook on a separate thread, makes an l-closure pass is_c_closure
--- scans, and unhooks with no footprint -- so it's the stealthiest way to hook
--- FireServer for the capture, and the default when it's present (the frameless
--- coroutine stays as the fallback for executors without it). oth.unhook takes
--- the target function.
-local oth_lib = rawget(getgenv(), "oth"); if type(oth_lib) ~= 'table' then pcall(function() oth_lib = oth end) end
-local oth_hook = type(oth_lib) == 'table' and type(oth_lib.hook) == 'function' and oth_lib.hook or nil
-local oth_unhook = type(oth_lib) == 'table' and type(oth_lib.unhook) == 'function' and oth_lib.unhook or nil
 local select_, type_, typeof_, tostring_, floor_, byte_, bxor_, pcall_ =
     select, type, typeof, tostring, math.floor, string.byte, bit32.bxor, pcall
 local JOB_ID = game.JobId
@@ -1052,7 +959,7 @@ local H = {fire = nil, nc = nil, want = false, until_t = 0}
 --   "FireServer"-- the FireServer function only (catches f(remote, ...) sends)
 --   "Both"      -- both, so every press captures
 -- Each alone sees about half the game's sends, so it can take two presses.
-local function capture_method() return getgenv().CaptureHook or "FireServer" end
+local function capture_method() return getgenv().CaptureHook or "Namecall" end
 Core.capture_method = capture_method
 
 -- __namecall goes back exactly: the original function object written straight
@@ -1102,8 +1009,8 @@ end
 -- stack). So the body is:
 --   * compiled with loadstring under the chunk name of the game's own Net
 --     module, so debug.info shows a game path, not our script;
---   * run in an empty env (just `script` = the Net ModuleScript), so getfenv on
---     its frame shows nothing of ours -- no getrenv, nothing of the executor;
+--   * run in a clean game environment (getrenv's globals, no writefile, nothing
+--     of ours), so getfenv on its frame shows nothing of ours;
 --   * cut off from us: it calls none of our functions -- it drops the send into
 --     `box` (a plain table) and passes the call straight on. Our own thread
 --     picks the box up a frame later, works out the key and takes the hook down.
@@ -1114,32 +1021,28 @@ end
 --     game's FireServer into GetServerTimeNow on the remote mid-send.
 local box = {want = false, nc = nil, fire = nil, list = {}, ws = Workspace, now = Workspace.GetServerTimeNow}
 local HOOK_NAME = "=ReplicatedStorage.Packages._Index.sleitnick_net@0.1.0.net"
--- One line each, like the game's obfuscated modules (every frame reports line
--- 1), compiled under the Net module's chunk name.
--- Tamper reports: the game's parry sender reports a tripped check home over
--- the parry remote itself, as FireServer(JobId, <magic>, ...). While the hook
--- is up such a send (JobId first) is dropped, not passed on -- so even if
--- something about the hook trips a check during a capture, the report never
--- reaches the server. Real parries start with the BAC hash, never the JobId.
-local NC_SRC = "local b,g,s,j=... return function(self,...) local a=... if a==j and g()=='FireServer' then return end if s('#',...)>=6 and b.want and g()=='FireServer' then local l=b.list if #l<4 then l[#l+1]={self,s('#',...),{...},b.now(b.ws)} end end return b.nc(self,...) end"
-local FIRE_SRC = "local b,s,j=... return function(self,...) local a=... if a==j then return end if s('#',...)>=6 and b.want then local l=b.list if #l<4 then l[#l+1]={self,s('#',...),{...},b.now(b.ws)} end end return b.fire(self,...) end"
--- The bodies only ever touch their own upvalues (the box table and a couple of
--- vanilla functions passed in), never a global, so they run fine in an empty
--- env. We used to seed this from getrenv() to disguise a getfenv of the body's
--- frame, but getrenv() reaches into the game's environment at load -- a kick
--- risk before any capture -- and oth runs the body off-thread anyway (getfenv
--- on the game's stack never sees it), so no getrenv is used. `script` is set to
--- the real Net ModuleScript (a plain FindFirstChild) to keep the disguise for
--- the non-oth fallback.
-local CLEAN_ENV = {}
+local NC_SRC = [[
+local box, getncm, sel = ...
+return function(self, ...)
+    local l = box.list
+    if box.want and #l < 4 and getncm() == "FireServer" and sel("#", ...) >= 6 then
+        l[#l + 1] = {self, sel("#", ...), {...}, box.now(box.ws)}
+    end
+    return box.nc(self, ...)
+end]]
+local FIRE_SRC = [[
+local box, sel = ...
+return function(self, ...)
+    local l = box.list
+    if box.want and #l < 4 and sel("#", ...) >= 6 then
+        l[#l + 1] = {self, sel("#", ...), {...}, box.now(box.ws)}
+    end
+    return box.fire(self, ...)
+end]]
+local CLEAN_ENV
 do
-    pcall(function()
-        local net = ReplicatedStorage:FindFirstChild("Packages")
-        net = net and net:FindFirstChild("_Index")
-        net = net and net:FindFirstChild("sleitnick_net@0.1.0")
-        net = net and net:FindFirstChild("net")
-        if net then rawset(CLEAN_ENV, "script", net) end
-    end)
+    local ok, renv = pcall(function() return getrenv and getrenv() end)
+    CLEAN_ENV = (ok and type(renv) == 'table' and renv.writefile == nil) and setmetatable({}, {__index = renv}) or {}
 end
 local function build_body(src, ...)
     local args = table.pack(...)
@@ -1150,119 +1053,33 @@ local function build_body(src, ...)
     end)
     return ok and type(fn) == 'function' and fn or nil
 end
--- The disguise compiles the hook bodies with loadstring under a FORGED chunk
--- name (the game's Net module) and setfenvs them into a faked game env. Those
--- forged-chunkname closures sit in memory from load on, and a closure that
--- claims to belong to a game ModuleScript it isn't part of is exactly what a
--- BAC integrity sweep flags -- a pre-capture reason-24 kick that fires
--- whenever the sweep happens to run (seen intermittently in the lobby with
--- nothing hooked). oth already makes the body pass is_c_closure and runs it
--- off-thread, so when oth is present the disguise is pure liability and is
--- turned OFF: the plain-function bodies below are used instead (honest chunk
--- name, no setfenv, nothing forged). Without oth it stays on (the frameless
--- coroutine relied on it) unless getgenv().HookDisguise == false.
-local disguise = getgenv().HookDisguise ~= false and not oth_hook
-local NC_BODY = disguise and build_body(NC_SRC, box, getnamecallmethod_ or function() return nil end, select, JOB_ID) or nil
-local FIRE_BODY = disguise and build_body(FIRE_SRC, box, select, JOB_ID) or nil
--- "isolated" = the bodies were built disguised (loadstring, forged chunk name).
--- With oth we deliberately don't (plain bodies), so this is false then.
+local NC_BODY = build_body(NC_SRC, box, getnamecallmethod_ or function() return nil end, select)
+local FIRE_BODY = build_body(FIRE_SRC, box, select)
 Core.isolated = NC_BODY ~= nil and FIRE_BODY ~= nil
--- FRAMELESS FireServer hook. Any hook written in Lua puts a Lua frame on the
--- game's call stack while the call passes through it -- the one thing a
--- stack check always sees, whatever the frame is named. This one doesn't:
--- the hook installed on FireServer is coroutine.wrap(...), a real C function,
--- and our code runs on a separate coroutine. The game's stack shows a single
--- C call, exactly like the real FireServer, and no newcclosure is involved.
--- Each call resumes the coroutine with the arguments; it records a parry,
--- drops a tamper report (JobId first), passes everything else to the real
--- FireServer, and yields back nothing (FireServer returns nothing). Errors
--- from the real call are caught inside so the coroutine never dies.
--- (Only dot-call sends reach FireServer's function; the game's namecall sends
--- don't, so a capture may take a second press.)
--- Errors: the real FireServer is called through pcall, so its error message
--- carries no position of ours; on an error the hook re-arms a fresh coroutine
--- (this one is about to die) and re-raises it at level 0, and coroutine.wrap
--- adds the CALLER's position -- the same message a real FireServer error has.
--- (v70 swallowed errors: a deliberate bad call would have "succeeded".)
-local FRAMELESS_SRC = "local b,s,j,y,pc,up,er=... local function pk(...) return {...},s('#',...) end return function(...) local a,n=pk(...) while true do if a[2]~=j then if n>=7 and b.want then local l=b.list if #l<4 then l[#l+1]={a[1],n-1,{up(a,2,n)},b.now(b.ws)} end end local ok,e=pc(b.fire,up(a,1,n)) if not ok then b.rearm() er(e,0) end end a,n=pk(y()) end end"
-local FRAMELESS = disguise and build_body(FRAMELESS_SRC, box, select, JOB_ID, coroutine.yield, pcall, table.unpack, error) or nil
-if not FRAMELESS then
-    FRAMELESS = function(...)
-        local function pk(...) return {...}, select_("#", ...) end
-        local a, n = pk(...)
-        while true do
-            if a[2] ~= JOB_ID then
-                if n >= 7 and box.want then
-                    local l = box.list
-                    if #l < 4 then l[#l + 1] = {a[1], n - 1, {table.unpack(a, 2, n)}, box.now(box.ws)} end
-                end
-                local ok, e = pcall_(box.fire, table.unpack(a, 1, n))
-                if not ok then box.rearm(); error(e, 0) end
-            end
-            a, n = pk(coroutine.yield())
-        end
-    end
-end
-
--- Plain bodies (disguise off, or no loadstring on this executor).
+-- No loadstring on this executor: same bodies, just not disguised.
 if not NC_BODY then
     NC_BODY = function(self, ...)
-        local a = ...
-        if a == JOB_ID and getnamecallmethod_() == "FireServer" then return end -- tamper report: dropped
-        if select_("#", ...) >= 6 and box.want and getnamecallmethod_() == "FireServer" then
-            local l = box.list
-            if #l < 4 then l[#l + 1] = {self, select_("#", ...), {...}, box.now(box.ws)} end
+        local l = box.list
+        if box.want and #l < 4 and getnamecallmethod_() == "FireServer" and select_("#", ...) >= 6 then
+            l[#l + 1] = {self, select_("#", ...), {...}, box.now(box.ws)}
         end
         return box.nc(self, ...)
     end
 end
 if not FIRE_BODY then
     FIRE_BODY = function(self, ...)
-        local a = ...
-        if a == JOB_ID then return end -- tamper report: dropped
-        if select_("#", ...) >= 6 and box.want then
-            local l = box.list
-            if #l < 4 then l[#l + 1] = {self, select_("#", ...), {...}, box.now(box.ws)} end
+        local l = box.list
+        if box.want and #l < 4 and select_("#", ...) >= 6 then
+            l[#l + 1] = {self, select_("#", ...), {...}, box.now(box.ws)}
         end
         return box.fire(self, ...)
     end
 end
 
--- STACK HIDING. Executors that have setstackhidden can hide a function from
--- anything that walks the stack (debug.info, debug.traceback, getfenv, error
--- positions). The frameless FireServer hook already leaves nothing on the
--- game's stack; the Namecall / Both hooks can't be frameless, so their bodies
--- (and every wrapper we install) are hidden when the executor allows it.
--- Without setstackhidden nothing changes.
--- OFF by default since v72: v71 used it and got a reason-24 kick 0.2s after
--- the capture. Executors typically implement it by wrapping debug.info and
--- friends -- and the game's parry code checks on every send that debug.info
--- is still a real C function. getgenv().StackHide = true turns it back on.
-local stack_hidden = getgenv().StackHide == true and (function()
-    local f = rawget(getgenv(), "setstackhidden")
-    if type(f) ~= 'function' then pcall(function() f = setstackhidden end) end
-    return type(f) == 'function' and f or nil
-end)() or nil
-local function hide(fn)
-    if not stack_hidden or type(fn) ~= 'function' then return fn end
-    if not pcall(stack_hidden, fn, true) then pcall(stack_hidden, fn) end
-    return fn
-end
-Core.stack_hiding = stack_hidden ~= nil
-hide(NC_BODY); hide(FIRE_BODY); hide(FRAMELESS)
-
 local function unhook()
-    local fire, nc, fire_oth = H.fire, H.nc, H.fire_oth
-    H.fire, H.nc, H.want, box.want, H.fire_oth = nil, nil, false, false, nil
-    if fire then
-        if fire_oth then
-            -- oth cleans itself up with no footprint; even if unhook is missing,
-            -- box.want is false now so the body just passes every call through.
-            if oth_unhook then pcall_(oth_unhook, FIRE_FN) end
-        elseif not (restore_ and pcall_(restore_, FIRE_FN)) then
-            pcall_(hookfunction_, FIRE_FN, fire)
-        end
-    end
+    local fire, nc = H.fire, H.nc
+    H.fire, H.nc, H.want, box.want = nil, nil, false, false
+    if fire and not (restore_ and pcall_(restore_, FIRE_FN)) then pcall_(hookfunction_, FIRE_FN, fire) end
     if nc then restore_namecall(nc) end
     box.nc, box.fire = nil, nil
 end
@@ -1270,116 +1087,40 @@ Core.unhook = unhook
 
 -- Up for one capture press (0.35s at most). Our thread watches the box every
 -- frame: the first real parry in it becomes the capture and the hook comes off.
--- `hold` = how long it stays up waiting (the auto press is answered within a
--- couple of frames, so 0.2s; a held touch on the block button stays armed
--- until shortly after the finger lifts).
-local function arm(hold)
+local function arm()
     if Core.cap or not is_live() then return false end
-    H.want, H.until_t = true, clock_() + (hold or 0.2)
+    H.want, H.until_t = true, clock_() + 0.35
     if H.fire or H.nc then return true end
     box.list = {}
     local method = capture_method()
-    -- oth present forces a FireServer/oth capture even if the setting is
-    -- Namecall, so the metatable-touching namecall hook is never installed.
-    if (method ~= "Namecall" or oth_hook) and FIRE_FN and (oth_hook or hookfunction_) then
-        -- a fresh coroutine each time (frameless fallback only): a C function,
-        -- no Lua frame on their stack. oth re-arms itself, so this is a no-op
-        -- for the oth path.
-        box.rearm = function()
-            if H.fire and not H.fire_oth and hookfunction_ then
-                pcall(hookfunction_, FIRE_FN, hide(coroutine.wrap(FRAMELESS)))
-            end
-        end
-        -- PREFERRED: oth.hook. It runs our body on ANOTHER thread, makes the
-        -- l-closure pass is_c_closure scans, and unhooks with no footprint --
-        -- the stealthiest path, so it's the default whenever oth is present.
-        -- The body (FIRE_BODY) only records into `box` while box.want is set and
-        -- always passes the real call straight on through box.fire (the original
-        -- oth.hook hands back); the packet reaches us indirectly through the box.
-        if oth_hook then
-            local ok, old = pcall(oth_hook, FIRE_FN, FIRE_BODY)
-            if ok and type(old) == 'function' then
-                H.fire, box.fire, H.fire_oth = old, old, true
-                Core.hook_path = "oth.hook (another thread, passes is_c_closure, no footprint)"
-            end
-        end
-        -- FALLBACK (no oth): the frameless coroutine. The game's call runs a
-        -- single C frame (coroutine.wrap) and the body runs on its own thread,
-        -- so the game's stack / traceback / getfenv never see a frame of ours.
-        -- The framed newcclosure path is only for getgenv().FramelessHook ==
-        -- false (it puts a visible Lua frame on the game's stack).
-        if not H.fire and hookfunction_ then
-            local framed = getgenv().FramelessHook == false
-            local hook_fn = hide(framed and newcclosure_(FIRE_BODY) or coroutine.wrap(FRAMELESS))
-            local ok, old = pcall(hookfunction_, FIRE_FN, hook_fn)
-            if ok and type(old) == 'function' then
-                H.fire, box.fire = old, old
-                Core.hook_path = framed and "framed newcclosure (VISIBLE on the game's stack)"
-                    or (Core.isolated and "frameless coroutine, disguised" or "frameless coroutine (disguise unavailable)")
-            end
-        end
+    if method ~= "Namecall" and hookfunction_ and FIRE_FN then
+        local ok, old = pcall(hookfunction_, FIRE_FN, newcclosure_(FIRE_BODY))
+        if ok and type(old) == 'function' then H.fire, box.fire = old, old end
     end
-    -- The __namecall hook can't be frameless (the method name is thread-local to
-    -- the game's own call, so the body has to read getnamecallmethod() on that
-    -- stack). It needs hookmetamethod + setreadonly on the game's own metatable
-    -- -- the most detectable capture op there is -- so:
-    --   * it's never used in the default FireServer mode;
-    --   * and when oth is present (Delta) it's skipped ENTIRELY, even for
-    --     Namecall / Both, because oth's FireServer hook is safe and the
-    --     metatable touch is exactly the kind of thing that earns a kick. A
-    --     FireServer-only capture may just take a second keypress to catch.
-    if method ~= "FireServer" and not oth_hook and hookmetamethod_ and getnamecallmethod_ then
-        local ok, old = pcall(hookmetamethod_, game, "__namecall", hide(newcclosure_(NC_BODY)))
-        if ok and type(old) == 'function' then
-            H.nc, box.nc = old, old
-            Core.hook_path = (Core.hook_path and (Core.hook_path .. " + ") or "")
-                .. "__namecall (newcclosure, on the game's stack)"
-        end
-    elseif method ~= "FireServer" and oth_hook then
-        pcall(flight, "capture: oth present -- skipping the __namecall hook (metatable touch); FireServer/oth only")
+    if method ~= "FireServer" and hookmetamethod_ and getnamecallmethod_ then
+        local ok, old = pcall(hookmetamethod_, game, "__namecall", newcclosure_(NC_BODY))
+        if ok and type(old) == 'function' then H.nc, box.nc = old, old end
     end
     if not (H.fire or H.nc) then H.want = false; return false end
     box.want = true
-    local up_at = clock_()
-    Core.ev.hook_up = up_at
-    pcall(flight, "hook up: " .. (Core.hook_path or "?"))
-    local done = false
-    local function finish()
-        if done then return end
-        done = true
-        unhook()
-        Core.ev.hook_down = clock_()
-        box.list = {}
-        pcall(flight, ("hook (%s) was up %.1fms -- %s"):format(capture_method(), (clock_() - up_at) * 1000,
-            Core.cap and "caught the parry" or "nothing caught"))
-    end
-    -- Checks what the hook has seen; takes it down the moment the parry is in.
-    H.check = function()
-        if done then return true end
-        local l = box.list
-        for i = 1, #l do
-            if pcall_(inspect, l[i]) and Core.cap then break end
-        end
-        if Core.cap then finish(); return true end
-        return false
-    end
     task.spawn(function()
-        while not done and (H.fire or H.nc) and clock_() < H.until_t do
+        while (H.fire or H.nc) and clock_() < H.until_t do
             task.wait()
-            if H.check() then return end
+            local l = box.list
+            for i = 1, #l do
+                if pcall_(inspect, l[i]) and Core.cap then break end
+            end
+            if Core.cap then break end
         end
-        finish()
+        unhook()
+        box.list = {}
     end)
     return true
 end
 
--- Modes that never use the captured remote: Keypress (F) and Game (the game's
--- own block press). With both parry and spam on those, nothing is captured.
-local function no_remote(m) return m == "Keypress" or m == "Game" end
 local function keypress_only()
-    return no_remote(getgenv().AutoParryMode) and no_remote(getgenv().ManualSpamMode)
+    return getgenv().AutoParryMode == "Keypress" and getgenv().ManualSpamMode == "Keypress"
 end
-Core.no_remote = no_remote
 local function remote_features_on()
     return props.__autoparry_enabled or props.__auto_spam_enabled or props.__manual_spam_enabled
         or System.__triggerbot.__enabled
@@ -1389,55 +1130,23 @@ end
 -- remote is on. Presses are 1.4s apart, so each one clears the game's 1.3s
 -- lockout and really sends. The press is a real parry, so it's never wasted.
 local last_press = -100
--- Capture press: "Keypress" presses the block key itself (default); "Own" waits
--- for your own tap on the block button (no synthetic input). The old "Game"
--- method (running the game's own block function to capture) is gone -- it maps
--- to "Keypress" so old configs keep working.
-local function capture_press_mode()
-    return getgenv().CapturePress == "Own" and "Own" or "Keypress"
-end
-Core.capture_press_mode = capture_press_mode
-
--- (The old GAME-call press -- running the game's own block function, found by
--- probing UserInputService.InputBegan with getconnections + getupvalues +
--- debug.info -- has been removed. That probing ran before any capture and was
--- a kick risk on its own, and Game mode is gone, so nothing needs it.)
 prime_remote = function()
     if Core.cap or not is_live() or keypress_only() or not remote_features_on() then return end
-    if capture_press_mode() == "Own" then
-        if not Core.own_told and canParryNow() then
-            Core.own_told = true
-            Core.info = "tap block once to arm"
-            Notify("Blade Ball", "Tap the block button once to arm Remote mode for this server.", 6)
-        end
-        return
-    end
     if not canParryNow() then return end
     local now = clock_()
     -- F, 1s after you became able to parry (so it never lands the instant a
     -- round or respawn starts), then every 1.4s until it's armed
     if not Core.can_since or now - Core.can_since < 1 then return end
     if now - last_press < 1.4 then return end
-    -- only when the press will really send: inside the game's lockout it
-    -- does nothing and the hook would be up for nothing
-    if Core.gate_open and not Core.gate_open() then return end
     last_press = now
-    if arm(0.2) then
-        pressBlockKey() -- keypress: the capture press is always a real block-key press now
-        -- if the game sent inside the press itself, the hook comes down right
-        -- here, before the frame ends
-        if H.check then H.check() end
-    end
+    if arm() then pressBlockKey() end
 end
 
--- Your own presses: only a touch on the game's block button arms it. The
--- game's block button fires when the finger LIFTS, so arming as the touch
--- starts puts the hook up before the send; it stays up while the finger is
--- down (at most 1s) and comes down 0.1s after it lifts.
--- F / click / controller presses do NOT arm any more: the game's input handler
--- is connected before ours and sends the parry in the same instant, so the
--- hook only went up after the send -- 0.35s of exposure that could never catch
--- anything. The auto press covers those (it arms first, then presses).
+-- Your own block press arms it too -- only a real block press, not any input:
+-- the F key, a left click, a gamepad button, or a touch on the game's block
+-- button. (Arming on every touch/key put the hooks up for moving the camera and
+-- walking.) The mobile button fires when your finger lifts, so a touch on it
+-- arms when it starts and again when it ends, covering however long you hold.
 local function on_block_button(pos)
     local ok, hit = pcall(function()
         local inset = GuiService:GetGuiInset()
@@ -1454,16 +1163,20 @@ local function on_block_button(pos)
     end)
     return ok and hit
 end
-local touch_armed = false
-UserInputService.InputBegan:Connect(function(input)
+local function is_block_press(input)
+    local t = input.UserInputType
+    if t == Enum.UserInputType.Keyboard then return input.KeyCode == Enum.KeyCode.F end
+    if t == Enum.UserInputType.MouseButton1 or t == Enum.UserInputType.Gamepad1 then return true end
+    if t == Enum.UserInputType.Touch then return on_block_button(input.Position) end
+    return false
+end
+local function own_input(input)
     if Core.cap or not is_live() or keypress_only() then return end
-    if input.UserInputType ~= Enum.UserInputType.Touch then return end
-    if canParryNow() and on_block_button(input.Position) and arm(1.0) then touch_armed = true end
-end)
+    if is_block_press(input) and canParryNow() then arm() end
+end
+UserInputService.InputBegan:Connect(own_input)
 UserInputService.InputEnded:Connect(function(input)
-    if input.UserInputType ~= Enum.UserInputType.Touch or not touch_armed then return end
-    touch_armed = false
-    if H.fire or H.nc then H.until_t = math.min(H.until_t, clock_() + 0.1) end
+    if input.UserInputType == Enum.UserInputType.Touch then own_input(input) end
 end)
 
 -- ------------------------------------------------------------
@@ -1481,12 +1194,11 @@ end)
 -- never cleared, and auto parry sat on "game lockout" while spam, which skips
 -- the gate, kept working.)
 local G = {until_t = 0, m1 = false, m1_at = 0}
--- The server times its lockout from when IT got the last parry; ours runs
--- from when we sent it. Firing the instant ours ends, network jitter can land
--- the parry a hair before the server's ends -> refused (the swing plays,
--- nothing happens). Spam never notices -- its next packet a frame later gets
--- in -- but auto parry sends exactly one. So the lockout here runs a little
--- past the game's: twice the measured ping jitter plus a frame (60-150ms).
+-- The server times its lockout from when IT got the last parry; ours runs from
+-- when we sent it. Firing the instant ours ends, network jitter can land the
+-- parry a hair before the server's ends -> refused (the swing plays, nothing
+-- happens). So ours runs a little past the game's: twice the measured ping
+-- jitter plus a frame (60-150ms).
 local function lockout_margin()
     local jit = Core.lag and Core.lag.jit or 0.01
     return math.clamp(jit * 2 + (props.__frame_dt or 1 / 60) + 0.03, 0.06, 0.15)
@@ -1497,7 +1209,6 @@ local function gate_start()
     local n6, n2 = parry_window()
     n6, n2 = n6 or 0.5, n2 or 1.3
     G.until_t = now + math.max(n6 + 0.1, n2) + lockout_margin()
-    G.started = now
 end
 local function gate_open()
     -- M1Stop blocks pressing while the game holds it; never longer than 3s
@@ -1611,10 +1322,14 @@ local function send(curveCF, spam)
     if not cap then return "unarmed" end
     if not canParryNow() then return "blocked" end
     if not cap.remote.Parent then Core.cap = nil; return "unarmed" end
-    -- The game's lockout: a parry that didn't land locks parrying for n2
-    -- (1.3s); one sent inside it plays the swing and does nothing. (The old
-    -- false lockout after every landed parry is fixed -- see the animation poll.)
-    -- Spam still goes through it.
+    -- ANIMATION BUT NO PARRY: a parry sent inside the game's lockout (the
+    -- window of the last parry, or the 1.3s after one that didn't land) is
+    -- ignored by the server -- but we still played the swing. That's the
+    -- "animation, no parry". So auto parry respects the lockout again: inside
+    -- it the send is "blocked" (no swing, nothing used up) and fire_for simply
+    -- retries next frame, so the parry goes out the moment the lockout ends.
+    -- A landed parry clears the lockout at once (ParrySuccess), so a returned
+    -- ball is never held. Spam isn't held: it keeps sending through it.
     if not spam and not gate_open() then return "blocked" end
     local window = parry_window()
     if window == nil then
@@ -1645,9 +1360,6 @@ local function send(curveCF, spam)
     end
     gate_start()
     log_send("remote")
-    Core.prev_send = Core.last_send
-    Core.last_send = clock_()
-    Core.ev[spam and "spam" or "remote"] = clock_()
     local r = cap.remote
     if cap.ball2 then
         local ray = cam:ScreenPointToRay(aim[1], aim[2], 0)
@@ -1666,10 +1378,8 @@ end
 Core.send = send
 
 -- A landed parry: the gate clears (the game's OnParrySuccess) and the pass on
--- us is done until the ball leaves. NOT a ParrySuccess listener any more --
--- the animation poll (Core.polls) calls this when the game's landed-parry swing
--- starts, which is exactly what ParrySuccess makes the game do.
-Core.on_landed = (function()
+-- us is done until the ball leaves.
+Remotes.ParrySuccess.OnClientEvent:Connect(function()
     local char = LocalPlayer.Character
     if not (char and char:IsDescendantOf(Workspace)) then return end
     G.until_t = 0 -- a landed parry clears the lockout at once (the game's OnParrySuccess)
@@ -1691,12 +1401,17 @@ Core.on_landed = (function()
     for _, st in pairs(tracked) do
         if st.target == me and st.pass_open then st.landed = true end
     end
-    if Core.mark_landed then Core.mark_landed() end
 end)
--- (No NoobParryHappened / M1Stop / ParrySuccessAll listeners either: in a noob
--- server the lockout now just runs its normal course instead of clearing early,
--- M1Stop's hold is no longer mirrored (a press during it simply does nothing),
--- and stopping our grab swing on a landed parry is done by the animation poll.)
+pcall(function()
+    Remotes.NoobParryHappened.OnClientEvent:Connect(function()
+        task.wait(0.11)
+        G.until_t = 0
+    end)
+end)
+pcall(function() Remotes.M1Stop.Event:Connect(function(v) G.m1, G.m1_at = v and true or false, clock_() end) end)
+Remotes.ParrySuccessAll.OnClientEvent:Connect(function()
+    if props.__grab_animation then pcall(function() props.__grab_animation:Stop() end) end
+end)
 
 -- The public parry API (spam, slashes, hotkeys go through these).
 local function count() props.__total_parries = props.__total_parries + 1 end
@@ -1724,10 +1439,9 @@ function System.parry.fast()
 end
 function System.parry.execute_action() return System.parry.execute() end
 -- One parry by the chosen mode. Keypress presses only when the game's gate is
--- open, since a press inside it does nothing. (Game mode -- the game's own block
--- press -- has been removed; a saved "Game" config falls back to Keypress.)
+-- open, since a press inside it does nothing.
 function System.parry.by_mode(mode)
-    if mode == "Keypress" or mode == "Game" then
+    if mode == "Keypress" then
         if not gate_open() then return false end
         return System.parry.keypress()
     end
@@ -1964,133 +1678,14 @@ end
 
 -- One parry per pass (per target change), like the first UI3 build: if the
 -- ball is still on us Retry delay seconds after it, parry again.
--- MISS CHECK + AUTO TIMING. Every auto parry is followed until the ball
--- actually reaches you (its closest approach, as you see it). If it didn't
--- land, the miss is put in one of three boxes and shown:
---   EARLY  -- the ball got here after the parry was already over
---   LATE   -- the ball got here before the parry could be up
---   REFUSED-- it got here inside the parry and the game still didn't take it
---             (lockout / packet -- timing isn't the problem)
--- EARLY / LATE also shift the timing (Core.bias, seconds added to the lead,
--- kept in BladeBall/timing.txt), so the same miss doesn't repeat.
--- (per session only: starts at 0 every load, so a correction can never carry
--- a bad offset into the next session)
-Core.bias = 0
-local function save_bias() end
-local open_shots = {}
-local function judge(shot, now)
-    shot.done = true
-    if shot.landed then return end
-    if not shot.close then
-        flight(("  -> MISS CHECK: no answer, but the ball never reached you (%s) -- nothing to fix"):format(shot.via))
-        return
-    end
-    local dt = shot.min_t - shot.t
-    local lo, hi = shot.reach, shot.reach + shot.W
-    local verdict, adj
-    local after_lock = shot.lock_t and (shot.t - shot.lock_t) or nil
-    if dt < lo - 0.02 then
-        verdict, adj = ("LATE by %.2fs"):format(lo - dt), math.min((lo - dt) * 0.5 + 0.02, 0.08)
-    elseif dt > hi + 0.02 then
-        verdict, adj = ("EARLY by %.2fs"):format(dt - hi), -math.min((dt - hi) * 0.5 + 0.03, 0.08)
-    else
-        verdict = "REFUSED: it arrived inside the parry and the game didn't take it"
-            .. (after_lock and (" (sent %.2fs after the last parry)"):format(after_lock) or "")
-    end
-    -- only a parry that had time to be timed teaches the timing: point blank
-    -- and instant retarget shots are late by nature, nothing to correct
-    if adj and not shot.planned then
-        verdict, adj = verdict .. " (point blank -- no timing could catch it)", nil
-    end
-    if adj then
-        Core.bias = math.clamp(Core.bias + adj, -0.25, 0.25)
-        save_bias()
-    end
-    flight(("  -> MISS CHECK (%s): %s -- ball arrived %.2fs after the parry, parry was up %.2f-%.2fs%s"):format(
-        shot.via, verdict, dt, lo, hi, adj and (", timing now %+.2fs"):format(Core.bias) or ""))
-    Notify("Missed parry", verdict .. (adj and (" (timing %+.2fs)"):format(Core.bias) or ""), 4)
-    -- STALE / WRONG CAPTURE (restored, v68 guard + the v69 lockout margin, not
-    -- one or the other). The packet's id/token can go out of date during a
-    -- server, so every parry is refused however well it's timed: the swing
-    -- plays and nothing lands -- "animation but no parry". A REFUSED that the
-    -- lockout edge can't explain (this parry wasn't sent right on the heels of
-    -- the last one -- after_lock nil or >= 0.2s) counts; two in a row drop the
-    -- capture so the next press takes a fresh one. The margin in gate_start
-    -- already keeps the edge refusals this used to false-trigger on from
-    -- counting, so the two live together instead of replacing each other.
-    if not adj and shot.close and dt >= lo - 0.02 and dt <= hi + 0.02
-        and (not after_lock or after_lock >= 0.2) then
-        Core.refused = (Core.refused or 0) + 1
-        if Core.refused >= 2 and Core.cap then
-            Core.refused, Core.cap = 0, nil
-            Core.own_told = false
-            flight("  -> 2 parries refused in a row: the capture went stale -- taking a fresh one")
-            Notify("Blade Ball", "Parries were being refused -- re-capturing a fresh parry packet.", 4)
-        end
-    end
-end
--- Once a frame: follow open shots; judge each once the ball has been and gone.
-local function track_shots(now)
-    local root = getRoot()
-    for i = #open_shots, 1, -1 do
-        local shot = open_shots[i]
-        local ball = shot.ball
-        -- keep watching 0.35s after the ball switches away: the switch shows
-        -- up before the ball's position does (positions are drawn slightly in
-        -- the past), so the closest approach comes just after it
-        local alive = not shot.landed and root and ball and ball.Parent
-        if alive and ball:GetAttribute('target') ~= me then shot.left = shot.left or now end
-        local still = alive and (not shot.left or now - shot.left < 0.35)
-        if still then
-            local d = (ball.Position - root.Position).Magnitude
-            if d < shot.min_d then shot.min_d, shot.min_t = d, now end
-            if d <= shot.gap + 8 then shot.close = true end
-        end
-        if shot.landed or not still or now - shot.t > 3 then
-            if not shot.done then judge(shot, now) end
-            table.remove(open_shots, i)
-        end
-    end
-end
-Core.track_shots = track_shots
-Core.mark_landed = function()
-    Core.refused = 0
-    for _, shot in ipairs(open_shots) do shot.landed = true end
-    -- a landed parry: let old corrections fade a little
-    if Core.bias ~= 0 then Core.bias = Core.bias * 0.97 end
-end
-
--- One parry per pass. If it runs out without landing and the ball is still on
--- us, the pass is live again once that parry's window is over (reach + W) --
--- and decide times the next one like the first. A fixed 1s+ wait left the
--- ball free to arrive in between.
+-- The retry never comes inside the game's lockout: a parry that didn't land
+-- locks parrying for n2 (1.3s normally), and a press inside it plays the swing
+-- and does nothing -- the "animation but no parry". So the retry waits at least
+-- n2 plus a little for the round trip, whatever Retry delay says.
 local function mark_parried(st, now)
-    st.parried, st.parry_until = true, now + reach_time() + (parry_window() or 0.5) + 0.03
-end
-
--- LANDING: a single remote shot can land a hair outside the SERVER's real
--- accept window even when our model says it was inside it (logged REFUSED) --
--- which is exactly why manual spam lands the same captured packet: it blankets
--- that window instead of betting on one shot. So after an auto parry's first
--- shot we send a few more on the spam path (same captured packet, skips the
--- gate) over the next frames, stopping the instant a ParrySuccess lands (it
--- clears Core.pending). The server takes one parry and ignores the rest -- what
--- spam already does, bounded to the parry. getgenv().ParryBurst=false disables;
--- length is getgenv().ParryBurstSeconds (default 0.10s, max 0.35).
-local bursting = false
-local function parry_burst()
-    if bursting or not Core.cap then return end
-    bursting = true
-    task.spawn(function()
-        local deadline = os.clock() + math.clamp(tonumber(getgenv().ParryBurstSeconds) or 0.10, 0, 0.35)
-        while is_live() and os.clock() < deadline and Core.pending and Core.cap do
-            ParryLog.source = "auto spam" -- counted like spam, no per-shot log spam
-            pcall(Core.send, System.curve.get_cframe_fast(), true)
-            ParryLog.source = nil
-            task.wait()
-        end
-        bursting = false
-    end)
+    local _, n2 = parry_window()
+    local wait = math.max(math.clamp(props.__retry_delay or 1, 0.2, 1.5), (n2 or 1.3) + 0.08)
+    st.parried, st.parry_until = true, now + wait
 end
 
 local function fire_for(st, now, via, info)
@@ -2101,29 +1696,11 @@ local function fire_for(st, now, via, info)
     else ok = System.parry.by_mode(getgenv().AutoParryMode) end
     ParryLog.source = nil
     if not ok then st.why = "couldn't send yet, retrying"; return false end
-    -- blanket the server's real window like manual spam does (Remote mode only)
-    if getgenv().AutoParryMode ~= "Keypress" and Core.cap and getgenv().ParryBurst ~= false then
-        parry_burst()
-    end
-    if info and info.ball and getgenv().AutoParryMode ~= "Keypress" then
-        -- an earlier shot at this ball that the ball still hasn't reached: early
-        for _, old in ipairs(open_shots) do
-            if old.ball == info.ball and not old.done and not old.landed then
-                old.close, old.min_t = true, now
-                judge(old, now)
-            end
-        end
-        local gap = contact_gap(info.ball)
-        local reach = reach_time()
-        open_shots[#open_shots + 1] = {ball = info.ball, via = via, t = now, reach = reach, lock_t = Core.prev_send,
-            W = parry_window() or 0.5, min_d = info.dist, min_t = now, gap = gap, close = info.dist <= gap + 6,
-            planned = via == "auto parry" and (info.eta or 0) >= reach + 0.05}
-    end
     if info then
         Core.last_parry = {t = now, via = via, info = info}
-        flight(("%s: %.1f studs, %.0f st/s, angle %.0f deg, soonest %.3fs, committed %.3fs, fires at %.3fs, reach %.3fs, window %.3f, ping %.0fms -- was: %s"):format(
-            via, info.dist, info.speed, math.deg(math.acos(math.clamp(info.heading or 1, -1, 1))), info.eta or -1,
-            math.min(info.committed or -1, 9.99), info.lead, reach_time(), parry_window() or -1, pingMs(), tostring(held_by)))
+        flight(("%s: %.1f studs, arrives in %.3fs, fires at %.3fs (distance %.0f), %.0f st/s, angle %.0f deg, ping %.0fms, window %.3f -- was: %s"):format(
+            via, info.dist, info.eta or -1, info.lead, info.lead * info.speed, info.speed,
+            math.deg(math.acos(math.clamp(info.heading or 1, -1, 1))), pingMs(), parry_window() or -1, tostring(held_by)))
     end
     mark_parried(st, now)
     st.why = via == "auto parry" and "parried" or ("parried (" .. via .. ")")
@@ -2148,54 +1725,43 @@ local function autoparry_root()
     return root
 end
 
--- AUTO PARRY DECISION (v61).
--- A parry is up from `reach` after we send (ping + view lag, measured) until
--- `reach + W` (W = the game's parry window, n6). It lands only if the ball
--- arrives inside that. So for every ball on us two arrival times are worked
--- out, against the ball we see and relative to how you're moving:
---   soonest  -- the homing arc: the gentlest circle from the ball's current
---               direction through you, d * theta / sin(theta), at its speed
---               plus your own approach. A ball can't get here sooner.
---   committed-- when it really gets here at the rate it's ACTUALLY turning
---               (measured), flown forward. A curve that isn't turning hard
---               enough to reach you yet (it'll swing past and loop) has no
---               committed arrival at all. For a ball aimed at you it's just
---               distance / closing speed.
--- Fire when the soonest arrival is down to the lead (parry distance / speed)
--- AND the committed arrival still falls inside the parry (<= reach + 0.9 W).
--- So a straight ball fires exactly as before, while a curve far out -- one that
--- could arrive soon but isn't actually coming in yet -- waits until it turns in
--- and commits. That was the death: a far curve parried early, the parry ran
--- out, the ball came in after it.
--- Also:
---   * swinging away (its angle to you opening up) waits;
---   * a ball we've only just started tracking waits for one 50ms angle sample
---     before a curve is trusted (a straight ball doesn't need to);
---   * point blank always fires; if the soonest arrival is already inside our
---     reach and it's closing, fire now -- waiting can only make it later.
---   * retry: if the parry runs out without landing and the ball is still on
---     us, the pass is live again as soon as that parry's window is over, and
---     the same check times the next one.
-local function arc_factor(theta)
-    return theta < 1e-3 and 1 or math.min(theta / math.sin(math.min(theta, 3.0)), 8)
+-- ANTI CURVE. A ball on you always homes in on you; a curve just makes the
+-- trip longer. So instead of waiting while it curves (which fires late when the
+-- curve finally swings in), auto parry estimates WHEN it arrives along the
+-- curve and fires on that, with the same lead the parry distance gives a
+-- straight ball:
+--   * the homing arc: the gentlest circle that leaves the ball's current
+--     direction and passes through you -- length d * theta / sin(theta),
+--     theta = angle between its direction and you (0 = straight at you);
+--   * the measured path: flown forward at the rate it's actually turning and
+--     speeding up (when it turns harder than the arc, it arrives sooner);
+--   the sooner of the two counts. Speed-up is included in both.
+--   * swinging AWAY (its angle to you opening up fast) is a wide curve or a
+--     bait: wait, unless it's already close enough that waiting is fatal.
+-- All times are against the ball we see, like the parry distance's.
+local function arc_time(distance, theta, speed)
+    local k = theta < 1e-3 and 1 or math.min(theta / math.sin(math.min(theta, 3.0)), 8)
+    return distance * k / speed
 end
 
 -- How fast the angle between the ball's direction and you is changing (rad/s,
 -- positive = opening up / swinging away). Sampled every 50ms, per pass.
 local function angle_trend(st, theta, now)
     local s = st.ang
-    if not s then st.ang = {t = now, v = theta, rate = 0, n = 0}; return 0, false end
+    if not s then st.ang = {t = now, v = theta, rate = 0}; return 0 end
     local dt = now - s.t
     if dt >= 0.05 then
         local rate = (theta - s.v) / dt
-        s.rate = s.n == 0 and rate or (s.rate * 0.4 + rate * 0.6)
-        s.n, s.t, s.v = s.n + 1, now, theta
+        s.rate = s.rate * 0.4 + rate * 0.6
+        s.t, s.v = now, theta
     end
-    return s.rate, s.n > 0
+    return s.rate
 end
 
-local AIMED = math.rad(25)
-
+-- The decision for a ball on us: fire when its estimated arrival (straight or
+-- along the curve) is down to the lead the parry distance gives
+-- (parry distance / speed). via "retarget" is the instant the ball switches
+-- to us, before its new direction shows.
 local function decide(ball, st, root, now, via)
     local function hold(why) st.why = why; return false end
     local busy = pass_busy(st, now)
@@ -2209,66 +1775,47 @@ local function decide(ball, st, root, now, via)
     if (clash and clash.ball == ball and clock_() < clash.until_t) or (Core.clash_check and Core.clash_check(ball)) then
         return hold("clash: auto spam has it")
     end
-    -- inside the game's lockout a parry does nothing: wait, and fire the
-    -- moment it ends if the ball is due (or already overdue)
-    local pm = getgenv().AutoParryMode
-    if pm ~= "Keypress" and Core.cap and not gate_open() then
-        return hold(("game lockout, %.2fs left"):format(math.max(G.until_t - clock_(), 0)))
-    end
 
     local heading, _, speed, distance, velocity = read_ball(ball, root)
     if speed < 1 then return hold("ball not moving") end
-    local to_me = distance > 1e-3 and (root.Position - ball.Position) / distance or Vector3.zero
-    local my_vel = root.AssemblyLinearVelocity or Vector3.zero
-    local approach = math.max(0, -my_vel:Dot(to_me))             -- you moving toward the ball
-    local closing = (velocity - my_vel):Dot(to_me)               -- how fast the gap shrinks
-
+    local range = System.parry_distance(speed)
+    local lead = range / speed
+    -- Keep the ball's arrival inside the parry: never so early that the
+    -- window (n6) runs out before it gets here. (On a small window -- the
+    -- game's noob boost shrinks it on low-kill accounts -- the distance alone
+    -- fired too early.)
     local W = parry_window() or 0.5
     local reach = reach_time()
-    local range = System.parry_distance(speed)
-    -- the parry distance's lead, corrected by what the misses taught
-    -- (Core.bias), and kept inside the parry: never before it can be up,
-    -- never so early it runs out first
-    local lead = math.clamp(range / speed + (Core.bias or 0), reach + 0.03, reach + W * 0.75)
+    local latest = reach + W * 0.7
+    if lead > latest then lead, range = latest, latest * speed end
     local theta = math.acos(math.clamp(heading, -1, 1))
-    local opening, trend_known = angle_trend(st, theta, now)
-
-    local soonest = distance * arc_factor(theta) / (speed + approach)
-    local committed = closing > speed * 0.05 and distance / closing or math.huge
-    if theta > AIMED then
-        -- a curve: fly it forward at the turn rate it actually has
-        local gap = contact_gap(ball)
-        local horizon = reach + W + 0.2
-        local sim = predict_contact(ball.Position, velocity, root.Position, gap, turn_rate(st, velocity, now), 0, horizon)
-        committed = sim and (sim + gap / speed) or math.huge
-    end
-    local info = {ball = ball, speed = speed, dist = distance, heading = heading, lead = lead, eta = soonest, committed = committed}
+    local opening = angle_trend(st, theta, now)
+    local info = {speed = speed, dist = distance, heading = heading, lead = lead}
 
     if via == "retarget" then
-        -- its new direction isn't in yet: only point blank goes now
-        if distance <= math.max(10, range * 0.5) then
+        -- the new direction isn't in yet: only point blank goes now
+        if distance <= range * 0.5 then
+            info.eta = distance / speed
             return fire_for(st, now, "instant retarget", info)
         end
         return hold("just retargeted, timing it")
     end
 
-    local point_blank = distance <= math.max(10, speed * 0.1)
-    if point_blank then return fire_for(st, now, "auto parry", info) end
-    if theta > 0.35 and opening > 0.6 then
-        return hold(("swinging away (%.0f deg)"):format(math.deg(theta)))
+    -- point blank: no time to wait for anything
+    local point_blank = distance <= math.max(10, speed * 0.12)
+    -- swinging away: a wide curve or a bait -- wait for it to come round
+    if not point_blank and theta > 0.35 and opening > 0.6 then
+        return hold(("curving away (%.0f deg, opening %.1f rad/s)"):format(math.deg(theta), opening))
     end
-    if soonest > lead then
-        if theta > AIMED then return hold(("curve, %.0f studs, could land in %.2fs"):format(distance, soonest)) end
-        return hold(("%.0f studs out, parries at %.0f"):format(distance, lead * speed))
+
+    local eta = arc_time(distance, theta, speed)
+    info.eta = eta
+    if point_blank or eta <= lead then
+        st.why = nil
+        return fire_for(st, now, "auto parry", info)
     end
-    -- due by the soonest arrival. Is it actually coming in?
-    if theta > AIMED and not trend_known then return hold("curve, reading it") end
-    local window_end = reach + W * 0.9
-    if committed > window_end and soonest > reach * 0.8 then
-        return hold(("curve not committed: closing would take %.2fs, parry lasts to %.2fs"):format(
-            math.min(committed, 9.99), window_end))
-    end
-    return fire_for(st, now, "auto parry", info)
+    if theta > 0.35 then return hold(("curving in, lands in %.2fs, firing at %.2fs"):format(eta, lead)) end
+    return hold(("%.0f studs out, parries at %.0f"):format(distance, range))
 end
 
 -- Pre-parry: the ball is on a player right next to us and their return would
@@ -2284,7 +1831,7 @@ local function try_preparry(ball, st, root, now)
     if not (cfg.preparry or (cfg.hp_close and high_ping())) then return end
     local target = st.target
     if type(target) ~= 'string' or target == '' or target == me then return end
-    if getgenv().AutoParryMode == "Keypress" or not Core.cap or not gate_open() then return end
+    if getgenv().AutoParryMode == "Keypress" or not Core.cap then return end
     local their_root = character_root(target)
     if not their_root then return end
     local gap = (their_root.Position - root.Position).Magnitude
@@ -2307,7 +1854,10 @@ local function try_preparry(ball, st, root, now)
     local ok = System.parry.execute()
     ParryLog.source = nil
     if ok then
-        st.preparried, st.preparry_until = true, now + (parry_window() or 0.5) + reach + 0.05
+        -- held at least the game's lockout: if this guess misses, a parry
+        -- inside that lockout would only play the swing
+        local _, n2 = parry_window()
+        st.preparried, st.preparry_until = true, now + math.max((parry_window() or 0.5) + reach + 0.15, (n2 or 1.3) + 0.08)
         flight(("pre-parry: return in %.3fs (to them %.3f, back %.3f), fires at %.3fs, gap %.1f, ping %.0fms"):format(
             eta, d_them / speed, back, lead, gap, pingMs()))
     end
@@ -2321,8 +1871,6 @@ local function trigger(ball, st)
     if not root or root:FindFirstChild('SingularityCape') or not canParryNow() then return end
     local now = clock_()
     if pass_busy(st, now) or blocked_by_detection() then return end
-    local pm = getgenv().AutoParryMode
-    if pm ~= "Keypress" and Core.cap and not gate_open() then return end
     if fire_for(st, now, "triggerbot") then
         System.__triggerbot.__parries = System.__triggerbot.__parries + 1
     end
@@ -2402,14 +1950,10 @@ local function stop_points(key)
     props.__connections[key] = nil
 end
 
--- getgenv().BBCoreOnly (diagnostic): when set, no feature starts its loops or
--- connections -- only the UI and the parry core load. Lets us tell whether a
--- startup kick comes from a feature (kick stops) or the core/UI (kick stays).
-function System.autoparry.start() if genv.BBCoreOnly or genv.BBNoAutoParry then return end run_every_point("__autoparry", autoparry_step, "auto parry") end
+function System.autoparry.start() run_every_point("__autoparry", autoparry_step, "auto parry") end
 function System.autoparry.stop() stop_points("__autoparry") end
 function System.triggerbot.loop() triggerbot_step() end
 function System.triggerbot.enable(enabled)
-    if enabled and (genv.BBCoreOnly or genv.BBNoTriggerbot) then return end
     System.__triggerbot.__enabled = enabled
     if enabled then
         run_every_point("__triggerbot", triggerbot_step, "triggerbot")
@@ -2480,7 +2024,7 @@ local ROOTS = {player = function() return LocalPlayer end, char = function() ret
 local function resolve(loc)
     if type(loc) ~= 'table' then return nil end
     local ok, v = pcall(function()
-        if loc.where == "G" then return nil end -- game _G (getrenv) no longer read
+        if loc.where == "G" then return getrenv()._G[loc.key] end
         if loc.where == "data" then
             local t = Win.data and Win.data:Get()
             for _, k in ipairs(loc.path) do t = type(t) == 'table' and t[k] or nil end
@@ -2517,8 +2061,11 @@ local function each_readable(visit)
     if LocalPlayer.Character then walk_inst("char", LocalPlayer.Character, {}, 3) end
     walk_inst("rs", ReplicatedStorage, {}, 5)
     walk_inst("ws", Workspace, {}, 1)
-    -- (The game's _G used to be walked here via getrenv -- removed; getrenv
-    -- reaches into the game's environment and is a kick risk.)
+    pcall(function()
+        for k, v in pairs(getrenv()._G) do
+            if type(v) == 'string' and type(k) == 'string' then visit({where = "G", key = k}, v) end
+        end
+    end)
     pcall(function()
         local function walk(t, path, depth)
             if depth > 4 then return end
@@ -2550,11 +2097,6 @@ local function hashed_remotes()
     return list
 end
 
--- (Saved captures were removed in v68: the packet's values go out of date,
--- and a capture reused after that makes every parry a refused one -- the
--- swing plays and nothing happens. Every capture is fresh now.)
-local function save_capture() end
-
 -- Watch incoming remote events for a value (id or key), for the rest of the
 -- session. found(desc, value) is called the first time it shows up.
 local function find_path(v, pred, path, depth)
@@ -2571,15 +2113,34 @@ local function find_path(v, pred, path, depth)
     end
     return nil
 end
--- DISABLED: this attached a listener to EVERY RemoteEvent in ReplicatedStorage
--- after a capture -- the same class of thing (listeners on the game's remotes)
--- that every kicked config had and every clean one didn't. The hook-free recipe
--- can't complete anyway since the getrenv hash source was removed.
-local function watch_events(pred, found) end
+local function watch_events(pred, found)
+    task.spawn(function()
+        for i, r in ipairs(ReplicatedStorage:GetDescendants()) do
+            if r:IsA("RemoteEvent") then
+                local rel = {}
+                local p = r
+                while p and p ~= ReplicatedStorage do table.insert(rel, 1, p.Name); p = p.Parent end
+                pcall(function()
+                    local conn
+                    conn = r.OnClientEvent:Connect(function(...)
+                        for j = 1, select('#', ...) do
+                            local sub = find_path((select(j, ...)), pred, {}, 0)
+                            if sub then
+                                pcall(function() conn:Disconnect() end)
+                                found({where = "event", id = table.concat(rel, "/") .. "#" .. j, remote = rel, arg = j, sub = table.clone(sub)})
+                                return
+                            end
+                        end
+                    end)
+                end)
+            end
+            if i % 300 == 0 then task.wait() end
+        end
+    end)
+end
 -- For a recipe whose id/key arrives by event: keep the latest value.
 Core.event_seen = {}
 local function listen_recipe_event(loc)
-    do return end -- DISABLED: no listeners on the game's remotes (see watch_events)
     if type(loc) ~= 'table' or loc.where ~= "event" then return end
     pcall(function()
         local r = ReplicatedStorage
@@ -2607,11 +2168,12 @@ local function learn_hookfree(cap)
         local r = {version = 1}
         local hr = hashed_remotes()
         if #hr == 1 and hr[1] == cap.remote then r.remote = "net_hashed" end
-        -- (The hash was looked up in the game's _G via getrenv here -- removed.
-        -- getrenv reaches into the game's environment, so the hook-free recipe
-        -- no longer records a _G hash source; without it the recipe stays
-        -- incomplete and every server just uses the normal capture, which is
-        -- the main path anyway.)
+        pcall(function()
+            local g = getrenv()._G
+            if g.BAC_HASH == cap.hash then r.hash = "BAC_HASH" else
+                for k, v in pairs(g) do if v == cap.hash and type(k) == 'string' then r.hash = k; break end end
+            end
+        end)
         for name, f in pairs(KEY_RULES) do
             local ok, s = pcall(f, cap.uid)
             if ok and key_matches(s, cap.key) then r.key = {where = "rule", rule = name}; break end
@@ -2649,10 +2211,8 @@ local function build_hookfree()
     if not (r and r.complete) or Core.hookfree_off then return nil end
     local hr = hashed_remotes()
     if #hr ~= 1 then return nil end
-    -- The hash used to come from the game's _G via getrenv; that's gone, so a
-    -- recipe can't rebuild the hash any more (a stale saved recipe that recorded
-    -- one just fails this check and the normal capture runs instead).
-    local hash = nil
+    local hash
+    pcall(function() hash = getrenv()._G[r.hash] end)
     local uid = resolve(r.uid)
     if type(hash) ~= 'string' or type(uid) ~= 'string' or uid == '' then return nil end
     local keysrc
@@ -2677,20 +2237,10 @@ end
 -- report the capture, log unanswered parries, and sample ping.
 RunService.Heartbeat:Connect(function()
     sample_lag() -- keep the ping average current between balls too
-    if Core.track_shots then pcall(Core.track_shots, clock_()) end
     if not is_live() then return end
-    -- load the game-module data (server type / parry-window stats) the first
-    -- time you can actually parry -- never in the lobby, where requiring a game
-    -- module with our frame on its stack is a needless kick risk
-    if not Win.started and canParryNow() then Win.load() end
-    -- read the state the old game listeners used to watch (see Core.polls) --
-    -- only while you're in a round; nothing runs against the game in the lobby
-    if Core.in_round() then
-        for _, poll in ipairs(Core.polls) do pcall(poll) end
-    end
     if not Core.cap then
         Core.told = false
-        -- a hook-free recipe, if one was ever completed
+        -- the recipe first: no hook, nothing pressed
         if Core.recipe and Core.recipe.complete and not Core.hookfree_off and clock_() - (Core.hf_try or 0) > 1 then
             Core.hf_try = clock_()
             local cap = build_hookfree()
@@ -2718,13 +2268,8 @@ RunService.Heartbeat:Connect(function()
     if nc then
         Core.new_capture = nil
         local cap, prev = Core.cap, nc.prev
-        -- (The hook-free learning walk -- player / ReplicatedStorage / Workspace
-        -- / the game's _G with its BAC_FAKE bait entries / a listener on every
-        -- remote -- no longer runs after a capture: none of it existed in the
-        -- version that got kicked least, and it never found the key anyway.
-        -- A recipe file that is already complete is still used.)
+        learn_hookfree(cap)
         local keystr = table.concat(cap.key, ",")
-        save_capture(cap)
         local changed
         if prev then
             local list = {}
@@ -2734,8 +2279,7 @@ RunService.Heartbeat:Connect(function()
             if table.concat(prev.key, ",") ~= keystr then list[#list + 1] = "KEY" end
             changed = table.concat(list, " ")
         end
-        flight(("CAPTURED (%s hook%s%s): remote %s, id %s, %s server%s"):format(capture_method(), Core.isolated and ", isolated" or ", NOT isolated",
-            Core.stack_hiding and ", stack-hidden" or "", tostring(cap.remote.Name), tostring(cap.uid),
+        flight(("CAPTURED (%s hook%s): remote %s, id %s, %s server%s"):format(capture_method(), Core.isolated and ", isolated" or ", NOT isolated", tostring(cap.remote.Name), tostring(cap.uid),
             cap.ball2 and "UseBall2" or "normal",
             prev and (changed ~= "" and (" -- CHANGED since last capture: " .. changed) or " -- same as last capture") or ""))
     end
@@ -2751,9 +2295,6 @@ RunService.Heartbeat:Connect(function()
     end
 end)
 end -- parry core
-
--- BBStop checkpoint 2 (diagnostic): getgenv().BBStop = 2 stops loading here.
-if genv.BBStop == 2 then flight("BBStop 2: stopped before the spam engine (parry core + main heartbeat have run)") return end
 
 -- ============================================================
 -- SPAM ENGINE (rewritten)
@@ -2791,7 +2332,7 @@ function System.manual_spam.start() System.__properties.__manual_spam_enabled = 
 function System.manual_spam.stop() System.__properties.__manual_spam_enabled = false end
 
 local function spam_fire()
-    if getgenv().ManualSpamMode == "Keypress" or getgenv().ManualSpamMode == "Game" then
+    if getgenv().ManualSpamMode == "Keypress" then
         System.parry.keypress()
         return true
     end
@@ -3012,14 +2553,9 @@ local function spam_instant()
     Pump.on = true
     fire_one(source)
 end
+Remotes.ParrySuccess.OnClientEvent:Connect(function() pcall(spam_instant) end)
 System.spam_on_retarget = function() pcall(spam_instant) end
 
--- Spam loop connections, back on all four signals (PreSimulation / Heartbeat /
--- PreRender / PreAnimation) as before -- those were never the kick; reverting
--- the mistaken change. BBCoreOnly / BBNoSpam still skip them for diagnostics.
-if not (genv.BBCoreOnly or genv.BBNoSpam) then
--- (was a ParrySuccess listener; the animation poll calls this on a landed parry)
-System.spam_landed = function() pcall(spam_instant) end
 do
     local last_error
     local function run(fn)
@@ -3043,10 +2579,6 @@ do
     pcall(function() conns.__spam_render = RunService.PreRender:Connect(function() run(spam_tick) end) end)
     pcall(function() conns.__spam_anim = RunService.PreAnimation:Connect(function() run(spam_tick) end) end)
 end
-end -- if not genv.BBCoreOnly (spam loop)
-
--- BBStop checkpoint 3 (diagnostic): getgenv().BBStop = 3 stops loading here.
-if genv.BBStop == 3 then flight("BBStop 3: stopped before Headless/Korblox + skin changer") return end
 
 -- ============================================================
 -- HEADLESS & KORBLOX
@@ -3426,9 +2958,6 @@ local function __resolveTargetId(value)
     return nil
 end
 
--- BBStop checkpoint 4 (diagnostic): getgenv().BBStop = 4 stops loading here.
-if genv.BBStop == 4 then flight("BBStop 4: stopped before Ability ESP + status loops") return end
-
 -- ============================================================
 -- ABILITY ESP
 -- ============================================================
@@ -3576,7 +3105,6 @@ local function add_ability_esp_player(player)
 end
 
 function start_ability_esp()
-    if genv.BBCoreOnly or genv.BBNoESP then return end
     if abilityEspLoop then return end
     getgenv().AbilityESP = true
     for _, player in pairs(Players:GetPlayers()) do
@@ -3689,9 +3217,6 @@ task.spawn(function()
     end
 end)
 
--- BBStop checkpoint 5 (diagnostic): getgenv().BBStop = 5 stops loading here.
-if genv.BBStop == 5 then flight("BBStop 5: stopped before the UI tabs / config autoload (everything else has run)") return end
-
 -- ============================================================
 -- UI
 -- ============================================================
@@ -3750,7 +3275,7 @@ task.spawn(function()
 end)
 
 local function remoteStatusText()
-    if getgenv().AutoParryMode == "Keypress" or getgenv().AutoParryMode == "Game" then return "Mode: Keypress (presses the block key)" end
+    if getgenv().AutoParryMode == "Keypress" then return "Mode: Keypress (presses the block key)" end
     local w = parry_window()
     local wtxt = w and ("%.3f"):format(w) or (Win.done and "fallback" or "reading stats...")
     if remoteReady() then
@@ -3808,18 +3333,12 @@ AP:AddToggle("AutoParry", {Text = "Auto parry", Default = false, Callback = func
     if v then System.autoparry.start(); prime_remote() else System.autoparry.stop() end
     NotifyToggle("Auto Parry", v)
 end}):AddKeyPicker("AutoParryKey", {Default = "None", Mode = "Toggle", SyncToggleState = true, Text = "Auto parry"})
-AP:AddDropdown("CaptureHook", {Text = "Capture hook", Values = {"FireServer", "Namecall", "Both"}, Default = "FireServer",
-    Tooltip = "FireServer (default): hooks the parry remote's FireServer. When the executor has oth (Delta), the hook is installed with oth.hook -- it runs on another thread, passes is_c_closure scans and unhooks with no footprint; otherwise it falls back to a frameless coroutine (a real C function whose body runs on a separate coroutine), so nothing of ours is on the game's call stack either way. Catches the game's dot-call sends, so a capture can take a second press. Namecall / Both also catch the namecall sends but put a (disguised) Lua frame on the stack while up.",
+AP:AddDropdown("CaptureHook", {Text = "Capture hook", Values = {"Namecall", "FireServer", "Both"}, Default = "Namecall",
+    Tooltip = "Which hook catches the one parry packet Remote mode needs (up for that press only). Namecall or FireServer alone may take two presses; Both arms in one. The flight log notes which one was on for every capture and kick.",
     Callback = function(v) getgenv().CaptureHook = v end})
-AP:AddDropdown("CapturePress", {Text = "Capture press", Values = {"Keypress", "Own"}, Default = "Keypress",
-    Tooltip = "How the one capture per server is triggered. Keypress (default): the script presses the block key so the game sends one real parry for the hook to read. Own: waits for your own tap on the block button (no synthetic input). (The old Game-call capture method has been removed.)",
-    Callback = function(v) getgenv().CapturePress = v end})
 AP:AddDropdown("ParryMode", {Text = "Parry mode", Values = {"Remote", "Keypress"}, Default = "Remote",
-    Tooltip = "Remote: fires the captured parry remote (needs the one capture hook per server) -- curve and target mode apply. Keypress: presses the block key (no curve/target). (Game mode has been removed.)",
+    Tooltip = "Remote fires the parry remote with your curve (hookless, sends exactly what the game sends). Keypress presses the block key (F).",
     Callback = function(v) getgenv().AutoParryMode = v end})
-AP:AddToggle("ParryBurst", {Text = "Parry burst (landing)", Default = true,
-    Tooltip = "After an auto parry's first remote shot, sends a few more on the spam path for a few frames, stopping the instant it lands. A single shot can land a hair outside the server's real window even when it looks in-window (logged REFUSED) -- this blankets that window the way manual spam does, which is why spam lands when a single parry doesn't. Turn off for exactly one packet per parry.",
-    Callback = function(v) getgenv().ParryBurst = v end})
 AP:AddDropdown("CurveMode", {Text = "Curve mode", Values = System.__config.__curve_names, Default = "Camera",
     Callback = function(v)
         for i, n in ipairs(System.__config.__curve_names) do if n == v then System.__properties.__curve_mode = i; break end end
@@ -3835,6 +3354,9 @@ AP:AddSlider("Accuracy", {Text = "Accuracy", Default = 50, Min = 1, Max = 100, R
 AP:AddSlider("TimingMultiplier", {Text = "Timing multiplier", Default = 1, Min = 0, Max = 2, Rounding = 2, Suffix = "x",
     Tooltip = "Scales the parry distance. 1 = as Accuracy sets it. Higher parries earlier (2 = 1.5x the distance), lower parries later (0 = half the distance).",
     Callback = function(v) System.__properties.__timing_mult = v end})
+AP:AddSlider("RetryDelay", {Text = "Retry delay", Default = 1, Min = 0.2, Max = 1.5, Rounding = 2, Suffix = "s",
+    Tooltip = "If the ball is still on you this long after a parry, parry again.",
+    Callback = function(v) System.__properties.__retry_delay = v end})
 AP:AddToggle("RandomAccuracy", {Text = "Randomize accuracy", Default = false,
     Tooltip = "Jitters accuracy around your current Accuracy setting each parry, to look less robotic.",
     Callback = function(v)
@@ -3964,9 +3486,7 @@ SP:AddToggle("ManualSpam", {Text = "Manual spam", Default = false, Callback = fu
     end
     NotifyToggle("Manual Spam", v)
 end}):AddKeyPicker("ManualSpamKey", {Default = "E", Mode = "Hold", SyncToggleState = true, Text = "Manual spam"})
-SP:AddDropdown("SpamMode", {Text = "Mode", Values = {"Remote", "Keypress"}, Default = "Remote",
-    Tooltip = "Remote: the captured remote (goes through the cooldown). Keypress: presses the block key. (Game mode has been removed.)",
-    Callback = function(v) getgenv().ManualSpamMode = v end})
+SP:AddDropdown("SpamMode", {Text = "Mode", Values = {"Remote", "Keypress"}, Default = "Remote", Callback = function(v) getgenv().ManualSpamMode = v end})
 SP:AddSlider("SpamMaxKbps", {Text = "Max upload", Default = 220, Min = 60, Max = 600, Rounding = 0, Suffix = " kbps",
     Tooltip = "Manual and auto spam both run as fast as they can (up to 120/s) and slow down only when your upload goes over this. Higher = more spam but more risk of your movement lagging behind (desync). Lower = smoother movement, less spam. If you rubber-band while spamming, lower it.",
     Callback = function(v) SpamNet.budget_kbps = v end})
@@ -4244,7 +3764,6 @@ end)
 -- The next copy calls this before it starts.
 genv.__BladeBallShutdown = function()
     pcall(function() Core.unhook() end)
-    Core.polls = {}
     pcall(function() Library:Unload() end)
     if genv.__BladeBallInstance == INSTANCE then genv.__BladeBallInstance = nil end
 end
@@ -4254,65 +3773,15 @@ do
     local GuiService = cloneref(game:GetService('GuiService'))
     local exec = "?"
     pcall(function() exec = table.concat({identifyexecutor()}, " ") end)
-    flight(("==== v%s loaded | executor %s | place %s | userId %s | setstackhidden %s"):format(
-        SCRIPT_VERSION, exec, tostring(game.PlaceId), tostring(LocalPlayer.UserId),
-        Core.stack_hiding and "ON (hook bodies hidden)" or "off"))
-    if genv.BBCoreOnly then flight("BBCoreOnly ON -- no features started, UI + parry core only") end
-    do
-        local off = {}
-        if genv.BBNoSpam then off[#off + 1] = "spam" end
-        if genv.BBNoESP then off[#off + 1] = "abilityESP" end
-        if genv.BBNoAutoParry then off[#off + 1] = "autoparry" end
-        if genv.BBNoTriggerbot then off[#off + 1] = "triggerbot" end
-        if #off > 0 then flight("feature kill flags: " .. table.concat(off, ", ") .. " not started") end
-    end
-    -- (The SELF-CHECK that used to run here is REMOVED. It called debug.info on
-    -- the game's OWN protected functions (renv.debug.info/traceback/getinfo,
-    -- getfenv, setfenv, pcall, require, ...) a couple of seconds after load to
-    -- predict whether the game's parry code would flag the executor. Reaching
-    -- into those protected closures before any capture is itself what a BAC
-    -- integrity sweep flags (the reason-24 kick seen ~20s in, in the lobby, with
-    -- nothing hooked). It was pure diagnostics -- nothing depended on it -- so it
-    -- is gone. Nothing now touches the game's own functions before the capture.)
+    flight(("==== v%s loaded | executor %s | place %s | userId %s"):format(
+        SCRIPT_VERSION, exec, tostring(game.PlaceId), tostring(LocalPlayer.UserId)))
     local conns = {}
-    -- What happened just before a kick, in seconds: the capture hook (up /
-    -- down), the fake F press, our last remote parry and spam send. Saved to
-    -- BladeBall/lastkick.txt and shown on screen the next time you load.
-    local function kick_context()
-        local now, ev, parts = os.clock(), Core.ev or {}, {}
-        local function ago(label, t) if t then parts[#parts + 1] = ("%s %.1fs ago"):format(label, now - t) end end
-        ago("hook up", ev.hook_up); ago("hook down", ev.hook_down)
-        ago("block-key press", ev.press)
-        ago("remote parry", ev.remote); ago("spam send", ev.spam)
-        local hooked_now = ev.hook_up and (not ev.hook_down or ev.hook_down < ev.hook_up)
-        return (#parts > 0 and table.concat(parts, ", ") or "nothing sent or hooked yet")
-            .. (hooked_now and " -- HOOK WAS UP" or "")
-            .. (" | capture: %s hook, %s press, disguise %s, stack hiding %s, armed %s"):format(tostring(getgenv().CaptureHook or "FireServer"),
-                Core.capture_press_mode and Core.capture_press_mode() or "?", getgenv().HookDisguise == false and "off" or "on",
-                Core.stack_hiding and "on" or "not available",
-                Core.cap and "yes" or "no")
-            .. (Core.hook_path and (" | hook path: " .. Core.hook_path) or "")
-    end
     table.insert(conns, GuiService.ErrorMessageChanged:Connect(function(msg)
         local reason = tostring(msg):match("BAC%s+%w-X(%d%d)")
-        local ctx = kick_context()
-        flight("!!!! KICK / ERROR MESSAGE: " .. tostring(msg) .. (reason and (" [reason " .. reason .. "]") or "") .. " | " .. ctx)
-        if not getgenv().BladeBallNoLog then
-            pcall(function()
-                ensureSaveFolder()
-                writefile(SAVE_FOLDER .. "/lastkick.txt", ("v%s reason %s: %s"):format(SCRIPT_VERSION, reason or "?", ctx))
-            end)
-        end
+        flight("!!!! KICK / ERROR MESSAGE: " .. tostring(msg) .. (reason and (" [reason " .. reason .. "]") or "")
+            .. " [capture hook " .. tostring(getgenv().CaptureHook or "Namecall") .. "]")
     end))
-    -- the last session's kick, shown once
-    pcall(function()
-        local last = readfile(SAVE_FOLDER .. "/lastkick.txt")
-        if type(last) == 'string' and last ~= "" then
-            flight("last session's kick: " .. last)
-            task.delay(4, function() Notify("Last kick", last, 15) end)
-            if not getgenv().BladeBallNoLog then writefile(SAVE_FOLDER .. "/lastkick.txt", "") end
-        end
-    end)
+    table.insert(conns, Remotes.ParrySuccess.OnClientEvent:Connect(function() flight("ParrySuccess received") end))
     local function where()
         local char = LocalPlayer.Character
         local alive = char and char.Parent == Alive
