@@ -6,7 +6,7 @@ task.spawn(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.08-87"
+local SCRIPT_VERSION = "2026.10.08-88"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -2309,14 +2309,7 @@ end
 -- Run at four points of every frame, so the newest ball position is acted on
 -- at the first point after it arrives. A pass can't be parried twice, so the
 -- extra checks never double up.
--- Only Heartbeat + RenderStepped -- the two the game's own client code (and our
--- core) already bind, and the two BBCoreOnly keeps without ever being kicked.
--- The PreSimulation / PreRender / PreAnimation binds that used to be here were
--- the reason-24 trip: nothing the game's client does binds those, so an
--- external script connecting them stands out to a BAC sweep (every kick config
--- had a feature binding a Pre* signal; core-only, which binds neither, never
--- kicked). Two signals is still twice a frame -- plenty for the decide loop.
-local SIGNALS = {"Heartbeat", "RenderStepped"}
+local SIGNALS = {"PreSimulation", "Heartbeat", "PreRender", "PreAnimation"}
 local function run_every_point(key, fn, label)
     local conns = props.__connections
     if conns[key] then return end
@@ -2646,9 +2639,6 @@ RunService.Heartbeat:Connect(function()
     -- time you can actually parry -- never in the lobby, where requiring a game
     -- module with our frame on its stack is a needless kick risk
     if not Win.started and canParryNow() then Win.load() end
-    -- attach/detach the spam loop with the round, so nothing spam-related is
-    -- connected while idle in the lobby (that was the start-up kick)
-    if Core.spam_sync then Core.spam_sync() end
     if not Core.cap then
         Core.told = false
         -- a hook-free recipe, if one was ever completed
@@ -2972,28 +2962,12 @@ local function spam_instant()
 end
 System.spam_on_retarget = function() pcall(spam_instant) end
 
--- Spam loop connections. These used to be bound at LOAD, unconditionally -- 4
--- RunService signals + a ParrySuccess listener -- whether or not you ever
--- spammed. That is exactly what tripped the start-up kick: idle in the lobby
--- with the spam toggles even OFF, they were still attached (the one thing
--- BBCoreOnly removed that turning the toggles off did NOT, which is why "all
--- off" still kicked but core-only didn't). Now they're attached only while spam
--- is actually usable -- a spam toggle on AND you can parry (in a round) -- and
--- torn down the instant you're back in the lobby / dead. Driven once a frame
--- from the heartbeat (Core.spam_sync); nothing spam-related is connected in the
--- lobby.
-local spam_connected = false
-local function spam_disconnect()
-    if not spam_connected then return end
-    spam_connected = false
-    local conns = props.__connections
-    for _, k in ipairs({"__spam_evt", "__spam_heartbeat", "__spam_render"}) do
-        if conns[k] then pcall(function() conns[k]:Disconnect() end); conns[k] = nil end
-    end
-end
-local function spam_connect()
-    if spam_connected then return end
-    spam_connected = true
+-- Spam loop connections, back on all four signals (PreSimulation / Heartbeat /
+-- PreRender / PreAnimation) as before -- those were never the kick; reverting
+-- the mistaken change. BBCoreOnly / BBNoSpam still skip them for diagnostics.
+if not (genv.BBCoreOnly or genv.BBNoSpam) then
+Remotes.ParrySuccess.OnClientEvent:Connect(function() pcall(spam_instant) end)
+do
     local last_error
     local function run(fn)
         local ok, err = pcall(fn)
@@ -3003,11 +2977,7 @@ local function spam_connect()
         end
     end
     local conns = props.__connections
-    conns.__spam_evt = Remotes.ParrySuccess.OnClientEvent:Connect(function() pcall(spam_instant) end)
-    -- Heartbeat carries the frame bookkeeping + auto-spam evaluation; RenderStepped
-    -- gives a second send point in the frame. Only these two safe signals -- no
-    -- PreSimulation / PreRender / PreAnimation (the reason-24 trip, see SIGNALS).
-    conns.__spam_heartbeat = RunService.Heartbeat:Connect(function()
+    conns.__spam_pre = RunService.PreSimulation:Connect(function()
         Pump.frame = Pump.frame + 1
         run(auto_spam_evaluate)
         -- auto spam just switched on: its first parry goes now, not next point
@@ -3016,14 +2986,11 @@ local function spam_connect()
         AutoSpam.was_active = active
         run(spam_tick)
     end)
-    pcall(function() conns.__spam_render = RunService.RenderStepped:Connect(function() run(spam_tick) end) end)
+    conns.__spam_heartbeat = RunService.Heartbeat:Connect(function() run(spam_tick) end)
+    pcall(function() conns.__spam_render = RunService.PreRender:Connect(function() run(spam_tick) end) end)
+    pcall(function() conns.__spam_anim = RunService.PreAnimation:Connect(function() run(spam_tick) end) end)
 end
-function Core.spam_sync()
-    local want = not (genv.BBCoreOnly or genv.BBNoSpam)
-        and (props.__auto_spam_enabled or props.__manual_spam_enabled)
-        and canParryNow()
-    if want then spam_connect() else spam_disconnect() end
-end
+end -- if not genv.BBCoreOnly (spam loop)
 
 -- ============================================================
 -- HEADLESS & KORBLOX
@@ -3836,7 +3803,7 @@ AP:AddToggle("ClosePreParry", {Text = "Close-range pre-parry", Default = false,
 AP:AddToggle("RandomCurve", {Text = "Random curve", Default = false, Callback = function(s)
     if s then
         if not System.__properties.__connections.__rc then
-            System.__properties.__connections.__rc = RunService.Heartbeat:Connect(function()
+            System.__properties.__connections.__rc = RunService.PreSimulation:Connect(function()
                 System.__properties.__curve_mode = math.random(1, #System.__config.__curve_names)
             end)
         end
