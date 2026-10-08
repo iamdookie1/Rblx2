@@ -6,7 +6,7 @@ task.spawn(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.08-68"
+local SCRIPT_VERSION = "2026.10.08-69"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -1248,12 +1248,23 @@ end)
 -- never cleared, and auto parry sat on "game lockout" while spam, which skips
 -- the gate, kept working.)
 local G = {until_t = 0, m1 = false, m1_at = 0}
+-- The server times its lockout from when IT got the last parry; ours runs
+-- from when we sent it. Firing the instant ours ends, network jitter can land
+-- the parry a hair before the server's ends -> refused (the swing plays,
+-- nothing happens). Spam never notices -- its next packet a frame later gets
+-- in -- but auto parry sends exactly one. So the lockout here runs a little
+-- past the game's: twice the measured ping jitter plus a frame (60-150ms).
+local function lockout_margin()
+    local jit = Core.lag and Core.lag.jit or 0.01
+    return math.clamp(jit * 2 + (props.__frame_dt or 1 / 60) + 0.03, 0.06, 0.15)
+end
 local function gate_start()
     local now = clock_()
     if now < G.until_t then return end -- inside the lockout a press starts nothing
     local n6, n2 = parry_window()
     n6, n2 = n6 or 0.5, n2 or 1.3
-    G.until_t = now + math.max(n6 + 0.1, n2)
+    G.until_t = now + math.max(n6 + 0.1, n2) + lockout_margin()
+    G.started = now
 end
 local function gate_open()
     -- M1Stop blocks pressing while the game holds it; never longer than 3s
@@ -1401,6 +1412,8 @@ local function send(curveCF, spam)
     end
     gate_start()
     log_send("remote")
+    Core.prev_send = Core.last_send
+    Core.last_send = clock_()
     Core.ev[spam and "spam" or "remote"] = clock_()
     local r = cap.remote
     if cap.ball2 then
@@ -1745,12 +1758,14 @@ local function judge(shot, now)
     local dt = shot.min_t - shot.t
     local lo, hi = shot.reach, shot.reach + shot.W
     local verdict, adj
+    local after_lock = shot.lock_t and (shot.t - shot.lock_t) or nil
     if dt < lo - 0.02 then
         verdict, adj = ("LATE by %.2fs"):format(lo - dt), math.min((lo - dt) * 0.5 + 0.02, 0.08)
     elseif dt > hi + 0.02 then
         verdict, adj = ("EARLY by %.2fs"):format(dt - hi), -math.min((dt - hi) * 0.5 + 0.03, 0.08)
     else
         verdict = "REFUSED: it arrived inside the parry and the game didn't take it"
+            .. (after_lock and (" (sent %.2fs after the last parry)"):format(after_lock) or "")
     end
     -- only a parry that had time to be timed teaches the timing: point blank
     -- and instant retarget shots are late by nature, nothing to correct
@@ -1764,17 +1779,6 @@ local function judge(shot, now)
     flight(("  -> MISS CHECK (%s): %s -- ball arrived %.2fs after the parry, parry was up %.2f-%.2fs%s"):format(
         shot.via, verdict, dt, lo, hi, adj and (", timing now %+.2fs"):format(Core.bias) or ""))
     Notify("Missed parry", verdict .. (adj and (" (timing %+.2fs)"):format(Core.bias) or ""), 4)
-    -- STALE CAPTURE: the packet's values can change during a server. Then
-    -- every parry is refused (the swing plays, nothing happens) however well
-    -- it's timed. Two refused in a row -> drop the capture and take a fresh one.
-    if not adj and shot.close and dt >= lo - 0.02 and dt <= hi + 0.02 then
-        Core.refused = (Core.refused or 0) + 1
-        if Core.refused >= 2 and Core.cap then
-            Core.refused, Core.cap = 0, nil
-            Core.own_told = false
-            flight("  -> 2 parries refused in a row: the capture went stale -- taking a fresh one")
-        end
-    end
 end
 -- Once a frame: follow open shots; judge each once the ball has been and gone.
 local function track_shots(now)
@@ -1801,7 +1805,6 @@ local function track_shots(now)
 end
 Core.track_shots = track_shots
 Core.mark_landed = function()
-    Core.refused = 0
     for _, shot in ipairs(open_shots) do shot.landed = true end
     -- a landed parry: let old corrections fade a little
     if Core.bias ~= 0 then Core.bias = Core.bias * 0.97 end
@@ -1833,7 +1836,7 @@ local function fire_for(st, now, via, info)
         end
         local gap = contact_gap(info.ball)
         local reach = reach_time()
-        open_shots[#open_shots + 1] = {ball = info.ball, via = via, t = now, reach = reach,
+        open_shots[#open_shots + 1] = {ball = info.ball, via = via, t = now, reach = reach, lock_t = Core.prev_send,
             W = parry_window() or 0.5, min_d = info.dist, min_t = now, gap = gap, close = info.dist <= gap + 6,
             planned = via == "auto parry" and (info.eta or 0) >= reach + 0.05}
     end
