@@ -6,7 +6,7 @@ task.spawn(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.08-56"
+local SCRIPT_VERSION = "2026.10.08-57"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -376,7 +376,7 @@ local System = {
     __properties = {
         __autoparry_enabled = false, __triggerbot_enabled = false,
         __manual_spam_enabled = false, __play_animation = false,
-        __curve_mode = 1, __accuracy = 50, __accuracy_base = 50, __divisor_multiplier = 1.1, __timing_mult = 1,
+        __curve_mode = 1, __accuracy = 50, __accuracy_base = 50, __divisor_multiplier = 1.1, __timing_mult = 1, __retry_delay = 1,
         __random_accuracy = false, __random_accuracy_amount = 10, __frame_dt = 1/60,
         __auto_spam_enabled = false,
         __parried = false, __training_parried = false, __parries = 0,
@@ -1313,7 +1313,10 @@ local function send(curveCF, spam)
     if not cap then return "unarmed" end
     if not canParryNow() then return "blocked" end
     if not cap.remote.Parent then Core.cap = nil; return "unarmed" end
-    if not spam and not gate_open() then return "blocked" end
+    -- No client-side lockout check (the first UI3 build had none and fired
+    -- reliably): our guess of the game's lockout is what held parries until
+    -- they were too late. Keypress mode still checks it (a press inside the
+    -- game's lockout does nothing).
     local window = parry_window()
     if window == nil then
         if not Win.done then return "blocked" end -- stats not read yet
@@ -1597,9 +1600,21 @@ local function fire_lead(speed)
     return reach_time() + cushion_for(speed, W) + extra
 end
 Core.fire_lead = fire_lead
--- Shown on the Status tab: how far out a ball at `speed` gets parried.
+-- AUTO PARRY DISTANCE -- the first UI3 build's formula (it fired reliably):
+-- parry once the ball on you is within
+--   clamp(ping/100, 5, 17) + max(speed / divisor, 9.5) [+ speed * ping/2]
+-- studs, where divisor = (2.4 + min(speed - 9.5, 650) * 0.002) * accuracy
+-- factor (Accuracy 1..100 -> 0.7..1.6: higher = closer = later). The Timing
+-- multiplier scales the whole distance (0 -> half, 1 -> as is, 2 -> 1.5x).
 function System.parry_distance(speed)
-    return speed * fire_lead(speed) + 3
+    local ping_ms = pingMs()
+    local ping_threshold = math.clamp(ping_ms / 100, 5, 17)
+    local capped_speed_diff = math.min(math.max(speed - 9.5, 0), 650)
+    local divisor = (2.4 + capped_speed_diff * 0.002) * (props.__divisor_multiplier or 1.1)
+    local distance = ping_threshold + math.max(speed / divisor, 9.5)
+    if props.__ping_compensation then distance = distance + speed * (ping_ms / 1000) * 0.5 end
+    distance = distance * (0.5 + 0.5 * math.clamp(props.__timing_mult or 1, 0, 2))
+    return distance + (props.__extra_distance or 0)
 end
 
 -- ------------------------------------------------------------
@@ -1647,13 +1662,10 @@ blocked_by_detection = function()
         or (det.__slashesoffury and props.__slashesoffury_active)
 end
 
--- One parry for a pass. The pass stays ours until that parry has had its whole
--- window plus a round trip to land; if it didn't, the pass is live again and
--- the next parry goes the moment the game's lockout lets a press through --
--- exactly what pressing again would do. (The old one-parry-per-pass lock never
--- retried, so one early parry on a slow ball was a death.)
+-- One parry per pass (per target change), like the first UI3 build: if the
+-- ball is still on us Retry delay seconds after it, parry again.
 local function mark_parried(st, now)
-    st.parried, st.parry_until = true, now + (parry_window() or 0.5) + ping_s() + 0.15
+    st.parried, st.parry_until = true, now + math.clamp(props.__retry_delay or 1, 0.2, 1.5)
 end
 
 local function fire_for(st, now, via, info)
@@ -1666,27 +1678,21 @@ local function fire_for(st, now, via, info)
     if not ok then st.why = "couldn't send yet, retrying"; return false end
     if info then
         Core.last_parry = {t = now, via = via, info = info}
-        flight(("%s: eta %.3fs, fires at %.3fs, %.0f st/s, %.1f studs, heading %.2f, line %.1f, ping %.0fms, window %.3f, view lag %.3f"):format(
-            via, info.eta, info.lead, info.speed, info.dist, info.heading or 0, math.min(info.miss or 0, 999), pingMs(),
-            parry_window() or -1, Core.interp))
-        -- A parry fired after the ball is already inside our reach can't be up
-        -- in time: say so, and what held it until then.
-        local reach = reach_time()
-        if info.eta < reach - 0.02 then
-            flight(("  ** LATE by %.3fs (reach %.3fs) -- was waiting on: %s"):format(reach - info.eta, reach, tostring(held_by)))
-        end
+        flight(("%s: %.1f studs (parry distance %.0f), %.0f st/s, heading %.2f, ping %.0fms, window %.3f -- was: %s"):format(
+            via, info.dist, info.lead * info.speed, info.speed, info.heading or 0, pingMs(), parry_window() or -1, tostring(held_by)))
     end
     mark_parried(st, now)
     st.why = via == "auto parry" and "parried" or ("parried (" .. via .. ")")
     return true
 end
 
+
 -- Shared by auto parry and triggerbot: is this pass already handled?
 local function pass_busy(st, now)
     if st.landed then return "landed, waiting for the ball to leave" end
     if st.parried then
-        if now < st.parry_until then return "parry up" end
-        st.parried = false -- ran out without landing: live again
+        if now < st.parry_until then return "parried" end
+        st.parried = false -- still on us after the retry delay: parry again
     end
     return nil
 end
@@ -1698,8 +1704,30 @@ local function autoparry_root()
     return root
 end
 
--- The decision for a ball on us. via: nil (frame check) or "retarget" (straight
--- off the target change, before the ball has turned toward us).
+-- Curve check, the first UI3 build's is_curved, kept per ball: while the ball
+-- is swinging round (its angle to us still warping) and not yet close, wait.
+local function is_curving(ball, st, root, speed, velocity)
+    local pos = root.Position
+    local offset = pos - ball.Position
+    local distance = offset.Magnitude
+    if speed < 1 or distance < 1e-3 then return false end
+    local dot = (offset / distance):Dot(velocity / speed)
+    local ping = pingMs() / 1000
+    local reach = distance / speed - ping
+    local dot_threshold = math.clamp(0.55 - ping * 0.75, -1, 0.45)
+    local near = 15 - math.min(distance / 1000, 15) + math.min(speed / 100, 45)
+    local radians = math.asin(math.clamp(dot, -1, 1))
+    st.lerp_rad = (st.lerp_rad or radians) + (radians - (st.lerp_rad or radians)) * 0.85
+    local now = clock_()
+    if st.lerp_rad < 0.016 then st.warp_at = now end
+    if distance < near * 0.85 then return false end
+    if st.warp_at and now - st.warp_at < reach / 1.4 then return true end
+    return dot < dot_threshold
+end
+
+-- The decision for a ball on us (UI3 style): inside the parry distance and not
+-- curving -> parry. via "retarget" is the same check made the instant the ball
+-- switches to us.
 local function decide(ball, st, root, now, via)
     local function hold(why) st.why = why; return false end
     local busy = pass_busy(st, now)
@@ -1709,43 +1737,15 @@ local function decide(ball, st, root, now, via)
     if tornado and (tick() - props.__tornado_time) < (tornado:GetAttribute('TornadoTime') or 1) + 0.314159 then return hold("tornado") end
     if ball:FindFirstChild('ComboCounter') then return hold("combo") end
     if blocked_by_detection() then return hold("ability detected") end
-    if getgenv().AutoParryMode ~= "Keypress" and Core.cap and not gate_open() then return hold("game lockout, firing when it opens") end
 
     local heading, miss, speed, distance, velocity = read_ball(ball, root)
     if speed < 1 then return hold("ball not moving") end
-    local ping = ping_s()
-    local accel = speed_gain(st, speed, now)
-    local turn = turn_rate(st, velocity, now)
-    local lead = fire_lead(speed)
-    local gap = contact_gap(ball)
-
-    -- Gone past us (moving away after reaching us): nothing left to parry.
-    if heading < 0 and distance <= gap + 2 then st.reached_at = now end
-    if st.reached_at and heading < 0 and now - st.reached_at < ping + 0.3 then return hold("went past") end
-
-    local eta
-    if via == "retarget" then
-        -- The ball still flies toward its last holder, so there's no heading to
-        -- read yet. Go now only if there's no time to look: even its earliest
-        -- arrival is inside a round trip and a couple of frames, or it's point
-        -- blank. Anything else is timed by the frame checks a moment later.
-        -- (reach includes the view lag, so at high ping more of these go at once)
-        local earliest = math.max(distance - gap, 0) / speed
-        if not (earliest <= reach_time() + frame_dt() * 1.5 + 0.02 or distance <= cfg.instant_range) then
-            return hold("just retargeted, timing it")
-        end
-        eta = earliest
-    elseif miss <= cfg.hit_zone then
-        eta = time_to_contact(distance, ball, speed, accel)
-    else
-        eta = predict_contact(ball.Position, velocity, root.Position, gap, turn, accel, lead + 0.1)
-        -- a curve wrapped in so tight it's about to touch us
-        if not eta and heading > -0.3 and distance <= gap + speed * (ping + frame_dt() * 2) then eta = 0 end
-        if not eta then return hold(heading < 0 and "flying away" or "curving, waiting") end
-    end
-    if eta > lead then return hold(("lands in %.2fs, firing at %.2fs"):format(eta, lead)) end
+    local curving = is_curving(ball, st, root, speed, velocity)
+    local range = System.parry_distance(speed)
+    if distance > range then return hold(("%.0f studs out, parries at %.0f"):format(distance, range)) end
+    if curving and via ~= "retarget" then return hold("curving, waiting") end
     return fire_for(st, now, via == "retarget" and "instant retarget" or "auto parry",
-        {eta = eta, lead = lead, speed = speed, dist = distance, heading = heading, miss = miss})
+        {eta = distance / speed, lead = range / speed, speed = speed, dist = distance, heading = heading, miss = miss})
 end
 
 -- Pre-parry: the ball is on a player right next to us and their return would
@@ -1761,7 +1761,7 @@ local function try_preparry(ball, st, root, now)
     if not (cfg.preparry or (cfg.hp_close and high_ping())) then return end
     local target = st.target
     if type(target) ~= 'string' or target == '' or target == me then return end
-    if getgenv().AutoParryMode == "Keypress" or not Core.cap or not gate_open() then return end
+    if getgenv().AutoParryMode == "Keypress" or not Core.cap then return end
     local their_root = character_root(target)
     if not their_root then return end
     local gap = (their_root.Position - root.Position).Magnitude
@@ -1798,7 +1798,6 @@ local function trigger(ball, st)
     if not root or root:FindFirstChild('SingularityCape') or not canParryNow() then return end
     local now = clock_()
     if pass_busy(st, now) or blocked_by_detection() then return end
-    if getgenv().AutoParryMode ~= "Keypress" and Core.cap and not gate_open() then return end
     if fire_for(st, now, "triggerbot") then
         System.__triggerbot.__parries = System.__triggerbot.__parries + 1
     end
@@ -3296,11 +3295,14 @@ AP:AddDropdown("TargetMode", {Text = "Target mode", Values = System.__config.__t
         for i, n in ipairs(System.__config.__target_names) do if n == v then System.__properties.__target_mode = i; break end end
     end})
 AP:AddSlider("Accuracy", {Text = "Accuracy", Default = 50, Min = 1, Max = 100, Rounding = 0,
-    Tooltip = "How tight the parry is to the ball. 100: the ball lands just after your parry comes up, with only your measured lag swings as cushion. 1: it lands 60% into your parry, the most room for a lag spike or the ball speeding up. Always kept inside the parry.",
+    Tooltip = "Higher parries later (closer). Lower parries earlier (further away).",
     Callback = function(v) System.__properties.__accuracy_base = v; roll_accuracy() end})
 AP:AddSlider("TimingMultiplier", {Text = "Timing multiplier", Default = 1, Min = 0, Max = 2, Rounding = 2, Suffix = "x",
-    Tooltip = "Moves the parry from what Accuracy picks. 1 = Accuracy's pick. Higher parries earlier (2 = the earliest that still lands), lower parries later (0 = the last moment that still lands). Never pushed outside your parry window.",
+    Tooltip = "Scales the parry distance. 1 = as Accuracy sets it. Higher parries earlier (2 = 1.5x the distance), lower parries later (0 = half the distance).",
     Callback = function(v) System.__properties.__timing_mult = v end})
+AP:AddSlider("RetryDelay", {Text = "Retry delay", Default = 1, Min = 0.2, Max = 1.5, Rounding = 2, Suffix = "s",
+    Tooltip = "If the ball is still on you this long after a parry, parry again.",
+    Callback = function(v) System.__properties.__retry_delay = v end})
 AP:AddToggle("RandomAccuracy", {Text = "Randomize accuracy", Default = false,
     Tooltip = "Jitters accuracy around your current Accuracy setting each parry, to look less robotic.",
     Callback = function(v)
