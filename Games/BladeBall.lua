@@ -6,7 +6,7 @@ task.spawn(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.08-82"
+local SCRIPT_VERSION = "2026.10.08-83"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -318,32 +318,47 @@ local target_aim = {at = -1, name = nil, aim = nil}
 -- game reads (Replion "Data", via the same plain require the game's own modules
 -- use -- no getgc, no hook) and reproduce its arithmetic exactly.
 local Win = {data = nil, noob = false}
-task.spawn(function()
-    local function srv(info, name)
-        local ok, r = pcall(function() return info[name]() end)
-        return ok and r == true
-    end
-    local info, utils
-    pcall(function() info = require(ReplicatedStorage:WaitForChild("ServerInfo", 10)) end)
-    pcall(function() utils = require(ReplicatedStorage:WaitForChild("Common", 10):WaitForChild("Utils", 10)) end)
-    local flag_on = true
-    pcall(function() flag_on = utils.FFlag.GetInstantFFlag("NoobParryEnabled", true) end)
-    if info then
-        Win.noob = flag_on and not srv(info, "isDungeonsMatchServer") and not srv(info, "isRankedMatchServer")
-            and not srv(info, "isMedalServer") and not srv(info, "isClanWarServer")
-            and not srv(info, "isTournamentMatchServer") and true or false
-    end
+-- These REQUIRE the game's own ModuleScripts (ServerInfo, Utils, Replion) and
+-- call their functions -- that runs the game's code with our frame on the call
+-- stack, which a caller-identity check inside them can flag. It used to run at
+-- load (in the lobby, before anything else), and the data it reads (server
+-- type, the parry-window stats) is only ever used once you're actually parrying
+-- -- never in the lobby. So it's deferred: load_game_data() runs the first time
+-- you can actually parry (fired from the heartbeat below), and nothing touches
+-- a game module at startup any more.
+-- Stored on Win (not a new local) to stay under the main chunk's local limit.
+-- Win.load() runs once, the first time you can actually parry (fired from the
+-- heartbeat), so nothing requires a game module in the lobby.
+function Win.load()
+    if Win.started then return end
+    Win.started = true
     task.spawn(function()
-        pcall(function()
-            local Replion = require(ReplicatedStorage:WaitForChild("Packages", 10):WaitForChild("Replion", 10))
-            Win.data = Replion.Client:WaitReplion("Data")
+        local function srv(info, name)
+            local ok, r = pcall(function() return info[name]() end)
+            return ok and r == true
+        end
+        local info, utils
+        pcall(function() info = require(ReplicatedStorage:WaitForChild("ServerInfo", 10)) end)
+        pcall(function() utils = require(ReplicatedStorage:WaitForChild("Common", 10):WaitForChild("Utils", 10)) end)
+        local flag_on = true
+        pcall(function() flag_on = utils.FFlag.GetInstantFFlag("NoobParryEnabled", true) end)
+        if info then
+            Win.noob = flag_on and not srv(info, "isDungeonsMatchServer") and not srv(info, "isRankedMatchServer")
+                and not srv(info, "isMedalServer") and not srv(info, "isClanWarServer")
+                and not srv(info, "isTournamentMatchServer") and true or false
+        end
+        task.spawn(function()
+            pcall(function()
+                local Replion = require(ReplicatedStorage:WaitForChild("Packages", 10):WaitForChild("Replion", 10))
+                Win.data = Replion.Client:WaitReplion("Data")
+            end)
+            Win.done = true
         end)
-        Win.done = true
+        -- Never block Remote forever: if the stats can't be read within 10s, give
+        -- up waiting and let the parry sender use its fallback.
+        task.delay(10, function() Win.done = true end)
     end)
-    -- Never block Remote forever: if the stats can't be read within 10s, give
-    -- up waiting and let the parry sender use its fallback.
-    task.delay(10, function() Win.done = true end)
-end)
+end
 
 local function parry_window()
     local data = Win.data
@@ -2587,6 +2602,10 @@ RunService.Heartbeat:Connect(function()
     sample_lag() -- keep the ping average current between balls too
     if Core.track_shots then pcall(Core.track_shots, clock_()) end
     if not is_live() then return end
+    -- load the game-module data (server type / parry-window stats) the first
+    -- time you can actually parry -- never in the lobby, where requiring a game
+    -- module with our frame on its stack is a needless kick risk
+    if not Win.started and canParryNow() then Win.load() end
     if not Core.cap then
         Core.told = false
         -- a hook-free recipe, if one was ever completed
