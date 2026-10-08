@@ -6,7 +6,7 @@ task.spawn(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.08-86"
+local SCRIPT_VERSION = "2026.10.08-87"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -2005,6 +2005,31 @@ local function mark_parried(st, now)
     st.parried, st.parry_until = true, now + reach_time() + (parry_window() or 0.5) + 0.03
 end
 
+-- LANDING: a single remote shot can land a hair outside the SERVER's real
+-- accept window even when our model says it was inside it (logged REFUSED) --
+-- which is exactly why manual spam lands the same captured packet: it blankets
+-- that window instead of betting on one shot. So after an auto parry's first
+-- shot we send a few more on the spam path (same captured packet, skips the
+-- gate) over the next frames, stopping the instant a ParrySuccess lands (it
+-- clears Core.pending). The server takes one parry and ignores the rest -- what
+-- spam already does, bounded to the parry. getgenv().ParryBurst=false disables;
+-- length is getgenv().ParryBurstSeconds (default 0.10s, max 0.35).
+local bursting = false
+local function parry_burst()
+    if bursting or not Core.cap then return end
+    bursting = true
+    task.spawn(function()
+        local deadline = os.clock() + math.clamp(tonumber(getgenv().ParryBurstSeconds) or 0.10, 0, 0.35)
+        while is_live() and os.clock() < deadline and Core.pending and Core.cap do
+            ParryLog.source = "auto spam" -- counted like spam, no per-shot log spam
+            pcall(Core.send, System.curve.get_cframe_fast(), true)
+            ParryLog.source = nil
+            task.wait()
+        end
+        bursting = false
+    end)
+end
+
 local function fire_for(st, now, via, info)
     local held_by = st.why -- what the last frame was waiting on
     ParryLog.source = via
@@ -2013,6 +2038,10 @@ local function fire_for(st, now, via, info)
     else ok = System.parry.by_mode(getgenv().AutoParryMode) end
     ParryLog.source = nil
     if not ok then st.why = "couldn't send yet, retrying"; return false end
+    -- blanket the server's real window like manual spam does (Remote mode only)
+    if getgenv().AutoParryMode ~= "Keypress" and Core.cap and getgenv().ParryBurst ~= false then
+        parry_burst()
+    end
     if info and info.ball and getgenv().AutoParryMode ~= "Keypress" then
         -- an earlier shot at this ball that the ball still hasn't reached: early
         for _, old in ipairs(open_shots) do
@@ -2280,7 +2309,14 @@ end
 -- Run at four points of every frame, so the newest ball position is acted on
 -- at the first point after it arrives. A pass can't be parried twice, so the
 -- extra checks never double up.
-local SIGNALS = {"PreSimulation", "Heartbeat", "PreRender", "PreAnimation"}
+-- Only Heartbeat + RenderStepped -- the two the game's own client code (and our
+-- core) already bind, and the two BBCoreOnly keeps without ever being kicked.
+-- The PreSimulation / PreRender / PreAnimation binds that used to be here were
+-- the reason-24 trip: nothing the game's client does binds those, so an
+-- external script connecting them stands out to a BAC sweep (every kick config
+-- had a feature binding a Pre* signal; core-only, which binds neither, never
+-- kicked). Two signals is still twice a frame -- plenty for the decide loop.
+local SIGNALS = {"Heartbeat", "RenderStepped"}
 local function run_every_point(key, fn, label)
     local conns = props.__connections
     if conns[key] then return end
@@ -2951,7 +2987,7 @@ local function spam_disconnect()
     if not spam_connected then return end
     spam_connected = false
     local conns = props.__connections
-    for _, k in ipairs({"__spam_evt", "__spam_pre", "__spam_heartbeat", "__spam_render", "__spam_anim"}) do
+    for _, k in ipairs({"__spam_evt", "__spam_heartbeat", "__spam_render"}) do
         if conns[k] then pcall(function() conns[k]:Disconnect() end); conns[k] = nil end
     end
 end
@@ -2968,7 +3004,10 @@ local function spam_connect()
     end
     local conns = props.__connections
     conns.__spam_evt = Remotes.ParrySuccess.OnClientEvent:Connect(function() pcall(spam_instant) end)
-    conns.__spam_pre = RunService.PreSimulation:Connect(function()
+    -- Heartbeat carries the frame bookkeeping + auto-spam evaluation; RenderStepped
+    -- gives a second send point in the frame. Only these two safe signals -- no
+    -- PreSimulation / PreRender / PreAnimation (the reason-24 trip, see SIGNALS).
+    conns.__spam_heartbeat = RunService.Heartbeat:Connect(function()
         Pump.frame = Pump.frame + 1
         run(auto_spam_evaluate)
         -- auto spam just switched on: its first parry goes now, not next point
@@ -2977,9 +3016,7 @@ local function spam_connect()
         AutoSpam.was_active = active
         run(spam_tick)
     end)
-    conns.__spam_heartbeat = RunService.Heartbeat:Connect(function() run(spam_tick) end)
-    pcall(function() conns.__spam_render = RunService.PreRender:Connect(function() run(spam_tick) end) end)
-    pcall(function() conns.__spam_anim = RunService.PreAnimation:Connect(function() run(spam_tick) end) end)
+    pcall(function() conns.__spam_render = RunService.RenderStepped:Connect(function() run(spam_tick) end) end)
 end
 function Core.spam_sync()
     local want = not (genv.BBCoreOnly or genv.BBNoSpam)
@@ -3751,6 +3788,9 @@ AP:AddDropdown("CapturePress", {Text = "Capture press", Values = {"Keypress", "O
 AP:AddDropdown("ParryMode", {Text = "Parry mode", Values = {"Remote", "Keypress"}, Default = "Remote",
     Tooltip = "Remote: fires the captured parry remote (needs the one capture hook per server) -- curve and target mode apply. Keypress: presses the block key (no curve/target). (Game mode has been removed.)",
     Callback = function(v) getgenv().AutoParryMode = v end})
+AP:AddToggle("ParryBurst", {Text = "Parry burst (landing)", Default = true,
+    Tooltip = "After an auto parry's first remote shot, sends a few more on the spam path for a few frames, stopping the instant it lands. A single shot can land a hair outside the server's real window even when it looks in-window (logged REFUSED) -- this blankets that window the way manual spam does, which is why spam lands when a single parry doesn't. Turn off for exactly one packet per parry.",
+    Callback = function(v) getgenv().ParryBurst = v end})
 AP:AddDropdown("CurveMode", {Text = "Curve mode", Values = System.__config.__curve_names, Default = "Camera",
     Callback = function(v)
         for i, n in ipairs(System.__config.__curve_names) do if n == v then System.__properties.__curve_mode = i; break end end
@@ -3796,7 +3836,7 @@ AP:AddToggle("ClosePreParry", {Text = "Close-range pre-parry", Default = false,
 AP:AddToggle("RandomCurve", {Text = "Random curve", Default = false, Callback = function(s)
     if s then
         if not System.__properties.__connections.__rc then
-            System.__properties.__connections.__rc = RunService.PreSimulation:Connect(function()
+            System.__properties.__connections.__rc = RunService.Heartbeat:Connect(function()
                 System.__properties.__curve_mode = math.random(1, #System.__config.__curve_names)
             end)
         end
