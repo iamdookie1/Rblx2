@@ -6,7 +6,7 @@ task.spawn(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.08-88"
+local SCRIPT_VERSION = "2026.10.08-89"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -124,6 +124,9 @@ if not LocalPlayer.Character then LocalPlayer.CharacterAdded:Wait() end
 local Alive = Workspace:FindFirstChild("Alive") or Workspace:WaitForChild("Alive")
 local Runtime = Workspace:FindFirstChild("Runtime") or Workspace:WaitForChild("Runtime")
 local Remotes = ReplicatedStorage:WaitForChild("Remotes")
+-- BBStop checkpoint 0 (diagnostic): getgenv().BBStop = 0 stops loading here.
+if genv.BBStop == 0 then flight("BBStop 0: stopped right after the UI window + services") return end
+
 
 -- Every file this script writes goes under one folder.
 local SAVE_FOLDER = "BladeBall"
@@ -912,6 +915,9 @@ Remotes.ParrySuccess.OnClientEvent:Connect(function()
     if not LocalPlayer.Character or LocalPlayer.Character.Parent ~= Alive then return end
     if System.__properties.__grab_animation then System.__properties.__grab_animation:Stop() end
 end)
+
+-- BBStop checkpoint 1 (diagnostic): getgenv().BBStop = 1 stops loading here.
+if genv.BBStop == 1 then flight("BBStop 1: stopped before the parry core (UI, services, animation hooks, ability listeners ran)") return end
 
 -- ============================================================
 -- PARRY CORE (rewritten): capture, gate, sender, ball tracking, timing,
@@ -2703,6 +2709,9 @@ RunService.Heartbeat:Connect(function()
 end)
 end -- parry core
 
+-- BBStop checkpoint 2 (diagnostic): getgenv().BBStop = 2 stops loading here.
+if genv.BBStop == 2 then flight("BBStop 2: stopped before the spam engine (parry core + main heartbeat have run)") return end
+
 -- ============================================================
 -- SPAM ENGINE (rewritten)
 -- ============================================================
@@ -2991,6 +3000,9 @@ do
     pcall(function() conns.__spam_anim = RunService.PreAnimation:Connect(function() run(spam_tick) end) end)
 end
 end -- if not genv.BBCoreOnly (spam loop)
+
+-- BBStop checkpoint 3 (diagnostic): getgenv().BBStop = 3 stops loading here.
+if genv.BBStop == 3 then flight("BBStop 3: stopped before Headless/Korblox + skin changer") return end
 
 -- ============================================================
 -- HEADLESS & KORBLOX
@@ -3370,6 +3382,9 @@ local function __resolveTargetId(value)
     return nil
 end
 
+-- BBStop checkpoint 4 (diagnostic): getgenv().BBStop = 4 stops loading here.
+if genv.BBStop == 4 then flight("BBStop 4: stopped before Ability ESP + status loops") return end
+
 -- ============================================================
 -- ABILITY ESP
 -- ============================================================
@@ -3629,6 +3644,9 @@ task.spawn(function()
         end
     end
 end)
+
+-- BBStop checkpoint 5 (diagnostic): getgenv().BBStop = 5 stops loading here.
+if genv.BBStop == 5 then flight("BBStop 5: stopped before the UI tabs / config autoload (everything else has run)") return end
 
 -- ============================================================
 -- UI
