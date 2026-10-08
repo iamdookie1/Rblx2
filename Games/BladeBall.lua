@@ -6,7 +6,7 @@ task.spawn(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.08-58"
+local SCRIPT_VERSION = "2026.10.08-59"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -1678,8 +1678,9 @@ local function fire_for(st, now, via, info)
     if not ok then st.why = "couldn't send yet, retrying"; return false end
     if info then
         Core.last_parry = {t = now, via = via, info = info}
-        flight(("%s: %.1f studs (parry distance %.0f), %.0f st/s, heading %.2f, ping %.0fms, window %.3f -- was: %s"):format(
-            via, info.dist, info.lead * info.speed, info.speed, info.heading or 0, pingMs(), parry_window() or -1, tostring(held_by)))
+        flight(("%s: %.1f studs, arrives in %.3fs, fires at %.3fs (distance %.0f), %.0f st/s, angle %.0f deg, ping %.0fms, window %.3f -- was: %s"):format(
+            via, info.dist, info.eta or -1, info.lead, info.lead * info.speed, info.speed,
+            math.deg(math.acos(math.clamp(info.heading or 1, -1, 1))), pingMs(), parry_window() or -1, tostring(held_by)))
     end
     mark_parried(st, now)
     st.why = via == "auto parry" and "parried" or ("parried (" .. via .. ")")
@@ -1704,30 +1705,45 @@ local function autoparry_root()
     return root
 end
 
--- Curve check, the first UI3 build's is_curved, kept per ball: while the ball
--- is swinging round (its angle to us still warping) and not yet close, wait.
-local function is_curving(ball, st, root, speed, velocity)
-    local pos = root.Position
-    local offset = pos - ball.Position
-    local distance = offset.Magnitude
-    if speed < 1 or distance < 1e-3 then return false end
-    local dot = (offset / distance):Dot(velocity / speed)
-    local ping = pingMs() / 1000
-    local reach = distance / speed - ping
-    local dot_threshold = math.clamp(0.55 - ping * 0.75, -1, 0.45)
-    local near = 15 - math.min(distance / 1000, 15) + math.min(speed / 100, 45)
-    local radians = math.asin(math.clamp(dot, -1, 1))
-    st.lerp_rad = (st.lerp_rad or radians) + (radians - (st.lerp_rad or radians)) * 0.85
-    local now = clock_()
-    if st.lerp_rad < 0.016 then st.warp_at = now end
-    if distance < near * 0.85 then return false end
-    if st.warp_at and now - st.warp_at < reach / 1.4 then return true end
-    return dot < dot_threshold
+-- ANTI CURVE. A ball on you always homes in on you; a curve just makes the
+-- trip longer. So instead of waiting while it curves (which fires late when the
+-- curve finally swings in), auto parry estimates WHEN it arrives along the
+-- curve and fires on that, with the same lead the parry distance gives a
+-- straight ball:
+--   * the homing arc: the gentlest circle that leaves the ball's current
+--     direction and passes through you -- length d * theta / sin(theta),
+--     theta = angle between its direction and you (0 = straight at you);
+--   * the measured path: flown forward at the rate it's actually turning and
+--     speeding up (when it turns harder than the arc, it arrives sooner);
+--   the sooner of the two counts. Speed-up is included in both.
+--   * swinging AWAY (its angle to you opening up fast) is a wide curve or a
+--     bait: wait, unless it's already close enough that waiting is fatal.
+-- All times are against the ball we see, like the parry distance's.
+local function arc_time(distance, theta, speed, accel)
+    local k = theta < 1e-3 and 1 or math.min(theta / math.sin(math.min(theta, 3.0)), 8)
+    local path = distance * k
+    if accel > 1 then return (math.sqrt(speed * speed + 2 * accel * path) - speed) / accel end
+    return path / speed
 end
 
--- The decision for a ball on us (UI3 style): inside the parry distance and not
--- curving -> parry. via "retarget" is the same check made the instant the ball
--- switches to us.
+-- How fast the angle between the ball's direction and you is changing (rad/s,
+-- positive = opening up / swinging away). Sampled every 50ms, per pass.
+local function angle_trend(st, theta, now)
+    local s = st.ang
+    if not s then st.ang = {t = now, v = theta, rate = 0}; return 0 end
+    local dt = now - s.t
+    if dt >= 0.05 then
+        local rate = (theta - s.v) / dt
+        s.rate = s.rate * 0.4 + rate * 0.6
+        s.t, s.v = now, theta
+    end
+    return s.rate
+end
+
+-- The decision for a ball on us: fire when its estimated arrival (straight or
+-- along the curve) is down to the lead the parry distance gives
+-- (parry distance / speed). via "retarget" is the instant the ball switches
+-- to us, before its new direction shows.
 local function decide(ball, st, root, now, via)
     local function hold(why) st.why = why; return false end
     local busy = pass_busy(st, now)
@@ -1742,14 +1758,45 @@ local function decide(ball, st, root, now, via)
         return hold("clash: auto spam has it")
     end
 
-    local heading, miss, speed, distance, velocity = read_ball(ball, root)
+    local heading, _, speed, distance, velocity = read_ball(ball, root)
     if speed < 1 then return hold("ball not moving") end
-    local curving = is_curving(ball, st, root, speed, velocity)
     local range = System.parry_distance(speed)
-    if distance > range then return hold(("%.0f studs out, parries at %.0f"):format(distance, range)) end
-    if curving and via ~= "retarget" then return hold("curving, waiting") end
-    return fire_for(st, now, via == "retarget" and "instant retarget" or "auto parry",
-        {eta = distance / speed, lead = range / speed, speed = speed, dist = distance, heading = heading, miss = miss})
+    local lead = range / speed
+    local theta = math.acos(math.clamp(heading, -1, 1))
+    local accel = speed_gain(st, speed, now)
+    local turn = turn_rate(st, velocity, now)
+    local opening = angle_trend(st, theta, now)
+    local info = {speed = speed, dist = distance, heading = heading, lead = lead}
+
+    if via == "retarget" then
+        -- the new direction isn't in yet: only point blank goes now
+        if distance <= range * 0.5 then
+            info.eta = distance / speed
+            return fire_for(st, now, "instant retarget", info)
+        end
+        return hold("just retargeted, timing it")
+    end
+
+    -- point blank: no time to wait for anything
+    local point_blank = distance <= math.max(10, speed * 0.12)
+    -- swinging away: a wide curve or a bait -- wait for it to come round
+    if not point_blank and theta > 0.35 and opening > 0.6 then
+        return hold(("curving away (%.0f deg, opening %.1f rad/s)"):format(math.deg(theta), opening))
+    end
+
+    local eta = arc_time(distance, theta, speed, accel)
+    if theta > 0.05 and turn > 0 then
+        local gap = contact_gap(ball)
+        local sim = predict_contact(ball.Position, velocity, root.Position, gap, turn, accel, lead + 0.15)
+        if sim then eta = math.min(eta, sim + gap / speed) end
+    end
+    info.eta = eta
+    if point_blank or eta <= lead then
+        st.why = nil
+        return fire_for(st, now, "auto parry", info)
+    end
+    if theta > 0.35 then return hold(("curving in, lands in %.2fs, firing at %.2fs"):format(eta, lead)) end
+    return hold(("%.0f studs out, parries at %.0f"):format(distance, range))
 end
 
 -- Pre-parry: the ball is on a player right next to us and their return would
