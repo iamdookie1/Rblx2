@@ -6,7 +6,7 @@ task.spawn(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.08-57"
+local SCRIPT_VERSION = "2026.10.08-58"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -1737,6 +1737,10 @@ local function decide(ball, st, root, now, via)
     if tornado and (tick() - props.__tornado_time) < (tornado:GetAttribute('TornadoTime') or 1) + 0.314159 then return hold("tornado") end
     if ball:FindFirstChild('ComboCounter') then return hold("combo") end
     if blocked_by_detection() then return hold("ability detected") end
+    local clash = Core.clash
+    if (clash and clash.ball == ball and clock_() < clash.until_t) or (Core.clash_check and Core.clash_check(ball)) then
+        return hold("clash: auto spam has it")
+    end
 
     local heading, miss, speed, distance, velocity = read_ball(ball, root)
     if speed < 1 then return hold("ball not moving") end
@@ -2271,11 +2275,22 @@ local function spam_fire()
     return sent
 end
 
--- ---------- auto spam: when does one timed parry stop being enough? ----------
--- reach = how long a parry sent now takes to be up, against the ball we see
--- (ping + view lag + jitter, see TIMING). React = a couple of frames to notice.
+-- ---------- auto spam (rewritten): clashes only ----------
+-- Auto spam runs in one situation: a clash -- the ball traded back and forth
+-- between you and ONE nearby player, fast. Nothing else (no "point blank", no
+-- "close return": those fired alongside auto parry's own parry and made double
+-- parries outside clashes). While a clash is on, auto parry stands down for
+-- that ball (Core.clash), so each parry comes from one place only.
+--
+-- A clash needs, from the ball's recent owners (newest first):
+--   * you and the same opponent alternating at least 3 times in a row
+--     (you -> them -> you, or them -> you -> them): two quick hand-offs;
+--   * every one of those hand-offs quicker than `tempo` (about the ball
+--     crossing twice plus both players' reaction);
+--   * the last hand-off still recent (within tempo) and the ball on you or them;
+--   * the opponent close (clash range grows with ball speed).
+-- It ends the moment any of those stops being true (one frame of tail).
 local function spam_reach() return Core.reach_time() end
-local function react_time() return math.clamp(props.__frame_dt or 1 / 60, 1 / 240, 0.1) * 2 + 0.02 end
 
 -- The ball's recent owners, newest first (blank targets dropped, repeats merged).
 local function ball_owners(state)
@@ -2291,26 +2306,25 @@ local function ball_owners(state)
     return owners
 end
 
--- Clash range grows with ball speed: a 300 st/s exchange spans more ground.
-local function clash_range(speed) return math.clamp(18 + speed * 0.06, 18, 45) end
+local function clash_range(speed) return math.clamp(15 + speed * 0.05, 15, 35) end
 
--- A clash: the ball traded back and forth between you and one player, each
--- hand-off about as quick as the ball crossing plus both reactions. Returns the
--- opponent and how many quick hand-offs in a row.
-local function clash_with(st, root, speed, now)
+-- opponent, hand-offs -- or nil when this ball isn't in a clash with you.
+local function clash_on(ball, root, now)
+    local st = get_ball_state(ball)
+    if st.target ~= me and not (type(st.target) == 'string' and st.target ~= '') then return nil end
     local owners = ball_owners(st)
-    local newest, second = owners[1], owners[2]
-    if not second then return nil end
-    local opponent
-    if newest.name == me then opponent = second.name
-    elseif second.name == me then opponent = newest.name
-    else return nil end
+    if #owners < 3 then return nil end
+    local a, b = owners[1].name, owners[2].name
+    if a == b or (a ~= me and b ~= me) then return nil end
+    local opponent = a == me and b or a
+    if st.target ~= me and st.target ~= opponent then return nil end
     local their = character_root(opponent)
     if not their then return nil end
+    local speed = math.max(ball_velocity(ball).Magnitude, 1)
     local gap = (their.Position - root.Position).Magnitude
     if gap > clash_range(speed) then return nil end
-    local tempo = math.clamp(gap / speed * 2 + spam_reach() * 2 + 0.15, 0.3, 0.8)
-    if now - newest.t > tempo then return nil end
+    local tempo = math.clamp(gap / speed * 2 + spam_reach() * 2 + 0.1, 0.25, 0.6)
+    if now - owners[1].t > tempo then return nil end
     local hits = 0
     for i = 1, #owners - 1 do
         local cur, prev = owners[i], owners[i + 1]
@@ -2318,49 +2332,8 @@ local function clash_with(st, root, speed, now)
         if not alt or cur.t - prev.t > tempo then break end
         hits = hits + 1
     end
-    -- right up close (or the ball crosses faster than you react) one hand-off
-    -- is enough; otherwise it has to come back once
-    local need = (gap <= 10 or gap / speed <= spam_reach()) and 1 or 2
-    if hits < need then return nil end
+    if hits < 2 then return nil end
     return opponent, hits
-end
-
--- Why auto spam should run for this ball right now, or nil.
-local function spam_reason(ball, root, now)
-    local st = get_ball_state(ball)
-    local heading, _, speed, distance, velocity = read_ball(ball, root)
-    if speed < 1 then return nil end
-    local reach, react = spam_reach(), react_time()
-
-    local opponent, hits = clash_with(st, root, speed, now)
-    if opponent and (st.target == me or st.target == opponent) then
-        return ("clash vs %s (%d hits)"):format(opponent, hits)
-    end
-
-    if st.target == me then
-        -- coming in faster than a parry sent now could be up for, and auto parry
-        -- hasn't got one up for this pass
-        if heading <= 0.3 and distance > 6 then return nil end
-        if st.parried and now < (st.parry_until or 0) then return nil end
-        if math.max(distance - 3, 0) / speed <= reach + react then return "point blank" end
-        return nil
-    end
-
-    -- On a player next to you whose return would beat your reach (this is most
-    -- of what high ping loses at close range): spam through their hit.
-    local target = st.target
-    if type(target) ~= 'string' or target == '' then return nil end
-    local their = character_root(target)
-    if not their then return nil end
-    local gap = (their.Position - root.Position).Magnitude
-    if gap > clash_range(speed) then return nil end
-    local back = gap / (speed * 1.1)
-    if back > reach + react then return nil end
-    local to = their.Position - ball.Position
-    local d = to.Magnitude
-    if d > 3 and velocity:Dot(to / d) < speed * 0.3 then return nil end
-    if d / speed + back <= reach + react + 0.1 then return "close return from " .. target end
-    return nil
 end
 
 -- Lobby training or lobby parry: auto spam never runs there.
@@ -2370,33 +2343,45 @@ local function in_training()
     return char ~= nil and dead ~= nil and char.Parent == dead
 end
 
--- Once per frame. Keeps spam on a short tail past the last reason (about a
--- round trip), so it covers the hit it was started for.
+local function can_auto_spam(root)
+    return props.__auto_spam_enabled and root and not root:FindFirstChild('SingularityCape') and canParryNow()
+        and not blocked_by_detection() and not in_training()
+end
+local function start_clash(ball, now, opponent, hits)
+    AutoSpam.active_until = now + 0.05 -- re-checked every frame
+    AutoSpam.reason = ("clash vs %s (%d hand-offs)"):format(opponent, hits)
+    Core.clash = {ball = ball, until_t = AutoSpam.active_until}
+end
+-- Asked by auto parry the instant the ball changes hands (before this frame's
+-- evaluate): a clash starts right there, so auto parry never fires on top.
+Core.clash_check = function(ball)
+    local root = getRoot()
+    if not can_auto_spam(root) then return false end
+    local now = os.clock()
+    local opponent, hits = clash_on(ball, root, now)
+    if not opponent then return false end
+    start_clash(ball, now, opponent, hits)
+    return true
+end
+
+-- Once per frame.
 local function auto_spam_evaluate()
-    if not props.__auto_spam_enabled then
-        AutoSpam.active_until, AutoSpam.reason = 0, nil
-        return
-    end
     local now = os.clock()
     local root = getRoot()
-    if root and not root:FindFirstChild('SingularityCape') and canParryNow() and not blocked_by_detection()
-        and not in_training() then
+    if can_auto_spam(root) then
         for _, ball in ipairs(get_live_balls()) do
-            local reason = spam_reason(ball, root, now)
-            if reason then
-                AutoSpam.active_until = now + math.clamp(spam_reach() * 1.5 + 0.05, 0.12, 0.45)
-                AutoSpam.reason = reason
-                return
-            end
+            local opponent, hits = clash_on(ball, root, now)
+            if opponent then start_clash(ball, now, opponent, hits); return end
         end
     end
-    if now >= AutoSpam.active_until then AutoSpam.reason = nil end
+    AutoSpam.active_until, AutoSpam.reason = 0, nil
+    Core.clash = nil
 end
 
 function System.auto_spam.status()
     if not props.__auto_spam_enabled then return "off" end
     if os.clock() < AutoSpam.active_until then return "SPAMMING (" .. tostring(AutoSpam.reason or "clash") .. ")" end
-    return "watching"
+    return "watching for clashes"
 end
 
 -- ---------- the pump ----------
@@ -3444,7 +3429,7 @@ end})
 
 local AS = Tabs.Spam:AddRightGroupbox("Auto Spam", "activity")
 AS:AddToggle("AutoSpam", {Text = "Auto spam", Default = false,
-    Tooltip = "Spams only when one timed parry can't keep up: a clash (the ball traded back and forth with a player), a ball on you closer than your ping lets a parry come up in time, or a player next to you about to hit a ball whose return would beat your ping. Worked out from ball speed, your ping and its swings. Capped so it never backs up your upload (no desync). Never runs in training.",
+    Tooltip = "Spams only in a clash: the ball traded back and forth between you and one nearby player, two quick hand-offs in a row. Stops the moment it isn't one. Auto parry stays out of that ball while it runs, so no double parries. Never runs in training.",
     Callback = function(v)
         System.__properties.__auto_spam_enabled = v
         if v then prime_remote() else AutoSpam.active_until, AutoSpam.reason = 0, nil end
