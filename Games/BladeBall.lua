@@ -6,7 +6,7 @@ task.spawn(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.08-70"
+local SCRIPT_VERSION = "2026.10.08-71"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -1117,6 +1117,25 @@ if not FIRE_BODY then
     end
 end
 
+-- STACK HIDING. Executors that have setstackhidden can hide a function from
+-- anything that walks the stack (debug.info, debug.traceback, getfenv, error
+-- positions). The frameless FireServer hook already leaves nothing on the
+-- game's stack; the Namecall / Both hooks can't be frameless, so their bodies
+-- (and every wrapper we install) are hidden when the executor allows it.
+-- Without setstackhidden nothing changes.
+local stack_hidden = (function()
+    local f = rawget(getgenv(), "setstackhidden")
+    if type(f) ~= 'function' then pcall(function() f = setstackhidden end) end
+    return type(f) == 'function' and f or nil
+end)()
+local function hide(fn)
+    if not stack_hidden or type(fn) ~= 'function' then return fn end
+    if not pcall(stack_hidden, fn, true) then pcall(stack_hidden, fn) end
+    return fn
+end
+Core.stack_hiding = stack_hidden ~= nil
+hide(NC_BODY); hide(FIRE_BODY); hide(FRAMELESS)
+
 local function unhook()
     local fire, nc = H.fire, H.nc
     H.fire, H.nc, H.want, box.want = nil, nil, false, false
@@ -1139,12 +1158,12 @@ local function arm(hold)
     local method = capture_method()
     if method ~= "Namecall" and hookfunction_ and FIRE_FN then
         -- a fresh coroutine each time: a C function, no Lua frame on their stack
-        local hook_fn = getgenv().FramelessHook == false and newcclosure_(FIRE_BODY) or coroutine.wrap(FRAMELESS)
+        local hook_fn = hide(getgenv().FramelessHook == false and newcclosure_(FIRE_BODY) or coroutine.wrap(FRAMELESS))
         local ok, old = pcall(hookfunction_, FIRE_FN, hook_fn)
         if ok and type(old) == 'function' then H.fire, box.fire = old, old end
     end
     if method ~= "FireServer" and hookmetamethod_ and getnamecallmethod_ then
-        local ok, old = pcall(hookmetamethod_, game, "__namecall", newcclosure_(NC_BODY))
+        local ok, old = pcall(hookmetamethod_, game, "__namecall", hide(newcclosure_(NC_BODY)))
         if ok and type(old) == 'function' then H.nc, box.nc = old, old end
     end
     if not (H.fire or H.nc) then H.want = false; return false end
@@ -2493,7 +2512,8 @@ RunService.Heartbeat:Connect(function()
             if table.concat(prev.key, ",") ~= keystr then list[#list + 1] = "KEY" end
             changed = table.concat(list, " ")
         end
-        flight(("CAPTURED (%s hook%s): remote %s, id %s, %s server%s"):format(capture_method(), Core.isolated and ", isolated" or ", NOT isolated", tostring(cap.remote.Name), tostring(cap.uid),
+        flight(("CAPTURED (%s hook%s%s): remote %s, id %s, %s server%s"):format(capture_method(), Core.isolated and ", isolated" or ", NOT isolated",
+            Core.stack_hiding and ", stack-hidden" or "", tostring(cap.remote.Name), tostring(cap.uid),
             cap.ball2 and "UseBall2" or "normal",
             prev and (changed ~= "" and (" -- CHANGED since last capture: " .. changed) or " -- same as last capture") or ""))
     end
@@ -3987,8 +4007,9 @@ do
     local GuiService = cloneref(game:GetService('GuiService'))
     local exec = "?"
     pcall(function() exec = table.concat({identifyexecutor()}, " ") end)
-    flight(("==== v%s loaded | executor %s | place %s | userId %s"):format(
-        SCRIPT_VERSION, exec, tostring(game.PlaceId), tostring(LocalPlayer.UserId)))
+    flight(("==== v%s loaded | executor %s | place %s | userId %s | setstackhidden %s"):format(
+        SCRIPT_VERSION, exec, tostring(game.PlaceId), tostring(LocalPlayer.UserId),
+        Core.stack_hiding and "available (hook bodies hidden)" or "not available"))
     local conns = {}
     -- What happened just before a kick, in seconds: the capture hook (up /
     -- down), the fake F press, our last remote parry and spam send. Saved to
@@ -4001,8 +4022,9 @@ do
         local hooked_now = ev.hook_up and (not ev.hook_down or ev.hook_down < ev.hook_up)
         return (#parts > 0 and table.concat(parts, ", ") or "nothing sent or hooked yet")
             .. (hooked_now and " -- HOOK WAS UP" or "")
-            .. (" | capture: %s hook, %s press, disguise %s, armed %s"):format(tostring(getgenv().CaptureHook or "FireServer"),
+            .. (" | capture: %s hook, %s press, disguise %s, stack hiding %s, armed %s"):format(tostring(getgenv().CaptureHook or "FireServer"),
                 Core.capture_press_mode and Core.capture_press_mode() or "?", getgenv().HookDisguise == false and "off" or "on",
+                Core.stack_hiding and "on" or "not available",
                 Core.cap and "yes" or "no")
     end
     table.insert(conns, GuiService.ErrorMessageChanged:Connect(function(msg)
