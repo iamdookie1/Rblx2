@@ -6,7 +6,7 @@ task.spawn(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.08-83"
+local SCRIPT_VERSION = "2026.10.08-84"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -2310,10 +2310,14 @@ local function stop_points(key)
     props.__connections[key] = nil
 end
 
-function System.autoparry.start() run_every_point("__autoparry", autoparry_step, "auto parry") end
+-- getgenv().BBCoreOnly (diagnostic): when set, no feature starts its loops or
+-- connections -- only the UI and the parry core load. Lets us tell whether a
+-- startup kick comes from a feature (kick stops) or the core/UI (kick stays).
+function System.autoparry.start() if genv.BBCoreOnly then return end run_every_point("__autoparry", autoparry_step, "auto parry") end
 function System.autoparry.stop() stop_points("__autoparry") end
 function System.triggerbot.loop() triggerbot_step() end
 function System.triggerbot.enable(enabled)
+    if enabled and genv.BBCoreOnly then return end
     System.__triggerbot.__enabled = enabled
     if enabled then
         run_every_point("__triggerbot", triggerbot_step, "triggerbot")
@@ -2927,9 +2931,12 @@ local function spam_instant()
     Pump.on = true
     fire_one(source)
 end
-Remotes.ParrySuccess.OnClientEvent:Connect(function() pcall(spam_instant) end)
 System.spam_on_retarget = function() pcall(spam_instant) end
 
+-- spam loop connections (RunService + the spam_instant on ParrySuccess) are a
+-- feature, so BBCoreOnly skips them entirely.
+if not genv.BBCoreOnly then
+Remotes.ParrySuccess.OnClientEvent:Connect(function() pcall(spam_instant) end)
 do
     local last_error
     local function run(fn)
@@ -2953,6 +2960,7 @@ do
     pcall(function() conns.__spam_render = RunService.PreRender:Connect(function() run(spam_tick) end) end)
     pcall(function() conns.__spam_anim = RunService.PreAnimation:Connect(function() run(spam_tick) end) end)
 end
+end -- if not genv.BBCoreOnly (spam loop)
 
 -- ============================================================
 -- HEADLESS & KORBLOX
@@ -3479,6 +3487,7 @@ local function add_ability_esp_player(player)
 end
 
 function start_ability_esp()
+    if genv.BBCoreOnly then return end
     if abilityEspLoop then return end
     getgenv().AbilityESP = true
     for _, player in pairs(Players:GetPlayers()) do
@@ -4152,6 +4161,7 @@ do
     flight(("==== v%s loaded | executor %s | place %s | userId %s | setstackhidden %s"):format(
         SCRIPT_VERSION, exec, tostring(game.PlaceId), tostring(LocalPlayer.UserId),
         Core.stack_hiding and "ON (hook bodies hidden)" or "off"))
+    if genv.BBCoreOnly then flight("BBCoreOnly ON -- no features started, UI + parry core only") end
     -- (The SELF-CHECK that used to run here is REMOVED. It called debug.info on
     -- the game's OWN protected functions (renv.debug.info/traceback/getinfo,
     -- getfenv, setfenv, pcall, require, ...) a couple of seconds after load to
