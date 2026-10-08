@@ -6,7 +6,7 @@ task.spawn(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.08-91"
+local SCRIPT_VERSION = "2026.10.08-92"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -164,32 +164,23 @@ end
 local Core = {cap = nil, info = "not armed yet", told = false, interp = 0.14,
     ev = {}, -- last time of: hook_up, hook_down, press, remote, spam (for the kick report)
     cfg = {close_range = 20, instant = true, preparry = false, hp_close = false, hit_zone = 4, instant_range = 8, sim_dt = 1 / 120}}
--- ROUND-ONLY LISTENERS. The lobby kick (reason 24) was bisected to the
--- listeners attached at load between BBStop 0 (clean) and 1 (kicks): the
--- AnimationPlayed watcher + CharacterAdded hooks, ParrySuccess, DeathBall /
--- InfinityBall, the TimeHole / SlashesOfFury net events, Runtime.ChildAdded.
--- Every one of them only matters mid-round, so none of them is attached in the
--- lobby any more: sites register an attacher with Core.on_round, and
--- Core.round_sync (driven from the heartbeat) attaches them all when your
--- character enters Alive (or lobby training) and disconnects them all the
--- moment it leaves. Core.round_add keeps a connection only while in a round.
-Core.round = {attachers = {}, conns = {}, on = false}
-function Core.on_round(attach) table.insert(Core.round.attachers, attach) end
-function Core.round_add(c)
-    if Core.round.on then table.insert(Core.round.conns, c) else pcall(function() c:Disconnect() end) end
-end
-function Core.round_sync()
-    local R = Core.round
+-- NO LISTENERS ON THE GAME'S OBJECTS. The lobby kick (reason 24) was bisected
+-- to the listeners attached at load between BBStop 0 (clean) and 1 (kicks).
+-- Every one of them is replaced by POLLING the state those events leave
+-- behind, from the main heartbeat (the same kind of RunService connection the
+-- clean Ui3 test made) -- plain property/attribute reads, nothing connected to
+-- an animator, a remote or a folder of the game's:
+--   AnimationPlayed + ParrySuccess -> new tracks in GetPlayingAnimationTracks()
+--   CharacterAdded                 -> LocalPlayer.Character changing
+--   Runtime.ChildAdded             -> Runtime:FindFirstChild(transmission part)
+--   DeathBall / InfinityBall       -> the effect the game parents into the ball
+--   TimeHole / SlashesOfFury       -> your character's AbilityActive + ability
+-- Each site adds a function to Core.polls; they run once a frame while you're
+-- in a round (character in Alive, or lobby training) and never in the lobby.
+Core.polls = {}
+function Core.in_round()
     local char = LocalPlayer.Character
-    local want = char ~= nil and (char.Parent == Alive or LocalPlayer:GetAttribute("LobbyTraining") == true)
-    if want == R.on then return end
-    R.on = want
-    if want then
-        for _, attach in ipairs(R.attachers) do pcall(attach) end
-    else
-        for _, c in ipairs(R.conns) do pcall(function() c:Disconnect() end) end
-        R.conns = {}
-    end
+    return char ~= nil and (char.Parent == Alive or LocalPlayer:GetAttribute("LobbyTraining") == true)
 end
 local function remoteReady() return Core.cap ~= nil end
 -- Arms Remote mode by auto pressing block; defined in the parry core.
@@ -601,7 +592,7 @@ end
 -- The game's own presses (your block button, tap to block, the capture press)
 -- start its parry swing; seeing that swing start is how we know the server's
 -- lockout started without us. Our own swings are told apart by when we played
--- them. No hooks: Animator.AnimationPlayed.
+-- them. No hooks, no listeners: the animator is polled (Core.polls).
 local own_swing = setmetatable({}, {__mode = 'k'}) -- track -> when we played it
 -- When a parry lands, the game's OnParrySuccess plays {"Parry", "SuccessParryN"}:
 -- the success swing includes a track marked "Parry". That is NOT a press and
@@ -610,28 +601,50 @@ local own_swing = setmetatable({}, {__mode = 'k'}) -- track -> when we played it
 -- faster than that was held on "game lockout" and fired too late -- the swing
 -- with no parry. Tracks that start right after a ParrySuccess are skipped.
 local success_at = -math.huge
-Core.on_round(function()
-    Core.round_add(Remotes.ParrySuccess.OnClientEvent:Connect(function() success_at = os.clock() end))
-end)
-local function watch_presses(char)
-    task.spawn(function()
-        local humanoid = char:WaitForChild("Humanoid", 10)
-        local animator = humanoid and humanoid:WaitForChild("Animator", 10)
-        if not animator or not Core.round.on then return end
-        Core.round_add(animator.AnimationPlayed:Connect(function(track)
-            if track:GetAttribute("SuccessParry") then return end -- a landed parry's swing, not a press
-            if not (track:GetAttribute("Parry") or track:GetAttribute("GrabParry")) then return end
-            local now = os.clock()
-            if now - success_at < 0.35 then return end -- the success swing's Parry track
+-- POLLED, no listeners (see Core.polls): once a frame in a round, look at the
+-- animator's playing tracks. A track that just started (wasn't playing last
+-- frame, or restarted -- its TimePosition went backwards) is either the game's
+-- landed-parry swing (tagged SuccessParry -- what ParrySuccess makes the game
+-- play) or a press (Parry / GrabParry). Success swings are handled first so
+-- their own Parry track is skipped, exactly like the old ParrySuccess listener.
+-- A new character (the old CharacterAdded hook) resets the block gate.
+local last_pos = setmetatable({}, {__mode = 'k'}) -- track -> TimePosition last frame
+local polled_char
+table.insert(Core.polls, function()
+    local char = LocalPlayer.Character
+    if char ~= polled_char then
+        polled_char = char
+        gate.last, gate.landed, gate.landed_at = -math.huge, true, -math.huge
+    end
+    local humanoid = char and char:FindFirstChildOfClass("Humanoid")
+    local animator = humanoid and humanoid:FindFirstChildOfClass("Animator")
+    if not animator then return end
+    local fresh, playing = {}, {}
+    for _, track in ipairs(animator:GetPlayingAnimationTracks()) do
+        local pos, before = track.TimePosition, last_pos[track]
+        if before == nil or pos + 0.02 < before then fresh[#fresh + 1] = track end
+        playing[track] = pos
+    end
+    for track in pairs(last_pos) do if playing[track] == nil then last_pos[track] = nil end end
+    for track, pos in pairs(playing) do last_pos[track] = pos end
+    if #fresh == 0 then return end
+    local now = os.clock()
+    for _, track in ipairs(fresh) do
+        if track:GetAttribute("SuccessParry") then -- a parry landed
+            success_at = now
+            gate.landed, gate.landed_at = true, now
+            local grab = System.__properties.__grab_animation
+            if grab and char.Parent == Alive then pcall(function() grab:Stop() end) end
+        end
+    end
+    for _, track in ipairs(fresh) do
+        if not track:GetAttribute("SuccessParry") and (track:GetAttribute("Parry") or track:GetAttribute("GrabParry")) then
             local at = own_swing[track]
-            if at and now - at < 0.25 then return end
-            if Core.gate_start then Core.gate_start() end
-        end))
-    end)
-end
-Core.on_round(function()
-    if LocalPlayer.Character then watch_presses(LocalPlayer.Character) end
-    Core.round_add(LocalPlayer.CharacterAdded:Connect(watch_presses))
+            if now - success_at >= 0.35 and not (at and now - at < 0.25) then
+                if Core.gate_start then Core.gate_start() end
+            end
+        end
+    end
 end)
 
 local function play_block()
@@ -679,15 +692,8 @@ end
 
 -- Our own block landed: the next block can start straight away (the game plays
 -- the success swing itself).
-Core.on_round(function()
-    gate.last, gate.landed, gate.landed_at = -math.huge, true, -math.huge -- fresh round
-    Core.round_add(Remotes.ParrySuccess.OnClientEvent:Connect(function()
-        gate.landed, gate.landed_at = true, os.clock()
-    end))
-    Core.round_add(LocalPlayer.CharacterAdded:Connect(function()
-        gate.last, gate.landed, gate.landed_at = -math.huge, true, -math.huge
-    end))
-end)
+-- (Our block landing / a new character resetting this gate are read by the
+-- animation poll above -- no ParrySuccess or CharacterAdded listener.)
 
 -- The block swing that goes with our parries, through play_block's gate (the
 -- fix from 54757b6 / a7882af / 760eaa1): it never cuts the game's success swing
@@ -855,33 +861,37 @@ local function isLocal(player)
     return player == LocalPlayer or player == LocalPlayer.Name or (typeof(player) == 'Instance' and player.Name == LocalPlayer.Name)
 end
 
-Core.on_round(function()
-    System.__properties.__deathslash_active, System.__properties.__infinity_active = false, false -- fresh round
-    pcall(function()
-        Core.round_add(Remotes.DeathBall.OnClientEvent:Connect(function(c, d) System.__properties.__deathslash_active = d or false end))
-    end)
-    pcall(function()
-        Core.round_add(Remotes.InfinityBall.OnClientEvent:Connect(function(a, b) System.__properties.__infinity_active = b or false end))
-    end)
+-- Death Slash / Infinity, POLLED (no DeathBall / InfinityBall listener): while
+-- either is active the game parents its effect into the ball --
+-- DEATHSLASHHHHH / WEMAZOOKIEGO (BallReplicationHandler) -- so read that.
+table.insert(Core.polls, function()
+    local death, inf = false, false
+    for _, name in ipairs({"Balls", "TrainingBalls"}) do
+        local folder = Workspace:FindFirstChild(name)
+        if folder then
+            for _, ball in ipairs(folder:GetChildren()) do
+                if ball:FindFirstChild("DEATHSLASHHHHH") then death = true end
+                if ball:FindFirstChild("WEMAZOOKIEGO") then inf = true end
+            end
+        end
+    end
+    System.__properties.__deathslash_active, System.__properties.__infinity_active = death, inf
 end)
 
 -- BBStop checkpoint 1b (diagnostic).
 if genv.BBStop == "1b" then flight("BBStop 1b: stopped after the DeathBall/InfinityBall listeners, before the onNet listeners") return end
 
-local net
-pcall(function() net = ReplicatedStorage.Packages._Index["sleitnick_net@0.1.0"].net end)
-local function onNet(name, fn)
-    Core.on_round(function()
-        pcall(function() Core.round_add(net[name].OnClientEvent:Connect(fn)) end)
-    end)
+-- Time Hole / Slashes of Fury are YOUR abilities: the server sets AbilityActive
+-- on your character for the ability's duration (Shared.Abilities), so poll that
+-- with your equipped ability instead of listening to the TimeHole /
+-- SlashesOfFury net events.
+local function own_ability_active(name)
+    local char = LocalPlayer.Character
+    if not (char and char:GetAttribute("AbilityActive")) then return false end
+    local equipped = LocalPlayer:GetAttribute("AbilityOverride") or LocalPlayer:GetAttribute("EquippedAbility")
+        or char:GetAttribute("Ability")
+    return equipped == name
 end
-
-onNet("RE/TimeHoleActivate", function(player)
-    if isLocal(player) then System.__properties.__timehole_active = true end
-end)
-onNet("RE/TimeHoleDeactivate", function()
-    System.__properties.__timehole_active = false
-end)
 
 local maxParryCount = 36; local parryDelay = 0.05
 -- One loop at a time, driven locally so it works even if the server is slow to
@@ -913,31 +923,30 @@ local function runSlashesLoop()
         slashesLoopRunning = false
     end)
 end
-onNet("RE/SlashesOfFuryActivate", function(player)
-    if isLocal(player) then
-        System.__properties.__slashesoffury_active = true
-        System.__properties.__slashesoffury_count = 0
+-- Polled each frame in a round: Time Hole on/off, and Slashes of Fury's start
+-- (runs the loop, which caps itself at maxParryCount) and end.
+table.insert(Core.polls, function()
+    local props = System.__properties
+    props.__timehole_active = own_ability_active("Time Hole")
+    local slashes = own_ability_active("Slashes of Fury")
+    if slashes and not props.__slashesoffury_active then
+        props.__slashesoffury_active, props.__slashesoffury_count = true, 0
         runSlashesLoop()
+    elseif not slashes and props.__slashesoffury_active then
+        props.__slashesoffury_active, props.__slashesoffury_count = false, 0
+        slashesLoopRunning = false
     end
-end)
-onNet("RE/SlashesOfFuryEnd", function()
-    System.__properties.__slashesoffury_active = false
-    System.__properties.__slashesoffury_count = 0
-    slashesLoopRunning = false
-end)
-onNet("RE/SlashesOfFuryParry", function()
-    System.__properties.__slashesoffury_count = System.__properties.__slashesoffury_count + 1
-end)
-onNet("RE/SlashesOfFuryCatch", function()
-    runSlashesLoop()
 end)
 
 -- BBStop checkpoint 1c (diagnostic).
 if genv.BBStop == "1c" then flight("BBStop 1c: stopped after the onNet (TimeHole/SlashesOfFury) listeners, before Runtime.ChildAdded + the ParrySuccess listener") return end
 
-Core.on_round(function() Core.round_add(Runtime.ChildAdded:Connect(function(Object)
+-- Phantom, POLLED (no Runtime.ChildAdded listener): the transmission part shows
+-- up in Runtime welded to you; once its weld is destroyed it's never re-matched.
+table.insert(Core.polls, function()
     if not System.__config.__detections.__phantom then return end
-    if Object.Name ~= "maxTransmission" and Object.Name ~= "transmissionpart" then return end
+    local Object = Runtime:FindFirstChild("maxTransmission") or Runtime:FindFirstChild("transmissionpart")
+    if not Object then return end
     local Weld = Object:FindFirstChildWhichIsA("WeldConstraint")
     local root = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
     if not Weld or not root or Weld.Part1 ~= root then return end
@@ -953,12 +962,9 @@ Core.on_round(function() Core.round_add(Runtime.ChildAdded:Connect(function(Obje
         elseif Highlighted == false then FocusConnection:Disconnect() end
     end)
     task.delay(3, function() if FocusConnection and FocusConnection.Connected then FocusConnection:Disconnect() end end)
-end)) end)
-
-Core.on_round(function() Core.round_add(Remotes.ParrySuccess.OnClientEvent:Connect(function()
-    if not LocalPlayer.Character or LocalPlayer.Character.Parent ~= Alive then return end
-    if System.__properties.__grab_animation then System.__properties.__grab_animation:Stop() end
-end)) end)
+end)
+-- (Stopping our grab swing when a parry lands is done by the animation poll --
+-- no ParrySuccess listener here.)
 
 -- BBStop checkpoint 1 (diagnostic): getgenv().BBStop = 1 stops loading here.
 if genv.BBStop == 1 then flight("BBStop 1: stopped before the parry core (UI, services, animation hooks, ability listeners ran)") return end
@@ -1596,7 +1602,7 @@ local function send(curveCF, spam)
     if not cap.remote.Parent then Core.cap = nil; return "unarmed" end
     -- The game's lockout: a parry that didn't land locks parrying for n2
     -- (1.3s); one sent inside it plays the swing and does nothing. (The old
-    -- false lockout after every landed parry is fixed -- see watch_presses.)
+    -- false lockout after every landed parry is fixed -- see the animation poll.)
     -- Spam still goes through it.
     if not spam and not gate_open() then return "blocked" end
     local window = parry_window()
@@ -2689,8 +2695,11 @@ RunService.Heartbeat:Connect(function()
     -- time you can actually parry -- never in the lobby, where requiring a game
     -- module with our frame on its stack is a needless kick risk
     if not Win.started and canParryNow() then Win.load() end
-    -- attach the round-only listeners when you enter a round, drop them in the lobby
-    Core.round_sync()
+    -- read the state the old game listeners used to watch (see Core.polls) --
+    -- only while you're in a round; nothing runs against the game in the lobby
+    if Core.in_round() then
+        for _, poll in ipairs(Core.polls) do pcall(poll) end
+    end
     if not Core.cap then
         Core.told = false
         -- a hook-free recipe, if one was ever completed
@@ -4246,10 +4255,7 @@ end)
 -- The next copy calls this before it starts.
 genv.__BladeBallShutdown = function()
     pcall(function() Core.unhook() end)
-    pcall(function()
-        for _, c in ipairs(Core.round.conns) do pcall(function() c:Disconnect() end) end
-        Core.round.conns, Core.round.on, Core.round.attachers = {}, false, {}
-    end)
+    Core.polls = {}
     pcall(function() Library:Unload() end)
     if genv.__BladeBallInstance == INSTANCE then genv.__BladeBallInstance = nil end
 end
