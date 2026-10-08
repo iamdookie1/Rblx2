@@ -6,7 +6,7 @@ task.spawn(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.07-55"
+local SCRIPT_VERSION = "2026.10.08-56"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -159,7 +159,7 @@ end
 -- The parry core's shared state (see "PARRY CORE" further down). Declared here
 -- so the animation code and the UI, defined before the core, can reach it.
 local Core = {cap = nil, info = "not armed yet", told = false, interp = 0.14,
-    cfg = {close_range = 20, instant = true, preparry = false, hp_close = true, backup = true, hit_zone = 4, instant_range = 8, sim_dt = 1 / 120}}
+    cfg = {close_range = 20, instant = true, preparry = false, hp_close = true, hit_zone = 4, instant_range = 8, sim_dt = 1 / 120}}
 local function remoteReady() return Core.cap ~= nil end
 -- Arms Remote mode by auto pressing block; defined in the parry core.
 local prime_remote
@@ -556,6 +556,16 @@ end
 -- lockout started without us. Our own swings are told apart by when we played
 -- them. No hooks: Animator.AnimationPlayed.
 local own_swing = setmetatable({}, {__mode = 'k'}) -- track -> when we played it
+-- When a parry lands, the game's OnParrySuccess plays {"Parry", "SuccessParryN"}:
+-- the success swing includes a track marked "Parry". That is NOT a press and
+-- starts no lockout (the game clears its lockout on success). Before v56 it was
+-- read as one: every landed parry locked auto parry for 1.3s, so any return
+-- faster than that was held on "game lockout" and fired too late -- the swing
+-- with no parry. Tracks that start right after a ParrySuccess are skipped.
+local success_at = -math.huge
+pcall(function()
+    Remotes.ParrySuccess.OnClientEvent:Connect(function() success_at = os.clock() end)
+end)
 local function watch_presses(char)
     task.spawn(function()
         local humanoid = char:WaitForChild("Humanoid", 10)
@@ -564,8 +574,10 @@ local function watch_presses(char)
         animator.AnimationPlayed:Connect(function(track)
             if track:GetAttribute("SuccessParry") then return end -- a landed parry's swing, not a press
             if not (track:GetAttribute("Parry") or track:GetAttribute("GrabParry")) then return end
+            local now = os.clock()
+            if now - success_at < 0.35 then return end -- the success swing's Parry track
             local at = own_swing[track]
-            if at and os.clock() - at < 0.25 then return end
+            if at and now - at < 0.25 then return end
             if Core.gate_start then Core.gate_start() end
         end)
     end)
@@ -1244,7 +1256,6 @@ local function open_pass(st, now)
     st.pass_id, st.pass_open = pass_counter, true
     st.parried, st.landed, st.parry_until, st.why = false, false, 0, nil
     st.reached_at, st.trn, st.spd = nil, nil, nil
-    st.follow_until, st.follow_n = nil, 0
     -- a pre-parry fired while the ball was on its last holder is this pass's parry
     if st.preparried then
         st.parried, st.parry_until = true, st.preparry_until
@@ -1269,7 +1280,6 @@ get_ball_state = function(ball)
         st.target = new
         if type(new) == 'string' and new ~= '' and new ~= me then
             st.pass_open, st.parried, st.landed = false, false, false
-            st.follow_until = nil
         end
         if new == me and not st.pass_open then
             open_pass(st, now)
@@ -1368,12 +1378,11 @@ Remotes.ParrySuccess.OnClientEvent:Connect(function()
         if lp.info.eta < 0.9 and took < 1 then
             Core.interp = math.clamp(Core.interp * 0.7 + sample * 0.3, 0.02, 0.3)
         end
-        flight(("  -> landed %.3fs after the %s (view lag now %.3fs, backups sent %d)"):format(took, lp.via, Core.interp,
-            lp.st and lp.st.follow_n or 0))
+        flight(("  -> landed %.3fs after the %s (view lag now %.3fs)"):format(took, lp.via, Core.interp))
     end
     Core.pending, Core.misses = nil, 0
     for _, st in pairs(tracked) do
-        if st.target == me and st.pass_open then st.landed, st.follow_until = true, nil end
+        if st.target == me and st.pass_open then st.landed = true end
     end
 end)
 pcall(function()
@@ -1648,27 +1657,24 @@ local function mark_parried(st, now)
 end
 
 local function fire_for(st, now, via, info)
+    local held_by = st.why -- what the last frame was waiting on
     ParryLog.source = via
     local ok
     if try_ability() then log_send("ability"); ok = true
     else ok = System.parry.by_mode(getgenv().AutoParryMode) end
     ParryLog.source = nil
     if not ok then st.why = "couldn't send yet, retrying"; return false end
-    -- Backup parries: the server sometimes doesn't take a single parry packet
-    -- (the swing plays, nothing happens) while spam, sending one a frame, lands
-    -- at once. So after the timed parry, keep sending one quiet parry a frame
-    -- (no swing, past the press gate like spam) until it lands, the ball goes
-    -- to someone else, or the ball is well past when it was due.
-    if cfg.backup and getgenv().AutoParryMode ~= "Keypress" and Core.cap then
-        local due = info and info.eta or 0.3
-        st.follow_until = now + math.clamp(due + reach_time() + 0.15, 0.25, 1.2)
-        st.follow_last, st.follow_n = now, 0
-    end
     if info then
-        Core.last_parry = {t = now, via = via, info = info, st = st}
+        Core.last_parry = {t = now, via = via, info = info}
         flight(("%s: eta %.3fs, fires at %.3fs, %.0f st/s, %.1f studs, heading %.2f, line %.1f, ping %.0fms, window %.3f, view lag %.3f"):format(
             via, info.eta, info.lead, info.speed, info.dist, info.heading or 0, math.min(info.miss or 0, 999), pingMs(),
             parry_window() or -1, Core.interp))
+        -- A parry fired after the ball is already inside our reach can't be up
+        -- in time: say so, and what held it until then.
+        local reach = reach_time()
+        if info.eta < reach - 0.02 then
+            flight(("  ** LATE by %.3fs (reach %.3fs) -- was waiting on: %s"):format(reach - info.eta, reach, tostring(held_by)))
+        end
     end
     mark_parried(st, now)
     st.why = via == "auto parry" and "parried" or ("parried (" .. via .. ")")
@@ -1683,22 +1689,6 @@ local function pass_busy(st, now)
         st.parried = false -- ran out without landing: live again
     end
     return nil
-end
-
--- One backup parry a frame for a pass whose timed parry hasn't landed yet.
-local function follow_tick(st, now)
-    local until_t = st.follow_until
-    if not until_t then return end
-    if st.landed or st.target ~= me or now >= until_t then st.follow_until = nil; return end
-    if now - (st.follow_last or 0) < frame_dt() * 0.9 then return end
-    if props.__manual_spam_enabled then return end -- spam is already sending
-    if blocked_by_detection() then return end
-    st.follow_last = now
-    local prev = ParryLog.source
-    ParryLog.source = "auto spam" -- counted with spam, not as parries
-    local ok = System.parry.fast()
-    ParryLog.source = prev
-    if ok then st.follow_n = (st.follow_n or 0) + 1 end
 end
 
 local function autoparry_root()
@@ -1843,12 +1833,7 @@ local function autoparry_step()
             ball.AeroDynamicSlashVFX:Destroy(); props.__tornado_time = tick()
         end
         local st = get_ball_state(ball)
-        if st.target == me then
-            follow_tick(st, now)
-            decide(ball, st, root, now)
-        else
-            try_preparry(ball, st, root, now)
-        end
+        if st.target == me then decide(ball, st, root, now) else try_preparry(ball, st, root, now) end
     end
 end
 
@@ -1856,10 +1841,7 @@ local function triggerbot_step()
     if not System.__triggerbot.__enabled then return end
     for _, ball in ipairs(get_live_balls()) do
         local st = get_ball_state(ball)
-        if st.target == me then
-            follow_tick(st, clock_())
-            trigger(ball, st)
-        end
+        if st.target == me then trigger(ball, st) end
     end
 end
 
@@ -3340,9 +3322,6 @@ AP:AddSlider("CloseRange", {Text = "Pre-parry range", Default = 20, Min = 8, Max
 AP:AddToggle("InstantRetarget", {Text = "Instant parry on retarget", Default = true,
     Tooltip = "Parries straight off the ball switching to you when there's no time to wait: it lands within a round trip, or it's point blank. Anything with more time is timed normally.",
     Callback = function(v) Core.cfg.instant = v end})
-AP:AddToggle("BackupParries", {Text = "Backup parries", Default = true,
-    Tooltip = "After auto parry / retarget / triggerbot fires, keeps sending one quiet parry a frame (no extra swing) until it lands or the ball leaves. Fixes the swing playing with no parry. Remote mode only.",
-    Callback = function(v) Core.cfg.backup = v end})
 AP:AddToggle("HighPingClose", {Text = "High ping close range", Default = true,
     Tooltip = "At 80ms+ ping: when a player next to you is about to hit the ball and their return would beat your ping, parries ahead so it's up in time (only then). Timed by Accuracy / Timing multiplier like any parry.",
     Callback = function(v) Core.cfg.hp_close = v end})
