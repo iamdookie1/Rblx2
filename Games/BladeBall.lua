@@ -6,7 +6,7 @@ task.spawn(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.08-65"
+local SCRIPT_VERSION = "2026.10.08-66"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -1023,8 +1023,13 @@ local box = {want = false, nc = nil, fire = nil, list = {}, ws = Workspace, now 
 local HOOK_NAME = "=ReplicatedStorage.Packages._Index.sleitnick_net@0.1.0.net"
 -- One line each, like the game's obfuscated modules (every frame reports line
 -- 1), compiled under the Net module's chunk name.
-local NC_SRC = "local b,g,s=... return function(self,...) if s('#',...)>=6 and b.want and g()=='FireServer' then local l=b.list if #l<4 then l[#l+1]={self,s('#',...),{...},b.now(b.ws)} end end return b.nc(self,...) end"
-local FIRE_SRC = "local b,s=... return function(self,...) if s('#',...)>=6 and b.want then local l=b.list if #l<4 then l[#l+1]={self,s('#',...),{...},b.now(b.ws)} end end return b.fire(self,...) end"
+-- Tamper reports: the game's parry sender reports a tripped check home over
+-- the parry remote itself, as FireServer(JobId, <magic>, ...). While the hook
+-- is up such a send (JobId first) is dropped, not passed on -- so even if
+-- something about the hook trips a check during a capture, the report never
+-- reaches the server. Real parries start with the BAC hash, never the JobId.
+local NC_SRC = "local b,g,s,j=... return function(self,...) local a=... if a==j and g()=='FireServer' then return end if s('#',...)>=6 and b.want and g()=='FireServer' then local l=b.list if #l<4 then l[#l+1]={self,s('#',...),{...},b.now(b.ws)} end end return b.nc(self,...) end"
+local FIRE_SRC = "local b,s,j=... return function(self,...) local a=... if a==j then return end if s('#',...)>=6 and b.want then local l=b.list if #l<4 then l[#l+1]={self,s('#',...),{...},b.now(b.ws)} end end return b.fire(self,...) end"
 -- The bodies' environment looks like the Net module's own: the game's globals
 -- (getrenv, no writefile -- nothing of the executor's), and `script` set to
 -- the real Net ModuleScript, like every function compiled from that module.
@@ -1052,12 +1057,14 @@ end
 -- The disguise is ON by default (getgenv().HookDisguise = false turns it off):
 -- in play, the hook without it got kicked on the first try.
 local disguise = getgenv().HookDisguise ~= false
-local NC_BODY = disguise and build_body(NC_SRC, box, getnamecallmethod_ or function() return nil end, select) or nil
-local FIRE_BODY = disguise and build_body(FIRE_SRC, box, select) or nil
+local NC_BODY = disguise and build_body(NC_SRC, box, getnamecallmethod_ or function() return nil end, select, JOB_ID) or nil
+local FIRE_BODY = disguise and build_body(FIRE_SRC, box, select, JOB_ID) or nil
 Core.isolated = NC_BODY ~= nil and FIRE_BODY ~= nil
 -- Plain bodies (disguise off, or no loadstring on this executor).
 if not NC_BODY then
     NC_BODY = function(self, ...)
+        local a = ...
+        if a == JOB_ID and getnamecallmethod_() == "FireServer" then return end -- tamper report: dropped
         if select_("#", ...) >= 6 and box.want and getnamecallmethod_() == "FireServer" then
             local l = box.list
             if #l < 4 then l[#l + 1] = {self, select_("#", ...), {...}, box.now(box.ws)} end
@@ -1067,6 +1074,8 @@ if not NC_BODY then
 end
 if not FIRE_BODY then
     FIRE_BODY = function(self, ...)
+        local a = ...
+        if a == JOB_ID then return end -- tamper report: dropped
         if select_("#", ...) >= 6 and box.want then
             local l = box.list
             if #l < 4 then l[#l + 1] = {self, select_("#", ...), {...}, box.now(box.ws)} end
@@ -1409,6 +1418,10 @@ Remotes.ParrySuccess.OnClientEvent:Connect(function()
         flight(("  -> landed %.3fs after the %s (view lag now %.3fs)"):format(took, lp.via, Core.interp))
     end
     Core.pending, Core.misses = nil, 0
+    if Core.cap and Core.cap.saved and not Core.saved_confirmed then
+        Core.saved_confirmed = true
+        flight("SAVED CAPTURE WORKS on this server -- no hook used")
+    end
     for _, st in pairs(tracked) do
         if st.target == me and st.pass_open then st.landed = true end
     end
@@ -2227,6 +2240,48 @@ local function hashed_remotes()
     return list
 end
 
+-- SAVED CAPTURE: hook once per account, not once per server. The parry's id
+-- (packet arg 2) is a fixed string per account and its key comes from it;
+-- the hash is the server's _G.BAC_HASH and the remote is the one hashed
+-- RemoteEvent in Net -- both readable without a hook. So after a hook capture
+-- the id and key are saved (BladeBall/capture.json), and every later server
+-- arms from them with no hook and no press. If its first parries go
+-- unanswered twice before one lands, that server falls back to the hook
+-- capture (which then saves the new values).
+local CAPTURE_FILE = SAVE_FOLDER .. "/capture.json"
+local function load_saved()
+    local ok, r = pcall(function() return HttpService:JSONDecode(readfile(CAPTURE_FILE)) end)
+    if ok and type(r) == 'table' and type(r.uid) == 'string' and type(r.key) == 'table' and #r.key >= 8 then return r end
+    return nil
+end
+Core.saved = load_saved()
+local function save_capture(cap)
+    if cap.hookfree or getgenv().BladeBallNoLog then return end
+    local hash_is_bac = false
+    pcall(function() hash_is_bac = getrenv()._G.BAC_HASH == cap.hash end)
+    local hr = hashed_remotes()
+    if not hash_is_bac or #hr ~= 1 or hr[1] ~= cap.remote then
+        flight("capture NOT saved: the hash or remote can't be found without the hook on this server")
+        return
+    end
+    local rec = {uid = cap.uid, key = cap.key, ball2 = cap.ball2, t = os.time()}
+    pcall(function() ensureSaveFolder(); writefile(CAPTURE_FILE, HttpService:JSONEncode(rec)) end)
+    Core.saved = rec
+end
+local function build_from_saved()
+    local sv = Core.saved
+    if not sv or Core.saved_off then return nil end
+    local hr = hashed_remotes()
+    if #hr ~= 1 then return nil end
+    local hash
+    pcall(function() hash = getrenv()._G.BAC_HASH end)
+    if type(hash) ~= 'string' or #hash ~= 36 then return nil end
+    local text = tostring(math.floor(Workspace:GetServerTimeNow() * 100))
+    if #text ~= #sv.key then return nil end
+    return {remote = hr[1], hash = hash, uid = sv.uid, key = sv.key, len = #sv.key, ball2 = sv.ball2 == true,
+        hookfree = true, saved = true}
+end
+
 -- Watch incoming remote events for a value (id or key), for the rest of the
 -- session. found(desc, value) is called the first time it shows up.
 local function find_path(v, pred, path, depth)
@@ -2371,7 +2426,18 @@ RunService.Heartbeat:Connect(function()
     if not is_live() then return end
     if not Core.cap then
         Core.told = false
-        -- the recipe first: no hook, nothing pressed
+        -- the saved capture first: no hook, nothing pressed
+        if Core.saved and not Core.saved_off and clock_() - (Core.sv_try or 0) > 1 then
+            Core.sv_try = clock_()
+            local cap = build_from_saved()
+            if cap then
+                Core.cap = cap
+                Core.misses, Core.pending = 0, nil
+                flight(("ARMED FROM SAVED CAPTURE (no hook): remote %s, id %s"):format(cap.remote.Name:sub(1, 12), cap.uid))
+                return
+            end
+        end
+        -- then a hook-free recipe, if one was ever completed
         if Core.recipe and Core.recipe.complete and not Core.hookfree_off and clock_() - (Core.hf_try or 0) > 1 then
             Core.hf_try = clock_()
             local cap = build_hookfree()
@@ -2405,6 +2471,12 @@ RunService.Heartbeat:Connect(function()
         -- version that got kicked least, and it never found the key anyway.
         -- A recipe file that is already complete is still used.)
         local keystr = table.concat(cap.key, ",")
+        local sv = Core.saved
+        if sv and not cap.hookfree then
+            local same_id, same_key = sv.uid == cap.uid, table.concat(sv.key, ",") == keystr
+            flight(("vs the saved capture: id %s, key %s"):format(same_id and "SAME" or "CHANGED", same_key and "SAME" or "CHANGED"))
+        end
+        save_capture(cap)
         local changed
         if prev then
             local list = {}
@@ -2422,7 +2494,11 @@ RunService.Heartbeat:Connect(function()
         Core.pending, Core.misses = nil, (Core.misses or 0) + 1
         local lp = Core.last_parry
         flight(("  -> NO answer to the %s (miss %d in a row)"):format(lp and lp.via or "parry", Core.misses))
-        if Core.cap.hookfree and Core.misses >= 2 then
+        if Core.cap.saved and Core.misses >= 2 and not Core.saved_confirmed then
+            Core.saved_off, Core.cap = true, nil
+            flight("saved capture unanswered twice on this server: capturing with the hook here")
+            Notify("Blade Ball", "Saved capture didn't work on this server; capturing with the hook.", 5)
+        elseif Core.cap.hookfree and not Core.cap.saved and Core.misses >= 2 then
             Core.hookfree_off, Core.cap, learned = true, nil, false
             flight("hook-free parries unanswered twice: back to the hook capture for this server (re-learning)")
             Notify("Blade Ball", "No-hook mode didn't work on this server; capturing with the hook instead.", 5)
