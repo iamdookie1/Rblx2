@@ -6,7 +6,7 @@ task.spawn(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.08-69"
+local SCRIPT_VERSION = "2026.10.08-70"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -961,7 +961,7 @@ local H = {fire = nil, nc = nil, want = false, until_t = 0}
 --   "FireServer"-- the FireServer function only (catches f(remote, ...) sends)
 --   "Both"      -- both, so every press captures
 -- Each alone sees about half the game's sends, so it can take two presses.
-local function capture_method() return getgenv().CaptureHook or "Namecall" end
+local function capture_method() return getgenv().CaptureHook or "FireServer" end
 Core.capture_method = capture_method
 
 -- __namecall goes back exactly: the original function object written straight
@@ -1062,6 +1062,37 @@ local disguise = getgenv().HookDisguise ~= false
 local NC_BODY = disguise and build_body(NC_SRC, box, getnamecallmethod_ or function() return nil end, select, JOB_ID) or nil
 local FIRE_BODY = disguise and build_body(FIRE_SRC, box, select, JOB_ID) or nil
 Core.isolated = NC_BODY ~= nil and FIRE_BODY ~= nil
+-- FRAMELESS FireServer hook. Any hook written in Lua puts a Lua frame on the
+-- game's call stack while the call passes through it -- the one thing a
+-- stack check always sees, whatever the frame is named. This one doesn't:
+-- the hook installed on FireServer is coroutine.wrap(...), a real C function,
+-- and our code runs on a separate coroutine. The game's stack shows a single
+-- C call, exactly like the real FireServer, and no newcclosure is involved.
+-- Each call resumes the coroutine with the arguments; it records a parry,
+-- drops a tamper report (JobId first), passes everything else to the real
+-- FireServer, and yields back nothing (FireServer returns nothing). Errors
+-- from the real call are caught inside so the coroutine never dies.
+-- (Only dot-call sends reach FireServer's function; the game's namecall sends
+-- don't, so a capture may take a second press.)
+local FRAMELESS_SRC = "local b,s,j,y,pc,up=... local function pk(...) return {...},s('#',...) end return function(...) local a,n=pk(...) while true do if a[2]~=j then if n>=7 and b.want then local l=b.list if #l<4 then l[#l+1]={a[1],n-1,{up(a,2,n)},b.now(b.ws)} end end pc(b.fire,up(a,1,n)) end a,n=pk(y()) end end"
+local FRAMELESS = disguise and build_body(FRAMELESS_SRC, box, select, JOB_ID, coroutine.yield, pcall, table.unpack) or nil
+if not FRAMELESS then
+    FRAMELESS = function(...)
+        local function pk(...) return {...}, select_("#", ...) end
+        local a, n = pk(...)
+        while true do
+            if a[2] ~= JOB_ID then
+                if n >= 7 and box.want then
+                    local l = box.list
+                    if #l < 4 then l[#l + 1] = {a[1], n - 1, {table.unpack(a, 2, n)}, box.now(box.ws)} end
+                end
+                pcall_(box.fire, table.unpack(a, 1, n))
+            end
+            a, n = pk(coroutine.yield())
+        end
+    end
+end
+
 -- Plain bodies (disguise off, or no loadstring on this executor).
 if not NC_BODY then
     NC_BODY = function(self, ...)
@@ -1107,7 +1138,9 @@ local function arm(hold)
     box.list = {}
     local method = capture_method()
     if method ~= "Namecall" and hookfunction_ and FIRE_FN then
-        local ok, old = pcall(hookfunction_, FIRE_FN, newcclosure_(FIRE_BODY))
+        -- a fresh coroutine each time: a C function, no Lua frame on their stack
+        local hook_fn = getgenv().FramelessHook == false and newcclosure_(FIRE_BODY) or coroutine.wrap(FRAMELESS)
+        local ok, old = pcall(hookfunction_, FIRE_FN, hook_fn)
         if ok and type(old) == 'function' then H.fire, box.fire = old, old end
     end
     if method ~= "FireServer" and hookmetamethod_ and getnamecallmethod_ then
@@ -1161,12 +1194,11 @@ end
 -- lockout and really sends. The press is a real parry, so it's never wasted.
 local last_press = -100
 -- Capture press: "Auto" presses F itself; "Own" waits for your own tap on the
--- block button (no synthetic input at all -- the fake F is a keyboard event
--- on a phone with no keyboard). Default: Own on mobile, Auto elsewhere.
+-- block button (no synthetic input). Default: Auto (F) on every device.
 local function capture_press_mode()
     local m = getgenv().CapturePress
     if m == "Auto" or m == "Own" then return m end
-    return isMobile and "Own" or "Auto"
+    return "Auto"
 end
 Core.capture_press_mode = capture_press_mode
 prime_remote = function()
@@ -3515,10 +3547,10 @@ AP:AddToggle("AutoParry", {Text = "Auto parry", Default = false, Callback = func
     if v then System.autoparry.start(); prime_remote() else System.autoparry.stop() end
     NotifyToggle("Auto Parry", v)
 end}):AddKeyPicker("AutoParryKey", {Default = "None", Mode = "Toggle", SyncToggleState = true, Text = "Auto parry"})
-AP:AddDropdown("CaptureHook", {Text = "Capture hook", Values = {"Namecall", "FireServer", "Both"}, Default = "Namecall",
-    Tooltip = "Which hook catches the one parry packet Remote mode needs (up for that press only). Namecall or FireServer alone may take two presses; Both arms in one. The flight log notes which one was on for every capture and kick.",
+AP:AddDropdown("CaptureHook", {Text = "Capture hook", Values = {"FireServer", "Namecall", "Both"}, Default = "FireServer",
+    Tooltip = "FireServer (default): frameless -- the hook is a real C function and its code runs on a separate coroutine, so nothing of ours is ever on the game's call stack. Catches the game's dot-call sends, so a capture can take a second press. Namecall / Both also catch the namecall sends but put a (disguised) Lua frame on the stack while up.",
     Callback = function(v) getgenv().CaptureHook = v end})
-AP:AddDropdown("CapturePress", {Text = "Capture press", Values = {"Own", "Auto"}, Default = isMobile and "Own" or "Auto",
+AP:AddDropdown("CapturePress", {Text = "Capture press", Values = {"Auto", "Own"}, Default = "Auto",
     Tooltip = "How the one capture per server is triggered. Own: your own tap on the block button (no fake input at all). Auto: the script presses F for you (a fake keyboard event -- on a phone that's keyboard input from a device with no keyboard).",
     Callback = function(v) getgenv().CapturePress = v end})
 AP:AddDropdown("ParryMode", {Text = "Parry mode", Values = {"Remote", "Keypress"}, Default = "Remote",
@@ -3969,7 +4001,7 @@ do
         local hooked_now = ev.hook_up and (not ev.hook_down or ev.hook_down < ev.hook_up)
         return (#parts > 0 and table.concat(parts, ", ") or "nothing sent or hooked yet")
             .. (hooked_now and " -- HOOK WAS UP" or "")
-            .. (" | capture: %s hook, %s press, disguise %s, armed %s"):format(tostring(getgenv().CaptureHook or "Namecall"),
+            .. (" | capture: %s hook, %s press, disguise %s, armed %s"):format(tostring(getgenv().CaptureHook or "FireServer"),
                 Core.capture_press_mode and Core.capture_press_mode() or "?", getgenv().HookDisguise == false and "off" or "on",
                 Core.cap and "yes" or "no")
     end
