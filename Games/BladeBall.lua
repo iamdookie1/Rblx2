@@ -6,7 +6,7 @@ task.spawn(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.08-73"
+local SCRIPT_VERSION = "2026.10.08-74"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -1074,8 +1074,13 @@ Core.isolated = NC_BODY ~= nil and FIRE_BODY ~= nil
 -- from the real call are caught inside so the coroutine never dies.
 -- (Only dot-call sends reach FireServer's function; the game's namecall sends
 -- don't, so a capture may take a second press.)
-local FRAMELESS_SRC = "local b,s,j,y,pc,up=... local function pk(...) return {...},s('#',...) end return function(...) local a,n=pk(...) while true do if a[2]~=j then if n>=7 and b.want then local l=b.list if #l<4 then l[#l+1]={a[1],n-1,{up(a,2,n)},b.now(b.ws)} end end pc(b.fire,up(a,1,n)) end a,n=pk(y()) end end"
-local FRAMELESS = disguise and build_body(FRAMELESS_SRC, box, select, JOB_ID, coroutine.yield, pcall, table.unpack) or nil
+-- Errors: the real FireServer is called through pcall, so its error message
+-- carries no position of ours; on an error the hook re-arms a fresh coroutine
+-- (this one is about to die) and re-raises it at level 0, and coroutine.wrap
+-- adds the CALLER's position -- the same message a real FireServer error has.
+-- (v70 swallowed errors: a deliberate bad call would have "succeeded".)
+local FRAMELESS_SRC = "local b,s,j,y,pc,up,er=... local function pk(...) return {...},s('#',...) end return function(...) local a,n=pk(...) while true do if a[2]~=j then if n>=7 and b.want then local l=b.list if #l<4 then l[#l+1]={a[1],n-1,{up(a,2,n)},b.now(b.ws)} end end local ok,e=pc(b.fire,up(a,1,n)) if not ok then b.rearm() er(e,0) end end a,n=pk(y()) end end"
+local FRAMELESS = disguise and build_body(FRAMELESS_SRC, box, select, JOB_ID, coroutine.yield, pcall, table.unpack, error) or nil
 if not FRAMELESS then
     FRAMELESS = function(...)
         local function pk(...) return {...}, select_("#", ...) end
@@ -1086,7 +1091,8 @@ if not FRAMELESS then
                     local l = box.list
                     if #l < 4 then l[#l + 1] = {a[1], n - 1, {table.unpack(a, 2, n)}, box.now(box.ws)} end
                 end
-                pcall_(box.fire, table.unpack(a, 1, n))
+                local ok, e = pcall_(box.fire, table.unpack(a, 1, n))
+                if not ok then box.rearm(); error(e, 0) end
             end
             a, n = pk(coroutine.yield())
         end
@@ -1162,6 +1168,9 @@ local function arm(hold)
     local method = capture_method()
     if method ~= "Namecall" and hookfunction_ and FIRE_FN then
         -- a fresh coroutine each time: a C function, no Lua frame on their stack
+        box.rearm = function()
+            if H.fire then pcall(hookfunction_, FIRE_FN, hide(coroutine.wrap(FRAMELESS))) end
+        end
         local hook_fn = hide(getgenv().FramelessHook == false and newcclosure_(FIRE_BODY) or coroutine.wrap(FRAMELESS))
         local ok, old = pcall(hookfunction_, FIRE_FN, hook_fn)
         if ok and type(old) == 'function' then H.fire, box.fire = old, old end
@@ -1204,9 +1213,13 @@ local function arm(hold)
     return true
 end
 
+-- Modes that never use the captured remote: Keypress (F) and Game (the game's
+-- own block press). With both parry and spam on those, nothing is captured.
+local function no_remote(m) return m == "Keypress" or m == "Game" end
 local function keypress_only()
-    return getgenv().AutoParryMode == "Keypress" and getgenv().ManualSpamMode == "Keypress"
+    return no_remote(getgenv().AutoParryMode) and no_remote(getgenv().ManualSpamMode)
 end
+Core.no_remote = no_remote
 local function remote_features_on()
     return props.__autoparry_enabled or props.__auto_spam_enabled or props.__manual_spam_enabled
         or System.__triggerbot.__enabled
@@ -1624,10 +1637,37 @@ end
 function System.parry.execute_action() return System.parry.execute() end
 -- One parry by the chosen mode. Keypress presses only when the game's gate is
 -- open, since a press inside it does nothing.
+-- GAME mode: every parry is the game's own block press (see game_press) --
+-- no hook, no capture, nothing of ours in the packet: the game builds it, plays
+-- its swing and applies its own lockout. The curve goes in through the camera:
+-- the game's press reads CurrentCamera.CFrame when it builds the parry, so the
+-- camera is pointed along the curve for that instant and put straight back
+-- (the camera script rewrites it before the next render anyway). Target mode
+-- isn't applied (the game aims at your cursor / touch).
+function System.parry.game(curveCF)
+    if not LocalPlayer.Character then return false end
+    local cam = Workspace.CurrentCamera
+    local saved = cam and cam.CFrame
+    if saved and curveCF and props.__curve_mode ~= 1 then
+        local look = curveCF.LookVector
+        if look == look and look.Magnitude > 0.5 then
+            pcall(function() cam.CFrame = CFrame.lookAt(saved.Position, saved.Position + look) end)
+        end
+    end
+    log_send("game press")
+    local ok = game_press()
+    if saved then pcall(function() cam.CFrame = saved end) end
+    if ok then count() end
+    return ok
+end
 function System.parry.by_mode(mode)
     if mode == "Keypress" then
         if not gate_open() then return false end
         return System.parry.keypress()
+    end
+    if mode == "Game" then
+        if not gate_open() then return false end
+        return System.parry.game(System.curve.get_cframe())
     end
     return System.parry.execute()
 end
@@ -2060,7 +2100,8 @@ local function decide(ball, st, root, now, via)
     end
     -- inside the game's lockout a parry does nothing: wait, and fire the
     -- moment it ends if the ball is due (or already overdue)
-    if getgenv().AutoParryMode ~= "Keypress" and Core.cap and not gate_open() then
+    local pm = getgenv().AutoParryMode
+    if ((pm ~= "Keypress" and Core.cap) or pm == "Game") and not gate_open() then
         return hold(("game lockout, %.2fs left"):format(math.max(G.until_t - clock_(), 0)))
     end
 
@@ -2169,7 +2210,8 @@ local function trigger(ball, st)
     if not root or root:FindFirstChild('SingularityCape') or not canParryNow() then return end
     local now = clock_()
     if pass_busy(st, now) or blocked_by_detection() then return end
-    if getgenv().AutoParryMode ~= "Keypress" and Core.cap and not gate_open() then return end
+    local pm = getgenv().AutoParryMode
+    if ((pm ~= "Keypress" and Core.cap) or pm == "Game") and not gate_open() then return end
     if fire_for(st, now, "triggerbot") then
         System.__triggerbot.__parries = System.__triggerbot.__parries + 1
     end
@@ -2646,6 +2688,10 @@ local function spam_fire()
     if getgenv().ManualSpamMode == "Keypress" then
         System.parry.keypress()
         return true
+    end
+    if getgenv().ManualSpamMode == "Game" then
+        -- the game ignores presses inside its own lockout, like a real player's spam
+        return System.parry.game(System.curve.get_cframe_fast())
     end
     local sent = System.parry.fast()
     if sent and getgenv().ManualSpamAnimationFix and macroAnimFix then
@@ -3587,6 +3633,7 @@ end)
 
 local function remoteStatusText()
     if getgenv().AutoParryMode == "Keypress" then return "Mode: Keypress (presses the block key)" end
+    if getgenv().AutoParryMode == "Game" then return "Mode: Game (the game's own block press, no hook)" end
     local w = parry_window()
     local wtxt = w and ("%.3f"):format(w) or (Win.done and "fallback" or "reading stats...")
     if remoteReady() then
@@ -3650,8 +3697,8 @@ AP:AddDropdown("CaptureHook", {Text = "Capture hook", Values = {"FireServer", "N
 AP:AddDropdown("CapturePress", {Text = "Capture press", Values = {"Auto", "Game", "Own"}, Default = "Auto",
     Tooltip = "How the one capture per server is triggered. Auto: the script presses F (a fake keyboard event). Game: runs the game's own block function the way a real press does, at the game's identity on a clean thread -- no keyboard event at all (falls back to F if it can't be found). Own: waits for your own tap on the block button.",
     Callback = function(v) getgenv().CapturePress = v end})
-AP:AddDropdown("ParryMode", {Text = "Parry mode", Values = {"Remote", "Keypress"}, Default = "Remote",
-    Tooltip = "Remote fires the parry remote with your curve (hookless, sends exactly what the game sends). Keypress presses the block key (F).",
+AP:AddDropdown("ParryMode", {Text = "Parry mode", Values = {"Remote", "Game", "Keypress"}, Default = "Remote",
+    Tooltip = "Remote: fires the captured parry remote (needs the one capture hook per server). Game: NO hook, NO capture -- every parry is the game's own block press run like a real one, curve applied through the camera; the game's cooldown applies and target mode isn't. Keypress: presses F.",
     Callback = function(v) getgenv().AutoParryMode = v end})
 AP:AddDropdown("CurveMode", {Text = "Curve mode", Values = System.__config.__curve_names, Default = "Camera",
     Callback = function(v)
@@ -3797,7 +3844,9 @@ SP:AddToggle("ManualSpam", {Text = "Manual spam", Default = false, Callback = fu
     end
     NotifyToggle("Manual Spam", v)
 end}):AddKeyPicker("ManualSpamKey", {Default = "E", Mode = "Hold", SyncToggleState = true, Text = "Manual spam"})
-SP:AddDropdown("SpamMode", {Text = "Mode", Values = {"Remote", "Keypress"}, Default = "Remote", Callback = function(v) getgenv().ManualSpamMode = v end})
+SP:AddDropdown("SpamMode", {Text = "Mode", Values = {"Remote", "Game", "Keypress"}, Default = "Remote",
+    Tooltip = "Remote: the captured remote (goes through the cooldown). Game: the game's own block press, no hook (the game's cooldown applies, like a real player spamming). Keypress: F.",
+    Callback = function(v) getgenv().ManualSpamMode = v end})
 SP:AddSlider("SpamMaxKbps", {Text = "Max upload", Default = 220, Min = 60, Max = 600, Rounding = 0, Suffix = " kbps",
     Tooltip = "Manual and auto spam both run as fast as they can (up to 120/s) and slow down only when your upload goes over this. Higher = more spam but more risk of your movement lagging behind (desync). Lower = smoother movement, less spam. If you rubber-band while spamming, lower it.",
     Callback = function(v) SpamNet.budget_kbps = v end})
