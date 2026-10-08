@@ -6,7 +6,7 @@ task.spawn(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.08-67"
+local SCRIPT_VERSION = "2026.10.08-68"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -1440,10 +1440,6 @@ Remotes.ParrySuccess.OnClientEvent:Connect(function()
         flight(("  -> landed %.3fs after the %s (view lag now %.3fs)"):format(took, lp.via, Core.interp))
     end
     Core.pending, Core.misses = nil, 0
-    if Core.cap and Core.cap.saved and not Core.saved_confirmed then
-        Core.saved_confirmed = true
-        flight("SAVED CAPTURE WORKS on this server -- no hook used")
-    end
     for _, st in pairs(tracked) do
         if st.target == me and st.pass_open then st.landed = true end
     end
@@ -1734,15 +1730,10 @@ end
 --             (lockout / packet -- timing isn't the problem)
 -- EARLY / LATE also shift the timing (Core.bias, seconds added to the lead,
 -- kept in BladeBall/timing.txt), so the same miss doesn't repeat.
+-- (per session only: starts at 0 every load, so a correction can never carry
+-- a bad offset into the next session)
 Core.bias = 0
-pcall(function()
-    local v = tonumber(readfile(SAVE_FOLDER .. "/timing.txt"))
-    if v then Core.bias = math.clamp(v, -0.25, 0.25) end
-end)
-local function save_bias()
-    if getgenv().BladeBallNoLog then return end
-    pcall(function() ensureSaveFolder(); writefile(SAVE_FOLDER .. "/timing.txt", string.format("%.3f", Core.bias)) end)
-end
+local function save_bias() end
 local open_shots = {}
 local function judge(shot, now)
     shot.done = true
@@ -1773,6 +1764,17 @@ local function judge(shot, now)
     flight(("  -> MISS CHECK (%s): %s -- ball arrived %.2fs after the parry, parry was up %.2f-%.2fs%s"):format(
         shot.via, verdict, dt, lo, hi, adj and (", timing now %+.2fs"):format(Core.bias) or ""))
     Notify("Missed parry", verdict .. (adj and (" (timing %+.2fs)"):format(Core.bias) or ""), 4)
+    -- STALE CAPTURE: the packet's values can change during a server. Then
+    -- every parry is refused (the swing plays, nothing happens) however well
+    -- it's timed. Two refused in a row -> drop the capture and take a fresh one.
+    if not adj and shot.close and dt >= lo - 0.02 and dt <= hi + 0.02 then
+        Core.refused = (Core.refused or 0) + 1
+        if Core.refused >= 2 and Core.cap then
+            Core.refused, Core.cap = 0, nil
+            Core.own_told = false
+            flight("  -> 2 parries refused in a row: the capture went stale -- taking a fresh one")
+        end
+    end
 end
 -- Once a frame: follow open shots; judge each once the ball has been and gone.
 local function track_shots(now)
@@ -1799,6 +1801,7 @@ local function track_shots(now)
 end
 Core.track_shots = track_shots
 Core.mark_landed = function()
+    Core.refused = 0
     for _, shot in ipairs(open_shots) do shot.landed = true end
     -- a landed parry: let old corrections fade a little
     if Core.bias ~= 0 then Core.bias = Core.bias * 0.97 end
@@ -2262,37 +2265,10 @@ local function hashed_remotes()
     return list
 end
 
--- SAVED CAPTURE, per server: the packet's id/key change from server to
--- server, so a capture is saved with the server's JobId and reused only in
--- that same server (rejoining it, re-running the script) -- no hook, no press.
--- Never used in another server: stale values there would only send parries
--- the server rejects.
-local CAPTURE_FILE = SAVE_FOLDER .. "/capture.json"
-local function load_saved()
-    local ok, r = pcall(function() return HttpService:JSONDecode(readfile(CAPTURE_FILE)) end)
-    if ok and type(r) == 'table' and r.job == game.JobId and type(r.uid) == 'string' and type(r.key) == 'table'
-        and type(r.hash) == 'string' and type(r.remote) == 'string' and #r.key >= 8 then return r end
-    return nil
-end
-Core.saved = load_saved()
-local function save_capture(cap)
-    if cap.hookfree or getgenv().BladeBallNoLog then return end
-    local rec = {job = game.JobId, uid = cap.uid, key = cap.key, hash = cap.hash, remote = cap.remote.Name,
-        ball2 = cap.ball2, t = os.time()}
-    pcall(function() ensureSaveFolder(); writefile(CAPTURE_FILE, HttpService:JSONEncode(rec)) end)
-    Core.saved = rec
-end
-local function build_from_saved()
-    local sv = Core.saved
-    if not sv or Core.saved_off or sv.job ~= game.JobId then return nil end
-    local remote
-    for _, r in ipairs(hashed_remotes()) do if r.Name == sv.remote then remote = r end end
-    if not remote then return nil end
-    local text = tostring(math.floor(Workspace:GetServerTimeNow() * 100))
-    if #text ~= #sv.key then return nil end
-    return {remote = remote, hash = sv.hash, uid = sv.uid, key = sv.key, len = #sv.key, ball2 = sv.ball2 == true,
-        hookfree = true, saved = true}
-end
+-- (Saved captures were removed in v68: the packet's values go out of date,
+-- and a capture reused after that makes every parry a refused one -- the
+-- swing plays and nothing happens. Every capture is fresh now.)
+local function save_capture() end
 
 -- Watch incoming remote events for a value (id or key), for the rest of the
 -- session. found(desc, value) is called the first time it shows up.
@@ -2438,18 +2414,7 @@ RunService.Heartbeat:Connect(function()
     if not is_live() then return end
     if not Core.cap then
         Core.told = false
-        -- the saved capture first: no hook, nothing pressed
-        if Core.saved and not Core.saved_off and clock_() - (Core.sv_try or 0) > 1 then
-            Core.sv_try = clock_()
-            local cap = build_from_saved()
-            if cap then
-                Core.cap = cap
-                Core.misses, Core.pending = 0, nil
-                flight(("ARMED FROM THIS SERVER'S SAVED CAPTURE (no hook): remote %s, id %s"):format(cap.remote.Name:sub(1, 12), cap.uid))
-                return
-            end
-        end
-        -- then a hook-free recipe, if one was ever completed
+        -- a hook-free recipe, if one was ever completed
         if Core.recipe and Core.recipe.complete and not Core.hookfree_off and clock_() - (Core.hf_try or 0) > 1 then
             Core.hf_try = clock_()
             local cap = build_hookfree()
@@ -2501,11 +2466,7 @@ RunService.Heartbeat:Connect(function()
         Core.pending, Core.misses = nil, (Core.misses or 0) + 1
         local lp = Core.last_parry
         flight(("  -> NO answer to the %s (miss %d in a row)"):format(lp and lp.via or "parry", Core.misses))
-        if Core.cap.saved and Core.misses >= 2 and not Core.saved_confirmed then
-            Core.saved_off, Core.cap = true, nil
-            flight("saved capture unanswered twice on this server: capturing with the hook here")
-            Notify("Blade Ball", "Saved capture didn't work on this server; capturing with the hook.", 5)
-        elseif Core.cap.hookfree and not Core.cap.saved and Core.misses >= 2 then
+        if Core.cap.hookfree and Core.misses >= 2 then
             Core.hookfree_off, Core.cap, learned = true, nil, false
             flight("hook-free parries unanswered twice: back to the hook capture for this server (re-learning)")
             Notify("Blade Ball", "No-hook mode didn't work on this server; capturing with the hook instead.", 5)
@@ -4007,7 +3968,7 @@ do
             .. (hooked_now and " -- HOOK WAS UP" or "")
             .. (" | capture: %s hook, %s press, disguise %s, armed %s"):format(tostring(getgenv().CaptureHook or "Namecall"),
                 Core.capture_press_mode and Core.capture_press_mode() or "?", getgenv().HookDisguise == false and "off" or "on",
-                Core.cap and (Core.cap.saved and "from save" or "by hook") or "no")
+                Core.cap and "yes" or "no")
     end
     table.insert(conns, GuiService.ErrorMessageChanged:Connect(function(msg)
         local reason = tostring(msg):match("BAC%s+%w-X(%d%d)")
