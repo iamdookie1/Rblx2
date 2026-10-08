@@ -6,7 +6,7 @@ task.spawn(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.08-60.2"
+local SCRIPT_VERSION = "2026.10.08-60.3"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -1714,9 +1714,9 @@ local function fire_for(st, now, via, info)
     if not ok then st.why = "couldn't send yet, retrying"; return false end
     if info then
         Core.last_parry = {t = now, via = via, info = info}
-        flight(("%s: %.1f studs, arrives in %.3fs, fires at %.3fs (distance %.0f), %.0f st/s, angle %.0f deg, ping %.0fms, window %.3f -- was: %s"):format(
+        flight(("%s: %.1f studs, arrives in %.3fs, fires at %.3fs (distance %.0f), %.0f st/s, angle %.0f deg, ping %.0fms, window %.3f -- held before: %s"):format(
             via, info.dist, info.eta or -1, info.lead, info.lead * info.speed, info.speed,
-            math.deg(math.acos(math.clamp(info.heading or 1, -1, 1))), pingMs(), parry_window() or -1, tostring(held_by)))
+            math.deg(math.acos(math.clamp(info.heading or 1, -1, 1))), pingMs(), parry_window() or -1, held_by or "nothing (fired first frame)"))
     end
     mark_parried(st, now)
     st.why = via == "auto parry" and "parried" or ("parried (" .. via .. ")")
