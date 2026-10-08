@@ -6,7 +6,7 @@ task.spawn(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.08-60.4"
+local SCRIPT_VERSION = "2026.10.08-60.5"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -999,12 +999,6 @@ local function learn(remote, hash, uid, token, a4, t)
     local prev = Core.cap
     Core.cap = {remote = remote, hash = hash, uid = uid, key = key, len = #text, ball2 = typeof_(a4) == "CFrame",
         win = type_(a4) == "number" and a4 or nil} -- the window the game itself sent
-    -- Where the hash lives (the game's _G.BAC_HASH), so every send can use the
-    -- current one: the first Ui3 build replayed fresh values, v60 froze them.
-    pcall_(function()
-        local g = getrenv()._G
-        if rawget(g, "BAC_HASH") == hash then Core.cap.hash_g = g end
-    end)
     Core.misses, Core.pending = 0, nil
     Core.new_capture = {prev = prev}
 end
@@ -1030,8 +1024,8 @@ end
 -- stack). So the body is:
 --   * compiled with loadstring under the chunk name of the game's own Net
 --     module, so debug.info shows a game path, not our script;
---   * run in a clean game environment (getrenv's globals, no writefile, nothing
---     of ours), so getfenv on its frame shows nothing of ours;
+--   * run in an empty environment (nothing of ours, no getrenv), so getfenv on
+--     its frame shows nothing of ours;
 --   * cut off from us: it calls none of our functions -- it drops the send into
 --     `box` (a plain table) and passes the call straight on. Our own thread
 --     picks the box up a frame later, works out the key and takes the hook down.
@@ -1060,11 +1054,7 @@ return function(self, ...)
     end
     return box.fire(self, ...)
 end]]
-local CLEAN_ENV
-do
-    local ok, renv = pcall(function() return getrenv and getrenv() end)
-    CLEAN_ENV = (ok and type(renv) == 'table' and renv.writefile == nil) and setmetatable({}, {__index = renv}) or {}
-end
+local CLEAN_ENV = {} -- the bodies use only their upvalues, no globals
 local function build_body(src, ...)
     local args = table.pack(...)
     local ok, fn = pcall(function()
@@ -1382,17 +1372,6 @@ local function send(curveCF, spam)
     end
     gate_start()
     log_send("remote")
-    -- STALE PACKET (no answer): the hash can change mid-server, and a parry
-    -- with the old one is refused -- the swing plays, nothing happens. Read
-    -- the current one each send (a plain table read, nothing called).
-    local hg = cap.hash_g
-    if hg then
-        local h = rawget(hg, "BAC_HASH")
-        if type(h) == 'string' and #h == 36 and h ~= cap.hash then
-            flight("hash changed mid-server -- sending with the new one")
-            cap.hash = h
-        end
-    end
     local r = cap.remote
     if cap.ball2 then
         local ray = cam:ScreenPointToRay(aim[1], aim[2], 0)
@@ -2057,7 +2036,7 @@ local ROOTS = {player = function() return LocalPlayer end, char = function() ret
 local function resolve(loc)
     if type(loc) ~= 'table' then return nil end
     local ok, v = pcall(function()
-        if loc.where == "G" then return getrenv()._G[loc.key] end
+        if loc.where == "G" then return nil end -- the game's _G isn't read (no getrenv)
         if loc.where == "data" then
             local t = Win.data and Win.data:Get()
             for _, k in ipairs(loc.path) do t = type(t) == 'table' and t[k] or nil end
@@ -2094,11 +2073,6 @@ local function each_readable(visit)
     if LocalPlayer.Character then walk_inst("char", LocalPlayer.Character, {}, 3) end
     walk_inst("rs", ReplicatedStorage, {}, 5)
     walk_inst("ws", Workspace, {}, 1)
-    pcall(function()
-        for k, v in pairs(getrenv()._G) do
-            if type(v) == 'string' and type(k) == 'string' then visit({where = "G", key = k}, v) end
-        end
-    end)
     pcall(function()
         local function walk(t, path, depth)
             if depth > 4 then return end
@@ -2201,12 +2175,8 @@ local function learn_hookfree(cap)
         local r = {version = 1}
         local hr = hashed_remotes()
         if #hr == 1 and hr[1] == cap.remote then r.remote = "net_hashed" end
-        pcall(function()
-            local g = getrenv()._G
-            if g.BAC_HASH == cap.hash then r.hash = "BAC_HASH" else
-                for k, v in pairs(g) do if v == cap.hash and type(k) == 'string' then r.hash = k; break end end
-            end
-        end)
+        -- (the hash lives in the game's _G, which isn't read any more -- no
+        -- getrenv -- so a recipe never completes and the hook capture is used)
         for name, f in pairs(KEY_RULES) do
             local ok, s = pcall(f, cap.uid)
             if ok and key_matches(s, cap.key) then r.key = {where = "rule", rule = name}; break end
@@ -2244,8 +2214,7 @@ local function build_hookfree()
     if not (r and r.complete) or Core.hookfree_off then return nil end
     local hr = hashed_remotes()
     if #hr ~= 1 then return nil end
-    local hash
-    pcall(function() hash = getrenv()._G[r.hash] end)
+    local hash -- in the game's _G, not read (no getrenv): no recipe is ever used
     local uid = resolve(r.uid)
     if type(hash) ~= 'string' or type(uid) ~= 'string' or uid == '' then return nil end
     local keysrc
