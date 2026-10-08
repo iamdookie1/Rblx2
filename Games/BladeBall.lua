@@ -6,7 +6,7 @@ task.spawn(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.08-78"
+local SCRIPT_VERSION = "2026.10.08-79"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -1183,7 +1183,9 @@ local function arm(hold)
     if H.fire or H.nc then return true end
     box.list = {}
     local method = capture_method()
-    if method ~= "Namecall" and FIRE_FN and (oth_hook or hookfunction_) then
+    -- oth present forces a FireServer/oth capture even if the setting is
+    -- Namecall, so the metatable-touching namecall hook is never installed.
+    if (method ~= "Namecall" or oth_hook) and FIRE_FN and (oth_hook or hookfunction_) then
         -- a fresh coroutine each time (frameless fallback only): a C function,
         -- no Lua frame on their stack. oth re-arms itself, so this is a no-op
         -- for the oth path.
@@ -1223,15 +1225,22 @@ local function arm(hold)
     end
     -- The __namecall hook can't be frameless (the method name is thread-local to
     -- the game's own call, so the body has to read getnamecallmethod() on that
-    -- stack). It's the one path a stack check can see, so it's never used in the
-    -- default FireServer mode -- only when you pick Namecall / Both yourself.
-    if method ~= "FireServer" and hookmetamethod_ and getnamecallmethod_ then
+    -- stack). It needs hookmetamethod + setreadonly on the game's own metatable
+    -- -- the most detectable capture op there is -- so:
+    --   * it's never used in the default FireServer mode;
+    --   * and when oth is present (Delta) it's skipped ENTIRELY, even for
+    --     Namecall / Both, because oth's FireServer hook is safe and the
+    --     metatable touch is exactly the kind of thing that earns a kick. A
+    --     FireServer-only capture may just take a second keypress to catch.
+    if method ~= "FireServer" and not oth_hook and hookmetamethod_ and getnamecallmethod_ then
         local ok, old = pcall(hookmetamethod_, game, "__namecall", hide(newcclosure_(NC_BODY)))
         if ok and type(old) == 'function' then
             H.nc, box.nc = old, old
             Core.hook_path = (Core.hook_path and (Core.hook_path .. " + ") or "")
                 .. "__namecall (newcclosure, on the game's stack)"
         end
+    elseif method ~= "FireServer" and oth_hook then
+        pcall(flight, "capture: oth present -- skipping the __namecall hook (metatable touch); FireServer/oth only")
     end
     if not (H.fire or H.nc) then H.want = false; return false end
     box.want = true
@@ -4112,39 +4121,14 @@ do
     flight(("==== v%s loaded | executor %s | place %s | userId %s | setstackhidden %s"):format(
         SCRIPT_VERSION, exec, tostring(game.PlaceId), tostring(LocalPlayer.UserId),
         Core.stack_hiding and "ON (hook bodies hidden)" or "off"))
-    -- SELF-CHECK: what the game's parry sender checks on every send, run against
-    -- the GAME's own globals (the ones its code sees), not ours. If any of
-    -- these fail, every block press -- the capture press included -- trips it.
-    task.delay(2, function()
-        local fails = {}
-        pcall(function()
-            local renv = getrenv and getrenv() or nil
-            local d = renv and renv.debug
-            if type(d) == 'table' then
-                for _, name in ipairs({"info", "traceback", "getinfo"}) do
-                    local f = rawget(d, name)
-                    if type(f) == 'function' then
-                        local ok, src = pcall(d.info or debug.info, f, "s")
-                        if ok and src ~= "[C]" then fails[#fails + 1] = "debug." .. name .. " is not a C function in the game's env" end
-                    end
-                end
-            end
-            for _, name in ipairs({"getfenv", "setfenv", "pcall", "xpcall", "error", "require", "typeof", "tostring"}) do
-                local f = renv and rawget(renv, name)
-                if type(f) == 'function' then
-                    local ok, src = pcall(debug.info, f, "s")
-                    if ok and src ~= "[C]" then fails[#fails + 1] = name .. " is not a C function in the game's env" end
-                end
-            end
-            if renv and rawget(renv, "writefile") ~= nil then fails[#fails + 1] = "writefile is visible in the game's env" end
-        end)
-        if #fails == 0 then
-            flight("SELF-CHECK: the game's known parry-sender checks pass (debug functions are C, no writefile in its env)")
-        else
-            flight("SELF-CHECK FAILED: " .. table.concat(fails, "; "))
-            Notify("Self-check", "The game's parry code would flag this executor: " .. table.concat(fails, "; "), 12)
-        end
-    end)
+    -- (The SELF-CHECK that used to run here is REMOVED. It called debug.info on
+    -- the game's OWN protected functions (renv.debug.info/traceback/getinfo,
+    -- getfenv, setfenv, pcall, require, ...) a couple of seconds after load to
+    -- predict whether the game's parry code would flag the executor. Reaching
+    -- into those protected closures before any capture is itself what a BAC
+    -- integrity sweep flags (the reason-24 kick seen ~20s in, in the lobby, with
+    -- nothing hooked). It was pure diagnostics -- nothing depended on it -- so it
+    -- is gone. Nothing now touches the game's own functions before the capture.)
     local conns = {}
     -- What happened just before a kick, in seconds: the capture hook (up /
     -- down), the fake F press, our last remote parry and spam send. Saved to
