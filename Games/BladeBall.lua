@@ -6,7 +6,7 @@ task.spawn(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.08-64"
+local SCRIPT_VERSION = "2026.10.08-65"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -1021,28 +1021,24 @@ end
 --     game's FireServer into GetServerTimeNow on the remote mid-send.
 local box = {want = false, nc = nil, fire = nil, list = {}, ws = Workspace, now = Workspace.GetServerTimeNow}
 local HOOK_NAME = "=ReplicatedStorage.Packages._Index.sleitnick_net@0.1.0.net"
-local NC_SRC = [[
-local box, getncm, sel = ...
-return function(self, ...)
-    if sel("#", ...) >= 6 and box.want and getncm() == "FireServer" then
-        local l = box.list
-        if #l < 4 then l[#l + 1] = {self, sel("#", ...), {...}, box.now(box.ws)} end
-    end
-    return box.nc(self, ...)
-end]]
-local FIRE_SRC = [[
-local box, sel = ...
-return function(self, ...)
-    if sel("#", ...) >= 6 and box.want then
-        local l = box.list
-        if #l < 4 then l[#l + 1] = {self, sel("#", ...), {...}, box.now(box.ws)} end
-    end
-    return box.fire(self, ...)
-end]]
+-- One line each, like the game's obfuscated modules (every frame reports line
+-- 1), compiled under the Net module's chunk name.
+local NC_SRC = "local b,g,s=... return function(self,...) if s('#',...)>=6 and b.want and g()=='FireServer' then local l=b.list if #l<4 then l[#l+1]={self,s('#',...),{...},b.now(b.ws)} end end return b.nc(self,...) end"
+local FIRE_SRC = "local b,s=... return function(self,...) if s('#',...)>=6 and b.want then local l=b.list if #l<4 then l[#l+1]={self,s('#',...),{...},b.now(b.ws)} end end return b.fire(self,...) end"
+-- The bodies' environment looks like the Net module's own: the game's globals
+-- (getrenv, no writefile -- nothing of the executor's), and `script` set to
+-- the real Net ModuleScript, like every function compiled from that module.
 local CLEAN_ENV
 do
     local ok, renv = pcall(function() return getrenv and getrenv() end)
     CLEAN_ENV = (ok and type(renv) == 'table' and renv.writefile == nil) and setmetatable({}, {__index = renv}) or {}
+    pcall(function()
+        local net = ReplicatedStorage:FindFirstChild("Packages")
+        net = net and net:FindFirstChild("_Index")
+        net = net and net:FindFirstChild("sleitnick_net@0.1.0")
+        net = net and net:FindFirstChild("net")
+        if net then rawset(CLEAN_ENV, "script", net) end
+    end)
 end
 local function build_body(src, ...)
     local args = table.pack(...)
@@ -1053,13 +1049,13 @@ local function build_body(src, ...)
     end)
     return ok and type(fn) == 'function' and fn or nil
 end
--- The loadstring / chunk-name / setfenv disguise is opt-in now
--- (getgenv().HookDisguise = true): it wasn't in the version that got kicked
--- least, so by default the bodies are plain closures (same logic, below).
-local NC_BODY = getgenv().HookDisguise and build_body(NC_SRC, box, getnamecallmethod_ or function() return nil end, select) or nil
-local FIRE_BODY = getgenv().HookDisguise and build_body(FIRE_SRC, box, select) or nil
+-- The disguise is ON by default (getgenv().HookDisguise = false turns it off):
+-- in play, the hook without it got kicked on the first try.
+local disguise = getgenv().HookDisguise ~= false
+local NC_BODY = disguise and build_body(NC_SRC, box, getnamecallmethod_ or function() return nil end, select) or nil
+local FIRE_BODY = disguise and build_body(FIRE_SRC, box, select) or nil
 Core.isolated = NC_BODY ~= nil and FIRE_BODY ~= nil
--- Plain bodies (default; also when there's no loadstring).
+-- Plain bodies (disguise off, or no loadstring on this executor).
 if not NC_BODY then
     NC_BODY = function(self, ...)
         if select_("#", ...) >= 6 and box.want and getnamecallmethod_() == "FireServer" then
@@ -1416,6 +1412,7 @@ Remotes.ParrySuccess.OnClientEvent:Connect(function()
     for _, st in pairs(tracked) do
         if st.target == me and st.pass_open then st.landed = true end
     end
+    if Core.mark_landed then Core.mark_landed() end
 end)
 pcall(function()
     Remotes.NoobParryHappened.OnClientEvent:Connect(function()
@@ -1693,6 +1690,85 @@ end
 
 -- One parry per pass (per target change), like the first UI3 build: if the
 -- ball is still on us Retry delay seconds after it, parry again.
+-- MISS CHECK + AUTO TIMING. Every auto parry is followed until the ball
+-- actually reaches you (its closest approach, as you see it). If it didn't
+-- land, the miss is put in one of three boxes and shown:
+--   EARLY  -- the ball got here after the parry was already over
+--   LATE   -- the ball got here before the parry could be up
+--   REFUSED-- it got here inside the parry and the game still didn't take it
+--             (lockout / packet -- timing isn't the problem)
+-- EARLY / LATE also shift the timing (Core.bias, seconds added to the lead,
+-- kept in BladeBall/timing.txt), so the same miss doesn't repeat.
+Core.bias = 0
+pcall(function()
+    local v = tonumber(readfile(SAVE_FOLDER .. "/timing.txt"))
+    if v then Core.bias = math.clamp(v, -0.25, 0.25) end
+end)
+local function save_bias()
+    if getgenv().BladeBallNoLog then return end
+    pcall(function() ensureSaveFolder(); writefile(SAVE_FOLDER .. "/timing.txt", string.format("%.3f", Core.bias)) end)
+end
+local open_shots = {}
+local function judge(shot, now)
+    shot.done = true
+    if shot.landed then return end
+    if not shot.close then
+        flight(("  -> MISS CHECK: no answer, but the ball never reached you (%s) -- nothing to fix"):format(shot.via))
+        return
+    end
+    local dt = shot.min_t - shot.t
+    local lo, hi = shot.reach, shot.reach + shot.W
+    local verdict, adj
+    if dt < lo - 0.02 then
+        verdict, adj = ("LATE by %.2fs"):format(lo - dt), math.min((lo - dt) * 0.5 + 0.02, 0.08)
+    elseif dt > hi + 0.02 then
+        verdict, adj = ("EARLY by %.2fs"):format(dt - hi), -math.min((dt - hi) * 0.5 + 0.03, 0.08)
+    else
+        verdict = "REFUSED: it arrived inside the parry and the game didn't take it"
+    end
+    -- only a parry that had time to be timed teaches the timing: point blank
+    -- and instant retarget shots are late by nature, nothing to correct
+    if adj and not shot.planned then
+        verdict, adj = verdict .. " (point blank -- no timing could catch it)", nil
+    end
+    if adj then
+        Core.bias = math.clamp(Core.bias + adj, -0.25, 0.25)
+        save_bias()
+    end
+    flight(("  -> MISS CHECK (%s): %s -- ball arrived %.2fs after the parry, parry was up %.2f-%.2fs%s"):format(
+        shot.via, verdict, dt, lo, hi, adj and (", timing now %+.2fs"):format(Core.bias) or ""))
+    Notify("Missed parry", verdict .. (adj and (" (timing %+.2fs)"):format(Core.bias) or ""), 4)
+end
+-- Once a frame: follow open shots; judge each once the ball has been and gone.
+local function track_shots(now)
+    local root = getRoot()
+    for i = #open_shots, 1, -1 do
+        local shot = open_shots[i]
+        local ball = shot.ball
+        -- keep watching 0.35s after the ball switches away: the switch shows
+        -- up before the ball's position does (positions are drawn slightly in
+        -- the past), so the closest approach comes just after it
+        local alive = not shot.landed and root and ball and ball.Parent
+        if alive and ball:GetAttribute('target') ~= me then shot.left = shot.left or now end
+        local still = alive and (not shot.left or now - shot.left < 0.35)
+        if still then
+            local d = (ball.Position - root.Position).Magnitude
+            if d < shot.min_d then shot.min_d, shot.min_t = d, now end
+            if d <= shot.gap + 8 then shot.close = true end
+        end
+        if shot.landed or not still or now - shot.t > 3 then
+            if not shot.done then judge(shot, now) end
+            table.remove(open_shots, i)
+        end
+    end
+end
+Core.track_shots = track_shots
+Core.mark_landed = function()
+    for _, shot in ipairs(open_shots) do shot.landed = true end
+    -- a landed parry: let old corrections fade a little
+    if Core.bias ~= 0 then Core.bias = Core.bias * 0.97 end
+end
+
 -- One parry per pass. If it runs out without landing and the ball is still on
 -- us, the pass is live again once that parry's window is over (reach + W) --
 -- and decide times the next one like the first. A fixed 1s+ wait left the
@@ -1709,6 +1785,20 @@ local function fire_for(st, now, via, info)
     else ok = System.parry.by_mode(getgenv().AutoParryMode) end
     ParryLog.source = nil
     if not ok then st.why = "couldn't send yet, retrying"; return false end
+    if info and info.ball and getgenv().AutoParryMode ~= "Keypress" then
+        -- an earlier shot at this ball that the ball still hasn't reached: early
+        for _, old in ipairs(open_shots) do
+            if old.ball == info.ball and not old.done and not old.landed then
+                old.close, old.min_t = true, now
+                judge(old, now)
+            end
+        end
+        local gap = contact_gap(info.ball)
+        local reach = reach_time()
+        open_shots[#open_shots + 1] = {ball = info.ball, via = via, t = now, reach = reach,
+            W = parry_window() or 0.5, min_d = info.dist, min_t = now, gap = gap, close = info.dist <= gap + 6,
+            planned = via == "auto parry" and (info.eta or 0) >= reach + 0.05}
+    end
     if info then
         Core.last_parry = {t = now, via = via, info = info}
         flight(("%s: %.1f studs, %.0f st/s, angle %.0f deg, soonest %.3fs, committed %.3fs, fires at %.3fs, reach %.3fs, window %.3f, ping %.0fms -- was: %s"):format(
@@ -1815,7 +1905,10 @@ local function decide(ball, st, root, now, via)
     local W = parry_window() or 0.5
     local reach = reach_time()
     local range = System.parry_distance(speed)
-    local lead = math.min(range / speed, reach + W * 0.7)        -- never so early the window runs out first
+    -- the parry distance's lead, corrected by what the misses taught
+    -- (Core.bias), and kept inside the parry: never before it can be up,
+    -- never so early it runs out first
+    local lead = math.clamp(range / speed + (Core.bias or 0), reach + 0.03, reach + W * 0.75)
     local theta = math.acos(math.clamp(heading, -1, 1))
     local opening, trend_known = angle_trend(st, theta, now)
 
@@ -1828,7 +1921,7 @@ local function decide(ball, st, root, now, via)
         local sim = predict_contact(ball.Position, velocity, root.Position, gap, turn_rate(st, velocity, now), 0, horizon)
         committed = sim and (sim + gap / speed) or math.huge
     end
-    local info = {speed = speed, dist = distance, heading = heading, lead = lead, eta = soonest, committed = committed}
+    local info = {ball = ball, speed = speed, dist = distance, heading = heading, lead = lead, eta = soonest, committed = committed}
 
     if via == "retarget" then
         -- its new direction isn't in yet: only point blank goes now
@@ -2274,6 +2367,7 @@ end
 -- report the capture, log unanswered parries, and sample ping.
 RunService.Heartbeat:Connect(function()
     sample_lag() -- keep the ping average current between balls too
+    if Core.track_shots then pcall(Core.track_shots, clock_()) end
     if not is_live() then return end
     if not Core.cap then
         Core.told = false
