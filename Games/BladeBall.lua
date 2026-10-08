@@ -6,7 +6,7 @@ task.spawn(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.08-60.5"
+local SCRIPT_VERSION = "2026.10.08-60.6"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -958,6 +958,12 @@ local hookmetamethod_, getnamecallmethod_ = hookmetamethod, getnamecallmethod
 local getrawmetatable_, setreadonly_ = getrawmetatable, setreadonly or make_writeable
 local checkcaller_ = checkcaller or function() return false end
 local newcclosure_ = newcclosure or function(f) return f end
+-- oth: Delta's hook library. oth.hook(target, hook) -> original runs the hook
+-- on another thread, passes is_c_closure scans and cleans up with no
+-- footprint. It's the default capture hook when it's there.
+local oth_lib = rawget(getgenv(), "oth"); if type(oth_lib) ~= 'table' then pcall(function() oth_lib = oth end) end
+local oth_hook = type(oth_lib) == 'table' and type(oth_lib.hook) == 'function' and oth_lib.hook or nil
+local oth_unhook = type(oth_lib) == 'table' and type(oth_lib.unhook) == 'function' and oth_lib.unhook or nil
 local select_, type_, typeof_, tostring_, floor_, byte_, bxor_, pcall_ =
     select, type, typeof, tostring, math.floor, string.byte, bit32.bxor, pcall
 local JOB_ID = game.JobId
@@ -966,14 +972,20 @@ local JOB_ID = game.JobId
 local FIRE_FN
 pcall(function() FIRE_FN = Remotes.ParrySuccess.FireServer end)
 if type(FIRE_FN) ~= 'function' then pcall(function() FIRE_FN = Instance.new("RemoteEvent").FireServer end) end
-local H = {fire = nil, nc = nil, want = false, until_t = 0}
+local H = {fire = nil, nc = nil, want = false, until_t = 0, oth = false, oth_kept = nil}
 
 -- Which hook(s) a capture press uses (Parry tab -> "Capture hook"):
 --   "Namecall"  -- __namecall only (catches remote:FireServer sends)
 --   "FireServer"-- the FireServer function only (catches f(remote, ...) sends)
 --   "Both"      -- both, so every press captures
+--   "oth"       -- the FireServer function through oth.hook (the default when
+--                  oth is there; Namecall when it isn't)
 -- Each alone sees about half the game's sends, so it can take two presses.
-local function capture_method() return getgenv().CaptureHook or "Namecall" end
+local function capture_method()
+    local m = getgenv().CaptureHook or "oth"
+    if m == "oth" and not (oth_hook and FIRE_FN) then m = "Namecall" end
+    return m
+end
 Core.capture_method = capture_method
 
 -- __namecall goes back exactly: the original function object written straight
@@ -1088,11 +1100,18 @@ if not FIRE_BODY then
 end
 
 local function unhook()
-    local fire, nc = H.fire, H.nc
-    H.fire, H.nc, H.want, box.want = nil, nil, false, false
-    if fire and not (restore_ and pcall_(restore_, FIRE_FN)) then pcall_(hookfunction_, FIRE_FN, fire) end
+    local fire, nc, was_oth = H.fire, H.nc, H.oth
+    H.fire, H.nc, H.want, box.want, H.oth = nil, nil, false, false, false
+    if fire and was_oth then
+        -- oth takes itself down with no footprint. With no oth.unhook the hook
+        -- stays in place but passes every call straight on (box.want is off),
+        -- and the next capture reuses it instead of hooking twice.
+        if not (oth_unhook and pcall_(oth_unhook, FIRE_FN)) then H.oth_kept = fire end
+    elseif fire and not (restore_ and pcall_(restore_, FIRE_FN)) then pcall_(hookfunction_, FIRE_FN, fire) end
     if nc then restore_namecall(nc) end
-    box.nc, box.fire = nil, nil
+    box.nc = nil
+    -- a kept oth hook still passes calls on through box.fire: never clear it then
+    if not H.oth_kept then box.fire = nil end
 end
 Core.unhook = unhook
 
@@ -1104,11 +1123,18 @@ local function arm()
     if H.fire or H.nc then return true end
     box.list = {}
     local method = capture_method()
-    if method ~= "Namecall" and hookfunction_ and FIRE_FN then
+    if method == "oth" then
+        if H.oth_kept then
+            H.fire, box.fire, H.oth = H.oth_kept, H.oth_kept, true
+        else
+            local ok, old = pcall(oth_hook, FIRE_FN, FIRE_BODY)
+            if ok and type(old) == 'function' then H.fire, box.fire, H.oth = old, old, true end
+        end
+    elseif method ~= "Namecall" and hookfunction_ and FIRE_FN then
         local ok, old = pcall(hookfunction_, FIRE_FN, newcclosure_(FIRE_BODY))
         if ok and type(old) == 'function' then H.fire, box.fire = old, old end
     end
-    if method ~= "FireServer" and hookmetamethod_ and getnamecallmethod_ then
+    if (method == "Namecall" or method == "Both") and hookmetamethod_ and getnamecallmethod_ then
         local ok, old = pcall(hookmetamethod_, game, "__namecall", newcclosure_(NC_BODY))
         if ok and type(old) == 'function' then H.nc, box.nc = old, old end
     end
@@ -3342,8 +3368,8 @@ AP:AddToggle("AutoParry", {Text = "Auto parry", Default = false, Callback = func
     if v then System.autoparry.start(); prime_remote() else System.autoparry.stop() end
     NotifyToggle("Auto Parry", v)
 end}):AddKeyPicker("AutoParryKey", {Default = "None", Mode = "Toggle", SyncToggleState = true, Text = "Auto parry"})
-AP:AddDropdown("CaptureHook", {Text = "Capture hook", Values = {"Namecall", "FireServer", "Both"}, Default = "Namecall",
-    Tooltip = "Which hook catches the one parry packet Remote mode needs (up for that press only). Namecall or FireServer alone may take two presses; Both arms in one. The flight log notes which one was on for every capture and kick.",
+AP:AddDropdown("CaptureHook", {Text = "Capture hook", Values = {"oth", "Namecall", "FireServer", "Both"}, Default = "oth",
+    Tooltip = "Which hook catches the one parry packet Remote mode needs (up for that press only). oth = Delta's oth.hook on FireServer (Namecall if oth isn't there). Namecall or FireServer alone may take two presses; Both arms in one. The flight log notes which one was on for every capture and kick.",
     Callback = function(v) getgenv().CaptureHook = v end})
 AP:AddDropdown("ParryMode", {Text = "Parry mode", Values = {"Remote", "Keypress"}, Default = "Remote",
     Tooltip = "Remote fires the parry remote with your curve (hookless, sends exactly what the game sends). Keypress presses the block key (F).",
@@ -3788,7 +3814,7 @@ do
     table.insert(conns, GuiService.ErrorMessageChanged:Connect(function(msg)
         local reason = tostring(msg):match("BAC%s+%w-X(%d%d)")
         flight("!!!! KICK / ERROR MESSAGE: " .. tostring(msg) .. (reason and (" [reason " .. reason .. "]") or "")
-            .. " [capture hook " .. tostring(getgenv().CaptureHook or "Namecall") .. "]")
+            .. " [capture hook " .. tostring(Core.capture_method and Core.capture_method() or getgenv().CaptureHook) .. "]")
     end))
     table.insert(conns, Remotes.ParrySuccess.OnClientEvent:Connect(function() flight("ParrySuccess received") end))
     local function where()
