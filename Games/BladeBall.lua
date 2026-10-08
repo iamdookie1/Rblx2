@@ -6,7 +6,7 @@ task.spawn(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.08-62"
+local SCRIPT_VERSION = "2026.10.08-63"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -1024,18 +1024,18 @@ local HOOK_NAME = "=ReplicatedStorage.Packages._Index.sleitnick_net@0.1.0.net"
 local NC_SRC = [[
 local box, getncm, sel = ...
 return function(self, ...)
-    local l = box.list
-    if box.want and #l < 4 and getncm() == "FireServer" and sel("#", ...) >= 6 then
-        l[#l + 1] = {self, sel("#", ...), {...}, box.now(box.ws)}
+    if sel("#", ...) >= 6 and box.want and getncm() == "FireServer" then
+        local l = box.list
+        if #l < 4 then l[#l + 1] = {self, sel("#", ...), {...}, box.now(box.ws)} end
     end
     return box.nc(self, ...)
 end]]
 local FIRE_SRC = [[
 local box, sel = ...
 return function(self, ...)
-    local l = box.list
-    if box.want and #l < 4 and sel("#", ...) >= 6 then
-        l[#l + 1] = {self, sel("#", ...), {...}, box.now(box.ws)}
+    if sel("#", ...) >= 6 and box.want then
+        local l = box.list
+        if #l < 4 then l[#l + 1] = {self, sel("#", ...), {...}, box.now(box.ws)} end
     end
     return box.fire(self, ...)
 end]]
@@ -1059,18 +1059,18 @@ Core.isolated = NC_BODY ~= nil and FIRE_BODY ~= nil
 -- No loadstring on this executor: same bodies, just not disguised.
 if not NC_BODY then
     NC_BODY = function(self, ...)
-        local l = box.list
-        if box.want and #l < 4 and getnamecallmethod_() == "FireServer" and select_("#", ...) >= 6 then
-            l[#l + 1] = {self, select_("#", ...), {...}, box.now(box.ws)}
+        if select_("#", ...) >= 6 and box.want and getnamecallmethod_() == "FireServer" then
+            local l = box.list
+            if #l < 4 then l[#l + 1] = {self, select_("#", ...), {...}, box.now(box.ws)} end
         end
         return box.nc(self, ...)
     end
 end
 if not FIRE_BODY then
     FIRE_BODY = function(self, ...)
-        local l = box.list
-        if box.want and #l < 4 and select_("#", ...) >= 6 then
-            l[#l + 1] = {self, select_("#", ...), {...}, box.now(box.ws)}
+        if select_("#", ...) >= 6 and box.want then
+            local l = box.list
+            if #l < 4 then l[#l + 1] = {self, select_("#", ...), {...}, box.now(box.ws)} end
         end
         return box.fire(self, ...)
     end
@@ -1107,19 +1107,31 @@ local function arm(hold)
     if not (H.fire or H.nc) then H.want = false; return false end
     box.want = true
     local up_at = clock_()
-    task.spawn(function()
-        while (H.fire or H.nc) and clock_() < H.until_t do
-            task.wait()
-            local l = box.list
-            for i = 1, #l do
-                if pcall_(inspect, l[i]) and Core.cap then break end
-            end
-            if Core.cap then break end
-        end
+    local done = false
+    local function finish()
+        if done then return end
+        done = true
         unhook()
         box.list = {}
-        pcall(flight, ("hook (%s) was up %.0fms -- %s"):format(capture_method(), (clock_() - up_at) * 1000,
+        pcall(flight, ("hook (%s) was up %.1fms -- %s"):format(capture_method(), (clock_() - up_at) * 1000,
             Core.cap and "caught the parry" or "nothing caught"))
+    end
+    -- Checks what the hook has seen; takes it down the moment the parry is in.
+    H.check = function()
+        if done then return true end
+        local l = box.list
+        for i = 1, #l do
+            if pcall_(inspect, l[i]) and Core.cap then break end
+        end
+        if Core.cap then finish(); return true end
+        return false
+    end
+    task.spawn(function()
+        while not done and (H.fire or H.nc) and clock_() < H.until_t do
+            task.wait()
+            if H.check() then return end
+        end
+        finish()
     end)
     return true
 end
@@ -1148,7 +1160,12 @@ prime_remote = function()
     -- does nothing and the hook would be up for nothing
     if Core.gate_open and not Core.gate_open() then return end
     last_press = now
-    if arm(0.2) then pressBlockKey() end
+    if arm(0.2) then
+        pressBlockKey()
+        -- if the game sent inside the press itself, the hook comes down right
+        -- here, before the frame ends
+        if H.check then H.check() end
+    end
 end
 
 -- Your own presses: only a touch on the game's block button arms it. The
