@@ -6,7 +6,7 @@ task.spawn(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.08-71"
+local SCRIPT_VERSION = "2026.10.08-72"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -1123,11 +1123,15 @@ end
 -- game's stack; the Namecall / Both hooks can't be frameless, so their bodies
 -- (and every wrapper we install) are hidden when the executor allows it.
 -- Without setstackhidden nothing changes.
-local stack_hidden = (function()
+-- OFF by default since v72: v71 used it and got a reason-24 kick 0.2s after
+-- the capture. Executors typically implement it by wrapping debug.info and
+-- friends -- and the game's parry code checks on every send that debug.info
+-- is still a real C function. getgenv().StackHide = true turns it back on.
+local stack_hidden = getgenv().StackHide == true and (function()
     local f = rawget(getgenv(), "setstackhidden")
     if type(f) ~= 'function' then pcall(function() f = setstackhidden end) end
     return type(f) == 'function' and f or nil
-end)()
+end)() or nil
 local function hide(fn)
     if not stack_hidden or type(fn) ~= 'function' then return fn end
     if not pcall(stack_hidden, fn, true) then pcall(stack_hidden, fn) end
@@ -4009,7 +4013,40 @@ do
     pcall(function() exec = table.concat({identifyexecutor()}, " ") end)
     flight(("==== v%s loaded | executor %s | place %s | userId %s | setstackhidden %s"):format(
         SCRIPT_VERSION, exec, tostring(game.PlaceId), tostring(LocalPlayer.UserId),
-        Core.stack_hiding and "available (hook bodies hidden)" or "not available"))
+        Core.stack_hiding and "ON (hook bodies hidden)" or "off"))
+    -- SELF-CHECK: what the game's parry sender checks on every send, run against
+    -- the GAME's own globals (the ones its code sees), not ours. If any of
+    -- these fail, every block press -- the capture press included -- trips it.
+    task.delay(2, function()
+        local fails = {}
+        pcall(function()
+            local renv = getrenv and getrenv() or nil
+            local d = renv and renv.debug
+            if type(d) == 'table' then
+                for _, name in ipairs({"info", "traceback", "getinfo"}) do
+                    local f = rawget(d, name)
+                    if type(f) == 'function' then
+                        local ok, src = pcall(d.info or debug.info, f, "s")
+                        if ok and src ~= "[C]" then fails[#fails + 1] = "debug." .. name .. " is not a C function in the game's env" end
+                    end
+                end
+            end
+            for _, name in ipairs({"getfenv", "setfenv", "pcall", "xpcall", "error", "require", "typeof", "tostring"}) do
+                local f = renv and rawget(renv, name)
+                if type(f) == 'function' then
+                    local ok, src = pcall(debug.info, f, "s")
+                    if ok and src ~= "[C]" then fails[#fails + 1] = name .. " is not a C function in the game's env" end
+                end
+            end
+            if renv and rawget(renv, "writefile") ~= nil then fails[#fails + 1] = "writefile is visible in the game's env" end
+        end)
+        if #fails == 0 then
+            flight("SELF-CHECK: the game's known parry-sender checks pass (debug functions are C, no writefile in its env)")
+        else
+            flight("SELF-CHECK FAILED: " .. table.concat(fails, "; "))
+            Notify("Self-check", "The game's parry code would flag this executor: " .. table.concat(fails, "; "), 12)
+        end
+    end)
     local conns = {}
     -- What happened just before a kick, in seconds: the capture hook (up /
     -- down), the fake F press, our last remote parry and spam send. Saved to
