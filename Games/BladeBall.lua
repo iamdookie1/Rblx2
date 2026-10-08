@@ -6,7 +6,7 @@ task.spawn(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.08-79"
+local SCRIPT_VERSION = "2026.10.08-80"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -1020,8 +1020,8 @@ end
 -- stack). So the body is:
 --   * compiled with loadstring under the chunk name of the game's own Net
 --     module, so debug.info shows a game path, not our script;
---   * run in a clean game environment (getrenv's globals, no writefile, nothing
---     of ours), so getfenv on its frame shows nothing of ours;
+--   * run in an empty env (just `script` = the Net ModuleScript), so getfenv on
+--     its frame shows nothing of ours -- no getrenv, nothing of the executor;
 --   * cut off from us: it calls none of our functions -- it drops the send into
 --     `box` (a plain table) and passes the call straight on. Our own thread
 --     picks the box up a frame later, works out the key and takes the hook down.
@@ -1041,13 +1041,16 @@ local HOOK_NAME = "=ReplicatedStorage.Packages._Index.sleitnick_net@0.1.0.net"
 -- reaches the server. Real parries start with the BAC hash, never the JobId.
 local NC_SRC = "local b,g,s,j=... return function(self,...) local a=... if a==j and g()=='FireServer' then return end if s('#',...)>=6 and b.want and g()=='FireServer' then local l=b.list if #l<4 then l[#l+1]={self,s('#',...),{...},b.now(b.ws)} end end return b.nc(self,...) end"
 local FIRE_SRC = "local b,s,j=... return function(self,...) local a=... if a==j then return end if s('#',...)>=6 and b.want then local l=b.list if #l<4 then l[#l+1]={self,s('#',...),{...},b.now(b.ws)} end end return b.fire(self,...) end"
--- The bodies' environment looks like the Net module's own: the game's globals
--- (getrenv, no writefile -- nothing of the executor's), and `script` set to
--- the real Net ModuleScript, like every function compiled from that module.
-local CLEAN_ENV
+-- The bodies only ever touch their own upvalues (the box table and a couple of
+-- vanilla functions passed in), never a global, so they run fine in an empty
+-- env. We used to seed this from getrenv() to disguise a getfenv of the body's
+-- frame, but getrenv() reaches into the game's environment at load -- a kick
+-- risk before any capture -- and oth runs the body off-thread anyway (getfenv
+-- on the game's stack never sees it), so no getrenv is used. `script` is set to
+-- the real Net ModuleScript (a plain FindFirstChild) to keep the disguise for
+-- the non-oth fallback.
+local CLEAN_ENV = {}
 do
-    local ok, renv = pcall(function() return getrenv and getrenv() end)
-    CLEAN_ENV = (ok and type(renv) == 'table' and renv.writefile == nil) and setmetatable({}, {__index = renv}) or {}
     pcall(function()
         local net = ReplicatedStorage:FindFirstChild("Packages")
         net = net and net:FindFirstChild("_Index")
@@ -2355,7 +2358,7 @@ local ROOTS = {player = function() return LocalPlayer end, char = function() ret
 local function resolve(loc)
     if type(loc) ~= 'table' then return nil end
     local ok, v = pcall(function()
-        if loc.where == "G" then return getrenv()._G[loc.key] end
+        if loc.where == "G" then return nil end -- game _G (getrenv) no longer read
         if loc.where == "data" then
             local t = Win.data and Win.data:Get()
             for _, k in ipairs(loc.path) do t = type(t) == 'table' and t[k] or nil end
@@ -2392,11 +2395,8 @@ local function each_readable(visit)
     if LocalPlayer.Character then walk_inst("char", LocalPlayer.Character, {}, 3) end
     walk_inst("rs", ReplicatedStorage, {}, 5)
     walk_inst("ws", Workspace, {}, 1)
-    pcall(function()
-        for k, v in pairs(getrenv()._G) do
-            if type(v) == 'string' and type(k) == 'string' then visit({where = "G", key = k}, v) end
-        end
-    end)
+    -- (The game's _G used to be walked here via getrenv -- removed; getrenv
+    -- reaches into the game's environment and is a kick risk.)
     pcall(function()
         local function walk(t, path, depth)
             if depth > 4 then return end
@@ -2504,12 +2504,11 @@ local function learn_hookfree(cap)
         local r = {version = 1}
         local hr = hashed_remotes()
         if #hr == 1 and hr[1] == cap.remote then r.remote = "net_hashed" end
-        pcall(function()
-            local g = getrenv()._G
-            if g.BAC_HASH == cap.hash then r.hash = "BAC_HASH" else
-                for k, v in pairs(g) do if v == cap.hash and type(k) == 'string' then r.hash = k; break end end
-            end
-        end)
+        -- (The hash was looked up in the game's _G via getrenv here -- removed.
+        -- getrenv reaches into the game's environment, so the hook-free recipe
+        -- no longer records a _G hash source; without it the recipe stays
+        -- incomplete and every server just uses the normal capture, which is
+        -- the main path anyway.)
         for name, f in pairs(KEY_RULES) do
             local ok, s = pcall(f, cap.uid)
             if ok and key_matches(s, cap.key) then r.key = {where = "rule", rule = name}; break end
@@ -2547,8 +2546,10 @@ local function build_hookfree()
     if not (r and r.complete) or Core.hookfree_off then return nil end
     local hr = hashed_remotes()
     if #hr ~= 1 then return nil end
-    local hash
-    pcall(function() hash = getrenv()._G[r.hash] end)
+    -- The hash used to come from the game's _G via getrenv; that's gone, so a
+    -- recipe can't rebuild the hash any more (a stale saved recipe that recorded
+    -- one just fails this check and the normal capture runs instead).
+    local hash = nil
     local uid = resolve(r.uid)
     if type(hash) ~= 'string' or type(uid) ~= 'string' or uid == '' then return nil end
     local keysrc
