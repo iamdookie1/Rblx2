@@ -6,7 +6,7 @@ task.spawn(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.08-72"
+local SCRIPT_VERSION = "2026.10.08-73"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -1220,10 +1220,83 @@ local last_press = -100
 -- block button (no synthetic input). Default: Auto (F) on every device.
 local function capture_press_mode()
     local m = getgenv().CapturePress
-    if m == "Auto" or m == "Own" then return m end
+    if m == "Auto" or m == "Own" or m == "Game" then return m end
     return "Auto"
 end
 Core.capture_press_mode = capture_press_mode
+
+-- GAME CALL press (Capture press = "Game"): instead of a fake F key, run the
+-- game's own block function -- the one your block button and F key call --
+-- exactly as a real press does. Found once, with no getgc / require / hook:
+-- the game's block handler is connected to UserInputService.InputBegan and
+-- holds that function as an upvalue (getconnections + getupvalues read it).
+-- It runs on a fresh thread at the game's identity (2), whose base frame and
+-- globals are the game's environment, so nothing of ours sits under it and
+-- the game's identity probe (PluginManager) fails exactly as it does for a
+-- real press. No keyboard event is generated at all.
+local game_block, game_block_tried
+local function find_game_block()
+    if game_block_tried then return game_block end
+    game_block_tried = true
+    local getconns = rawget(getgenv(), "getconnections")
+    if type(getconns) ~= 'function' then pcall(function() getconns = getconnections end) end
+    local getups = (debug and debug.getupvalues) or rawget(getgenv(), "getupvalues")
+    if type(getconns) ~= 'function' then return nil end
+    local function from_controller(f)
+        local ok, src = pcall(debug.info, f, "s")
+        return ok and type(src) == 'string' and src:find("SwordsController", 1, true) ~= nil
+    end
+    local function handler_on(signal)
+        local found
+        pcall(function()
+            for _, c in ipairs(getconns(signal)) do
+                local f = c.Function
+                if type(f) == 'function' and from_controller(f) then found = f; return end
+            end
+        end)
+        return found
+    end
+    -- 1. the block button's own handler: exactly what a real tap runs (no args)
+    pcall(function()
+        for _, b in ipairs(CollectionService:GetTagged("BlockButton")) do
+            local f = handler_on(b.MouseButton1Up) or handler_on(b.Activated)
+            if f then game_block = {fn = f, via = "block button handler"}; return end
+        end
+    end)
+    -- 2. else the block function itself, held by the game's InputBegan handler
+    if not game_block and type(getups) == 'function' then
+        local h = handler_on(UserInputService.InputBegan)
+        if h then
+            pcall(function()
+                for _, up in pairs(getups(h)) do
+                    if type(up) == 'function' and from_controller(up) then game_block = {fn = up, via = "block function"}; return end
+                end
+            end)
+        end
+    end
+    flight("game press: " .. (game_block and ("using the game's " .. game_block.via) or "NOT found -- falls back to F"))
+    return game_block
+end
+-- Runs the game's function as the BASE frame of a fresh thread: identity 2
+-- and the game's globals (our thread's globals are switched to the clean
+-- game env for the instant of the spawn -- a new thread inherits them -- then
+-- switched straight back). Nothing of ours is on that thread at all.
+local function game_press()
+    local g = find_game_block()
+    if not g then return false end
+    local getid = rawget(getgenv(), "getthreadidentity") or rawget(getgenv(), "get_thread_identity") or rawget(getgenv(), "getidentity")
+    local setid = rawget(getgenv(), "setthreadidentity") or rawget(getgenv(), "set_thread_identity") or rawget(getgenv(), "setidentity")
+    local old_id = getid and select(2, pcall(getid))
+    local ok_gt, our_gt = pcall(getfenv, 0)
+    pcall(setfenv, 0, CLEAN_ENV)
+    if setid then pcall(setid, 2) end
+    local ok = pcall(task.spawn, g.fn)
+    if setid and type(old_id) == 'number' then pcall(setid, old_id) end
+    if ok_gt and our_gt then pcall(setfenv, 0, our_gt) end
+    Core.ev.press = clock_()
+    return ok
+end
+Core.find_game_block = find_game_block
 prime_remote = function()
     if Core.cap or not is_live() or keypress_only() or not remote_features_on() then return end
     if capture_press_mode() == "Own" then
@@ -1245,7 +1318,7 @@ prime_remote = function()
     if Core.gate_open and not Core.gate_open() then return end
     last_press = now
     if arm(0.2) then
-        pressBlockKey()
+        if not (capture_press_mode() == "Game" and game_press()) then pressBlockKey() end
         -- if the game sent inside the press itself, the hook comes down right
         -- here, before the frame ends
         if H.check then H.check() end
@@ -3574,8 +3647,8 @@ end}):AddKeyPicker("AutoParryKey", {Default = "None", Mode = "Toggle", SyncToggl
 AP:AddDropdown("CaptureHook", {Text = "Capture hook", Values = {"FireServer", "Namecall", "Both"}, Default = "FireServer",
     Tooltip = "FireServer (default): frameless -- the hook is a real C function and its code runs on a separate coroutine, so nothing of ours is ever on the game's call stack. Catches the game's dot-call sends, so a capture can take a second press. Namecall / Both also catch the namecall sends but put a (disguised) Lua frame on the stack while up.",
     Callback = function(v) getgenv().CaptureHook = v end})
-AP:AddDropdown("CapturePress", {Text = "Capture press", Values = {"Auto", "Own"}, Default = "Auto",
-    Tooltip = "How the one capture per server is triggered. Own: your own tap on the block button (no fake input at all). Auto: the script presses F for you (a fake keyboard event -- on a phone that's keyboard input from a device with no keyboard).",
+AP:AddDropdown("CapturePress", {Text = "Capture press", Values = {"Auto", "Game", "Own"}, Default = "Auto",
+    Tooltip = "How the one capture per server is triggered. Auto: the script presses F (a fake keyboard event). Game: runs the game's own block function the way a real press does, at the game's identity on a clean thread -- no keyboard event at all (falls back to F if it can't be found). Own: waits for your own tap on the block button.",
     Callback = function(v) getgenv().CapturePress = v end})
 AP:AddDropdown("ParryMode", {Text = "Parry mode", Values = {"Remote", "Keypress"}, Default = "Remote",
     Tooltip = "Remote fires the parry remote with your curve (hookless, sends exactly what the game sends). Keypress presses the block key (F).",
@@ -4054,7 +4127,8 @@ do
     local function kick_context()
         local now, ev, parts = os.clock(), Core.ev or {}, {}
         local function ago(label, t) if t then parts[#parts + 1] = ("%s %.1fs ago"):format(label, now - t) end end
-        ago("hook up", ev.hook_up); ago("hook down", ev.hook_down); ago("fake F press", ev.press)
+        ago("hook up", ev.hook_up); ago("hook down", ev.hook_down)
+        ago((Core.capture_press_mode and Core.capture_press_mode() == "Game") and "game press" or "fake F press", ev.press)
         ago("remote parry", ev.remote); ago("spam send", ev.spam)
         local hooked_now = ev.hook_up and (not ev.hook_down or ev.hook_down < ev.hook_up)
         return (#parts > 0 and table.concat(parts, ", ") or "nothing sent or hooked yet")
