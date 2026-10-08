@@ -6,7 +6,7 @@ task.spawn(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.08-74"
+local SCRIPT_VERSION = "2026.10.08-75"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -2311,7 +2311,12 @@ end
 -- After a hook capture (we then know the true remote, hash, id and key), every
 -- piece is looked for in places that need no hook: the game's Net folder, the
 -- game's _G, attributes / StringValues under you, your character,
--- ReplicatedStorage and Workspace, the Data replion, and incoming remote events.
+-- ReplicatedStorage and Workspace, the Data replion, incoming remote events,
+-- AND the game's own Lua memory (closure upvalues read with getgc / getupvalues
+-- -- see LUA-MEMORY below). The id and key almost always live in the last of
+-- those: the parry sender (SwordsController.PRY) is an obfuscated VM that keeps
+-- them as upvalues, never under an Instance, which is why a readable-only search
+-- never completed the recipe and every session fell back to a press.
 -- The key is also tried against simple ways of making it from the id. Whatever
 -- is found is written to BladeBall/hookfree.json (the "recipe"). When the
 -- recipe has all four pieces, later sessions build the packet from it and never
@@ -2326,6 +2331,137 @@ local function save_recipe(r)
     pcall(function() ensureSaveFolder(); writefile(RECIPE_FILE, HttpService:JSONEncode(r)) end)
 end
 Core.recipe = load_recipe()
+
+-- ------------------------------------------------------------
+-- LUA-MEMORY sources for the recipe (read-only; no hook, no press, no send)
+-- ------------------------------------------------------------
+-- getgc / getupvalues / debug.info / getconstants are passive executor reads:
+-- they walk the game's own Lua objects in our process and the game can't see
+-- them (no hook is installed, no call goes to the server). We use them only to
+-- find WHERE a captured id/key lives, so later sessions can read the fresh
+-- value straight from that spot with nothing pressed.
+--
+-- A game Lua closure is pinned by a fingerprint that is the same every session
+-- in the same game build but different between closures: its source, the line
+-- it is defined on, and a hash of its string constants. A found id/key records
+-- that fingerprint plus the upvalue index it sat in (and a table key, if it was
+-- one level inside an upvalue table). resolve() re-finds the closure by that
+-- fingerprint and reads whatever the upvalue holds NOW -- the current server's
+-- id/key -- so the saved recipe stays valid across sessions without ever
+-- storing a stale value. If the build moved and no closure matches, resolve
+-- returns nil and the capture hook takes over for that server exactly as
+-- before. Turn the whole thing off with getgenv().DeepRecipe = false.
+local lua_mem
+do
+    local getgc_ = rawget(getgenv(), "getgc"); if type(getgc_) ~= 'function' then pcall(function() getgc_ = getgc end) end
+    local getups_ = (debug and debug.getupvalues) or rawget(getgenv(), "getupvalues")
+    if type(getups_) ~= 'function' then pcall(function() getups_ = getupvalues end) end
+    local getconsts_ = (debug and debug.getconstants) or rawget(getgenv(), "getconstants")
+    if type(getconsts_) ~= 'function' then pcall(function() getconsts_ = getconstants end) end
+    local info_ = (debug and debug.info); if type(info_) ~= 'function' then pcall(function() info_ = getinfo end) end
+    local isl_ = rawget(getgenv(), "islclosure"); if type(isl_) ~= 'function' then pcall(function() isl_ = islclosure end) end
+    local clock_ = os.clock
+    local enabled = type(getgc_) == 'function' and type(getups_) == 'function'
+        and type(info_) == 'function' and getgenv().DeepRecipe ~= false
+
+    local function is_lclosure(f)
+        if type(f) ~= 'function' then return false end
+        if type(isl_) ~= 'function' then return true end
+        local ok, r = pcall(isl_, f); return ok and r == true
+    end
+    -- Short, stable hash of a closure's string constants (FNV-1a over them).
+    local function const_fp(f)
+        if type(getconsts_) ~= 'function' then return "" end
+        local ok, cs = pcall(getconsts_, f)
+        if not ok or type(cs) ~= 'table' then return "" end
+        local h = 2166136261
+        for _, c in ipairs(cs) do
+            if type(c) == 'string' then
+                for i = 1, #c do h = (bit32.bxor(h, c:byte(i)) * 16777619) % 4294967296 end
+                h = (h + 7) % 4294967296
+            end
+        end
+        return string.format("%x", h)
+    end
+    local function fingerprint(f)
+        local src, line
+        pcall(function() src = info_(f, "s") end)
+        pcall(function() line = info_(f, "l") end)
+        return {src = type(src) == 'string' and src or "", line = type(line) == 'number' and line or -1, fp = const_fp(f)}
+    end
+    local function matches(f, loc)
+        -- cheap fields first; only hash the constants when src+line already agree
+        local src, line
+        pcall(function() src = info_(f, "s") end)
+        if (type(src) == 'string' and src or "") ~= loc.src then return false end
+        pcall(function() line = info_(f, "l") end)
+        if (type(line) == 'number' and line or -1) ~= loc.line then return false end
+        return const_fp(f) == loc.fp
+    end
+    -- getgc's Lua-closure list, cached briefly (id and key resolve back to back).
+    local cache = {at = -1, list = nil}
+    local function closures()
+        local now = clock_()
+        if cache.list and now - cache.at < 0.5 then return cache.list end
+        local list = {}
+        pcall(function()
+            local all = getgc_(false)
+            if type(all) == 'table' then
+                for _, f in ipairs(all) do if is_lclosure(f) then list[#list + 1] = f end end
+            end
+        end)
+        cache.list, cache.at = list, now
+        return list
+    end
+
+    lua_mem = {enabled = enabled}
+    -- Visit every game-closure upvalue string (and strings one table deep inside
+    -- an upvalue table), each with a loc that re-finds it next session.
+    function lua_mem.scan(visit)
+        if not enabled then return end
+        local list = closures()
+        for n, f in ipairs(list) do
+            local base
+            local ok, ups = pcall(getups_, f)
+            if ok and type(ups) == 'table' then
+                for idx, v in pairs(ups) do
+                    if type(idx) == 'number' then
+                        if type(v) == 'string' and #v >= 4 and #v <= 128 then
+                            base = base or fingerprint(f)
+                            visit({where = "upval", src = base.src, line = base.line, fp = base.fp, idx = idx}, v)
+                        elseif type(v) == 'table' then
+                            pcall(function()
+                                for k, x in pairs(v) do
+                                    if type(x) == 'string' and #x >= 4 and #x <= 128
+                                        and (type(k) == 'string' or type(k) == 'number') then
+                                        base = base or fingerprint(f)
+                                        visit({where = "upval", src = base.src, line = base.line, fp = base.fp, idx = idx, tk = k}, x)
+                                    end
+                                end
+                            end)
+                        end
+                    end
+                end
+            end
+            if n % 300 == 0 then task.wait() end
+        end
+    end
+    -- Read the live value a recorded upvalue loc points at, this session.
+    function lua_mem.resolve(loc)
+        if not enabled then return nil end
+        for _, f in ipairs(closures()) do
+            if matches(f, loc) then
+                local ok, ups = pcall(getups_, f)
+                if ok and type(ups) == 'table' then
+                    local v = ups[loc.idx]
+                    if loc.tk ~= nil and type(v) == 'table' then v = v[loc.tk] end
+                    if type(v) == 'string' then return v end
+                end
+            end
+        end
+        return nil
+    end
+end
 
 -- Simple ways the key could be made from the id.
 local function bytes_op(a, b, op)
@@ -2372,6 +2508,7 @@ local function resolve(loc)
             return t
         end
         if loc.where == "event" then return Core.event_seen and Core.event_seen[loc.id] end
+        if loc.where == "upval" then return lua_mem and lua_mem.resolve(loc) end
         local inst = ROOTS[loc.where] and ROOTS[loc.where]()
         for _, name in ipairs(loc.path or {}) do inst = inst and inst:FindFirstChild(name) end
         if not inst then return nil end
@@ -2421,6 +2558,10 @@ local function each_readable(visit)
         end
         if Win.data then walk(Win.data:Get(), {}, 0) end
     end)
+    -- The game's own Lua memory, last so any readable Instance / _G path wins
+    -- over an upvalue (an Instance path is stable across builds; an upvalue is
+    -- re-found by fingerprint). This is where the id and key usually turn up.
+    if lua_mem and lua_mem.enabled then pcall(lua_mem.scan, visit) end
 end
 
 -- The parry remote, found with no hook: the only hashed-name RemoteEvent in Net.
@@ -2501,7 +2642,11 @@ end
 if Core.recipe then listen_recipe_event(Core.recipe.uid); listen_recipe_event(Core.recipe.key) end
 
 local function recipe_summary(r)
-    local function mark(x) return x and "found" or "NOT found" end
+    local function mark(x)
+        if not x then return "NOT found" end
+        if type(x) == 'table' and x.where then return "found (" .. tostring(x.where) .. ")" end
+        return "found"
+    end
     return ("remote %s, hash %s, id %s, key %s"):format(mark(r.remote), mark(r.hash), mark(r.uid), mark(r.key))
 end
 
