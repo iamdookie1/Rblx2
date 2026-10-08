@@ -6,7 +6,7 @@ task.spawn(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.08-61"
+local SCRIPT_VERSION = "2026.10.08-62"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -1087,9 +1087,12 @@ Core.unhook = unhook
 
 -- Up for one capture press (0.35s at most). Our thread watches the box every
 -- frame: the first real parry in it becomes the capture and the hook comes off.
-local function arm()
+-- `hold` = how long it stays up waiting (the auto press is answered within a
+-- couple of frames, so 0.2s; a held touch on the block button stays armed
+-- until shortly after the finger lifts).
+local function arm(hold)
     if Core.cap or not is_live() then return false end
-    H.want, H.until_t = true, clock_() + 0.35
+    H.want, H.until_t = true, clock_() + (hold or 0.2)
     if H.fire or H.nc then return true end
     box.list = {}
     local method = capture_method()
@@ -1103,6 +1106,7 @@ local function arm()
     end
     if not (H.fire or H.nc) then H.want = false; return false end
     box.want = true
+    local up_at = clock_()
     task.spawn(function()
         while (H.fire or H.nc) and clock_() < H.until_t do
             task.wait()
@@ -1114,6 +1118,8 @@ local function arm()
         end
         unhook()
         box.list = {}
+        pcall(flight, ("hook (%s) was up %.0fms -- %s"):format(capture_method(), (clock_() - up_at) * 1000,
+            Core.cap and "caught the parry" or "nothing caught"))
     end)
     return true
 end
@@ -1138,15 +1144,21 @@ prime_remote = function()
     -- round or respawn starts), then every 1.4s until it's armed
     if not Core.can_since or now - Core.can_since < 1 then return end
     if now - last_press < 1.4 then return end
+    -- only when the press will really send: inside the game's lockout it
+    -- does nothing and the hook would be up for nothing
+    if Core.gate_open and not Core.gate_open() then return end
     last_press = now
-    if arm() then pressBlockKey() end
+    if arm(0.2) then pressBlockKey() end
 end
 
--- Your own block press arms it too -- only a real block press, not any input:
--- the F key, a left click, a gamepad button, or a touch on the game's block
--- button. (Arming on every touch/key put the hooks up for moving the camera and
--- walking.) The mobile button fires when your finger lifts, so a touch on it
--- arms when it starts and again when it ends, covering however long you hold.
+-- Your own presses: only a touch on the game's block button arms it. The
+-- game's block button fires when the finger LIFTS, so arming as the touch
+-- starts puts the hook up before the send; it stays up while the finger is
+-- down (at most 1s) and comes down 0.1s after it lifts.
+-- F / click / controller presses do NOT arm any more: the game's input handler
+-- is connected before ours and sends the parry in the same instant, so the
+-- hook only went up after the send -- 0.35s of exposure that could never catch
+-- anything. The auto press covers those (it arms first, then presses).
 local function on_block_button(pos)
     local ok, hit = pcall(function()
         local inset = GuiService:GetGuiInset()
@@ -1163,20 +1175,16 @@ local function on_block_button(pos)
     end)
     return ok and hit
 end
-local function is_block_press(input)
-    local t = input.UserInputType
-    if t == Enum.UserInputType.Keyboard then return input.KeyCode == Enum.KeyCode.F end
-    if t == Enum.UserInputType.MouseButton1 or t == Enum.UserInputType.Gamepad1 then return true end
-    if t == Enum.UserInputType.Touch then return on_block_button(input.Position) end
-    return false
-end
-local function own_input(input)
+local touch_armed = false
+UserInputService.InputBegan:Connect(function(input)
     if Core.cap or not is_live() or keypress_only() then return end
-    if is_block_press(input) and canParryNow() then arm() end
-end
-UserInputService.InputBegan:Connect(own_input)
+    if input.UserInputType ~= Enum.UserInputType.Touch then return end
+    if canParryNow() and on_block_button(input.Position) and arm(1.0) then touch_armed = true end
+end)
 UserInputService.InputEnded:Connect(function(input)
-    if input.UserInputType == Enum.UserInputType.Touch then own_input(input) end
+    if input.UserInputType ~= Enum.UserInputType.Touch or not touch_armed then return end
+    touch_armed = false
+    if H.fire or H.nc then H.until_t = math.min(H.until_t, clock_() + 0.1) end
 end)
 
 -- ------------------------------------------------------------
