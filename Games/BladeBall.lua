@@ -6,7 +6,7 @@ task.spawn(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.08-77"
+local SCRIPT_VERSION = "2026.10.08-78"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -1293,78 +1293,10 @@ local function capture_press_mode()
 end
 Core.capture_press_mode = capture_press_mode
 
--- GAME CALL press (Capture press = "Game"): instead of a fake F key, run the
--- game's own block function -- the one your block button and F key call --
--- exactly as a real press does. Found once, with no getgc / require / hook:
--- the game's block handler is connected to UserInputService.InputBegan and
--- holds that function as an upvalue (getconnections + getupvalues read it).
--- It runs on a fresh thread at the game's identity (2), whose base frame and
--- globals are the game's environment, so nothing of ours sits under it and
--- the game's identity probe (PluginManager) fails exactly as it does for a
--- real press. No keyboard event is generated at all.
-local game_block, game_block_tried
-local function find_game_block()
-    if game_block_tried then return game_block end
-    game_block_tried = true
-    local getconns = rawget(getgenv(), "getconnections")
-    if type(getconns) ~= 'function' then pcall(function() getconns = getconnections end) end
-    local getups = (debug and debug.getupvalues) or rawget(getgenv(), "getupvalues")
-    if type(getconns) ~= 'function' then return nil end
-    local function from_controller(f)
-        local ok, src = pcall(debug.info, f, "s")
-        return ok and type(src) == 'string' and src:find("SwordsController", 1, true) ~= nil
-    end
-    local function handler_on(signal)
-        local found
-        pcall(function()
-            for _, c in ipairs(getconns(signal)) do
-                local f = c.Function
-                if type(f) == 'function' and from_controller(f) then found = f; return end
-            end
-        end)
-        return found
-    end
-    -- 1. the block button's own handler: exactly what a real tap runs (no args)
-    pcall(function()
-        for _, b in ipairs(CollectionService:GetTagged("BlockButton")) do
-            local f = handler_on(b.MouseButton1Up) or handler_on(b.Activated)
-            if f then game_block = {fn = f, via = "block button handler"}; return end
-        end
-    end)
-    -- 2. else the block function itself, held by the game's InputBegan handler
-    if not game_block and type(getups) == 'function' then
-        local h = handler_on(UserInputService.InputBegan)
-        if h then
-            pcall(function()
-                for _, up in pairs(getups(h)) do
-                    if type(up) == 'function' and from_controller(up) then game_block = {fn = up, via = "block function"}; return end
-                end
-            end)
-        end
-    end
-    flight("game press: " .. (game_block and ("using the game's " .. game_block.via) or "NOT found -- falls back to F"))
-    return game_block
-end
--- Runs the game's function as the BASE frame of a fresh thread: identity 2
--- and the game's globals (our thread's globals are switched to the clean
--- game env for the instant of the spawn -- a new thread inherits them -- then
--- switched straight back). Nothing of ours is on that thread at all.
-local function game_press()
-    local g = find_game_block()
-    if not g then return false end
-    local getid = rawget(getgenv(), "getthreadidentity") or rawget(getgenv(), "get_thread_identity") or rawget(getgenv(), "getidentity")
-    local setid = rawget(getgenv(), "setthreadidentity") or rawget(getgenv(), "set_thread_identity") or rawget(getgenv(), "setidentity")
-    local old_id = getid and select(2, pcall(getid))
-    local ok_gt, our_gt = pcall(getfenv, 0)
-    pcall(setfenv, 0, CLEAN_ENV)
-    if setid then pcall(setid, 2) end
-    local ok = pcall(task.spawn, g.fn)
-    if setid and type(old_id) == 'number' then pcall(setid, old_id) end
-    if ok_gt and our_gt then pcall(setfenv, 0, our_gt) end
-    Core.ev.press = clock_()
-    return ok
-end
-Core.find_game_block = find_game_block
+-- (The old GAME-call press -- running the game's own block function, found by
+-- probing UserInputService.InputBegan with getconnections + getupvalues +
+-- debug.info -- has been removed. That probing ran before any capture and was
+-- a kick risk on its own, and Game mode is gone, so nothing needs it.)
 prime_remote = function()
     if Core.cap or not is_live() or keypress_only() or not remote_features_on() then return end
     if capture_press_mode() == "Own" then
@@ -1691,38 +1623,12 @@ function System.parry.fast()
 end
 function System.parry.execute_action() return System.parry.execute() end
 -- One parry by the chosen mode. Keypress presses only when the game's gate is
--- open, since a press inside it does nothing.
--- GAME mode: every parry is the game's own block press (see game_press) --
--- no hook, no capture, nothing of ours in the packet: the game builds it, plays
--- its swing and applies its own lockout. The curve goes in through the camera:
--- the game's press reads CurrentCamera.CFrame when it builds the parry, so the
--- camera is pointed along the curve for that instant and put straight back
--- (the camera script rewrites it before the next render anyway). Target mode
--- isn't applied (the game aims at your cursor / touch).
-function System.parry.game(curveCF)
-    if not LocalPlayer.Character then return false end
-    local cam = Workspace.CurrentCamera
-    local saved = cam and cam.CFrame
-    if saved and curveCF and props.__curve_mode ~= 1 then
-        local look = curveCF.LookVector
-        if look == look and look.Magnitude > 0.5 then
-            pcall(function() cam.CFrame = CFrame.lookAt(saved.Position, saved.Position + look) end)
-        end
-    end
-    log_send("game press")
-    local ok = game_press()
-    if saved then pcall(function() cam.CFrame = saved end) end
-    if ok then count() end
-    return ok
-end
+-- open, since a press inside it does nothing. (Game mode -- the game's own block
+-- press -- has been removed; a saved "Game" config falls back to Keypress.)
 function System.parry.by_mode(mode)
-    if mode == "Keypress" then
+    if mode == "Keypress" or mode == "Game" then
         if not gate_open() then return false end
         return System.parry.keypress()
-    end
-    if mode == "Game" then
-        if not gate_open() then return false end
-        return System.parry.game(System.curve.get_cframe())
     end
     return System.parry.execute()
 end
@@ -2176,7 +2082,7 @@ local function decide(ball, st, root, now, via)
     -- inside the game's lockout a parry does nothing: wait, and fire the
     -- moment it ends if the ball is due (or already overdue)
     local pm = getgenv().AutoParryMode
-    if ((pm ~= "Keypress" and Core.cap) or pm == "Game") and not gate_open() then
+    if pm ~= "Keypress" and Core.cap and not gate_open() then
         return hold(("game lockout, %.2fs left"):format(math.max(G.until_t - clock_(), 0)))
     end
 
@@ -2286,7 +2192,7 @@ local function trigger(ball, st)
     local now = clock_()
     if pass_busy(st, now) or blocked_by_detection() then return end
     local pm = getgenv().AutoParryMode
-    if ((pm ~= "Keypress" and Core.cap) or pm == "Game") and not gate_open() then return end
+    if pm ~= "Keypress" and Core.cap and not gate_open() then return end
     if fire_for(st, now, "triggerbot") then
         System.__triggerbot.__parries = System.__triggerbot.__parries + 1
     end
@@ -2760,13 +2666,9 @@ function System.manual_spam.start() System.__properties.__manual_spam_enabled = 
 function System.manual_spam.stop() System.__properties.__manual_spam_enabled = false end
 
 local function spam_fire()
-    if getgenv().ManualSpamMode == "Keypress" then
+    if getgenv().ManualSpamMode == "Keypress" or getgenv().ManualSpamMode == "Game" then
         System.parry.keypress()
         return true
-    end
-    if getgenv().ManualSpamMode == "Game" then
-        -- the game ignores presses inside its own lockout, like a real player's spam
-        return System.parry.game(System.curve.get_cframe_fast())
     end
     local sent = System.parry.fast()
     if sent and getgenv().ManualSpamAnimationFix and macroAnimFix then
@@ -3707,8 +3609,7 @@ task.spawn(function()
 end)
 
 local function remoteStatusText()
-    if getgenv().AutoParryMode == "Keypress" then return "Mode: Keypress (presses the block key)" end
-    if getgenv().AutoParryMode == "Game" then return "Mode: Game (the game's own block press, no hook)" end
+    if getgenv().AutoParryMode == "Keypress" or getgenv().AutoParryMode == "Game" then return "Mode: Keypress (presses the block key)" end
     local w = parry_window()
     local wtxt = w and ("%.3f"):format(w) or (Win.done and "fallback" or "reading stats...")
     if remoteReady() then
@@ -3772,8 +3673,8 @@ AP:AddDropdown("CaptureHook", {Text = "Capture hook", Values = {"FireServer", "N
 AP:AddDropdown("CapturePress", {Text = "Capture press", Values = {"Keypress", "Own"}, Default = "Keypress",
     Tooltip = "How the one capture per server is triggered. Keypress (default): the script presses the block key so the game sends one real parry for the hook to read. Own: waits for your own tap on the block button (no synthetic input). (The old Game-call capture method has been removed.)",
     Callback = function(v) getgenv().CapturePress = v end})
-AP:AddDropdown("ParryMode", {Text = "Parry mode", Values = {"Remote", "Game", "Keypress"}, Default = "Remote",
-    Tooltip = "Remote: fires the captured parry remote (needs the one capture hook per server). Game: NO hook, NO capture -- every parry is the game's own block press run like a real one, curve applied through the camera; the game's cooldown applies and target mode isn't. Keypress: presses F.",
+AP:AddDropdown("ParryMode", {Text = "Parry mode", Values = {"Remote", "Keypress"}, Default = "Remote",
+    Tooltip = "Remote: fires the captured parry remote (needs the one capture hook per server) -- curve and target mode apply. Keypress: presses the block key (no curve/target). (Game mode has been removed.)",
     Callback = function(v) getgenv().AutoParryMode = v end})
 AP:AddDropdown("CurveMode", {Text = "Curve mode", Values = System.__config.__curve_names, Default = "Camera",
     Callback = function(v)
@@ -3919,8 +3820,8 @@ SP:AddToggle("ManualSpam", {Text = "Manual spam", Default = false, Callback = fu
     end
     NotifyToggle("Manual Spam", v)
 end}):AddKeyPicker("ManualSpamKey", {Default = "E", Mode = "Hold", SyncToggleState = true, Text = "Manual spam"})
-SP:AddDropdown("SpamMode", {Text = "Mode", Values = {"Remote", "Game", "Keypress"}, Default = "Remote",
-    Tooltip = "Remote: the captured remote (goes through the cooldown). Game: the game's own block press, no hook (the game's cooldown applies, like a real player spamming). Keypress: F.",
+SP:AddDropdown("SpamMode", {Text = "Mode", Values = {"Remote", "Keypress"}, Default = "Remote",
+    Tooltip = "Remote: the captured remote (goes through the cooldown). Keypress: presses the block key. (Game mode has been removed.)",
     Callback = function(v) getgenv().ManualSpamMode = v end})
 SP:AddSlider("SpamMaxKbps", {Text = "Max upload", Default = 220, Min = 60, Max = 600, Rounding = 0, Suffix = " kbps",
     Tooltip = "Manual and auto spam both run as fast as they can (up to 120/s) and slow down only when your upload goes over this. Higher = more spam but more risk of your movement lagging behind (desync). Lower = smoother movement, less spam. If you rubber-band while spamming, lower it.",
