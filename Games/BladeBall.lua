@@ -6,7 +6,7 @@ task.spawn(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.08-92"
+local SCRIPT_VERSION = "2026.10.08-93"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -610,6 +610,13 @@ local success_at = -math.huge
 -- A new character (the old CharacterAdded hook) resets the block gate.
 local last_pos = setmetatable({}, {__mode = 'k'}) -- track -> TimePosition last frame
 local polled_char
+-- The game's OnParrySuccess plays {"Parry", "SuccessParry"} -- or, for swords
+-- with variants, "SuccessParry<N>" -- so any of those tags means a landed parry.
+local function is_success_track(track)
+    if track:GetAttribute("SuccessParry") then return true end
+    for i = 1, 8 do if track:GetAttribute("SuccessParry" .. i) then return true end end
+    return false
+end
 table.insert(Core.polls, function()
     local char = LocalPlayer.Character
     if char ~= polled_char then
@@ -629,16 +636,20 @@ table.insert(Core.polls, function()
     for track, pos in pairs(playing) do last_pos[track] = pos end
     if #fresh == 0 then return end
     local now = os.clock()
+    local landed = false
     for _, track in ipairs(fresh) do
-        if track:GetAttribute("SuccessParry") then -- a parry landed
-            success_at = now
-            gate.landed, gate.landed_at = true, now
-            local grab = System.__properties.__grab_animation
-            if grab and char.Parent == Alive then pcall(function() grab:Stop() end) end
-        end
+        if is_success_track(track) then landed = true end
+    end
+    if landed then -- a parry landed: everything the ParrySuccess listeners used to do
+        success_at = now
+        gate.landed, gate.landed_at = true, now
+        local grab = System.__properties.__grab_animation
+        if grab then pcall(function() grab:Stop() end) end
+        if Core.on_landed then pcall(Core.on_landed) end           -- parry core: gate, timing, passes
+        if System.spam_landed then pcall(System.spam_landed) end   -- spam: next one goes now
     end
     for _, track in ipairs(fresh) do
-        if not track:GetAttribute("SuccessParry") and (track:GetAttribute("Parry") or track:GetAttribute("GrabParry")) then
+        if not is_success_track(track) and (track:GetAttribute("Parry") or track:GetAttribute("GrabParry")) then
             local at = own_swing[track]
             if now - success_at >= 0.35 and not (at and now - at < 0.25) then
                 if Core.gate_start then Core.gate_start() end
@@ -1655,8 +1666,10 @@ end
 Core.send = send
 
 -- A landed parry: the gate clears (the game's OnParrySuccess) and the pass on
--- us is done until the ball leaves.
-Remotes.ParrySuccess.OnClientEvent:Connect(function()
+-- us is done until the ball leaves. NOT a ParrySuccess listener any more --
+-- the animation poll (Core.polls) calls this when the game's landed-parry swing
+-- starts, which is exactly what ParrySuccess makes the game do.
+Core.on_landed = (function()
     local char = LocalPlayer.Character
     if not (char and char:IsDescendantOf(Workspace)) then return end
     G.until_t = 0 -- a landed parry clears the lockout at once (the game's OnParrySuccess)
@@ -1680,16 +1693,10 @@ Remotes.ParrySuccess.OnClientEvent:Connect(function()
     end
     if Core.mark_landed then Core.mark_landed() end
 end)
-pcall(function()
-    Remotes.NoobParryHappened.OnClientEvent:Connect(function()
-        task.wait(0.11)
-        G.until_t = 0
-    end)
-end)
-pcall(function() Remotes.M1Stop.Event:Connect(function(v) G.m1, G.m1_at = v and true or false, clock_() end) end)
-Remotes.ParrySuccessAll.OnClientEvent:Connect(function()
-    if props.__grab_animation then pcall(function() props.__grab_animation:Stop() end) end
-end)
+-- (No NoobParryHappened / M1Stop / ParrySuccessAll listeners either: in a noob
+-- server the lockout now just runs its normal course instead of clearing early,
+-- M1Stop's hold is no longer mirrored (a press during it simply does nothing),
+-- and stopping our grab swing on a landed parry is done by the animation poll.)
 
 -- The public parry API (spam, slashes, hotkeys go through these).
 local function count() props.__total_parries = props.__total_parries + 1 end
@@ -2564,34 +2571,15 @@ local function find_path(v, pred, path, depth)
     end
     return nil
 end
-local function watch_events(pred, found)
-    task.spawn(function()
-        for i, r in ipairs(ReplicatedStorage:GetDescendants()) do
-            if r:IsA("RemoteEvent") then
-                local rel = {}
-                local p = r
-                while p and p ~= ReplicatedStorage do table.insert(rel, 1, p.Name); p = p.Parent end
-                pcall(function()
-                    local conn
-                    conn = r.OnClientEvent:Connect(function(...)
-                        for j = 1, select('#', ...) do
-                            local sub = find_path((select(j, ...)), pred, {}, 0)
-                            if sub then
-                                pcall(function() conn:Disconnect() end)
-                                found({where = "event", id = table.concat(rel, "/") .. "#" .. j, remote = rel, arg = j, sub = table.clone(sub)})
-                                return
-                            end
-                        end
-                    end)
-                end)
-            end
-            if i % 300 == 0 then task.wait() end
-        end
-    end)
-end
+-- DISABLED: this attached a listener to EVERY RemoteEvent in ReplicatedStorage
+-- after a capture -- the same class of thing (listeners on the game's remotes)
+-- that every kicked config had and every clean one didn't. The hook-free recipe
+-- can't complete anyway since the getrenv hash source was removed.
+local function watch_events(pred, found) end
 -- For a recipe whose id/key arrives by event: keep the latest value.
 Core.event_seen = {}
 local function listen_recipe_event(loc)
+    do return end -- DISABLED: no listeners on the game's remotes (see watch_events)
     if type(loc) ~= 'table' or loc.where ~= "event" then return end
     pcall(function()
         local r = ReplicatedStorage
@@ -3030,7 +3018,8 @@ System.spam_on_retarget = function() pcall(spam_instant) end
 -- PreRender / PreAnimation) as before -- those were never the kick; reverting
 -- the mistaken change. BBCoreOnly / BBNoSpam still skip them for diagnostics.
 if not (genv.BBCoreOnly or genv.BBNoSpam) then
-Remotes.ParrySuccess.OnClientEvent:Connect(function() pcall(spam_instant) end)
+-- (was a ParrySuccess listener; the animation poll calls this on a landed parry)
+System.spam_landed = function() pcall(spam_instant) end
 do
     local last_error
     local function run(fn)
@@ -4324,7 +4313,6 @@ do
             if not getgenv().BladeBallNoLog then writefile(SAVE_FOLDER .. "/lastkick.txt", "") end
         end
     end)
-    table.insert(conns, Remotes.ParrySuccess.OnClientEvent:Connect(function() flight("ParrySuccess received") end))
     local function where()
         local char = LocalPlayer.Character
         local alive = char and char.Parent == Alive
