@@ -6,7 +6,7 @@ task.spawn(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.09-63.2"
+local SCRIPT_VERSION = "2026.10.09-63.3"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -1160,9 +1160,37 @@ end
 -- remote is on. Presses are 1.4s apart, so each one clears the game's 1.3s
 -- lockout and really sends. The press is a real parry, so it's never wasted.
 local last_press = -100
+-- CAPTURE PRESS: whose press the capture reads (Parry tab -> "Capture press").
+--   "Your press" -- NO fake input at all: the hook goes up when you press block
+--                   yourself (F, click, or a tap on the block button) in a
+--                   match, and reads that press. You press block once per
+--                   server; auto parry is live from then on.
+--   "Auto press" -- the script presses F through VirtualInputManager.
+-- On a phone that F is keyboard input on a device with no keyboard -- the
+-- game can see that (the last input type flips to Keyboard while
+-- KeyboardEnabled is false), at the exact moment of every capture, whichever
+-- hook is used. So the default is "Your press" on a device without a
+-- keyboard, "Auto press" with one.
+local function capture_with()
+    local v = getgenv().CaptureWith
+    if v == "Your press" or v == "Auto press" then return v end
+    local kb = true
+    pcall(function() kb = UserInputService.KeyboardEnabled end)
+    return kb and "Auto press" or "Your press"
+end
+Core.capture_with = capture_with
+
 prime_remote = function()
     if Core.cap or not is_live() or keypress_only() or not remote_features_on() then return end
     if not Core.in_match() or not canParryNow() then return end
+    if capture_with() == "Your press" then
+        if not Core.asked then
+            Core.asked = true
+            flight("waiting for YOUR block press to capture (no fake input)")
+            Notify("Blade Ball", "Press block once to arm auto parry (no fake input is used).", 5)
+        end
+        return
+    end
     local now = clock_()
     -- F, 1s after you became able to parry (so it never lands the instant a
     -- round or respawn starts), then every 1.4s until it's armed
@@ -1192,7 +1220,7 @@ end
 -- picked in "Capture hook".
 Core.rehook = function()
     pcall(unhook)
-    Core.cap, Core.pending, Core.misses, Core.told, Core.dry_presses = nil, nil, 0, false, 0
+    Core.cap, Core.pending, Core.misses, Core.told, Core.dry_presses, Core.asked = nil, nil, 0, false, 0, false
     last_press = -100
     if canParryNow() then Core.can_since = clock_() - 1 end
     flight("REHOOK: capture dropped, taking a fresh one (" .. tostring(capture_method()) .. " hook)")
@@ -1229,7 +1257,10 @@ local function is_block_press(input)
 end
 local function own_input(input)
     if Core.cap or not is_live() or keypress_only() then return end
-    if is_block_press(input) and Core.in_match() and canParryNow() then arm() end
+    if is_block_press(input) and Core.in_match() and canParryNow() then
+        local was_up = H.fire or H.nc
+        if arm() and not was_up then flight(("your press: %s hook up for 0.35s"):format(capture_method())) end
+    end
 end
 UserInputService.InputBegan:Connect(own_input)
 -- Every real block press of yours (F, click, gamepad, the block button) starts
@@ -2348,7 +2379,7 @@ RunService.Heartbeat:Connect(function()
     local nc = Core.new_capture
     if nc then
         Core.new_capture = nil
-        Core.dry_presses = 0
+        Core.dry_presses, Core.asked = 0, false
         local cap, prev = Core.cap, nc.prev
         learn_hookfree(cap)
         local keystr = table.concat(cap.key, ",")
@@ -3512,10 +3543,14 @@ end}):AddKeyPicker("AutoParryKey", {Default = "None", Mode = "Toggle", SyncToggl
 AP:AddDropdown("CaptureHook", {Text = "Capture hook", Values = {"oth", "Namecall", "FireServer", "Both"}, Default = "oth",
     Tooltip = "Which hook catches the one parry packet Remote mode needs (up for that press only). oth = Delta's oth.hook on FireServer (Namecall if oth isn't there). Namecall or FireServer alone may take two presses; Both arms in one. The flight log notes which one was on for every capture and kick.",
     Callback = function(v) getgenv().CaptureHook = v end})
+AP:AddDropdown("CaptureWith", {Text = "Capture press", Values = {"Your press", "Auto press"}, Default = Core.capture_with(),
+    Tooltip = "Your press = no fake input: press block yourself once per server (in a match) and that press is captured. Auto press = the script presses F for you. On a phone that F is keyboard input on a device with no keyboard, which the game can see, so Your press is the default there.",
+    Callback = function(v) getgenv().CaptureWith = v end})
 AP:AddButton({Text = "Rehook", Tooltip = "Drops the current capture and takes a fresh one with the Capture hook above, the next moment you can parry (in a match). Use it after switching hook, or when parries stop landing.",
     Func = function()
         Core.rehook()
-        Notify("Blade Ball", Core.cap and "Rehooked." or "Rehooking: the next press captures.", 3)
+        Notify("Blade Ball", Core.capture_with() == "Your press" and "Rehooking: press block once to capture."
+            or "Rehooking: the next press captures.", 3)
     end})
 AP:AddDropdown("ParryMode", {Text = "Parry mode", Values = {"Remote", "Keypress"}, Default = "Remote",
     Tooltip = "Remote fires the parry remote with your curve (hookless, sends exactly what the game sends). Keypress presses the block key (F).",
