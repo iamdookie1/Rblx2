@@ -6,7 +6,7 @@ task.spawn(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.08-60.6"
+local SCRIPT_VERSION = "2026.10.09-60.7"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -245,16 +245,29 @@ local function build_screen_points(cam)
         if mode == "Hovergoal" or mode == "Soccer" then
             -- Like the game in these modes: the other team's goal, plus any
             -- Rising Zombie -- not every player.
+            -- The other team's goal, without require()-ing the game's targeting
+            -- helper: your team from the player/character attributes or Team,
+            -- else the goal farther from you (yours is the one you defend).
             pcall(function()
-                local helper = require(ReplicatedStorage.Shared.ThreadSafeTargetingHelper)
-                local team = helper.GetPlayerTeam(LocalPlayer)
-                local want = ("Goal%s"):format(tostring(team == 1 and 2 or 1))
+                local char = LocalPlayer.Character
+                local team = LocalPlayer:GetAttribute("Team") or (char and char:GetAttribute("Team"))
+                if team == nil and LocalPlayer.Team then team = tonumber(LocalPlayer.Team.Name:match("%d+")) end
+                team = tonumber(team)
+                local want = team and ("Goal%s"):format(tostring(team == 1 and 2 or 1))
+                local root = char and char.PrimaryPart
+                local best, best_d
                 for _, goal in ipairs(CollectionService:GetTagged("HovergoalGoal")) do
-                    if goal.Name == want and goal:FindFirstChild("Target") then
-                        add(goal.Name, goal.Target.Position)
-                        break
+                    local t = goal:FindFirstChild("Target")
+                    if t then
+                        if want then
+                            if goal.Name == want then best = goal; break end
+                        elseif root then
+                            local d = (t.Position - root.Position).Magnitude
+                            if not best_d or d > best_d then best, best_d = goal, d end
+                        end
                     end
                 end
+                if best then add(best.Name, best.Target.Position) end
             end)
             for _, entity in ipairs(Alive:GetChildren()) do
                 local hrp = entity:FindFirstChild('HumanoidRootPart')
@@ -301,86 +314,20 @@ local choose_target
 local target_aim = {at = -1, name = nil, aim = nil}
 
 -- ============================================================
--- PARRY WINDOW (packet arg 4) -- computed exactly like the game
+-- PARRY WINDOW (packet arg 4) -- the game's own, from the capture
 -- ============================================================
--- The window is NOT a constant. SwordsController computes it per account on
--- every parry (dump, SwordsController parry handler):
---   n6 = 0.5; timesParried 0/1/2/3/4 -> 1.5/1.25/1.0/0.75/0.625
---   if the noob boost is on (normal servers + FFlag NoobParryEnabled):
---     TotalStats.Kills >= 20 -> boost switches off for good
---     otherwise            -> n6 = kills/20 * n6
--- The server knows your timesParried and kills too, so it knows exactly what
--- window your client is allowed to send. Every hookless build before this sent
--- a hard-coded 0.5 -- on a low-kill account that's claiming a far bigger window
--- than the game would ever send for you. We read the same replicated stats the
--- game reads (Replion "Data", via the same plain require the game's own modules
--- use -- no getgc, no hook) and reproduce its arithmetic exactly.
-local Win = {data = nil, noob = false}
-task.spawn(function()
-    local function srv(info, name)
-        local ok, r = pcall(function() return info[name]() end)
-        return ok and r == true
-    end
-    local info, utils
-    pcall(function() info = require(ReplicatedStorage:WaitForChild("ServerInfo", 10)) end)
-    pcall(function() utils = require(ReplicatedStorage:WaitForChild("Common", 10):WaitForChild("Utils", 10)) end)
-    local flag_on = true
-    pcall(function() flag_on = utils.FFlag.GetInstantFFlag("NoobParryEnabled", true) end)
-    if info then
-        Win.noob = flag_on and not srv(info, "isDungeonsMatchServer") and not srv(info, "isRankedMatchServer")
-            and not srv(info, "isMedalServer") and not srv(info, "isClanWarServer")
-            and not srv(info, "isTournamentMatchServer") and true or false
-    end
-    task.spawn(function()
-        pcall(function()
-            local Replion = require(ReplicatedStorage:WaitForChild("Packages", 10):WaitForChild("Replion", 10))
-            Win.data = Replion.Client:WaitReplion("Data")
-        end)
-        Win.done = true
-    end)
-    -- Never block Remote forever: if the stats can't be read within 10s, give
-    -- up waiting and let the parry sender use its fallback.
-    task.delay(10, function() Win.done = true end)
-end)
-
+-- The game works the window out per account (SwordsController: 0.5, bigger
+-- for an account's first 5 parries ever, smaller under the noob boost below 20
+-- kills). Reading those stats meant require()-ing the game's modules (Replion,
+-- ServerInfo, Utils) and calling them from our thread at load -- removed.
+-- Instead the window is the one the game itself put in the captured packet:
+-- it already has your real stats in it. Before the first capture: 0.5.
+-- n2 (the lockout after a parry that didn't land) is 1.3s, scaled the same
+-- way the game scales it under the noob boost (n2 shrinks with n6).
 local function parry_window()
-    local data = Win.data
-    if not data then return nil end
-    local ok_tp, tp = pcall(data.Get, data, "timesParried")
-    if not ok_tp or type(tp) ~= 'number' then tp = 0 end
-    -- n6 = the window, n2 = the press lockout, fresh = the game's u120 (it plays
-    -- the parry swing faster for its first five parries).
-    local n6, n2, fresh = 0.5, 1.3, false
-    if tp == 0 then n6, n2, fresh = 1.5, 1.5, true
-    elseif tp == 1 then n6, n2, fresh = 1.25, 1.3, true
-    elseif tp == 2 then n6, n2, fresh = 1, 1.3, true
-    elseif tp == 3 then n6, fresh = 0.75, true
-    elseif tp == 4 then n6, fresh = 0.625, true end
-    -- The game's own window wins. The capture holds the window the game itself
-    -- sent (packet arg 4), worked out from your real stats. The first Ui3 build
-    -- replayed the game's packet as-is (0.5) and its parries landed; v60 only
-    -- ever used its own sum, and when "TotalStats.Kills" couldn't be read it
-    -- took kills as 0 -> window 0 (and lockout 0). A 0 window is a parry the
-    -- server never counts unless the ball is touching you that very instant:
-    -- swing plays, no parry, and only now and then one lands.
     local cw = Core.cap and Core.cap.win
-    if cw and cw > 0 and not fresh then
-        n2 = n2 * math.min(cw / n6, 1)
-        return cw, n2, fresh, tp
-    end
-    if Win.noob then
-        local ok_k, kills = pcall(data.Get, data, "TotalStats.Kills")
-        -- unreadable kills: leave the window alone rather than scale it to 0
-        if ok_k and type(kills) == 'number' then
-            if kills >= 20 then
-                Win.noob = false -- the game turns the boost off for good at 20 kills
-            else
-                n2 = kills / 20 * n2
-                n6 = kills / 20 * n6
-            end
-        end
-    end
-    return n6, n2, fresh, tp
+    if cw and cw > 0 then return cw, 1.3 * math.min(cw / 0.5, 1) end
+    return 0.5, 1.3
 end
 
 -- ============================================================
@@ -454,7 +401,6 @@ System.animation = {}
 do
 local SwordAPIFolder = ReplicatedStorage:WaitForChild("Shared"):WaitForChild("SwordAPI")
 local BLOCK_COOLDOWN = 1.3   -- the game's block lockout when a block doesn't land
-local game_api, game_anim, modules_tried
 local sword_info_cache = {}  -- sword name -> {collection, sword_type}
 local own_tracks = setmetatable({}, {__mode = 'k'}) -- animator -> {[Animation] = track}
 local r15_clones = {}        -- Animation -> Animation using its R15Id
@@ -477,16 +423,9 @@ local function ball_on_us()
     return false
 end
 
-local function modules()
-    if not modules_tried then
-        modules_tried = true
-        pcall(function() game_api = require(SwordAPIFolder) end)
-        pcall(function() game_anim = require(ReplicatedStorage.Controllers.AnimationController) end)
-        if type(game_api) ~= 'table' or type(game_api.GetAnimations) ~= 'function' then game_api = nil end
-        if type(game_anim) ~= 'table' or type(game_anim.LoadAnimation) ~= 'function' then game_anim = nil end
-    end
-    return game_api, game_anim
-end
+-- The game's SwordAPI / AnimationController aren't require()d any more: the
+-- swing uses the fallbacks below (same pick by attribute, same track loading).
+local function modules() return nil, nil end
 
 local function current_sword(char)
     if getgenv().skinChangerEnabled then
@@ -1369,11 +1308,6 @@ local function send(curveCF, spam)
     -- ball is never held. Spam isn't held: it keeps sending through it.
     if not spam and not gate_open() then return "blocked" end
     local window = parry_window()
-    if window == nil then
-        if cap.win and cap.win > 0 then window = cap.win -- the game's own, from the capture
-        elseif not Win.done then return "blocked" -- stats not read yet
-        else window = 0.5 end
-    end
     local tok = make_token(cap)
     if not tok then Core.cap = nil; return "unarmed" end
     local cam = Workspace.CurrentCamera
@@ -2064,9 +1998,7 @@ local function resolve(loc)
     local ok, v = pcall(function()
         if loc.where == "G" then return nil end -- the game's _G isn't read (no getrenv)
         if loc.where == "data" then
-            local t = Win.data and Win.data:Get()
-            for _, k in ipairs(loc.path) do t = type(t) == 'table' and t[k] or nil end
-            return t
+            return nil -- the game's Data isn't read (no require)
         end
         if loc.where == "event" then return Core.event_seen and Core.event_seen[loc.id] end
         local inst = ROOTS[loc.where] and ROOTS[loc.where]()
@@ -2111,7 +2043,7 @@ local function each_readable(visit)
                 end
             end
         end
-        if Win.data then walk(Win.data:Get(), {}, 0) end
+        -- (the game's Data isn't read: no require)
     end)
 end
 
@@ -2254,8 +2186,7 @@ local function build_hookfree()
     local text = tostring(math.floor(Workspace:GetServerTimeNow() * 100))
     local key = {}
     for i = 1, #text do key[i] = keysrc:byte((i - 1) % #keysrc + 1) end
-    local ball2 = false
-    pcall(function() ball2 = require(ReplicatedStorage.Shared.UseBall2)() == true end)
+    local ball2 = false -- (UseBall2 isn't require()d any more)
     return {remote = hr[1], hash = hash, uid = uid, key = key, len = #text, ball2 = ball2, hookfree = true}
 end
 
@@ -3312,7 +3243,7 @@ end)
 local function remoteStatusText()
     if getgenv().AutoParryMode == "Keypress" then return "Mode: Keypress (presses the block key)" end
     local w = parry_window()
-    local wtxt = w and ("%.3f"):format(w) or (Win.done and "fallback" or "reading stats...")
+    local wtxt = ("%.3f%s"):format(w, (Core.cap and Core.cap.win) and " (game's)" or " (default)")
     if remoteReady() then
         return ("Remote: %s. window=%s. No hook up, no memory reads"):format(tostring(Core.info), wtxt)
     end
