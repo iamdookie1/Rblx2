@@ -6,7 +6,7 @@ task.spawn(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.09-60.8"
+local SCRIPT_VERSION = "2026.10.09-60.9"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -920,8 +920,16 @@ local H = {fire = nil, nc = nil, want = false, until_t = 0, oth = false, oth_kep
 --   "oth"       -- the FireServer function through oth.hook (the default when
 --                  oth is there; Namecall when it isn't)
 -- Each alone sees about half the game's sends, so it can take two presses.
+--   "Both + oth" -- (default) the first capture with Both, which is thrown
+--                  away; every capture after it with oth, and only that one is
+--                  used to parry. (Without oth: Both, kept.)
+local function both_then_oth() return (getgenv().CaptureHook or "Both + oth") == "Both + oth" end
 local function capture_method()
-    local m = getgenv().CaptureHook or "oth"
+    local m = getgenv().CaptureHook or "Both + oth"
+    if m == "Both + oth" then
+        if not (oth_hook and FIRE_FN) then return "Both" end
+        return Core.both_done and "oth" or "Both"
+    end
     if m == "oth" and not (oth_hook and FIRE_FN) then m = "Namecall" end
     return m
 end
@@ -1062,6 +1070,9 @@ local function arm()
     if H.fire or H.nc then return true end
     box.list = {}
     local method = capture_method()
+    -- Both + oth, first round: this capture only opens the way -- it's thrown
+    -- away and the next press captures with oth
+    H.discard = both_then_oth() and method == "Both" and oth_hook ~= nil and FIRE_FN ~= nil
     if method == "oth" then
         if H.oth_kept then
             H.fire, box.fire, H.oth = H.oth_kept, H.oth_kept, true
@@ -1090,6 +1101,12 @@ local function arm()
         end
         unhook()
         box.list = {}
+        if Core.cap and H.discard then
+            -- forget what Both caught: the parries use the oth capture only
+            Core.both_done, Core.cap, Core.new_capture = true, nil, nil
+            flight("Both capture done (thrown away) -- capturing again with oth")
+        end
+        H.discard = false
     end)
     return true
 end
@@ -3353,8 +3370,8 @@ AP:AddToggle("AutoParry", {Text = "Auto parry", Default = false, Callback = func
     if v then System.autoparry.start(); prime_remote() else System.autoparry.stop() end
     NotifyToggle("Auto Parry", v)
 end}):AddKeyPicker("AutoParryKey", {Default = "None", Mode = "Toggle", SyncToggleState = true, Text = "Auto parry"})
-AP:AddDropdown("CaptureHook", {Text = "Capture hook", Values = {"oth", "Namecall", "FireServer", "Both"}, Default = "oth",
-    Tooltip = "Which hook catches the one parry packet Remote mode needs (up for that press only). oth = Delta's oth.hook on FireServer (Namecall if oth isn't there). Namecall or FireServer alone may take two presses; Both arms in one. The flight log notes which one was on for every capture and kick.",
+AP:AddDropdown("CaptureHook", {Text = "Capture hook", Values = {"Both + oth", "oth", "Namecall", "FireServer", "Both"}, Default = "Both + oth",
+    Tooltip = "Which hook catches the one parry packet Remote mode needs (up for that press only). Both + oth = first capture with Both (thrown away), then a second press captures with oth and only that one is used. oth = Delta's oth.hook on FireServer (Namecall if oth isn't there). Namecall or FireServer alone may take two presses; Both arms in one. The flight log notes which one was on for every capture and kick.",
     Callback = function(v) getgenv().CaptureHook = v end})
 AP:AddDropdown("ParryMode", {Text = "Parry mode", Values = {"Remote", "Keypress"}, Default = "Remote",
     Tooltip = "Remote fires the parry remote with your curve (hookless, sends exactly what the game sends). Keypress presses the block key (F).",
