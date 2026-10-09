@@ -6,7 +6,7 @@ task.spawn(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.09-60.7"
+local SCRIPT_VERSION = "2026.10.09-60.8"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -1269,7 +1269,7 @@ get_ball_state = function(ball)
         if new == me and not st.pass_open then
             open_pass(st, now)
             if on_retarget then pcall(on_retarget, ball, st) end
-            if System.spam_on_retarget then System.spam_on_retarget() end
+            if System.spam_on_retarget then System.spam_on_retarget(ball) end
         end
     end)
     return st
@@ -2263,42 +2263,43 @@ end)
 end -- parry core
 
 -- ============================================================
--- SPAM ENGINE (rewritten)
+-- SPAM ENGINE (rewritten again)
 -- ============================================================
 -- Manual and auto spam share one pump. Spam isn't held by the parry gate (the
--- game's cooldown): it keeps sending through it, and the server takes the first
--- one it can. What it is held by is your connection: every parry packet carries
--- every player's screen point, and once upload backs up your movement queues
--- behind it (the "I'm ahead of where I really am" desync). So:
---   * never more than SpamNet.hard_max a second, whatever the slider says
---     (120; 90 if your upload rate can't be read, since then the guard below
---     is blind);
---   * at most per_frame() per frame -- the server counts one parry per frame,
---     the rest only fill upload;
---   * the upload guard eases off while the client's real send rate is over
---     budget and comes back once it's clear;
---   * manual spam with no ball on or near you drops to a keep-alive rate.
+-- game's cooldown): it keeps sending through it, and the server takes the
+-- first one it can -- so the side that sends more, sooner, wins the clash.
+--   * Max rate (slider): parries a second, up to 1000. The pump is credit
+--     based on all four frame signals, so the rate you set is the rate you
+--     get (no 120 cap, no one-per-frame cap any more): at 60 fps, 600/s is
+--     ten a frame, spread across the frame's four signals.
+--   * Upload limit (slider): 0 = off. Every parry packet carries every
+--     player's screen point, so very high rates fill upload and your movement
+--     queues behind it (desync / rubber-banding). With a limit set, the rate
+--     backs off while upload is over it and comes back once it's clear.
+--   * Keypress mode: at most one press a frame -- the game reads input once a
+--     frame, so faster presses just merge.
+--   * Manual spam with no ball on or near you drops to a keep-alive 20/s; a
+--     ball turning to you fires at once (spam_instant) and the full rate is
+--     back the same frame.
 System.manual_spam = {}
 System.auto_spam = {}
 local props = System.__properties
 local me = LocalPlayer.Name
 local macroAnimFix = false
-local AutoSpam = {active_until = 0, reason = nil, was_active = false}
-local SpamNet = {
+local AutoSpam = {active_until = 0, reason = nil, was_active = false, ball = nil, partner = nil, ok_at = 0}
+local SpamCfg = {
+    max_rate = 1000,   -- "Max rate" slider
+    upload_kbps = 0,   -- "Upload limit" slider, 0 = off
     idle_rate = 20,
-    hard_max = 120,
-    blind_max = 90,
-    budget_kbps = 220,    -- "Max upload" slider
-    guard_at = -1,
-    factor = 1,
-    readable = false,
+    factor = 1, guard_at = -1,
 }
 
 function System.manual_spam.start() System.__properties.__manual_spam_enabled = true end
 function System.manual_spam.stop() System.__properties.__manual_spam_enabled = false end
 
+local function keypress_spam() return getgenv().ManualSpamMode == "Keypress" end
 local function spam_fire()
-    if getgenv().ManualSpamMode == "Keypress" then
+    if keypress_spam() then
         System.parry.keypress()
         return true
     end
@@ -2310,22 +2311,30 @@ local function spam_fire()
     return sent
 end
 
--- ---------- auto spam (rewritten): clashes only ----------
--- Auto spam runs in one situation: a clash -- the ball traded back and forth
--- between you and ONE nearby player, fast. Nothing else (no "point blank", no
--- "close return": those fired alongside auto parry's own parry and made double
--- parries outside clashes). While a clash is on, auto parry stands down for
--- that ball (Core.clash), so each parry comes from one place only.
---
--- A clash needs, from the ball's recent owners (newest first):
---   * you and the same opponent alternating at least 3 times in a row
---     (you -> them -> you, or them -> you -> them): two quick hand-offs;
---   * every one of those hand-offs quicker than `tempo` (about the ball
---     crossing twice plus both players' reaction);
---   * the last hand-off still recent (within tempo) and the ball on you or them;
---   * the opponent close (clash range grows with ball speed).
--- It ends the moment any of those stops being true (one frame of tail).
+-- ---------- auto spam (rewritten): clashes, caught on the first hand-off ----------
+-- A clash is the ball traded fast between you and one player next to you.
+-- The old version waited for two full hand-offs and dropped out the first
+-- frame anything wobbled, so it started late and flickered mid-clash. Now:
+--   START (ball on you, the partner is whoever sent it):
+--     * they're within clash range (grows with ball speed), and
+--     * either they held it only briefly before sending it back (one quick
+--       hand-off), or the ball reaches you sooner than a normal parry can
+--       react (inside your reach time plus a margin).
+--   START (ball on them): only when it was a quick you -> them -> you -> them
+--     run already (two hand-offs), so a normal parry to a nearby player
+--     doesn't start spam.
+--   KEEP: while the ball stays between you two, they stay in range (with
+--     some slack) and hand-offs stay quick -- with a short tail (Hold), so one
+--     slow frame doesn't drop it.
+--   STOP at once: the ball goes to anyone else, the partner leaves range, or
+--     the ball is gone.
+-- While it runs, auto parry stays out of that ball (Core.clash), so every
+-- parry on it comes from one place.
 local function spam_reach() return Core.reach_time() end
+local function clash_range(speed) return math.clamp(18 + speed * 0.08, 18, 45) end
+local function clash_tempo(gap, speed)
+    return math.clamp(gap / speed * 2 + spam_reach() * 2 + 0.15, 0.3, 0.9)
+end
 
 -- The ball's recent owners, newest first (blank targets dropped, repeats merged).
 local function ball_owners(state)
@@ -2337,38 +2346,60 @@ local function ball_owners(state)
             if last and last.name == s.to then last.t = s.t
             else owners[#owners + 1] = {name = s.to, t = s.t} end
         end
+        if #owners >= 6 then break end
     end
     return owners
 end
 
-local function clash_range(speed) return math.clamp(15 + speed * 0.05, 15, 35) end
+-- Quick hand-offs between me and partner, newest first, counted while they
+-- alternate and each came within tempo.
+local function quick_handoffs(owners, partner, tempo)
+    local n = 0
+    for i = 1, #owners - 1 do
+        local cur, prev = owners[i], owners[i + 1]
+        local alt = (cur.name == me and prev.name == partner) or (cur.name == partner and prev.name == me)
+        if not alt or cur.t - prev.t > tempo then break end
+        n = n + 1
+    end
+    return n
+end
 
--- opponent, hand-offs -- or nil when this ball isn't in a clash with you.
-local function clash_on(ball, root, now)
+-- partner, why -- or nil when this ball isn't a clash with you right now.
+-- `held` = this ball is already the running clash (keeps it with slack).
+local function clash_on(ball, root, now, held)
     local st = get_ball_state(ball)
-    if st.target ~= me and not (type(st.target) == 'string' and st.target ~= '') then return nil end
+    local target = ball:GetAttribute('target')
+    if type(target) ~= 'string' or target == '' then return nil end
     local owners = ball_owners(st)
-    if #owners < 3 then return nil end
-    local a, b = owners[1].name, owners[2].name
-    if a == b or (a ~= me and b ~= me) then return nil end
-    local opponent = a == me and b or a
-    if st.target ~= me and st.target ~= opponent then return nil end
-    local their = character_root(opponent)
+    if #owners < 2 then return nil end
+    local partner
+    if target == me then partner = owners[2].name
+    else
+        if owners[2].name ~= me then return nil end
+        partner = target
+    end
+    if partner == me then return nil end
+    if held and AutoSpam.partner and partner ~= AutoSpam.partner then return nil end
+    local their = character_root(partner)
     if not their then return nil end
     local speed = math.max(ball_velocity(ball).Magnitude, 1)
     local gap = (their.Position - root.Position).Magnitude
-    if gap > clash_range(speed) then return nil end
-    local tempo = math.clamp(gap / speed * 2 + spam_reach() * 2 + 0.1, 0.25, 0.6)
-    if now - owners[1].t > tempo then return nil end
-    local hits = 0
-    for i = 1, #owners - 1 do
-        local cur, prev = owners[i], owners[i + 1]
-        local alt = (cur.name == me and prev.name == opponent) or (cur.name == opponent and prev.name == me)
-        if not alt or cur.t - prev.t > tempo then break end
-        hits = hits + 1
+    local range = clash_range(speed) * (held and 1.3 or 1)
+    if gap > range then return nil end
+    local tempo = clash_tempo(gap, speed) * (held and 1.25 or 1)
+    local handoffs = quick_handoffs(owners, partner, tempo)
+    if target == me then
+        if handoffs >= 1 or held then return partner, ("%d quick hand-off%s"):format(handoffs, handoffs == 1 and "" or "s") end
+        -- no history yet: spam only if a normal parry can't react in time
+        local eta = (ball.Position - root.Position).Magnitude / speed
+        if eta <= spam_reach() + 0.12 then return partner, "point blank" end
+        return nil
     end
-    if hits < 2 then return nil end
-    return opponent, hits
+    -- ball on them: they're about to send it back
+    if handoffs >= 2 or (held and now - owners[1].t <= tempo) then
+        return partner, ("%d quick hand-offs"):format(handoffs)
+    end
+    return nil
 end
 
 -- Lobby training or lobby parry: auto spam never runs there.
@@ -2382,10 +2413,20 @@ local function can_auto_spam(root)
     return props.__auto_spam_enabled and root and not root:FindFirstChild('SingularityCape') and canParryNow()
         and not blocked_by_detection() and not in_training()
 end
-local function start_clash(ball, now, opponent, hits)
-    AutoSpam.active_until = now + 0.05 -- re-checked every frame
-    AutoSpam.reason = ("clash vs %s (%d hand-offs)"):format(opponent, hits)
+local function hold_time() return math.clamp(props.__auto_spam_hold or 0.15, 0, 0.5) end
+local function mark_clash(ball, now, partner, why)
+    if AutoSpam.ball ~= ball or AutoSpam.partner ~= partner then
+        flight(("auto spam ON: clash vs %s (%s)"):format(tostring(partner), why))
+    end
+    AutoSpam.ball, AutoSpam.partner, AutoSpam.ok_at = ball, partner, now
+    AutoSpam.active_until = now + hold_time() + 0.02
+    AutoSpam.reason = ("clash vs %s (%s)"):format(partner, why)
     Core.clash = {ball = ball, until_t = AutoSpam.active_until}
+end
+local function end_clash(why)
+    if AutoSpam.ball then flight("auto spam OFF: " .. why) end
+    AutoSpam.active_until, AutoSpam.reason, AutoSpam.ball, AutoSpam.partner = 0, nil, nil, nil
+    Core.clash = nil
 end
 -- Asked by auto parry the instant the ball changes hands (before this frame's
 -- evaluate): a clash starts right there, so auto parry never fires on top.
@@ -2393,9 +2434,9 @@ Core.clash_check = function(ball)
     local root = getRoot()
     if not can_auto_spam(root) then return false end
     local now = os.clock()
-    local opponent, hits = clash_on(ball, root, now)
-    if not opponent then return false end
-    start_clash(ball, now, opponent, hits)
+    local partner, why = clash_on(ball, root, now, AutoSpam.ball == ball)
+    if not partner then return false end
+    mark_clash(ball, now, partner, why)
     return true
 end
 
@@ -2403,14 +2444,25 @@ end
 local function auto_spam_evaluate()
     local now = os.clock()
     local root = getRoot()
-    if can_auto_spam(root) then
-        for _, ball in ipairs(get_live_balls()) do
-            local opponent, hits = clash_on(ball, root, now)
-            if opponent then start_clash(ball, now, opponent, hits); return end
-        end
+    if not can_auto_spam(root) then
+        if AutoSpam.ball then end_clash("can't spam here") end
+        return
     end
-    AutoSpam.active_until, AutoSpam.reason = 0, nil
-    Core.clash = nil
+    -- the running clash first, with slack
+    local cur = AutoSpam.ball
+    if cur then
+        if not cur.Parent then end_clash("ball gone"); return end
+        local target = cur:GetAttribute('target')
+        if target ~= me and target ~= AutoSpam.partner then end_clash("ball went to " .. tostring(target)); return end
+        local partner, why = clash_on(cur, root, now, true)
+        if partner then mark_clash(cur, now, partner, why); return end
+        if now < AutoSpam.active_until then return end -- the tail (Hold)
+        end_clash("clash over")
+    end
+    for _, ball in ipairs(get_live_balls()) do
+        local partner, why = clash_on(ball, root, now, false)
+        if partner then mark_clash(ball, now, partner, why); return end
+    end
 end
 
 function System.auto_spam.status()
@@ -2437,41 +2489,36 @@ local function spam_focus()
     return false
 end
 
--- Upload guard, checked 10x a second: over budget it cuts the rate hard
--- (down to half per check), under budget it climbs back gently. Spam can run
--- faster because this reacts before upload has time to queue movement.
-local function bandwidth_factor(now)
-    if now - SpamNet.guard_at < 0.1 then return SpamNet.factor end
-    SpamNet.guard_at = now
+-- Upload limit, checked 10x a second (only when one is set): over it the rate
+-- is cut hard (down to half per check), under it it climbs back.
+local function upload_factor(now)
+    if SpamCfg.upload_kbps <= 0 then SpamCfg.factor = 1; return 1 end
+    if now - SpamCfg.guard_at < 0.1 then return SpamCfg.factor end
+    SpamCfg.guard_at = now
     local ok, kbps = pcall(function() return Stats.DataSendKbps end)
-    SpamNet.readable = ok and type(kbps) == 'number' and kbps > 0
-    if SpamNet.readable then
-        local step = math.clamp(SpamNet.budget_kbps / kbps, 0.5, 1.1)
-        SpamNet.factor = math.clamp(SpamNet.factor * step, 0.2, 1)
+    if ok and type(kbps) == 'number' and kbps > 0 then
+        local step = math.clamp(SpamCfg.upload_kbps / kbps, 0.5, 1.15)
+        SpamCfg.factor = math.clamp(SpamCfg.factor * step, 0.1, 1)
     end
-    return SpamNet.factor
+    return SpamCfg.factor
 end
 
 local Pump = {credit = 0, last = os.clock(), on = false, frame = 0, frame_fires = 0, fired_frame = -1}
 local function current_source(now)
-    -- no rate setting: both run flat out; the caps and the Max upload slider
-    -- (SpamNet.budget_kbps) are what hold them back
-    if props.__manual_spam_enabled then return SpamNet.hard_max, "manual spam" end
-    if props.__auto_spam_enabled and now < AutoSpam.active_until then return SpamNet.hard_max, "auto spam" end
+    if props.__manual_spam_enabled then return "manual spam" end
+    if props.__auto_spam_enabled and now < AutoSpam.active_until then return "auto spam" end
     return nil
 end
-local function effective_rate(rate, now)
-    local factor = bandwidth_factor(now)
-    rate = math.min(rate, SpamNet.readable and SpamNet.hard_max or SpamNet.blind_max)
-    if not spam_focus() then rate = math.min(rate, SpamNet.idle_rate) end
-    return math.max(rate * factor, 1)
-end
-local function per_frame(rate)
-    return math.max(1, math.ceil(rate * math.clamp(props.__frame_dt or 1 / 60, 1 / 240, 0.1) - 1e-6))
+local function target_rate(now)
+    local rate = math.clamp(SpamCfg.max_rate or 1000, 1, 1000) * upload_factor(now)
+    if keypress_spam() then rate = math.min(rate, 1 / math.clamp(props.__frame_dt or 1 / 60, 1 / 240, 0.1)) end
+    if not spam_focus() then rate = math.min(rate, SpamCfg.idle_rate) end
+    return math.max(rate, 1)
 end
 
 local function fire_one(source)
     if Pump.fired_frame ~= Pump.frame then Pump.fired_frame, Pump.frame_fires = Pump.frame, 0 end
+    if keypress_spam() and Pump.frame_fires >= 1 then return false end
     ParryLog.source = source
     local ok = spam_fire()
     ParryLog.source = nil
@@ -2480,47 +2527,54 @@ local function fire_one(source)
     return ok
 end
 
+-- Runs on each of the frame's four signals. Credit grows with the real time
+-- since the last signal, so the parries a second match the rate exactly
+-- whatever the frame rate. A hitch can't dump a backlog: at most 15ms of
+-- credit (plus the one in hand) carries over.
 local function spam_tick()
     local now = os.clock()
-    local elapsed = math.min(now - Pump.last, 0.1)
+    local elapsed = math.min(now - Pump.last, 0.05)
     Pump.last = now
     local span = now - SpamMeter.since
     if span >= 0.5 then
         SpamMeter.rate = SpamMeter.count / span
         SpamMeter.count, SpamMeter.since = 0, now
     end
-    local rate, source = current_source(now)
-    if not rate or not LocalPlayer.Character then
+    local source = current_source(now)
+    if not source or not LocalPlayer.Character then
         Pump.credit, Pump.on = 0, false
         return
     end
-    rate = effective_rate(rate, now)
+    local rate = target_rate(now)
     if Pump.on then
-        Pump.credit = math.min(Pump.credit + elapsed * rate, 2) -- no backlog after a hitch
+        Pump.credit = math.min(Pump.credit + elapsed * rate, 1 + rate * 0.015)
     else
         Pump.credit, Pump.on = 1, true -- a burst's first parry goes straight away
     end
-    if Pump.credit < 1 - 1e-6 then return end -- (float error would drop one a frame)
-    if Pump.fired_frame == Pump.frame and Pump.frame_fires >= per_frame(rate) then return end
-    Pump.credit = Pump.credit - 1
-    fire_one(source)
+    while Pump.credit >= 1 - 1e-6 do
+        Pump.credit = Pump.credit - 1
+        if fire_one(source) == false and keypress_spam() then Pump.credit = math.min(Pump.credit, 0); break end
+    end
 end
 
 -- The moments a fresh parry matters most: ours just landed (the ball is on its
--- way back) and the ball has just turned to us. Fire one from the event itself,
--- inside the same caps, rather than waiting for the next tick.
+-- way back) and the ball has just turned to us. Fire one from the event itself
+-- rather than waiting for the next signal.
 local function spam_instant()
     local now = os.clock()
-    local rate, source = current_source(now)
-    if not rate or not LocalPlayer.Character then return end
-    rate = effective_rate(rate, now)
-    if Pump.fired_frame == Pump.frame and Pump.frame_fires >= per_frame(rate) then return end
+    local source = current_source(now)
+    if not source or not LocalPlayer.Character then return end
     Pump.credit = math.max(Pump.credit - 1, -1)
     Pump.on = true
     fire_one(source)
 end
 Remotes.ParrySuccess.OnClientEvent:Connect(function() pcall(spam_instant) end)
-System.spam_on_retarget = function() pcall(spam_instant) end
+System.spam_on_retarget = function(ball)
+    -- a clash ball turning to us: re-check right now so the first parry of
+    -- the exchange goes this instant
+    if ball and props.__auto_spam_enabled and Core.clash_check then pcall(Core.clash_check, ball) end
+    pcall(spam_instant)
+end
 
 do
     local last_error
@@ -2535,7 +2589,7 @@ do
     conns.__spam_pre = RunService.PreSimulation:Connect(function()
         Pump.frame = Pump.frame + 1
         run(auto_spam_evaluate)
-        -- auto spam just switched on: its first parry goes now, not next point
+        -- auto spam just switched on: its first parry goes now, not next signal
         local active = os.clock() < AutoSpam.active_until
         if active and not AutoSpam.was_active and not props.__manual_spam_enabled then run(spam_instant) end
         AutoSpam.was_active = active
@@ -3453,9 +3507,12 @@ SP:AddToggle("ManualSpam", {Text = "Manual spam", Default = false, Callback = fu
     NotifyToggle("Manual Spam", v)
 end}):AddKeyPicker("ManualSpamKey", {Default = "E", Mode = "Hold", SyncToggleState = true, Text = "Manual spam"})
 SP:AddDropdown("SpamMode", {Text = "Mode", Values = {"Remote", "Keypress"}, Default = "Remote", Callback = function(v) getgenv().ManualSpamMode = v end})
-SP:AddSlider("SpamMaxKbps", {Text = "Max upload", Default = 220, Min = 60, Max = 600, Rounding = 0, Suffix = " kbps",
-    Tooltip = "Manual and auto spam both run as fast as they can (up to 120/s) and slow down only when your upload goes over this. Higher = more spam but more risk of your movement lagging behind (desync). Lower = smoother movement, less spam. If you rubber-band while spamming, lower it.",
-    Callback = function(v) SpamNet.budget_kbps = v end})
+SP:AddSlider("SpamMaxRate", {Text = "Max rate", Default = 1000, Min = 20, Max = 1000, Rounding = 0, Suffix = "/s",
+    Tooltip = "Parries a second for manual and auto spam. 1000 = as fast as it goes. The rate you set is the rate it sends (the Actual line shows it). Keypress mode tops out at one press a frame.",
+    Callback = function(v) SpamCfg.max_rate = v end})
+SP:AddSlider("SpamUploadLimit", {Text = "Upload limit", Default = 0, Min = 0, Max = 1500, Rounding = 0, Suffix = " kbps",
+    Tooltip = "0 = off (full speed always). Every spam packet carries every player's screen point, so very high rates can fill your upload and make your movement lag behind (rubber-banding). If that happens, set a limit (around 200-400): spam backs off only while upload is over it.",
+    Callback = function(v) SpamCfg.upload_kbps = v end})
 local ManualSpamLabel = SP:AddLabel("Actual: 0/s", true)
 SP:AddToggle("SpamAnimFix", {Text = "Animation fix", Default = false, Callback = function(v)
     getgenv().ManualSpamAnimationFix = v
@@ -3464,7 +3521,7 @@ end})
 
 local AS = Tabs.Spam:AddRightGroupbox("Auto Spam", "activity")
 AS:AddToggle("AutoSpam", {Text = "Auto spam", Default = false,
-    Tooltip = "Spams only in a clash: the ball traded back and forth between you and one nearby player, two quick hand-offs in a row. Stops the moment it isn't one. Auto parry stays out of that ball while it runs, so no double parries. Never runs in training.",
+    Tooltip = "Spams in a clash: the ball traded fast between you and one player next to you. Starts on the first quick hand-off (or when the ball is on you too close for a normal parry), keeps going while the exchange stays quick, and stops as soon as the ball goes to someone else or they leave range. Uses the Max rate / Upload limit sliders. Auto parry stays out of that ball while it runs. Never runs in training.",
     Callback = function(v)
         System.__properties.__auto_spam_enabled = v
         if v then prime_remote() else AutoSpam.active_until, AutoSpam.reason = 0, nil end
