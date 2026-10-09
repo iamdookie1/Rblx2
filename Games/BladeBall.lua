@@ -6,7 +6,7 @@ task.spawn(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.09-63.1"
+local SCRIPT_VERSION = "2026.10.09-63.2"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -2411,7 +2411,7 @@ local me = LocalPlayer.Name
 local macroAnimFix = false
 local AutoSpam = {active_until = 0, reason = nil, was_active = false, ball = nil, partner = nil, ok_at = 0}
 local SpamCfg = {
-    max_rate = 2000,   -- "Max rate" slider
+    max_rate = 1000,   -- "Max rate" slider (up to 2000)
     upload_kbps = 0,   -- "Upload limit" slider, 0 = off
     idle_rate = 20,
     factor = 1, guard_at = -1,
@@ -3668,8 +3668,8 @@ SP:AddToggle("ManualSpam", {Text = "Manual spam", Default = false, Callback = fu
     NotifyToggle("Manual Spam", v)
 end}):AddKeyPicker("ManualSpamKey", {Default = "E", Mode = "Hold", SyncToggleState = true, Text = "Manual spam"})
 SP:AddDropdown("SpamMode", {Text = "Mode", Values = {"Remote", "Keypress"}, Default = "Remote", Callback = function(v) getgenv().ManualSpamMode = v end})
-SP:AddSlider("SpamMaxRate", {Text = "Max rate", Default = 2000, Min = 20, Max = 2000, Rounding = 0, Suffix = "/s",
-    Tooltip = "Parries a second for manual and auto spam. 2000 = as fast as it goes. The rate you set is the rate it sends (the Actual line shows it). Keypress mode tops out at one press a frame.",
+SP:AddSlider("SpamMaxRate", {Text = "Max rate", Default = 1000, Min = 20, Max = 2000, Rounding = 0, Suffix = "/s",
+    Tooltip = "Parries a second for manual and auto spam. Default 1000 (37663f9's rate); up to 2000 if you want more -- that doubles the parry packets the server sees. The rate you set is the rate it sends (the Actual line shows it). Keypress mode tops out at one press a frame.",
     Callback = function(v) SpamCfg.max_rate = v end})
 SP:AddSlider("SpamUploadLimit", {Text = "Upload limit", Default = 0, Min = 0, Max = 1500, Rounding = 0, Suffix = " kbps",
     Tooltip = "0 = off (full speed always). Every spam packet carries every player's screen point, so very high rates can fill your upload and make your movement lag behind (rubber-banding). If that happens, set a limit (around 200-400): spam backs off only while upload is over it.",
