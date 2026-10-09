@@ -6,7 +6,7 @@ task.spawn(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.09-62"
+local SCRIPT_VERSION = "2026.10.09-62.1"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -531,7 +531,7 @@ local function watch_presses(char)
             if now - success_at < 0.35 then return end -- the success swing's Parry track
             local at = own_swing[track]
             if at and now - at < 0.25 then return end
-            if Core.gate_start then Core.gate_start() end
+            if Core.gate_start then Core.gate_start("game swing") end
         end)
     end)
 end
@@ -1161,7 +1161,13 @@ prime_remote = function()
     if not Core.can_since or now - Core.can_since < 1 then return end
     if now - last_press < 1.4 then return end
     last_press = now
-    if arm() then pressBlockKey() end
+    if arm() then
+        pressBlockKey()
+        -- the capture press is a real parry press: the game's lockout starts
+        -- now. Mark it ourselves instead of only trusting its swing to show up
+        -- (missed, auto parry fired inside it: swing, no parry).
+        if Core.gate_start then Core.gate_start("capture press") end
+    end
 end
 
 -- Your own block press arms it too -- only a real block press, not any input:
@@ -1197,6 +1203,12 @@ local function own_input(input)
     if is_block_press(input) and canParryNow() then arm() end
 end
 UserInputService.InputBegan:Connect(own_input)
+-- Every real block press of yours (F, click, gamepad, the block button) starts
+-- the game's lockout too -- marked here directly, same reason as above.
+UserInputService.InputBegan:Connect(function(input, processed)
+    if processed or not is_live() then return end
+    if is_block_press(input) and canParryNow() and Core.gate_start then Core.gate_start("your press") end
+end)
 UserInputService.InputEnded:Connect(function(input)
     if input.UserInputType == Enum.UserInputType.Touch then own_input(input) end
 end)
@@ -1225,12 +1237,13 @@ local function lockout_margin()
     local jit = Core.lag and Core.lag.jit or 0.01
     return math.clamp(jit * 2 + (props.__frame_dt or 1 / 60) + 0.03, 0.06, 0.15)
 end
-local function gate_start()
+local function gate_start(why)
     local now = clock_()
     if now < G.until_t then return end -- inside the lockout a press starts nothing
     local n6, n2 = parry_window()
     n6, n2 = n6 or 0.5, n2 or 1.3
     G.until_t = now + math.max(n6 + 0.1, n2) + lockout_margin()
+    G.started_at, G.started_by = now, why or "parry"
 end
 local function gate_open()
     -- M1Stop blocks pressing while the game holds it; never longer than 3s
@@ -1718,7 +1731,8 @@ local function fire_for(st, now, via, info)
         Core.last_parry = {t = now, via = via, info = info}
         flight(("%s: %.1f studs, arrives in %.3fs, fires at %.3fs (distance %.0f), %.0f st/s, angle %.0f deg, ping %.0fms, window %.3f -- held before: %s"):format(
             via, info.dist, info.eta or -1, info.lead, info.lead * info.speed, info.speed,
-            math.deg(math.acos(math.clamp(info.heading or 1, -1, 1))), pingMs(), parry_window() or -1, held_by or "nothing (fired first frame)"))
+            math.deg(math.acos(math.clamp(info.heading or 1, -1, 1))), pingMs(), parry_window() or -1, held_by or "nothing (fired first frame)")
+            .. (G.started_at and (" | last lockout: %s %.2fs ago"):format(G.started_by or "?", now - G.started_at) or ""))
     end
     mark_parried(st, now)
     st.why = via == "auto parry" and "parried" or ("parried (" .. via .. ")")
