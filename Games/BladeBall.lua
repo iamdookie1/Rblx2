@@ -6,7 +6,7 @@ task.spawn(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.09-63.2"
+local SCRIPT_VERSION = "2026.10.09-63.4"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
