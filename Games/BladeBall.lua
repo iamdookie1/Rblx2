@@ -6,7 +6,7 @@ task.spawn(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.09-63"
+local SCRIPT_VERSION = "2026.10.09-63.1"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -194,6 +194,14 @@ local function canParryNow()
         if Dead and char.Parent == Dead then return true end
     end
     return false
+end
+-- In a live round (your character under Workspace.Alive). The capture -- the
+-- auto press and the hook -- only ever happens here: a lobby / lobby-parry
+-- press never sends the match parry packet, so capturing there just put the
+-- hook up every 1.4s, forever, while you stood in the lobby.
+Core.in_match = function()
+    local char = LocalPlayer.Character
+    return char ~= nil and char.Parent == Alive
 end
 
 -- Presses the block key via VirtualInputManager, which makes the game run its
@@ -985,16 +993,45 @@ end
 --     overwrites the method the game's call is waiting on -- the old body did
 --     that (Workspace:GetServerTimeNow() via learn), which could turn the
 --     game's FireServer into GetServerTimeNow on the remote mid-send.
-local box = {want = false, nc = nil, fire = nil, list = {}, ws = Workspace, now = Workspace.GetServerTimeNow}
+--   * INVISIBLE TO THE PROBE (why Both/Namecall captures used to give the
+--     animation-but-no-parry and oth's didn't): the game's press handler makes
+--     a namecall that errors on purpose and checks the error. A C error is
+--     stamped with the place that made the call -- normally the game's own
+--     script line. With our namecall hook in between, the stamp became OUR
+--     hook's line, so the game knew __namecall was hooked for that press and
+--     the parry packet it sent (the one we captured) was one the server won't
+--     take: every parry built from it played the swing and did nothing. oth
+--     never hooks __namecall, so it never tripped this. Now the namecall body
+--     runs the real call in pcall (so the error carries no stamp of ours) and
+--     re-raises it stamped with the game's own calling line -- exactly the
+--     message the game gets with no hook at all.
+local box = {want = false, nc = nil, fire = nil, list = {}, ws = Workspace, now = Workspace.GetServerTimeNow,
+    me = "ReplicatedStorage.Packages._Index.sleitnick_net@0.1.0.net"}
 local HOOK_NAME = "=ReplicatedStorage.Packages._Index.sleitnick_net@0.1.0.net"
 local NC_SRC = [[
-local box, getncm, sel = ...
+local box, getncm, sel, pc, err, info, typ, find = ...
+local function pass(ok, ...)
+    if ok then return ... end
+    local e = ...
+    if typ(e) == "string" and not find(e, "^[^\n]-:%d+: ") then
+        -- stamp it with the first frame that isn't ours or C: the game's line
+        for lvl = 2, 12 do
+            local src, line = info(lvl, "sl")
+            if src == nil then break end
+            if src ~= "[C]" and src ~= box.me and line and line > 0 then
+                e = src .. ":" .. line .. ": " .. e
+                break
+            end
+        end
+    end
+    return err(e, 0)
+end
 return function(self, ...)
     local l = box.list
     if box.want and #l < 4 and getncm() == "FireServer" and sel("#", ...) >= 6 then
         l[#l + 1] = {self, sel("#", ...), {...}, box.now(box.ws)}
     end
-    return box.nc(self, ...)
+    return pass(pc(box.nc, self, ...))
 end]]
 local FIRE_SRC = [[
 local box, sel = ...
@@ -1015,17 +1052,33 @@ local function build_body(src, ...)
     end)
     return ok and type(fn) == 'function' and fn or nil
 end
-local NC_BODY = build_body(NC_SRC, box, getnamecallmethod_ or function() return nil end, select)
+local NC_BODY = build_body(NC_SRC, box, getnamecallmethod_ or function() return nil end, select,
+    pcall, error, debug.info, type, string.find)
 local FIRE_BODY = build_body(FIRE_SRC, box, select)
 Core.isolated = NC_BODY ~= nil and FIRE_BODY ~= nil
 -- No loadstring on this executor: same bodies, just not disguised.
 if not NC_BODY then
+    local function pass(ok, ...)
+        if ok then return ... end
+        local e = ...
+        if type(e) == "string" and not string.find(e, "^[^\n]-:%d+: ") then
+            for lvl = 2, 12 do
+                local src, line = debug.info(lvl, "sl")
+                if src == nil then break end
+                if src ~= "[C]" and line and line > 0 and src ~= debug.info(1, "s") then
+                    e = src .. ":" .. line .. ": " .. e
+                    break
+                end
+            end
+        end
+        return error(e, 0)
+    end
     NC_BODY = function(self, ...)
         local l = box.list
         if box.want and #l < 4 and getnamecallmethod_() == "FireServer" and select_("#", ...) >= 6 then
             l[#l + 1] = {self, select_("#", ...), {...}, box.now(box.ws)}
         end
-        return box.nc(self, ...)
+        return pass(pcall(box.nc, self, ...))
     end
 end
 if not FIRE_BODY then
@@ -1062,7 +1115,8 @@ local function arm()
     if H.fire or H.nc then return true end
     box.list = {}
     local method = capture_method()
-    if method == "oth" then
+    -- Both = oth on FireServer (when oth is there) + the probe-proof __namecall
+    if method == "oth" or (method == "Both" and oth_hook and FIRE_FN) then
         if H.oth_kept then
             H.fire, box.fire, H.oth = H.oth_kept, H.oth_kept, true
         else
@@ -1108,14 +1162,22 @@ end
 local last_press = -100
 prime_remote = function()
     if Core.cap or not is_live() or keypress_only() or not remote_features_on() then return end
-    if not canParryNow() then return end
+    if not Core.in_match() or not canParryNow() then return end
     local now = clock_()
     -- F, 1s after you became able to parry (so it never lands the instant a
     -- round or respawn starts), then every 1.4s until it's armed
     if not Core.can_since or now - Core.can_since < 1 then return end
     if now - last_press < 1.4 then return end
+    -- 3 presses in a row that caught nothing: stop for 20s instead of putting
+    -- the hook up every 1.4s
+    if (Core.dry_presses or 0) >= 3 then
+        if now - last_press < 20 then return end
+        Core.dry_presses = 0
+    end
     last_press = now
     if arm() then
+        Core.dry_presses = (Core.dry_presses or 0) + 1
+        flight(("capture press %d (%s hook up for 0.35s)"):format(Core.dry_presses, capture_method()))
         pressBlockKey()
         -- the capture press is a real parry press: the game's lockout starts
         -- now. Mark it ourselves instead of only trusting its swing to show up
@@ -1130,7 +1192,7 @@ end
 -- picked in "Capture hook".
 Core.rehook = function()
     pcall(unhook)
-    Core.cap, Core.pending, Core.misses, Core.told = nil, nil, 0, false
+    Core.cap, Core.pending, Core.misses, Core.told, Core.dry_presses = nil, nil, 0, false, 0
     last_press = -100
     if canParryNow() then Core.can_since = clock_() - 1 end
     flight("REHOOK: capture dropped, taking a fresh one (" .. tostring(capture_method()) .. " hook)")
@@ -1167,7 +1229,7 @@ local function is_block_press(input)
 end
 local function own_input(input)
     if Core.cap or not is_live() or keypress_only() then return end
-    if is_block_press(input) and canParryNow() then arm() end
+    if is_block_press(input) and Core.in_match() and canParryNow() then arm() end
 end
 UserInputService.InputBegan:Connect(own_input)
 -- Every real block press of yours (F, click, gamepad, the block button) starts
@@ -2286,6 +2348,7 @@ RunService.Heartbeat:Connect(function()
     local nc = Core.new_capture
     if nc then
         Core.new_capture = nil
+        Core.dry_presses = 0
         local cap, prev = Core.cap, nc.prev
         learn_hookfree(cap)
         local keystr = table.concat(cap.key, ",")
