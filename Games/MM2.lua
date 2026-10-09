@@ -180,21 +180,199 @@ local function countOwned(owned)
     return n
 end
 
-local Onyx
+-- Ui3 (https://github.com/iamdookie1/Ui3) in place of the old Ui2/Onyx library.
+-- Ui3 follows Obsidian's layout and API, so the thin compatibility layer below
+-- keeps the rest of this script speaking the old Onyx terms - CreateWindow,
+-- CreateTab, CreateSection and the element builders - while every control it
+-- makes is really a Ui3 one underneath. That way the switch is only this block.
+local Library
 do
     local ref = 'main'
     local resolved, shaOrError = pcall(function()
-        local commit = game:GetService("HttpService"):JSONDecode(game:HttpGet('https://api.github.com/repos/iamdookie1/Ui2/commits/main'))
+        local commit = game:GetService("HttpService"):JSONDecode(game:HttpGet('https://api.github.com/repos/iamdookie1/Ui3/commits/main'))
         return commit.sha
     end)
     if resolved and shaOrError then
         ref = shaOrError
     else
-        warn('[Onyx] could not resolve the latest commit, falling back to main (raw.githubusercontent.com caches that for up to 5 minutes): ' .. tostring(shaOrError))
+        warn('[Ui3] could not resolve the latest commit, falling back to main (raw.githubusercontent.com caches that for up to 5 minutes): ' .. tostring(shaOrError))
     end
 
-    local url = ('https://raw.githubusercontent.com/iamdookie1/Ui2/%s/Ui.lua'):format(ref)
-    Onyx = loadstring(game:HttpGet(url))()
+    local url = ('https://raw.githubusercontent.com/iamdookie1/Ui3/%s/Ui.lua'):format(ref)
+    Library = loadstring(game:HttpGet(url))()
+end
+
+--// Onyx -> Ui3 compatibility shim -------------------------------------------
+--
+-- Ui3 is an Obsidian-style library, so its calls do not line up one to one with
+-- the Ui2 ones this script was written against. Rather than rewrite every tab,
+-- `Onyx` below answers to the old API and translates each call into Ui3:
+--
+--  * a CreateSection is one Ui3 groupbox; sections alternate down the left and
+--    right columns so each tab fills out in two columns the Obsidian way
+--  * an Onyx Flag becomes the Ui3 index, so configs keep working by the same key
+--  * a Description becomes a Ui3 Tooltip (shown on hover)
+--  * a Paragraph becomes a titled divider with wrapped text under it
+--  * a Console lives in a big groupbox, the only place Ui3 puts a log
+--  * Ui3 labels do not recolour, so a stat's :SetColor is a no-op; the text,
+--    which carries the real reading, still updates
+local Onyx = {}
+do
+    -- the lucide icon each tab wears, keyed by its old title
+    local TAB_ICONS = {
+        ['profile'] = 'user',
+        ['silent aim v2'] = 'crosshair',
+        ['trigger bot'] = 'zap',
+        ['fling'] = 'wind',
+        ['items'] = 'package',
+        ['proof'] = 'clipboard-check',
+        ['visual'] = 'eye',
+    }
+
+    -- how many decimal places a slider step implies, for Ui3's Rounding
+    local function roundingFor(increment)
+        local inc = tonumber(increment)
+        if not inc or inc <= 0 or inc >= 1 then return 0 end
+        return math.clamp(math.ceil(-math.log(inc, 10) - 1e-9), 0, 6)
+    end
+
+    local function notifyIcon(kind)
+        if kind == 'error' then return 'circle-x' end
+        if kind == 'warning' then return 'triangle-alert' end
+        if kind == 'success' then return 'circle-check' end
+        return 'bell'
+    end
+
+    local function wrapLabel(label)
+        return {
+            SetText = function(_, text) pcall(function() label:SetText(tostring(text)) end) end,
+            SetColor = function() end,
+        }
+    end
+
+    local function makeSection(tab, box)
+        local section = { _tab = tab, _box = box }
+
+        function section:Toggle(cfg)
+            local toggle = box:AddToggle(cfg.Flag, {
+                Text = cfg.Title,
+                Default = cfg.Default or false,
+                Tooltip = cfg.Description,
+                Risky = cfg.Risky,
+                Callback = cfg.Callback,
+            })
+            return { Set = function(_, value) toggle:SetValue(value) end }
+        end
+
+        function section:Slider(cfg)
+            return box:AddSlider(cfg.Flag, {
+                Text = cfg.Title,
+                Default = cfg.Default or cfg.Min or 0,
+                Min = cfg.Min or 0,
+                Max = cfg.Max or 1,
+                Rounding = roundingFor(cfg.Increment),
+                Suffix = cfg.Suffix,
+                Tooltip = cfg.Description,
+                Callback = cfg.Callback,
+            })
+        end
+
+        function section:Dropdown(cfg)
+            return box:AddDropdown(cfg.Flag, {
+                Text = cfg.Title,
+                Values = cfg.Values,
+                Default = cfg.Default,
+                Tooltip = cfg.Description,
+                Callback = cfg.Callback,
+            })
+        end
+
+        function section:Button(cfg)
+            return box:AddButton({
+                Text = cfg.Title,
+                Func = cfg.Callback,
+                Tooltip = cfg.Description,
+            })
+        end
+
+        function section:Label(cfg)
+            return wrapLabel(box:AddLabel(cfg.Title or '', true))
+        end
+
+        function section:Paragraph(cfg)
+            box:AddDivider(cfg.Title or '')
+            return wrapLabel(box:AddLabel(cfg.Content or cfg.Text or '', true))
+        end
+
+        -- Ui3's log console only lives in a big groupbox, so give the tab one
+        -- and drop the console into it. :Warn tints the line the way Onyx did
+        function section:Console(cfg)
+            local big = tab._ui3:AddBigGroupbox(cfg.Title or 'log')
+            local log = big:AddLog(cfg.Flag or cfg.Title or 'log', {
+                Height = cfg.Height,
+                MaxLines = cfg.MaxLines,
+                Timestamps = cfg.Timestamps,
+            })
+            return {
+                Log = function(_, text) pcall(function() log:Log(tostring(text)) end) end,
+                Warn = function(_, text) pcall(function() log:Log(tostring(text), Color3.fromRGB(255, 170, 70)) end) end,
+                Clear = function() pcall(function() log:Clear() end) end,
+            }
+        end
+
+        return section
+    end
+
+    local function makeTab(ui3Tab)
+        local tab = { _ui3 = ui3Tab, _count = 0 }
+        function tab:CreateSection(name)
+            self._count = self._count + 1
+            local box
+            if self._count % 2 == 1 then
+                box = ui3Tab:AddLeftGroupbox(name or 'section')
+            else
+                box = ui3Tab:AddRightGroupbox(name or 'section')
+            end
+            return makeSection(self, box)
+        end
+        return tab
+    end
+
+    function Onyx:CreateWindow(cfg)
+        cfg = cfg or {}
+        local ui3Window = Library:CreateWindow({
+            Title = cfg.Title or 'menu',
+            Footer = cfg.SubTitle,
+            ToggleKeybind = cfg.Keybind,
+            ConfigFolder = cfg.Folder,
+            Center = true,
+            AutoShow = true,
+        })
+        local window = {}
+        function window:CreateTab(tabCfg)
+            tabCfg = tabCfg or {}
+            local title = tabCfg.Title or 'tab'
+            return makeTab(ui3Window:AddTab(title, TAB_ICONS[title]))
+        end
+        return window
+    end
+
+    function Onyx:Notify(cfg)
+        if typeof(cfg) == "string" then
+            return Library:Notify(cfg)
+        end
+        cfg = cfg or {}
+        return Library:Notify({
+            Title = cfg.Title,
+            Description = cfg.Content,
+            Time = cfg.Duration,
+            Icon = notifyIcon(cfg.Type),
+        })
+    end
+
+    function Onyx:Unload()
+        pcall(function() Library:Unload() end)
+    end
 end
 
 local function addStat(section, cfg)
@@ -295,6 +473,16 @@ end
 -- silent aim v2's dropdowns
 Choice.Targets = { default = 'Enemies', order = { 'Enemies', 'Anyone' } }
 Choice.NeverSure = { default = 'Drop the shot', order = { 'Drop the shot', 'Fire anyway' } }
+
+-- which of several would-be targets a shot goes to, for silent aim and the
+-- trigger bot alike. nearest to aim keeps the old behaviour (the one closest to
+-- where you fired); most likely to hit takes the one the predictor is surest of,
+-- which lands the most shots in a game where any hit is a kill; closest takes
+-- the nearest in studs
+Choice.Priority = {
+    default = 'Nearest to aim',
+    order = { 'Nearest to aim', 'Most likely to hit', 'Closest' },
+}
 
 -- fling. a flung player is one whose own client resolved a contact against a
 -- part of yours that your client reported moving absurdly fast; every method
@@ -417,6 +605,7 @@ Choice.Trigger = {
 local Aim = {
     Enabled = false,
     Targets = Choice.Targets.default,
+    Priority = Choice.Priority.default,  -- which target to take when several qualify
     WallCheck = true,
     Fov = 0,        -- degrees either side of where you shot; 0 takes anyone on screen
     Trim = 0,       -- ms added to the lead on top of what it has learned
@@ -1444,45 +1633,89 @@ function SA.candidates(origin, dir, anyone)
     return list
 end
 
--- a plan: who, and the point to send. only would-be targets with a clear line
--- to that point are taken while the wall check is on (the server casts to it)
-function SA.plan(which, origin, dir, now, anyone, only)
+-- the plan for one candidate: solve where to aim, then keep it only if the shot
+-- has a clear line to that point while the wall check is on (the server casts to
+-- it). nil when the wall is in the way
+function SA.tryPlan(which, origin, now, candidate)
+    local track = candidate.track
+    local aim, chance, lead, flight, root = SA.solve(track, which, origin, now)
+    local char = track.char
+    if Aim.WallCheck and not clearPath(origin, aim, char) then return nil end
+    return {
+        plr = candidate.plr,
+        char = char,
+        root = candidate.root,
+        part = candidate.root,
+        entry = track,
+        isKnife = which == 'Knife',
+        fallback = CFrame.new(aim),
+        aim = aim,
+        chance = chance,
+        travel = lead,
+        flight = flight,
+        rtt = cachedPing,
+        predicted = aim,
+        from = root,
+        stamp = now,
+        ahead = not clearPath(origin, candidate.root.Position, char),
+    }
+end
+
+-- a plan: who, and the point to send.
+--  * only  - forces that one player (a held shot staying on its target)
+--  * prefer - a player to keep firing at if they are still a valid candidate,
+--             so the trigger bot does not thrash between two enemies and reset
+--             its reaction every frame one drifts nearer the crosshair
+--  * priority - which candidate to take when several qualify (see Choice.Priority)
+function SA.plan(which, origin, dir, now, anyone, only, prefer, priority)
     if not origin then return nil end
-    local list
     if only then
         local track = SA.tracks[only]
         if not track or not track.root or not isAlivePlr(only) then return nil end
-        list = { { plr = only, track = track, root = track.root, angle = 0 } }
-    else
-        list = SA.candidates(origin, dir, anyone)
+        return SA.tryPlan(which, origin, now, { plr = only, track = track, root = track.root, angle = 0 })
     end
-    for rank, candidate in ipairs(list) do
-        if rank > 4 then break end
-        local track = candidate.track
-        local aim, chance, lead, flight, root = SA.solve(track, which, origin, now)
-        local char = track.char
-        if not Aim.WallCheck or clearPath(origin, aim, char) then
-            return {
-                plr = candidate.plr,
-                char = char,
-                root = candidate.root,
-                part = candidate.root,
-                entry = track,
-                isKnife = which == 'Knife',
-                fallback = CFrame.new(aim),
-                aim = aim,
-                chance = chance,
-                travel = lead,
-                flight = flight,
-                rtt = cachedPing,
-                predicted = aim,
-                from = root,
-                stamp = now,
-                ahead = not clearPath(origin, candidate.root.Position, char),
-            }
+
+    local list = SA.candidates(origin, dir, anyone)
+
+    -- stickiness: stay on the preferred target while it is still a clear candidate
+    if prefer then
+        for _, candidate in ipairs(list) do
+            if candidate.plr == prefer or candidate.plr.Character == prefer then
+                local plan = SA.tryPlan(which, origin, now, candidate)
+                if plan then return plan end
+                break
+            end
         end
     end
-    return nil
+
+    priority = priority or Choice.Priority.default
+    if priority == 'Nearest to aim' then
+        -- the cheap path, and the old behaviour: the first clear candidate in
+        -- angle order, solved one at a time so no extra work is ever done
+        for rank, candidate in ipairs(list) do
+            if rank > 4 then break end
+            local plan = SA.tryPlan(which, origin, now, candidate)
+            if plan then return plan end
+        end
+        return nil
+    end
+
+    -- the scored path: solve the nearest few and take the best by the mode
+    local best, bestScore
+    for rank, candidate in ipairs(list) do
+        if rank > 4 then break end
+        local plan = SA.tryPlan(which, origin, now, candidate)
+        if plan then
+            local score
+            if priority == 'Closest' then
+                score = -(candidate.root.Position - origin).Magnitude
+            else -- 'Most likely to hit'
+                score = plan.chance
+            end
+            if not best or score > bestScore then best, bestScore = plan, score end
+        end
+    end
+    return best
 end
 
 local knifeSpeedStat = nil
@@ -1624,6 +1857,11 @@ function SA.stepHeld(now)
         if not Aim.Enabled or not originCFrame then
             -- the weapon put away, or silent aim switched off
             SA.dropHeld(which, now)
+        elseif not isAlivePlr(held.plr) then
+            -- the person this shot was waiting on is dead or gone: there is
+            -- nothing left to hold for, so let it go rather than fire it at a
+            -- corpse when the hold runs out
+            SA.dropHeld(which, now)
         else
             local plan = SA.plan(which, originCFrame.Position, held.dir, now, held.anyone, held.plr)
             held.plan = plan or held.plan
@@ -1670,7 +1908,7 @@ local function resolveRedirect(which, claimed, originCFrame, sentCFrame, remote)
     if claimed then
         plan = SA.plan(which, origin, dir, now, false, claimed.plr)
     else
-        plan = SA.plan(which, origin, dir, now, anyone)
+        plan = SA.plan(which, origin, dir, now, anyone, nil, nil, Choice.pick(Choice.Priority, Aim.Priority))
     end
 
     if not plan then
@@ -1868,16 +2106,20 @@ function Trigger.ahead()
     return (tonumber(Trigger.Reaction) or 0) <= 0
 end
 
--- The trigger bot's own plans: enemies only, nearest where the camera looks
+-- The trigger bot's own plans: enemies only, nearest where the camera looks,
+-- sticking with whoever it is already drawn on so a second enemy drifting past
+-- the crosshair does not keep resetting the reaction. It takes the same target
+-- priority as silent aim otherwise
 function Trigger.buildPlans(now, char)
     local plans = Trigger.plans
     plans.Gun, plans.Knife = nil, nil
     local look = Camera.CFrame.LookVector
+    local priority = Choice.pick(Choice.Priority, Aim.Priority)
     if Trigger.Gun and char and char:FindFirstChild("Gun") then
-        plans.Gun = SA.plan('Gun', findGunOrigin(), look, now, false)
+        plans.Gun = SA.plan('Gun', findGunOrigin(), look, now, false, nil, Trigger.gun.target, priority)
     end
     if Trigger.Throw and char and char:FindFirstChild("Knife") then
-        plans.Knife = SA.plan('Knife', findKnifeOrigin(), look, now, false)
+        plans.Knife = SA.plan('Knife', findKnifeOrigin(), look, now, false, nil, Trigger.knife.target, priority)
     end
 end
 
@@ -2917,6 +3159,15 @@ do
         Default = Choice.Targets.default,
         Flag = 'mm2_sa2_targets',
         Callback = function(value) Aim.Targets = Choice.pick(Choice.Targets, value) end,
+    })
+
+    MainSection:Dropdown({
+        Title = 'pick target by',
+        Description = 'when more than one target qualifies. nearest to aim takes the one closest to where you fired (the old behaviour). most likely to hit takes the one the predictor is surest of, which lands more shots since any hit here is a kill. closest takes the nearest in studs. the trigger bot follows this too',
+        Values = Choice.Priority.order,
+        Default = Choice.Priority.default,
+        Flag = 'mm2_sa2_priority',
+        Callback = function(value) Aim.Priority = Choice.pick(Choice.Priority, value) end,
     })
 
     MainSection:Toggle({
