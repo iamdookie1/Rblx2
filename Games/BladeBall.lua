@@ -8,10 +8,20 @@
 -- the flight log only. Nothing of ours ever reaches ScriptContext.Error or the
 -- console (LogService), the two places the game's own scripts can watch for
 -- errors from a script that isn't theirs, and there's no print/warn anywhere.
-local GUARD_LOG = {}
+-- It also measures how much memory each callback allocates (gcinfo before /
+-- after, calls that didn't yield only), so the flight log can name what
+-- grows the Lua heap -- the game's anti-cheat can watch that heap.
+local GUARD_LOG, GUARD_STAT = {}, {}
 local function GUARD_(fn)
+    local st = {kb = 0, n = 0, line = 0}
+    pcall(function() st.line = debug.info(fn, "l") or 0 end)
+    GUARD_STAT[#GUARD_STAT + 1] = st
     return function(...)
+        local t0, k0 = os.clock(), gcinfo()
         local ok, err = pcall(fn, ...)
+        local dk = gcinfo() - k0
+        if dk > 0 and os.clock() - t0 < 0.05 then st.kb = st.kb + dk end
+        st.n = st.n + 1
         if not ok then
             local log = GUARD_LOG.f
             if log then pcall(log, "caught error (kept silent): " .. tostring(err)) end
@@ -23,7 +33,7 @@ task.spawn(GUARD_(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.09-62.4"
+local SCRIPT_VERSION = "2026.10.09-62.5"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -3980,6 +3990,22 @@ do
                 end
             end
             beat = beat + 1
+            if beat % 5 == 0 then
+                -- the 5 callbacks that allocated most in the last 5s
+                local list = {}
+                for _, st in ipairs(GUARD_STAT) do
+                    if st.kb > 0 then list[#list + 1] = st end
+                end
+                table.sort(list, function(a, b) return a.kb > b.kb end)
+                local parts, total = {}, 0
+                for i, st in ipairs(list) do
+                    total = total + st.kb
+                    if i <= 6 then parts[#parts + 1] = ("L%d %dKB/%dx"):format(st.line, st.kb, st.n) end
+                end
+                for _, st in ipairs(GUARD_STAT) do st.kb, st.n = 0, 0 end
+                flight(("alloc 5s: ours %dKB total | %s | menu %s"):format(total, table.concat(parts, ", "),
+                    Library.Toggled and "OPEN" or "closed"))
+            end
             if beat % 5 == 0 or ParryLog.spam ~= last_spam then
                 flight(("beat: %s | heap %dKB | sends %d, spam sends %d | modes parry=%s spam=%s | remote %s"):format(
                     where(), math.floor(gcinfo()), ParryLog.total, ParryLog.spam, tostring(getgenv().AutoParryMode),
