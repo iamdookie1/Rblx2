@@ -6,7 +6,7 @@ task.spawn(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.09-62.1"
+local SCRIPT_VERSION = "2026.10.09-62.2"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -1081,6 +1081,35 @@ if not FIRE_BODY then
         end
         return box.fire(self, ...)
     end
+end
+
+-- STACK HIDING (opt-in: Status tab -> "Hide hook bodies"). OFF by default:
+-- v71 used setstackhidden and got a reason-24 kick 0.2s after the capture --
+-- executors typically implement it by wrapping debug.info and friends, and the
+-- game's parry code checks on every send that debug.info is still a real C
+-- function. When on, only the two hook bodies are hidden (they're the only
+-- code of ours that ever sits on the game's stack, and only during a capture
+-- press). Whichever of setstackhidden / sethiddenstack the executor has is used.
+do
+    local found, name
+    for _, n in ipairs({"setstackhidden", "sethiddenstack"}) do
+        local ok, v = pcall(function() return rawget(getgenv(), n) or getfenv(0)[n] end)
+        if ok and type(v) == 'function' then found, name = v, n; break end
+        ok, v = pcall(function() return debug[n] end)
+        if ok and type(v) == 'function' then found, name = v, "debug." .. n; break end
+    end
+    Core.stack_fn, Core.stack_fn_name, Core.stack_hidden = found, name, false
+end
+function Core.set_stack_hide(on)
+    local f = Core.stack_fn
+    if not f then return false end
+    for _, body in ipairs({NC_BODY, FIRE_BODY}) do
+        local ok = pcall(f, body, on)
+        if not ok and on then ok = pcall(f, body) end
+    end
+    Core.stack_hidden = on and true or false
+    flight(("stack hiding %s (%s)"):format(on and "ON" or "OFF", tostring(Core.stack_fn_name)))
+    return true
 end
 
 local function unhook()
@@ -3326,6 +3355,13 @@ Overview:AddLabel("Version: " .. SCRIPT_VERSION, true)
 local RemoteLabel = Overview:AddLabel("Remote: checking...", true)
 local TargetLabel = Overview:AddLabel("Ball target: -", true)
 
+local SH = Tabs.Status:AddRightGroupbox("Stack hiding", "eye-off")
+SH:AddLabel(Core.stack_fn and ("Executor has " .. tostring(Core.stack_fn_name) .. ".")
+    or "Your executor has no setstackhidden / sethiddenstack: this does nothing.", true)
+SH:AddToggle("StackHide", {Text = "Hide hook bodies", Default = false, Risky = true,
+    Tooltip = "Opt-in, OFF by default. Hides the capture hook bodies from the game's stack checks with setstackhidden / sethiddenstack. v71 used it and got a reason-24 kick 0.2s after the capture (it usually works by wrapping debug.info, which the game checks on every parry). Test it in a match with a capture press, not on its own. The kick line in flight.txt says whether it was on.",
+    Callback = function(v) Core.set_stack_hide(v) end})
+
 local LogBox = Tabs.Status:AddLeftGroupbox("Parry log", "list")
 LogBox:AddLabel("Every parry this copy sends: where it came from and which pass at you it was for. Two for the same pass are marked DOUBLE. Spam is only counted.", true)
 local LogCounts = LogBox:AddLabel("Parries: 0  |  doubles: 0  |  spam: 0", true)
@@ -3862,7 +3898,8 @@ do
     table.insert(conns, GuiService.ErrorMessageChanged:Connect(function(msg)
         local reason = tostring(msg):match("BAC%s+%w-X(%d%d)")
         flight("!!!! KICK / ERROR MESSAGE: " .. tostring(msg) .. (reason and (" [reason " .. reason .. "]") or "")
-            .. " [capture hook " .. tostring(Core.capture_method and Core.capture_method() or getgenv().CaptureHook) .. "]")
+            .. " [capture hook " .. tostring(Core.capture_method and Core.capture_method() or getgenv().CaptureHook) .. "]"
+            .. " [stack hiding " .. (Core.stack_hidden and "ON" or "off") .. "]")
     end))
     table.insert(conns, Remotes.ParrySuccess.OnClientEvent:Connect(function() flight("ParrySuccess received") end))
     local function where()
