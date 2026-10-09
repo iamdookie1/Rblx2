@@ -23,7 +23,7 @@ task.spawn(GUARD_(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.09-62.3"
+local SCRIPT_VERSION = "2026.10.09-62.4"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -212,6 +212,14 @@ local function canParryNow()
         if Dead and char.Parent == Dead then return true end
     end
     return false
+end
+-- In a live round (your character under Workspace.Alive). The capture -- the
+-- auto press and the hook -- only ever happens here: a lobby / lobby-parry
+-- press never sends the match parry packet, so capturing there just put the
+-- __namecall hook up every 1.4s, forever, while you stood in the lobby.
+Core.in_match = function()
+    local char = LocalPlayer.Character
+    return char ~= nil and char.Parent == Alive
 end
 
 -- Presses the block key via VirtualInputManager, which makes the game run its
@@ -1201,14 +1209,22 @@ end
 local last_press = -100
 prime_remote = function()
     if Core.cap or not is_live() or keypress_only() or not remote_features_on() then return end
-    if not canParryNow() then return end
+    if not Core.in_match() or not canParryNow() then return end
     local now = clock_()
     -- F, 1s after you became able to parry (so it never lands the instant a
     -- round or respawn starts), then every 1.4s until it's armed
     if not Core.can_since or now - Core.can_since < 1 then return end
     if now - last_press < 1.4 then return end
+    -- 3 presses in a row that caught nothing: stop for 20s instead of putting
+    -- the hook up every 1.4s
+    if (Core.dry_presses or 0) >= 3 then
+        if now - last_press < 20 then return end
+        Core.dry_presses = 0
+    end
     last_press = now
     if arm() then
+        Core.dry_presses = (Core.dry_presses or 0) + 1
+        flight(("capture press %d (%s hook up for 0.35s)"):format(Core.dry_presses, capture_method()))
         pressBlockKey()
         -- the capture press is a real parry press: the game's lockout starts
         -- now. Mark it ourselves instead of only trusting its swing to show up
@@ -1247,7 +1263,7 @@ local function is_block_press(input)
 end
 local function own_input(input)
     if Core.cap or not is_live() or keypress_only() then return end
-    if is_block_press(input) and canParryNow() then arm() end
+    if is_block_press(input) and Core.in_match() and canParryNow() then arm() end
 end
 UserInputService.InputBegan:Connect(GUARD_(own_input))
 -- Every real block press of yours (F, click, gamepad, the block button) starts
@@ -2333,6 +2349,7 @@ RunService.Heartbeat:Connect(GUARD_(function()
     local nc = Core.new_capture
     if nc then
         Core.new_capture = nil
+        Core.dry_presses = 0
         local cap, prev = Core.cap, nc.prev
         learn_hookfree(cap)
         local keystr = table.concat(cap.key, ",")
