@@ -2,28 +2,11 @@
 -- UI: Ui3 (https://github.com/iamdookie1/Ui3). Menu key, accent, DPI and
 -- configs (save / load / autoload) live in Ui3's settings panel (gear icon).
 
--- SILENT: every function this script hands the engine -- signal connections,
--- task.spawn / delay / defer threads, UI callbacks, and the script body itself
--- -- runs through GUARD_. An error inside one is caught right there and goes to
--- the flight log only. Nothing of ours ever reaches ScriptContext.Error or the
--- console (LogService), the two places the game's own scripts can watch for
--- errors from a script that isn't theirs, and there's no print/warn anywhere.
-local GUARD_LOG = {}
-local function GUARD_(fn)
-    return function(...)
-        local ok, err = pcall(fn, ...)
-        if not ok then
-            local log = GUARD_LOG.f
-            if log then pcall(log, "caught error (kept silent): " .. tostring(err)) end
-        end
-    end
-end
-
-task.spawn(GUARD_(function()
+task.spawn(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.09-61"
+local SCRIPT_VERSION = "2026.10.09-62"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -62,7 +45,6 @@ do
         end)
     end
 end
-GUARD_LOG.f = flight
 
 -- Parry log: every parry this copy sends, where it came from, which pass at you
 -- it was for. Spam sources are only counted (they fire hundreds a second).
@@ -535,14 +517,14 @@ local own_swing = setmetatable({}, {__mode = 'k'}) -- track -> when we played it
 -- with no parry. Tracks that start right after a ParrySuccess are skipped.
 local success_at = -math.huge
 pcall(function()
-    Remotes.ParrySuccess.OnClientEvent:Connect(GUARD_(function() success_at = os.clock() end))
+    Remotes.ParrySuccess.OnClientEvent:Connect(function() success_at = os.clock() end)
 end)
 local function watch_presses(char)
-    task.spawn(GUARD_(function()
+    task.spawn(function()
         local humanoid = char:WaitForChild("Humanoid", 10)
         local animator = humanoid and humanoid:WaitForChild("Animator", 10)
         if not animator then return end
-        animator.AnimationPlayed:Connect(GUARD_(function(track)
+        animator.AnimationPlayed:Connect(function(track)
             if track:GetAttribute("SuccessParry") then return end -- a landed parry's swing, not a press
             if not (track:GetAttribute("Parry") or track:GetAttribute("GrabParry")) then return end
             local now = os.clock()
@@ -550,11 +532,11 @@ local function watch_presses(char)
             local at = own_swing[track]
             if at and now - at < 0.25 then return end
             if Core.gate_start then Core.gate_start() end
-        end))
-    end))
+        end)
+    end)
 end
 if LocalPlayer.Character then watch_presses(LocalPlayer.Character) end
-LocalPlayer.CharacterAdded:Connect(GUARD_(watch_presses))
+LocalPlayer.CharacterAdded:Connect(watch_presses)
 
 local function play_block()
     local char = LocalPlayer.Character
@@ -602,13 +584,13 @@ end
 -- Our own block landed: the next block can start straight away (the game plays
 -- the success swing itself).
 pcall(function()
-    Remotes.ParrySuccess.OnClientEvent:Connect(GUARD_(function()
+    Remotes.ParrySuccess.OnClientEvent:Connect(function()
         gate.landed, gate.landed_at = true, os.clock()
-    end))
+    end)
 end)
-LocalPlayer.CharacterAdded:Connect(GUARD_(function()
+LocalPlayer.CharacterAdded:Connect(function()
     gate.last, gate.landed, gate.landed_at = -math.huge, true, -math.huge
-end))
+end)
 
 -- The block swing that goes with our parries, through play_block's gate (the
 -- fix from 54757b6 / a7882af / 760eaa1): it never cuts the game's success swing
@@ -774,16 +756,16 @@ local function isLocal(player)
 end
 
 pcall(function()
-    Remotes.DeathBall.OnClientEvent:Connect(GUARD_(function(c, d) System.__properties.__deathslash_active = d or false end))
+    Remotes.DeathBall.OnClientEvent:Connect(function(c, d) System.__properties.__deathslash_active = d or false end)
 end)
 pcall(function()
-    Remotes.InfinityBall.OnClientEvent:Connect(GUARD_(function(a, b) System.__properties.__infinity_active = b or false end))
+    Remotes.InfinityBall.OnClientEvent:Connect(function(a, b) System.__properties.__infinity_active = b or false end)
 end)
 
 local net
 pcall(function() net = ReplicatedStorage.Packages._Index["sleitnick_net@0.1.0"].net end)
 local function onNet(name, fn)
-    pcall(function() net[name].OnClientEvent:Connect(GUARD_(fn)) end)
+    pcall(function() net[name].OnClientEvent:Connect(fn) end)
 end
 
 onNet("RE/TimeHoleActivate", function(player)
@@ -805,7 +787,7 @@ local function runSlashesLoop()
     if not System.__config.__detections.__slashesoffury then return end
     if not System.__properties.__slashesoffury_active then return end
     slashesLoopRunning = true
-    task.spawn(GUARD_(function()
+    task.spawn(function()
         local sent = 0
         while System.__properties.__slashesoffury_active
             and System.__config.__detections.__slashesoffury
@@ -821,7 +803,7 @@ local function runSlashesLoop()
             task.wait(parryDelay)
         end
         slashesLoopRunning = false
-    end))
+    end)
 end
 onNet("RE/SlashesOfFuryActivate", function(player)
     if isLocal(player) then
@@ -842,7 +824,7 @@ onNet("RE/SlashesOfFuryCatch", function()
     runSlashesLoop()
 end)
 
-Runtime.ChildAdded:Connect(GUARD_(function(Object)
+Runtime.ChildAdded:Connect(function(Object)
     if not System.__config.__detections.__phantom then return end
     if Object.Name ~= "maxTransmission" and Object.Name ~= "transmissionpart" then return end
     local Weld = Object:FindFirstChildWhichIsA("WeldConstraint")
@@ -851,21 +833,21 @@ Runtime.ChildAdded:Connect(GUARD_(function(Object)
     local CurrentBall = System.ball.get(); Weld:Destroy()
     if not CurrentBall then return end
     local FocusConnection
-    FocusConnection = RunService.RenderStepped:Connect(GUARD_(function()
+    FocusConnection = RunService.RenderStepped:Connect(function()
         local Highlighted = CurrentBall:GetAttribute("highlighted")
         if Highlighted == true then
             Remotes.AbilityButtonPress:Fire()
             System.__properties.__parried = true
-            task.delay(1, GUARD_(function() System.__properties.__parried = false end))
+            task.delay(1, function() System.__properties.__parried = false end)
         elseif Highlighted == false then FocusConnection:Disconnect() end
-    end))
-    task.delay(3, GUARD_(function() if FocusConnection and FocusConnection.Connected then FocusConnection:Disconnect() end end))
-end))
+    end)
+    task.delay(3, function() if FocusConnection and FocusConnection.Connected then FocusConnection:Disconnect() end end)
+end)
 
-Remotes.ParrySuccess.OnClientEvent:Connect(GUARD_(function()
+Remotes.ParrySuccess.OnClientEvent:Connect(function()
     if not LocalPlayer.Character or LocalPlayer.Character.Parent ~= Alive then return end
     if System.__properties.__grab_animation then System.__properties.__grab_animation:Stop() end
-end))
+end)
 
 -- ============================================================
 -- PARRY CORE (rewritten): capture, gate, sender, ball tracking, timing,
@@ -938,16 +920,8 @@ local H = {fire = nil, nc = nil, want = false, until_t = 0, oth = false, oth_kep
 --   "oth"       -- the FireServer function through oth.hook (the default when
 --                  oth is there; Namecall when it isn't)
 -- Each alone sees about half the game's sends, so it can take two presses.
---   "Both + oth" -- (default) the first capture with Both, which is thrown
---                  away; every capture after it with oth, and only that one is
---                  used to parry. (Without oth: Both, kept.)
-local function both_then_oth() return (getgenv().CaptureHook or "Both + oth") == "Both + oth" end
 local function capture_method()
-    local m = getgenv().CaptureHook or "Both + oth"
-    if m == "Both + oth" then
-        if not (oth_hook and FIRE_FN) then return "Both" end
-        return Core.both_done and "oth" or "Both"
-    end
+    local m = getgenv().CaptureHook or "oth"
     if m == "oth" and not (oth_hook and FIRE_FN) then m = "Namecall" end
     return m
 end
@@ -1011,16 +985,45 @@ end
 --     overwrites the method the game's call is waiting on -- the old body did
 --     that (Workspace:GetServerTimeNow() via learn), which could turn the
 --     game's FireServer into GetServerTimeNow on the remote mid-send.
-local box = {want = false, nc = nil, fire = nil, list = {}, ws = Workspace, now = Workspace.GetServerTimeNow}
+--   * INVISIBLE TO THE PROBE (why Both/Namecall captures used to give the
+--     animation-but-no-parry and oth's didn't): the game's press handler makes
+--     a namecall that errors on purpose and checks the error. A C error is
+--     stamped with the place that made the call -- normally the game's own
+--     script line. With our namecall hook in between, the stamp became OUR
+--     hook's line, so the game knew __namecall was hooked for that press and
+--     the parry packet it sent (the one we captured) was one the server won't
+--     take: every parry built from it played the swing and did nothing. oth
+--     never hooks __namecall, so it never tripped this. Now the namecall body
+--     runs the real call in pcall (so the error carries no stamp of ours) and
+--     re-raises it stamped with the game's own calling line -- exactly the
+--     message the game gets with no hook at all.
+local box = {want = false, nc = nil, fire = nil, list = {}, ws = Workspace, now = Workspace.GetServerTimeNow,
+    me = "ReplicatedStorage.Packages._Index.sleitnick_net@0.1.0.net"}
 local HOOK_NAME = "=ReplicatedStorage.Packages._Index.sleitnick_net@0.1.0.net"
 local NC_SRC = [[
-local box, getncm, sel = ...
+local box, getncm, sel, pc, err, info, typ, find = ...
+local function pass(ok, ...)
+    if ok then return ... end
+    local e = ...
+    if typ(e) == "string" and not find(e, "^[^\n]-:%d+: ") then
+        -- stamp it with the first frame that isn't ours or C: the game's line
+        for lvl = 2, 12 do
+            local src, line = info(lvl, "sl")
+            if src == nil then break end
+            if src ~= "[C]" and src ~= box.me and line and line > 0 then
+                e = src .. ":" .. line .. ": " .. e
+                break
+            end
+        end
+    end
+    return err(e, 0)
+end
 return function(self, ...)
     local l = box.list
     if box.want and #l < 4 and getncm() == "FireServer" and sel("#", ...) >= 6 then
         l[#l + 1] = {self, sel("#", ...), {...}, box.now(box.ws)}
     end
-    return box.nc(self, ...)
+    return pass(pc(box.nc, self, ...))
 end]]
 local FIRE_SRC = [[
 local box, sel = ...
@@ -1041,17 +1044,33 @@ local function build_body(src, ...)
     end)
     return ok and type(fn) == 'function' and fn or nil
 end
-local NC_BODY = build_body(NC_SRC, box, getnamecallmethod_ or function() return nil end, select)
+local NC_BODY = build_body(NC_SRC, box, getnamecallmethod_ or function() return nil end, select,
+    pcall, error, debug.info, type, string.find)
 local FIRE_BODY = build_body(FIRE_SRC, box, select)
 Core.isolated = NC_BODY ~= nil and FIRE_BODY ~= nil
 -- No loadstring on this executor: same bodies, just not disguised.
 if not NC_BODY then
+    local function pass(ok, ...)
+        if ok then return ... end
+        local e = ...
+        if type(e) == "string" and not string.find(e, "^[^\n]-:%d+: ") then
+            for lvl = 2, 12 do
+                local src, line = debug.info(lvl, "sl")
+                if src == nil then break end
+                if src ~= "[C]" and line and line > 0 and src ~= debug.info(1, "s") then
+                    e = src .. ":" .. line .. ": " .. e
+                    break
+                end
+            end
+        end
+        return error(e, 0)
+    end
     NC_BODY = function(self, ...)
         local l = box.list
         if box.want and #l < 4 and getnamecallmethod_() == "FireServer" and select_("#", ...) >= 6 then
             l[#l + 1] = {self, select_("#", ...), {...}, box.now(box.ws)}
         end
-        return box.nc(self, ...)
+        return pass(pcall(box.nc, self, ...))
     end
 end
 if not FIRE_BODY then
@@ -1088,10 +1107,8 @@ local function arm()
     if H.fire or H.nc then return true end
     box.list = {}
     local method = capture_method()
-    -- Both + oth, first round: this capture only opens the way -- it's thrown
-    -- away and the next press captures with oth
-    H.discard = both_then_oth() and method == "Both" and oth_hook ~= nil and FIRE_FN ~= nil
-    if method == "oth" then
+    -- Both = oth on FireServer (when oth is there) + the probe-proof __namecall
+    if method == "oth" or (method == "Both" and oth_hook and FIRE_FN) then
         if H.oth_kept then
             H.fire, box.fire, H.oth = H.oth_kept, H.oth_kept, true
         else
@@ -1108,7 +1125,7 @@ local function arm()
     end
     if not (H.fire or H.nc) then H.want = false; return false end
     box.want = true
-    task.spawn(GUARD_(function()
+    task.spawn(function()
         while (H.fire or H.nc) and clock_() < H.until_t do
             task.wait()
             local l = box.list
@@ -1119,13 +1136,7 @@ local function arm()
         end
         unhook()
         box.list = {}
-        if Core.cap and H.discard then
-            -- forget what Both caught: the parries use the oth capture only
-            Core.both_done, Core.cap, Core.new_capture = true, nil, nil
-            flight("Both capture done (thrown away) -- capturing again with oth")
-        end
-        H.discard = false
-    end))
+    end)
     return true
 end
 
@@ -1185,10 +1196,10 @@ local function own_input(input)
     if Core.cap or not is_live() or keypress_only() then return end
     if is_block_press(input) and canParryNow() then arm() end
 end
-UserInputService.InputBegan:Connect(GUARD_(own_input))
-UserInputService.InputEnded:Connect(GUARD_(function(input)
+UserInputService.InputBegan:Connect(own_input)
+UserInputService.InputEnded:Connect(function(input)
     if input.UserInputType == Enum.UserInputType.Touch then own_input(input) end
-end))
+end)
 
 -- ------------------------------------------------------------
 -- 2. GATE
@@ -1291,7 +1302,7 @@ get_ball_state = function(ball)
         parried = false, landed = false, parry_until = 0, preparried = false, preparry_until = 0}
     tracked[ball] = st
     if st.target == me then open_pass(st, clock_()) end
-    ball:GetAttributeChangedSignal('target'):Connect(GUARD_(function()
+    ball:GetAttributeChangedSignal('target'):Connect(function()
         local new = ball:GetAttribute('target')
         local now = clock_()
         local swaps = st.swaps
@@ -1306,7 +1317,7 @@ get_ball_state = function(ball)
             if on_retarget then pcall(on_retarget, ball, st) end
             if System.spam_on_retarget then System.spam_on_retarget(ball) end
         end
-    end))
+    end)
     return st
 end
 System.ball_state = get_ball_state
@@ -1386,7 +1397,7 @@ Core.send = send
 
 -- A landed parry: the gate clears (the game's OnParrySuccess) and the pass on
 -- us is done until the ball leaves.
-Remotes.ParrySuccess.OnClientEvent:Connect(GUARD_(function()
+Remotes.ParrySuccess.OnClientEvent:Connect(function()
     local char = LocalPlayer.Character
     if not (char and char:IsDescendantOf(Workspace)) then return end
     G.until_t = 0 -- a landed parry clears the lockout at once (the game's OnParrySuccess)
@@ -1408,17 +1419,17 @@ Remotes.ParrySuccess.OnClientEvent:Connect(GUARD_(function()
     for _, st in pairs(tracked) do
         if st.target == me and st.pass_open then st.landed = true end
     end
-end))
+end)
 pcall(function()
-    Remotes.NoobParryHappened.OnClientEvent:Connect(GUARD_(function()
+    Remotes.NoobParryHappened.OnClientEvent:Connect(function()
         task.wait(0.11)
         G.until_t = 0
-    end))
+    end)
 end)
-pcall(function() Remotes.M1Stop.Event:Connect(GUARD_(function(v) G.m1, G.m1_at = v and true or false, clock_() end)) end)
-Remotes.ParrySuccessAll.OnClientEvent:Connect(GUARD_(function()
+pcall(function() Remotes.M1Stop.Event:Connect(function(v) G.m1, G.m1_at = v and true or false, clock_() end) end)
+Remotes.ParrySuccessAll.OnClientEvent:Connect(function()
     if props.__grab_animation then pcall(function() props.__grab_animation:Stop() end) end
-end))
+end)
 
 -- The public parry API (spam, slashes, hotkeys go through these).
 local function count() props.__total_parries = props.__total_parries + 1 end
@@ -1662,10 +1673,10 @@ end
 local function try_ability()
     if props.__auto_ability_enabled and ability_ready() and has_ability(ABILITY_PARRY) then
         Remotes.AbilityButtonPress:Fire()
-        task.delay(2.432, GUARD_(function()
+        task.delay(2.432, function()
             local ds = Remotes:FindFirstChild("DeathSlashShootActivation")
             if ds then pcall(function() ds:FireServer(true) end) end
-        end))
+        end)
         return true
     end
     if props.__cooldown_protection and ability_ready() and has_ability(ABILITY_PROTECT) then
@@ -1936,7 +1947,7 @@ local function run_every_point(key, fn, label)
         local ok, err = pcall(fn)
         if not ok and err ~= last_error then
             last_error = err
-            flight("error in " .. label .. ": " .. tostring(err))
+            warn("[Blade Ball] " .. label .. ": " .. tostring(err))
         end
     end
     local list = {}
@@ -2114,7 +2125,7 @@ local function find_path(v, pred, path, depth)
     return nil
 end
 local function watch_events(pred, found)
-    task.spawn(GUARD_(function()
+    task.spawn(function()
         for i, r in ipairs(ReplicatedStorage:GetDescendants()) do
             if r:IsA("RemoteEvent") then
                 local rel = {}
@@ -2122,7 +2133,7 @@ local function watch_events(pred, found)
                 while p and p ~= ReplicatedStorage do table.insert(rel, 1, p.Name); p = p.Parent end
                 pcall(function()
                     local conn
-                    conn = r.OnClientEvent:Connect(GUARD_(function(...)
+                    conn = r.OnClientEvent:Connect(function(...)
                         for j = 1, select('#', ...) do
                             local sub = find_path((select(j, ...)), pred, {}, 0)
                             if sub then
@@ -2131,12 +2142,12 @@ local function watch_events(pred, found)
                                 return
                             end
                         end
-                    end))
+                    end)
                 end)
             end
             if i % 300 == 0 then task.wait() end
         end
-    end))
+    end)
 end
 -- For a recipe whose id/key arrives by event: keep the latest value.
 Core.event_seen = {}
@@ -2145,11 +2156,11 @@ local function listen_recipe_event(loc)
     pcall(function()
         local r = ReplicatedStorage
         for _, n in ipairs(loc.remote) do r = r:FindFirstChild(n) end
-        r.OnClientEvent:Connect(GUARD_(function(...)
+        r.OnClientEvent:Connect(function(...)
             local v = (select(loc.arg, ...))
             for _, k in ipairs(loc.sub or {}) do v = type(v) == 'table' and v[k] or nil end
             if type(v) == 'string' then Core.event_seen[loc.id] = v end
-        end))
+        end)
     end)
 end
 if Core.recipe then listen_recipe_event(Core.recipe.uid); listen_recipe_event(Core.recipe.key) end
@@ -2164,7 +2175,7 @@ local learned = false
 local function learn_hookfree(cap)
     if learned or cap.hookfree then return end
     learned = true
-    task.spawn(GUARD_(function()
+    task.spawn(function()
         local r = {version = 1}
         local hr = hashed_remotes()
         if #hr == 1 and hr[1] == cap.remote then r.remote = "net_hashed" end
@@ -2197,7 +2208,7 @@ local function learn_hookfree(cap)
                 r.key = loc; listen_recipe_event(loc); finish()
             end)
         end
-    end))
+    end)
 end
 Core.learn_hookfree = learn_hookfree
 
@@ -2229,7 +2240,7 @@ end
 -- block button/key is ever pressed in Remote mode -- once captured, every parry
 -- is a remote parry; it presses again only if the game deletes the remote),
 -- report the capture, log unanswered parries, and sample ping.
-RunService.Heartbeat:Connect(GUARD_(function()
+RunService.Heartbeat:Connect(function()
     sample_lag() -- keep the ping average current between balls too
     if not is_live() then return end
     if not Core.cap then
@@ -2294,7 +2305,7 @@ RunService.Heartbeat:Connect(GUARD_(function()
             Notify("Blade Ball", "No-hook mode didn't work on this server; capturing with the hook instead.", 5)
         end
     end
-end))
+end)
 end -- parry core
 
 -- ============================================================
@@ -2603,7 +2614,7 @@ local function spam_instant()
     Pump.on = true
     fire_one(source)
 end
-Remotes.ParrySuccess.OnClientEvent:Connect(GUARD_(function() pcall(spam_instant) end))
+Remotes.ParrySuccess.OnClientEvent:Connect(function() pcall(spam_instant) end)
 System.spam_on_retarget = function(ball)
     -- a clash ball turning to us: re-check right now so the first parry of
     -- the exchange goes this instant
@@ -2617,11 +2628,11 @@ do
         local ok, err = pcall(fn)
         if not ok and err ~= last_error then
             last_error = err
-            flight("error in spam: " .. tostring(err))
+            warn("[Blade Ball] spam: " .. tostring(err))
         end
     end
     local conns = props.__connections
-    conns.__spam_pre = RunService.PreSimulation:Connect(GUARD_(function()
+    conns.__spam_pre = RunService.PreSimulation:Connect(function()
         Pump.frame = Pump.frame + 1
         run(auto_spam_evaluate)
         -- auto spam just switched on: its first parry goes now, not next signal
@@ -2629,10 +2640,10 @@ do
         if active and not AutoSpam.was_active and not props.__manual_spam_enabled then run(spam_instant) end
         AutoSpam.was_active = active
         run(spam_tick)
-    end))
-    conns.__spam_heartbeat = RunService.Heartbeat:Connect(GUARD_(function() run(spam_tick) end))
-    pcall(function() conns.__spam_render = RunService.PreRender:Connect(GUARD_(function() run(spam_tick) end)) end)
-    pcall(function() conns.__spam_anim = RunService.PreAnimation:Connect(GUARD_(function() run(spam_tick) end)) end)
+    end)
+    conns.__spam_heartbeat = RunService.Heartbeat:Connect(function() run(spam_tick) end)
+    pcall(function() conns.__spam_render = RunService.PreRender:Connect(function() run(spam_tick) end) end)
+    pcall(function() conns.__spam_anim = RunService.PreAnimation:Connect(function() run(spam_tick) end) end)
 end
 
 -- ============================================================
@@ -2684,7 +2695,7 @@ local function ApplyHeadlessKorblox()
     if System.__properties.__headless_enabled then Byte_Library.Headless(char) end
     if System.__properties.__korblox_enabled then Byte_Library.Korblox(char) end
 end
-LocalPlayer.CharacterAdded:Connect(GUARD_(function(char) task.wait(0.5); ApplyHeadlessKorblox() end))
+LocalPlayer.CharacterAdded:Connect(function(char) task.wait(0.5); ApplyHeadlessKorblox() end)
 
 
 -- ============================================================
@@ -2750,7 +2761,7 @@ getgenv().swordAnimations = savedSkin.swordModel or ""
 getgenv().swordFX = savedSkin.swordModel or ""
 getgenv().slashName = "SlashEffect"
 
-task.spawn(GUARD_(function()
+task.spawn(function()
     -- Wait until the user actually enables skin changer before doing any
     -- getconnections calls — those loops were causing kicks while standing still.
     while not getgenv().skinChangerEnabled do task.wait(1) end
@@ -2759,7 +2770,7 @@ task.spawn(GUARD_(function()
     local swordInstancesInstance = rs:WaitForChild("Shared", 9e9):WaitForChild("ReplicatedInstances", 9e9):WaitForChild("Swords", 9e9)
     local swordInstances = require(swordInstancesInstance)
     local swordsController
-    task.spawn(GUARD_(function()
+    task.spawn(function()
         while task.wait(0.25) and not swordsController do
             local ok, conns = pcall(getconnections, rs.Remotes.FireSwordInfo.OnClientEvent)
             if ok and conns then
@@ -2771,7 +2782,7 @@ task.spawn(GUARD_(function()
                 end
             end
         end
-    end))
+    end)
     local function getSlashName(swordName)
         local ok, sln = pcall(function() return swordInstances:GetSword(swordName) end)
         return (ok and sln and sln.SlashName) or "SlashEffect"
@@ -2793,7 +2804,7 @@ task.spawn(GUARD_(function()
             end
         end)
         pcall(function() swordInstances:EquipSwordTo(LocalPlayer.Character, getgenv().swordModel) end)
-        task.spawn(GUARD_(function()
+        task.spawn(function()
             local attempts = 0
             while not swordsController and attempts < 20 do task.wait(0.5); attempts = attempts + 1 end
             if not swordsController then return end
@@ -2808,7 +2819,7 @@ task.spawn(GUARD_(function()
                 if swordsController.currentSword ~= nil then pcall(function() swordsController.currentSword = targetSword end) end
                 if swordsController.SwordFX ~= nil then pcall(function() swordsController.SwordFX = targetSword end) end
             end)
-        end))
+        end)
     end
     -- ========================================================================
     -- SKIN RENDERING -- resolver remap (completely different: no handler hooks)
@@ -2860,7 +2871,7 @@ task.spawn(GUARD_(function()
         if getgenv().skinChanger and getgenv().swordModel ~= "" then saveSkinData() end
         setSword()
     end
-    task.spawn(GUARD_(function()
+    task.spawn(function()
         while task.wait(1) do
             if getgenv().skinChanger and getgenv().swordModel ~= "" then
                 local char = LocalPlayer.Character
@@ -2874,14 +2885,14 @@ task.spawn(GUARD_(function()
                 end
             end
         end
-    end))
+    end)
     -- Re-equip the chosen sword after a respawn, once the game has given back the real one.
-    LocalPlayer.CharacterAdded:Connect(GUARD_(function()
+    LocalPlayer.CharacterAdded:Connect(function()
         if not getgenv().skinChanger then return end
         task.wait(2.5)
         if getgenv().skinChanger then pcall(function() getgenv().updateSword() end) end
-    end))
-end))
+    end)
+end)
 
 -- ============================================================
 -- AVATAR CHANGER
@@ -3123,7 +3134,7 @@ local function update_ability_esp()
 end
 
 local function create_ability_esp_for_player(player)
-    task.spawn(GUARD_(function()
+    task.spawn(function()
         local character = player.Character
         while getgenv().AbilityESP and (not character or not character.Parent) do task.wait(0.5); character = player.Character end
         if not character then return end
@@ -3149,13 +3160,13 @@ local function create_ability_esp_for_player(player)
             billboard = billboard, label = label, character = character, head = head,
             color = AbilityESPConfig.Color, size = AbilityESPConfig.TextSize, height = AbilityESPConfig.Height,
         }
-    end))
+    end)
 end
 
 local function add_ability_esp_player(player)
     if player == LocalPlayer then return end
     if abilityEspCharConns[player] then pcall(function() abilityEspCharConns[player]:Disconnect() end) end
-    abilityEspCharConns[player] = player.CharacterAdded:Connect(GUARD_(function() create_ability_esp_for_player(player) end))
+    abilityEspCharConns[player] = player.CharacterAdded:Connect(function() create_ability_esp_for_player(player) end)
     if player.Character then create_ability_esp_for_player(player) end
 end
 
@@ -3165,16 +3176,16 @@ function start_ability_esp()
     for _, player in pairs(Players:GetPlayers()) do
         if player ~= LocalPlayer then add_ability_esp_player(player) end
     end
-    abilityEspPlayerAddedConnection = Players.PlayerAdded:Connect(GUARD_(function(player)
+    abilityEspPlayerAddedConnection = Players.PlayerAdded:Connect(function(player)
         if getgenv().AbilityESP then add_ability_esp_player(player) end
-    end))
+    end)
     local acc = 0
-    abilityEspLoop = RunService.Heartbeat:Connect(GUARD_(function(dt)
+    abilityEspLoop = RunService.Heartbeat:Connect(function(dt)
         acc = acc + dt
         if acc < 0.1 then return end
         acc = 0
         pcall(update_ability_esp)
-    end))
+    end)
 end
 
 function stop_ability_esp()
@@ -3259,7 +3270,7 @@ PingLabel.Font = Enum.Font.GothamBold; PingLabel.TextSize = 14; PingLabel.RichTe
 PingLabel.TextXAlignment = Enum.TextXAlignment.Center
 PingGui.Parent = HUI
 
-task.spawn(GUARD_(function()
+task.spawn(function()
     while task.wait(0.5) do
         if Library.Unloaded then break end
         if System.__properties.__show_ping then
@@ -3270,7 +3281,7 @@ task.spawn(GUARD_(function()
             PingLabel.Text = string.format("Ping: <font color='#%s'>%dms</font>", color:ToHex(), ping)
         end
     end
-end))
+end)
 
 -- ============================================================
 -- UI
@@ -3305,9 +3316,9 @@ local LogBox = Tabs.Status:AddLeftGroupbox("Parry log", "list")
 LogBox:AddLabel("Every parry this copy sends: where it came from and which pass at you it was for. Two for the same pass are marked DOUBLE. Spam is only counted.", true)
 local LogCounts = LogBox:AddLabel("Parries: 0  |  doubles: 0  |  spam: 0", true)
 local LogLines = LogBox:AddLabel("(nothing yet)", true)
-LogBox:AddButton({Text = "Clear log", Func = GUARD_(function()
+LogBox:AddButton({Text = "Clear log", Func = function()
     ParryLog.entries, ParryLog.total, ParryLog.doubles, ParryLog.spam = {}, 0, 0, 0
-end)})
+end})
 local function parry_log_text()
     if #ParryLog.entries == 0 then return "(nothing yet)" end
     local now, lines = os.clock(), {}
@@ -3319,7 +3330,7 @@ local function parry_log_text()
     end
     return table.concat(lines, "\n")
 end
-task.spawn(GUARD_(function()
+task.spawn(function()
     while task.wait(0.25) do
         if Library.Unloaded then break end
         if Library.Toggled then
@@ -3327,7 +3338,7 @@ task.spawn(GUARD_(function()
             LogLines:SetText(parry_log_text())
         end
     end
-end))
+end)
 
 local function remoteStatusText()
     if getgenv().AutoParryMode == "Keypress" then return "Mode: Keypress (presses the block key)" end
@@ -3340,7 +3351,7 @@ local function remoteStatusText()
 end
 
 local status_peak, status_ball = 0, nil
-task.spawn(GUARD_(function()
+task.spawn(function()
     while task.wait(0.1) do
         if Library.Unloaded then break end
         if Library.Toggled then
@@ -3378,73 +3389,73 @@ task.spawn(GUARD_(function()
             TargetLabel:SetText(text)
         end
     end
-end))
+end)
 
 -- AUTO PARRY TAB
 local AP = Tabs.Parry:AddLeftGroupbox("Auto Parry", "swords")
-AP:AddToggle("AutoParry", {Text = "Auto parry", Default = false, Callback = GUARD_(function(v)
+AP:AddToggle("AutoParry", {Text = "Auto parry", Default = false, Callback = function(v)
     System.__properties.__autoparry_enabled = v
     System.__properties.__play_animation = v
     if v then System.autoparry.start(); prime_remote() else System.autoparry.stop() end
     NotifyToggle("Auto Parry", v)
-end)}):AddKeyPicker("AutoParryKey", {Default = "None", Mode = "Toggle", SyncToggleState = true, Text = "Auto parry"})
-AP:AddDropdown("CaptureHook", {Text = "Capture hook", Values = {"Both + oth", "oth", "Namecall", "FireServer", "Both"}, Default = "Both + oth",
-    Tooltip = "Which hook catches the one parry packet Remote mode needs (up for that press only). Both + oth = first capture with Both (thrown away), then a second press captures with oth and only that one is used. oth = Delta's oth.hook on FireServer (Namecall if oth isn't there). Namecall or FireServer alone may take two presses; Both arms in one. The flight log notes which one was on for every capture and kick.",
-    Callback = GUARD_(function(v) getgenv().CaptureHook = v end)})
+end}):AddKeyPicker("AutoParryKey", {Default = "None", Mode = "Toggle", SyncToggleState = true, Text = "Auto parry"})
+AP:AddDropdown("CaptureHook", {Text = "Capture hook", Values = {"oth", "Namecall", "FireServer", "Both"}, Default = "oth",
+    Tooltip = "Which hook catches the one parry packet Remote mode needs (up for that press only). oth = Delta's oth.hook on FireServer (Namecall if oth isn't there). Namecall or FireServer alone may take two presses; Both arms in one. The flight log notes which one was on for every capture and kick.",
+    Callback = function(v) getgenv().CaptureHook = v end})
 AP:AddDropdown("ParryMode", {Text = "Parry mode", Values = {"Remote", "Keypress"}, Default = "Remote",
     Tooltip = "Remote fires the parry remote with your curve (hookless, sends exactly what the game sends). Keypress presses the block key (F).",
-    Callback = GUARD_(function(v) getgenv().AutoParryMode = v end)})
+    Callback = function(v) getgenv().AutoParryMode = v end})
 AP:AddDropdown("CurveMode", {Text = "Curve mode", Values = System.__config.__curve_names, Default = "Camera",
-    Callback = GUARD_(function(v)
+    Callback = function(v)
         for i, n in ipairs(System.__config.__curve_names) do if n == v then System.__properties.__curve_mode = i; break end end
-    end)})
+    end})
 AP:AddDropdown("TargetMode", {Text = "Target mode", Values = System.__config.__target_names, Default = "Cursor",
     Tooltip = "Who the ball goes to (separate from curve). Cursor: player under your mouse. Camera: player nearest screen centre. Closest/Farthest: by distance to you. Random: a random player. Needs remote parry mode.",
-    Callback = GUARD_(function(v)
+    Callback = function(v)
         for i, n in ipairs(System.__config.__target_names) do if n == v then System.__properties.__target_mode = i; break end end
-    end)})
+    end})
 AP:AddSlider("Accuracy", {Text = "Accuracy", Default = 50, Min = 1, Max = 100, Rounding = 0,
     Tooltip = "Higher parries later (closer). Lower parries earlier (further away).",
-    Callback = GUARD_(function(v) System.__properties.__accuracy_base = v; roll_accuracy() end)})
+    Callback = function(v) System.__properties.__accuracy_base = v; roll_accuracy() end})
 AP:AddSlider("TimingMultiplier", {Text = "Timing multiplier", Default = 1, Min = 0, Max = 2, Rounding = 2, Suffix = "x",
     Tooltip = "Scales the parry distance. 1 = as Accuracy sets it. Higher parries earlier (2 = 1.5x the distance), lower parries later (0 = half the distance).",
-    Callback = GUARD_(function(v) System.__properties.__timing_mult = v end)})
+    Callback = function(v) System.__properties.__timing_mult = v end})
 AP:AddSlider("RetryDelay", {Text = "Retry delay", Default = 1, Min = 0.2, Max = 1.5, Rounding = 2, Suffix = "s",
     Tooltip = "If the ball is still on you this long after a parry, parry again.",
-    Callback = GUARD_(function(v) System.__properties.__retry_delay = v end)})
+    Callback = function(v) System.__properties.__retry_delay = v end})
 AP:AddToggle("RandomAccuracy", {Text = "Randomize accuracy", Default = false,
     Tooltip = "Jitters accuracy around your current Accuracy setting each parry, to look less robotic.",
-    Callback = GUARD_(function(v)
+    Callback = function(v)
         System.__properties.__random_accuracy = v
         roll_accuracy() -- snaps back to the base value when turned off
         NotifyToggle("Randomize Accuracy", v)
-    end)})
+    end})
 AP:AddSlider("RandomAccuracyAmount", {Text = "Randomize amount", Default = 10, Min = 0, Max = 50, Rounding = 0, Suffix = " ±",
     Tooltip = "How far accuracy can swing above/below your setting, based on the current Accuracy value.",
-    Callback = GUARD_(function(v) System.__properties.__random_accuracy_amount = v; roll_accuracy() end)})
+    Callback = function(v) System.__properties.__random_accuracy_amount = v; roll_accuracy() end})
 AP:AddToggle("PingCompensation", {Text = "Ping compensation", Default = true,
     Tooltip = "Parries earlier the higher your ping, by how far the ball moves in half a round trip.",
-    Callback = GUARD_(function(v) System.__properties.__ping_compensation = v end)})
+    Callback = function(v) System.__properties.__ping_compensation = v end})
 AP:AddSlider("ExtraDistance", {Text = "Extra distance", Default = 0, Min = -10, Max = 30, Rounding = 0, Suffix = " studs",
-    Callback = GUARD_(function(v) System.__properties.__extra_distance = v end)})
+    Callback = function(v) System.__properties.__extra_distance = v end})
 AP:AddSlider("CloseRange", {Text = "Pre-parry range", Default = 20, Min = 8, Max = 45, Rounding = 0, Suffix = " studs",
     Tooltip = "How close the player holding the ball has to be for close-range pre-parry.",
-    Callback = GUARD_(function(v) Core.cfg.close_range = v end)})
+    Callback = function(v) Core.cfg.close_range = v end})
 AP:AddToggle("InstantRetarget", {Text = "Instant parry on retarget", Default = true,
     Tooltip = "Parries straight off the ball switching to you when there's no time to wait: it lands within a round trip, or it's point blank. Anything with more time is timed normally.",
-    Callback = GUARD_(function(v) Core.cfg.instant = v end)})
+    Callback = function(v) Core.cfg.instant = v end})
 AP:AddToggle("HighPingClose", {Text = "High ping close range", Default = false,
     Tooltip = "At 80ms+ ping: when a player next to you is about to hit the ball and their return would beat your ping, parries ahead so it's up in time (only then). Timed by Accuracy / Timing multiplier like any parry.",
-    Callback = GUARD_(function(v) Core.cfg.hp_close = v end)})
+    Callback = function(v) Core.cfg.hp_close = v end})
 AP:AddToggle("ClosePreParry", {Text = "Close-range pre-parry", Default = false,
     Tooltip = "Off by default. Parries ahead when a player next to you is about to hit the ball and a return would be too fast to react to. It's a guess: if they send it elsewhere or curve it, it was wasted. Auto spam is the better tool for clashes.",
-    Callback = GUARD_(function(v) Core.cfg.preparry = v end)})
-AP:AddToggle("RandomCurve", {Text = "Random curve", Default = false, Callback = GUARD_(function(s)
+    Callback = function(v) Core.cfg.preparry = v end})
+AP:AddToggle("RandomCurve", {Text = "Random curve", Default = false, Callback = function(s)
     if s then
         if not System.__properties.__connections.__rc then
-            System.__properties.__connections.__rc = RunService.PreSimulation:Connect(GUARD_(function()
+            System.__properties.__connections.__rc = RunService.PreSimulation:Connect(function()
                 System.__properties.__curve_mode = math.random(1, #System.__config.__curve_names)
-            end))
+            end)
         end
     else
         if System.__properties.__connections.__rc then
@@ -3454,10 +3465,10 @@ AP:AddToggle("RandomCurve", {Text = "Random curve", Default = false, Callback = 
         -- Back to whatever the dropdown says.
         if Options.CurveMode then Options.CurveMode:SetValue(Options.CurveMode.Value) end
     end
-end)})
+end})
 AP:AddToggle("CurveHotkeys", {Text = "Curve hotkeys (1-9)", Default = true,
     Tooltip = "Number keys 1-9 pick the curve mode.",
-    Callback = GUARD_(function(v) System.__properties.__curve_hotkeys = v end)})
+    Callback = function(v) System.__properties.__curve_hotkeys = v end})
 
 local TB = Tabs.Parry:AddRightGroupbox("Triggerbot", "crosshair")
 local function setTriggerbot(v)
@@ -3467,7 +3478,7 @@ local function setTriggerbot(v)
 end
 TB:AddToggle("Triggerbot", {Text = "Triggerbot", Default = false,
     Tooltip = "Parries the moment the ball targets you, at any distance. Overrides auto parry while on.",
-    Callback = GUARD_(function(v)
+    Callback = function(v)
         setTriggerbot(v)
         NotifyToggle("Triggerbot", v)
         if not isMobile then return end
@@ -3475,43 +3486,43 @@ TB:AddToggle("Triggerbot", {Text = "Triggerbot", Default = false,
             if not System.__properties.__mobile_guis.triggerbot then
                 local tb = create_mobile_button('Trigger', 0.20, Color3.fromRGB(255, 100, 0), 0.15)
                 System.__properties.__mobile_guis.triggerbot = tb
-                tb.button.MouseButton1Click:Connect(GUARD_(function()
+                tb.button.MouseButton1Click:Connect(function()
                     setTriggerbot(not System.__properties.__triggerbot_enabled)
                     local on = System.__properties.__triggerbot_enabled
                     tb.text.Text = on and "ON" or "Trigger"
                     tb.text.TextColor3 = on and Color3.fromRGB(0, 255, 100) or Color3.fromRGB(255, 255, 255)
                     Notify("Triggerbot", on and "ON" or "OFF", 1.5)
-                end))
+                end)
             end
         else
             destroy_mobile_gui(System.__properties.__mobile_guis.triggerbot)
             System.__properties.__mobile_guis.triggerbot = nil
         end
-    end)}):AddKeyPicker("TriggerbotKey", {Default = "R", Mode = "Toggle", SyncToggleState = true, Text = "Triggerbot"})
+    end}):AddKeyPicker("TriggerbotKey", {Default = "R", Mode = "Toggle", SyncToggleState = true, Text = "Triggerbot"})
 
 local AB = Tabs.Parry:AddRightGroupbox("Abilities", "sparkles")
 AB:AddToggle("AutoAbility", {Text = "Auto ability", Default = false,
     Tooltip = "Uses a ready deflect or slash ability instead of parrying.",
-    Callback = GUARD_(function(v) System.__properties.__auto_ability_enabled = v end)})
+    Callback = function(v) System.__properties.__auto_ability_enabled = v end})
 AB:AddToggle("CooldownProtection", {Text = "Cooldown protection", Default = false,
     Tooltip = "Uses a ready deflection ability (Raging, Rapture, Calming) instead of parrying.",
-    Callback = GUARD_(function(v) System.__properties.__cooldown_protection = v end)})
+    Callback = function(v) System.__properties.__cooldown_protection = v end})
 
 -- DETECTION TAB
 local DL = Tabs.Detection:AddLeftGroupbox("Abilities", "shield-alert")
-DL:AddToggle("DetInfinity", {Text = "Infinity detection", Default = false, Callback = GUARD_(function(v) System.__config.__detections.__infinity = v end)})
-DL:AddToggle("DetDeathSlash", {Text = "Death Slash detection", Default = false, Callback = GUARD_(function(v) System.__config.__detections.__deathslash = v end)})
-DL:AddToggle("DetTimeHole", {Text = "Time Hole detection", Default = false, Callback = GUARD_(function(v) System.__config.__detections.__timehole = v end)})
-DL:AddToggle("DetPhantom", {Text = "Anti-Phantom [BETA]", Default = false, Callback = GUARD_(function(v) System.__config.__detections.__phantom = v end)})
+DL:AddToggle("DetInfinity", {Text = "Infinity detection", Default = false, Callback = function(v) System.__config.__detections.__infinity = v end})
+DL:AddToggle("DetDeathSlash", {Text = "Death Slash detection", Default = false, Callback = function(v) System.__config.__detections.__deathslash = v end})
+DL:AddToggle("DetTimeHole", {Text = "Time Hole detection", Default = false, Callback = function(v) System.__config.__detections.__timehole = v end})
+DL:AddToggle("DetPhantom", {Text = "Anti-Phantom [BETA]", Default = false, Callback = function(v) System.__config.__detections.__phantom = v end})
 
 local DR = Tabs.Detection:AddRightGroupbox("Slashes Of Fury", "swords")
-DR:AddToggle("DetSlashes", {Text = "Slashes detection", Default = false, Callback = GUARD_(function(v) System.__config.__detections.__slashesoffury = v end)})
-DR:AddSlider("SlashesDelay", {Text = "Parry delay", Default = 0.05, Min = 0.05, Max = 0.25, Rounding = 2, Suffix = "s", Callback = GUARD_(function(v) parryDelay = v end)})
-DR:AddSlider("SlashesMax", {Text = "Max parry count", Default = 36, Min = 1, Max = 100, Rounding = 0, Callback = GUARD_(function(v) maxParryCount = v end)})
+DR:AddToggle("DetSlashes", {Text = "Slashes detection", Default = false, Callback = function(v) System.__config.__detections.__slashesoffury = v end})
+DR:AddSlider("SlashesDelay", {Text = "Parry delay", Default = 0.05, Min = 0.05, Max = 0.25, Rounding = 2, Suffix = "s", Callback = function(v) parryDelay = v end})
+DR:AddSlider("SlashesMax", {Text = "Max parry count", Default = 36, Min = 1, Max = 100, Rounding = 0, Callback = function(v) maxParryCount = v end})
 
 -- SPAM TAB
 local SP = Tabs.Spam:AddLeftGroupbox("Manual Spam", "zap")
-SP:AddToggle("ManualSpam", {Text = "Manual spam", Default = false, Callback = GUARD_(function(v)
+SP:AddToggle("ManualSpam", {Text = "Manual spam", Default = false, Callback = function(v)
     if isMobile then
         -- On mobile the on-screen button is the real control. Arming the toggle
         -- only shows that button (OFF by default), so enabling the feature no
@@ -3522,13 +3533,13 @@ SP:AddToggle("ManualSpam", {Text = "Manual spam", Default = false, Callback = GU
             if not System.__properties.__mobile_guis.manual_spam then
                 local sm = create_mobile_button('Spam', 0.35, Color3.fromRGB(255, 255, 255), 0.15)
                 System.__properties.__mobile_guis.manual_spam = sm
-                sm.button.MouseButton1Click:Connect(GUARD_(function()
+                sm.button.MouseButton1Click:Connect(function()
                     System.__properties.__manual_spam_enabled = not System.__properties.__manual_spam_enabled
                     local on = System.__properties.__manual_spam_enabled
                     sm.text.Text = on and "ON" or "Spam"
                     sm.text.TextColor3 = on and Color3.fromRGB(0, 255, 100) or Color3.fromRGB(255, 255, 255)
                     Notify("Manual Spam", on and "ON" or "OFF", 1.5)
-                end))
+                end)
             end
         else
             System.__properties.__manual_spam_enabled = false
@@ -3540,31 +3551,31 @@ SP:AddToggle("ManualSpam", {Text = "Manual spam", Default = false, Callback = GU
         if v then prime_remote() end
     end
     NotifyToggle("Manual Spam", v)
-end)}):AddKeyPicker("ManualSpamKey", {Default = "E", Mode = "Hold", SyncToggleState = true, Text = "Manual spam"})
-SP:AddDropdown("SpamMode", {Text = "Mode", Values = {"Remote", "Keypress"}, Default = "Remote", Callback = GUARD_(function(v) getgenv().ManualSpamMode = v end)})
+end}):AddKeyPicker("ManualSpamKey", {Default = "E", Mode = "Hold", SyncToggleState = true, Text = "Manual spam"})
+SP:AddDropdown("SpamMode", {Text = "Mode", Values = {"Remote", "Keypress"}, Default = "Remote", Callback = function(v) getgenv().ManualSpamMode = v end})
 SP:AddSlider("SpamMaxRate", {Text = "Max rate", Default = 1000, Min = 20, Max = 1000, Rounding = 0, Suffix = "/s",
     Tooltip = "Parries a second for manual and auto spam. 1000 = as fast as it goes. The rate you set is the rate it sends (the Actual line shows it). Keypress mode tops out at one press a frame.",
-    Callback = GUARD_(function(v) SpamCfg.max_rate = v end)})
+    Callback = function(v) SpamCfg.max_rate = v end})
 SP:AddSlider("SpamUploadLimit", {Text = "Upload limit", Default = 0, Min = 0, Max = 1500, Rounding = 0, Suffix = " kbps",
     Tooltip = "0 = off (full speed always). Every spam packet carries every player's screen point, so very high rates can fill your upload and make your movement lag behind (rubber-banding). If that happens, set a limit (around 200-400): spam backs off only while upload is over it.",
-    Callback = GUARD_(function(v) SpamCfg.upload_kbps = v end)})
+    Callback = function(v) SpamCfg.upload_kbps = v end})
 local ManualSpamLabel = SP:AddLabel("Actual: 0/s", true)
-SP:AddToggle("SpamAnimFix", {Text = "Animation fix", Default = false, Callback = GUARD_(function(v)
+SP:AddToggle("SpamAnimFix", {Text = "Animation fix", Default = false, Callback = function(v)
     getgenv().ManualSpamAnimationFix = v
     macroAnimFix = v
-end)})
+end})
 
 local AS = Tabs.Spam:AddRightGroupbox("Auto Spam", "activity")
 AS:AddToggle("AutoSpam", {Text = "Auto spam", Default = false,
     Tooltip = "Spams in a clash: the ball traded fast between you and one player next to you. Starts on the first quick hand-off (or when the ball is on you too close for a normal parry), keeps going while the exchange stays quick, and stops as soon as the ball goes to someone else or they leave range. Uses the Max rate / Upload limit sliders. Auto parry stays out of that ball while it runs. Never runs in training.",
-    Callback = GUARD_(function(v)
+    Callback = function(v)
         System.__properties.__auto_spam_enabled = v
         if v then prime_remote() else AutoSpam.active_until, AutoSpam.reason = 0, nil end
         NotifyToggle("Auto Spam", v)
-    end)})
+    end})
 local AutoSpamLabel = AS:AddLabel("Status: off", true)
 
-task.spawn(GUARD_(function()
+task.spawn(function()
     while task.wait(0.1) do
         if Library.Unloaded then break end
         if Library.Toggled then
@@ -3578,51 +3589,51 @@ task.spawn(GUARD_(function()
             ManualSpamLabel:SetText(("Actual: %d/s"):format(props.__manual_spam_enabled and math.floor(actual + 0.5) or 0))
         end
     end
-end))
+end)
 
 -- PLAYER TAB
 local AVC = Tabs.Player:AddLeftGroupbox("Avatar Changer", "user")
-AVC:AddInput("AvatarTarget", {Text = "Target", Placeholder = "Username or user id", Default = "", Finished = true, Callback = GUARD_(function(t)
+AVC:AddInput("AvatarTarget", {Text = "Target", Placeholder = "Username or user id", Default = "", Finished = true, Callback = function(t)
     __avatar_changer_target = t
-end)})
-AVC:AddToggle("AvatarChanger", {Text = "Avatar changer", Default = false, Callback = GUARD_(function(v)
+end})
+AVC:AddToggle("AvatarChanger", {Text = "Avatar changer", Default = false, Callback = function(v)
     __avatar_changer_enabled = v
     if v then
-        task.spawn(GUARD_(function()
+        task.spawn(function()
             local userId = __resolveTargetId(__avatar_changer_target)
             if userId then
                 saveOriginalAppearance(); applyAvatarLocally(userId)
                 Notify("Avatar Changer", "Appearance changed", 3)
             else Notify("Avatar Changer", "Invalid username or id", 3) end
-        end))
+        end)
     else
         restoreOriginalAppearance()
         if UIReady then Notify("Avatar Changer", "Appearance restored", 2) end
     end
-end)})
+end})
 
 local HK = Tabs.Player:AddRightGroupbox("Cosmetics", "shirt")
-HK:AddToggle("Headless", {Text = "Headless", Default = false, Callback = GUARD_(function(v)
+HK:AddToggle("Headless", {Text = "Headless", Default = false, Callback = function(v)
     System.__properties.__headless_enabled = v
     local c = LocalPlayer.Character
     if c then if v then Byte_Library.Headless(c) else Byte_Library.Restore_Head(c) end end
-end)})
-HK:AddToggle("Korblox", {Text = "Korblox", Default = false, Callback = GUARD_(function(v)
+end})
+HK:AddToggle("Korblox", {Text = "Korblox", Default = false, Callback = function(v)
     System.__properties.__korblox_enabled = v
     local c = LocalPlayer.Character
     if c then if v then Byte_Library.Korblox(c) else Byte_Library.Restore_Leg(c) end end
-end)})
+end})
 
 local AutoJump = false
 local ajLastOnGround = false
 local MV = Tabs.Player:AddRightGroupbox("Movement", "footprints")
-MV:AddToggle("AutoJump", {Text = "Auto jump", Default = false, Callback = GUARD_(function(v)
+MV:AddToggle("AutoJump", {Text = "Auto jump", Default = false, Callback = function(v)
     AutoJump = v
     if not v then ajLastOnGround = false end
     NotifyToggle("Auto Jump", v)
-end)}):AddKeyPicker("AutoJumpKey", {Default = "J", Mode = "Toggle", SyncToggleState = true, Text = "Auto jump"})
+end}):AddKeyPicker("AutoJumpKey", {Default = "J", Mode = "Toggle", SyncToggleState = true, Text = "Auto jump"})
 
-RunService.Heartbeat:Connect(GUARD_(function()
+RunService.Heartbeat:Connect(function()
     if AutoJump then
         local char = LocalPlayer.Character
         local hum = char and char:FindFirstChildOfClass("Humanoid")
@@ -3632,59 +3643,59 @@ RunService.Heartbeat:Connect(GUARD_(function()
             ajLastOnGround = onGround
         end
     else ajLastOnGround = false end
-end))
+end)
 
 -- VISUALS TAB
 local VS = Tabs.Visuals:AddLeftGroupbox("Overlays", "monitor")
-VS:AddToggle("BallVelocity", {Text = "Ball velocity overlay", Default = false, Callback = GUARD_(function(v)
+VS:AddToggle("BallVelocity", {Text = "Ball velocity overlay", Default = false, Callback = function(v)
     System.__properties.__ball_velocity_enabled = v
     if v then
         System.create_ball_velocity_gui()
         if not System.__properties.__connections.__ball_velocity then
-            System.__properties.__connections.__ball_velocity = RunService.RenderStepped:Connect(GUARD_(function() System.update_ball_velocity() end))
+            System.__properties.__connections.__ball_velocity = RunService.RenderStepped:Connect(function() System.update_ball_velocity() end)
         end
     else
         if System.__properties.__ball_velocity_gui then System.__properties.__ball_velocity_gui.gui:Destroy(); System.__properties.__ball_velocity_gui = nil end
         if System.__properties.__connections.__ball_velocity then System.__properties.__connections.__ball_velocity:Disconnect(); System.__properties.__connections.__ball_velocity = nil end
     end
-end)})
-VS:AddToggle("ShowPing", {Text = "Ping overlay", Default = false, Callback = GUARD_(function(v)
+end})
+VS:AddToggle("ShowPing", {Text = "Ping overlay", Default = false, Callback = function(v)
     System.__properties.__show_ping = v
     PingGui.Enabled = v
-end)})
+end})
 
 local AE = Tabs.Visuals:AddRightGroupbox("Ability ESP", "eye")
-AE:AddToggle("AbilityESP", {Text = "Ability ESP", Default = false, Callback = GUARD_(function(s)
+AE:AddToggle("AbilityESP", {Text = "Ability ESP", Default = false, Callback = function(s)
     if s then start_ability_esp() else stop_ability_esp() end
     NotifyToggle("Ability ESP", s)
-end)})
+end})
 AE:AddToggle("AbilityESPName", {Text = "Show name", Default = true,
-    Callback = GUARD_(function(v) AbilityESPConfig.ShowName = v end)})
+    Callback = function(v) AbilityESPConfig.ShowName = v end})
 AE:AddToggle("AbilityESPDistance", {Text = "Show distance", Default = false,
-    Callback = GUARD_(function(v) AbilityESPConfig.ShowDistance = v end)})
+    Callback = function(v) AbilityESPConfig.ShowDistance = v end})
 AE:AddToggle("AbilityESPOnlyWith", {Text = "Only players with an ability", Default = false,
-    Callback = GUARD_(function(v) AbilityESPConfig.OnlyWithAbility = v end)})
+    Callback = function(v) AbilityESPConfig.OnlyWithAbility = v end})
 AE:AddToggle("AbilityESPActive", {Text = "Show active time", Default = true,
     Tooltip = "Shows ACTIVE and the seconds left while their ability is running.",
-    Callback = GUARD_(function(v) AbilityESPConfig.ShowActive = v end)})
+    Callback = function(v) AbilityESPConfig.ShowActive = v end})
 AE:AddToggle("AbilityESPCooldown", {Text = "Show cooldown", Default = true,
     Tooltip = "Shows the seconds left on their ability cooldown, or READY.",
-    Callback = GUARD_(function(v) AbilityESPConfig.ShowCooldown = v end)})
+    Callback = function(v) AbilityESPConfig.ShowCooldown = v end})
 AE:AddSlider("AbilityESPTextSize", {Text = "Text size", Default = 14, Min = 8, Max = 30, Rounding = 0,
-    Callback = GUARD_(function(v) AbilityESPConfig.TextSize = v end)})
+    Callback = function(v) AbilityESPConfig.TextSize = v end})
 AE:AddSlider("AbilityESPHeight", {Text = "Height offset", Default = 3.5, Min = 0, Max = 15, Rounding = 1, Suffix = " studs",
     Tooltip = "How far above the head the label sits.",
-    Callback = GUARD_(function(v) AbilityESPConfig.Height = v end)})
+    Callback = function(v) AbilityESPConfig.Height = v end})
 AE:AddSlider("AbilityESPMaxDistance", {Text = "Max distance", Default = 0, Min = 0, Max = 2000, Rounding = 0, Suffix = " studs",
     Tooltip = "Hide labels beyond this distance. 0 = unlimited.",
-    Callback = GUARD_(function(v) AbilityESPConfig.MaxDistance = v end)})
+    Callback = function(v) AbilityESPConfig.MaxDistance = v end})
 AE:AddLabel("Text color"):AddColorPicker("AbilityESPColor", {
     Default = Color3.fromRGB(255, 255, 255), Title = "Ability ESP color",
-    Callback = GUARD_(function(v) AbilityESPConfig.Color = v end)})
+    Callback = function(v) AbilityESPConfig.Color = v end})
 
 -- MISC TAB
 local SC = Tabs.Misc:AddLeftGroupbox("Skin Changer", "palette")
-SC:AddInput("SkinName", {Text = "Sword name", Placeholder = "e.g. DualPrince", Default = getgenv().swordModel or "", Finished = true, Callback = GUARD_(function(t)
+SC:AddInput("SkinName", {Text = "Sword name", Placeholder = "e.g. DualPrince", Default = getgenv().swordModel or "", Finished = true, Callback = function(t)
     getgenv().swordModel = t
     getgenv().swordAnimations = t
     getgenv().swordFX = t
@@ -3692,47 +3703,47 @@ SC:AddInput("SkinName", {Text = "Sword name", Placeholder = "e.g. DualPrince", D
         if getgenv().updateSword then pcall(getgenv().updateSword) end
     end
     if getgenv().saveLastEquippedSword then pcall(getgenv().saveLastEquippedSword) end
-end)})
-SC:AddToggle("SkinChanger", {Text = "Skin changer", Default = false, Callback = GUARD_(function(v)
+end})
+SC:AddToggle("SkinChanger", {Text = "Skin changer", Default = false, Callback = function(v)
     getgenv().skinChanger = v
     getgenv().skinChangerEnabled = v
     if v and getgenv().swordModel ~= "" then
         if getgenv().updateSword then pcall(getgenv().updateSword) end
     end
     NotifyToggle("Skin Changer", v)
-end)})
+end})
 
 local NR = Tabs.Misc:AddRightGroupbox("Performance", "cpu")
 local Connections_Manager = {}
 NR:AddToggle("NoRender", {Text = "No render", Default = false,
     Tooltip = "Turns off ability and parry effects.",
-    Callback = GUARD_(function(state)
+    Callback = function(state)
         local effectScripts = LocalPlayer.PlayerScripts:FindFirstChild("EffectScripts")
         local clientFX = effectScripts and effectScripts:FindFirstChild("ClientFX")
         if clientFX then clientFX.Disabled = state end
         if state then
             if not Connections_Manager['No Render'] then
-                Connections_Manager['No Render'] = Runtime.ChildAdded:Connect(GUARD_(function(Value) Debris:AddItem(Value, 0) end))
+                Connections_Manager['No Render'] = Runtime.ChildAdded:Connect(function(Value) Debris:AddItem(Value, 0) end)
             end
         elseif Connections_Manager['No Render'] then
             Connections_Manager['No Render']:Disconnect()
             Connections_Manager['No Render'] = nil
         end
-    end)})
+    end})
 
 local UA = Tabs.Misc:AddRightGroupbox("Unlock All", "unlock")
 UA:AddButton({Text = "Load unlock all", Risky = true, DoubleClick = true,
     Tooltip = "Runs a third-party script from flowauth.net. Its code is not part of this repo.",
-    Func = GUARD_(function()
+    Func = function()
         Notify("Unlock All", "Loading script...", 3)
         local success, err = pcall(function()
             loadstring(game:HttpGet("https://flowauth.net/v1/loaders/5d423493a8f0aa8432cda8455a5f8906.lua"))()
         end)
         if success then Notify("Unlock All", "Script loaded", 3)
         else Notify("Unlock All", "Error: " .. tostring(err), 5) end
-    end)})
-UA:AddButton({Text = "Remove unlock UI", Func = GUARD_(function()
-    task.spawn(GUARD_(function()
+    end})
+UA:AddButton({Text = "Remove unlock UI", Func = function()
+    task.spawn(function()
         local destroyed_count = 0
         local keywords = {"unlock", "unlocksuite", "flowauth", "flow", "authui", "hubui", "keyui", "keysystem", "key", "loader"}
         local function shouldDestroy(gui)
@@ -3768,8 +3779,8 @@ UA:AddButton({Text = "Remove unlock UI", Func = GUARD_(function()
         else
             Notify("Unlock All", "No UI found", 3)
         end
-    end))
-end)})
+    end)
+end})
 
 -- ============================================================
 -- HOTKEYS
@@ -3781,7 +3792,7 @@ local curveKeys = {
     [Enum.KeyCode.Four] = 4, [Enum.KeyCode.Five] = 5, [Enum.KeyCode.Six] = 6,
     [Enum.KeyCode.Seven] = 7, [Enum.KeyCode.Eight] = 8, [Enum.KeyCode.Nine] = 9,
 }
-Library:GiveSignal(UserInputService.InputBegan:Connect(GUARD_(function(inp, gp)
+Library:GiveSignal(UserInputService.InputBegan:Connect(function(inp, gp)
     if gp or not System.__properties.__curve_hotkeys then return end
     local index = curveKeys[inp.KeyCode]
     local name = index and System.__config.__curve_names[index]
@@ -3789,7 +3800,7 @@ Library:GiveSignal(UserInputService.InputBegan:Connect(GUARD_(function(inp, gp)
         Options.CurveMode:SetValue(name)
         Notify("Curve Mode", name, 1)
     end
-end)))
+end))
 
 -- ============================================================
 -- UNLOAD
@@ -3834,19 +3845,19 @@ do
     flight(("==== v%s loaded | executor %s | place %s | userId %s"):format(
         SCRIPT_VERSION, exec, tostring(game.PlaceId), tostring(LocalPlayer.UserId)))
     local conns = {}
-    table.insert(conns, GuiService.ErrorMessageChanged:Connect(GUARD_(function(msg)
+    table.insert(conns, GuiService.ErrorMessageChanged:Connect(function(msg)
         local reason = tostring(msg):match("BAC%s+%w-X(%d%d)")
         flight("!!!! KICK / ERROR MESSAGE: " .. tostring(msg) .. (reason and (" [reason " .. reason .. "]") or "")
             .. " [capture hook " .. tostring(Core.capture_method and Core.capture_method() or getgenv().CaptureHook) .. "]")
-    end)))
-    table.insert(conns, Remotes.ParrySuccess.OnClientEvent:Connect(GUARD_(function() flight("ParrySuccess received") end)))
+    end))
+    table.insert(conns, Remotes.ParrySuccess.OnClientEvent:Connect(function() flight("ParrySuccess received") end))
     local function where()
         local char = LocalPlayer.Character
         local alive = char and char.Parent == Alive
         local balls = Workspace:FindFirstChild('Balls')
         return ("%s, %d ball(s)"):format(alive and "in match" or "lobby/dead", balls and #balls:GetChildren() or 0)
     end
-    task.spawn(GUARD_(function()
+    task.spawn(function()
         local on, last_spam, beat = {}, 0, 0
         while is_live() and not Library.Unloaded do
             for name, t in pairs(Toggles) do
@@ -3867,10 +3878,10 @@ do
         end
         for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
         flight("==== unloaded")
-    end))
+    end)
 end
 
 UIReady = true
 Notify("Blade Ball", "Loaded. " .. (isMobile and "Tap the menu button to open." or "LeftControl toggles the menu."), 5)
 
-end))
+end)
