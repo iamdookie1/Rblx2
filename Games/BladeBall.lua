@@ -6,7 +6,7 @@ task.spawn(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.10-63.8"
+local SCRIPT_VERSION = "2026.10.10-63.9"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -971,6 +971,10 @@ local function learn(remote, hash, uid, token, a4, t)
         win = type_(a4) == "number" and a4 or nil} -- the window the game itself sent
     Core.misses, Core.pending = 0, nil
     Core.new_capture = {prev = prev}
+    -- A fresh capture needs the housekeeping loop awake to report it and watch
+    -- for unanswered parries (the hook only arms with a feature on, so it is
+    -- normally running already -- this just makes sure).
+    if System.wake_housekeeping then System.wake_housekeeping() end
 end
 
 -- A real parry: (hash, id, token, window, cameraCF, points, aim, flag), or on
@@ -2347,16 +2351,23 @@ end
 -- block button/key is ever pressed in Remote mode -- once captured, every parry
 -- is a remote parry; it presses again only if the game deletes the remote),
 -- report the capture, log unanswered parries, and sample ping.
-RunService.Heartbeat:Connect(function()
+-- Housekeeping used to be a Heartbeat that fired every frame and returned when
+-- idle. Now it only exists while there's something to keep -- a capture to
+-- maintain or a remote feature on. wake_housekeeping (called from each
+-- remote-feature toggle and from a hook capture) connects it; the loop drops its
+-- own connection the first idle frame. With nothing on there is no per-frame
+-- connection at all, not even one that returns early.
+local function housekeeping_tick()
+  -- Not us any more, or nothing left to keep: disconnect until a feature wakes
+  -- us again.
+  if not is_live() or (not Core.cap and not remote_features_on()) then
+    local c = props.__connections.__housekeeping
+    if c then pcall(function() c:Disconnect() end); props.__connections.__housekeeping = nil end
+    return
+  end
   -- Guard the once-a-frame housekeeping like the loop runners above: a transient
   -- error here goes to the flight log, never the Roblox console the game can read.
   local ok_hk, err_hk = pcall(function()
-    if not is_live() then return end
-    -- Idle means idle: with no capture and no remote feature on, don't touch the
-    -- game at all -- no Stats/ping read, no character checks, no prime. A clean
-    -- client doesn't poll these every frame, and this is the one behavioural
-    -- difference from doing nothing. The loop wakes the instant a feature is on.
-    if not Core.cap and not remote_features_on() then return end
     sample_lag() -- keep the ping average current between balls too
     if not Core.cap then
         Core.told = false
@@ -2423,7 +2434,15 @@ RunService.Heartbeat:Connect(function()
     end
   end)
   if not ok_hk then flight("housekeeping: " .. tostring(err_hk)) end
-end)
+end
+-- Connect the housekeeping loop if it isn't running and there's work for it.
+-- Idempotent: safe to call from every feature toggle and from a hook capture.
+local function wake_housekeeping()
+    if props.__connections.__housekeeping or not is_live() then return end
+    if not Core.cap and not remote_features_on() then return end
+    props.__connections.__housekeeping = RunService.Heartbeat:Connect(housekeeping_tick)
+end
+System.wake_housekeeping = wake_housekeeping
 end -- parry core
 
 -- ============================================================
@@ -2458,7 +2477,7 @@ local SpamCfg = {
     factor = 1, guard_at = -1,
 }
 
-function System.manual_spam.start() System.__properties.__manual_spam_enabled = true end
+function System.manual_spam.start() System.__properties.__manual_spam_enabled = true; if System.wake_housekeeping then System.wake_housekeeping() end end
 function System.manual_spam.stop() System.__properties.__manual_spam_enabled = false end
 
 local function keypress_spam() return getgenv().ManualSpamMode == "Keypress" end
@@ -3553,7 +3572,7 @@ local AP = Tabs.Parry:AddLeftGroupbox("Auto Parry", "swords")
 AP:AddToggle("AutoParry", {Text = "Auto parry", Default = false, Callback = function(v)
     System.__properties.__autoparry_enabled = v
     System.__properties.__play_animation = v
-    if v then System.autoparry.start(); prime_remote() else System.autoparry.stop() end
+    if v then System.wake_housekeeping(); System.autoparry.start(); prime_remote() else System.autoparry.stop() end
     NotifyToggle("Auto Parry", v)
 end}):AddKeyPicker("AutoParryKey", {Default = "None", Mode = "Toggle", SyncToggleState = true, Text = "Auto parry"})
 AP:AddDropdown("CaptureHook", {Text = "Capture hook", Values = {"oth", "Namecall", "FireServer", "Both"}, Default = "oth",
@@ -3698,6 +3717,7 @@ SP:AddToggle("ManualSpam", {Text = "Manual spam", Default = false, Callback = fu
                 sm.button.MouseButton1Click:Connect(function()
                     System.__properties.__manual_spam_enabled = not System.__properties.__manual_spam_enabled
                     local on = System.__properties.__manual_spam_enabled
+                    if on then System.wake_housekeeping() end
                     sm.text.Text = on and "ON" or "Spam"
                     sm.text.TextColor3 = on and Color3.fromRGB(0, 255, 100) or Color3.fromRGB(255, 255, 255)
                     Notify("Manual Spam", on and "ON" or "OFF", 1.5)
@@ -3710,7 +3730,7 @@ SP:AddToggle("ManualSpam", {Text = "Manual spam", Default = false, Callback = fu
         end
     else
         System.__properties.__manual_spam_enabled = v
-        if v then prime_remote() end
+        if v then System.wake_housekeeping(); prime_remote() end
     end
     NotifyToggle("Manual Spam", v)
 end}):AddKeyPicker("ManualSpamKey", {Default = "E", Mode = "Hold", SyncToggleState = true, Text = "Manual spam"})
@@ -3732,7 +3752,7 @@ AS:AddToggle("AutoSpam", {Text = "Auto spam", Default = false,
     Tooltip = "Spams in a clash: the ball traded fast between you and one player next to you. Starts on the first quick hand-off (or when the ball is on you too close for a normal parry), keeps going while the exchange stays quick, and stops as soon as the ball goes to someone else or they leave range. Uses the Max rate / Upload limit sliders. Auto parry stays out of that ball while it runs. Never runs in training.",
     Callback = function(v)
         System.__properties.__auto_spam_enabled = v
-        if v then prime_remote() else AutoSpam.active_until, AutoSpam.reason = 0, nil end
+        if v then System.wake_housekeeping(); prime_remote() else AutoSpam.active_until, AutoSpam.reason = 0, nil end
         NotifyToggle("Auto Spam", v)
     end})
 local AutoSpamLabel = AS:AddLabel("Status: off", true)
@@ -3788,24 +3808,32 @@ end})
 
 local AutoJump = false
 local ajLastOnGround = false
+-- One frame of the auto-jump watch: jump the instant we land, so held jump keeps
+-- bouncing. Only ever connected while the toggle is on (see below).
+local function autoJumpStep()
+    local char = LocalPlayer.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    if hum then
+        local onGround = hum.FloorMaterial ~= Enum.Material.Air
+        if onGround and not ajLastOnGround then hum:ChangeState(Enum.HumanoidStateType.Jumping) end
+        ajLastOnGround = onGround
+    end
+end
 local MV = Tabs.Player:AddRightGroupbox("Movement", "footprints")
 MV:AddToggle("AutoJump", {Text = "Auto jump", Default = false, Callback = function(v)
     AutoJump = v
-    if not v then ajLastOnGround = false end
+    ajLastOnGround = false
+    -- Lazy-connect: with auto jump off there's no per-frame Heartbeat at all,
+    -- rather than one that fires every frame and returns. Stored in __connections
+    -- so unload tears it down.
+    local conns = System.__properties.__connections
+    if v then
+        if not conns.__autojump then conns.__autojump = RunService.Heartbeat:Connect(autoJumpStep) end
+    elseif conns.__autojump then
+        pcall(function() conns.__autojump:Disconnect() end); conns.__autojump = nil
+    end
     NotifyToggle("Auto Jump", v)
 end}):AddKeyPicker("AutoJumpKey", {Default = "J", Mode = "Toggle", SyncToggleState = true, Text = "Auto jump"})
-
-RunService.Heartbeat:Connect(function()
-    if AutoJump then
-        local char = LocalPlayer.Character
-        local hum = char and char:FindFirstChildOfClass("Humanoid")
-        if hum then
-            local onGround = hum.FloorMaterial ~= Enum.Material.Air
-            if onGround and not ajLastOnGround then hum:ChangeState(Enum.HumanoidStateType.Jumping) end
-            ajLastOnGround = onGround
-        end
-    else ajLastOnGround = false end
-end)
 
 -- VISUALS TAB
 local VS = Tabs.Visuals:AddLeftGroupbox("Overlays", "monitor")
