@@ -21,7 +21,7 @@
 --   * spam that knows when to stop: auto spam ends the moment the exchange does
 --     (third player, partner gone/out of range, ball left, slowed, not returned);
 --     manual spam only fires while a ball is actually a threat (Smart stop)
---   * mobile manual-spam orb (hold to spam, double-tap to lock, drag to move);
+--   * mobile manual-spam orb (tap to toggle, drag to move);
 --     no on-screen UI on PC
 --   * everything else: auto-parry Keypress mode, random curve, auto ability,
 --     cooldown protection, Infinity / Death Slash / Time Hole / Phantom /
@@ -30,7 +30,7 @@
 
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.1"
+local SCRIPT_VERSION = "rewrite-0.5.2"
 
 -- ---------------------------------------------------------------------------
 -- Single instance.
@@ -126,6 +126,131 @@ end
 -- PARRY + SPAM CORE (defines only; touches the game only after resolve())
 -- ===========================================================================
 local Parry = {}
+
+-- ===========================================================================
+-- PARRY ANIMATION (mirrors the game's own block action, so remote parries and
+-- spam look like real presses). Defines only; the game's SwordAPI folder is read
+-- the first time a swing is actually played.
+--   * which tracks: every animation in the sword's set (the skin's set while the
+--     skin changer is on) tagged Parry or GrabParry, picked by attribute;
+--   * how: loaded once per animator with the Animation's attributes copied onto
+--     the track (PlaySpeed, PlayFadeTime, StopFadeTime...) -- the game's success
+--     handler finds what to stop by those, so block and success swing never stack;
+--   * when: like the game, a new block starts only once the last one landed
+--     (ParrySuccess) or its 1.3s cooldown ran out, and after a landed parry it
+--     waits for the success swing to show and the ball to be back on you. So spam
+--     at hundreds a second reads as block -> success swing -> block, exactly what
+--     a real held key looks like, instead of restarting the swing every few ms.
+-- ===========================================================================
+local Anim = { enabled = true, spam = true, skin = nil }
+do
+    local BLOCK_COOLDOWN, SWING_SHOW = 1.3, 0.08
+    local info_cache = {}
+    local own_tracks = setmetatable({}, { __mode = 'k' }) -- animator -> {[Animation] = track}
+    local r15_clones = {}
+    local own_swing = setmetatable({}, { __mode = 'k' })  -- track -> when we played it
+    local gate = { last = -math.huge, landed = true, landed_at = -math.huge }
+    local success_at, grab_track = -math.huge, nil
+    local function sword_info(char)
+        local name = (Anim.skin and Anim.skin()) or char:GetAttribute("CurrentlyEquippedSword") or ""
+        local info = info_cache[name]
+        if info then return info end
+        info = { collection = "Default" }
+        if name ~= "" then
+            local ok, data = pcall(function() return ReplicatedStorage.Shared.ReplicatedInstances.Swords.GetSword:Invoke(name) end)
+            if ok and type(data) == "table" and data.AnimationType then info.collection = data.AnimationType end
+        end
+        info_cache[name] = info
+        return info
+    end
+    local function find_animations(info)
+        local list = {}
+        local ok, folder = pcall(function()
+            local col = ReplicatedStorage.Shared.SwordAPI:FindFirstChild("Collection")
+            return col and (col:FindFirstChild(info.collection) or col:FindFirstChild("Default"))
+        end)
+        if ok and folder then
+            for _, anim in ipairs(folder:GetChildren()) do
+                if anim:IsA("Animation") and (anim:GetAttribute("Parry") or anim:GetAttribute("GrabParry")) then
+                    list[#list + 1] = anim
+                end
+            end
+        end
+        return list
+    end
+    local function load_track(animator, humanoid, anim)
+        local per = own_tracks[animator]
+        if not per then per = {}; own_tracks[animator] = per end
+        local track = per[anim]
+        if track then return track end
+        local source = anim
+        local r15 = anim:GetAttribute("R15Id")
+        if r15 and humanoid.RigType == Enum.HumanoidRigType.R15 then
+            source = r15_clones[anim]
+            if not source then source = Instance.new("Animation"); source.AnimationId = r15; r15_clones[anim] = source end
+        end
+        track = animator:LoadAnimation(source)
+        for k, v in pairs(anim:GetAttributes()) do pcall(track.SetAttribute, track, k, v) end
+        per[anim] = track
+        return track
+    end
+    local function play_block()
+        local char = LocalPlayer.Character
+        if not char or char:GetAttribute("InOverdriveMech") then return end
+        local humanoid = char:FindFirstChildOfClass("Humanoid")
+        local animator = humanoid and humanoid:FindFirstChildOfClass("Animator")
+        if not animator then return end
+        local now = os.clock()
+        -- the last block didn't land: no new one inside the game's block cooldown
+        if not gate.landed and now - gate.last < BLOCK_COOLDOWN then return end
+        -- it landed: let the success swing show, and start the next block when the
+        -- ball is back on us (give up waiting after the cooldown)
+        if gate.landed and gate.landed_at > gate.last then
+            if now - gate.landed_at < SWING_SHOW then return end
+            if not Parry.ballOnMe() and now - gate.landed_at < BLOCK_COOLDOWN then return end
+        end
+        gate.last, gate.landed = now, false
+        for _, track in ipairs(animator:GetPlayingAnimationTracks()) do
+            if track:GetAttribute("SuccessParry") or track:GetAttribute("Parry") then track:Stop(track:GetAttribute("StopFadeTime")) end
+        end
+        local parry_time = char:GetAttribute("ParryTime") or 0
+        for _, anim in ipairs(find_animations(sword_info(char))) do
+            local ok, track = pcall(load_track, animator, humanoid, anim)
+            if ok and track then
+                local speed = track:GetAttribute("PlaySpeed") or 1
+                own_swing[track] = os.clock()
+                track:Play(track:GetAttribute("PlayFadeTime"), track:GetAttribute("PlayWeight"), speed)
+                grab_track = track
+                local left = track.Length == 0 and 1 or (track.Length - track.TimePosition) * speed
+                if left > parry_time then parry_time = left end
+            end
+        end
+        pcall(char.SetAttribute, char, "ParryTime", parry_time)
+    end
+    -- a single parry (auto parry, triggerbot, pre-parry)
+    function Anim.block() if Anim.enabled then pcall(play_block) end end
+    -- spam: same gate, so it plays like a held key
+    function Anim.spamBlock() if Anim.enabled and Anim.spam then pcall(play_block) end end
+    function Anim.onSuccess()
+        local now = os.clock()
+        success_at, gate.landed, gate.landed_at = now, true, now
+        -- the game plays its own success swing now; take our block pose off it
+        if grab_track then pcall(function() grab_track:Stop(grab_track:GetAttribute("StopFadeTime")) end) end
+    end
+    function Anim.reset() gate.last, gate.landed, gate.landed_at, grab_track = -math.huge, true, -math.huge, nil end
+    -- a swing the GAME started from a real press (yours, tap to block, a capture
+    -- press) -- not our own swing and not a landed parry's success swing
+    function Anim.isGamePress(track)
+        if track:GetAttribute("SuccessParry") then return false end
+        if not (track:GetAttribute("Parry") or track:GetAttribute("GrabParry")) then return false end
+        local now = os.clock()
+        if now - success_at < 0.35 then return false end
+        local at = own_swing[track]
+        if at and now - at < 0.25 then return false end
+        return true
+    end
+end
+
 do
     local me = LocalPlayer.Name
     local Core = { cap = nil, pending = nil, misses = 0, interp = 0.14, last_parry = nil }
@@ -925,6 +1050,10 @@ end]]
         return list
     end
     -- the ball that matters: the one on us, else the first live one
+    function Parry.ballOnMe()
+        for _, b in ipairs(get_live_balls()) do if b:GetAttribute('target') == me then return true end end
+        return false
+    end
     function Parry.mainBall()
         local balls = get_live_balls()
         for _, b in ipairs(balls) do if b:GetAttribute('target') == me then return b end end
@@ -1220,17 +1349,23 @@ end]]
         rate = math.max(rate, 1)
         if Pump.on then Pump.credit = math.min(Pump.credit + elapsed * rate, 1 + rate * 0.015)
         else Pump.credit, Pump.on = 1, true end
+        local sent = false
         while Pump.credit >= 1 - 1e-6 do
             Pump.credit = Pump.credit - 1
-            if fire_one() == false and SP.mode == "Keypress" then Pump.credit = math.min(Pump.credit, 0); break end
+            local ok = fire_one()
+            if ok then sent = true end
+            if ok == false and SP.mode == "Keypress" then Pump.credit = math.min(Pump.credit, 0); break end
         end
+        -- one animation call per tick, through the held-key gate (Keypress mode:
+        -- the game animates its own presses)
+        if sent and SP.mode == "Remote" then Anim.spamBlock() end
     end
     local function spam_instant()
         local source = current_source(clock_())
         if not source or not LocalPlayer.Character then return end
         if source == "manual" and SP.smart and not spam_focus() then return end
         Pump.credit, Pump.on = math.max(Pump.credit - 1, -1), true
-        fire_one()
+        if fire_one() and SP.mode == "Remote" then Anim.spamBlock() end
     end
 
     -- ===================== AUTO PARRY / TRIGGERBOT / PRE-PARRY =====================
@@ -1255,6 +1390,7 @@ end]]
         else
             if send(false) ~= "sent" then return false end
             how = "remote"
+            Anim.block() -- a remote parry has no swing of its own; the key and abilities do
         end
         Core.last_parry = { t = now, via = via, info = info }
         mark_parried(st, now)
@@ -1373,6 +1509,7 @@ end]]
         local lead = fire_lead(speed)
         if eta > lead or has_clash(ball, now) then return end
         if send(false) == "sent" then
+            Anim.block()
             local W, n2 = parry_window()
             st.preparried = true
             st.preparry_until = now + math.max((W or 0.5) + reach + 0.15, (n2 or 1.3) + 0.08)
@@ -1459,6 +1596,7 @@ end]]
         return list
     end
     function Parry.onParrySuccess()
+        Anim.onSuccess()
         local char = LocalPlayer.Character
         if not (char and char:IsDescendantOf(Workspace)) then return end
         G.until_t = 0
@@ -1539,9 +1677,12 @@ end]]
     -- one parry outside the engine (Slashes of Fury): remote if armed, else the key
     function Parry.spamParry()
         if not Parry.resolve() then return false end
-        if Core.cap and send(true) == "sent" then return true end
+        if Core.cap and send(true) == "sent" then Anim.spamBlock(); return true end
         return pressBlockKey()
     end
+    -- the game started a block swing from a real press (yours, a capture press):
+    -- its lockout is running, so a remote parry now would only play the swing
+    function Parry.gameSwing() gate_start() end
     function Parry.remotes() return Remotes end
     function Parry.spamRate() return SpamMeter.rate end
     function Parry.isMe(name) return name == me end
@@ -1565,12 +1706,27 @@ function Engine.start()
         if Library then Library:Notify({ Title = "Blade Ball", Description = "Couldn't find the game's Remotes / Alive.", Time = 4 }) end
         return false
     end
+    Engine.running = true -- before anything below that may run synchronously
     local R = Parry.remotes()
     pcall(function() econnect(R.ParrySuccess.OnClientEvent, Parry.onParrySuccess) end)
     pcall(function() econnect(R.ParrySuccessAll.OnClientEvent, Parry.onParryAll) end)
     pcall(function() econnect(R.NoobParryHappened.OnClientEvent, Parry.onNoobParry) end)
     pcall(function() econnect(R.M1Stop.Event, Parry.onM1Stop) end)
     for _, folder in ipairs(Parry.ballFolders()) do econnect(folder.ChildAdded, Parry.onBallAdded) end
+    -- the game's own block swings (your presses, capture presses) start its
+    -- lockout; seen on the animator, no hooks
+    local function watch_animator(char)
+        task.spawn(function()
+            local hum = char:WaitForChild("Humanoid", 10)
+            local animator = hum and hum:WaitForChild("Animator", 10)
+            if not animator or not Engine.running then return end
+            econnect(animator.AnimationPlayed, function(track)
+                if Anim.isGamePress(track) then Parry.gameSwing() end
+            end)
+        end)
+    end
+    if LocalPlayer.Character then watch_animator(LocalPlayer.Character) end
+    econnect(LocalPlayer.CharacterAdded, function(char) Anim.reset(); watch_animator(char) end)
     econnect(RunService.PreSimulation, function(dt) Parry.frame(dt, 1) end)
     econnect(RunService.Heartbeat, function()
         Parry.frame(nil, 2)
@@ -1601,16 +1757,15 @@ function Engine.want(name, on)
 end
 
 -- ===========================================================================
--- MOBILE MANUAL-SPAM ORB (touch devices only). Hold to spam, double-tap to
--- lock it on (double-tap again to unlock), drag to move. The ring pulses and
--- shows the live rate while it spams.
+-- MOBILE MANUAL-SPAM ORB (touch devices only). Tap to toggle spam on/off, drag
+-- to move. The ring pulses and shows the live rate while it spams.
 -- ===========================================================================
 local Orb = {}
 do
     local SP = Parry.SP
     local gui, button, ring, title, sub, pill
-    local locked, pressing, dragging = false, false, false
-    local press_input, press_pos, press_t, start_abs, last_tap = nil, nil, 0, nil, 0
+    local pressing, dragging = false, false
+    local press_input, press_pos, start_abs = nil, nil, nil
     local press_conns = {}
     local IDLE, ACTIVE = Color3.fromRGB(110, 112, 128), Color3.fromRGB(0, 225, 130)
     local function set_spam(on) SP.manual = on and true or false end
@@ -1625,27 +1780,17 @@ do
         ring.Transparency = on and (0.1 + 0.4 * (0.5 + 0.5 * math.sin(clock_() * 12))) or 0.3
         title.TextColor3 = on and ACTIVE or Color3.fromRGB(235, 235, 240)
         if on then sub.Text = (rate and rate >= 1) and (math.floor(rate + 0.5) .. "/s") or "waiting"
-        else sub.Text = "hold" end
-        pill.Text = locked and "LOCKED" or "HOLD"
-        pill.BackgroundColor3 = locked and Color3.fromRGB(0, 150, 95) or Color3.fromRGB(32, 33, 40)
+        else sub.Text = "tap" end
+        pill.Text = on and "ON" or "OFF"
+        pill.BackgroundColor3 = on and Color3.fromRGB(0, 150, 95) or Color3.fromRGB(32, 33, 40)
     end
     function Orb.tick(rate) paint(rate) end
+    -- a press that didn't turn into a drag toggles spam
     local function release_press()
         pressing = false
         drop_press_conns()
-        if dragging then dragging = false; paint(); return end
-        local now = clock_()
-        if now - press_t < 0.25 then
-            if now - last_tap < 0.4 then
-                locked, last_tap = not locked, 0
-                set_spam(locked)
-            else
-                last_tap = now
-                if not locked then set_spam(false) end
-            end
-        elseif not locked then
-            set_spam(false)
-        end
+        if dragging then dragging = false
+        else set_spam(not SP.manual) end
         paint()
     end
     function Orb.show()
@@ -1675,12 +1820,12 @@ do
         title.TextColor3 = Color3.fromRGB(235, 235, 240); title.Parent = button
         sub = Instance.new("TextLabel")
         sub.BackgroundTransparency = 1; sub.Size = UDim2.new(1, 0, 0, 14); sub.Position = UDim2.new(0, 0, 0.5, 5)
-        sub.Font = Enum.Font.GothamMedium; sub.TextSize = 11; sub.Text = "hold"
+        sub.Font = Enum.Font.GothamMedium; sub.TextSize = 11; sub.Text = "tap"
         sub.TextColor3 = Color3.fromRGB(170, 172, 185); sub.Parent = button
         pill = Instance.new("TextLabel")
         pill.Size = UDim2.fromOffset(58, 18); pill.AnchorPoint = Vector2.new(0.5, 1)
         pill.Position = UDim2.new(0.5, 0, 0, -6); pill.Font = Enum.Font.GothamBold; pill.TextSize = 10
-        pill.Text = "HOLD"; pill.TextColor3 = Color3.fromRGB(240, 240, 245)
+        pill.Text = "OFF"; pill.TextColor3 = Color3.fromRGB(240, 240, 245)
         pill.BackgroundColor3 = Color3.fromRGB(32, 33, 40); pill.Parent = button
         Instance.new("UICorner", pill).CornerRadius = UDim.new(1, 0)
         button.InputBegan:Connect(function(input)
@@ -1688,19 +1833,14 @@ do
             if t ~= Enum.UserInputType.Touch and t ~= Enum.UserInputType.MouseButton1 then return end
             if pressing then return end
             pressing, dragging = true, false
-            press_input, press_pos, press_t = input, input.Position, clock_()
+            press_input, press_pos = input, input.Position
             start_abs = button.AbsolutePosition + button.AbsoluteSize * 0.5
-            if not locked then set_spam(true) end
-            paint()
             -- move / release are tracked only while a press is live
             press_conns[#press_conns + 1] = UserInputService.InputChanged:Connect(function(i)
                 if not pressing then return end
                 if i ~= press_input and i.UserInputType ~= Enum.UserInputType.MouseMovement then return end
                 local d = i.Position - press_pos
-                if not dragging and Vector2.new(d.X, d.Y).Magnitude > 14 then
-                    dragging = true
-                    if not locked then set_spam(false) end
-                end
+                if not dragging and Vector2.new(d.X, d.Y).Magnitude > 14 then dragging = true end
                 if dragging then
                     button.AnchorPoint = Vector2.new(0.5, 0.5)
                     button.Position = UDim2.fromOffset(start_abs.X + d.X, start_abs.Y + d.Y)
@@ -1716,7 +1856,7 @@ do
     end
     function Orb.hide()
         drop_press_conns()
-        pressing, dragging, locked = false, false, false
+        pressing, dragging = false, false
         set_spam(false)
         if gui then pcall(function() gui:Destroy() end) end
         gui, button = nil, nil
@@ -1762,6 +1902,11 @@ AP:AddToggle("Triggerbot", {
     Tooltip = "Parries the instant the ball is on you, at any distance. Overrides auto parry's timing while on.",
     Callback = function(v) S.triggerbot = v; Engine.want("triggerbot", v) end,
 }):AddKeyPicker("TriggerbotKey", { Default = "None", Mode = "Toggle", SyncToggleState = true, Text = "Triggerbot" })
+AP:AddToggle("ParryAnimation", {
+    Text = "Parry animation", Default = true,
+    Tooltip = "Plays your sword's block swing on remote parries (Keypress mode and abilities animate themselves). Off = no animations from the script at all.",
+    Callback = function(v) Anim.enabled = v end,
+})
 AP:AddDropdown("ParryMode", {
     Values = { "Remote", "Keypress" }, Default = "Remote", Text = "Parry mode",
     Tooltip = "Remote sends the captured packet (curves, no cooldown tell). Keypress presses block.",
@@ -1980,8 +2125,8 @@ DR:AddSlider("SlashesMax", { Text = "Max parry count", Default = 36, Min = 1, Ma
 local MS = Tabs.Spam:AddLeftGroupbox("Manual Spam", "zap")
 MS:AddToggle("ManualSpam", {
     Text = touchUI and "Manual spam (show orb)" or "Manual spam", Default = false,
-    Tooltip = touchUI and "Shows the spam orb: hold it to spam, double-tap to lock on, drag to move."
-        or "Hold the key (E by default) to spam.",
+    Tooltip = touchUI and "Shows the spam orb: tap it to turn spam on/off, drag to move."
+        or "Press the key (E by default) to turn spam on, press again to turn it off.",
     Callback = function(v)
         if touchUI then
             -- the toggle shows the orb; the orb decides when to actually spam
@@ -1991,7 +2136,12 @@ MS:AddToggle("ManualSpam", {
         end
         Engine.want("manualspam", v)
     end,
-}):AddKeyPicker("ManualSpamKey", { Default = "E", Mode = "Hold", SyncToggleState = not touchUI, Text = "Manual spam" })
+}):AddKeyPicker("ManualSpamKey", { Default = "E", Mode = "Toggle", SyncToggleState = not touchUI, Text = "Manual spam" })
+MS:AddToggle("SpamAnimation", {
+    Text = "Spam animation", Default = true,
+    Tooltip = "Plays the block swing with spam the way a real held key looks: block, success swing, block -- never restarted every parry.",
+    Callback = function(v) Anim.spam = v end,
+})
 MS:AddToggle("SmartStop", {
     Text = "Smart stop", Default = true,
     Tooltip = "Only spams while a ball is on you, close to you, or heading at you -- stops by itself the rest of the time.",
@@ -2526,6 +2676,8 @@ local SC = Tabs.Misc:AddLeftGroupbox("Skin Changer", "palette")
 SC:AddInput("SkinName", { Text = "Sword name", Placeholder = "e.g. DualPrince", Default = Skin.name, Finished = true,
     Callback = function(t) Skin.name = t; save_skin(); SkinChanger.apply() end })
 SC:AddToggle("SkinChanger", { Text = "Skin changer", Default = false, Callback = function(v) SkinChanger:setEnabled(v) end })
+-- parry swings use the skin's animation set while the skin changer is on
+Anim.skin = function() return (SkinChanger.on and Skin.name ~= "") and Skin.name or nil end
 
 -- No render: turn off the game's ability / parry effects
 local NoRender = Feature("NoRender")
