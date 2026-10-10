@@ -6,7 +6,7 @@ task.spawn(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.10-63.9"
+local SCRIPT_VERSION = "2026.10.10-63.10"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -2808,6 +2808,15 @@ do
         end
     end
     local conns = props.__connections
+    -- Diagnostic: getgenv().BB_NOENGINE = true BEFORE the script loads skips the
+    -- spam engine's per-frame signals entirely. Spam then won't drive a rate (the
+    -- event-driven spam_instant on ParrySuccess/retarget still fires), but the
+    -- point is to sit idle with these four connections absent and see whether the
+    -- "nothing on" kick stops -- that isolates them as the cause. Normal runs
+    -- (flag unset) are unchanged.
+    if getgenv().BB_NOENGINE then
+        flight("BB_NOENGINE: spam engine signals NOT connected (diagnostic -- no per-frame spam loop)")
+    else
     conns.__spam_pre = RunService.PreSimulation:Connect(function()
         Pump.frame = Pump.frame + 1
         run(auto_spam_evaluate)
@@ -2820,6 +2829,7 @@ do
     conns.__spam_heartbeat = RunService.Heartbeat:Connect(function() run(spam_tick) end)
     pcall(function() conns.__spam_render = RunService.PreRender:Connect(function() run(spam_tick) end) end)
     pcall(function() conns.__spam_anim = RunService.PreAnimation:Connect(function() run(spam_tick) end) end)
+    end
 end
 
 -- ============================================================
