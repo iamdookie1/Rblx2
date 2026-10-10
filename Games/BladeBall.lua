@@ -6,7 +6,7 @@ task.spawn(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.10-63.5"
+local SCRIPT_VERSION = "2026.10.10-63.6"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -918,7 +918,18 @@ local JOB_ID = game.JobId
 -- (every RemoteEvent hands back the same one) -- no instance is created for it.
 local FIRE_FN
 pcall(function() FIRE_FN = Remotes.ParrySuccess.FireServer end)
-if type(FIRE_FN) ~= 'function' then pcall(function() FIRE_FN = Instance.new("RemoteEvent").FireServer end) end
+-- Fallback that still creates nothing (as the note above promises): the
+-- FireServer C function is shared by every RemoteEvent, so borrow it off any
+-- the game already has. The old fallback did Instance.new("RemoteEvent") at
+-- load -- a brand-new RemoteEvent the moment the script runs, exactly the kind
+-- of instance a scan can flag -- for a function we can read off an existing one.
+if type(FIRE_FN) ~= 'function' then
+    pcall(function()
+        for _, d in ipairs(Remotes:GetDescendants()) do
+            if d:IsA("RemoteEvent") then FIRE_FN = d.FireServer; break end
+        end
+    end)
+end
 local H = {fire = nil, nc = nil, want = false, until_t = 0, oth = false, oth_kept = nil}
 
 -- Which hook(s) a capture press uses (Parry tab -> "Capture hook"):
