@@ -30,7 +30,7 @@
 
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.3"
+local SCRIPT_VERSION = "rewrite-0.5.4"
 
 -- ---------------------------------------------------------------------------
 -- Single instance.
@@ -253,7 +253,8 @@ end
 
 do
     local me = LocalPlayer.Name
-    local Core = { cap = nil, pending = nil, misses = 0, interp = 0.14, last_parry = nil }
+    local Core = { cap = nil, pending = nil, misses = 0, interp = 0.14, last_parry = nil,
+        ctx = "match", caps = {}, gen = 0, last_send_at = -math.huge }
     local G = { until_t = 0, m1 = false, m1_at = 0 }
     local frame_dt = 1 / 60
     local active = false
@@ -702,6 +703,16 @@ end]]
         if not H.oth_kept then box.fire = nil end
     end
     local JOB_ID = game.JobId
+    -- CAPTURE RIDES ON A REAL PARRY. A capture is taken only from a block press
+    -- that is a well-timed parry anyway (auto parry / triggerbot / spam decided a
+    -- parry is due and has no usable capture): the hook goes up for that one
+    -- press and comes down the frame its packet is read. Until 0.5.3 the script
+    -- pressed block every 1.4s whenever it had no capture -- each of those was a
+    -- swing that parried nothing and opened the game's 1.3s lockout, so a ball
+    -- arriving inside it was parried late or not at all ("animation, no parry").
+    -- Captures are kept per place (match / lobby training): a training packet is
+    -- never sent in a match.
+    local Capture = { armed_at = 0, dry = 0, last_spam_key = -math.huge }
     local function inspect(entry)
         local self, a = entry[1], entry[3]
         local a1, a2, a3, a4, a5 = a[1], a[2], a[3], a[4], a[5]
@@ -712,18 +723,21 @@ end]]
             if #a3 ~= #text then return false end
             local key = {}
             for i = 1, #text do key[i] = bit32.bxor(string.byte(a3, i), (string.byte(text, i) + i) % 256) end
-            Core.cap = { remote = self, hash = a1, uid = a2, key = key, len = #text,
+            Core.cap = { remote = self, hash = a1, uid = a2, key = key, len = #text, ctx = Core.ctx,
                 ball2 = typeof(a4) == "CFrame", win = type(a4) == "number" and a4 or nil }
+            Core.gen = Core.gen + 1
             Core.misses, Core.pending = 0, nil
-            logp("captured the parry packet (" .. capture_method() .. ")")
+            logp(("captured the parry packet (%s, %s) %.0fms after the press"):format(capture_method(), Core.ctx,
+                (clock_() - Capture.armed_at) * 1000))
             return true
         end
     end
-    -- Hook up for one capture press, at most `window` seconds; it comes down the
-    -- frame the parry is caught, whichever is first.
+    -- Hook up for one press, at most `window` seconds; down the frame the packet
+    -- is read. Works with or without a current capture (a refresh replaces it).
     local function arm(window)
-        if Core.cap or not is_live() then return false end
-        H.want, H.until_t = true, clock_() + (window or 0.12)
+        if not is_live() then return false end
+        H.want, H.until_t = true, clock_() + (window or 0.25)
+        Capture.armed_at = clock_()
         if H.fire or H.nc then return true end
         box.list = {}
         local method = capture_method()
@@ -744,57 +758,48 @@ end]]
         end
         if not (H.fire or H.nc) then H.want = false; return false end
         box.want = true
+        local gen0 = Core.gen
         task.spawn(function()
             while (H.fire or H.nc) and clock_() < H.until_t do
                 task.wait()
                 local l = box.list
-                for i = 1, #l do if pcall(inspect, l[i]) and Core.cap then break end end
-                if Core.cap then break end
+                for i = 1, #l do if pcall(inspect, l[i]) and Core.gen ~= gen0 then break end end
+                if Core.gen ~= gen0 then break end
             end
             unhook()
             box.list = {}
+            if Core.gen == gen0 then
+                Capture.dry = Capture.dry + 1
+                logp(("capture: nothing readable within %.2fs (try %d) -- the next parry tries again"):format(
+                    clock_() - Capture.armed_at, Capture.dry))
+            else
+                Capture.dry = 0
+            end
         end)
         return true
     end
     local function pressBlockKey()
         if not is_live() then return false end
+        Core.last_send_at = clock_()
         pcall(function()
             VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.F, false, game)
             VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.F, false, game)
         end)
         return true
     end
-    -- Lobby training sends the same parry packet as a match (its screen points
-    -- are the trainees + dummies, built in build_screen_points), so capture there
-    -- too. Plain lobby parry (no training) is still skipped.
+    -- 0.25s ceiling (it comes down as soon as the packet is read); a press that
+    -- came up dry gives the next one a little longer, up to 0.45s
+    local function capture_window() return math.min(0.25 * (1 + 0.5 * Capture.dry), 0.45) end
+    -- a native block press (the game sends the parry and animates it); with
+    -- capture = true the hook is up for it so its packet becomes the capture
+    local function key_parry(capture)
+        if capture then arm(capture_window()) end
+        return pressBlockKey()
+    end
     local function in_lobby_training()
         if not LocalPlayer:GetAttribute("LobbyTraining") then return false end
         local char, dead = LocalPlayer.Character, Workspace:FindFirstChild("Dead")
         return char ~= nil and dead ~= nil and char.Parent == dead
-    end
-    local Prime = { last = 0, since = nil, dry = 0 }
-    local function prime_remote()
-        if not is_live() then return end
-        if Core.cap then Prime.dry = 0; return end
-        if not (in_match() or in_lobby_training()) or not canParryNow() then Prime.since = nil; return end
-        local now = clock_()
-        Prime.since = Prime.since or now
-        if now - Prime.since < 1 or now - Prime.last < 1.4 then return end
-        if Prime.dry >= 3 then
-            if now - Prime.last < 20 then return end
-            Prime.dry = 0
-        end
-        Prime.last = now
-        -- Short hook window: ~4 frames (0.08s floor, 0.2s at low FPS) -- the game
-        -- sends its parry a frame or two after the press. Only if a press comes up
-        -- dry does the next one get longer (x1.5, x2), capped at 0.3s.
-        local window = math.min(math.clamp(frame_dt * 4, 0.08, 0.2) * (1 + 0.5 * Prime.dry), 0.3)
-        if arm(window) then
-            Prime.dry = Prime.dry + 1
-            pressBlockKey(); gate_start()
-            logp(("capture press %d (%s, hook up <= %.2fs%s)"):format(Prime.dry, capture_method(), window,
-                in_lobby_training() and ", training" or ""))
-        end
     end
 
     -- ---------- token + send ----------
@@ -831,6 +836,7 @@ end]]
         local look = curve_look_cached(cam)
         if look then local o = cf.Position; cf = CFrame.lookAt(o, o + look) end
         if not spam then gate_start() end
+        Core.last_send_at = clock_()
         local r = cap.remote
         if cap.ball2 then
             local ray = cam:ScreenPointToRay(aim[1], aim[2], 0)
@@ -1326,10 +1332,21 @@ end]]
     local function fire_one()
         if Pump.fired_frame ~= Pump.frame then Pump.fired_frame, Pump.frame_fires = Pump.frame, 0 end
         if SP.mode == "Keypress" and Pump.frame_fires >= 1 then return false end
-        local ok
-        if SP.mode == "Keypress" then ok = pressBlockKey() else ok = send(true) == "sent" end
+        local ok, remote = false, false
+        if SP.mode == "Keypress" then ok = pressBlockKey()
+        elseif not Core.cap then
+            -- no capture yet: a native press (it parries by itself) that also
+            -- captures, at most one per 0.3s until the packet is in
+            if clock_() - Capture.last_spam_key < 0.3 then return false end
+            Capture.last_spam_key = clock_()
+            ok = key_parry(true)
+        else
+            ok = send(true) == "sent"
+            remote = ok
+        end
         Pump.frame_fires = Pump.frame_fires + 1
         if ok then SpamMeter.count = SpamMeter.count + 1 end
+        Pump.remote_sent = Pump.remote_sent or remote
         return ok
     end
     -- Holds the parries-a-second at the slider value at any FPS:
@@ -1363,9 +1380,11 @@ end]]
             Pump.credit = Pump.credit - 1
             sent = true
         end
-        -- one animation call per tick, through the held-key gate (Keypress mode:
-        -- the game animates its own presses)
-        if sent and SP.mode == "Remote" then Anim.spamBlock() end
+        -- one animation call per tick, through the held-key gate, and only for
+        -- remote sends (a native press -- Keypress mode or a capture press -- has
+        -- the game's own swing)
+        if sent and Pump.remote_sent then Anim.spamBlock() end
+        Pump.remote_sent = false
     end
     local function spam_instant()
         local source = current_source(clock_())
@@ -1375,8 +1394,9 @@ end]]
         -- borrowed from the next tick's credit, so the average stays on target
         if fire_one() then
             Pump.credit = math.max(Pump.credit - 1, -1)
-            if SP.mode == "Remote" then Anim.spamBlock() end
+            if Pump.remote_sent then Anim.spamBlock() end
         end
+        Pump.remote_sent = false
     end
     function Parry.spamWaiting() return Pump.waiting end
 
@@ -1395,10 +1415,15 @@ end]]
     end
     local function fire(st, now, via, info)
         local how
+        -- no capture yet, or the last remote parry went unanswered (the capture
+        -- may be stale): this parry is a native press, which parries by itself
+        -- and takes / refreshes the capture on the way
+        local fresh = S.parry_mode ~= "Keypress" and (not Core.cap or Core.misses >= 1)
         if try_ability() then how = "ability"
-        elseif S.parry_mode == "Keypress" then
+        elseif S.parry_mode == "Keypress" or fresh then
             if not gate_open() or not canParryNow() then return false end
-            pressBlockKey(); gate_start(); how = "key"
+            key_parry(fresh); gate_start()
+            how = not fresh and "key" or (Core.cap and "key, refreshing capture" or "key, capturing")
         else
             if send(false) ~= "sent" then return false end
             how = "remote"
@@ -1561,14 +1586,22 @@ end]]
         if point == 1 then
             if dt then frame_dt = math.clamp(dt, 1 / 240, 0.1) end
             Pump.frame = Pump.frame + 1
+            -- captures are per place: entering / leaving lobby training swaps them
+            local ctx = in_lobby_training() and "training" or "match"
+            if ctx ~= Core.ctx then
+                Core.caps[Core.ctx] = Core.cap
+                Core.ctx, Core.cap = ctx, Core.caps[ctx]
+                Core.misses, Core.pending = 0, nil
+            end
             if Core.pending and now > Core.pending then
                 Core.pending, Core.misses = nil, Core.misses + 1
                 if Core.misses >= 2 then
                     Core.cap, Core.misses = nil, 0
-                    logp("2 parries unanswered: capture went stale, taking a fresh one")
+                    logp("2 remote parries unanswered: capture dropped, the next parry takes a fresh one")
+                else
+                    logp("remote parry unanswered: the next parry is a native press that refreshes the capture")
                 end
             end
-            if not Core.cap then prime_remote() end
             auto_spam_evaluate(now)
             local act = now < AutoSpam.active_until
             if act and not AutoSpam.was_active and not SP.manual then spam_instant() end
@@ -1648,7 +1681,7 @@ end]]
         else clash = "watching for clashes" end
         local manual = not SP.manual and "off" or (Pump.waiting and "waiting for a threat" or "spamming")
         return {
-            armed = Core.cap and ("armed (" .. capture_method() .. ")") or "not armed yet",
+            armed = Core.cap and ("armed (" .. capture_method() .. ", " .. Core.ctx .. ")") or "not armed -- your next parry captures",
             last = last, clash = clash, manual = manual, rate = SpamMeter.rate, ping = pingMs(),
             curve = S.random_curve and "Random each parry" or (CURVE_NAMES[S.curve_mode] or "?"),
             detect = blocked_by_detection() and "PAUSED (ability detected)" or "clear",
@@ -1684,30 +1717,35 @@ end]]
         end_clash("engine off")
         Pump.credit, Pump.on, Pump.waiting = 0, false, false
         Core.pending, Core.misses = nil, 0
-        G.until_t, Prime.since, Prime.dry = 0, nil, 0
+        G.until_t, Capture.dry = 0, 0
     end
-    -- one parry outside the engine (Slashes of Fury): remote if armed, else the key
+    -- one parry outside the engine (Slashes of Fury): remote if armed, else a
+    -- native press that also captures
     function Parry.spamParry()
         if not Parry.resolve() then return false end
         if Core.cap and send(true) == "sent" then Anim.spamBlock(); return true end
-        return pressBlockKey()
+        return key_parry(Core.cap == nil)
     end
-    -- REHOOK: throw the capture away and take a fresh one -- hook down, capture
-    -- cleared, and the next chance to parry presses straight away (no 1s settle,
-    -- no 1.4s spacing, no dry-press backoff) with the hook picked in Capture hook.
+    -- REHOOK: throw the capture away (this place's and the other's); the next
+    -- parry is a native press that takes a fresh one with the hook picked in
+    -- Capture hook. Nothing is pressed now -- no swing at a random moment.
     function Parry.rehook()
         pcall(unhook)
-        Core.cap, Core.pending, Core.misses = nil, nil, 0
+        Core.cap, Core.pending, Core.misses, Core.caps = nil, nil, 0, {}
         tok_cache.cap = nil
-        Prime.last, Prime.dry = -math.huge, 0
-        Prime.since = canParryNow() and (clock_() - 1) or nil
-        logp("rehook: capture dropped, taking a fresh one (" .. capture_method() .. ")")
-        if active then prime_remote() end
+        Capture.dry = 0
+        logp("rehook: capture dropped -- the next parry takes a fresh one (" .. capture_method() .. ")")
         return active
     end
-    -- the game started a block swing from a real press (yours, a capture press):
-    -- its lockout is running, so a remote parry now would only play the swing
-    function Parry.gameSwing() gate_start() end
+    -- The game started a block swing. If it came from a real press of yours, its
+    -- lockout is running and a remote parry now would only play the swing -- so
+    -- start our gate. Swings within 0.5s of a send of ours are the game showing
+    -- OUR parry (spam included) and are ignored: read as presses, they used to
+    -- close the gate for 1.4s after a clash and make auto parry fire late.
+    function Parry.gameSwing()
+        if clock_() - Core.last_send_at < 0.5 then return end
+        gate_start()
+    end
     function Parry.remotes() return Remotes end
     function Parry.spamRate() return SpamMeter.rate end
     function Parry.isMe(name) return name == me end
@@ -2026,10 +2064,10 @@ AP:AddDropdown("CaptureHook", {
 })
 AP:AddButton({
     Text = "Rehook",
-    Tooltip = "Drop the current capture and take a fresh one on your next chance to parry (uses the Capture hook above). Use it if parries stop landing.",
+    Tooltip = "Drop the current capture; your next parry is a normal block press that takes a fresh one (uses the Capture hook above). Use it if parries stop landing.",
     Func = function()
         if Parry.rehook() then
-            Notify("Rehook", "Capture dropped -- taking a fresh one on your next chance to parry.", 3)
+            Notify("Rehook", "Capture dropped -- your next parry takes a fresh one.", 3)
         else
             Notify("Rehook", "Capture dropped. Turn on Auto parry or spam to take a fresh one.", 4)
         end
