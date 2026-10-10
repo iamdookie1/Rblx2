@@ -6,7 +6,7 @@ task.spawn(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.10-63.7"
+local SCRIPT_VERSION = "2026.10.10-63.8"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -2351,8 +2351,13 @@ RunService.Heartbeat:Connect(function()
   -- Guard the once-a-frame housekeeping like the loop runners above: a transient
   -- error here goes to the flight log, never the Roblox console the game can read.
   local ok_hk, err_hk = pcall(function()
-    sample_lag() -- keep the ping average current between balls too
     if not is_live() then return end
+    -- Idle means idle: with no capture and no remote feature on, don't touch the
+    -- game at all -- no Stats/ping read, no character checks, no prime. A clean
+    -- client doesn't poll these every frame, and this is the one behavioural
+    -- difference from doing nothing. The loop wakes the instant a feature is on.
+    if not Core.cap and not remote_features_on() then return end
+    sample_lag() -- keep the ping average current between balls too
     if not Core.cap then
         Core.told = false
         -- the recipe first: no hook, nothing pressed
@@ -2628,6 +2633,12 @@ end
 
 -- Once per frame.
 local function auto_spam_evaluate()
+    -- Auto spam off: bail before reading the character, so an idle "nothing on"
+    -- frame touches no game object at all (see the housekeeping loop).
+    if not props.__auto_spam_enabled then
+        if AutoSpam.ball then end_clash("off") end
+        return
+    end
     local now = os.clock()
     local root = getRoot()
     if not can_auto_spam(root) then
