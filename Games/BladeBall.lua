@@ -6,7 +6,7 @@ task.spawn(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.10-63.6"
+local SCRIPT_VERSION = "2026.10.10-63.7"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -1239,7 +1239,12 @@ local function is_block_press(input)
     return false
 end
 local function own_input(input)
-    if Core.cap or not is_live() or keypress_only() then return end
+    -- Only capture when a remote feature will actually use it. Without this,
+    -- a normal block press in a live round armed the hook even with auto parry,
+    -- spam and triggerbot all OFF -- putting the capture hook up for 0.35s for
+    -- no reason, which is exactly what the game's parry probe looks for (a kick
+    -- with nothing on). prime_remote already gates on this; this path didn't.
+    if Core.cap or not is_live() or keypress_only() or not remote_features_on() then return end
     if is_block_press(input) and Core.in_match() and canParryNow() then arm() end
 end
 UserInputService.InputBegan:Connect(own_input)
