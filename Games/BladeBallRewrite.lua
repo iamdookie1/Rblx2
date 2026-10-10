@@ -30,7 +30,7 @@
 
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5"
+local SCRIPT_VERSION = "rewrite-0.5.1"
 
 -- ---------------------------------------------------------------------------
 -- Single instance.
@@ -594,9 +594,11 @@ end]]
             return true
         end
     end
-    local function arm()
+    -- Hook up for one capture press, at most `window` seconds; it comes down the
+    -- frame the parry is caught, whichever is first.
+    local function arm(window)
         if Core.cap or not is_live() then return false end
-        H.want, H.until_t = true, clock_() + 0.35
+        H.want, H.until_t = true, clock_() + (window or 0.12)
         if H.fire or H.nc then return true end
         box.list = {}
         local method = capture_method()
@@ -637,10 +639,19 @@ end]]
         end)
         return true
     end
+    -- Lobby training sends the same parry packet as a match (its screen points
+    -- are the trainees + dummies, built in build_screen_points), so capture there
+    -- too. Plain lobby parry (no training) is still skipped.
+    local function in_lobby_training()
+        if not LocalPlayer:GetAttribute("LobbyTraining") then return false end
+        local char, dead = LocalPlayer.Character, Workspace:FindFirstChild("Dead")
+        return char ~= nil and dead ~= nil and char.Parent == dead
+    end
     local Prime = { last = 0, since = nil, dry = 0 }
     local function prime_remote()
-        if Core.cap or not is_live() then return end
-        if not in_match() or not canParryNow() then Prime.since = nil; return end
+        if not is_live() then return end
+        if Core.cap then Prime.dry = 0; return end
+        if not (in_match() or in_lobby_training()) or not canParryNow() then Prime.since = nil; return end
         local now = clock_()
         Prime.since = Prime.since or now
         if now - Prime.since < 1 or now - Prime.last < 1.4 then return end
@@ -649,7 +660,16 @@ end]]
             Prime.dry = 0
         end
         Prime.last = now
-        if arm() then Prime.dry = Prime.dry + 1; pressBlockKey(); gate_start() end
+        -- Short hook window: ~4 frames (0.08s floor, 0.2s at low FPS) -- the game
+        -- sends its parry a frame or two after the press. Only if a press comes up
+        -- dry does the next one get longer (x1.5, x2), capped at 0.3s.
+        local window = math.min(math.clamp(frame_dt * 4, 0.08, 0.2) * (1 + 0.5 * Prime.dry), 0.3)
+        if arm(window) then
+            Prime.dry = Prime.dry + 1
+            pressBlockKey(); gate_start()
+            logp(("capture press %d (%s, hook up <= %.2fs%s)"):format(Prime.dry, capture_method(), window,
+                in_lobby_training() and ", training" or ""))
+        end
     end
 
     -- ---------- token + send ----------
