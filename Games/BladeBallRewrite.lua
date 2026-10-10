@@ -21,7 +21,7 @@
 --   * spam that knows when to stop: auto spam ends the moment the exchange does
 --     (third player, partner gone/out of range, ball left, slowed, not returned);
 --     manual spam only fires while a ball is actually a threat (Smart stop)
---   * mobile manual-spam orb (tap to toggle, drag to move);
+--   * mobile manual-spam switch (tap to toggle, drag to move);
 --     no on-screen UI on PC
 --   * everything else: auto-parry Keypress mode, random curve, auto ability,
 --     cooldown protection, Infinity / Death Slash / Time Hole / Phantom /
@@ -30,7 +30,7 @@
 
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.2"
+local SCRIPT_VERSION = "rewrite-0.5.3"
 
 -- ---------------------------------------------------------------------------
 -- Single instance.
@@ -275,7 +275,7 @@ do
         auto_ability = false, cooldown_protection = false,
     }
     local SP = {
-        manual = false, auto = false, mode = "Remote", max_rate = 1000, upload_kbps = 0, idle_rate = 20,
+        manual = false, auto = false, mode = "Remote", max_rate = 1000, upload_kbps = 0,
         smart = true, range_bonus = 0, hold = 0.15, sensitivity = 1.3, predictive = true,
         factor = 1, guard_at = -1,
     }
@@ -1332,8 +1332,16 @@ end]]
         if ok then SpamMeter.count = SpamMeter.count + 1 end
         return ok
     end
+    -- Holds the parries-a-second at the slider value at any FPS:
+    --   * credit grows with real time and carries ~2 frames (>= 50ms), so a 30 FPS
+    --     frame (33ms) no longer overflows it (0.5.2 kept 15ms: ~5% short at 30 FPS,
+    --     up to 12% short across hitches);
+    --   * a parry that can't go out right now (stunned, respawning, no capture)
+    --     keeps its credit instead of being counted as sent (0.5.2 lost ~5% there).
+    -- Simulated against real frame timing (3 signal points a frame, jitter,
+    -- hitches, blocked moments): 100% of target from 30 to 240 FPS, 300-2000/s.
     local function spam_tick(now)
-        local elapsed = math.min(now - Pump.last, 0.05)
+        local elapsed = math.min(now - Pump.last, 0.25)
         Pump.last = now
         local span = now - SpamMeter.since
         if span >= 0.5 then SpamMeter.rate, SpamMeter.count, SpamMeter.since = SpamMeter.count / span, 0, now end
@@ -1345,16 +1353,15 @@ end]]
         Pump.waiting = false
         local rate = math.clamp(SP.max_rate or 1000, 1, 2000) * upload_factor(now)
         if SP.mode == "Keypress" then rate = math.min(rate, 1 / frame_dt) end
-        if not focus then rate = math.min(rate, SP.idle_rate) end
         rate = math.max(rate, 1)
-        if Pump.on then Pump.credit = math.min(Pump.credit + elapsed * rate, 1 + rate * 0.015)
+        local cap = 1 + rate * math.max(frame_dt * 2.2, 0.05)
+        if Pump.on then Pump.credit = math.min(Pump.credit + elapsed * rate, cap)
         else Pump.credit, Pump.on = 1, true end
         local sent = false
         while Pump.credit >= 1 - 1e-6 do
+            if not fire_one() then break end -- can't go right now: keep the credit
             Pump.credit = Pump.credit - 1
-            local ok = fire_one()
-            if ok then sent = true end
-            if ok == false and SP.mode == "Keypress" then Pump.credit = math.min(Pump.credit, 0); break end
+            sent = true
         end
         -- one animation call per tick, through the held-key gate (Keypress mode:
         -- the game animates its own presses)
@@ -1364,9 +1371,14 @@ end]]
         local source = current_source(clock_())
         if not source or not LocalPlayer.Character then return end
         if source == "manual" and SP.smart and not spam_focus() then return end
-        Pump.credit, Pump.on = math.max(Pump.credit - 1, -1), true
-        if fire_one() and SP.mode == "Remote" then Anim.spamBlock() end
+        Pump.on = true
+        -- borrowed from the next tick's credit, so the average stays on target
+        if fire_one() then
+            Pump.credit = math.max(Pump.credit - 1, -1)
+            if SP.mode == "Remote" then Anim.spamBlock() end
+        end
     end
+    function Parry.spamWaiting() return Pump.waiting end
 
     -- ===================== AUTO PARRY / TRIGGERBOT / PRE-PARRY =====================
     local function mark_parried(st, now)
@@ -1680,6 +1692,19 @@ end]]
         if Core.cap and send(true) == "sent" then Anim.spamBlock(); return true end
         return pressBlockKey()
     end
+    -- REHOOK: throw the capture away and take a fresh one -- hook down, capture
+    -- cleared, and the next chance to parry presses straight away (no 1s settle,
+    -- no 1.4s spacing, no dry-press backoff) with the hook picked in Capture hook.
+    function Parry.rehook()
+        pcall(unhook)
+        Core.cap, Core.pending, Core.misses = nil, nil, 0
+        tok_cache.cap = nil
+        Prime.last, Prime.dry = -math.huge, 0
+        Prime.since = canParryNow() and (clock_() - 1) or nil
+        logp("rehook: capture dropped, taking a fresh one (" .. capture_method() .. ")")
+        if active then prime_remote() end
+        return active
+    end
     -- the game started a block swing from a real press (yours, a capture press):
     -- its lockout is running, so a remote parry now would only play the swing
     function Parry.gameSwing() gate_start() end
@@ -1757,32 +1782,61 @@ function Engine.want(name, on)
 end
 
 -- ===========================================================================
--- MOBILE MANUAL-SPAM ORB (touch devices only). Tap to toggle spam on/off, drag
--- to move. The ring pulses and shows the live rate while it spams.
+-- MOBILE MANUAL-SPAM SWITCH (touch devices only; no on-screen UI on PC).
+-- A capsule switch: tap to turn spam on/off, drag to move it. The thumb slides
+-- across, the track fills with a green->cyan gradient that shimmers while it
+-- spams, dims while Smart stop is waiting for a threat, and shows the live rate.
 -- ===========================================================================
 local Orb = {}
 do
     local SP = Parry.SP
-    local gui, button, ring, title, sub, pill
+    local TweenService = cloneref(game:GetService("TweenService"))
+    local W, H, PAD = 172, 58, 6
+    local THUMB = H - PAD * 2
+    local C = {
+        track_off = Color3.fromRGB(22, 23, 29), track_on = Color3.fromRGB(10, 32, 26),
+        stroke = Color3.fromRGB(255, 255, 255),
+        g1 = Color3.fromRGB(0, 232, 140), g2 = Color3.fromRGB(0, 186, 255),
+        thumb_off = Color3.fromRGB(58, 60, 72), thumb_on = Color3.fromRGB(246, 255, 251),
+        icon_off = Color3.fromRGB(205, 208, 220), icon_on = Color3.fromRGB(0, 150, 95),
+        text = Color3.fromRGB(238, 240, 246), dim = Color3.fromRGB(148, 152, 168),
+    }
+    local gui, root, track, fill, grad, thumb, ring, bar, notch, textbox, title, sub
     local pressing, dragging = false, false
     local press_input, press_pos, start_abs = nil, nil, nil
-    local press_conns = {}
-    local IDLE, ACTIVE = Color3.fromRGB(110, 112, 128), Color3.fromRGB(0, 225, 130)
+    local press_conns, painted, last_rate = {}, nil, 0
+    local function tween(obj, props, t)
+        TweenService:Create(obj, TweenInfo.new(t or 0.22, Enum.EasingStyle.Quint, Enum.EasingDirection.Out), props):Play()
+    end
+    local function corner(obj, r) local c = Instance.new("UICorner"); c.CornerRadius = r or UDim.new(1, 0); c.Parent = obj; return c end
     local function set_spam(on) SP.manual = on and true or false end
     local function drop_press_conns()
         for _, c in ipairs(press_conns) do pcall(function() c:Disconnect() end) end
         press_conns = {}
     end
     local function paint(rate)
-        if not button then return end
+        if not track then return end
+        if rate then last_rate = rate end
         local on = SP.manual
-        ring.Color = on and ACTIVE or IDLE
-        ring.Transparency = on and (0.1 + 0.4 * (0.5 + 0.5 * math.sin(clock_() * 12))) or 0.3
-        title.TextColor3 = on and ACTIVE or Color3.fromRGB(235, 235, 240)
-        if on then sub.Text = (rate and rate >= 1) and (math.floor(rate + 0.5) .. "/s") or "waiting"
-        else sub.Text = "tap" end
-        pill.Text = on and "ON" or "OFF"
-        pill.BackgroundColor3 = on and Color3.fromRGB(0, 150, 95) or Color3.fromRGB(32, 33, 40)
+        local state = not on and "off" or (Parry.spamWaiting() and "wait" or "on")
+        if state ~= painted then
+            painted = state
+            tween(thumb, {
+                Position = on and UDim2.fromOffset(W - PAD - THUMB, PAD) or UDim2.fromOffset(PAD, PAD),
+                BackgroundColor3 = on and C.thumb_on or C.thumb_off,
+            })
+            tween(fill, { BackgroundTransparency = state == "on" and 0.05 or (state == "wait" and 0.55 or 1) })
+            tween(track, { BackgroundColor3 = on and C.track_on or C.track_off })
+            tween(textbox, { Position = on and UDim2.fromOffset(PAD * 3, 0) or UDim2.fromOffset(THUMB + PAD * 3, 0) })
+            local ic = on and C.icon_on or C.icon_off
+            tween(ring, { Color = ic }); tween(bar, { BackgroundColor3 = ic })
+            tween(notch, { BackgroundColor3 = on and C.thumb_on or C.thumb_off })
+        end
+        if state == "off" then sub.Text, sub.TextColor3 = "tap to start", C.dim
+        elseif state == "wait" then sub.Text, sub.TextColor3 = "ready", C.dim
+        else sub.Text, sub.TextColor3 = (math.floor(last_rate + 0.5) .. "/s"), C.g1 end
+        -- shimmer while spamming
+        if state == "on" then grad.Offset = Vector2.new(math.sin(clock_() * 3) * 0.3, 0) end
     end
     function Orb.tick(rate) paint(rate) end
     -- a press that didn't turn into a drag toggles spam
@@ -1790,61 +1844,79 @@ do
         pressing = false
         drop_press_conns()
         if dragging then dragging = false
-        else set_spam(not SP.manual) end
+        else
+            set_spam(not SP.manual)
+            -- a little squish so the tap feels physical
+            root.Size = UDim2.fromOffset(W * 0.96, H * 0.96)
+            tween(root, { Size = UDim2.fromOffset(W, H) }, 0.25)
+        end
         paint()
     end
     function Orb.show()
         if gui or not touchUI then return end
         gui = Instance.new("ScreenGui")
-        gui.Name = "BB_SpamOrb"; gui.ResetOnSpawn = false; gui.IgnoreGuiInset = true
+        gui.Name = "BB_SpamSwitch"; gui.ResetOnSpawn = false; gui.IgnoreGuiInset = true
         gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling; gui.DisplayOrder = 9999
-        button = Instance.new("TextButton")
-        button.Name = "Orb"; button.Text = ""; button.AutoButtonColor = false
-        button.Size = UDim2.fromOffset(86, 86); button.AnchorPoint = Vector2.new(0.5, 0.5)
-        button.Position = UDim2.new(0.86, 0, 0.55, 0)
-        button.BackgroundColor3 = Color3.fromRGB(16, 17, 22); button.BackgroundTransparency = 0.12
-        button.Parent = gui
-        Instance.new("UICorner", button).CornerRadius = UDim.new(1, 0)
-        ring = Instance.new("UIStroke", button); ring.Thickness = 3; ring.Color = IDLE
-        local core = Instance.new("Frame")
-        core.Size = UDim2.fromOffset(62, 62); core.AnchorPoint = Vector2.new(0.5, 0.5)
-        core.Position = UDim2.fromScale(0.5, 0.5); core.BackgroundColor3 = Color3.fromRGB(28, 30, 38)
-        core.BackgroundTransparency = 0.05; core.Active = false; core.Parent = button
-        Instance.new("UICorner", core).CornerRadius = UDim.new(1, 0)
-        local grad = Instance.new("UIGradient", core)
-        grad.Rotation = 90
-        grad.Color = ColorSequence.new(Color3.fromRGB(48, 50, 62), Color3.fromRGB(20, 21, 27))
+        root = Instance.new("Frame")
+        root.Size = UDim2.fromOffset(W, H); root.AnchorPoint = Vector2.new(0.5, 0.5)
+        root.Position = UDim2.new(1, -(W / 2 + 18), 0.62, 0); root.BackgroundTransparency = 1
+        root.Parent = gui
+        -- soft drop shadow (two stacked translucent capsules)
+        for i, a in ipairs({ 0.82, 0.9 }) do
+            local sh = Instance.new("Frame")
+            sh.Size = UDim2.new(1, i * 6, 1, i * 6); sh.AnchorPoint = Vector2.new(0.5, 0.5)
+            sh.Position = UDim2.new(0.5, 0, 0.5, 3); sh.BackgroundColor3 = Color3.new(0, 0, 0)
+            sh.BackgroundTransparency = a; sh.ZIndex = 0; sh.Parent = root; corner(sh)
+        end
+        track = Instance.new("TextButton")
+        track.Name = "Track"; track.Text = ""; track.AutoButtonColor = false
+        track.Size = UDim2.fromScale(1, 1); track.BackgroundColor3 = C.track_off; track.ZIndex = 1
+        track.Parent = root; corner(track)
+        local st = Instance.new("UIStroke"); st.Color = C.stroke; st.Transparency = 0.86; st.Thickness = 1.2
+        st.ApplyStrokeMode = Enum.ApplyStrokeMode.Border; st.Parent = track
+        fill = Instance.new("Frame")
+        fill.Size = UDim2.fromScale(1, 1); fill.BackgroundColor3 = Color3.new(1, 1, 1); fill.BackgroundTransparency = 1
+        fill.ZIndex = 2; fill.Active = false; fill.Parent = track; corner(fill)
+        grad = Instance.new("UIGradient"); grad.Color = ColorSequence.new(C.g1, C.g2); grad.Parent = fill
+        textbox = Instance.new("Frame")
+        textbox.Size = UDim2.fromOffset(W - THUMB - PAD * 5, H); textbox.Position = UDim2.fromOffset(THUMB + PAD * 3, 0)
+        textbox.BackgroundTransparency = 1; textbox.ZIndex = 3; textbox.Parent = track
         title = Instance.new("TextLabel")
-        title.BackgroundTransparency = 1; title.Size = UDim2.new(1, 0, 0, 20); title.Position = UDim2.new(0, 0, 0.5, -14)
-        title.Font = Enum.Font.GothamBlack; title.TextSize = 15; title.Text = "SPAM"
-        title.TextColor3 = Color3.fromRGB(235, 235, 240); title.Parent = button
+        title.BackgroundTransparency = 1; title.Size = UDim2.new(1, 0, 0, 20); title.Position = UDim2.new(0, 0, 0.5, -18)
+        title.Font = Enum.Font.GothamBlack; title.TextSize = 16; title.Text = "SPAM"; title.TextColor3 = C.text
+        title.TextXAlignment = Enum.TextXAlignment.Left; title.ZIndex = 3; title.Parent = textbox
         sub = Instance.new("TextLabel")
-        sub.BackgroundTransparency = 1; sub.Size = UDim2.new(1, 0, 0, 14); sub.Position = UDim2.new(0, 0, 0.5, 5)
-        sub.Font = Enum.Font.GothamMedium; sub.TextSize = 11; sub.Text = "tap"
-        sub.TextColor3 = Color3.fromRGB(170, 172, 185); sub.Parent = button
-        pill = Instance.new("TextLabel")
-        pill.Size = UDim2.fromOffset(58, 18); pill.AnchorPoint = Vector2.new(0.5, 1)
-        pill.Position = UDim2.new(0.5, 0, 0, -6); pill.Font = Enum.Font.GothamBold; pill.TextSize = 10
-        pill.Text = "OFF"; pill.TextColor3 = Color3.fromRGB(240, 240, 245)
-        pill.BackgroundColor3 = Color3.fromRGB(32, 33, 40); pill.Parent = button
-        Instance.new("UICorner", pill).CornerRadius = UDim.new(1, 0)
-        button.InputBegan:Connect(function(input)
+        sub.BackgroundTransparency = 1; sub.Size = UDim2.new(1, 0, 0, 16); sub.Position = UDim2.new(0, 0, 0.5, 2)
+        sub.Font = Enum.Font.GothamMedium; sub.TextSize = 12; sub.Text = "tap to start"; sub.TextColor3 = C.dim
+        sub.TextXAlignment = Enum.TextXAlignment.Left; sub.ZIndex = 3; sub.Parent = textbox
+        thumb = Instance.new("Frame")
+        thumb.Size = UDim2.fromOffset(THUMB, THUMB); thumb.Position = UDim2.fromOffset(PAD, PAD)
+        thumb.BackgroundColor3 = C.thumb_off; thumb.ZIndex = 4; thumb.Active = false; thumb.Parent = track; corner(thumb)
+        -- power icon: an open ring with a bar through the gap
+        local icon = Instance.new("Frame")
+        icon.Size = UDim2.fromOffset(18, 18); icon.AnchorPoint = Vector2.new(0.5, 0.5); icon.Position = UDim2.fromScale(0.5, 0.52)
+        icon.BackgroundTransparency = 1; icon.ZIndex = 5; icon.Parent = thumb; corner(icon)
+        ring = Instance.new("UIStroke"); ring.Thickness = 2.4; ring.Color = C.icon_off; ring.Parent = icon
+        notch = Instance.new("Frame")
+        notch.Size = UDim2.fromOffset(8, 6); notch.AnchorPoint = Vector2.new(0.5, 0.5); notch.Position = UDim2.new(0.5, 0, 0, -1)
+        notch.BackgroundColor3 = C.thumb_off; notch.BorderSizePixel = 0; notch.ZIndex = 6; notch.Parent = icon
+        bar = Instance.new("Frame")
+        bar.Size = UDim2.fromOffset(2.6, 10); bar.AnchorPoint = Vector2.new(0.5, 0); bar.Position = UDim2.new(0.5, 0, 0, -3)
+        bar.BackgroundColor3 = C.icon_off; bar.BorderSizePixel = 0; bar.ZIndex = 7; bar.Parent = icon; corner(bar)
+        track.InputBegan:Connect(function(input)
             local t = input.UserInputType
             if t ~= Enum.UserInputType.Touch and t ~= Enum.UserInputType.MouseButton1 then return end
             if pressing then return end
             pressing, dragging = true, false
             press_input, press_pos = input, input.Position
-            start_abs = button.AbsolutePosition + button.AbsoluteSize * 0.5
+            start_abs = root.AbsolutePosition + root.AbsoluteSize * 0.5
             -- move / release are tracked only while a press is live
             press_conns[#press_conns + 1] = UserInputService.InputChanged:Connect(function(i)
                 if not pressing then return end
                 if i ~= press_input and i.UserInputType ~= Enum.UserInputType.MouseMovement then return end
                 local d = i.Position - press_pos
                 if not dragging and Vector2.new(d.X, d.Y).Magnitude > 14 then dragging = true end
-                if dragging then
-                    button.AnchorPoint = Vector2.new(0.5, 0.5)
-                    button.Position = UDim2.fromOffset(start_abs.X + d.X, start_abs.Y + d.Y)
-                end
+                if dragging then root.Position = UDim2.fromOffset(start_abs.X + d.X, start_abs.Y + d.Y) end
             end)
             press_conns[#press_conns + 1] = UserInputService.InputEnded:Connect(function(i)
                 if not pressing then return end
@@ -1852,6 +1924,7 @@ do
             end)
         end)
         gui.Parent = hui()
+        painted = nil
         paint()
     end
     function Orb.hide()
@@ -1859,7 +1932,8 @@ do
         pressing, dragging = false, false
         set_spam(false)
         if gui then pcall(function() gui:Destroy() end) end
-        gui, button = nil, nil
+        gui, root, track = nil, nil, nil
+        painted = nil
     end
 end
 
@@ -1949,6 +2023,17 @@ AP:AddDropdown("CaptureHook", {
     Values = { "oth", "Namecall", "FireServer", "Both" }, Default = "oth", Text = "Capture hook",
     Tooltip = "How the first parry packet is captured. 'oth' (Delta) is the stealthiest.",
     Callback = function(v) getgenv().CaptureHook = v end,
+})
+AP:AddButton({
+    Text = "Rehook",
+    Tooltip = "Drop the current capture and take a fresh one on your next chance to parry (uses the Capture hook above). Use it if parries stop landing.",
+    Func = function()
+        if Parry.rehook() then
+            Notify("Rehook", "Capture dropped -- taking a fresh one on your next chance to parry.", 3)
+        else
+            Notify("Rehook", "Capture dropped. Turn on Auto parry or spam to take a fresh one.", 4)
+        end
+    end,
 })
 
 local APS = Tabs.Parry:AddRightGroupbox("Timing", "sliders-horizontal")
@@ -2124,12 +2209,12 @@ DR:AddSlider("SlashesMax", { Text = "Max parry count", Default = 36, Min = 1, Ma
 -- ----- Spam tab -----
 local MS = Tabs.Spam:AddLeftGroupbox("Manual Spam", "zap")
 MS:AddToggle("ManualSpam", {
-    Text = touchUI and "Manual spam (show orb)" or "Manual spam", Default = false,
-    Tooltip = touchUI and "Shows the spam orb: tap it to turn spam on/off, drag to move."
+    Text = touchUI and "Manual spam (show switch)" or "Manual spam", Default = false,
+    Tooltip = touchUI and "Shows the spam switch: tap it to turn spam on/off, drag to move it."
         or "Press the key (E by default) to turn spam on, press again to turn it off.",
     Callback = function(v)
         if touchUI then
-            -- the toggle shows the orb; the orb decides when to actually spam
+            -- the toggle shows the switch; the switch decides when to actually spam
             if v then Orb.show() else Orb.hide() end
         else
             SP.manual = v
@@ -2152,13 +2237,9 @@ MS:AddDropdown("SpamMode", {
     Callback = function(v) SP.mode = v end,
 })
 MS:AddSlider("SpamMaxRate", {
-    Text = "Max rate", Default = 1000, Min = 20, Max = 2000, Rounding = 0, Suffix = "/s",
+    Text = "Rate", Default = 1000, Min = 20, Max = 2000, Rounding = 0, Suffix = "/s",
+    Tooltip = "Parries a second for manual and auto spam. The actual rate is held at this value at any FPS.",
     Callback = function(v) SP.max_rate = v end,
-})
-MS:AddSlider("SpamIdleRate", {
-    Text = "Idle rate", Default = 20, Min = 1, Max = 200, Rounding = 0, Suffix = "/s",
-    Tooltip = "With Smart stop off: the rate while nothing is a threat.",
-    Callback = function(v) SP.idle_rate = v end,
 })
 MS:AddSlider("SpamUploadLimit", {
     Text = "Upload limit", Default = 0, Min = 0, Max = 1500, Rounding = 0, Suffix = " kbps",
