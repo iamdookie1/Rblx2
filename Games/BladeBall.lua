@@ -6,7 +6,7 @@ task.spawn(function()
 
 -- Bumped on every change, shown in the window footer and the Status tab, so
 -- you always know which build you're testing.
-local SCRIPT_VERSION = "2026.10.09-63.4"
+local SCRIPT_VERSION = "2026.10.10-63.5"
 
 -- Only one copy runs. Executing the script again shuts the previous copy down
 -- first (otherwise both keep auto parrying, and every pass gets two parries
@@ -1891,7 +1891,18 @@ local function decide(ball, st, root, now, via)
         -- later frame. Still flying away from us: it has to turn first (+20%).
         local eta = distance / speed * (heading < 0 and 1.2 or 1)
         info.eta = eta
-        if eta <= lead then return fire_for(st, now, "instant retarget", info) end
+        -- Only fire straight off the retarget when the ball is heading in, or
+        -- it's already point blank. A ball that just turned to us while still
+        -- flying away won't actually arrive within our short lead -- the flat
+        -- +20% above understates a full reversal -- so firing now wastes the
+        -- parry and opens the 1.3s lockout that then blocks the real return.
+        -- Held balls fall through to the normal per-frame path (arc_time plus
+        -- the curving-away guard), which re-evaluates every frame and fires when
+        -- the ball genuinely arrives, so nothing is lost by waiting here.
+        local point_blank = distance <= math.max(10, speed * 0.12)
+        if eta <= lead and (heading >= 0 or point_blank) then
+            return fire_for(st, now, "instant retarget", info)
+        end
         return hold(("just retargeted, lands in %.2fs, firing at %.2fs"):format(eta, lead))
     end
 
@@ -2023,7 +2034,11 @@ local function run_every_point(key, fn, label)
         local ok, err = pcall(fn)
         if not ok and err ~= last_error then
             last_error = err
-            warn("[Blade Ball] " .. label .. ": " .. tostring(err))
+            -- Silent by design: diagnostics go to the executor-side flight log,
+            -- never the Roblox console. warn() reaches LogService.MessageOut,
+            -- which the game's own client scripts can read, and the string
+            -- would name this script.
+            flight(label .. ": " .. tostring(err))
         end
     end
     local list = {}
@@ -2317,6 +2332,9 @@ end
 -- is a remote parry; it presses again only if the game deletes the remote),
 -- report the capture, log unanswered parries, and sample ping.
 RunService.Heartbeat:Connect(function()
+  -- Guard the once-a-frame housekeeping like the loop runners above: a transient
+  -- error here goes to the flight log, never the Roblox console the game can read.
+  local ok_hk, err_hk = pcall(function()
     sample_lag() -- keep the ping average current between balls too
     if not is_live() then return end
     if not Core.cap then
@@ -2382,6 +2400,8 @@ RunService.Heartbeat:Connect(function()
             Notify("Blade Ball", "No-hook mode didn't work on this server; capturing with the hook instead.", 5)
         end
     end
+  end)
+  if not ok_hk then flight("housekeeping: " .. tostring(err_hk)) end
 end)
 end -- parry core
 
@@ -2738,7 +2758,7 @@ do
         local ok, err = pcall(fn)
         if not ok and err ~= last_error then
             last_error = err
-            warn("[Blade Ball] spam: " .. tostring(err))
+            flight("spam: " .. tostring(err)) -- flight log, not the console (see run_every_point)
         end
     end
     local conns = props.__connections
