@@ -30,7 +30,7 @@
 
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.5"
+local SCRIPT_VERSION = "rewrite-0.5.6"
 
 -- ---------------------------------------------------------------------------
 -- Single instance.
@@ -290,6 +290,7 @@ do
         LOG[#LOG + 1] = text
         if #LOG > 60 then table.remove(LOG, 1) end
         log_new = math.min(log_new + 1, 60)
+        if Parry.onLog then pcall(Parry.onLog, text) end -- the log file (see Flight)
     end
     function Parry.drainLog()
         local out = {}
@@ -695,12 +696,28 @@ end]]
     local function unhook()
         local fire, nc, was_oth = H.fire, H.nc, H.oth
         H.fire, H.nc, H.want, box.want, H.oth = nil, nil, false, false, false
+        if not (fire or nc) then return end
+        local how
         if fire and was_oth then
-            if not (oth_unhook and pcall(oth_unhook, FIRE_FN)) then H.oth_kept = fire end
-        elseif fire and not (restore_ and pcall(restore_, FIRE_FN)) then pcall(hookfunction_, FIRE_FN, fire) end
-        if nc then restore_namecall(nc) end
+            if oth_unhook and pcall(oth_unhook, FIRE_FN) then how = "oth hook removed"
+            else
+                -- no oth.unhook here: the hook stays in place, passing every call
+                -- straight on, and the next capture reuses it
+                H.oth_kept, how = fire, "oth hook LEFT IN PLACE (this executor's oth has no unhook) -- pass-through"
+            end
+        elseif fire then
+            if restore_ and pcall(restore_, FIRE_FN) then how = "FireServer hook restored"
+            else pcall(hookfunction_, FIRE_FN, fire); how = "FireServer hook re-pointed at the original" end
+        end
+        if nc then restore_namecall(nc); how = (how and how .. ", " or "") .. "__namecall restored" end
         box.nc = nil
         if not H.oth_kept then box.fire = nil end
+        logp("hook down: " .. tostring(how))
+    end
+    function Parry.hookState()
+        if H.fire or H.nc then return "up (capturing)" end
+        if H.oth_kept then return "oth hook left in place (pass-through)" end
+        return "none"
     end
     local JOB_ID = game.JobId
     -- CAPTURE RIDES ON A REAL PARRY. A capture is taken only from a block press
@@ -1810,7 +1827,25 @@ end
 -- ===========================================================================
 local Library
 local StatusHook, UiTick
-local Engine = { users = {}, conns = {}, running = false, status_at = 0, tick_at = 0 }
+
+-- Log file: workspace/BladeBall/rewrite_log.txt. Everything the parry log shows
+-- plus engine wake/sleep, hook state and the kick message, so after a kick the
+-- last lines say exactly what the script was doing. Written by the executor;
+-- the game can't see it. Nothing is written until something happens.
+local Flight = { path = "BladeBall/rewrite_log.txt", started = false }
+function Flight.write(line)
+    pcall(function()
+        if not Flight.started then
+            Flight.started = true
+            if makefolder and isfolder and not isfolder("BladeBall") then makefolder("BladeBall") end
+            if writefile then writefile(Flight.path, ("==== %s session %s\n"):format(SCRIPT_VERSION, os.date("%Y-%m-%d %H:%M:%S"))) end
+        end
+        if appendfile then appendfile(Flight.path, ("[%s] %s\n"):format(os.date("%H:%M:%S"), tostring(line))) end
+    end)
+end
+Parry.onLog = Flight.write
+
+local Engine = { users = {}, conns = {}, watch = {}, running = false, armed = false, status_at = 0, tick_at = 0, sleep_tok = nil }
 local function econnect(signal, fn)
     local c = signal:Connect(function(...)
         if not is_live() then return end
@@ -1861,16 +1896,90 @@ function Engine.stop()
     pcall(Parry.deactivate)
     Engine.running = false
     if UiTick then pcall(UiTick, 0) end
-    if StatusHook then pcall(StatusHook, nil) end
+    if StatusHook then pcall(StatusHook, nil, Engine.armed) end
+end
+
+-- SLEEP OUTSIDE A ROUND. With a parry/spam feature on, the engine above runs
+-- only while there's something to parry: you're in a round (your character
+-- under Workspace.Alive), in lobby training, or in lobby parry. Anywhere else --
+-- just standing in the lobby -- it sleeps: no per-frame loops, no game-remote
+-- listeners, no polling; only these event watchers, which wake it the moment
+-- you join a round, start training or lobby parry. Before 0.5.6 it ran in the
+-- lobby exactly as in a round (3 per-frame loops, 4 remote listeners, Stats
+-- reads), which is the footprint the old script's idle kicks had.
+local function in_play()
+    local char = LocalPlayer.Character
+    if not char or not char.Parent then return false end
+    local alive = Workspace:FindFirstChild("Alive")
+    if alive and char.Parent == alive then return true end
+    if LocalPlayer:GetAttribute("LobbyParry") then return true end
+    if LocalPlayer:GetAttribute("LobbyTraining") then
+        local dead = Workspace:FindFirstChild("Dead")
+        if dead and char.Parent == dead then return true end
+    end
+    return false
+end
+local function wconnect(signal, fn)
+    local c = signal:Connect(function(...)
+        if not is_live() then return end
+        fn(...)
+    end)
+    Engine.watch[#Engine.watch + 1] = c
+end
+local function reevaluate()
+    if not Engine.armed then return end
+    if in_play() then
+        Engine.sleep_tok = nil
+        if not Engine.running then
+            if Engine.start() then Flight.write("engine AWAKE (in a round / training / lobby parry)") end
+        end
+    elseif Engine.running and not Engine.sleep_tok then
+        -- a short grace so a respawn or a quick hop doesn't flap it
+        local tok = {}
+        Engine.sleep_tok = tok
+        task.delay(1.5, function()
+            if Engine.sleep_tok ~= tok then return end
+            Engine.sleep_tok = nil
+            if Engine.armed and Engine.running and not in_play() then
+                Engine.stop()
+                Flight.write("engine ASLEEP (lobby) -- no loops, no remote listeners; hook: " .. Parry.hookState())
+            end
+        end)
+    end
+end
+function Engine.arm()
+    if Engine.armed then return end
+    Engine.armed = true
+    local function on_change() task.defer(reevaluate) end
+    local function watch_char(char) wconnect(char.AncestryChanged, on_change) end
+    if LocalPlayer.Character then watch_char(LocalPlayer.Character) end
+    wconnect(LocalPlayer.CharacterAdded, function(c) watch_char(c); on_change() end)
+    wconnect(LocalPlayer:GetAttributeChangedSignal("LobbyTraining"), on_change)
+    wconnect(LocalPlayer:GetAttributeChangedSignal("LobbyParry"), on_change)
+    -- the kick / error message, into the log file
+    pcall(function()
+        local GuiService = cloneref(game:GetService("GuiService"))
+        wconnect(GuiService.ErrorMessageChanged, function(msg)
+            Flight.write(("!!!! KICK / ERROR: %s | engine %s | hook %s"):format(tostring(msg),
+                Engine.running and "awake" or "asleep", Parry.hookState()))
+        end)
+    end)
+    Flight.write("parry/spam feature on -- engine " .. (in_play() and "waking" or "asleep until a round"))
+    reevaluate()
+    if not Engine.running and StatusHook then pcall(StatusHook, nil, true) end
+end
+function Engine.disarm()
+    if not Engine.armed then return end
+    Engine.armed, Engine.sleep_tok = false, nil
+    for _, c in ipairs(Engine.watch) do pcall(function() c:Disconnect() end) end
+    Engine.watch = {}
+    if Engine.running then Engine.stop() end
+    if StatusHook then pcall(StatusHook, nil, false) end
+    Flight.write("all parry/spam features off -- engine off; hook: " .. Parry.hookState())
 end
 function Engine.want(name, on)
     Engine.users[name] = on and true or nil
-    local any = next(Engine.users) ~= nil
-    if any and not Engine.running then
-        if not Engine.start() then Engine.users[name] = nil end
-    elseif not any and Engine.running then
-        Engine.stop()
-    end
+    if next(Engine.users) ~= nil then Engine.arm() else Engine.disarm() end
 end
 
 -- ===========================================================================
@@ -2914,9 +3023,9 @@ SB:AddLabel("Version: " .. SCRIPT_VERSION)
 SB:AddLabel("Idle = nothing connected. Each feature connects only while it's on.", true)
 
 local function set(label, text) pcall(function() label:SetText(text) end) end
-StatusHook = function(s)
+StatusHook = function(s, armed)
     if not s then
-        set(L_capture, "Capture: idle (engine off)")
+        set(L_capture, armed and "Capture: engine asleep in the lobby -- wakes when you join a round" or "Capture: idle (engine off)")
         set(L_clash, "Auto spam: off"); set(L_manual, "Manual spam: off")
         set(L_rate, "Spam rate: 0/s"); set(SpamRateLabel, "Actual: 0/s"); set(ClashLabel, "Status: off")
         return
@@ -2943,6 +3052,7 @@ Library:OnUnload(function()
     for _, f in pairs(Features) do pcall(function() f:setEnabled(false) end) end
     pcall(Orb.hide)
     Engine.users = {}
+    pcall(Engine.disarm)
     pcall(Engine.stop)
     if genv.__BladeBallInstance == INSTANCE then genv.__BladeBallInstance = nil end
 end)
@@ -2951,6 +3061,7 @@ genv.__BladeBallShutdown = function()
     for _, f in pairs(Features) do pcall(function() f:setEnabled(false) end) end
     pcall(Orb.hide)
     Engine.users = {}
+    pcall(Engine.disarm)
     pcall(Engine.stop)
     pcall(function() Library:Unload() end)
     if genv.__BladeBallInstance == INSTANCE then genv.__BladeBallInstance = nil end
