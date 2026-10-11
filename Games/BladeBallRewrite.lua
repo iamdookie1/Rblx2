@@ -30,7 +30,7 @@
 
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.6"
+local SCRIPT_VERSION = "rewrite-0.5.7"
 
 -- ---------------------------------------------------------------------------
 -- Single instance.
@@ -638,14 +638,35 @@ return function(self, ...)
     end
     return pass(pc(box.nc, self, ...))
 end]]
+    -- The FireServer body gets the same treatment as the namecall body: the real
+    -- call runs in pcall and an error is re-raised stamped with the GAME's calling
+    -- line. A C error is stamped with the line that called it; called straight
+    -- through this body, a deliberate bad call (a probe) came back stamped with
+    -- the hook's line instead of the game's -- a tell the namecall body already
+    -- hid but this one didn't.
     local FIRE_SRC = [[
-local box, sel = ...
+local box, sel, pc, err, info, typ, find = ...
+local function pass(ok, ...)
+    if ok then return ... end
+    local e = ...
+    if typ(e) == "string" and not find(e, "^[^\n]-:%d+: ") then
+        for lvl = 2, 12 do
+            local src, line = info(lvl, "sl")
+            if src == nil then break end
+            if src ~= "[C]" and src ~= box.me and line and line > 0 then
+                e = src .. ":" .. line .. ": " .. e
+                break
+            end
+        end
+    end
+    return err(e, 0)
+end
 return function(self, ...)
     local l = box.list
     if box.want and #l < 4 and sel("#", ...) >= 6 then
         l[#l + 1] = {self, sel("#", ...), {...}, box.now(box.ws)}
     end
-    return box.fire(self, ...)
+    return pass(pc(box.fire, self, ...))
 end]]
     local function build_body(src, ...)
         local args = table.pack(...)
@@ -658,14 +679,33 @@ end]]
     end
     local NC_BODY = build_body(NC_SRC, box, getnamecallmethod_ or function() return nil end, select,
         pcall, error, debug.info, type, string.find)
-    local FIRE_BODY = build_body(FIRE_SRC, box, select)
+    local FIRE_BODY = build_body(FIRE_SRC, box, select, pcall, error, debug.info, type, string.find)
+    -- No loadstring on this executor: same bodies (not disguised under a game
+    -- chunk name), still re-stamping errors with the game's line -- frames from
+    -- this script are skipped.
+    local own_src = debug.info(1, "s")
+    local function fb_pass(ok, ...)
+        if ok then return ... end
+        local e = ...
+        if type(e) == "string" and not string.find(e, "^[^\n]-:%d+: ") then
+            for lvl = 2, 12 do
+                local src, line = debug.info(lvl, "sl")
+                if src == nil then break end
+                if src ~= "[C]" and src ~= own_src and line and line > 0 then
+                    e = src .. ":" .. line .. ": " .. e
+                    break
+                end
+            end
+        end
+        return error(e, 0)
+    end
     if not NC_BODY then
         NC_BODY = function(self, ...)
             local l = box.list
             if box.want and #l < 4 and getnamecallmethod_() == "FireServer" and select("#", ...) >= 6 then
                 l[#l + 1] = { self, select("#", ...), { ... }, box.now(box.ws) }
             end
-            return box.nc(self, ...)
+            return fb_pass(pcall(box.nc, self, ...))
         end
     end
     if not FIRE_BODY then
@@ -674,13 +714,25 @@ end]]
             if box.want and #l < 4 and select("#", ...) >= 6 then
                 l[#l + 1] = { self, select("#", ...), { ... }, box.now(box.ws) }
             end
-            return box.fire(self, ...)
+            return fb_pass(pcall(box.fire, self, ...))
         end
     end
     local H = { fire = nil, nc = nil, want = false, until_t = 0, oth = false, oth_kept = nil }
+    -- oth is used only where it can take its hook down again. Without oth.unhook
+    -- its FireServer hook would stay in place for the rest of the session (pass-
+    -- through) -- the easiest thing for a periodic scan to find -- so then a hook
+    -- that comes off cleanly is used instead: FireServer via hookfunction when
+    -- restorefunction exists, else __namecall (put back by writing the original
+    -- function straight into the metatable). Every hook is up only for the one
+    -- press (about the measured send time) and comes down the frame it's read.
     local function capture_method()
         local m = getgenv().CaptureHook or "oth"
-        if m == "oth" and not (oth_hook and FIRE_FN) then m = "Namecall" end
+        if m == "oth" or m == "Both" then
+            local oth_ok = oth_hook and oth_unhook and FIRE_FN
+            if m == "oth" and not oth_ok then
+                m = (hookfunction_ and restore_ and FIRE_FN) and "FireServer" or "Namecall"
+            end
+        end
         return m
     end
     local function restore_namecall(original)
@@ -762,7 +814,7 @@ end]]
         if H.fire or H.nc then return true end
         box.list = {}
         local method = capture_method()
-        if method == "oth" or (method == "Both" and oth_hook and FIRE_FN) then
+        if method == "oth" or (method == "Both" and oth_hook and oth_unhook and FIRE_FN) then
             if H.oth_kept then
                 H.fire, box.fire, H.oth = H.oth_kept, H.oth_kept, true
             else
