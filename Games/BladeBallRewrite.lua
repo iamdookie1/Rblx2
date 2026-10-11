@@ -30,7 +30,7 @@
 
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.7"
+local SCRIPT_VERSION = "rewrite-0.5.8"
 
 -- ---------------------------------------------------------------------------
 -- Single instance.
@@ -1766,11 +1766,13 @@ end]]
         local char = LocalPlayer.Character
         if not (char and char:IsDescendantOf(Workspace)) then return end
         G.until_t = 0
-        local lp = Core.last_parry
-        if Core.pending and lp and lp.info and lp.info.eta and lp.info.eta < 0.9 then
-            local took = clock_() - lp.t
-            if took < 1 then Core.interp = math.clamp(Core.interp * 0.7 + (lp.info.eta - took) * 0.3, 0.02, 0.3) end
-        end
+        -- Core.interp stays fixed. Until 0.5.8 every landed remote parry nudged it
+        -- by (predicted eta - time until this event). The event comes back about
+        -- one round trip after the send, not at contact, so each hit pushed it up
+        -- (0.14 -> 0.30 in ~5 hits), and a missed parry never pulled it back down.
+        -- Every parry fired a little earlier than the one before; once the ball
+        -- was fast, it went ~75 studs early: "animation, no parry after a few
+        -- hits", on every mode.
         Core.pending, Core.misses = nil, 0
         for _, st in pairs(tracked) do if st.target == me and st.pass_open then st.landed = true end end
         spam_instant()
