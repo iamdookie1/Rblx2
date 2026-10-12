@@ -5,7 +5,8 @@
 -- DESIGN CONTRACT -- "inert until enabled":
 --   At load this script builds the UI and NOTHING else -- no game remotes, no
 --   RunService connections, no hooks, no module requires, no remote-folder
---   resolve. One Engine owns every parry/spam connection; it starts with the
+--   resolve -- only a listener for the kick message, so the log file can say
+--   what was on when it came. One Engine owns every parry/spam connection; it starts with the
 --   first parry/spam feature and tears everything down with the last. Every
 --   other feature (detections, cosmetics, ESP, overlays, skins...) owns its own
 --   connections and releases them when turned off. All off == UI-only footprint.
@@ -30,7 +31,7 @@
 
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.8"
+local SCRIPT_VERSION = "rewrite-0.5.9"
 
 -- ---------------------------------------------------------------------------
 -- Single instance.
@@ -58,6 +59,7 @@ local CoreGui = cloneref(game:GetService('CoreGui'))
 local Debris = cloneref(game:GetService('Debris'))
 local LocalPlayer = Players.LocalPlayer
 local clock_ = os.clock
+local LOAD_T = clock_()
 local isMobile = UserInputService.TouchEnabled and not UserInputService.MouseEnabled
 -- on-screen controls only on touch devices with no keyboard (no UI on PC)
 local touchUI = UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled
@@ -78,6 +80,7 @@ end
 -- turning it off releases all of them.
 -- ---------------------------------------------------------------------------
 local Features = {}
+local feature_log -- the log file writer (set once it exists, below)
 local function Feature(name)
     local f = { name = name, on = false, _conns = {}, _insts = {}, _token = nil }
     function f:connect(signal, fn)
@@ -109,6 +112,7 @@ local function Feature(name)
         v = v and true or false
         if v == self.on then return end
         self.on = v
+        if feature_log then pcall(feature_log, ("%s %s"):format(name, v and "ON" or "OFF")) end
         if v then
             self._token = {}
             if self.start then pcall(self.start) end
@@ -717,7 +721,7 @@ end]]
             return fb_pass(pcall(box.fire, self, ...))
         end
     end
-    local H = { fire = nil, nc = nil, want = false, until_t = 0, oth = false, oth_kept = nil }
+    local H = { fire = nil, nc = nil, want = false, until_t = 0, oth = false, oth_kept = nil, up_at = nil, down_at = nil, ups = 0 }
     -- oth is used only where it can take its hook down again. Without oth.unhook
     -- its FireServer hook would stay in place for the rest of the session (pass-
     -- through) -- the easiest thing for a periodic scan to find -- so then a hook
@@ -749,6 +753,7 @@ end]]
         local fire, nc, was_oth = H.fire, H.nc, H.oth
         H.fire, H.nc, H.want, box.want, H.oth = nil, nil, false, false, false
         if not (fire or nc) then return end
+        H.down_at = clock_()
         local how
         if fire and was_oth then
             if oth_unhook and pcall(oth_unhook, FIRE_FN) then how = "oth hook removed"
@@ -767,9 +772,12 @@ end]]
         logp("hook down: " .. tostring(how))
     end
     function Parry.hookState()
-        if H.fire or H.nc then return "up (capturing)" end
+        local now = clock_()
+        if H.fire or H.nc then return ("UP right now (capturing, up %.2fs)"):format(now - (H.up_at or now)) end
         if H.oth_kept then return "oth hook left in place (pass-through)" end
-        return "none"
+        if not H.up_at then return "none -- never put up this session" end
+        return ("none -- last up %.1fs ago, down %.1fs ago (%d time(s) this session)"):format(
+            now - H.up_at, now - (H.down_at or now), H.ups)
     end
     local JOB_ID = game.JobId
     -- CAPTURE RIDES ON A REAL PARRY. A capture is taken only from a block press
@@ -830,6 +838,7 @@ end]]
             if ok and type(old) == 'function' then H.nc, box.nc = old, old end
         end
         if not (H.fire or H.nc) then H.want = false; return false end
+        H.up_at, H.ups = clock_(), H.ups + 1
         box.want = true
         local gen0 = Core.gen
         task.spawn(function()
@@ -1491,7 +1500,7 @@ end]]
         end
         return false
     end
-    local function fire(st, now, via, info)
+    local function fire(st, now, via, info, ball)
         local how
         -- no capture yet, or the last remote parry went unanswered (the capture
         -- may be stale): this parry is a native press, which parries by itself
@@ -1508,6 +1517,13 @@ end]]
             Anim.block() -- a remote parry has no swing of its own; the key and abilities do
         end
         Core.last_parry = { t = now, via = via, info = info }
+        -- a key press is answered (or not) like a remote parry: same miss check
+        if how ~= "remote" and how ~= "ability" then Core.pending = clock_() + (parry_window() or 0.5) + ping_s() + 0.3 end
+        -- watch this ball until the parry is answered: when it actually got
+        -- closest to us says whether a miss was early, late, or on time
+        local root = getRoot()
+        Core.watch = ball and root and { ball = ball, t = now, how = how, d0 = (ball.Position - root.Position).Magnitude,
+            min_d = math.huge, min_t = now, ping = ping_s(), W = parry_window() or 0.5, lead = info and info.lead } or nil
         mark_parried(st, now)
         if info then
             logp(("%s [%s] dist %.0f spd %.0f head %.2f eta %.2f lead %.2f%s"):format(via, how, info.dist or 0,
@@ -1546,13 +1562,13 @@ end]]
         -- sideways can look "inside reach" while it actually curves past (the
         -- bench caught exactly that); those go through the estimators below.
         if rem <= 3 or (straight <= reach and heading >= 0.9) then
-            return fire(st, now, via == "retarget" and "instant retarget" or "point blank", info)
+            return fire(st, now, via == "retarget" and "instant retarget" or "point blank", info, ball)
         end
         if via == "retarget" then
             -- its velocity may still be the old one at the flip: fire straight off
             -- the event only if it's clearly coming at us; else the velocity update
             -- (a moment later) or the next frame point decides.
-            if heading >= 0.5 and straight <= lead then return fire(st, now, "instant retarget", info) end
+            if heading >= 0.5 and straight <= lead then return fire(st, now, "instant retarget", info, ball) end
             return
         end
         local mode = S.anticurve
@@ -1563,7 +1579,7 @@ end]]
             -- classic: wait until it points at us, then fire on time or distance
             local thr = math.clamp((S.dot_threshold or 0.5) - pingMs() / 1000, -0.2, 0.95)
             if heading < thr then return end
-            if dist <= parry_distance(speed) then return fire(st, now, "auto parry (dot)", info) end
+            if dist <= parry_distance(speed) then return fire(st, now, "auto parry (dot)", info, ball) end
         elseif heading < 0.985 then
             -- SMART: median of three arrival estimates
             local horizon = lead + 0.35
@@ -1589,13 +1605,13 @@ end]]
         -- safety net: the classic distance trigger for a ball coming in nearly straight
         local net = heading >= 0.85 and dist <= parry_distance(speed) and straight <= reach + W * 0.85
         if eta <= lead or net then
-            return fire(st, now, via == "velocity" and "auto parry (velocity)" or "auto parry", info)
+            return fire(st, now, via == "velocity" and "auto parry (velocity)" or "auto parry", info, ball)
         end
     end
 
     local function trigger(ball, st, now)
         if pass_busy(st, now) or has_clash(ball, now) or blocked_by_detection() then return end
-        fire(st, now, "triggerbot", nil)
+        fire(st, now, "triggerbot", nil, ball)
     end
 
     local function try_preparry(ball, st, root, now)
@@ -1700,6 +1716,27 @@ end]]
         end
     end
 
+    -- Why a parry went unanswered. Our parry reaches the server about half a
+    -- round trip after we fire, and the server's ball is about half a round trip
+    -- ahead of the one we see, so (in what we see) the parry is up from about
+    -- `ping` after the fire for `W`. Where the ball's closest approach fell
+    -- against that says early / late / on time.
+    local function miss_verdict(w)
+        if not w then return "parry unanswered (no ball watched)" end
+        local head = ("parry unanswered [%s]: fired at %.0f studs"):format(tostring(w.how), w.d0)
+        if w.min_d == math.huge then return head .. " -- ball gone before it got near" end
+        local dt = w.min_t - w.t
+        local open, close = w.ping, w.ping + w.W
+        local tail = ("; closest %.0f studs, %.2fs after the fire (parry up ~%.2f-%.2fs, ping %.0fms%s)"):format(
+            w.min_d, dt, open, close, w.ping * 1000, w.lead and (", lead %.2f"):format(w.lead) or "")
+        local verdict
+        if w.min_d > 15 then verdict = " -> ball never reached you (curved off / went elsewhere): not a timing miss"
+        elseif dt > close then verdict = (" -> EARLY by %.2fs"):format(dt - close)
+        elseif dt < open then verdict = (" -> LATE by %.2fs"):format(open - dt)
+        else verdict = " -> ON TIME by what we see: the server didn't count it" end
+        return head .. tail .. verdict
+    end
+
     function Parry.frame(dt, point)
         if not active or not is_live() then return end
         local now = clock_()
@@ -1713,13 +1750,25 @@ end]]
                 Core.ctx, Core.cap = ctx, Core.caps[ctx]
                 Core.misses, Core.pending = 0, nil
             end
+            local w = Core.watch
+            if w then
+                local root = getRoot()
+                if w.ball.Parent and root and now - w.t < 2.5 then
+                    local d = (w.ball.Position - root.Position).Magnitude
+                    if d < w.min_d then w.min_d, w.min_t = d, now end
+                end
+            end
             if Core.pending and now > Core.pending then
                 Core.pending, Core.misses = nil, Core.misses + 1
-                if Core.misses >= 2 then
+                logp(miss_verdict(Core.watch))
+                Core.watch = nil
+                if S.parry_mode == "Keypress" then
+                    Core.misses = 0
+                elseif Core.misses >= 2 then
                     Core.cap, Core.misses = nil, 0
-                    logp("2 remote parries unanswered: capture dropped, the next parry takes a fresh one")
+                    logp("  2 unanswered in a row: capture dropped, the next parry takes a fresh one")
                 else
-                    logp("remote parry unanswered: the next parry is a native press that refreshes the capture")
+                    logp("  the next parry is a native press that refreshes the capture")
                 end
             end
             if not Core.cap then prime_capture(now) end
@@ -1766,6 +1815,11 @@ end]]
         local char = LocalPlayer.Character
         if not (char and char:IsDescendantOf(Workspace)) then return end
         G.until_t = 0
+        local w = Core.watch
+        if Core.pending and w then
+            logp(("  -> landed %.2fs after the parry (fired at %.0f studs)"):format(clock_() - w.t, w.d0))
+        end
+        Core.watch = nil
         -- Core.interp stays fixed. Until 0.5.8 every landed remote parry nudged it
         -- by (predicted eta - time until this event). The event comes back about
         -- one round trip after the send, not at contact, so each hit pushed it up
@@ -1839,13 +1893,15 @@ end]]
         for k in pairs(tracked) do tracked[k] = nil end
         end_clash("engine off")
         Pump.credit, Pump.on, Pump.waiting = 0, false, false
-        Core.pending, Core.misses = nil, 0
+        Core.pending, Core.misses, Core.watch = nil, 0, nil
         G.until_t, Capture.dry, Capture.since = 0, 0, nil
     end
     -- one parry outside the engine (Slashes of Fury): remote if armed, else a
     -- native press that also captures
     function Parry.spamParry()
         if not Parry.resolve() then return false end
+        -- both modes on Keypress: a plain press, never a hook
+        if S.parry_mode == "Keypress" and SP.mode == "Keypress" then return pressBlockKey() end
         if Core.cap and send(true) == "sent" then Anim.spamBlock(); return true end
         return key_parry(Core.cap == nil)
     end
@@ -1885,7 +1941,11 @@ local StatusHook, UiTick
 -- Log file: workspace/BladeBall/rewrite_log.txt. Everything the parry log shows
 -- plus engine wake/sleep, hook state and the kick message, so after a kick the
 -- last lines say exactly what the script was doing. Written by the executor;
--- the game can't see it. Nothing is written until something happens.
+-- the game can't see it. Until 0.5.9 the kick listener only existed while a
+-- parry/spam feature was on, so a kick with everything off (on load) wrote
+-- nothing at all. Now it's there from load, and the kick line carries how long
+-- after load it came, every feature that was on, and whether / how long ago the
+-- capture hook was up -- one kick tells "detected by load" from "by the hook".
 local Flight = { path = "BladeBall/rewrite_log.txt", started = false }
 function Flight.write(line)
     pcall(function()
@@ -1894,10 +1954,11 @@ function Flight.write(line)
             if makefolder and isfolder and not isfolder("BladeBall") then makefolder("BladeBall") end
             if writefile then writefile(Flight.path, ("==== %s session %s\n"):format(SCRIPT_VERSION, os.date("%Y-%m-%d %H:%M:%S"))) end
         end
-        if appendfile then appendfile(Flight.path, ("[%s] %s\n"):format(os.date("%H:%M:%S"), tostring(line))) end
+        if appendfile then appendfile(Flight.path, ("[%s +%6.1fs] %s\n"):format(os.date("%H:%M:%S"), clock_() - LOAD_T, tostring(line))) end
     end)
 end
 Parry.onLog = Flight.write
+feature_log = Flight.write
 
 local Engine = { users = {}, conns = {}, watch = {}, running = false, armed = false, status_at = 0, tick_at = 0, sleep_tok = nil }
 local function econnect(signal, fn)
@@ -2010,14 +2071,6 @@ function Engine.arm()
     wconnect(LocalPlayer.CharacterAdded, function(c) watch_char(c); on_change() end)
     wconnect(LocalPlayer:GetAttributeChangedSignal("LobbyTraining"), on_change)
     wconnect(LocalPlayer:GetAttributeChangedSignal("LobbyParry"), on_change)
-    -- the kick / error message, into the log file
-    pcall(function()
-        local GuiService = cloneref(game:GetService("GuiService"))
-        wconnect(GuiService.ErrorMessageChanged, function(msg)
-            Flight.write(("!!!! KICK / ERROR: %s | engine %s | hook %s"):format(tostring(msg),
-                Engine.running and "awake" or "asleep", Parry.hookState()))
-        end)
-    end)
     Flight.write("parry/spam feature on -- engine " .. (in_play() and "waking" or "asleep until a round"))
     reevaluate()
     if not Engine.running and StatusHook then pcall(StatusHook, nil, true) end
@@ -2032,8 +2085,29 @@ function Engine.disarm()
     Flight.write("all parry/spam features off -- engine off; hook: " .. Parry.hookState())
 end
 function Engine.want(name, on)
+    if (Engine.users[name] ~= nil) ~= (on and true or false) then Flight.write(("%s %s"):format(name, on and "ON" or "OFF")) end
     Engine.users[name] = on and true or nil
     if next(Engine.users) ~= nil then Engine.arm() else Engine.disarm() end
+end
+
+-- From load: a load line, then (only if it happens) the kick with full context.
+do
+    local exec = "?"
+    pcall(function() exec = table.concat({ identifyexecutor() }, " ") end)
+    Flight.write(("loaded | executor %s | place %s"):format(exec, tostring(game.PlaceId)))
+    pcall(function()
+        local GuiService = cloneref(game:GetService("GuiService"))
+        Flight.kick_conn = GuiService.ErrorMessageChanged:Connect(function(msg)
+            if not is_live() then return end
+            local on = {}
+            for name, f in pairs(Features) do if f.on then on[#on + 1] = name end end
+            for name in pairs(Engine.users) do on[#on + 1] = name end
+            table.sort(on)
+            Flight.write(("!!!! KICK / ERROR: %s"):format(tostring(msg)))
+            Flight.write(("     %.1fs after load | on: %s | engine %s | hook %s"):format(clock_() - LOAD_T,
+                #on > 0 and table.concat(on, ", ") or "NOTHING", Engine.running and "awake" or "asleep", Parry.hookState()))
+        end)
+    end)
 end
 
 -- ===========================================================================
@@ -3108,6 +3182,7 @@ Library:OnUnload(function()
     Engine.users = {}
     pcall(Engine.disarm)
     pcall(Engine.stop)
+    pcall(function() Flight.kick_conn:Disconnect() end)
     if genv.__BladeBallInstance == INSTANCE then genv.__BladeBallInstance = nil end
 end)
 
@@ -3117,6 +3192,7 @@ genv.__BladeBallShutdown = function()
     Engine.users = {}
     pcall(Engine.disarm)
     pcall(Engine.stop)
+    pcall(function() Flight.kick_conn:Disconnect() end)
     pcall(function() Library:Unload() end)
     if genv.__BladeBallInstance == INSTANCE then genv.__BladeBallInstance = nil end
 end
