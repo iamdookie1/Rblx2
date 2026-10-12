@@ -125,15 +125,22 @@ local Control = {
 
 local Better = {
     Enabled = false,
-    Pace = "Speed",       -- Speed: studs/s from the streak / Travel time: each trip takes a set time
-    BaseSpeed = 80,       -- studs/s at streak 0
-    GainMode = "Add",     -- Add: + Gain per parry / Multiply: x Multiplier per parry
-    Gain = 3,
-    Multiplier = 1.05,
-    MaxSpeed = 400,       -- any number, 1e9 and inf included
-    TravelTime = 0.35,    -- seconds per trip, Travel time pace
+    Pace = "Speed",       -- Speed: studs/s / Travel time: seconds per trip, both ramped over the rally
+    BaseSpeed = 80,       -- studs/s at the start of a rally
+    MaxSpeed = 400,       -- studs/s at the end of the ramp; any number, 1e9 and inf included
+    TravelTime = 0.35,    -- seconds per trip at the start of a rally
+    MinTravelTime = 0.02, -- seconds per trip at the end of the ramp
+    RampParries = 1000,   -- parries this rally to go from start to top
+    Curve = "Exponential",-- how the ramp climbs: Linear / Exponential / Ease in / Ease out / Smooth / Add per parry / Multiply per parry / Instant
+    Gain = 3,             -- Add per parry
+    Multiplier = 1.05,    -- Multiply per parry
+    TimeScale = 1,        -- slow motion below 1, fast forward above
     InstantBots = false,  -- bots send it back the moment it is sent to them
-    HitsPerFrame = 1,     -- most parries one frame may hold, at speeds that cover several trips a frame
+    HitsPerFrame = 1,     -- normal rules: most parries one frame may hold
+    Turbo = true,         -- with auto parry + sync: the script's own parry, settled in plain math
+    TurboPerFrame = 5000, -- turbo: most parries one frame may hold
+    StopAt = 0,           -- rally to stop at, 0 = never
+    AtTarget = "Pause",   -- Keep going / Pause / End round (saves best)
     YouChance = 50,       -- % a bot sends it at you when there are two bots
     HitRadius = 5,        -- studs from your root that counts as reaching you
     ParryWindow = 0.7,    -- seconds a parry protects you
@@ -152,9 +159,13 @@ local Visual = {
     FxColor = Color3.fromRGB(255, 255, 255),
     HideGameFx = false,
     HitVolume = 0.5,
+    RallyBeam = true, BeamFrom = 2, BeamWidth = 1,
+    Hud = false, HudScale = 1,
+    Milestones = true, MilestoneEvery = 1000, MilestoneFx = true, MilestoneNotify = true,
+    UncapFps = false, FpsCap = 240,
 }
 
-local Stats = { Parries = 0, Speed = 0, Distance = 0, Status = "idle", PerSecond = 0 }
+local Stats = { Parries = 0, Speed = 0, Distance = 0, Status = "idle", PerSecond = 0, FrameHits = 0 }
 
 --// helpers -----------------------------------------------------------------
 
@@ -491,19 +502,39 @@ if LocalPlayer.Character then task.spawn(watchGameFx, LocalPlayer.Character) end
 track(LocalPlayer.CharacterAdded:Connect(function(char) task.spawn(watchGameFx, char) end))
 
 --// better ball -------------------------------------------------------------
+-- The ball runs as a chain of legs: bot -> you -> bot -> ... Each leg has a
+-- start point, a live end point (you move, so it follows you) and a duration
+-- worked out when it starts, from this rally's ramp. Frames hand the engine
+-- time, not steps, so a leg shorter than a frame finishes and the next leg
+-- starts with what is left.
+--
+-- Two ways a leg that ends on you is settled:
+--  * normal: the game's rules, the "Deflecting" / "Debounce" values on your
+--    character, the Deflect event, the grace window, death.
+--  * turbo (better ball + auto parry + turbo on): the script parries itself,
+--    in plain math. Nothing in the game is touched per hit; the streak, the
+--    speed value, the counter and the effects get one update per frame with
+--    however many parries that frame held. That is what lets it run at tens
+--    of thousands a second.
 
 local Engine = {
     Running = false,
     Ball = nil,
-    Target = nil,       -- "p1" / "p2" / "you"
-    Speed = 0,
+    Rally = 0,          -- parries this round, the ramp's input
+    Leg = nil,          -- { From = Vector3, To = "you" | "p1" | "p2", T = 0, Duration = s }
     GraceUntil = nil,
+    Paused = false,
     Attachment = nil,
     Highlight = nil,
     BallHighlight = nil,
     Deflecting = nil,
     Debounce = nil,
+    Pending = 0,        -- turbo parries not yet handed to the game this frame
+    Speed = 0,          -- studs/s of the current leg, for display
+    LegTime = 0,
 }
+
+local Session = { Peak = 0, BestRally = 0, Total = 0, Started = os.clock() }
 
 local function botPart(name)
     if name == "p1" then return Bot1 end
@@ -529,35 +560,76 @@ local function wander(bot, home, indicator)
     end)
 end
 
-local function streakSpeed()
-    local streak = leaderstat("Streak")
-    local speed
-    if Better.GainMode == "Multiply" then
-        speed = Better.BaseSpeed * (Better.Multiplier ^ streak)
-    else
-        speed = Better.BaseSpeed + Better.Gain * streak
-    end
-    if speed ~= speed then speed = Better.MaxSpeed end
-    return math.max(math.min(speed, Better.MaxSpeed), 1)
+-- 0..1 along the ramp for a rally of p parries, shaped by the curve.
+local function rampAlpha(p)
+    local n = math.max(Better.RampParries, 1)
+    local x = math.clamp(p / n, 0, 1)
+    local curve = Better.Curve
+    if curve == "Ease in" then return x * x end
+    if curve == "Ease out" then return 1 - (1 - x) * (1 - x) end
+    if curve == "Smooth" then return x * x * (3 - 2 * x) end
+    return x
 end
 
--- Speed for the trip about to start: from the streak, or whatever gets it
--- there in the set travel time.
-local function engineSpeed(distance)
-    if Better.Pace == "Travel time" and distance then
-        return math.max(distance / math.max(Better.TravelTime, 0.001), 1)
+-- From a to b over the ramp. Exponential moves in equal ratios instead of
+-- equal steps, so even 80 -> 1e9 climbs evenly instead of jumping.
+local function ramp(a, b, p)
+    local curve = Better.Curve
+    if curve == "Instant" then return b end
+    if curve == "Add per parry" then
+        if b >= a then return math.min(a + Better.Gain * p, b) end
+        return math.max(a - Better.Gain * p, b)
     end
-    return streakSpeed()
+    if curve == "Multiply per parry" then
+        local m = math.max(Better.Multiplier, 1)
+        if b >= a then return math.min(a * m ^ p, b) end
+        return math.max(a / m ^ p, b)
+    end
+    local alpha = rampAlpha(p)
+    -- an endless top speed is only reached at the end of the ramp; on the way
+    -- there it climbs toward 1e15
+    if b == math.huge then
+        if alpha >= 1 then return math.huge end
+        b = 1e15
+    end
+    if curve == "Exponential" and a > 0 and b > 0 then
+        return a * (b / a) ^ alpha
+    end
+    return a + (b - a) * alpha
 end
 
-local function setTarget(name)
-    Engine.Target = name
+-- How long a leg takes, from its length and the rally so far.
+local function legDuration(distance, toYou, p)
+    if not toYou and Better.InstantBots then return 0 end
+    local scale = math.max(Better.TimeScale, 0.01)
+    if Better.Pace == "Travel time" then
+        local t = ramp(Better.TravelTime, Better.MinTravelTime, p)
+        Engine.Speed = t > 0 and distance / t or math.huge
+        return math.max(t, 0) / scale
+    end
+    local speed = ramp(Better.BaseSpeed, Better.MaxSpeed, p)
+    Engine.Speed = speed
+    if speed == math.huge or speed <= 0 then return 0 end
+    return distance / speed / scale
+end
+
+-- positions read once per frame, so a frame with thousands of legs doesn't
+-- look them up thousands of times
+local FrameCache = nil
+
+local function targetPosition(name)
+    if FrameCache then return FrameCache[name] end
+    if name == "you" then
+        local _, root = myCharacter()
+        return root and root.Position
+    end
+    local bot = botPart(name)
+    return bot and bot.Position
+end
+
+local function paintBall(danger)
     local ball = Engine.Ball
     if not ball then return end
-    local _, root = myCharacter()
-    local goal = name == "you" and root or botPart(name)
-    Engine.Speed = engineSpeed(goal and (goal.Position - ball.Position).Magnitude)
-    local danger = name == "you"
     pcall(function()
         ball.Material = Enum.Material.Neon
         ball.Color = danger and Visual.DangerColor or (Visual.BallColor or Color3.fromRGB(163, 162, 165))
@@ -569,9 +641,34 @@ local function setTarget(name)
     end)
 end
 
+local function startLeg(from, to)
+    local goal = targetPosition(to)
+    local distance = goal and (goal - from).Magnitude or 0
+    if to == "you" then distance = math.max(distance - Better.HitRadius, 0) end
+    local duration = legDuration(distance, to == "you", Engine.Rally)
+    local leg = Engine.Leg
+    if not leg then
+        leg = {}
+        Engine.Leg = leg
+    end
+    leg.From, leg.To, leg.T, leg.Duration = from, to, 0, duration
+    Engine.LegTime = duration
+end
+
+local function nextBot()
+    if FrameCache then
+        if FrameCache.OneBot then return "p1" end
+        return math.random() < 0.5 and "p1" or "p2"
+    end
+    if oneBot() then return "p1" end
+    return math.random() < 0.5 and "p1" or "p2"
+end
+
 local function stopEngineRound()
     Engine.Running = false
     Engine.GraceUntil = nil
+    Engine.Leg = nil
+    Engine.Paused = false
     for _, key in ipairs({ "Ball", "Attachment", "Highlight", "Deflecting", "Debounce" }) do
         local inst = Engine[key]
         if inst then pcall(function() inst:Destroy() end) end
@@ -608,31 +705,73 @@ local function playClash(at)
     end)
 end
 
-local function engineDeflected()
-    local _, root = myCharacter()
-    if root then playClash(root) end
-    Engine.Deflecting.Value = 0
-    Engine.Debounce.Value = 0
-    Engine.GraceUntil = nil
-    Stats.Parries += 1
+-- rate tracking: { time, count } buckets over the last second
+local RateBuckets = {}
+local function countParries(n)
+    RateBuckets[#RateBuckets + 1] = { os.clock(), n }
+    Session.Total += n
+end
+
+local onMilestone -- set by the visuals below
+
+-- Hands parries to the game: the streak, its speed value and its counter, all
+-- in one go however many there were.
+local function commitParries(n)
+    if n <= 0 then return end
+    local before = Engine.Rally
+    Engine.Rally += n
+    if Engine.Rally > Session.BestRally then Session.BestRally = Engine.Rally end
+    countParries(n)
     pcall(function()
         local streak = LocalPlayer.leaderstats.Streak
-        streak.Value += 1
+        streak.Value += n
     end)
-    writeValue("Speed", readNumber("Speed", 2) + 1)
+    writeValue("Speed", readNumber("Speed", 2) + n)
     pcall(function() event("Count"):Fire(readNumber("Speed", 2)) end)
-    local next = (oneBot() or math.random() < 0.5) and "p1" or "p2"
-    setTarget(next)
+    if Visual.Milestones and Visual.MilestoneEvery > 0 then
+        local every = Visual.MilestoneEvery
+        if math.floor(Engine.Rally / every) > math.floor(before / every) and onMilestone then
+            onMilestone(math.floor(Engine.Rally / every) * every)
+        end
+    end
 end
 
 -- The game's deflect, for the better ball: BallMove's own copy is off with it.
--- instant: a parry landing this very frame (sync), so no timers are needed;
--- its animation and sound are thinned out at extreme rates.
 local DeflectToken = 0
 local LastDeflectFx = 0
-local function engineDeflect(instant)
+local function deflectVisual(root, hum)
+    local stamp = os.clock()
+    if stamp - LastDeflectFx < math.max(Visual.FxGap, 0.1) then return end
+    LastDeflectFx = stamp
+    pcall(function()
+        local animation = Instance.new("Animation")
+        animation.AnimationId = "rbxassetid://15173331151"
+        hum:LoadAnimation(animation):Play()
+    end)
+    if Visual.HideGameFx or Visual.BetterFx then return end
+    pcall(function()
+        if Assets.Other then
+            local sound = Assets.Other:Clone()
+            sound.Volume = 0.2
+            sound.Parent = root
+            sound:Play()
+            Debris:AddItem(sound, 0.5)
+        end
+        local shield = Assets.Shield and Assets.Shield:FindFirstChild("Attachment")
+        if shield then
+            local clone = shield:Clone()
+            clone.Parent = root
+            for _, emitter in ipairs(clone:GetChildren()) do
+                if emitter:IsA("ParticleEmitter") then emitter:Emit(emitter:GetAttribute("EmitCount") or 5) end
+            end
+            Debris:AddItem(clone, 0.45)
+        end
+    end)
+end
+
+local function engineDeflect()
     if not Engine.Running or not Engine.Debounce or not Engine.Deflecting then return end
-    if Engine.Debounce.Value > 0 and not instant then return end
+    if Engine.Debounce.Value > 0 then return end
     local char, root, hum = myCharacter()
     if not char then return end
     DeflectToken += 1
@@ -641,35 +780,7 @@ local function engineDeflect(instant)
     Engine.Debounce.Value = stamp
     Engine.Deflecting.Value = stamp
     pcall(function() event("Cooldown"):Fire() end)
-    if stamp - LastDeflectFx >= math.max(Visual.FxGap, 0.1) then
-        LastDeflectFx = stamp
-        pcall(function()
-            local animation = Instance.new("Animation")
-            animation.AnimationId = "rbxassetid://15173331151"
-            hum:LoadAnimation(animation):Play()
-        end)
-        if not Visual.HideGameFx and not Visual.BetterFx then
-            pcall(function()
-                if Assets.Other then
-                    local sound = Assets.Other:Clone()
-                    sound.Volume = 0.2
-                    sound.Parent = root
-                    sound:Play()
-                    Debris:AddItem(sound, 0.5)
-                end
-                local shield = Assets.Shield and Assets.Shield:FindFirstChild("Attachment")
-                if shield then
-                    local clone = shield:Clone()
-                    clone.Parent = root
-                    for _, emitter in ipairs(clone:GetChildren()) do
-                        if emitter:IsA("ParticleEmitter") then emitter:Emit(emitter:GetAttribute("EmitCount") or 5) end
-                    end
-                    Debris:AddItem(clone, 0.45)
-                end
-            end)
-        end
-    end
-    if instant then return end
+    deflectVisual(root, hum)
     task.delay(Better.ParryWindow, function()
         if token == DeflectToken and Engine.Deflecting and Engine.Deflecting.Value == stamp then
             Engine.Deflecting.Value = 0
@@ -678,6 +789,148 @@ local function engineDeflect(instant)
     task.delay(Better.Cooldown, function()
         if Engine.Debounce and Engine.Debounce.Value == stamp then Engine.Debounce.Value = 0 end
     end)
+end
+
+local function turboOn()
+    return Better.Enabled and Better.Turbo and Parry.Enabled and Parry.Sync
+end
+
+local function endRound()
+    local _, _, hum = myCharacter()
+    if hum then hum.Health = 0 end
+end
+
+-- Normal-rules settle of a leg ending on you. Returns true when it was parried.
+local function settleOnYou(root, hum)
+    if Engine.Deflecting and Engine.Deflecting.Value ~= 0 then
+        -- parried
+    elseif Parry.Enabled and Parry.Sync and Engine.Debounce and Engine.Debounce.Value == 0 then
+        -- sync: the parry lands on the exact frame of contact
+        deflectVisual(root, hum)
+    else
+        Engine.GraceUntil = Engine.GraceUntil or (os.clock() + readNumber("Mode", 0.09))
+        return false
+    end
+    Engine.Deflecting.Value = 0
+    Engine.Debounce.Value = 0
+    Engine.GraceUntil = nil
+    playClash(root)
+    commitParries(1)
+    return true
+end
+
+local function stopTarget()
+    return Better.StopAt > 0 and Engine.Rally >= Better.StopAt
+end
+
+local function engineStep(dt)
+    local ball = Engine.Ball
+    local _, root, hum = myCharacter()
+    if not ball or not ball.Parent or not root or not Engine.Leg then return end
+
+    if Engine.GraceUntil then
+        -- sitting on you, waiting out the parry window the game gives
+        ball.Position = root.Position
+        if Engine.Deflecting and Engine.Deflecting.Value ~= 0 then
+            Engine.GraceUntil = nil
+            if settleOnYou(root, hum) then startLeg(root.Position, nextBot()) end
+        elseif os.clock() >= Engine.GraceUntil then
+            Engine.GraceUntil = nil
+            hum.Health = 0
+        end
+        return
+    end
+
+    if Control.FreezeBall or Engine.Paused then return end
+
+    local turbo = turboOn()
+    local cap = turbo and Better.TurboPerFrame or Better.HitsPerFrame
+    FrameCache = {
+        you = root.Position,
+        p1 = Bot1 and Bot1.Position,
+        p2 = Bot2 and Bot2.Position,
+        OneBot = oneBot(),
+    }
+    local single = FrameCache.OneBot
+    local budget = dt
+    local hits = 0
+    local botsVisited = {}
+    local guard = 0
+    while guard < 1e6 do
+        guard += 1
+        local leg = Engine.Leg
+        local remaining = leg.Duration - leg.T
+        if remaining > budget then
+            leg.T += budget
+            break
+        end
+        budget -= remaining
+        -- the leg lands
+        local landed = targetPosition(leg.To) or leg.From
+        if leg.To == "you" then
+            if turbo then
+                hits += 1
+                Engine.Rally += 1 -- the ramp moves on now; the game hears once per frame
+                startLeg(landed, nextBot())
+            else
+                Engine.Leg.T = Engine.Leg.Duration
+                if not settleOnYou(root, hum) then
+                    FrameCache = nil
+                    ball.Position = landed
+                    paintBall(true)
+                    return
+                end
+                hits += 1
+                startLeg(landed, nextBot())
+            end
+            if stopTarget() then break end
+            if hits >= cap then
+                -- this frame is full: the rest of its time is dropped, not owed
+                Engine.Leg.T = 0
+                break
+            end
+        else
+            botsVisited[leg.To] = true
+            -- one bot always sends it at you; with two, the other bot is a maybe
+            local to = "you"
+            if leg.To == "p1" and not single and math.random(100) > Better.YouChance then to = "p2" end
+            startLeg(landed, to)
+        end
+    end
+
+    FrameCache = nil
+
+    if turbo and hits > 0 then
+        Engine.Rally -= hits -- commitParries adds them back with the game's side
+        commitParries(hits)
+        deflectVisual(root, hum)
+        playClash(root)
+    end
+    Stats.FrameHits = hits
+
+    for name in pairs(botsVisited) do
+        local bot = botPart(name)
+        pcall(function() bot.Ding:Play() end)
+        if name == "p1" then wander(Bot1, Home1, Indicator1) else wander(Bot2, Home2, Indicator2) end
+    end
+
+    -- draw the ball where the current leg has it
+    local leg = Engine.Leg
+    local goal = targetPosition(leg.To) or leg.From
+    local alpha = leg.Duration > 0 and math.clamp(leg.T / leg.Duration, 0, 1) or 1
+    ball.Position = leg.From:Lerp(goal, alpha)
+    paintBall(leg.To == "you")
+
+    if stopTarget() and not Engine.Paused then
+        if Better.AtTarget == "Pause" then
+            Engine.Paused = true
+            log("Success", ("reached %d, ball paused"):format(Engine.Rally))
+        elseif Better.AtTarget == "End round (saves best)" then
+            log("Success", ("reached %d, ending the round to save it"):format(Engine.Rally))
+            task.defer(endRound)
+            Engine.Paused = true
+        end
+    end
 end
 
 local function engineStart()
@@ -733,7 +986,8 @@ local function engineStart()
     ball.CanCollide = false
     ball.CanQuery = false
     ball.CanTouch = false
-    if Bot1 then ball.Position = Bot1.Position + Vector3.new(0, 4, 0) end
+    local start = Bot1 and (Bot1.Position + Vector3.new(0, 4, 0)) or root.Position + Vector3.new(0, 10, 30)
+    ball.Position = start
     ball.Parent = Workspace
     Engine.Ball = ball
     Engine.BallHighlight = Instance.new("Highlight")
@@ -741,7 +995,9 @@ local function engineStart()
     Engine.BallHighlight.Parent = ball
 
     writeValue("Speed", Control.StartSpeed)
-    setTarget("p1")
+    Engine.Rally = 0
+    Engine.Paused = false
+    startLeg(start, "p1")
     Engine.Running = true
     Stats.Status = "better ball"
 
@@ -758,80 +1014,6 @@ local function engineStart()
             stats.Streak.Value = 0
         end)
     end)
-end
-
-local function engineArrive()
-    local name = Engine.Target
-    if name == "you" then
-        if Engine.Deflecting and Engine.Deflecting.Value ~= 0 then
-            engineDeflected()
-        elseif Parry.Enabled and Parry.Sync and Engine.Debounce and Engine.Debounce.Value == 0 then
-            -- sync: the parry lands on the exact frame of contact
-            engineDeflect(true)
-            engineDeflected()
-        elseif not Engine.GraceUntil then
-            Engine.GraceUntil = os.clock() + readNumber("Mode", 0.09)
-        end
-        return
-    end
-    local bot = botPart(name)
-    pcall(function() bot.Ding:Play() end)
-    if name == "p1" then wander(Bot1, Home1, Indicator1) else wander(Bot2, Home2, Indicator2) end
-    -- one bot always sends it at you; with two, the other bot is a maybe
-    if name == "p2" or oneBot() or math.random(100) <= Better.YouChance then
-        setTarget("you")
-    else
-        setTarget("p2")
-    end
-end
-
--- Moves the ball by this frame's time, not by one step: a trip that takes
--- less than a frame lands and the next trip starts with the time left, up to
--- HitsPerFrame parries a frame.
-local function engineStep(dt)
-    local ball = Engine.Ball
-    local _, root, hum = myCharacter()
-    if not ball or not ball.Parent or not root then return end
-
-    if Engine.GraceUntil then
-        -- sitting on you, waiting out the parry window the game gives
-        ball.Position = root.Position
-        if Engine.Deflecting and Engine.Deflecting.Value ~= 0 then
-            engineDeflected()
-        elseif os.clock() >= Engine.GraceUntil then
-            Engine.GraceUntil = nil
-            hum.Health = 0
-        end
-        return
-    end
-
-    if Control.FreezeBall then return end
-    local timeLeft = dt
-    local hits = 0
-    for _ = 1, 400 do
-        if not Engine.Running or Engine.GraceUntil then return end
-        local target = Engine.Target == "you" and root or botPart(Engine.Target)
-        if not target then return end
-        local goal = target.Position
-        local toGoal = goal - ball.Position
-        local distance = toGoal.Magnitude
-        local radius = Engine.Target == "you" and Better.HitRadius or 2.5
-        local travel = math.max(distance - radius, 0)
-        local needed = (Engine.Target ~= "you" and Better.InstantBots) and 0
-            or (Engine.Speed == math.huge and 0 or travel / Engine.Speed)
-        if needed > timeLeft then
-            ball.Position += toGoal.Unit * (Engine.Speed * timeLeft)
-            return
-        end
-        timeLeft -= needed
-        ball.Position = goal
-        local wasYou = Engine.Target == "you"
-        engineArrive()
-        if wasYou then
-            hits += 1
-            if hits >= Better.HitsPerFrame then return end
-        end
-    end
 end
 
 local function setBetter(state)
@@ -869,6 +1051,14 @@ local function setBetter(state)
     end
 end
 
+local function restartRound()
+    if Better.Enabled and Engine.Running then
+        engineStart()
+    else
+        pcall(function() event("Start"):Fire() end)
+    end
+end
+
 local function onEvent(name, fn)
     local e = event(name)
     if e then track(e.Event:Connect(fn)) else log("Warn", "Events." .. name .. " not found") end
@@ -879,7 +1069,7 @@ onEvent("Start", function()
 end)
 
 onEvent("Deflect", function()
-    if Better.Enabled then engineDeflect(false) end
+    if Better.Enabled then engineDeflect() end
 end)
 
 do
@@ -888,7 +1078,7 @@ do
     track(UserInputService.InputBegan:Connect(function(input, processed)
         if not Better.Enabled or processed then return end
         if input.KeyCode == Enum.KeyCode.F or input.UserInputType == Enum.UserInputType.MouseButton1 then
-            engineDeflect(false)
+            engineDeflect()
         elseif input.UserInputType == Enum.UserInputType.Touch then
             touchStart = input.Position
         end
@@ -899,31 +1089,30 @@ do
     end))
     track(UserInputService.InputEnded:Connect(function(input, processed)
         if not Better.Enabled or processed or input.UserInputType ~= Enum.UserInputType.Touch then return end
-        if touchStart then engineDeflect(false) end
+        if touchStart then engineDeflect() end
         touchStart = nil
     end))
 end
 
--- better effects on every parry, game ball or better ball
+--// rally visuals -----------------------------------------------------------
+
+-- better effects for parries from the game's own ball (the better ball calls
+-- them itself, once per frame)
 do
     local lastStreak = leaderstat("Streak")
-    local recent = {}
     local function hook(stats)
         local streak = stats:WaitForChild("Streak", 10)
         if not streak then return end
         lastStreak = streak.Value
         track(streak.Changed:Connect(function(new)
-            if new > lastStreak then
-                local now = os.clock()
-                recent[#recent + 1] = now
-                if Visual.BetterFx then
-                    local ball = Better.Enabled and Engine.Ball or gameBall()
-                    local _, root = myCharacter()
-                    local at = (root and root.Position) or (ball and ball.Position)
-                    if at then parryEffect(at) end
-                end
-            end
+            local gained = new - lastStreak
             lastStreak = new
+            if gained <= 0 or Better.Enabled then return end
+            countParries(gained)
+            if Visual.BetterFx then
+                local _, root = myCharacter()
+                if root then parryEffect(root.Position) end
+            end
         end))
     end
     local stats = LocalPlayer:FindFirstChild("leaderstats")
@@ -931,17 +1120,180 @@ do
     track(LocalPlayer.ChildAdded:Connect(function(child)
         if child.Name == "leaderstats" then task.spawn(hook, child) end
     end))
-    -- parries over the last second
     task.spawn(function()
         while not Unloaded do
-            task.wait(0.25)
+            task.wait(0.1)
             local cutoff = os.clock() - 1
-            local kept = {}
-            for _, t in ipairs(recent) do if t >= cutoff then kept[#kept + 1] = t end end
-            recent = kept
-            Stats.PerSecond = #recent
+            local kept, total = {}, 0
+            for _, bucket in ipairs(RateBuckets) do
+                if bucket[1] >= cutoff then
+                    kept[#kept + 1] = bucket
+                    total += bucket[2]
+                end
+            end
+            RateBuckets = kept
+            Stats.PerSecond = total
+            if total > Session.Peak then Session.Peak = total end
         end
     end)
+end
+
+-- The rally beam: once the ball crosses more than once a frame you can't see
+-- it move any more, so a beam between you and the bots shows the rally
+-- instead, brighter and wider the faster it goes.
+local Beam = {}
+local function updateBeam()
+    local show = Visual.RallyBeam and Better.Enabled and Engine.Running and (Stats.FrameHits or 0) >= Visual.BeamFrom
+    local _, root = myCharacter()
+    if not show or not root then
+        if Beam.Beam then Beam.Beam.Enabled = false end
+        if Beam.Beam2 then Beam.Beam2.Enabled = false end
+        return
+    end
+    if not Beam.Holder or not Beam.Holder.Parent then
+        Beam.Holder = Instance.new("Part")
+        Beam.Holder.Name = "RallyBeam"
+        Beam.Holder.Anchored = true
+        Beam.Holder.CanCollide = false
+        Beam.Holder.CanQuery = false
+        Beam.Holder.CanTouch = false
+        Beam.Holder.Transparency = 1
+        Beam.Holder.Size = Vector3.new(0.1, 0.1, 0.1)
+        Beam.Holder.Parent = FxFolder
+        Beam.You = Instance.new("Attachment")
+        Beam.You.Parent = Beam.Holder
+        Beam.Bot = Instance.new("Attachment")
+        Beam.Bot.Parent = Beam.Holder
+        Beam.Bot2 = Instance.new("Attachment")
+        Beam.Bot2.Parent = Beam.Holder
+        local function make(a1)
+            local b = Instance.new("Beam")
+            b.Attachment0 = Beam.You
+            b.Attachment1 = a1
+            b.FaceCamera = true
+            b.LightEmission = 1
+            b.LightInfluence = 0
+            b.Segments = 1
+            b.Texture = "rbxasset://textures/particles/sparkles_main.dds"
+            b.TextureMode = Enum.TextureMode.Wrap
+            b.TextureLength = 4
+            b.TextureSpeed = 4
+            b.Parent = Beam.Holder
+            return b
+        end
+        Beam.Beam = make(Beam.Bot)
+        Beam.Beam2 = make(Beam.Bot2)
+    end
+    Beam.You.WorldPosition = root.Position
+    if Bot1 then Beam.Bot.WorldPosition = Bot1.Position end
+    if Bot2 then Beam.Bot2.WorldPosition = Bot2.Position end
+    local rate = math.max(Stats.PerSecond, 1)
+    local width = math.clamp(math.log10(rate), 0.3, 6) * Visual.BeamWidth
+    local color = Visual.Rainbow and rainbow() or Visual.FxColor
+    for _, b in ipairs({ Beam.Beam, Beam.Beam2 }) do
+        b.Width0 = width
+        b.Width1 = width
+        b.Color = ColorSequence.new(color)
+        b.Transparency = NumberSequence.new(0.15 + 0.1 * math.sin(os.clock() * 30))
+        b.TextureSpeed = math.clamp(rate / 50, 2, 40)
+    end
+    Beam.Beam.Enabled = true
+    Beam.Beam2.Enabled = not oneBot()
+end
+
+-- the rally HUD, drawn over the game
+local Hud = {}
+local function buildHud()
+    if Hud.Gui and Hud.Gui.Parent then return end
+    local ok, holder = pcall(function() return gethui and gethui() or game:GetService("CoreGui") end)
+    local gui = Instance.new("ScreenGui")
+    gui.Name = "TrainerHud"
+    gui.IgnoreGuiInset = true
+    gui.ResetOnSpawn = false
+    gui.DisplayOrder = 50
+    gui.Parent = ok and holder or LocalPlayer:WaitForChild("PlayerGui")
+    local frame = Instance.new("Frame")
+    frame.AnchorPoint = Vector2.new(0.5, 0)
+    frame.Position = UDim2.new(0.5, 0, 0, 60)
+    frame.Size = UDim2.fromOffset(360, 74)
+    frame.BackgroundColor3 = Color3.fromRGB(10, 10, 12)
+    frame.BackgroundTransparency = 0.35
+    frame.Parent = gui
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 10)
+    corner.Parent = frame
+    local stroke = Instance.new("UIStroke")
+    stroke.Thickness = 1.5
+    stroke.Transparency = 0.3
+    stroke.Parent = frame
+    local big = Instance.new("TextLabel")
+    big.BackgroundTransparency = 1
+    big.Size = UDim2.new(1, 0, 0, 44)
+    big.Font = Enum.Font.GothamBlack
+    big.TextScaled = true
+    big.TextColor3 = Color3.new(1, 1, 1)
+    big.Text = "0"
+    big.Parent = frame
+    local small = Instance.new("TextLabel")
+    small.BackgroundTransparency = 1
+    small.Position = UDim2.new(0, 0, 0, 44)
+    small.Size = UDim2.new(1, 0, 0, 26)
+    small.Font = Enum.Font.GothamMedium
+    small.TextSize = 15
+    small.TextColor3 = Color3.fromRGB(210, 210, 220)
+    small.Text = ""
+    small.Parent = frame
+    Hud.Gui, Hud.Frame, Hud.Big, Hud.Small, Hud.Stroke = gui, frame, big, small, stroke
+end
+
+local function updateHud()
+    if not Visual.Hud then
+        if Hud.Gui then Hud.Gui.Enabled = false end
+        return
+    end
+    buildHud()
+    Hud.Gui.Enabled = true
+    Hud.Frame.Size = UDim2.fromOffset(360 * Visual.HudScale, 74 * Visual.HudScale)
+    Hud.Small.TextSize = 15 * Visual.HudScale
+    Hud.Small.Position = UDim2.new(0, 0, 0, 44 * Visual.HudScale)
+    Hud.Big.Size = UDim2.new(1, 0, 0, 44 * Visual.HudScale)
+    Hud.Small.Size = UDim2.new(1, 0, 0, 26 * Visual.HudScale)
+    local rally = Better.Enabled and Engine.Rally or leaderstat("Streak")
+    Hud.Big.Text = showNumber(rally)
+    local speed = Better.Pace == "Travel time" and Better.Enabled
+        and (showNumber(Engine.LegTime * 1000) .. "ms trip") or (showNumber(Stats.Speed) .. " studs/s")
+    Hud.Small.Text = ("%s/s   %s   best %s"):format(showNumber(Stats.PerSecond), speed, showNumber(leaderstat("Best")))
+    local color = Visual.Rainbow and rainbow() or Visual.FxColor
+    Hud.Stroke.Color = color
+    Hud.Big.TextColor3 = Visual.Rainbow and color or Color3.new(1, 1, 1)
+end
+
+onMilestone = function(reached)
+    log("Success", ("rally %s"):format(showNumber(reached)))
+    if Visual.MilestoneFx then
+        local _, root = myCharacter()
+        if root then
+            local keep = Visual.FxGap
+            Visual.FxGap = 0
+            local size = Visual.FxSize
+            Visual.FxSize = size * 2.5
+            pcall(parryEffect, root.Position, Visual.Rainbow and rainbow() or Color3.fromRGB(255, 215, 80))
+            Visual.FxSize = size
+            Visual.FxGap = keep
+        end
+    end
+    if Library and Visual.MilestoneNotify then
+        pcall(function()
+            Library:Notify({ Title = "Rally " .. showNumber(reached), Description = "best this session " .. showNumber(Session.BestRally), Time = 3, Icon = "trophy" })
+        end)
+    end
+end
+
+-- fps cap, when the executor can set it
+local function applyFps()
+    if typeof(setfpscap) ~= "function" then return false end
+    pcall(setfpscap, Visual.UncapFps and Visual.FpsCap or 60)
+    return true
 end
 
 --// main loop ---------------------------------------------------------------
@@ -961,8 +1313,13 @@ track(RunService.Heartbeat:Connect(function(dt)
 
     if Better.Enabled and Engine.Running then
         local ok, err = pcall(engineStep, dt)
-        if not ok then log("Error", "better ball: " .. tostring(err)) end
+        if not ok then
+            FrameCache = nil
+            log("Error", "better ball: " .. tostring(err))
+        end
     end
+    pcall(updateBeam)
+    pcall(updateHud)
 
     -- the ball in play and whether it is after you
     local ball, targetsMe, closing
@@ -971,7 +1328,7 @@ track(RunService.Heartbeat:Connect(function(dt)
         ball = Engine.Running and Engine.Ball or nil
         -- still "after you" while it sits on you in the grace window, so a parry
         -- that was a frame late still lands
-        targetsMe = ball ~= nil and Engine.Target == "you"
+        targetsMe = ball ~= nil and Engine.Leg ~= nil and Engine.Leg.To == "you"
         closing = Engine.Speed
     else
         local align
@@ -1008,7 +1365,9 @@ track(RunService.Heartbeat:Connect(function(dt)
     end
     Stats.Distance = distance
     Stats.Speed = closing or 0
-    Stats.Status = targetsMe and "coming for you" or "with a bot"
+    Stats.Status = (Better.Enabled and turboOn() and "turbo rally")
+        or (Better.Enabled and Engine.Paused and "paused at target")
+        or (targetsMe and "coming for you" or "with a bot")
 
     if not Parry.Enabled or not targetsMe then
         ParryPlannedAt = nil
@@ -1084,6 +1443,8 @@ local function unload()
         end)
     end
     pcall(function() FxFolder:Destroy() end)
+    pcall(function() if Hud.Gui then Hud.Gui:Destroy() end end)
+    if Visual.UncapFps and typeof(setfpscap) == "function" then pcall(setfpscap, 60) end
 end
 
 Genv.__BladeTrainerStop = function()
@@ -1145,10 +1506,13 @@ do
         },
     })
     local status = overview:AddLabel('ball: -')
+    local session = overview:AddLabel('session: -')
     every(0.15, function()
-        cards:SetValue('Streak', tostring(leaderstat("Streak")))
+        session:SetText(("session: best rally %s, peak %s/s, %s parries total"):format(
+            showNumber(Session.BestRally), showNumber(Session.Peak), showNumber(Session.Total)))
+        cards:SetValue('Streak', showNumber(leaderstat("Streak")))
         cards:SetValue('Best', tostring(leaderstat("Best")))
-        cards:SetValue('Parries / s', tostring(Stats.PerSecond))
+        cards:SetValue('Parries / s', showNumber(Stats.PerSecond))
         cards:SetValue('Ball speed', showNumber(Stats.Speed))
         cards:SetValue('Distance', showNumber(Stats.Distance))
         status:SetText('ball: ' .. Stats.Status)
@@ -1331,21 +1695,28 @@ do
         Tooltip = 'turns off the trainer\'s ball script and runs one that flies straight at its target, follows you, and never skips a hit at any speed. bots, grace and wander above still apply',
         Default = false,
         Callback = function(state) setBetter(state) end,
+    }):AddKeyPicker('bbt_better_key', {
+        Default = 'None',
+        Mode = 'Toggle',
+        SyncToggleState = true,
+        Text = 'Better ball',
+    })
+
+    better:AddButton({ Text = 'Restart round', Func = restartRound })
+    better:AddLabel('Restart round'):AddKeyPicker('bbt_restart_key', {
+        Default = 'None',
+        Mode = 'Toggle',
+        NoMode = true,
+        Text = 'Restart round',
+        Callback = function() restartRound() end,
     })
 
     better:AddDropdown('bbt_pace', {
         Text = 'Pace',
-        Tooltip = 'speed: studs per second from your streak. travel time: every trip takes the same time however far it is',
+        Tooltip = 'speed: studs per second. travel time: seconds per trip however far it is. both climb over the rally on the ramp below',
         Values = { 'Speed', 'Travel time' },
         Default = Better.Pace,
         Callback = function(v) Better.Pace = v or "Speed" end,
-    })
-
-    numberBox(better, 'bbt_travel', {
-        Text = 'Travel time (s)',
-        Tooltip = 'travel time pace: seconds for each trip. 0.001 and up',
-        Default = Better.TravelTime, Min = 0.001,
-        Callback = function(v) Better.TravelTime = v end,
     })
 
     better:AddToggle('bbt_instantbots', {
@@ -1355,46 +1726,11 @@ do
         Callback = function(state) Better.InstantBots = state end,
     })
 
-    numberBox(better, 'bbt_base', {
-        Text = 'Start speed (studs/s)',
-        Tooltip = 'speed pace: how fast it starts',
-        Default = Better.BaseSpeed, Min = 1,
-        Callback = function(v) Better.BaseSpeed = v end,
-    })
-
-    better:AddDropdown('bbt_gainmode', {
-        Text = 'Speed up by',
-        Tooltip = 'add: plus the amount below each parry. multiply: times the multiplier each parry, which climbs fast',
-        Values = { 'Add', 'Multiply' },
-        Default = Better.GainMode,
-        Callback = function(v) Better.GainMode = v or "Add" end,
-    })
-
-    numberBox(better, 'bbt_gain', {
-        Text = 'Add per parry (studs/s)',
-        Default = Better.Gain, Min = 0,
-        Callback = function(v) Better.Gain = v end,
-    })
-
-    numberBox(better, 'bbt_mult', {
-        Text = 'Multiply per parry',
-        Tooltip = 'e.g. 1.05 is 5% faster every parry',
-        Default = Better.Multiplier, Min = 1,
-        Callback = function(v) Better.Multiplier = v end,
-    })
-
-    numberBox(better, 'bbt_max', {
-        Text = 'Top speed (studs/s)',
-        Tooltip = 'any number: 5000, 1e6, 1e9, inf',
-        Default = Better.MaxSpeed, Min = 1,
-        Callback = function(v) Better.MaxSpeed = v end,
-    })
-
-    better:AddSlider('bbt_hitsframe', {
-        Text = 'Most parries per frame',
-        Tooltip = 'at speeds where the ball would cover several trips in one frame, how many of them a frame may hold',
-        Min = 1, Max = 100, Default = Better.HitsPerFrame, Rounding = 0,
-        Callback = function(v) Better.HitsPerFrame = v end,
+    better:AddSlider('bbt_timescale', {
+        Text = 'Time scale',
+        Tooltip = 'slow motion under 1x, fast forward over it',
+        Min = 0.1, Max = 10, Default = Better.TimeScale, Rounding = 1, Suffix = 'x',
+        Callback = function(v) Better.TimeScale = v end,
     })
 
     better:AddSlider('bbt_youchance', {
@@ -1419,13 +1755,115 @@ do
         end,
     })
 
-    better:AddSlider('bbt_window', {
+    local rampBox = Tab:AddRightGroupbox('Speed ramp', 'trending-up')
+
+    rampBox:AddDropdown('bbt_curve', {
+        Text = 'Ramp curve',
+        Tooltip = 'how the speed climbs from start to top over the ramp. exponential climbs in equal ratios, so even 80 to 1e9 builds up steadily. add / multiply per parry ignore the ramp length',
+        Values = { 'Exponential', 'Linear', 'Ease in', 'Ease out', 'Smooth', 'Add per parry', 'Multiply per parry', 'Instant' },
+        Default = Better.Curve,
+        Callback = function(v) Better.Curve = v or "Exponential" end,
+    })
+
+    numberBox(rampBox, 'bbt_ramp', {
+        Text = 'Parries to top speed',
+        Tooltip = 'how many parries this rally it takes to go from start to top',
+        Default = Better.RampParries, Min = 1,
+        Callback = function(v) Better.RampParries = v end,
+    })
+
+    numberBox(rampBox, 'bbt_base', {
+        Text = 'Start speed (studs/s)',
+        Tooltip = 'speed pace',
+        Default = Better.BaseSpeed, Min = 0.1,
+        Callback = function(v) Better.BaseSpeed = v end,
+    })
+
+    numberBox(rampBox, 'bbt_max', {
+        Text = 'Top speed (studs/s)',
+        Tooltip = 'speed pace. any number: 5000, 1e6, 1e9, inf',
+        Default = Better.MaxSpeed, Min = 0.1,
+        Callback = function(v) Better.MaxSpeed = v end,
+    })
+
+    numberBox(rampBox, 'bbt_travel', {
+        Text = 'Start trip time (s)',
+        Tooltip = 'travel time pace: seconds per trip at the start',
+        Default = Better.TravelTime, Min = 0,
+        Callback = function(v) Better.TravelTime = v end,
+    })
+
+    numberBox(rampBox, 'bbt_mintravel', {
+        Text = 'Fastest trip time (s)',
+        Tooltip = 'travel time pace: seconds per trip at the top of the ramp. 0 = every trip lands at once',
+        Default = Better.MinTravelTime, Min = 0,
+        Callback = function(v) Better.MinTravelTime = v end,
+    })
+
+    numberBox(rampBox, 'bbt_gain', {
+        Text = 'Add per parry',
+        Tooltip = '"add per parry" curve: studs/s (or seconds off a trip) per parry',
+        Default = Better.Gain, Min = 0,
+        Callback = function(v) Better.Gain = v end,
+    })
+
+    numberBox(rampBox, 'bbt_mult', {
+        Text = 'Multiply per parry',
+        Tooltip = '"multiply per parry" curve: 1.05 is 5% faster every parry',
+        Default = Better.Multiplier, Min = 1,
+        Callback = function(v) Better.Multiplier = v end,
+    })
+
+    local turbo = Tab:AddLeftGroupbox('Turbo and limits', 'zap')
+
+    turbo:AddToggle('bbt_turbo', {
+        Text = 'Turbo parry',
+        Tooltip = 'with the better ball, auto parry and sync on, the script parries the ball itself in plain math instead of through the game, and hands the game one update per frame. this is what reaches tens of thousands a second',
+        Default = Better.Turbo,
+        Callback = function(state) Better.Turbo = state end,
+    })
+
+    numberBox(turbo, 'bbt_turboframe', {
+        Text = 'Turbo: most parries per frame',
+        Tooltip = 'how many parries one frame may hold in turbo. 5000 at 60 fps is 300k a second',
+        Default = Better.TurboPerFrame, Min = 1,
+        Callback = function(v) Better.TurboPerFrame = math.floor(v) end,
+    })
+
+    turbo:AddSlider('bbt_hitsframe', {
+        Text = 'Normal: most parries per frame',
+        Tooltip = 'without turbo, how many parries one frame may hold',
+        Min = 1, Max = 200, Default = Better.HitsPerFrame, Rounding = 0,
+        Callback = function(v) Better.HitsPerFrame = v end,
+    })
+
+    numberBox(turbo, 'bbt_stopat', {
+        Text = 'Stop at rally',
+        Tooltip = '0 = never',
+        Default = Better.StopAt, Min = 0,
+        Callback = function(v) Better.StopAt = math.floor(v) end,
+    })
+
+    turbo:AddDropdown('bbt_attarget', {
+        Text = 'At that rally',
+        Tooltip = 'pause: the ball stops where it is. end round: you die on purpose so the game saves it as your best',
+        Values = { 'Pause', 'End round (saves best)', 'Keep going' },
+        Default = Better.AtTarget,
+        Callback = function(v) Better.AtTarget = v or "Pause" end,
+    })
+
+    turbo:AddButton({
+        Text = 'Unpause',
+        Func = function() Engine.Paused = false end,
+    })
+
+    turbo:AddSlider('bbt_window', {
         Text = 'Parry lasts',
         Min = 0.1, Max = 1.5, Default = Better.ParryWindow, Rounding = 2, Suffix = 's',
         Callback = function(v) Better.ParryWindow = v end,
     })
 
-    better:AddSlider('bbt_cooldown', {
+    turbo:AddSlider('bbt_cooldown', {
         Text = 'Missed parry cooldown',
         Min = 0, Max = 3, Default = Better.Cooldown, Rounding = 2, Suffix = 's',
         Callback = function(v) Better.Cooldown = v end,
@@ -1540,6 +1978,86 @@ do
         Text = 'Hit sound',
         Min = 0, Max = 2, Default = Visual.HitVolume, Rounding = 1,
         Callback = function(v) Visual.HitVolume = v end,
+    })
+
+    local rally = Tab:AddRightGroupbox('Rally', 'activity')
+
+    rally:AddToggle('bbt_beam', {
+        Text = 'Rally beam',
+        Tooltip = 'once the ball crosses more than a set number of times a frame, a beam between you and the bots shows the rally, wider the faster it goes',
+        Default = Visual.RallyBeam,
+        Callback = function(state) Visual.RallyBeam = state end,
+    })
+
+    rally:AddSlider('bbt_beamfrom', {
+        Text = 'Beam from',
+        Tooltip = 'parries a frame before the beam shows',
+        Min = 1, Max = 50, Default = Visual.BeamFrom, Rounding = 0, Suffix = ' a frame',
+        Callback = function(v) Visual.BeamFrom = v end,
+    })
+
+    rally:AddSlider('bbt_beamwidth', {
+        Text = 'Beam width',
+        Min = 0.2, Max = 4, Default = Visual.BeamWidth, Rounding = 1, Suffix = 'x',
+        Callback = function(v) Visual.BeamWidth = v end,
+    })
+
+    rally:AddToggle('bbt_hud', {
+        Text = 'Rally HUD',
+        Tooltip = 'a big counter on screen: rally, parries a second, speed and best',
+        Default = Visual.Hud,
+        Callback = function(state) Visual.Hud = state end,
+    })
+
+    rally:AddSlider('bbt_hudscale', {
+        Text = 'HUD size',
+        Min = 0.5, Max = 2.5, Default = Visual.HudScale, Rounding = 1, Suffix = 'x',
+        Callback = function(v) Visual.HudScale = v end,
+    })
+
+    rally:AddToggle('bbt_milestones', {
+        Text = 'Milestones',
+        Default = Visual.Milestones,
+        Callback = function(state) Visual.Milestones = state end,
+    })
+
+    numberBox(rally, 'bbt_milestone_every', {
+        Text = 'Milestone every',
+        Default = Visual.MilestoneEvery, Min = 1,
+        Callback = function(v) Visual.MilestoneEvery = math.floor(v) end,
+    })
+
+    rally:AddToggle('bbt_milestone_fx', {
+        Text = 'Milestone burst',
+        Default = Visual.MilestoneFx,
+        Callback = function(state) Visual.MilestoneFx = state end,
+    })
+
+    rally:AddToggle('bbt_milestone_notify', {
+        Text = 'Milestone notification',
+        Default = Visual.MilestoneNotify,
+        Callback = function(state) Visual.MilestoneNotify = state end,
+    })
+
+    local perf = Tab:AddRightGroupbox('Performance', 'cpu')
+
+    perf:AddToggle('bbt_fps', {
+        Text = 'Uncap FPS',
+        Tooltip = typeof(setfpscap) == "function" and 'more frames a second means the ball and parries update more often' or 'your executor has no setfpscap, so this does nothing',
+        Default = Visual.UncapFps,
+        Callback = function(state)
+            Visual.UncapFps = state
+            applyFps()
+        end,
+    })
+
+    perf:AddSlider('bbt_fpscap', {
+        Text = 'FPS cap',
+        Min = 60, Max = 1000, Default = Visual.FpsCap, Rounding = 0,
+        Callback = function(v)
+            Visual.FpsCap = v
+            if Visual.UncapFps then applyFps() end
+        end,
     })
 
     local look = Tab:AddLeftGroupbox('Ball look', 'circle')
