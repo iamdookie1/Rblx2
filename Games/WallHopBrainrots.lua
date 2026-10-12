@@ -136,12 +136,6 @@ local function toSet(list)
     return set
 end
 
-local function lowerSet(list)
-    local set = {}
-    for _, value in ipairs(list or {}) do set[tostring(value):lower()] = true end
-    return set
-end
-
 --// settings ----------------------------------------------------------------
 -- Every value here is driven by a flagged element in the menu below, so all of
 -- it is saved and loaded with the menu's configs.
@@ -223,12 +217,14 @@ local Stats = { Grabbed = 0, Placed = 0, Sold = 0, Trips = 0, State = "idle" }
 
 --// helpers -----------------------------------------------------------------
 
-local Onyx -- the menu library, loaded last
+local Library -- the Ui3 menu library, loaded last
+
+local NOTIFY_ICONS = { info = "bell", success = "check", warning = "triangle-alert", error = "circle-x" }
 
 local function notify(title, content, kind)
-    if not Onyx then return end
+    if not Library then return end
     pcall(function()
-        Onyx:Notify({ Title = title, Content = content, Type = kind or "info", Duration = 6 })
+        Library:Notify({ Title = title, Description = content, Time = 6, Icon = NOTIFY_ICONS[kind or "info"] })
     end)
 end
 
@@ -516,9 +512,23 @@ end
 
 --// farm --------------------------------------------------------------------
 
-local Log -- console, set once the menu exists
+local Log -- the menu's log, set once the menu exists
+local LOG_COLORS = {
+    Info = Color3.fromRGB(150, 200, 255),
+    Success = Color3.fromRGB(126, 217, 87),
+    Warn = Color3.fromRGB(255, 200, 90),
+    Error = Color3.fromRGB(255, 96, 106),
+}
+local PendingLog = {}
 local function log(kind, ...)
-    if Log then pcall(Log[kind], Log, ...) end
+    local parts = table.pack(...)
+    for i = 1, parts.n do parts[i] = tostring(parts[i]) end
+    local text = table.concat(parts, " ", 1, parts.n)
+    if not Log then
+        PendingLog[#PendingLog + 1] = { text, LOG_COLORS[kind] }
+        return
+    end
+    pcall(function() Log:Log(text, LOG_COLORS[kind]) end)
 end
 
 local Busy = false -- a farm step or a manual action is moving the character
@@ -660,7 +670,7 @@ local function deposit()
             elseif Farm.StopWhenFull and #carried() >= Farm.PerTrip then
                 log("Warn", "base is full, auto grab stopped")
                 notify("auto grab stopped", "every slot is taken. turn on swap or the sell deposit to keep going.", "warning")
-                if FarmToggle then FarmToggle:Set(false) else Farm.Enabled = false end
+                if FarmToggle then FarmToggle:SetValue(false) else Farm.Enabled = false end
             end
         end
     end
@@ -1194,265 +1204,260 @@ end
 
 Genv.__WallHopBrainrotsStop = function()
     unload()
-    if Onyx then pcall(function() Onyx:Unload() end) end
+    if Library then pcall(function() Library:Unload() end) end
 end
 
 --// ui ----------------------------------------------------------------------
 
-local ref = 'main'
-local resolved, shaOrError = pcall(function()
-    local commit = game:GetService("HttpService"):JSONDecode(game:HttpGet('https://api.github.com/repos/iamdookie1/Ui2/commits/main'))
-    return commit.sha
-end)
-if resolved and shaOrError then
-    ref = shaOrError
-else
-    warn('[Onyx] could not resolve the latest commit, falling back to main (raw.githubusercontent.com caches that for up to 5 minutes): ' .. tostring(shaOrError))
-end
+Library = loadstring(game:HttpGet('https://raw.githubusercontent.com/iamdookie1/Ui3/main/Ui.lua'))()
 
-Onyx = loadstring(game:HttpGet(('https://raw.githubusercontent.com/iamdookie1/Ui2/%s/Ui.lua'):format(ref)))()
-
-local Window = Onyx:CreateWindow({
-    Title = 'wall hop for brainrots',
-    SubTitle = 'assist',
-    Folder = 'WallHopBrainrots',
-    Keybind = Enum.KeyCode.RightShift,
-    Accent = Color3.fromRGB(255, 120, 200),
+local Window = Library:CreateWindow({
+    Title = 'Wall Hop for Brainrots',
+    Footer = 'assist',
+    Icon = 'mountain',
+    ToggleKeybind = Enum.KeyCode.RightShift,
+    Theme = 'Magenta',
+    ConfigFolder = 'WallHopBrainrots',
 })
 
--- closing the menu from its own settings tears the script down too
-Onyx.OnUnload = unload
+-- unloading from the menu's own settings tears the script down too
+Library:OnUnload(unload)
 
-local function numberInput(section, cfg)
-    return section:Input({
-        Title = cfg.Title,
-        Description = cfg.Description,
-        Placeholder = tostring(cfg.Default),
-        Default = tostring(cfg.Default),
-        Numeric = true,
-        Flag = cfg.Flag,
-        Callback = function(value)
-            local number = tonumber(value)
-            if number then cfg.Callback(number) end
-        end,
-    })
+-- Ui3 hands a multi dropdown's value over as { [value] = true }; a default
+-- (or anything else) may still be a plain array, so both are accepted.
+local function asSet(value)
+    local set = {}
+    if type(value) ~= "table" then return set end
+    for key, flag in pairs(value) do
+        if type(key) == "number" then
+            set[flag] = true
+        elseif flag then
+            set[key] = true
+        end
+    end
+    return set
+end
+
+local function setToList(set, order)
+    local list = {}
+    for _, name in ipairs(order) do
+        if set[name] then list[#list + 1] = name end
+    end
+    return list
+end
+
+-- names typed as a comma separated list, matched without case
+local function nameSet(text)
+    local set = {}
+    for name in tostring(text or ""):gmatch("[^,]+") do
+        name = name:match("^%s*(.-)%s*$")
+        if name ~= "" then set[name:lower()] = true end
+    end
+    return set
+end
+
+local function every(interval, fn)
+    task.spawn(function()
+        while not Unloaded and not Library.Unloaded do
+            pcall(fn)
+            task.wait(interval)
+        end
+    end)
 end
 
 do
-    local FarmTab = Window:CreateTab({ Title = 'farm', Default = true })
+    local FarmTab = Window:AddTab('Farm', 'tractor', 'Auto grab, deposits and cash')
 
-    local status = FarmTab:CreateSection('status')
-    status:Stats({
-        Columns = 3,
-        Items = {
-            { Label = "money", Value = function() return "$" .. formatNumber(leaderstat("Money")) end },
-            { Label = "jump power", Value = function() return formatNumber(leaderstat("Jump Power")) end },
-            { Label = "rebirths", Value = function() return tostring(leaderstat("Rebirths")) end },
-            { Label = "carrying", Value = function() return tostring(#carried()) end },
-            { Label = "grabbed", Value = function() return tostring(Stats.Grabbed) end },
-            { Label = "placed / sold", Value = function() return Stats.Placed .. " / " .. Stats.Sold end },
+    local overview = FarmTab:AddBigGroupbox('Overview', 'gauge')
+    local cards = overview:AddStatCards('whb_stats', {
+        Cards = {
+            { Title = 'Money', Value = '$0', Icon = 'dollar-sign' },
+            { Title = 'Jump Power', Value = '0', Icon = 'arrow-up' },
+            { Title = 'Rebirths', Value = '0', Icon = 'refresh-cw' },
+            { Title = 'Carrying', Value = '0', Icon = 'package' },
+            { Title = 'Grabbed', Value = '0', Icon = 'hand' },
+            { Title = 'Placed / Sold', Value = '0 / 0', Icon = 'warehouse' },
         },
     })
-    status:Label({ Title = function() return "doing: " .. Stats.State end })
+    local stateLabel = overview:AddLabel('doing: idle')
+    every(0.5, function()
+        cards:SetValue('Money', '$' .. formatNumber(leaderstat("Money")))
+        cards:SetValue('Jump Power', formatNumber(leaderstat("Jump Power")))
+        cards:SetValue('Rebirths', tostring(leaderstat("Rebirths")))
+        cards:SetValue('Carrying', tostring(#carried()))
+        cards:SetValue('Grabbed', tostring(Stats.Grabbed))
+        cards:SetValue('Placed / Sold', Stats.Placed .. ' / ' .. Stats.Sold)
+        stateLabel:SetText('doing: ' .. Stats.State)
+    end)
 
-    local grabSection = FarmTab:CreateSection('auto grab')
+    local grabBox = FarmTab:AddLeftGroupbox('Auto grab', 'hand')
 
-    FarmToggle = grabSection:Toggle({
-        Title = 'auto grab',
-        Description = 'goes to the best brainrot that passes the filters below, picks it up, and brings it home once you carry the amount set under trips',
-        Flag = 'whb_farm',
+    FarmToggle = grabBox:AddToggle('whb_farm', {
+        Text = 'Auto grab',
+        Tooltip = 'goes to the best brainrot that passes the filters below, picks it up, and brings it home once you carry the amount set under trips',
         Default = false,
         Callback = function(state) Farm.Enabled = state end,
     })
-
-    grabSection:Keybind({
-        Title = 'auto grab key',
-        Default = nil,
-        Mode = 'Always',
-        Flag = 'whb_farm_key',
-        Callback = function() FarmToggle:Set(not Farm.Enabled) end,
+    FarmToggle:AddKeyPicker('whb_farm_key', {
+        Default = 'None',
+        Mode = 'Toggle',
+        SyncToggleState = true,
+        Text = 'Auto grab',
     })
 
-    grabSection:Dropdown({
-        Title = 'rarities',
-        Multi = true,
+    grabBox:AddDropdown('whb_farm_rarities', {
+        Text = 'Rarities',
         Values = RARITIES,
-        Default = (function()
-            local list = {}
-            for _, name in ipairs(RARITIES) do if Farm.Rarities[name] then list[#list + 1] = name end end
-            return list
-        end)(),
-        Flag = 'whb_farm_rarities',
-        Callback = function(list) Farm.Rarities = toSet(list) end,
-    })
-
-    grabSection:Dropdown({
-        Title = 'mutations',
         Multi = true,
-        Values = MUTATIONS,
-        Default = table.clone(MUTATIONS),
-        Flag = 'whb_farm_mutations',
-        Callback = function(list) Farm.Mutations = toSet(list) end,
+        Default = setToList(Farm.Rarities, RARITIES),
+        Callback = function(value) Farm.Rarities = asSet(value) end,
     })
 
-    grabSection:Segmented({
-        Title = 'go for',
+    grabBox:AddDropdown('whb_farm_mutations', {
+        Text = 'Mutations',
+        Values = MUTATIONS,
+        Multi = true,
+        Default = table.clone(MUTATIONS),
+        Callback = function(value) Farm.Mutations = asSet(value) end,
+    })
+
+    grabBox:AddDropdown('whb_farm_priority', {
+        Text = 'Go for',
         Values = { 'Rarity', 'Income', 'Nearest' },
         Default = Farm.Priority,
-        Flag = 'whb_farm_priority',
-        Callback = function(value) Farm.Priority = value end,
+        Callback = function(value) Farm.Priority = value or 'Rarity' end,
     })
 
-    grabSection:Toggle({
-        Title = 'rush divine and up',
-        Description = 'Divine, Insane and Exclusive spawns are grabbed first, even if the rarity, mutation or name filters would skip them',
-        Flag = 'whb_farm_specials',
+    grabBox:AddToggle('whb_farm_specials', {
+        Text = 'Rush Divine and up',
+        Tooltip = 'Divine, Insane and Exclusive spawns are grabbed first, even if the rarity, mutation or name filters would skip them',
         Default = Farm.RushSpecials,
         Callback = function(state) Farm.RushSpecials = state end,
     })
 
-    grabSection:Tags({
-        Title = 'only these names',
-        Placeholder = 'brainrot name, enter to add',
-        Default = {},
-        Flag = 'whb_farm_only',
-        Callback = function(list) Farm.Only = lowerSet(list) end,
+    grabBox:AddInput('whb_farm_only', {
+        Text = 'Only these names',
+        Placeholder = 'comma separated, empty = any',
+        Default = '',
+        Callback = function(text) Farm.Only = nameSet(text) end,
     })
 
-    grabSection:Tags({
-        Title = 'never grab',
-        Placeholder = 'brainrot name, enter to add',
-        Default = {},
-        Flag = 'whb_farm_ignore',
-        Callback = function(list) Farm.Ignore = lowerSet(list) end,
+    grabBox:AddInput('whb_farm_ignore', {
+        Text = 'Never grab',
+        Placeholder = 'comma separated',
+        Default = '',
+        Callback = function(text) Farm.Ignore = nameSet(text) end,
     })
 
-    grabSection:Slider({
-        Title = 'skip if despawning within',
-        Min = 0, Max = 30, Default = Farm.MinTimeLeft, Increment = 1, Suffix = 's',
-        Flag = 'whb_farm_timeleft',
+    grabBox:AddSlider('whb_farm_timeleft', {
+        Text = 'Skip if despawning within',
+        Min = 0, Max = 30, Default = Farm.MinTimeLeft, Rounding = 0, Suffix = 's',
         Callback = function(value) Farm.MinTimeLeft = value end,
     })
 
-    local tripSection = FarmTab:CreateSection('trips')
+    local trips = FarmTab:AddRightGroupbox('Trips', 'route')
 
-    tripSection:Slider({
-        Title = 'items per trip',
-        Description = 'how many to pick up before heading home. the game has its own carry limit (buy more at the carry shop); a pickup that fails because of it sends you home early',
-        Min = 1, Max = 20, Default = Farm.PerTrip, Increment = 1,
-        Flag = 'whb_farm_pertrip',
+    trips:AddSlider('whb_farm_pertrip', {
+        Text = 'Items per trip',
+        Tooltip = 'how many to pick up before heading home. the game has its own carry limit (buy more at the carry shop); a pickup that fails because of it sends you home early',
+        Min = 1, Max = 20, Default = Farm.PerTrip, Rounding = 0,
         Callback = function(value) Farm.PerTrip = value end,
     })
 
-    tripSection:Segmented({
-        Title = 'when home',
+    trips:AddDropdown('whb_farm_deposit', {
+        Text = 'When home',
         Values = { 'Place', 'Sell', 'Place then sell' },
         Default = Farm.Deposit,
-        Flag = 'whb_farm_deposit',
-        Callback = function(value) Farm.Deposit = value end,
+        Callback = function(value) Farm.Deposit = value or 'Place' end,
     })
 
-    tripSection:Toggle({
-        Title = 'swap worse items',
-        Description = 'with every slot taken, swaps what you carry for the worst placed brainrot it beats (same ranking as "go for")',
-        Flag = 'whb_farm_swap',
+    trips:AddToggle('whb_farm_swap', {
+        Text = 'Swap worse items',
+        Tooltip = 'with every slot taken, swaps what you carry for the worst placed brainrot it beats (same ranking as "go for")',
         Default = Farm.Swap,
         Callback = function(state) Farm.Swap = state end,
     })
 
-    tripSection:Toggle({
-        Title = 'stop when base is full',
-        Flag = 'whb_farm_stopfull',
+    trips:AddToggle('whb_farm_stopfull', {
+        Text = 'Stop when base is full',
         Default = Farm.StopWhenFull,
         Callback = function(state) Farm.StopWhenFull = state end,
     })
 
-    tripSection:Toggle({
-        Title = 'collect cash on return',
-        Flag = 'whb_farm_collect',
+    trips:AddToggle('whb_farm_collect', {
+        Text = 'Collect cash on return',
         Default = Farm.CollectOnReturn,
         Callback = function(state) Farm.CollectOnReturn = state end,
     })
 
-    tripSection:Toggle({
-        Title = 'wait at base when idle',
-        Flag = 'whb_farm_idle',
+    trips:AddToggle('whb_farm_idle', {
+        Text = 'Wait at base when idle',
         Default = Farm.IdleAtBase,
         Callback = function(state) Farm.IdleAtBase = state end,
     })
 
-    local travelSection = FarmTab:CreateSection('travel')
+    local travel = FarmTab:AddLeftGroupbox('Travel', 'navigation')
 
-    travelSection:Segmented({
-        Title = 'move by',
+    travel:AddDropdown('whb_travel_mode', {
+        Text = 'Move by',
         Values = { 'Teleport', 'Tween' },
         Default = Travel.Mode,
-        Flag = 'whb_travel_mode',
-        Callback = function(value) Travel.Mode = value end,
+        Callback = function(value) Travel.Mode = value or 'Teleport' end,
     })
 
-    travelSection:Slider({
-        Title = 'tween speed',
-        Min = 30, Max = 1500, Default = Travel.Speed, Increment = 10, Suffix = ' studs/s',
-        Flag = 'whb_travel_speed',
+    travel:AddSlider('whb_travel_speed', {
+        Text = 'Tween speed',
+        Min = 30, Max = 1500, Default = Travel.Speed, Rounding = 0, Suffix = ' studs/s',
         Callback = function(value) Travel.Speed = value end,
     })
 
-    travelSection:Segmented({
-        Title = 'go home by',
-        Description = 'remote asks the server to send you home with the game\'s own teleport-to-base; it falls back to moving there yourself if it does not take',
+    travel:AddDropdown('whb_travel_return', {
+        Text = 'Go home by',
+        Tooltip = 'remote asks the server to send you home with the game\'s own teleport-to-base; it falls back to moving there yourself if it does not take',
         Values = { 'Teleport', 'Remote' },
         Default = Travel.Return,
-        Flag = 'whb_travel_return',
-        Callback = function(value) Travel.Return = value end,
+        Callback = function(value) Travel.Return = value or 'Teleport' end,
     })
 
-    travelSection:Slider({
-        Title = 'arrive above target',
-        Min = 0, Max = 8, Default = Travel.Height, Increment = 0.5, Suffix = ' studs',
-        Flag = 'whb_travel_height',
+    travel:AddSlider('whb_travel_height', {
+        Text = 'Arrive above target',
+        Min = 0, Max = 8, Default = Travel.Height, Rounding = 1, Suffix = ' studs',
         Callback = function(value) Travel.Height = value end,
     })
 
-    travelSection:Slider({
-        Title = 'action delay',
-        Min = 0, Max = 1, Default = Farm.ActionDelay, Increment = 0.05, Suffix = 's',
-        Flag = 'whb_farm_delay',
+    travel:AddSlider('whb_farm_delay', {
+        Text = 'Action delay',
+        Min = 0, Max = 1, Default = Farm.ActionDelay, Rounding = 2, Suffix = 's',
         Callback = function(value) Farm.ActionDelay = value end,
     })
 
-    local cashSection = FarmTab:CreateSection('cash')
+    local cash = FarmTab:AddRightGroupbox('Cash', 'banknote')
 
-    cashSection:Toggle({
-        Title = 'auto collect cash',
-        Description = 'touches the collect pad of every filled slot on your base',
-        Flag = 'whb_cash',
+    cash:AddToggle('whb_cash', {
+        Text = 'Auto collect cash',
+        Tooltip = 'touches the collect pad of every filled slot on your base',
         Default = false,
         Callback = function(state) Cash.Enabled = state end,
     })
 
-    cashSection:Slider({
-        Title = 'collect every',
-        Min = 1, Max = 60, Default = Cash.Interval, Increment = 1, Suffix = 's',
-        Flag = 'whb_cash_interval',
+    cash:AddSlider('whb_cash_interval', {
+        Text = 'Collect every',
+        Min = 1, Max = 60, Default = Cash.Interval, Rounding = 0, Suffix = 's',
         Callback = function(value) Cash.Interval = value end,
     })
 
-    cashSection:Toggle({
-        Title = 'walk pads if needed',
-        Description = typeof(firetouchinterest) == "function"
+    cash:AddToggle('whb_cash_walk', {
+        Text = 'Walk pads if needed',
+        Tooltip = typeof(firetouchinterest) == "function"
             and 'your executor has firetouchinterest, so pads are touched from anywhere and this is not used'
             or 'your executor has no firetouchinterest, so collecting moves you over each pad',
-        Flag = 'whb_cash_walk',
         Default = Cash.WalkFallback,
         Callback = function(state) Cash.WalkFallback = state end,
     })
 
-    cashSection:Button({ Title = 'collect now', Mini = true, Callback = function() errand(collectCash) end })
-    cashSection:Button({
-        Title = 'sell inventory',
-        Mini = true,
-        Callback = function()
+    cash:AddButton({ Text = 'Collect now', Func = function() errand(collectCash) end }):AddButton({
+        Text = 'Sell inventory',
+        Func = function()
             errand(function()
                 travelTo(sellPosition())
                 task.wait(0.15)
@@ -1464,87 +1469,84 @@ do
 end
 
 do
-    local UpTab = Window:CreateTab({ Title = 'upgrades' })
-    local section = UpTab:CreateSection('auto buy')
+    local UpTab = Window:AddTab('Upgrades', 'trending-up', 'Auto buy and rebirth')
+    local buy = UpTab:AddLeftGroupbox('Auto buy', 'shopping-cart')
 
-    section:Toggle({
-        Title = 'jump power',
-        Flag = 'whb_up_jump',
+    buy:AddToggle('whb_up_jump', {
+        Text = 'Jump power',
         Default = false,
         Callback = function(state) Up.Jump = state end,
     })
 
-    section:Segmented({
-        Title = 'jump power per buy',
+    buy:AddDropdown('whb_up_jump_amount', {
+        Text = 'Jump power per buy',
         Values = { '1', '5', '10' },
         Default = '1',
-        Flag = 'whb_up_jump_amount',
         Callback = function(value) Up.JumpAmount = tonumber(value) or 1 end,
     })
 
-    section:Toggle({
-        Title = 'carry',
-        Flag = 'whb_up_carry',
+    buy:AddToggle('whb_up_carry', {
+        Text = 'Carry',
         Default = false,
         Callback = function(state) Up.Carry = state end,
     })
 
-    section:Toggle({
-        Title = 'base floors',
-        Flag = 'whb_up_base',
+    buy:AddToggle('whb_up_base', {
+        Text = 'Base floors',
         Default = false,
         Callback = function(state) Up.Base = state end,
     })
 
-    section:Toggle({
-        Title = 'slot levels',
-        Description = 'upgrades every filled slot on your base',
-        Flag = 'whb_up_slots',
+    buy:AddToggle('whb_up_slots', {
+        Text = 'Slot levels',
+        Tooltip = 'upgrades every filled slot on your base',
         Default = false,
         Callback = function(state) Up.Slots = state end,
     })
 
-    section:Toggle({
-        Title = 'auto rebirth',
-        Description = 'rebirths as soon as your jump power reaches the cost, 2^rebirths x 40. each rebirth adds x0.5 to your money multiplier',
-        Flag = 'whb_up_rebirth',
+    buy:AddToggle('whb_up_rebirth', {
+        Text = 'Auto rebirth',
+        Tooltip = 'rebirths as soon as your jump power reaches the cost, 2^rebirths x 40. each rebirth adds x0.5 to your money multiplier',
         Default = false,
         Callback = function(state) Up.Rebirth = state end,
     })
 
-    numberInput(section, {
-        Title = 'keep at least ($)',
-        Description = 'the auto buyers never spend below this',
-        Default = Up.Reserve,
-        Flag = 'whb_up_reserve',
-        Callback = function(number) Up.Reserve = math.max(0, number) end,
+    local limits = UpTab:AddRightGroupbox('Limits', 'wallet')
+
+    limits:AddInput('whb_up_reserve', {
+        Text = 'Keep at least ($)',
+        Tooltip = 'the auto buyers never spend below this',
+        Numeric = true,
+        Default = tostring(Up.Reserve),
+        Placeholder = '0',
+        Callback = function(value) Up.Reserve = math.max(0, tonumber(value) or 0) end,
     })
 
-    section:Slider({
-        Title = 'buy every',
-        Min = 0.2, Max = 10, Default = Up.Interval, Increment = 0.1, Suffix = 's',
-        Flag = 'whb_up_interval',
+    limits:AddSlider('whb_up_interval', {
+        Text = 'Buy every',
+        Min = 0.2, Max = 10, Default = Up.Interval, Rounding = 1, Suffix = 's',
         Callback = function(value) Up.Interval = value end,
     })
 
-    section:Label({
-        Title = function()
-            local jp = leaderstat("Jump Power")
-            local carry = CarryInfo.Current and (CarryInfo.IsMax and "max" or ("$" .. formatNumber(CarryInfo.NextPrice or 0))) or "open the carry shop once"
-            return ("next jump power: $%s   next carry: %s"):format(formatNumber(jumpPrice(jp, Up.JumpAmount)), carry)
-        end,
-    })
+    local prices = limits:AddLabel('next jump power: -', true)
+    local rebirthCost = limits:AddLabel('next rebirth: -', true)
+    every(0.5, function()
+        local jp = leaderstat("Jump Power")
+        local rebirths = leaderstat("Rebirths")
+        local carry = CarryInfo.Current and (CarryInfo.IsMax and "max" or ("$" .. formatNumber(CarryInfo.NextPrice or 0))) or "open the carry shop once"
+        prices:SetText(("next jump power: $%s\nnext carry: %s"):format(formatNumber(jumpPrice(jp, Up.JumpAmount)), carry))
+        rebirthCost:SetText(("next rebirth: %s jump power (x%.1f money)"):format(formatNumber(2 ^ rebirths * 40), 1 + (rebirths + 1) * 0.5))
+    end)
 end
 
 do
-    local PlayerTab = Window:CreateTab({ Title = 'player' })
+    local PlayerTab = Window:AddTab('Player', 'user', 'Movement and teleports')
 
-    local jumpSection = PlayerTab:CreateSection('jump')
+    local jump = PlayerTab:AddLeftGroupbox('Jump', 'arrow-up')
 
-    jumpSection:Toggle({
-        Title = 'jump power override',
-        Description = 'the game sets your jump power on the client from your stat, so any value works here',
-        Flag = 'whb_move_jump',
+    jump:AddToggle('whb_move_jump', {
+        Text = 'Jump power override',
+        Tooltip = 'the game sets your jump power on the client from your stat, so any value works here',
         Default = false,
         Callback = function(state)
             Move.JumpOn = state
@@ -1556,31 +1558,27 @@ do
         end,
     })
 
-    jumpSection:Slider({
-        Title = 'jump power',
-        Min = 50, Max = 3000, Default = Move.Jump, Increment = 10,
-        Flag = 'whb_move_jump_value',
+    jump:AddSlider('whb_move_jump_value', {
+        Text = 'Jump power',
+        Min = 50, Max = 3000, Default = Move.Jump, Rounding = 0,
         Callback = function(value) Move.Jump = value end,
     })
 
-    jumpSection:Toggle({
-        Title = 'ignore no-jump zone',
-        Flag = 'whb_move_nojump',
+    jump:AddToggle('whb_move_nojump', {
+        Text = 'Ignore no-jump zone',
         Default = Move.IgnoreNoJump,
         Callback = function(state) Move.IgnoreNoJump = state end,
     })
 
-    jumpSection:Toggle({
-        Title = 'infinite jump',
-        Flag = 'whb_move_infjump',
+    jump:AddToggle('whb_move_infjump', {
+        Text = 'Infinite jump',
         Default = false,
         Callback = function(state) Move.InfiniteJump = state end,
     })
 
-    jumpSection:Toggle({
-        Title = 'remove wall speed cap',
-        Description = 'turns off the game\'s anti fling script, which caps your speed off walls at 55 every frame, so wall hops keep all their momentum',
-        Flag = 'whb_move_uncap',
+    jump:AddToggle('whb_move_uncap', {
+        Text = 'Remove wall speed cap',
+        Tooltip = 'turns off the game\'s anti fling script, which caps your speed off walls at 55 every frame, so wall hops keep all their momentum',
         Default = false,
         Callback = function(state)
             Move.Uncap = state
@@ -1588,10 +1586,10 @@ do
         end,
     })
 
-    jumpSection:Button({
-        Title = 'open wall hop helper',
-        Description = 'loads the hub\'s universal wall hop script in its own window',
-        Callback = function()
+    jump:AddButton({
+        Text = 'Open wall hop helper',
+        Tooltip = 'loads the hub\'s universal wall hop script in its own window',
+        Func = function()
             local ok, err = pcall(function()
                 loadstring(game:HttpGet(REPO_RAW_BASE .. 'Universal/WallHop.lua'))()
             end)
@@ -1599,11 +1597,10 @@ do
         end,
     })
 
-    local moveSection = PlayerTab:CreateSection('movement')
+    local movement = PlayerTab:AddRightGroupbox('Movement', 'footprints')
 
-    moveSection:Toggle({
-        Title = 'walk speed',
-        Flag = 'whb_move_speed',
+    movement:AddToggle('whb_move_speed', {
+        Text = 'Walk speed',
         Default = false,
         Callback = function(state)
             Move.SpeedOn = state
@@ -1612,51 +1609,43 @@ do
         end,
     })
 
-    moveSection:Slider({
-        Title = 'speed',
-        Min = 16, Max = 300, Default = Move.Speed, Increment = 1,
-        Flag = 'whb_move_speed_value',
+    movement:AddSlider('whb_move_speed_value', {
+        Text = 'Speed',
+        Min = 16, Max = 300, Default = Move.Speed, Rounding = 0,
         Callback = function(value) Move.Speed = value end,
     })
 
-    local flyToggle = moveSection:Toggle({
-        Title = 'fly',
-        Description = 'space to rise, ctrl or shift to sink. on touch, look up or down while moving forward',
-        Flag = 'whb_move_fly',
+    movement:AddToggle('whb_move_fly', {
+        Text = 'Fly',
+        Tooltip = 'space to rise, ctrl or shift to sink. on touch, look up or down while moving forward',
         Default = false,
         Callback = function(state)
             Move.Fly = state
             local _, root = myCharacter()
             if root and not state then root.AssemblyLinearVelocity = Vector3.zero end
         end,
+    }):AddKeyPicker('whb_move_fly_key', {
+        Default = 'None',
+        Mode = 'Toggle',
+        SyncToggleState = true,
+        Text = 'Fly',
     })
 
-    moveSection:Keybind({
-        Title = 'fly key',
-        Default = nil,
-        Mode = 'Always',
-        Flag = 'whb_move_fly_key',
-        Callback = function() flyToggle:Set(not Move.Fly) end,
-    })
-
-    moveSection:Slider({
-        Title = 'fly speed',
-        Min = 10, Max = 500, Default = Move.FlySpeed, Increment = 5,
-        Flag = 'whb_move_fly_speed',
+    movement:AddSlider('whb_move_fly_speed', {
+        Text = 'Fly speed',
+        Min = 10, Max = 500, Default = Move.FlySpeed, Rounding = 0,
         Callback = function(value) Move.FlySpeed = value end,
     })
 
-    moveSection:Toggle({
-        Title = 'noclip',
-        Flag = 'whb_move_noclip',
+    movement:AddToggle('whb_move_noclip', {
+        Text = 'Noclip',
         Default = false,
         Callback = function(state) Move.Noclip = state end,
     })
 
-    moveSection:Toggle({
-        Title = 'open vip door',
-        Description = 'the vip door only stops colliding on the owner\'s client; this does the same on yours',
-        Flag = 'whb_move_vip',
+    movement:AddToggle('whb_move_vip', {
+        Text = 'Open VIP door',
+        Tooltip = 'the vip door only stops colliding on the owner\'s client; this does the same on yours',
         Default = false,
         Callback = function(state)
             Move.Vip = state
@@ -1664,7 +1653,7 @@ do
         end,
     })
 
-    local tpSection = PlayerTab:CreateSection('teleport')
+    local tp = PlayerTab:AddLeftGroupbox('Teleport', 'map-pin')
 
     local function destinations()
         local list = { "my base", "sell npc", "carry shop", "jump power shop", "collection zone" }
@@ -1695,17 +1684,18 @@ do
     end
 
     local chosen = "my base"
-    local dropdown = tpSection:Dropdown({
-        Title = 'place',
+    local dropdown = tp:AddDropdown('whb_tp_place', {
+        Text = 'Place',
         Values = destinations(),
         Default = chosen,
-        Callback = function(value) chosen = value end,
+        Callback = function(value) chosen = value or "my base" end,
     })
+    -- where to go is picked fresh each time, so it is not saved in configs
+    Library:SetIgnoreIndexes({ 'whb_tp_place' })
 
-    tpSection:Button({
-        Title = 'go',
-        Mini = true,
-        Callback = function()
+    tp:AddButton({
+        Text = 'Go',
+        Func = function()
             local pos = destination(chosen)
             if pos then
                 task.spawn(travelTo, pos)
@@ -1713,114 +1703,107 @@ do
                 log("Warn", "could not find " .. tostring(chosen))
             end
         end,
-    })
-
-    tpSection:Button({ Title = 'refresh list', Mini = true, Callback = function() dropdown:SetValues(destinations()) end })
+    }):AddButton({ Text = 'Refresh list', Func = function() dropdown:SetValues(destinations()) end })
 end
 
 do
-    local VisualTab = Window:CreateTab({ Title = 'visuals' })
-    local espSection = VisualTab:CreateSection('brainrot esp')
+    local VisualTab = Window:AddTab('Visuals', 'eye', 'Item esp and spawn alerts')
+    local esp = VisualTab:AddLeftGroupbox('Brainrot esp', 'scan-eye')
 
-    espSection:Toggle({
-        Title = 'esp',
-        Flag = 'whb_esp',
+    esp:AddToggle('whb_esp', {
+        Text = 'Esp',
         Default = false,
         Callback = function(state) Esp.Enabled = state end,
     })
 
-    espSection:Dropdown({
-        Title = 'show rarities',
-        Multi = true,
+    esp:AddDropdown('whb_esp_rarities', {
+        Text = 'Show rarities',
         Values = RARITIES,
+        Multi = true,
         Default = table.clone(RARITIES),
-        Flag = 'whb_esp_rarities',
-        Callback = function(list) Esp.Rarities = toSet(list) end,
+        Callback = function(value) Esp.Rarities = asSet(value) end,
     })
 
-    espSection:Toggle({ Title = 'name', Mini = true, Flag = 'whb_esp_name', Default = Esp.Name, Callback = function(s) Esp.Name = s end })
-    espSection:Toggle({ Title = 'rarity', Mini = true, Flag = 'whb_esp_rarity', Default = Esp.Rarity, Callback = function(s) Esp.Rarity = s end })
-    espSection:Toggle({ Title = 'mutation', Mini = true, Flag = 'whb_esp_mutation', Default = Esp.Mutation, Callback = function(s) Esp.Mutation = s end })
-    espSection:Toggle({ Title = 'despawn timer', Mini = true, Flag = 'whb_esp_timer', Default = Esp.Timer, Callback = function(s) Esp.Timer = s end })
-    espSection:Toggle({ Title = 'distance', Mini = true, Flag = 'whb_esp_distance', Default = Esp.Distance, Callback = function(s) Esp.Distance = s end })
-    espSection:Toggle({ Title = 'base income', Mini = true, Flag = 'whb_esp_income', Default = Esp.Income, Callback = function(s) Esp.Income = s end })
-    espSection:Toggle({ Title = 'highlight', Mini = true, Flag = 'whb_esp_highlight', Default = Esp.Highlight, Callback = function(s) Esp.Highlight = s end })
+    for _, entry in ipairs({
+        { 'whb_esp_name', 'Name', 'Name' },
+        { 'whb_esp_rarity', 'Rarity', 'Rarity' },
+        { 'whb_esp_mutation', 'Mutation', 'Mutation' },
+        { 'whb_esp_timer', 'Despawn timer', 'Timer' },
+        { 'whb_esp_distance', 'Distance', 'Distance' },
+        { 'whb_esp_income', 'Base income', 'Income' },
+        { 'whb_esp_highlight', 'Highlight', 'Highlight' },
+    }) do
+        local key = entry[3]
+        esp:AddCheckbox(entry[1], {
+            Text = entry[2],
+            Default = Esp[key],
+            Callback = function(state) Esp[key] = state end,
+        })
+    end
 
-    espSection:Slider({
-        Title = 'text size',
-        Min = 8, Max = 28, Default = Esp.TextSize, Increment = 1,
-        Flag = 'whb_esp_textsize',
+    esp:AddSlider('whb_esp_textsize', {
+        Text = 'Text size',
+        Min = 8, Max = 28, Default = Esp.TextSize, Rounding = 0,
         Callback = function(value) Esp.TextSize = value end,
     })
 
-    espSection:Slider({
-        Title = 'max distance',
-        Min = 50, Max = 20000, Default = Esp.MaxDistance, Increment = 50, Suffix = ' studs',
-        Flag = 'whb_esp_distance_max',
+    esp:AddSlider('whb_esp_distance_max', {
+        Text = 'Max distance',
+        Min = 50, Max = 20000, Default = Esp.MaxDistance, Rounding = 0, Suffix = ' studs',
         Callback = function(value) Esp.MaxDistance = value end,
     })
 
-    local alertSection = VisualTab:CreateSection('spawn alerts')
+    local alerts = VisualTab:AddRightGroupbox('Spawn alerts', 'bell-ring')
 
-    alertSection:Toggle({
-        Title = 'divine / insane announcements',
-        Flag = 'whb_alert_specials',
+    alerts:AddToggle('whb_alert_specials', {
+        Text = 'Divine / Insane announcements',
         Default = Alerts.Specials,
         Callback = function(state) Alerts.Specials = state end,
     })
 
-    alertSection:Dropdown({
-        Title = 'notify on new',
-        Multi = true,
+    alerts:AddDropdown('whb_alert_rarities', {
+        Text = 'Notify on new',
         Values = RARITIES,
-        Default = (function()
-            local list = {}
-            for _, name in ipairs(RARITIES) do if Alerts.Rarities[name] then list[#list + 1] = name end end
-            return list
-        end)(),
-        Flag = 'whb_alert_rarities',
-        Callback = function(list) Alerts.Rarities = toSet(list) end,
+        Multi = true,
+        Default = setToList(Alerts.Rarities, RARITIES),
+        Callback = function(value) Alerts.Rarities = asSet(value) end,
     })
 
-    alertSection:Toggle({
-        Title = 'alert sound',
-        Flag = 'whb_alert_sound',
+    alerts:AddToggle('whb_alert_sound', {
+        Text = 'Alert sound',
         Default = Alerts.Sound,
         Callback = function(state) Alerts.Sound = state end,
     })
 end
 
 do
-    local MiscTab = Window:CreateTab({ Title = 'misc' })
-    local rewards = MiscTab:CreateSection('free rewards')
+    local MiscTab = Window:AddTab('Misc', 'gift', 'Free rewards and session')
+    local rewards = MiscTab:AddLeftGroupbox('Free rewards', 'gift')
 
-    rewards:Toggle({
-        Title = 'auto daily reward',
-        Flag = 'whb_misc_daily',
+    rewards:AddToggle('whb_misc_daily', {
+        Text = 'Auto daily reward',
         Default = false,
         Callback = function(state) Misc.Daily = state end,
     })
 
-    rewards:Toggle({
-        Title = 'auto playtime gifts',
-        Description = 'claims each of the nine playtime gifts the moment your session time reaches it (5 minutes up to 100)',
-        Flag = 'whb_misc_playtime',
+    rewards:AddToggle('whb_misc_playtime', {
+        Text = 'Auto playtime gifts',
+        Tooltip = 'claims each of the nine playtime gifts the moment your session time reaches it (5 minutes up to 100)',
         Default = false,
         Callback = function(state) Misc.Playtime = state end,
     })
 
-    rewards:Toggle({
-        Title = 'auto spin',
-        Description = 'spins the wheel whenever you have a spin ticket',
-        Flag = 'whb_misc_spin',
+    rewards:AddToggle('whb_misc_spin', {
+        Text = 'Auto spin',
+        Tooltip = 'spins the wheel whenever you have a spin ticket',
         Default = false,
         Callback = function(state) Misc.Spin = state end,
     })
 
-    rewards:Button({
-        Title = 'claim group reward',
-        Description = 'goes to the group reward stand, presses it, and comes back. it only pays out if you are in the group',
-        Callback = function()
+    rewards:AddButton({
+        Text = 'Claim group reward',
+        Tooltip = 'goes to the group reward stand, presses it, and comes back. it only pays out if you are in the group',
+        Func = function()
             errand(function()
                 local prompt = groupRewardPrompt()
                 if not prompt then
@@ -1835,25 +1818,28 @@ do
         end,
     })
 
-    local session = MiscTab:CreateSection('session')
+    local session = MiscTab:AddRightGroupbox('Session', 'power')
 
-    session:Toggle({
-        Title = 'anti afk',
-        Flag = 'whb_misc_afk',
+    session:AddToggle('whb_misc_afk', {
+        Text = 'Anti afk',
         Default = Misc.AntiAfk,
         Callback = function(state) Misc.AntiAfk = state end,
     })
 
-    Log = session:Console({ Title = 'log', Height = 150, MaxLines = 120, Timestamps = true })
-    Log:Log('loaded. configs live under settings (gear icon, top right).')
-    if not ItemConfig then Log:Warn('could not read ItemConfigurations, income sorting falls back to rarity') end
-    if typeof(fireproximityprompt) ~= "function" then Log:Warn('no fireproximityprompt, prompts are pressed through their own input') end
-
-    session:Button({
-        Title = 'unload',
-        Callback = function()
-            unload()
-            Onyx:Unload()
-        end,
+    session:AddButton({
+        Text = 'Unload',
+        Risky = true,
+        DoubleClick = true,
+        Func = function() Library:Unload() end,
     })
+
+    local logBox = MiscTab:AddBigGroupbox('Log', 'scroll-text')
+    Log = logBox:AddLog('whb_log', { Height = 170, MaxLines = 150, Timestamps = true })
+    Log:Log('loaded. configs, themes and the menu key live under settings (gear icon, top right).')
+    if not ItemConfig then log("Warn", 'could not read ItemConfigurations, income sorting falls back to rarity') end
+    if typeof(fireproximityprompt) ~= "function" then log("Warn", 'no fireproximityprompt, prompts are pressed through their own input') end
+    for _, line in ipairs(PendingLog) do
+        pcall(function() Log:Log(line[1], line[2]) end)
+    end
+    table.clear(PendingLog)
 end
