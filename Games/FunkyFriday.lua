@@ -811,6 +811,124 @@ task.spawn(function()
     end
 end)
 
+-- Finding what eats your input. If jump works but the joystick and camera
+-- don't, touches are being taken before the controls see them: a screen GUI
+-- under your finger, or a control script that never started. This logs, for
+-- each touch or click, whether the game counted it as used by a GUI and what
+-- is under it, and reports the default controls' state.
+
+local Probe = { Enabled = false, LastBlockers = {} }
+
+local function pathOf(inst)
+    local ok, name = pcall(function() return inst:GetFullName() end)
+    return ok and name or inst.Name
+end
+
+local function looksInvisible(gui)
+    if gui.BackgroundTransparency < 0.95 then return false end
+    if (gui:IsA("ImageLabel") or gui:IsA("ImageButton")) and gui.Image ~= "" and gui.ImageTransparency < 0.95 then return false end
+    if (gui:IsA("TextLabel") or gui:IsA("TextButton")) and gui.Text ~= "" and gui.TextTransparency < 0.95 then return false end
+    return true
+end
+
+-- GUI objects at a screen point that take input there
+local function blockersAt(point)
+    local gui = playerGui()
+    if not gui then return {} end
+    local ok, list = pcall(function() return gui:GetGuiObjectsAtPosition(point.X, point.Y) end)
+    if not ok then return {} end
+    local out = {}
+    for _, obj in ipairs(list) do
+        local takesInput = obj:IsA("GuiButton") or obj:IsA("TextBox") or obj.Active
+        local interactable = true
+        pcall(function() interactable = obj.Interactable end)
+        if takesInput and interactable then out[#out + 1] = obj end
+    end
+    return out
+end
+
+local function controlsReport()
+    local lines = {}
+    local scripts = LocalPlayer:FindFirstChildOfClass("PlayerScripts")
+    local module = scripts and scripts:FindFirstChild("PlayerModule")
+    if not module then
+        lines[#lines + 1] = "PlayerModule is missing from PlayerScripts, so nothing drives walking or the camera"
+    else
+        local ok, controls = pcall(function() return require(module):GetControls() end)
+        if not ok or not controls then
+            lines[#lines + 1] = "PlayerModule's controls could not be read: " .. tostring(controls)
+        else
+            local active = controls.activeController
+            lines[#lines + 1] = "controls: " .. (active and ("running (" .. tostring(active.Name or "controller") .. ")") or "no active controller")
+            local okVector, move = pcall(function() return controls:GetMoveVector() end)
+            if okVector then lines[#lines + 1] = ("move input right now: %.2f, %.2f, %.2f"):format(move.X, move.Y, move.Z) end
+        end
+    end
+    local hum = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+    if hum then
+        lines[#lines + 1] = ("humanoid: walk %s, state %s, move dir %.2f"):format(tostring(hum.WalkSpeed), hum:GetState().Name, hum.MoveDirection.Magnitude)
+    end
+    pcall(function()
+        local camera = workspace.CurrentCamera
+        lines[#lines + 1] = "camera: " .. camera.CameraType.Name .. ", following " .. tostring(camera.CameraSubject)
+    end)
+    pcall(function()
+        local UserInputService = game:GetService("UserInputService")
+        lines[#lines + 1] = ("input: touch %s, mouse behavior %s"):format(tostring(UserInputService.TouchEnabled), UserInputService.MouseBehavior.Name)
+        lines[#lines + 1] = "touch controls on: " .. tostring(game:GetService("GuiService").TouchControlsEnabled)
+    end)
+    -- every input context, wherever it lives, that is on and swallows input
+    local found = 0
+    local roots = { playerGui(), scripts, LocalPlayer.Character }
+    for _, root in ipairs(roots) do
+        for _, inst in ipairs(root and root:GetDescendants() or {}) do
+            if inst:IsA("InputContext") then
+                found += 1
+                lines[#lines + 1] = ("input context %s: on %s, sink %s, priority %s"):format(pathOf(inst), tostring(inst.Enabled), tostring(inst.Sink), tostring(inst.Priority))
+            end
+        end
+    end
+    if found == 0 then lines[#lines + 1] = "no input contexts" end
+    pcall(function()
+        local bound = game:GetService("ContextActionService"):GetAllBoundActionInfo()
+        local names = {}
+        for name in pairs(bound) do names[#names + 1] = name end
+        lines[#lines + 1] = "bound actions: " .. (#names > 0 and table.concat(names, ", ") or "none")
+    end)
+    return lines
+end
+
+track(game:GetService("UserInputService").InputBegan:Connect(function(input, processed)
+    if not Probe.Enabled then return end
+    local kind = input.UserInputType
+    if kind ~= Enum.UserInputType.Touch and kind ~= Enum.UserInputType.MouseButton1 and kind ~= Enum.UserInputType.MouseButton2 then return end
+    local point = Vector2.new(input.Position.X, input.Position.Y)
+    local blockers = blockersAt(point)
+    Probe.LastBlockers = blockers
+    log(processed and "Warn" or "Info", ("%s at %d, %d: %s"):format(
+        kind == Enum.UserInputType.Touch and "touch" or "click", point.X, point.Y,
+        processed and "taken by a gui" or "reached the game"))
+    for i = 1, math.min(#blockers, 4) do
+        local obj = blockers[i]
+        log("Info", ("  under it: %s (%s%s)"):format(pathOf(obj), obj.ClassName, looksInvisible(obj) and ", invisible" or ""))
+    end
+end))
+
+-- Stops the GUI found under your last touch from taking input. Only things
+-- you can't see are touched, so no visible button stops working.
+local function unblock()
+    local count = 0
+    for _, obj in ipairs(Probe.LastBlockers) do
+        if obj.Parent and looksInvisible(obj) then
+            pcall(function() obj.Active = false end)
+            pcall(function() obj.Interactable = false end)
+            count += 1
+            log("Success", "unblocked " .. pathOf(obj))
+        end
+    end
+    if count == 0 then log("Info", "nothing invisible under your last touch. turn on the touch check and touch where the joystick should be first") end
+end
+
 --// teardown ----------------------------------------------------------------
 
 local function unload()
@@ -979,6 +1097,30 @@ do
         Tooltip = 'checks every second outside a song and fixes whatever got stuck',
         Default = false,
         Callback = function(state) Fix.Auto = state end,
+    })
+
+    fixes:AddDivider('Find what is blocking')
+
+    fixes:AddToggle('ff_probe', {
+        Text = 'Touch check',
+        Tooltip = 'logs every touch or click: whether a gui took it and what is under your finger. touch where the joystick should be and drag where the camera should turn',
+        Default = false,
+        Callback = function(state) Probe.Enabled = state end,
+    })
+    Library:SetIgnoreIndexes({ 'ff_probe' })
+
+    fixes:AddButton({
+        Text = 'Controls report',
+        Tooltip = 'logs the state of walking, the camera and every input layer',
+        Func = function()
+            for _, line in ipairs(controlsReport()) do log("Info", line) end
+        end,
+    })
+
+    fixes:AddButton({
+        Text = 'Unblock last touch',
+        Tooltip = 'stops invisible gui under your last touch from taking input',
+        Func = unblock,
     })
 
     local logBox = Tab:AddBigGroupbox('Log', 'scroll-text')
