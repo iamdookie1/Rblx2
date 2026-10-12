@@ -683,6 +683,134 @@ local function checkModes()
     return lines
 end
 
+--// camera and movement fix -------------------------------------------------
+-- Outside a song the game should hand the camera and your character back:
+-- its CameraHandler unbinds its "CameraHandler" render step and sets the
+-- camera to Custom, and the input context for the arrow keys (VSRGContext,
+-- which sinks every other input while enabled) is torn down. If one of those
+-- gets stuck you can't look around or walk. This puts each of them back, but
+-- only while you are not in a song, so it never fights the game mid-chart.
+
+local Fix = { Auto = false }
+
+-- In a song while the arrow input exists and a note field is on screen. The
+-- context alone isn't enough: it is the thing that can get left behind.
+local function inSong()
+    if not context() then return false end
+    local ok, field = pcall(myField)
+    return ok and field ~= nil
+end
+
+-- Puts camera and controls back. Returns what it had to change.
+local function fixControls(quiet)
+    local changed = {}
+    if inSong() then
+        if not quiet then log("Warn", "you are in a song, the game owns the camera and keys until it ends") end
+        return changed
+    end
+    local char = LocalPlayer.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    local root = char and char:FindFirstChild("HumanoidRootPart")
+    local camera = workspace.CurrentCamera
+
+    -- camera
+    pcall(function() RunService:UnbindFromRenderStep("CameraHandler") end)
+    if camera then
+        if camera.CameraType ~= Enum.CameraType.Custom then
+            changed[#changed + 1] = "camera type was " .. camera.CameraType.Name
+            camera.CameraType = Enum.CameraType.Custom
+        end
+        if hum and camera.CameraSubject ~= hum then
+            changed[#changed + 1] = "camera was not following you"
+            camera.CameraSubject = hum
+        end
+    end
+    if LocalPlayer.CameraMaxZoomDistance < LocalPlayer.CameraMinZoomDistance or LocalPlayer.CameraMaxZoomDistance < 1 then
+        changed[#changed + 1] = "camera zoom was locked"
+        LocalPlayer.CameraMinZoomDistance = 0.5
+        LocalPlayer.CameraMaxZoomDistance = 128
+    end
+    if LocalPlayer.CameraMode == Enum.CameraMode.LockFirstPerson then
+        changed[#changed + 1] = "camera was locked first person"
+        LocalPlayer.CameraMode = Enum.CameraMode.Classic
+    end
+
+    -- input contexts that swallow everything outside a song
+    local gui = playerGui()
+    for _, inst in ipairs(gui and gui:GetDescendants() or {}) do
+        if inst:IsA("InputContext") and inst.Enabled and inst.Sink then
+            changed[#changed + 1] = "input context " .. inst.Name .. " was blocking input"
+            pcall(function() inst.Enabled = false end)
+        end
+    end
+    pcall(function()
+        local UserInputService = game:GetService("UserInputService")
+        if UserInputService.ModalEnabled then
+            changed[#changed + 1] = "modal input was on"
+            UserInputService.ModalEnabled = false
+        end
+    end)
+    pcall(function()
+        local GuiService = game:GetService("GuiService")
+        if GuiService.SelectedObject then
+            changed[#changed + 1] = "a menu button had gamepad focus"
+            GuiService.SelectedObject = nil
+        end
+    end)
+
+    -- the default control scripts
+    pcall(function()
+        local scripts = LocalPlayer:FindFirstChildOfClass("PlayerScripts")
+        local module = scripts and scripts:FindFirstChild("PlayerModule")
+        if module then
+            local controls = require(module):GetControls()
+            controls:Enable(true)
+        end
+    end)
+
+    -- the character itself
+    if hum then
+        if hum.WalkSpeed <= 0 then
+            changed[#changed + 1] = "walk speed was 0"
+            hum.WalkSpeed = 24 -- the game's own default (Character Walk Speed setting)
+        end
+        if hum.PlatformStand then
+            changed[#changed + 1] = "character was platform standing"
+            hum.PlatformStand = false
+        end
+        if hum.Sit then
+            hum.Sit = false
+        end
+        if hum.UseJumpPower and hum.JumpPower <= 0 then
+            hum.JumpPower = 50
+        elseif not hum.UseJumpPower and hum.JumpHeight <= 0 then
+            hum.JumpHeight = 7.2
+        end
+    end
+    if root and root.Anchored then
+        changed[#changed + 1] = "character was anchored"
+        root.Anchored = false
+    end
+
+    if not quiet then
+        if #changed == 0 then
+            log("Info", "nothing looked stuck. if you still can't move, rejoin, or say what you see")
+        else
+            for _, line in ipairs(changed) do log("Success", "fixed: " .. line) end
+        end
+    elseif #changed > 0 then
+        log("Success", "auto fix: " .. table.concat(changed, ", "))
+    end
+    return changed
+end
+
+task.spawn(function()
+    while not Unloaded do
+        task.wait(1)
+        if Fix.Auto then pcall(fixControls, true) end
+    end
+end)
+
 --// teardown ----------------------------------------------------------------
 
 local function unload()
@@ -836,6 +964,21 @@ do
         Tooltip = 'the screen modes can\'t read a note\'s type, so a note drawn differently from the lane\'s usual ones (death, poison) is left alone. game mode always knows the type',
         Default = Auto.SkipSpecial,
         Callback = function(state) Auto.SkipSpecial = state end,
+    })
+
+    local fixes = Tab:AddRightGroupbox('Camera and movement', 'move')
+
+    fixes:AddButton({
+        Text = 'Fix camera and movement',
+        Tooltip = 'puts the camera back on you, unblocks input and unanchors your character. only does anything outside a song',
+        Func = function() fixControls(false) end,
+    })
+
+    fixes:AddToggle('ff_autofix', {
+        Text = 'Keep it fixed',
+        Tooltip = 'checks every second outside a song and fixes whatever got stuck',
+        Default = false,
+        Callback = function(state) Fix.Auto = state end,
     })
 
     local logBox = Tab:AddBigGroupbox('Log', 'scroll-text')
