@@ -21,9 +21,11 @@
 --    through the game's own Deflect event, the same one its button fires.
 --
 -- The better ball turns BallMove off (it is a LocalScript in your
--- PlayerScripts, so it can be) and runs a ball of its own: it curves onto its
--- target like the real game, speeds up per parry, and plays to the same
--- values, events, effects and streak as the game's ball.
+-- PlayerScripts, so it can be) and runs a ball of its own: it flies straight
+-- at its target, re-aimed every frame so it follows you, counts as arrived the
+-- frame it would pass its target (so it never skips its hit), and either gets
+-- faster per parry or takes a set time per trip. It plays to the same values,
+-- events, effects and streak as the game's ball.
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -120,12 +122,14 @@ local Control = {
 
 local Better = {
     Enabled = false,
-    BaseSpeed = 40,       -- studs/s at streak 0
+    Pace = "Speed",       -- Speed: studs/s that grow per parry / Travel time: each trip takes a set time
+    BaseSpeed = 80,       -- studs/s at streak 0
     Gain = 3,             -- studs/s per parry
     MaxSpeed = 400,
-    Curve = 6,            -- how hard it turns onto its target; higher = straighter
+    TravelTime = 0.35,    -- seconds per trip, Travel time pace
+    InstantBots = false,  -- bots send it back the moment it is sent to them
     YouChance = 50,       -- % a bot sends it at you when there are two bots
-    HitRadius = 3.5,      -- studs from your root that counts as reaching you
+    HitRadius = 5,        -- studs from your root that counts as reaching you
     ParryWindow = 0.7,    -- seconds a parry protects you
     Cooldown = 1.9,       -- seconds before you can parry again after a miss
 }
@@ -221,7 +225,6 @@ local Engine = {
     Running = false,
     Ball = nil,
     Target = nil,       -- "p1" / "p2" / "you"
-    Velocity = Vector3.zero,
     Speed = 0,
     GraceUntil = nil,
     Attachment = nil,
@@ -255,10 +258,22 @@ local function wander(bot, home, indicator)
     end)
 end
 
+-- Speed for the trip about to start: from the streak, or whatever gets it
+-- there in the set travel time.
+local function engineSpeed(distance)
+    if Better.Pace == "Travel time" and distance then
+        return math.max(distance / math.max(Better.TravelTime, 0.02), 1)
+    end
+    return math.min(Better.BaseSpeed + Better.Gain * leaderstat("Streak"), Better.MaxSpeed)
+end
+
 local function setTarget(name)
     Engine.Target = name
     local ball = Engine.Ball
     if not ball then return end
+    local _, root = myCharacter()
+    local goal = name == "you" and root or botPart(name)
+    Engine.Speed = engineSpeed(goal and (goal.Position - ball.Position).Magnitude)
     local danger = name == "you"
     pcall(function()
         ball.Material = Enum.Material.Neon
@@ -269,10 +284,6 @@ local function setTarget(name)
             Engine.BallHighlight.FillTransparency = danger and 0 or 1
         end
     end)
-end
-
-local function engineSpeed()
-    return math.min(Better.BaseSpeed + Better.Gain * leaderstat("Streak"), Better.MaxSpeed)
 end
 
 local function stopEngineRound()
@@ -323,11 +334,6 @@ local function engineDeflected()
     pcall(function() event("Count"):Fire(readNumber("Speed", 2)) end)
     local next = (oneBot() or math.random() < 0.5) and "p1" or "p2"
     setTarget(next)
-    -- bounce back off you, then curve onto the bot
-    if root and Engine.Ball then
-        local away = (Engine.Ball.Position - root.Position)
-        if away.Magnitude > 0 then Engine.Velocity = away.Unit * Engine.Speed end
-    end
 end
 
 local function engineStart()
@@ -391,8 +397,6 @@ local function engineStart()
     Engine.BallHighlight.Parent = ball
 
     writeValue("Speed", Control.StartSpeed)
-    Engine.Speed = engineSpeed()
-    Engine.Velocity = Vector3.zero
     setTarget("p1")
     Engine.Running = true
     Stats.Status = "better ball"
@@ -431,7 +435,6 @@ local function engineArrive()
     else
         setTarget("p2")
     end
-    Engine.Speed = engineSpeed()
 end
 
 local function engineStep(dt)
@@ -455,6 +458,14 @@ local function engineStep(dt)
     local target = Engine.Target == "you" and root or botPart(Engine.Target)
     if not target then return end
     local goal = target.Position
+    if Engine.Target ~= "you" and Better.InstantBots then
+        ball.Position = goal
+        engineArrive()
+        return
+    end
+    -- straight at the target, re-aimed every frame so it follows you. it counts
+    -- as arrived once inside the radius or once this frame's move would pass
+    -- the target, so a fast ball can never skip over it
     local toGoal = goal - ball.Position
     local distance = toGoal.Magnitude
     local radius = Engine.Target == "you" and Better.HitRadius or 2.5
@@ -464,15 +475,7 @@ local function engineStep(dt)
         engineArrive()
         return
     end
-    -- curves onto the target: turn the heading toward it at Curve per second,
-    -- harder the closer it gets, so it never orbits
-    local desired = toGoal.Unit * Engine.Speed
-    local current = Engine.Velocity.Magnitude > 0 and Engine.Velocity or desired
-    local turn = math.clamp(Better.Curve * dt * (1 + 20 / math.max(distance, 1)), 0, 1)
-    local heading = current:Lerp(desired, turn)
-    if heading.Magnitude < 1e-3 then heading = desired end
-    Engine.Velocity = heading.Unit * Engine.Speed
-    ball.Position += Engine.Velocity * dt
+    ball.Position += toGoal.Unit * step
 end
 
 -- The game's deflect, for the better ball: BallMove's own copy is off with it.
@@ -616,7 +619,9 @@ track(RunService.Heartbeat:Connect(function(dt)
     local _, root = myCharacter()
     if Better.Enabled then
         ball = Engine.Running and Engine.Ball or nil
-        targetsMe = ball ~= nil and Engine.Target == "you" and not Engine.GraceUntil
+        -- still "after you" while it sits on you in the grace window, so a parry
+        -- that was a frame late still lands
+        targetsMe = ball ~= nil and Engine.Target == "you"
         closing = Engine.Speed
     else
         local align
@@ -902,34 +907,52 @@ do
 
     better:AddToggle('bbt_better', {
         Text = 'Better ball',
-        Tooltip = 'turns off the trainer\'s ball script and runs a ball that curves onto its target and speeds up per parry like the real game. bots, grace and wander above still apply',
+        Tooltip = 'turns off the trainer\'s ball script and runs one that flies straight at its target, follows you, and never misses its hit. bots, grace and wander above still apply',
         Default = false,
         Callback = function(state) setBetter(state) end,
     })
 
+    better:AddDropdown('bbt_pace', {
+        Text = 'Pace',
+        Tooltip = 'speed: studs per second that go up every parry. travel time: every trip takes the same time however far it is, the fastest way to stack parries',
+        Values = { 'Speed', 'Travel time' },
+        Default = Better.Pace,
+        Callback = function(v) Better.Pace = v or "Speed" end,
+    })
+
+    better:AddSlider('bbt_travel', {
+        Text = 'Travel time',
+        Tooltip = 'travel time pace: seconds for each trip, to a bot or to you',
+        Min = 0.05, Max = 2, Default = Better.TravelTime, Rounding = 2, Suffix = 's',
+        Callback = function(v) Better.TravelTime = v end,
+    })
+
+    better:AddToggle('bbt_instantbots', {
+        Text = 'Instant bot hits',
+        Tooltip = 'the ball skips the trip to the bots and comes straight back at you, so only your trips take time',
+        Default = Better.InstantBots,
+        Callback = function(state) Better.InstantBots = state end,
+    })
+
     better:AddSlider('bbt_base', {
         Text = 'Start speed',
-        Min = 10, Max = 200, Default = Better.BaseSpeed, Rounding = 0, Suffix = ' studs/s',
+        Tooltip = 'speed pace only',
+        Min = 10, Max = 1000, Default = Better.BaseSpeed, Rounding = 0, Suffix = ' studs/s',
         Callback = function(v) Better.BaseSpeed = v end,
     })
 
     better:AddSlider('bbt_gain', {
         Text = 'Speed per parry',
-        Min = 0, Max = 30, Default = Better.Gain, Rounding = 1, Suffix = ' studs/s',
+        Tooltip = 'speed pace only',
+        Min = 0, Max = 100, Default = Better.Gain, Rounding = 1, Suffix = ' studs/s',
         Callback = function(v) Better.Gain = v end,
     })
 
     better:AddSlider('bbt_max', {
         Text = 'Top speed',
-        Min = 50, Max = 1500, Default = Better.MaxSpeed, Rounding = 0, Suffix = ' studs/s',
+        Tooltip = 'speed pace only',
+        Min = 50, Max = 5000, Default = Better.MaxSpeed, Rounding = 0, Suffix = ' studs/s',
         Callback = function(v) Better.MaxSpeed = v end,
-    })
-
-    better:AddSlider('bbt_curve', {
-        Text = 'Curve',
-        Tooltip = 'how hard the ball turns onto its target. low = wide curves, high = almost straight',
-        Min = 1, Max = 30, Default = Better.Curve, Rounding = 1,
-        Callback = function(v) Better.Curve = v end,
     })
 
     better:AddSlider('bbt_youchance', {
@@ -941,7 +964,7 @@ do
 
     better:AddSlider('bbt_radius', {
         Text = 'Hit radius',
-        Min = 1, Max = 10, Default = Better.HitRadius, Rounding = 1, Suffix = ' studs',
+        Min = 1, Max = 15, Default = Better.HitRadius, Rounding = 1, Suffix = ' studs',
         Callback = function(v) Better.HitRadius = v end,
     })
 
