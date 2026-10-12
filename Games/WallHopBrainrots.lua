@@ -30,6 +30,10 @@
 --    playtime gifts, Events.SpinRequest with AdData.AdSpinTickets, and the
 --    group reward stand's prompt.
 --
+-- The map streams, so spawners and your base are only on the client while
+-- you are near them. Their positions are saved as soon as they are seen (the
+-- spawners to a file, per place) and the farm travels to them to load them in.
+--
 -- The server scripts were not in the dump, so which remotes it checks for
 -- distance is not known: the farm walks (or teleports) to the prompt, base and
 -- sell NPC the way a player would rather than relying on it not checking.
@@ -156,6 +160,9 @@ local Farm = {
     CollectOnReturn = true,
     ActionDelay = 0.15,
     IdleAtBase = true,         -- wait at the base when there is nothing to grab
+    Scout = true,              -- visit saved spawners when nothing wanted is loaded in
+    ScoutWait = 1,             -- seconds to let a spawner's brainrots load in
+    PickupWait = 3,            -- seconds a pickup gets to show up in your backpack
 }
 
 local Travel = {
@@ -461,18 +468,157 @@ local function slots()
     return list
 end
 
-local function homePosition()
+--// saved positions -------------------------------------------------------
+-- The map streams: a few hundred studs away the spawners, their brainrots and
+-- even your own base are not on the client at all, so they can't be found by
+-- looking. Every spot the farm needs is written down the moment it is seen.
+-- Spawners and the fixed spots (sell npc, shops) never move, so they are also
+-- saved to a file and known on the next join before they ever load in. Your
+-- plot changes from server to server, so it is only kept for this session.
+
+local HttpService = game:GetService("HttpService")
+local SAVE_FOLDER = "WallHopBrainrots"
+local SAVE_FILE = SAVE_FOLDER .. "/positions_" .. tostring(game.PlaceId) .. ".json"
+
+local Saved = { Spawners = {}, Points = {} } -- name -> Vector3, written to SAVE_FILE
+local Session = { Home = nil, Slots = {} }   -- this server only
+local SaveDirty = false
+
+local POINTS = {
+    -- point name, model under Workspace, child holding the position
+    { "sell npc", "SellNPC", "ProxPart" },
+    { "carry shop", "Carry", "Touch" },
+    { "jump power shop", "JumpPower", "Touch" },
+    { "collection zone", "CollectionZone" },
+}
+
+local function canFile()
+    return typeof(writefile) == "function" and typeof(readfile) == "function" and typeof(isfile) == "function"
+end
+
+local function encodePositions(map)
+    local out = {}
+    for key, pos in pairs(map) do out[key] = { pos.X, pos.Y, pos.Z } end
+    return out
+end
+
+local function decodePositions(map)
+    local out = {}
+    for key, value in pairs(type(map) == "table" and map or {}) do
+        if type(value) == "table" and #value == 3 then out[key] = Vector3.new(value[1], value[2], value[3]) end
+    end
+    return out
+end
+
+local function loadSaved()
+    if not canFile() then return end
+    local ok, data = pcall(function()
+        if not isfile(SAVE_FILE) then return nil end
+        return HttpService:JSONDecode(readfile(SAVE_FILE))
+    end)
+    if ok and type(data) == "table" then
+        Saved.Spawners = decodePositions(data.Spawners)
+        Saved.Points = decodePositions(data.Points)
+    end
+end
+
+local function writeSaved()
+    if not canFile() then return end
+    pcall(function()
+        if typeof(isfolder) == "function" and typeof(makefolder) == "function" and not isfolder(SAVE_FOLDER) then
+            makefolder(SAVE_FOLDER)
+        end
+        writefile(SAVE_FILE, HttpService:JSONEncode({
+            Spawners = encodePositions(Saved.Spawners),
+            Points = encodePositions(Saved.Points),
+        }))
+    end)
+end
+
+local function remember(map, key, pos, persist)
+    local old = map[key]
+    if old and (old - pos).Magnitude < 1 then return end
+    map[key] = pos
+    if persist then SaveDirty = true end
+end
+
+local function positionOf(inst)
+    if not inst then return nil end
+    if inst:IsA("BasePart") then return inst.Position end
+    if inst:IsA("Model") then
+        local ok, pivot = pcall(function() return inst:GetPivot() end)
+        if ok and inst:FindFirstChildWhichIsA("BasePart", true) then return pivot.Position end
+    end
+    return nil
+end
+
+local function liveHome()
     local plot = myPlot()
-    if not plot then return nil end
-    local spawn = plot:FindFirstChild("Spawn")
-    if spawn and spawn:IsA("BasePart") then return spawn.Position end
-    return plot:GetPivot().Position
+    return plot and positionOf(plot:FindFirstChild("Spawn")) or nil
+end
+
+-- Writes down everything currently loaded in.
+local function recordPositions()
+    local spawners = Workspace:FindFirstChild("ItemSpawners")
+    for _, part in ipairs(spawners and spawners:GetChildren() or {}) do
+        local pos = RarityRank[part.Name] and positionOf(part)
+        if pos then remember(Saved.Spawners, part.Name, pos, true) end
+    end
+    for _, point in ipairs(POINTS) do
+        local inst = Workspace:FindFirstChild(point[2])
+        if inst and point[3] then inst = inst:FindFirstChild(point[3]) or inst end
+        local pos = positionOf(inst)
+        if pos then remember(Saved.Points, point[1], pos, true) end
+    end
+    local home = liveHome()
+    if home then Session.Home = home end
+    for _, slot in ipairs(slots()) do
+        Session.Slots[slot.Floor .. "/" .. slot.Name] = slot.Spawn.Position
+    end
+end
+
+local function homePosition()
+    return liveHome() or Session.Home
 end
 
 local function sellPosition()
     local npc = Workspace:FindFirstChild("SellNPC")
-    local part = npc and npc:FindFirstChild("ProxPart")
-    return part and part.Position or nil
+    return positionOf(npc and npc:FindFirstChild("ProxPart")) or Saved.Points["sell npc"]
+end
+
+loadSaved()
+pcall(recordPositions)
+
+task.spawn(function()
+    local nextWrite = 0
+    while not Unloaded do
+        task.wait(1)
+        pcall(recordPositions)
+        if SaveDirty and os.clock() >= nextWrite then
+            SaveDirty = false
+            nextWrite = os.clock() + 5
+            writeSaved()
+        end
+    end
+end)
+
+-- Asks the server to load the map around a point before you get there, when
+-- the game streams. It waits at most a couple of seconds.
+local function streamAround(pos)
+    if not pos then return end
+    pcall(function()
+        if Workspace.StreamingEnabled then LocalPlayer:RequestStreamAroundAsync(pos, 2) end
+    end)
+end
+
+local function waitFor(check, timeout)
+    local start = os.clock()
+    while os.clock() - start < timeout and not Unloaded do
+        local ok, done = pcall(check)
+        if ok and done then return true end
+        task.wait(0.1)
+    end
+    return false
 end
 
 --// movement ----------------------------------------------------------------
@@ -485,6 +631,9 @@ local function travelTo(pos, keepGoing)
     local _, root = myCharacter()
     if not root or not pos then return false end
     local goal = pos + Vector3.new(0, Travel.Height, 0)
+    if (goal - root.Position).Magnitude > 150 then streamAround(goal) end
+    _, root = myCharacter()
+    if not root then return false end
     if Travel.Mode == "Teleport" then
         root.CFrame = CFrame.new(goal) * (root.CFrame - root.CFrame.Position)
         root.AssemblyLinearVelocity = Vector3.zero
@@ -535,6 +684,17 @@ local Busy = false -- a farm step or a manual action is moving the character
 
 local function farmOn() return Farm.Enabled and not Unloaded end
 
+-- Pickups made on this trip. The tool can take a while to reach your
+-- backpack, so a brainrot counts as soon as it leaves the ground; going by the
+-- backpack alone let the farm pick up more than the trip allows.
+local Trip = { Count = 0 }
+
+local function onGround(item)
+    local model, prompt = item.Model, item.Prompt
+    return model.Parent ~= nil and model:GetAttribute("IsSpawnedItem") == true
+        and prompt ~= nil and prompt.Parent ~= nil and prompt.Enabled
+end
+
 local function grab(item)
     local before = #carried()
     Stats.State = "grabbing " .. item.Name
@@ -542,13 +702,18 @@ local function grab(item)
     task.wait(Farm.ActionDelay)
     firePrompt(item.Prompt)
     local start = os.clock()
-    while os.clock() - start < 1.5 do
-        if #carried() > before then
+    while os.clock() - start < Farm.PickupWait do
+        local arrived = #carried() > before
+        if arrived or not onGround(item) then
+            if not arrived then
+                -- gone from the ground: give the tool a moment to arrive
+                waitFor(function() return #carried() > before end, 1)
+            end
+            Trip.Count += 1
             Stats.Grabbed += 1
             log("Success", ("grabbed %s (%s %s)"):format(item.Name, item.Mutation, item.Rarity))
             return true
         end
-        if not item.Model.Parent then break end
         task.wait(0.05)
     end
     local failed = FailedAt[item.Model] or { Count = 0, At = 0 }
@@ -562,13 +727,26 @@ local function goHome()
     Stats.State = "going home"
     local home = homePosition()
     local back = remote("TeleportToBase")
-    if Travel.Return == "Remote" and back then
+    -- with the base never seen this server there is no point to go to, so the
+    -- game's own teleport home is the only way there
+    if back and (Travel.Return == "Remote" or not home) then
         pcall(function() back:FireServer() end)
         task.wait(0.6)
         local _, root = myCharacter()
-        if root and home and (root.Position - home).Magnitude < 60 then return true end
+        home = homePosition()
+        if root and home and (root.Position - home).Magnitude < 60 then
+            waitFor(function() return #slots() > 0 end, 3)
+            return true
+        end
     end
-    return travelTo(home, farmOn)
+    if not home then
+        log("Warn", "base position not known yet, walk to your base once")
+        return false
+    end
+    local ok = travelTo(home, farmOn)
+    -- your slots stream in after you arrive
+    waitFor(function() return #slots() > 0 end, 3)
+    return ok
 end
 
 local function collectCash()
@@ -599,10 +777,13 @@ local function worstSlotBelow(info)
     return worst
 end
 
--- Places what you carry, best first. Returns how many could not be placed.
+-- Places what you carry, best first. Returns how many could not be placed,
+-- and whether your slots were loaded in at all (a base that hasn't streamed in
+-- is not a full one).
 local function placeCarried()
     local _, _, hum = myCharacter()
-    if not hum then return #carried() end
+    if not hum then return #carried(), false end
+    if #slots() == 0 then return #carried(), false end
     local tools = carried()
     table.sort(tools, function(a, b) return itemBetter(toolInfo(a), toolInfo(b)) end)
     local left = 0
@@ -635,7 +816,7 @@ local function placeCarried()
         end
     end
     pcall(function() hum:UnequipTools() end)
-    return left
+    return left, true
 end
 
 local function sellCarried()
@@ -658,13 +839,17 @@ local FarmToggle -- the menu toggle, so a full base can switch it off
 
 local function deposit()
     Stats.Trips += 1
+    Trip.Count = 0
     if Farm.Deposit == "Sell" then
         sellCarried()
     else
         goHome()
-        local left = placeCarried()
+        local left, loaded = placeCarried()
         if Farm.CollectOnReturn then collectCash() end
-        if left > 0 then
+        if left > 0 and not loaded then
+            log("Warn", "your base did not load in, trying again next trip")
+            task.wait(1)
+        elseif left > 0 then
             if Farm.Deposit == "Place then sell" then
                 sellCarried()
             elseif Farm.StopWhenFull and #carried() >= Farm.PerTrip then
@@ -676,6 +861,39 @@ local function deposit()
     end
 end
 
+-- Spawners the farm can visit when nothing it wants is loaded in: the saved
+-- ones for the rarities you picked, best first (or nearest first). A full
+-- round that finds nothing waits a few seconds before going round again.
+local Scout = { Index = 0, Misses = 0, PauseUntil = 0 }
+
+local function scoutList(origin)
+    local list = {}
+    for index = #RARITIES, 1, -1 do
+        local rarity = RARITIES[index]
+        if Saved.Spawners[rarity] and Farm.Rarities[rarity] then list[#list + 1] = rarity end
+    end
+    if Farm.Priority == "Nearest" and origin then
+        table.sort(list, function(a, b)
+            return (Saved.Spawners[a] - origin).Magnitude < (Saved.Spawners[b] - origin).Magnitude
+        end)
+    end
+    return list
+end
+
+local function nextScout(origin)
+    if not Farm.Scout or os.clock() < Scout.PauseUntil then return nil end
+    local list = scoutList(origin)
+    if #list == 0 then return nil end
+    if Scout.Misses >= #list then
+        Scout.Misses = 0
+        Scout.PauseUntil = os.clock() + 4
+        return nil
+    end
+    Scout.Index = Scout.Index % #list + 1
+    Scout.Misses += 1
+    return list[Scout.Index]
+end
+
 local function farmStep()
     local _, root = myCharacter()
     if not root then
@@ -683,13 +901,23 @@ local function farmStep()
         task.wait(0.5)
         return
     end
-    local holding = #carried()
+    local holding = math.max(#carried(), Trip.Count)
     if holding >= Farm.PerTrip then
         deposit()
         return
     end
     local target = pickTarget(root.Position)
-    if not target then
+    if target then
+        Scout.Misses = 0
+    else
+        -- look round the other spawners before heading home half full
+        local rarity = nextScout(root.Position)
+        if rarity then
+            Stats.State = "checking the " .. rarity .. " spawner"
+            travelTo(Saved.Spawners[rarity], farmOn)
+            task.wait(Farm.ScoutWait)
+            return
+        end
         if holding > 0 then
             deposit()
             return
@@ -702,7 +930,7 @@ local function farmStep()
         task.wait(0.5)
         return
     end
-    if not grab(target) and holding > 0 and #carried() == holding then
+    if not grab(target) and holding > 0 then
         -- a pickup that does nothing while you already hold something is
         -- usually the carry limit
         local failed = FailedAt[target.Model]
@@ -1431,6 +1659,83 @@ do
         Callback = function(value) Farm.ActionDelay = value end,
     })
 
+    local spots = FarmTab:AddLeftGroupbox('Saved positions', 'map-pinned')
+
+    spots:AddToggle('whb_farm_scout', {
+        Text = 'Visit saved spawners',
+        Tooltip = 'brainrots far away are not loaded in, so with nothing wanted in view the farm goes round the saved spawners of the rarities you picked to load them',
+        Default = Farm.Scout,
+        Callback = function(state) Farm.Scout = state end,
+    })
+
+    spots:AddSlider('whb_farm_scoutwait', {
+        Text = 'Wait at a spawner',
+        Min = 0.2, Max = 5, Default = Farm.ScoutWait, Rounding = 1, Suffix = 's',
+        Callback = function(value) Farm.ScoutWait = value end,
+    })
+
+    spots:AddSlider('whb_farm_pickupwait', {
+        Text = 'Pickup wait',
+        Tooltip = 'how long a pickup gets before it counts as failed',
+        Min = 0.5, Max = 6, Default = Farm.PickupWait, Rounding = 1, Suffix = 's',
+        Callback = function(value) Farm.PickupWait = value end,
+    })
+
+    local spotsLabel = spots:AddLabel('saved: -', true)
+    every(1, function()
+        local found = {}
+        for _, rarity in ipairs(RARITIES) do
+            if Saved.Spawners[rarity] then found[#found + 1] = rarity end
+        end
+        local missing = {}
+        for _, rarity in ipairs({ "Common", "Uncommon", "Rare", "Epic", "Legendary", "Mythical" }) do
+            if not Saved.Spawners[rarity] then missing[#missing + 1] = rarity end
+        end
+        spotsLabel:SetText(("spawners: %s\nnot seen yet: %s\nbase: %s%s"):format(
+            #found > 0 and table.concat(found, ", ") or "none",
+            #missing > 0 and table.concat(missing, ", ") or "none",
+            homePosition() and "saved" or "not seen this server",
+            canFile() and "" or "\n(no writefile, positions last until you leave)"))
+    end)
+
+    local saveAs = "Mythical"
+    local saveValues = { "my base" }
+    for _, rarity in ipairs(RARITIES) do saveValues[#saveValues + 1] = rarity end
+    spots:AddDropdown('whb_spot_kind', {
+        Text = 'Save where I stand as',
+        Tooltip = 'for a spawner that never loaded in while the script ran (or the rarer ones that have no spawner part)',
+        Values = saveValues,
+        Default = saveAs,
+        Callback = function(value) saveAs = value or "Mythical" end,
+    })
+    Library:SetIgnoreIndexes({ 'whb_spot_kind' })
+
+    spots:AddButton({
+        Text = 'Save here',
+        Func = function()
+            local _, root = myCharacter()
+            if not root then return end
+            local pos = root.Position - Vector3.new(0, 3, 0)
+            if saveAs == "my base" then
+                Session.Home = pos
+            else
+                remember(Saved.Spawners, saveAs, pos, true)
+            end
+            log("Success", "saved " .. saveAs)
+        end,
+    }):AddButton({
+        Text = 'Forget all',
+        DoubleClick = true,
+        Func = function()
+            table.clear(Saved.Spawners)
+            table.clear(Saved.Points)
+            Session.Home = nil
+            table.clear(Session.Slots)
+            writeSaved()
+            log("Warn", "saved positions cleared")
+        end,
+    })
+
     local cash = FarmTab:AddRightGroupbox('Cash', 'banknote')
 
     cash:AddToggle('whb_cash', {
@@ -1655,11 +1960,13 @@ do
 
     local tp = PlayerTab:AddLeftGroupbox('Teleport', 'map-pin')
 
+    -- everything here goes by the saved positions, so a spot that has
+    -- streamed out can still be reached
     local function destinations()
-        local list = { "my base", "sell npc", "carry shop", "jump power shop", "collection zone" }
-        local spawners = Workspace:FindFirstChild("ItemSpawners")
+        local list = { "my base" }
+        for _, point in ipairs(POINTS) do list[#list + 1] = point[1] end
         for _, rarity in ipairs(RARITIES) do
-            if spawners and spawners:FindFirstChild(rarity) then list[#list + 1] = rarity .. " spawner" end
+            if Saved.Spawners[rarity] then list[#list + 1] = rarity .. " spawner" end
         end
         return list
     end
@@ -1667,20 +1974,9 @@ do
     local function destination(name)
         if name == "my base" then return homePosition() end
         if name == "sell npc" then return sellPosition() end
-        local function partOf(model)
-            local inst = Workspace:FindFirstChild(model)
-            if not inst then return nil end
-            local part = inst:FindFirstChild("Touch") or inst
-            if part:IsA("BasePart") then return part.Position end
-            return part:IsA("Model") and part:GetPivot().Position or nil
-        end
-        if name == "carry shop" then return partOf("Carry") end
-        if name == "jump power shop" then return partOf("JumpPower") end
-        if name == "collection zone" then return partOf("CollectionZone") end
         local rarity = name:match("^(%S+) spawner$")
-        local spawners = Workspace:FindFirstChild("ItemSpawners")
-        local part = rarity and spawners and spawners:FindFirstChild(rarity)
-        return part and part.Position or nil
+        if rarity then return Saved.Spawners[rarity] end
+        return Saved.Points[name]
     end
 
     local chosen = "my base"
