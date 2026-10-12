@@ -31,7 +31,7 @@
 
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.9"
+local SCRIPT_VERSION = "rewrite-0.5.10"
 
 -- ---------------------------------------------------------------------------
 -- Single instance.
@@ -616,7 +616,7 @@ do
     local oth_hook = type(oth_lib) == 'table' and type(oth_lib.hook) == 'function' and oth_lib.hook or nil
     local oth_unhook = type(oth_lib) == 'table' and type(oth_lib.unhook) == 'function' and oth_lib.unhook or nil
     local FIRE_FN
-    local box = { want = false, nc = nil, fire = nil, list = {}, ws = Workspace, now = Workspace.GetServerTimeNow,
+    local box = { want = false, nc = nil, fire = nil, list = {}, ws = Workspace, now = nil,
         me = "ReplicatedStorage.Packages._Index.sleitnick_net@0.1.0.net" }
     local NC_SRC = [[
 local box, getncm, sel, pc, err, info, typ, find = ...
@@ -681,44 +681,54 @@ end]]
         end)
         return ok and type(fn) == 'function' and fn or nil
     end
-    local NC_BODY = build_body(NC_SRC, box, getnamecallmethod_ or function() return nil end, select,
-        pcall, error, debug.info, type, string.find)
-    local FIRE_BODY = build_body(FIRE_SRC, box, select, pcall, error, debug.info, type, string.find)
-    -- No loadstring on this executor: same bodies (not disguised under a game
-    -- chunk name), still re-stamping errors with the game's line -- frames from
-    -- this script are skipped.
-    local own_src = debug.info(1, "s")
-    local function fb_pass(ok, ...)
-        if ok then return ... end
-        local e = ...
-        if type(e) == "string" and not string.find(e, "^[^\n]-:%d+: ") then
-            for lvl = 2, 12 do
-                local src, line = debug.info(lvl, "sl")
-                if src == nil then break end
-                if src ~= "[C]" and src ~= own_src and line and line > 0 then
-                    e = src .. ":" .. line .. ": " .. e
-                    break
+    -- Built the first time a hook actually goes up, never at load: until then
+    -- nothing hook-related exists (no compiled body, no chunk under the game's
+    -- module name, no debug.info call, no read of GetServerTimeNow). With
+    -- Keypress modes, or a session that never captures, they are never built.
+    local NC_BODY, FIRE_BODY
+    local function ensure_bodies()
+        if NC_BODY and FIRE_BODY then return end
+        box.now = box.now or Workspace.GetServerTimeNow
+        NC_BODY = NC_BODY or build_body(NC_SRC, box, getnamecallmethod_ or function() return nil end, select,
+            pcall, error, debug.info, type, string.find)
+        FIRE_BODY = FIRE_BODY or build_body(FIRE_SRC, box, select, pcall, error, debug.info, type, string.find)
+        if NC_BODY and FIRE_BODY then return end
+        -- No loadstring on this executor: same bodies (not disguised under a game
+        -- chunk name), still re-stamping errors with the game's line -- frames from
+        -- this script are skipped.
+        local own_src = debug.info(1, "s")
+        local function fb_pass(ok, ...)
+            if ok then return ... end
+            local e = ...
+            if type(e) == "string" and not string.find(e, "^[^\n]-:%d+: ") then
+                for lvl = 2, 12 do
+                    local src, line = debug.info(lvl, "sl")
+                    if src == nil then break end
+                    if src ~= "[C]" and src ~= own_src and line and line > 0 then
+                        e = src .. ":" .. line .. ": " .. e
+                        break
+                    end
                 end
             end
+            return error(e, 0)
         end
-        return error(e, 0)
-    end
-    if not NC_BODY then
-        NC_BODY = function(self, ...)
-            local l = box.list
-            if box.want and #l < 4 and getnamecallmethod_() == "FireServer" and select("#", ...) >= 6 then
-                l[#l + 1] = { self, select("#", ...), { ... }, box.now(box.ws) }
+        if not NC_BODY then
+            NC_BODY = function(self, ...)
+                local l = box.list
+                if box.want and #l < 4 and getnamecallmethod_() == "FireServer" and select("#", ...) >= 6 then
+                    l[#l + 1] = { self, select("#", ...), { ... }, box.now(box.ws) }
+                end
+                return fb_pass(pcall(box.nc, self, ...))
             end
-            return fb_pass(pcall(box.nc, self, ...))
         end
-    end
-    if not FIRE_BODY then
-        FIRE_BODY = function(self, ...)
-            local l = box.list
-            if box.want and #l < 4 and select("#", ...) >= 6 then
-                l[#l + 1] = { self, select("#", ...), { ... }, box.now(box.ws) }
+        if not FIRE_BODY then
+            FIRE_BODY = function(self, ...)
+                local l = box.list
+                if box.want and #l < 4 and select("#", ...) >= 6 then
+                    l[#l + 1] = { self, select("#", ...), { ... }, box.now(box.ws) }
+                end
+                return fb_pass(pcall(box.fire, self, ...))
             end
-            return fb_pass(pcall(box.fire, self, ...))
         end
     end
     local H = { fire = nil, nc = nil, want = false, until_t = 0, oth = false, oth_kept = nil, up_at = nil, down_at = nil, ups = 0 }
@@ -821,6 +831,7 @@ end]]
         Capture.armed_at = clock_()
         if H.fire or H.nc then return true end
         box.list = {}
+        ensure_bodies()
         local method = capture_method()
         if method == "oth" or (method == "Both" and oth_hook and oth_unhook and FIRE_FN) then
             if H.oth_kept then
