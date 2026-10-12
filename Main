@@ -54,6 +54,8 @@ local Games = {
     [108628039999641] = { Name = 'Needle in a Haystack', Script = 'Games/NeedleHaystack.lua' },
     -- Jailbreak's main place, from the dump's own place id (game 245662005).
     [606849621] = { Name = 'Jailbreak', Script = 'Games/Jailbreak.lua' },
+    -- Wall Hop for Brainrots! (game 10004134791), from its dump's own place id.
+    [138154148141431] = { Name = 'Wall Hop for Brainrots', Script = 'Games/WallHopBrainrots.lua' },
 }
 
 -- Games whose other modes (ranked, duels, events...) each have their own place
