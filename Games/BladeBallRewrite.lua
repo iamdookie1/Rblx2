@@ -31,7 +31,7 @@
 
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.10"
+local SCRIPT_VERSION = "rewrite-0.5.11"
 
 -- ---------------------------------------------------------------------------
 -- Single instance.
@@ -810,9 +810,10 @@ end]]
             if #a3 ~= #text then return false end
             local key = {}
             for i = 1, #text do key[i] = bit32.bxor(string.byte(a3, i), (string.byte(text, i) + i) % 256) end
-            Core.cap = { remote = self, hash = a1, uid = a2, key = key, len = #text, ctx = Core.ctx,
-                ball2 = typeof(a4) == "CFrame", win = type(a4) == "number" and a4 or nil }
             Core.gen = Core.gen + 1
+            Core.cap = { remote = self, hash = a1, uid = a2, key = key, len = #text, ctx = Core.ctx,
+                ball2 = typeof(a4) == "CFrame", win = type(a4) == "number" and a4 or nil,
+                id = Core.gen, lat = clock_() - Capture.armed_at, sent = 0, landed = 0 }
             Core.misses, Core.pending = 0, nil
             -- how long the game took to send after the press: the hook window is
             -- sized from this (smoothed), so it's only up as long as it needs to be
@@ -942,7 +943,7 @@ end]]
         else
             r:FireServer(cap.hash, cap.uid, tok, window, cf, points, aim, false)
         end
-        if not spam then Core.pending = clock_() + window + ping_s() + 0.25 end
+        if not spam then Core.pending = clock_() + window + ping_s() + 0.25; cap.sent = (cap.sent or 0) + 1 end
         return "sent"
     end
 
@@ -1534,7 +1535,8 @@ end]]
         -- closest to us says whether a miss was early, late, or on time
         local root = getRoot()
         Core.watch = ball and root and { ball = ball, t = now, how = how, d0 = (ball.Position - root.Position).Magnitude,
-            min_d = math.huge, min_t = now, ping = ping_s(), W = parry_window() or 0.5, lead = info and info.lead } or nil
+            min_d = math.huge, min_t = now, ping = ping_s(), W = parry_window() or 0.5, lead = info and info.lead,
+            cap = how == "remote" and Core.cap or nil } or nil
         mark_parried(st, now)
         if info then
             logp(("%s [%s] dist %.0f spd %.0f head %.2f eta %.2f lead %.2f%s"):format(via, how, info.dist or 0,
@@ -1745,7 +1747,10 @@ end]]
         elseif dt > close then verdict = (" -> EARLY by %.2fs"):format(dt - close)
         elseif dt < open then verdict = (" -> LATE by %.2fs"):format(open - dt)
         else verdict = " -> ON TIME by what we see: the server didn't count it" end
-        return head .. tail .. verdict
+        local c = w.cap
+        local capinfo = c and ("\n    capture #%d (taken %.0fms after its press): %d of %d remote parries landed"):format(
+            c.id or 0, (c.lat or 0) * 1000, c.landed or 0, c.sent or 0) or ""
+        return head .. tail .. verdict .. capinfo
     end
 
     function Parry.frame(dt, point)
@@ -1757,9 +1762,13 @@ end]]
             -- captures are per place: entering / leaving lobby training swaps them
             local ctx = in_lobby_training() and "training" or "match"
             if ctx ~= Core.ctx then
+                -- dying in training ends it (this swap) before the parry's answer
+                -- deadline: say why it missed first (until 0.5.11 it was dropped
+                -- silently, so no training death ever got a verdict)
+                if Core.pending then logp(miss_verdict(Core.watch) .. " [round ended]") end
                 Core.caps[Core.ctx] = Core.cap
                 Core.ctx, Core.cap = ctx, Core.caps[ctx]
-                Core.misses, Core.pending = 0, nil
+                Core.misses, Core.pending, Core.watch = 0, nil, nil
             end
             local w = Core.watch
             if w then
@@ -1828,6 +1837,7 @@ end]]
         G.until_t = 0
         local w = Core.watch
         if Core.pending and w then
+            if w.cap then w.cap.landed = (w.cap.landed or 0) + 1 end
             logp(("  -> landed %.2fs after the parry (fired at %.0f studs)"):format(clock_() - w.t, w.d0))
         end
         Core.watch = nil
@@ -1904,6 +1914,7 @@ end]]
         for k in pairs(tracked) do tracked[k] = nil end
         end_clash("engine off")
         Pump.credit, Pump.on, Pump.waiting = 0, false, false
+        if Core.pending then pcall(function() logp(miss_verdict(Core.watch) .. " [engine stopped]") end) end
         Core.pending, Core.misses, Core.watch = nil, 0, nil
         G.until_t, Capture.dry, Capture.since = 0, 0, nil
     end
