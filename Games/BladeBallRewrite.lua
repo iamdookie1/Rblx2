@@ -31,7 +31,7 @@
 
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.13"
+local SCRIPT_VERSION = "rewrite-0.5.14"
 
 -- ---------------------------------------------------------------------------
 -- Single instance.
@@ -2953,30 +2953,48 @@ do
         if e then pcall(function() e.bb:Destroy() end) end
         entries[player] = nil
     end
-    local function create(player, token)
-        task.spawn(function()
-            local character = player.Character
-            while AbilityESP:alive(token) and (not character or not character.Parent) do task.wait(0.5); character = player.Character end
-            if not character then return end
-            local head = character:WaitForChild('Head', 10)
-            if not head or not AbilityESP:alive(token) then return end
-            remove(player)
-            local bb = Instance.new('BillboardGui')
-            bb.Name = 'BB_AbilityESP'; bb.Adornee = head; bb.Size = UDim2.new(0, 220, 0, 60)
-            bb.StudsOffset = Vector3.new(0, EspCfg.Height, 0); bb.AlwaysOnTop = true
-            local label = Instance.new('TextLabel')
-            label.Size = UDim2.new(1, 0, 1, 0); label.BackgroundTransparency = 1; label.TextColor3 = EspCfg.Color
-            label.TextSize = EspCfg.TextSize; label.TextStrokeTransparency = 0; label.Font = Enum.Font.Roboto
-            label.RichText = true; label.Visible = false; label.Parent = bb
-            bb.Parent = hui()
-            entries[player] = { bb = bb, label = label, character = character, head = head }
-        end)
+    local function clear_all() for p in pairs(entries) do remove(p) end end
+    -- Build (or rebuild against a fresh head) the billboard for one player. Nil
+    -- when the player has no character / head yet; the next tick retries.
+    local function ensure_entry(player)
+        local e = entries[player]
+        local character = player.Character
+        local head = character and character:FindFirstChild('Head')
+        if not character or not head or not head.Parent then
+            if e then remove(player) end
+            return nil
+        end
+        if e and e.head == head then return e end
+        if e then remove(player) end -- respawned: rebuild on the new head
+        local bb = Instance.new('BillboardGui')
+        bb.Name = 'BB_AbilityESP'; bb.Adornee = head; bb.Size = UDim2.new(0, 220, 0, 60)
+        bb.StudsOffset = Vector3.new(0, EspCfg.Height, 0); bb.AlwaysOnTop = true
+        local label = Instance.new('TextLabel')
+        label.Size = UDim2.new(1, 0, 1, 0); label.BackgroundTransparency = 1; label.TextColor3 = EspCfg.Color
+        label.TextSize = EspCfg.TextSize; label.TextStrokeTransparency = 0; label.Font = Enum.Font.Roboto
+        label.RichText = true; label.Visible = false; label.Parent = bb
+        bb.Parent = hui()
+        e = { bb = bb, label = label, character = character, head = head }
+        entries[player] = e
+        return e
     end
+    -- One driver, loop-paced. The ESP exists ONLY while you are in play (a round /
+    -- lobby training / lobby parry); the moment you are back in the plain lobby
+    -- every billboard is destroyed, so nothing the game can scan is left adorned
+    -- to a player while you idle there. Until 0.5.14 the billboards were built on
+    -- join and left up in the lobby -- with every other feature's engine asleep,
+    -- BAC's idle scan still found them and kicked "for exploiting" ~30s in. Ability
+    -- ESP is useless in the lobby anyway (nobody is mid-ability), so this costs
+    -- nothing and comes straight back the moment a round / training starts.
     local function update()
+        if not in_play() then
+            if next(entries) then clear_all() end
+            return
+        end
         local my = getRoot()
-        for player, e in pairs(entries) do
-            if not (e.character and e.character.Parent and e.head and e.head.Parent) then remove(player)
-            else
+        for _, player in ipairs(Players:GetPlayers()) do
+            local e = player ~= LocalPlayer and ensure_entry(player) or nil
+            if e then
                 local dist = my and (my.Position - e.head.Position).Magnitude
                 local name, status = info(player, e.character)
                 local vis = not (EspCfg.MaxDistance > 0 and dist and dist > EspCfg.MaxDistance) and not (EspCfg.OnlyWithAbility and not name)
@@ -2994,20 +3012,14 @@ do
                 end
             end
         end
-    end
-    local function add(player, token)
-        if player == LocalPlayer then return end
-        AbilityESP:connect(player.CharacterAdded, function() create(player, token) end)
-        if player.Character then create(player, token) end
+        -- players who left the server
+        for player in pairs(entries) do if player.Parent ~= Players then remove(player) end end
     end
     function AbilityESP.start()
-        local token = AbilityESP._token
-        for _, p in ipairs(Players:GetPlayers()) do add(p, token) end
-        AbilityESP:connect(Players.PlayerAdded, function(p) add(p, token) end)
         AbilityESP:connect(Players.PlayerRemoving, function(p) remove(p) end)
         AbilityESP:loop(0.1, update)
     end
-    function AbilityESP.stop() for p in pairs(entries) do remove(p) end end
+    function AbilityESP.stop() clear_all() end
 end
 
 local VS = Tabs.Visuals:AddLeftGroupbox("Overlays", "monitor")
