@@ -31,7 +31,7 @@
 
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.14"
+local SCRIPT_VERSION = "rewrite-0.5.15"
 
 -- ---------------------------------------------------------------------------
 -- Single instance.
@@ -2978,19 +2978,11 @@ do
         entries[player] = e
         return e
     end
-    -- One driver, loop-paced. The ESP exists ONLY while you are in play (a round /
-    -- lobby training / lobby parry); the moment you are back in the plain lobby
-    -- every billboard is destroyed, so nothing the game can scan is left adorned
-    -- to a player while you idle there. Until 0.5.14 the billboards were built on
-    -- join and left up in the lobby -- with every other feature's engine asleep,
-    -- BAC's idle scan still found them and kicked "for exploiting" ~30s in. Ability
-    -- ESP is useless in the lobby anyway (nobody is mid-ability), so this costs
-    -- nothing and comes straight back the moment a round / training starts.
+    -- One driver, loop-paced: every tick, (re)build a billboard for each other
+    -- player and refresh its text. Runs everywhere (lobby and rounds) -- the ESP
+    -- lives entirely in gethui, which the game's own scripts cannot read, so it is
+    -- not a detection surface regardless of where you are.
     local function update()
-        if not in_play() then
-            if next(entries) then clear_all() end
-            return
-        end
         local my = getRoot()
         for _, player in ipairs(Players:GetPlayers()) do
             local e = player ~= LocalPlayer and ensure_entry(player) or nil
