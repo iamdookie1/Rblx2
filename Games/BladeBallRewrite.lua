@@ -31,7 +31,7 @@
 
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.11"
+local SCRIPT_VERSION = "rewrite-0.5.12"
 
 -- ---------------------------------------------------------------------------
 -- Single instance.
@@ -740,7 +740,7 @@ end]]
     -- function straight into the metatable). Every hook is up only for the one
     -- press (about the measured send time) and comes down the frame it's read.
     local function capture_method()
-        local m = getgenv().CaptureHook or "oth"
+        local m = getgenv().CaptureHook or "Both"
         if m == "oth" or m == "Both" then
             local oth_ok = oth_hook and oth_unhook and FIRE_FN
             if m == "oth" and not oth_ok then
@@ -2371,8 +2371,8 @@ AP:AddDropdown("TargetMode", {
     Callback = function(v) Parry.setTargetMode(v) end,
 })
 AP:AddDropdown("CaptureHook", {
-    Values = { "oth", "Namecall", "FireServer", "Both" }, Default = "oth", Text = "Capture hook",
-    Tooltip = "How the first parry packet is captured. 'oth' (Delta) is the stealthiest.",
+    Values = { "oth", "Namecall", "FireServer", "Both" }, Default = "Both", Text = "Capture hook",
+    Tooltip = "How the parry packet is captured. 'Both' (oth + Namecall) caught it on the first press most reliably on Delta; 'oth' alone often came up empty.",
     Callback = function(v) getgenv().CaptureHook = v end,
 })
 AP:AddButton({
