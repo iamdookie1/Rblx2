@@ -60,11 +60,12 @@ local Auto = {
     -- up to 100). all Sick by default.
     Chance = { Sick = 100, Good = 0, Ok = 0, Bad = 0, Miss = 0 },
     SkipSpecial = true,  -- screen modes: leave death / poison notes alone
-    -- hold notes
-    Holds = true,        -- hold them down; off plays every hold as a tap
-    HoldPercent = 100,   -- how much of each hold to keep down (80% and up already scores full)
-    HoldRandom = false,  -- vary it per hold
-    HoldRandomRange = 20,-- holds pick between HoldPercent - this and HoldPercent
+    -- how long a key stays down after hitting a normal note (hold notes are
+    -- always held for their full length)
+    PressHold = true,    -- off lets go straight away
+    PressHoldMs = 60,
+    PressRandom = false, -- vary it per note
+    PressRandomRange = 30, -- % either side of PressHoldMs
     Side = "Auto",       -- screen modes: which field is yours
 }
 
@@ -146,22 +147,24 @@ do
     Bridge.Parent = ok and holder or LocalPlayer:WaitForChild("PlayerGui")
 end
 
--- How much of a hold this one keeps, 0..1.
-local function holdFraction(rng)
-    local top = math.clamp(Auto.HoldPercent, 0, 100)
-    if Auto.HoldRandom and Auto.HoldRandomRange > 0 then
-        local low = math.max(top - Auto.HoldRandomRange, 0)
-        return (rng or Rng):NextNumber(low, top) / 100
+-- Seconds a key stays down after a normal note. It is always let go before
+-- the next note in the same lane, however long this is.
+local function pressLength()
+    if not Auto.PressHold then return 0.001 end
+    local ms = Auto.PressHoldMs
+    if Auto.PressRandom and Auto.PressRandomRange > 0 then
+        local spread = ms * Auto.PressRandomRange / 100
+        ms = Rng:NextNumber(math.max(ms - spread, 1), ms + spread)
     end
-    return top / 100
+    return math.max(ms, 1) / 1000
 end
 
 local function pushSettings()
     Bridge:SetAttribute("Enabled", Auto.Enabled and Auto.Mode == "Game")
-    Bridge:SetAttribute("Holds", Auto.Holds)
-    Bridge:SetAttribute("HoldPercent", Auto.HoldPercent)
-    Bridge:SetAttribute("HoldRandom", Auto.HoldRandom)
-    Bridge:SetAttribute("HoldRandomRange", Auto.HoldRandomRange)
+    Bridge:SetAttribute("PressHold", Auto.PressHold)
+    Bridge:SetAttribute("PressHoldMs", Auto.PressHoldMs)
+    Bridge:SetAttribute("PressRandom", Auto.PressRandom)
+    Bridge:SetAttribute("PressRandomRange", Auto.PressRandomRange)
     for _, name in ipairs(GRADE_ORDER) do
         Bridge:SetAttribute("Chance" .. name, Auto.Chance[name] or 0)
     end
@@ -224,7 +227,18 @@ local GRADES = {
     Sick = { 0, 30 }, Good = { 60, 90 }, Ok = { 110, 140 }, Bad = { 160, 190 },
 }
 local ORDER = { "Sick", "Good", "Ok", "Bad", "Miss" }
-local TAP = 0.03 -- seconds a tap stays down, cut short when the next note in the lane comes sooner
+-- seconds a key stays down after a normal note, cut short when the next note
+-- in the lane comes sooner
+local function tapLength()
+    if not attr("PressHold", true) then return 0.001 end
+    local ms = attr("PressHoldMs", 60)
+    local range = attr("PressRandom", false) and attr("PressRandomRange", 0) or 0
+    if range > 0 then
+        local spread = ms * range / 100
+        ms = rng:NextNumber(math.max(ms - spread, 1), ms + spread)
+    end
+    return math.max(ms, 1) / 1000
+end
 
 local function pickGrade()
     local total = 0
@@ -407,14 +421,8 @@ connection = RunService.Heartbeat:Connect(function(dt)
             state.Down = true
             state.LastPress = pressAt
             local length = tonumber(note.Length) or 0
-            local keep = 0
-            if length > 0 and attr("Holds", true) then
-                local top = math.clamp(attr("HoldPercent", 100), 0, 100)
-                local range = attr("HoldRandom", false) and math.max(attr("HoldRandomRange", 0), 0) or 0
-                keep = (range > 0 and rng:NextNumber(math.max(top - range, 0), top) or top) / 100
-            end
-            state.Hold = keep > 0
-            state.ReleaseAt = state.Hold and (note.Time + length * keep) or (pressAt + TAP)
+            state.Hold = length > 0
+            state.ReleaseAt = state.Hold and (note.Time + length) or (pressAt + tapLength())
             index += 1
         end
     end
@@ -809,15 +817,13 @@ local function screenStep(dt)
                     Stats[state.Grade] = (Stats[state.Grade] or 0) + 1
                     local tail = tailLength(best, state.Axis)
                     local noteSize = math.min(best.AbsoluteSize.X, best.AbsoluteSize.Y)
-                    local keep = (tail > noteSize * 1.6 and Auto.Holds) and holdFraction() or 0
-                    if keep > 0 then
+                    if tail > noteSize * 1.6 then
                         Holding[index] = {
                             Frame = best, Name = best.Name, Axis = state.Axis, NoteSize = noteSize,
-                            -- a full hold also lets go when the tail runs out
-                            ReleaseAt = clock + (tail / state.Speed) * keep + (keep >= 1 and 0.1 or 0),
+                            ReleaseAt = clock + tail / state.Speed + 0.1,
                         }
                     else
-                        TapRelease[index] = clock + 0.03
+                        TapRelease[index] = clock + pressLength()
                     end
                 end
             end
@@ -1053,44 +1059,45 @@ do
 
     screen:AddLabel('Or turn off Note Mechanics in the game\'s song options: the game then never spawns death or poison notes at all.', true)
 
-    local holds = Tab:AddRightGroupbox('Hold notes', 'hand')
+    local pressBox = Tab:AddRightGroupbox('Key hold after a hit', 'hand')
 
-    holds:AddToggle('ff_holds', {
-        Text = 'Hold them',
-        Tooltip = 'off plays every hold like a tap, which loses the hold part of its score',
-        Default = Auto.Holds,
+    pressBox:AddLabel('How long the key stays down after hitting a normal note. It always lets go before the next note in the same lane, so fast streams still work. Hold notes are always held for their full length.', true)
+
+    pressBox:AddToggle('ff_presshold', {
+        Text = 'Hold the key',
+        Tooltip = 'off lets go straight away',
+        Default = Auto.PressHold,
         Callback = function(state)
-            Auto.Holds = state
+            Auto.PressHold = state
             pushSettings()
         end,
     })
 
-    holds:AddSlider('ff_holdpercent', {
+    pressBox:AddSlider('ff_pressms', {
         Text = 'Hold for',
-        Tooltip = 'how much of each hold to keep down. the game gives full marks from 80% on',
-        Min = 0, Max = 100, Default = Auto.HoldPercent, Rounding = 0, Suffix = '%',
+        Min = 1, Max = 300, Default = Auto.PressHoldMs, Rounding = 0, Suffix = 'ms',
         Callback = function(value)
-            Auto.HoldPercent = value
+            Auto.PressHoldMs = value
             pushSettings()
         end,
     })
 
-    holds:AddToggle('ff_holdrandom', {
+    pressBox:AddToggle('ff_pressrandom', {
         Text = 'Randomize',
-        Tooltip = 'each hold picks its own length, up to the range below shorter than "hold for"',
-        Default = Auto.HoldRandom,
+        Tooltip = 'each hit holds a different length, within the range below',
+        Default = Auto.PressRandom,
         Callback = function(state)
-            Auto.HoldRandom = state
+            Auto.PressRandom = state
             pushSettings()
         end,
     })
 
-    holds:AddSlider('ff_holdrange', {
+    pressBox:AddSlider('ff_pressrange', {
         Text = 'Random range',
-        Tooltip = 'e.g. hold for 100% with a 30% range holds each one somewhere between 70% and 100%',
-        Min = 0, Max = 100, Default = Auto.HoldRandomRange, Rounding = 0, Suffix = '%',
+        Tooltip = 'e.g. 60ms with a 50% range holds each hit somewhere between 30ms and 90ms',
+        Min = 0, Max = 100, Default = Auto.PressRandomRange, Rounding = 0, Suffix = '%',
         Callback = function(value)
-            Auto.HoldRandomRange = value
+            Auto.PressRandomRange = value
             pushSettings()
         end,
     })
