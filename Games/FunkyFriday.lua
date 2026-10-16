@@ -56,15 +56,14 @@ local MODES = { "Game", "Input action", "Keypress" }
 local Auto = {
     Enabled = false,
     Mode = "Game",
-    Offset = 0,          -- ms, later is positive
-    Spread = 0,          -- ms of random timing either side, 0 = every hit dead on
-    MissChance = 0,      -- % of notes left alone on purpose
-    TapHold = 40,        -- ms a tap stays down
+    -- how often each judgement comes out, as weights (they don't need to add
+    -- up to 100). all Sick by default.
+    Chance = { Sick = 100, Good = 0, Ok = 0, Bad = 0, Miss = 0 },
     SkipSpecial = true,  -- screen modes: leave notes that don't look like the lane's normal ones
     Side = "Auto",       -- screen modes: which field is yours
 }
 
-local Stats = { Hits = 0, Skipped = 0, Status = "off" }
+local Stats = { Status = "off", Special = 0, Sick = 0, Good = 0, Ok = 0, Bad = 0, Miss = 0 }
 
 local Library -- the Ui3 menu, loaded last
 local Log
@@ -90,11 +89,43 @@ end
 
 local Rng = Random.new()
 
--- How a note gets played: its timing error in seconds, or nil to leave it.
+-- The game judges a hit by how far off it is: under 50ms is Sick, under
+-- 100ms Good, under 150ms Ok, and anything inside its 200ms window Bad. Each
+-- judgement plays from the middle of its band, so frame-to-frame jitter in the
+-- screen modes can't push it into the next one.
+local GRADES = {
+    { Name = "Sick", Min = 0, Max = 30 },
+    { Name = "Good", Min = 60, Max = 90 },
+    { Name = "Ok", Min = 110, Max = 140 },
+    { Name = "Bad", Min = 160, Max = 190 },
+}
+local GRADE_ORDER = { "Sick", "Good", "Ok", "Bad", "Miss" }
+
+-- Picks a judgement by the chances. Returns its name and the timing error in
+-- seconds (nil for a miss: the note is left alone).
 local function plan()
-    if Auto.MissChance > 0 and Rng:NextNumber(0, 100) < Auto.MissChance then return nil end
-    local spread = Auto.Spread > 0 and Rng:NextNumber(-Auto.Spread, Auto.Spread) or 0
-    return (Auto.Offset + spread) / 1000
+    local total = 0
+    for _, name in ipairs(GRADE_ORDER) do total += math.max(Auto.Chance[name] or 0, 0) end
+    local pick = "Sick"
+    if total > 0 then
+        local roll = Rng:NextNumber(0, total)
+        for _, name in ipairs(GRADE_ORDER) do
+            roll -= math.max(Auto.Chance[name] or 0, 0)
+            if roll <= 0 then
+                pick = name
+                break
+            end
+        end
+    end
+    if pick == "Miss" then return pick, nil end
+    for _, grade in ipairs(GRADES) do
+        if grade.Name == pick then
+            local ms = Rng:NextNumber(grade.Min, grade.Max)
+            if Rng:NextNumber() < 0.5 then ms = -ms end
+            return pick, ms / 1000
+        end
+    end
+    return "Sick", 0
 end
 
 --// game mode ---------------------------------------------------------------
@@ -112,10 +143,9 @@ end
 
 local function pushSettings()
     Bridge:SetAttribute("Enabled", Auto.Enabled and Auto.Mode == "Game")
-    Bridge:SetAttribute("Offset", Auto.Offset)
-    Bridge:SetAttribute("Spread", Auto.Spread)
-    Bridge:SetAttribute("MissChance", Auto.MissChance)
-    Bridge:SetAttribute("TapHold", Auto.TapHold)
+    for _, name in ipairs(GRADE_ORDER) do
+        Bridge:SetAttribute("Chance" .. name, Auto.Chance[name] or 0)
+    end
 end
 pushSettings()
 
@@ -165,10 +195,41 @@ end
 local Framework
 local nextSearch = 0
 local searches = 0
-local Held = {}
-local Planned = setmetatable({}, { __mode = "k" })
+local Lanes = {}     -- lane -> { Down, Hold, ReleaseAt (song time), LastPress }
+local Planned = setmetatable({}, { __mode = "k" }) -- note -> true pressed / false left alone
+local Plans = setmetatable({}, { __mode = "k" })   -- note -> { Grade, Offset }, decided the first time it is seen
 local lastField
 local rng = Random.new()
+
+local GRADES = {
+    Sick = { 0, 30 }, Good = { 60, 90 }, Ok = { 110, 140 }, Bad = { 160, 190 },
+}
+local ORDER = { "Sick", "Good", "Ok", "Bad", "Miss" }
+local TAP = 0.03 -- seconds a tap stays down, cut short when the next note in the lane comes sooner
+
+local function pickGrade()
+    local total = 0
+    for _, name in ipairs(ORDER) do total += math.max(attr("Chance" .. name, name == "Sick" and 100 or 0), 0) end
+    if total <= 0 then return "Sick", 0 end
+    local roll = rng:NextNumber(0, total)
+    local pick = "Sick"
+    for _, name in ipairs(ORDER) do
+        roll -= math.max(attr("Chance" .. name, name == "Sick" and 100 or 0), 0)
+        if roll <= 0 then
+            pick = name
+            break
+        end
+    end
+    if pick == "Miss" then return pick, nil end
+    local band = GRADES[pick]
+    local ms = rng:NextNumber(band[1], band[2])
+    if rng:NextNumber() < 0.5 then ms = -ms end
+    return pick, ms / 1000
+end
+
+local function bump(name)
+    bridge:SetAttribute(name, attr(name, 0) + 1)
+end
 
 local function ignored(note)
     local kind = type(note.NoteData) == "table" and note.NoteData.Type
@@ -179,16 +240,19 @@ local function ignored(note)
 end
 
 local function releaseAll(field)
-    for lane in pairs(Held) do
-        pcall(field.HitLane, field, lane, false, os.clock())
+    for lane, state in pairs(Lanes) do
+        if state.Down then pcall(field.HitLane, field, lane, false, os.clock()) end
     end
-    table.clear(Held)
+    table.clear(Lanes)
 end
 
 local function hitboxOffset()
     local ok, value = pcall(function() return Framework.SettingsHandler:Get("HitboxOffset") end)
     return ok and tonumber(value) or 0
 end
+
+local candidates = {}
+local function byTime(a, b) return a.Time < b.Time end
 
 local connection
 connection = RunService.Heartbeat:Connect(function(dt)
@@ -203,7 +267,7 @@ connection = RunService.Heartbeat:Connect(function(dt)
         return
     end
     if not attr("Enabled", false) then
-        if lastField and next(Held) then pcall(releaseAll, lastField) end
+        if lastField then pcall(releaseAll, lastField) end
         return
     end
 
@@ -230,6 +294,7 @@ connection = RunService.Heartbeat:Connect(function(dt)
         if lastField then pcall(releaseAll, lastField) end
         lastField = field
         Planned = setmetatable({}, { __mode = "k" })
+        Plans = setmetatable({}, { __mode = "k" })
     end
     local song = field and field.Game
     if not song or song.Ending or type(field.Lanes) ~= "table" then
@@ -245,49 +310,87 @@ connection = RunService.Heartbeat:Connect(function(dt)
     local clock = os.clock()
     local now = samplePos + (clock - sampleClock) * playback
     local hitbox = hitboxOffset() / 1000
-    -- presses go out up to a frame and a half early, stamped with the exact
-    -- moment the note is due, so the game scores them as if pressed right on it
-    local lead = math.max(dt, 1 / 240) * 1.5 * playback
-    local offset = attr("Offset", 0) / 1000
-    local spread = attr("Spread", 0) / 1000
-    local missChance = attr("MissChance", 0)
-    local tapHold = attr("TapHold", 40) / 1000
+    -- everything due before the next frame goes out now, each press stamped
+    -- with its own moment, so the game judges it as if it came exactly then.
+    -- a lane can take any number of presses and releases in one frame, which
+    -- is what keeps up with jacks and streams faster than the frame rate
+    local horizon = now + math.max(dt, 1 / 240) * 1.5 * playback
 
     local function stamp(songTime)
         return sampleClock + (songTime - samplePos - hitbox) / playback
     end
 
     for lane, laneObject in pairs(field.Lanes) do
-        local held = Held[lane]
-        if held then
-            if now >= held.Until then
-                pcall(field.HitLane, field, lane, false, clock)
-                Held[lane] = nil
-            end
-        elseif type(laneObject) == "table" and type(laneObject.Notes) == "table" then
-            local best
+        local state = Lanes[lane]
+        if not state then
+            state = { Down = false, Hold = false, ReleaseAt = 0, LastPress = -math.huge }
+            Lanes[lane] = state
+        end
+
+        table.clear(candidates)
+        if type(laneObject) == "table" and type(laneObject.Notes) == "table" then
             for _, note in pairs(laneObject.Notes) do
                 if type(note) == "table" and not note.Hit and not note.Cleaned and type(note.Time) == "number"
-                    and Planned[note] == nil and note.Time > now - 0.15
-                    and (not best or note.Time < best.Time) then
-                    best = note
+                    and Planned[note] == nil and note.Time > now - 0.18 then
+                    candidates[#candidates + 1] = note
                 end
             end
-            if best then
-                if ignored(best) or (missChance > 0 and rng:NextNumber(0, 100) < missChance) then
-                    Planned[best] = false
-                    bridge:SetAttribute("Skipped", attr("Skipped", 0) + 1)
-                else
-                    local target = best.Time + offset + (spread > 0 and rng:NextNumber(-spread, spread) or 0)
-                    if target - now <= lead then
-                        pcall(field.HitLane, field, lane, true, stamp(target))
-                        Planned[best] = true
-                        bridge:SetAttribute("Hits", attr("Hits", 0) + 1)
-                        local length = tonumber(best.Length) or 0
-                        Held[lane] = { Until = length > 0 and (best.Time + length) or (target + tapHold) }
+        end
+        table.sort(candidates, byTime)
+
+        local index = 1
+        for _ = 1, 256 do
+            local note = candidates[index]
+            -- settle the note's judgement the first time it is looked at
+            local pressAt
+            if note then
+                local plan = Plans[note]
+                if not plan then
+                    if ignored(note) then
+                        Planned[note] = false
+                        bump("Special")
+                        index += 1
+                        continue
                     end
+                    local grade, offset = pickGrade()
+                    if not offset then
+                        Planned[note] = false
+                        bump("GradeMiss")
+                        index += 1
+                        continue
+                    end
+                    plan = { Grade = grade, Offset = offset }
+                    Plans[note] = plan
+                end
+                -- presses in a lane never go back in time, however the
+                -- judgement offsets fall on tightly packed notes
+                pressAt = math.max(note.Time + plan.Offset, state.LastPress + 0.001)
+            end
+
+            if state.Down then
+                local releaseAt = state.ReleaseAt
+                if not state.Hold and pressAt and pressAt <= horizon then
+                    -- the next note comes before this tap would let go
+                    releaseAt = math.min(releaseAt, (state.LastPress + pressAt) / 2)
+                end
+                if releaseAt <= horizon then
+                    pcall(field.HitLane, field, lane, false, stamp(math.max(releaseAt, state.LastPress)))
+                    state.Down = false
+                else
+                    break
                 end
             end
+
+            if not note or pressAt > horizon then break end
+            pcall(field.HitLane, field, lane, true, stamp(pressAt))
+            Planned[note] = true
+            bump("Grade" .. Plans[note].Grade)
+            state.Down = true
+            state.LastPress = pressAt
+            local length = tonumber(note.Length) or 0
+            state.Hold = length > 0
+            state.ReleaseAt = state.Hold and (note.Time + length) or (pressAt + TAP)
+            index += 1
         end
     end
     bridge:SetAttribute("Status", "playing")
@@ -585,14 +688,19 @@ local function screenStep(dt)
         if best and not Holding[index] then
             local state = Tracked[best]
             if state.Plan == nil then
-                local planned = plan()
                 local normal, count = majorityLook(index)
-                if Auto.SkipSpecial and count >= 3 and state.Look ~= normal then planned = nil end
-                state.Plan = planned or false
+                if Auto.SkipSpecial and count >= 3 and state.Look ~= normal then
+                    state.Plan = false
+                    Stats.Special += 1
+                else
+                    local grade, offset = plan()
+                    state.Grade = grade
+                    state.Plan = offset or false
+                    if not offset then Stats.Miss += 1 end
+                end
             end
             if state.Plan == false then
                 state.Done = true
-                Stats.Skipped += 1
             elseif bestTime + state.Plan <= dt * 0.5 then
                 -- lands within half a frame from now: press on this one
                 state.Done = true
@@ -601,7 +709,7 @@ local function screenStep(dt)
                     TapRelease[index] = nil
                 end
                 if press(index, true) then
-                    Stats.Hits += 1
+                    Stats[state.Grade] = (Stats[state.Grade] or 0) + 1
                     local tail = tailLength(best, state.Axis)
                     local noteSize = math.min(best.AbsoluteSize.X, best.AbsoluteSize.Y)
                     if tail > noteSize * 1.6 then
@@ -610,7 +718,7 @@ local function screenStep(dt)
                             ReleaseAt = clock + tail / state.Speed + 0.1,
                         }
                     else
-                        TapRelease[index] = clock + Auto.TapHold / 1000
+                        TapRelease[index] = clock + 0.03
                     end
                 end
             end
@@ -635,8 +743,9 @@ end))
 
 -- game mode status comes back over the bridge
 track(Bridge.AttributeChanged:Connect(function(name)
-    if name == "Hits" then Stats.Hits = Bridge:GetAttribute("Hits") or Stats.Hits end
-    if name == "Skipped" then Stats.Skipped = Bridge:GetAttribute("Skipped") or Stats.Skipped end
+    local grade = name:match("^Grade(%a+)$")
+    if grade then Stats[grade] = Bridge:GetAttribute(name) or Stats[grade] end
+    if name == "Special" then Stats.Special = Bridge:GetAttribute("Special") or Stats.Special end
     if name == "Where" then
         local where = Bridge:GetAttribute("Where") == "Actor" and "the game's actor" or "this script's vm"
         log("Success", "game mode found the game, running in " .. where)
@@ -681,252 +790,6 @@ local function checkModes()
     lines[#lines + 1] = "executor: " .. identify
     for _, line in ipairs(lines) do log("Info", line) end
     return lines
-end
-
---// camera and movement fix -------------------------------------------------
--- Outside a song the game should hand the camera and your character back:
--- its CameraHandler unbinds its "CameraHandler" render step and sets the
--- camera to Custom, and the input context for the arrow keys (VSRGContext,
--- which sinks every other input while enabled) is torn down. If one of those
--- gets stuck you can't look around or walk. This puts each of them back, but
--- only while you are not in a song, so it never fights the game mid-chart.
-
-local Fix = { Auto = false }
-
--- In a song while the arrow input exists and a note field is on screen. The
--- context alone isn't enough: it is the thing that can get left behind.
-local function inSong()
-    if not context() then return false end
-    local ok, field = pcall(myField)
-    return ok and field ~= nil
-end
-
--- Puts camera and controls back. Returns what it had to change.
-local function fixControls(quiet)
-    local changed = {}
-    if inSong() then
-        if not quiet then log("Warn", "you are in a song, the game owns the camera and keys until it ends") end
-        return changed
-    end
-    local char = LocalPlayer.Character
-    local hum = char and char:FindFirstChildOfClass("Humanoid")
-    local root = char and char:FindFirstChild("HumanoidRootPart")
-    local camera = workspace.CurrentCamera
-
-    -- camera
-    pcall(function() RunService:UnbindFromRenderStep("CameraHandler") end)
-    if camera then
-        if camera.CameraType ~= Enum.CameraType.Custom then
-            changed[#changed + 1] = "camera type was " .. camera.CameraType.Name
-            camera.CameraType = Enum.CameraType.Custom
-        end
-        if hum and camera.CameraSubject ~= hum then
-            changed[#changed + 1] = "camera was not following you"
-            camera.CameraSubject = hum
-        end
-    end
-    if LocalPlayer.CameraMaxZoomDistance < LocalPlayer.CameraMinZoomDistance or LocalPlayer.CameraMaxZoomDistance < 1 then
-        changed[#changed + 1] = "camera zoom was locked"
-        LocalPlayer.CameraMinZoomDistance = 0.5
-        LocalPlayer.CameraMaxZoomDistance = 128
-    end
-    if LocalPlayer.CameraMode == Enum.CameraMode.LockFirstPerson then
-        changed[#changed + 1] = "camera was locked first person"
-        LocalPlayer.CameraMode = Enum.CameraMode.Classic
-    end
-
-    -- input contexts that swallow everything outside a song
-    local gui = playerGui()
-    for _, inst in ipairs(gui and gui:GetDescendants() or {}) do
-        if inst:IsA("InputContext") and inst.Enabled and inst.Sink then
-            changed[#changed + 1] = "input context " .. inst.Name .. " was blocking input"
-            pcall(function() inst.Enabled = false end)
-        end
-    end
-    pcall(function()
-        local UserInputService = game:GetService("UserInputService")
-        if UserInputService.ModalEnabled then
-            changed[#changed + 1] = "modal input was on"
-            UserInputService.ModalEnabled = false
-        end
-    end)
-    pcall(function()
-        local GuiService = game:GetService("GuiService")
-        if GuiService.SelectedObject then
-            changed[#changed + 1] = "a menu button had gamepad focus"
-            GuiService.SelectedObject = nil
-        end
-    end)
-
-    -- the default control scripts
-    pcall(function()
-        local scripts = LocalPlayer:FindFirstChildOfClass("PlayerScripts")
-        local module = scripts and scripts:FindFirstChild("PlayerModule")
-        if module then
-            local controls = require(module):GetControls()
-            controls:Enable(true)
-        end
-    end)
-
-    -- the character itself
-    if hum then
-        if hum.WalkSpeed <= 0 then
-            changed[#changed + 1] = "walk speed was 0"
-            hum.WalkSpeed = 24 -- the game's own default (Character Walk Speed setting)
-        end
-        if hum.PlatformStand then
-            changed[#changed + 1] = "character was platform standing"
-            hum.PlatformStand = false
-        end
-        if hum.Sit then
-            hum.Sit = false
-        end
-        if hum.UseJumpPower and hum.JumpPower <= 0 then
-            hum.JumpPower = 50
-        elseif not hum.UseJumpPower and hum.JumpHeight <= 0 then
-            hum.JumpHeight = 7.2
-        end
-    end
-    if root and root.Anchored then
-        changed[#changed + 1] = "character was anchored"
-        root.Anchored = false
-    end
-
-    if not quiet then
-        if #changed == 0 then
-            log("Info", "nothing looked stuck. if you still can't move, rejoin, or say what you see")
-        else
-            for _, line in ipairs(changed) do log("Success", "fixed: " .. line) end
-        end
-    elseif #changed > 0 then
-        log("Success", "auto fix: " .. table.concat(changed, ", "))
-    end
-    return changed
-end
-
-task.spawn(function()
-    while not Unloaded do
-        task.wait(1)
-        if Fix.Auto then pcall(fixControls, true) end
-    end
-end)
-
--- Finding what eats your input. If jump works but the joystick and camera
--- don't, touches are being taken before the controls see them: a screen GUI
--- under your finger, or a control script that never started. This logs, for
--- each touch or click, whether the game counted it as used by a GUI and what
--- is under it, and reports the default controls' state.
-
-local Probe = { Enabled = false, LastBlockers = {} }
-
-local function pathOf(inst)
-    local ok, name = pcall(function() return inst:GetFullName() end)
-    return ok and name or inst.Name
-end
-
-local function looksInvisible(gui)
-    if gui.BackgroundTransparency < 0.95 then return false end
-    if (gui:IsA("ImageLabel") or gui:IsA("ImageButton")) and gui.Image ~= "" and gui.ImageTransparency < 0.95 then return false end
-    if (gui:IsA("TextLabel") or gui:IsA("TextButton")) and gui.Text ~= "" and gui.TextTransparency < 0.95 then return false end
-    return true
-end
-
--- GUI objects at a screen point that take input there
-local function blockersAt(point)
-    local gui = playerGui()
-    if not gui then return {} end
-    local ok, list = pcall(function() return gui:GetGuiObjectsAtPosition(point.X, point.Y) end)
-    if not ok then return {} end
-    local out = {}
-    for _, obj in ipairs(list) do
-        local takesInput = obj:IsA("GuiButton") or obj:IsA("TextBox") or obj.Active
-        local interactable = true
-        pcall(function() interactable = obj.Interactable end)
-        if takesInput and interactable then out[#out + 1] = obj end
-    end
-    return out
-end
-
-local function controlsReport()
-    local lines = {}
-    local scripts = LocalPlayer:FindFirstChildOfClass("PlayerScripts")
-    local module = scripts and scripts:FindFirstChild("PlayerModule")
-    if not module then
-        lines[#lines + 1] = "PlayerModule is missing from PlayerScripts, so nothing drives walking or the camera"
-    else
-        local ok, controls = pcall(function() return require(module):GetControls() end)
-        if not ok or not controls then
-            lines[#lines + 1] = "PlayerModule's controls could not be read: " .. tostring(controls)
-        else
-            local active = controls.activeController
-            lines[#lines + 1] = "controls: " .. (active and ("running (" .. tostring(active.Name or "controller") .. ")") or "no active controller")
-            local okVector, move = pcall(function() return controls:GetMoveVector() end)
-            if okVector then lines[#lines + 1] = ("move input right now: %.2f, %.2f, %.2f"):format(move.X, move.Y, move.Z) end
-        end
-    end
-    local hum = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
-    if hum then
-        lines[#lines + 1] = ("humanoid: walk %s, state %s, move dir %.2f"):format(tostring(hum.WalkSpeed), hum:GetState().Name, hum.MoveDirection.Magnitude)
-    end
-    pcall(function()
-        local camera = workspace.CurrentCamera
-        lines[#lines + 1] = "camera: " .. camera.CameraType.Name .. ", following " .. tostring(camera.CameraSubject)
-    end)
-    pcall(function()
-        local UserInputService = game:GetService("UserInputService")
-        lines[#lines + 1] = ("input: touch %s, mouse behavior %s"):format(tostring(UserInputService.TouchEnabled), UserInputService.MouseBehavior.Name)
-        lines[#lines + 1] = "touch controls on: " .. tostring(game:GetService("GuiService").TouchControlsEnabled)
-    end)
-    -- every input context, wherever it lives, that is on and swallows input
-    local found = 0
-    local roots = { playerGui(), scripts, LocalPlayer.Character }
-    for _, root in ipairs(roots) do
-        for _, inst in ipairs(root and root:GetDescendants() or {}) do
-            if inst:IsA("InputContext") then
-                found += 1
-                lines[#lines + 1] = ("input context %s: on %s, sink %s, priority %s"):format(pathOf(inst), tostring(inst.Enabled), tostring(inst.Sink), tostring(inst.Priority))
-            end
-        end
-    end
-    if found == 0 then lines[#lines + 1] = "no input contexts" end
-    pcall(function()
-        local bound = game:GetService("ContextActionService"):GetAllBoundActionInfo()
-        local names = {}
-        for name in pairs(bound) do names[#names + 1] = name end
-        lines[#lines + 1] = "bound actions: " .. (#names > 0 and table.concat(names, ", ") or "none")
-    end)
-    return lines
-end
-
-track(game:GetService("UserInputService").InputBegan:Connect(function(input, processed)
-    if not Probe.Enabled then return end
-    local kind = input.UserInputType
-    if kind ~= Enum.UserInputType.Touch and kind ~= Enum.UserInputType.MouseButton1 and kind ~= Enum.UserInputType.MouseButton2 then return end
-    local point = Vector2.new(input.Position.X, input.Position.Y)
-    local blockers = blockersAt(point)
-    Probe.LastBlockers = blockers
-    log(processed and "Warn" or "Info", ("%s at %d, %d: %s"):format(
-        kind == Enum.UserInputType.Touch and "touch" or "click", point.X, point.Y,
-        processed and "taken by a gui" or "reached the game"))
-    for i = 1, math.min(#blockers, 4) do
-        local obj = blockers[i]
-        log("Info", ("  under it: %s (%s%s)"):format(pathOf(obj), obj.ClassName, looksInvisible(obj) and ", invisible" or ""))
-    end
-end))
-
--- Stops the GUI found under your last touch from taking input. Only things
--- you can't see are touched, so no visible button stops working.
-local function unblock()
-    local count = 0
-    for _, obj in ipairs(Probe.LastBlockers) do
-        if obj.Parent and looksInvisible(obj) then
-            pcall(function() obj.Active = false end)
-            pcall(function() obj.Interactable = false end)
-            count += 1
-            log("Success", "unblocked " .. pathOf(obj))
-        end
-    end
-    if count == 0 then log("Info", "nothing invisible under your last touch. turn on the touch check and touch where the joystick should be first") end
 end
 
 --// teardown ----------------------------------------------------------------
@@ -979,17 +842,18 @@ do
     local overview = Tab:AddBigGroupbox('Overview', 'gauge')
     local cards = overview:AddStatCards('ff_stats', {
         Cards = {
-            { Title = 'Status', Value = 'off', Icon = 'activity' },
-            { Title = 'Mode', Value = Auto.Mode, Icon = 'keyboard' },
-            { Title = 'Hits', Value = '0', Icon = 'target' },
-            { Title = 'Left alone', Value = '0', Icon = 'skull' },
+            { Title = 'Sick', Value = '0', Icon = 'sparkles' },
+            { Title = 'Good', Value = '0', Icon = 'thumbs-up' },
+            { Title = 'Ok', Value = '0', Icon = 'circle' },
+            { Title = 'Bad', Value = '0', Icon = 'thumbs-down' },
+            { Title = 'Miss', Value = '0', Icon = 'x' },
         },
     })
-    every(0.25, function()
-        cards:SetValue('Status', tostring(Stats.Status))
-        cards:SetValue('Mode', Auto.Mode)
-        cards:SetValue('Hits', tostring(Stats.Hits))
-        cards:SetValue('Left alone', tostring(Stats.Skipped))
+    local statusLabel = overview:AddLabel('status: off')
+    every(0.2, function()
+        for _, name in ipairs(GRADE_ORDER) do cards:SetValue(name, tostring(Stats[name] or 0)) end
+        statusLabel:SetText(("status: %s   mode: %s   special notes left alone: %d"):format(
+            tostring(Stats.Status), Auto.Mode, Stats.Special or 0))
     end)
 
     local play = Tab:AddLeftGroupbox('Autoplayer', 'play')
@@ -1024,48 +888,46 @@ do
 
     play:AddButton({ Text = 'Check modes', Func = checkModes })
 
-    play:AddLabel('All Sick by default. Use the sliders on the right if you want it to look human.', true)
-
-    local timing = Tab:AddRightGroupbox('Timing', 'timer')
-
-    timing:AddSlider('ff_offset', {
-        Text = 'Offset',
-        Tooltip = 'moves every press earlier (negative) or later (positive)',
-        Min = -100, Max = 100, Default = Auto.Offset, Rounding = 0, Suffix = 'ms',
-        Callback = function(value)
-            Auto.Offset = value
-            pushSettings()
+    play:AddButton({
+        Text = 'Reset counts',
+        Func = function()
+            for _, name in ipairs(GRADE_ORDER) do
+                Stats[name] = 0
+                Bridge:SetAttribute("Grade" .. name, 0)
+            end
+            Stats.Special = 0
+            Bridge:SetAttribute("Special", 0)
         end,
     })
 
-    timing:AddSlider('ff_spread', {
-        Text = 'Random spread',
-        Tooltip = 'random timing either side of each note. up to 50ms stays Sick, past that you start getting Goods',
-        Min = 0, Max = 150, Default = Auto.Spread, Rounding = 0, Suffix = 'ms',
-        Callback = function(value)
-            Auto.Spread = value
-            pushSettings()
-        end,
-    })
+    local chances = Tab:AddRightGroupbox('Judgement chances', 'dices')
 
-    timing:AddSlider('ff_miss', {
-        Text = 'Miss chance',
-        Min = 0, Max = 50, Default = Auto.MissChance, Rounding = 1, Suffix = '%',
-        Callback = function(value)
-            Auto.MissChance = value
-            pushSettings()
-        end,
-    })
+    chances:AddLabel('How often each judgement comes out. They work as weights, so they don\'t have to add up to 100: 90 Sick and 10 Good is one Good in ten. All Sick by default.', true)
 
-    timing:AddSlider('ff_taphold', {
-        Text = 'Tap length',
-        Tooltip = 'how long a tap note is held down',
-        Min = 10, Max = 150, Default = Auto.TapHold, Rounding = 0, Suffix = 'ms',
-        Callback = function(value)
-            Auto.TapHold = value
-            pushSettings()
-        end,
-    })
+    local share = chances:AddLabel('', true)
+    local function showShare()
+        local total = 0
+        for _, name in ipairs(GRADE_ORDER) do total += math.max(Auto.Chance[name] or 0, 0) end
+        local parts = {}
+        for _, name in ipairs(GRADE_ORDER) do
+            local pct = total > 0 and (math.max(Auto.Chance[name] or 0, 0) / total * 100) or (name == "Sick" and 100 or 0)
+            if pct > 0 then parts[#parts + 1] = ("%s %.0f%%"):format(name, pct) end
+        end
+        share:SetText("so: " .. table.concat(parts, ", "))
+    end
+
+    for _, name in ipairs(GRADE_ORDER) do
+        chances:AddSlider('ff_chance_' .. name:lower(), {
+            Text = name,
+            Min = 0, Max = 100, Default = Auto.Chance[name], Rounding = 0, Suffix = '%',
+            Callback = function(value)
+                Auto.Chance[name] = value
+                pushSettings()
+                showShare()
+            end,
+        })
+    end
+    showShare()
 
     local screen = Tab:AddLeftGroupbox('Input action / keypress', 'monitor')
 
@@ -1082,45 +944,6 @@ do
         Tooltip = 'the screen modes can\'t read a note\'s type, so a note drawn differently from the lane\'s usual ones (death, poison) is left alone. game mode always knows the type',
         Default = Auto.SkipSpecial,
         Callback = function(state) Auto.SkipSpecial = state end,
-    })
-
-    local fixes = Tab:AddRightGroupbox('Camera and movement', 'move')
-
-    fixes:AddButton({
-        Text = 'Fix camera and movement',
-        Tooltip = 'puts the camera back on you, unblocks input and unanchors your character. only does anything outside a song',
-        Func = function() fixControls(false) end,
-    })
-
-    fixes:AddToggle('ff_autofix', {
-        Text = 'Keep it fixed',
-        Tooltip = 'checks every second outside a song and fixes whatever got stuck',
-        Default = false,
-        Callback = function(state) Fix.Auto = state end,
-    })
-
-    fixes:AddDivider('Find what is blocking')
-
-    fixes:AddToggle('ff_probe', {
-        Text = 'Touch check',
-        Tooltip = 'logs every touch or click: whether a gui took it and what is under your finger. touch where the joystick should be and drag where the camera should turn',
-        Default = false,
-        Callback = function(state) Probe.Enabled = state end,
-    })
-    Library:SetIgnoreIndexes({ 'ff_probe' })
-
-    fixes:AddButton({
-        Text = 'Controls report',
-        Tooltip = 'logs the state of walking, the camera and every input layer',
-        Func = function()
-            for _, line in ipairs(controlsReport()) do log("Info", line) end
-        end,
-    })
-
-    fixes:AddButton({
-        Text = 'Unblock last touch',
-        Tooltip = 'stops invisible gui under your last touch from taking input',
-        Func = unblock,
     })
 
     local logBox = Tab:AddBigGroupbox('Log', 'scroll-text')
