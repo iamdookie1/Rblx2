@@ -59,7 +59,12 @@ local Auto = {
     -- how often each judgement comes out, as weights (they don't need to add
     -- up to 100). all Sick by default.
     Chance = { Sick = 100, Good = 0, Ok = 0, Bad = 0, Miss = 0 },
-    SkipSpecial = true,  -- screen modes: leave notes that don't look like the lane's normal ones
+    SkipSpecial = true,  -- screen modes: leave death / poison notes alone
+    -- hold notes
+    Holds = true,        -- hold them down; off plays every hold as a tap
+    HoldPercent = 100,   -- how much of each hold to keep down (80% and up already scores full)
+    HoldRandom = false,  -- vary it per hold
+    HoldRandomRange = 20,-- holds pick between HoldPercent - this and HoldPercent
     Side = "Auto",       -- screen modes: which field is yours
 }
 
@@ -141,8 +146,22 @@ do
     Bridge.Parent = ok and holder or LocalPlayer:WaitForChild("PlayerGui")
 end
 
+-- How much of a hold this one keeps, 0..1.
+local function holdFraction(rng)
+    local top = math.clamp(Auto.HoldPercent, 0, 100)
+    if Auto.HoldRandom and Auto.HoldRandomRange > 0 then
+        local low = math.max(top - Auto.HoldRandomRange, 0)
+        return (rng or Rng):NextNumber(low, top) / 100
+    end
+    return top / 100
+end
+
 local function pushSettings()
     Bridge:SetAttribute("Enabled", Auto.Enabled and Auto.Mode == "Game")
+    Bridge:SetAttribute("Holds", Auto.Holds)
+    Bridge:SetAttribute("HoldPercent", Auto.HoldPercent)
+    Bridge:SetAttribute("HoldRandom", Auto.HoldRandom)
+    Bridge:SetAttribute("HoldRandomRange", Auto.HoldRandomRange)
     for _, name in ipairs(GRADE_ORDER) do
         Bridge:SetAttribute("Chance" .. name, Auto.Chance[name] or 0)
     end
@@ -388,8 +407,14 @@ connection = RunService.Heartbeat:Connect(function(dt)
             state.Down = true
             state.LastPress = pressAt
             local length = tonumber(note.Length) or 0
-            state.Hold = length > 0
-            state.ReleaseAt = state.Hold and (note.Time + length) or (pressAt + TAP)
+            local keep = 0
+            if length > 0 and attr("Holds", true) then
+                local top = math.clamp(attr("HoldPercent", 100), 0, 100)
+                local range = attr("HoldRandom", false) and math.max(attr("HoldRandomRange", 0), 0) or 0
+                keep = (range > 0 and rng:NextNumber(math.max(top - range, 0), top) or top) / 100
+            end
+            state.Hold = keep > 0
+            state.ReleaseAt = state.Hold and (note.Time + length * keep) or (pressAt + TAP)
             index += 1
         end
     end
@@ -573,6 +598,68 @@ local function myField()
     return best
 end
 
+-- Death and poison notes are drawn with the game's hazard skins (arrow skins
+-- of type "DeathPoison"; the type picks the skin when the note is set up).
+-- The game's own Arrows settings page builds a preview of every hazard skin
+-- under ...Notes.Options.Bottom.Skin.Content, so the images used there are
+-- exactly the images a hazard note can carry. Read once they exist; until
+-- then the lane-majority guess below stands in.
+local Hazard = { Images = nil, NextScan = 0 }
+
+local function scanHazardSkins()
+    if Hazard.Images or os.clock() < Hazard.NextScan then return end
+    Hazard.NextScan = os.clock() + 3
+    local gui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    if not gui then return end
+    local found, normal = {}, {}
+    local count = 0
+    for _, inst in ipairs(gui:GetDescendants()) do
+        local parent = inst.Parent
+        if inst.Name == "Content" and parent and parent.Name == "Skin"
+            and parent.Parent and parent.Parent.Name == "Bottom" then
+            for _, image in ipairs(inst:GetDescendants()) do
+                if image:IsA("ImageLabel") and image.Image ~= "" then found[image.Image] = true end
+            end
+        elseif inst.Name == "Arrows" and parent and parent.Name == "Inner"
+            and parent.Parent and parent.Parent.Name == "Arrows" then
+            -- the normal arrow preview on the same page: anything in it is not a hazard
+            for _, image in ipairs(inst:GetDescendants()) do
+                if image:IsA("ImageLabel") and image.Image ~= "" then normal[image.Image] = true end
+            end
+        end
+    end
+    for image in pairs(normal) do found[image] = nil end
+    for _ in pairs(found) do count += 1 end
+    if count > 0 then
+        Hazard.Images = found
+        log("Success", ("found the game's death / poison skins (%d images), special notes are read exactly now"):format(count))
+    end
+end
+
+Hazard.Seen, Hazard.Flagged = 0, 0
+
+local function isHazard(frame)
+    if not Hazard.Images then return nil end
+    local hit = false
+    for _, inst in ipairs(frame:GetDescendants()) do
+        if inst:IsA("ImageLabel") and Hazard.Images[inst.Image] then
+            hit = true
+            break
+        end
+    end
+    Hazard.Seen += 1
+    if hit then Hazard.Flagged += 1 end
+    -- hazards are a handful of notes in a song. if most notes match, the skins
+    -- share images with your arrows, so fall back to guessing from looks
+    if Hazard.Seen >= 12 and Hazard.Flagged / Hazard.Seen > 0.5 then
+        Hazard.Images = nil
+        Hazard.NextScan = math.huge
+        log("Warn", "your arrow skin shares images with the death / poison skins, guessing from looks instead")
+        return nil
+    end
+    return hit
+end
+
 -- The image a note is drawn with, to tell normal notes from death / poison
 -- ones, which come in their own skin.
 local function noteLook(frame)
@@ -628,6 +715,7 @@ local function screenStep(dt)
         return
     end
     Stats.Status = "playing"
+    if Auto.SkipSpecial then scanHazardSkins() end
     local clock = os.clock()
 
     for index, lane in pairs(field.Lanes) do
@@ -688,8 +776,17 @@ local function screenStep(dt)
         if best and not Holding[index] then
             local state = Tracked[best]
             if state.Plan == nil then
-                local normal, count = majorityLook(index)
-                if Auto.SkipSpecial and count >= 3 and state.Look ~= normal then
+                local special = false
+                if Auto.SkipSpecial then
+                    local exact = isHazard(best)
+                    if exact ~= nil then
+                        special = exact
+                    else
+                        local normal, count = majorityLook(index)
+                        special = count >= 3 and state.Look ~= normal
+                    end
+                end
+                if special then
                     state.Plan = false
                     Stats.Special += 1
                 else
@@ -712,10 +809,12 @@ local function screenStep(dt)
                     Stats[state.Grade] = (Stats[state.Grade] or 0) + 1
                     local tail = tailLength(best, state.Axis)
                     local noteSize = math.min(best.AbsoluteSize.X, best.AbsoluteSize.Y)
-                    if tail > noteSize * 1.6 then
+                    local keep = (tail > noteSize * 1.6 and Auto.Holds) and holdFraction() or 0
+                    if keep > 0 then
                         Holding[index] = {
                             Frame = best, Name = best.Name, Axis = state.Axis, NoteSize = noteSize,
-                            ReleaseAt = clock + tail / state.Speed + 0.1,
+                            -- a full hold also lets go when the tail runs out
+                            ReleaseAt = clock + (tail / state.Speed) * keep + (keep >= 1 and 0.1 or 0),
                         }
                     else
                         TapRelease[index] = clock + 0.03
@@ -940,10 +1039,60 @@ do
     })
 
     screen:AddToggle('ff_skipspecial', {
-        Text = 'Leave special notes',
-        Tooltip = 'the screen modes can\'t read a note\'s type, so a note drawn differently from the lane\'s usual ones (death, poison) is left alone. game mode always knows the type',
+        Text = 'Leave death / poison notes',
+        Tooltip = 'matches notes against the game\'s own death and poison skins once its Arrows settings page has built them (open settings > Arrows > Notes once if it says it hasn\'t). until then a note drawn differently from the rest of its lane is left alone. game mode always knows the real type',
         Default = Auto.SkipSpecial,
         Callback = function(state) Auto.SkipSpecial = state end,
+    })
+
+    local hazardLabel = screen:AddLabel('death / poison: -', true)
+    every(1, function()
+        hazardLabel:SetText(Hazard.Images and "death / poison: read from the game's skins"
+            or "death / poison: guessing from looks (open settings > Arrows > Notes once)")
+    end)
+
+    screen:AddLabel('Or turn off Note Mechanics in the game\'s song options: the game then never spawns death or poison notes at all.', true)
+
+    local holds = Tab:AddRightGroupbox('Hold notes', 'hand')
+
+    holds:AddToggle('ff_holds', {
+        Text = 'Hold them',
+        Tooltip = 'off plays every hold like a tap, which loses the hold part of its score',
+        Default = Auto.Holds,
+        Callback = function(state)
+            Auto.Holds = state
+            pushSettings()
+        end,
+    })
+
+    holds:AddSlider('ff_holdpercent', {
+        Text = 'Hold for',
+        Tooltip = 'how much of each hold to keep down. the game gives full marks from 80% on',
+        Min = 0, Max = 100, Default = Auto.HoldPercent, Rounding = 0, Suffix = '%',
+        Callback = function(value)
+            Auto.HoldPercent = value
+            pushSettings()
+        end,
+    })
+
+    holds:AddToggle('ff_holdrandom', {
+        Text = 'Randomize',
+        Tooltip = 'each hold picks its own length, up to the range below shorter than "hold for"',
+        Default = Auto.HoldRandom,
+        Callback = function(state)
+            Auto.HoldRandom = state
+            pushSettings()
+        end,
+    })
+
+    holds:AddSlider('ff_holdrange', {
+        Text = 'Random range',
+        Tooltip = 'e.g. hold for 100% with a 30% range holds each one somewhere between 70% and 100%',
+        Min = 0, Max = 100, Default = Auto.HoldRandomRange, Rounding = 0, Suffix = '%',
+        Callback = function(value)
+            Auto.HoldRandomRange = value
+            pushSettings()
+        end,
     })
 
     local logBox = Tab:AddBigGroupbox('Log', 'scroll-text')
