@@ -62,6 +62,10 @@ local Games = {
     [6447798030] = { Name = 'Funky Friday', Script = 'Games/FunkyFriday.lua' },
     -- [🎃] Dodge or Die (game 9845585365), from its dump's own place id.
     [131794278839305] = { Name = 'Dodge or Die', Script = 'Games/DodgeOrDie.lua' },
+    -- OVERKILL (game 7872343282): lobby and match places, both from the
+    -- PlaceIds table in its own Libraries.Shared.
+    [74996816424339] = { Name = 'OVERKILL', Script = 'Games/Overkill.lua' },
+    [101878803733802] = { Name = 'OVERKILL (match)', Script = 'Games/Overkill.lua' },
 }
 
 -- Games whose other modes (ranked, duels, events...) each have their own place
