@@ -60,6 +60,8 @@ local Games = {
     [15172193554] = { Name = 'Blade Ball Aim Trainer', Script = 'Games/BladeBallTrainer.lua' },
     -- [MADNESS] Funky Friday (game 2404080894), from its dump's own place id.
     [6447798030] = { Name = 'Funky Friday', Script = 'Games/FunkyFriday.lua' },
+    -- [🎃] Dodge or Die (game 9845585365), from its dump's own place id.
+    [131794278839305] = { Name = 'Dodge or Die', Script = 'Games/DodgeOrDie.lua' },
 }
 
 -- Games whose other modes (ranked, duels, events...) each have their own place
