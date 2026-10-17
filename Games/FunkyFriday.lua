@@ -67,6 +67,24 @@ local Auto = {
     PressRandom = false, -- vary it per note
     PressRandomRange = 30, -- % either side of PressHoldMs
     Side = "Auto",       -- screen modes: which field is yours
+    Perfect = false,     -- every hit dead on the note: 0.00ms (exact in game mode)
+}
+
+-- client side note themes, one per lane direction, after the website's space
+-- themes (black hole left out)
+local THEME_NAMES = {
+    "Default", "Violet Nebula", "Deep Ocean", "Magenta Cloud", "Emerald Drift",
+    "Ember Storm", "Aurora", "Crimson Void", "Ice Comet", "Supernova",
+}
+local DIRECTIONS = { "Left", "Down", "Up", "Right" }
+local Theme = {
+    Left = "Default", Down = "Default", Up = "Default", Right = "Default",
+    Animate = true,
+    Speed = 1,
+    Stars = true,
+    Glow = true,
+    Tails = true,
+    Receptors = false,
 }
 
 local Stats = { Status = "off", Special = 0, Sick = 0, Good = 0, Ok = 0, Bad = 0, Miss = 0 }
@@ -110,6 +128,7 @@ local GRADE_ORDER = { "Sick", "Good", "Ok", "Bad", "Miss" }
 -- Picks a judgement by the chances. Returns its name and the timing error in
 -- seconds (nil for a miss: the note is left alone).
 local function plan()
+    if Auto.Perfect then return "Sick", 0 end
     local total = 0
     for _, name in ipairs(GRADE_ORDER) do total += math.max(Auto.Chance[name] or 0, 0) end
     local pick = "Sick"
@@ -124,6 +143,7 @@ local function plan()
         end
     end
     if pick == "Miss" then return pick, nil end
+    if Auto.Perfect then return "Sick", 0 end
     for _, grade in ipairs(GRADES) do
         if grade.Name == pick then
             local ms = Rng:NextNumber(grade.Min, grade.Max)
@@ -168,7 +188,28 @@ local function pushSettings()
     for _, name in ipairs(GRADE_ORDER) do
         Bridge:SetAttribute("Chance" .. name, Auto.Chance[name] or 0)
     end
+    Bridge:SetAttribute("Perfect", Auto.Perfect)
 end
+
+local function themesOn()
+    for _, dir in ipairs(DIRECTIONS) do
+        if Theme[dir] ~= "Default" then return true end
+    end
+    return false
+end
+
+local function pushTheme()
+    for _, dir in ipairs(DIRECTIONS) do Bridge:SetAttribute("Theme" .. dir, Theme[dir]) end
+    Bridge:SetAttribute("ThemeAnimate", Theme.Animate)
+    Bridge:SetAttribute("ThemeSpeed", Theme.Speed)
+    Bridge:SetAttribute("ThemeStars", Theme.Stars)
+    Bridge:SetAttribute("ThemeGlow", Theme.Glow)
+    Bridge:SetAttribute("ThemeTails", Theme.Tails)
+    Bridge:SetAttribute("ThemeReceptors", Theme.Receptors)
+    Bridge:SetAttribute("ThemesOn", themesOn())
+    Bridge:SetAttribute("ThemeVersion", (Bridge:GetAttribute("ThemeVersion") or 0) + 1)
+end
+pushTheme()
 pushSettings()
 
 local WORKER = [==[
@@ -241,6 +282,10 @@ local function tapLength()
 end
 
 local function pickGrade()
+    -- perfect: pressed exactly on the note. the press is stamped to the note's
+    -- own time, which Lane:Hit turns back into exactly that song time, so the
+    -- game judges it 0.00ms
+    if attr("Perfect", false) then return "Sick", 0 end
     local total = 0
     for _, name in ipairs(ORDER) do total += math.max(attr("Chance" .. name, name == "Sick" and 100 or 0), 0) end
     if total <= 0 then return "Sick", 0 end
@@ -284,6 +329,251 @@ local function hitboxOffset()
     return ok and tonumber(value) or 0
 end
 
+--// note themes ------------------------------------------------------------
+-- Every arrow, note and hold tail is built by Framework.SpriteHandler's
+-- GenerateArrow as a LayeredSprite: one ImageLabel per layer, the colourable
+-- ones flagged Colorized. A theme sits on those colourable layers: a UIGradient
+-- that drifts and turns like the website's gas clouds (a gradient on an image
+-- only colours the image's own pixels, so it keeps the arrow's shape), a
+-- twinkling star shimmer on top and a soft glow behind.
+
+local function hex(h) return Color3.fromHex(h) end
+local function themeDef(c1, c2, c3, c4, glow, glowAlpha)
+    c1, c2, c3, c4 = hex(c1), hex(c2), hex(c3), hex(c4)
+    return {
+        Gas = ColorSequence.new({
+            ColorSequenceKeypoint.new(0, c1),
+            ColorSequenceKeypoint.new(0.2, c2),
+            ColorSequenceKeypoint.new(0.38, c3),
+            ColorSequenceKeypoint.new(0.52, c2),
+            ColorSequenceKeypoint.new(0.68, c1:Lerp(c4, 0.45)),
+            ColorSequenceKeypoint.new(0.84, c2),
+            ColorSequenceKeypoint.new(1, c1),
+        }),
+        Glow = glow,
+        GlowAlpha = glowAlpha,
+    }
+end
+local THEMES = {
+    ["Violet Nebula"] = themeDef("3b0f8f", "7a3cff", "e0a8ff", "12052e", Color3.fromRGB(150, 90, 255), 0.5),
+    ["Deep Ocean"] = themeDef("0a2a8f", "1f7bff", "8fe3ff", "030b26", Color3.fromRGB(60, 150, 255), 0.5),
+    ["Magenta Cloud"] = themeDef("7a0a5c", "ff2fa8", "ffb3e1", "22041a", Color3.fromRGB(255, 60, 170), 0.5),
+    ["Emerald Drift"] = themeDef("04594a", "12d18e", "b4ffd9", "021a14", Color3.fromRGB(30, 220, 150), 0.45),
+    ["Ember Storm"] = themeDef("8a1c05", "ff5a1f", "ffd08a", "240702", Color3.fromRGB(255, 110, 40), 0.5),
+    ["Aurora"] = themeDef("0b4f6c", "f2b632", "6ff7ff", "04121c", Color3.fromRGB(120, 220, 230), 0.45),
+    ["Crimson Void"] = themeDef("5c0010", "d4143a", "ff8fa3", "160005", Color3.fromRGB(230, 30, 70), 0.5),
+    ["Ice Comet"] = themeDef("1b3a5c", "7fc4ff", "f2fbff", "050d18", Color3.fromRGB(180, 225, 255), 0.45),
+    ["Supernova"] = themeDef("6b2bd9", "ffb52e", "fff6dd", "120a20", Color3.fromRGB(255, 200, 90), 0.5),
+}
+
+-- narrow bright flecks on an otherwise clear gradient: the stars
+local STARS = NumberSequence.new({
+    NumberSequenceKeypoint.new(0, 1),
+    NumberSequenceKeypoint.new(0.10, 1), NumberSequenceKeypoint.new(0.12, 0.1), NumberSequenceKeypoint.new(0.14, 1),
+    NumberSequenceKeypoint.new(0.31, 1), NumberSequenceKeypoint.new(0.33, 0.25), NumberSequenceKeypoint.new(0.35, 1),
+    NumberSequenceKeypoint.new(0.56, 1), NumberSequenceKeypoint.new(0.58, 0), NumberSequenceKeypoint.new(0.60, 1),
+    NumberSequenceKeypoint.new(0.74, 1), NumberSequenceKeypoint.new(0.76, 0.3), NumberSequenceKeypoint.new(0.78, 1),
+    NumberSequenceKeypoint.new(0.87, 1), NumberSequenceKeypoint.new(0.89, 0.15), NumberSequenceKeypoint.new(0.91, 1),
+    NumberSequenceKeypoint.new(1, 1),
+})
+
+local DIRS = { "Left", "Down", "Up", "Right" }
+local Themed = setmetatable({}, { __mode = "k" }) -- sprite -> { Decor = {...}, Labels = {...} }
+local Live = setmetatable({}, { __mode = "k" })   -- label -> animation state
+local ThemeHook = nil
+
+local function dirName(d)
+    d = tonumber(d) or 1
+    return DIRS[((math.floor(d) - 1) % 4) + 1]
+end
+
+local function themeFor(sprite)
+    local kind = sprite.Type
+    if kind == "Tail" then
+        if not attr("ThemeTails", true) then return nil end
+    elseif kind == "Base" or kind == "Released" then
+        if not attr("ThemeReceptors", false) then return nil end
+    elseif kind ~= "Note" then
+        return nil
+    end
+    return THEMES[attr("Theme" .. dirName(sprite.Direction), "Default")]
+end
+
+local function copyImage(from, to)
+    to.Image = from.Image
+    to.ImageRectOffset = from.ImageRectOffset
+    to.ImageRectSize = from.ImageRectSize
+    to.ScaleType = from.ScaleType
+    to.SliceCenter = from.SliceCenter
+    to.SliceScale = from.SliceScale
+    to.ResampleMode = from.ResampleMode
+end
+
+local function undecorate(sprite)
+    local entry = Themed[sprite]
+    if not entry then return end
+    for _, obj in ipairs(entry.Decor) do pcall(function() obj:Destroy() end) end
+    table.clear(entry.Decor)
+    for _, layer in ipairs(entry.Layers) do
+        if rawget(layer, "SetColor") then rawset(layer, "SetColor", nil) end
+        local label = layer.Frame
+        if typeof(label) == "Instance" then
+            Live[label] = nil
+            pcall(function() label.ImageColor3 = layer.ImageColor3 end)
+        end
+    end
+    table.clear(entry.Layers)
+end
+
+local function decorate(sprite)
+    local entry = Themed[sprite]
+    if not entry then return end
+    undecorate(sprite)
+    local theme = themeFor(sprite)
+    if not theme or type(sprite.Sprites) ~= "table" then return end
+    local anyColorized = false
+    for _, layer in pairs(sprite.Sprites) do
+        if type(layer) == "table" and layer.Colorized then anyColorized = true end
+    end
+    local phase = rng:NextNumber(0, 20)
+    for _, layer in pairs(sprite.Sprites) do
+        local label = type(layer) == "table" and layer.Frame
+        if typeof(label) == "Instance" and label:IsA("ImageLabel") and (layer.Colorized or not anyColorized) then
+            entry.Layers[#entry.Layers + 1] = layer
+            -- the game recolours notes through SetColor; while themed, the
+            -- label stays white and the gradient does the colour
+            rawset(layer, "SetColor", function(self, color) self.ImageColor3 = color or self.ImageColor3 end)
+            label.ImageColor3 = Color3.new(1, 1, 1)
+
+            local gas = Instance.new("UIGradient")
+            gas.Name = "FFT_Gas"
+            gas.Color = theme.Gas
+            gas.Rotation = 35
+            gas.Parent = label
+            entry.Decor[#entry.Decor + 1] = gas
+            local state = { Gas = gas, Phase = phase, Theme = theme }
+
+            if attr("ThemeStars", true) and sprite.Type ~= "Tail" then
+                local stars = Instance.new("ImageLabel")
+                stars.Name = "FFT_Stars"
+                stars.BackgroundTransparency = 1
+                stars.Size = UDim2.fromScale(1, 1)
+                stars.ImageColor3 = Color3.new(1, 1, 1)
+                stars.ZIndex = label.ZIndex
+                copyImage(label, stars)
+                local sparkle = Instance.new("UIGradient")
+                sparkle.Transparency = STARS
+                sparkle.Rotation = rng:NextNumber(20, 160)
+                sparkle.Parent = stars
+                stars.Parent = label
+                entry.Decor[#entry.Decor + 1] = stars
+                state.Stars, state.Sparkle = stars, sparkle
+            end
+
+            if attr("ThemeGlow", true) and sprite.Type ~= "Tail" and label.Parent then
+                local glow = Instance.new("ImageLabel")
+                glow.Name = "FFT_Glow"
+                glow.BackgroundTransparency = 1
+                glow.AnchorPoint = label.AnchorPoint
+                glow.Position = label.Position
+                glow.Size = label.Size
+                glow.ImageColor3 = theme.Glow
+                glow.ZIndex = 0
+                copyImage(label, glow)
+                local scale = Instance.new("UIScale")
+                scale.Scale = 1.22
+                scale.Parent = glow
+                glow.Parent = label.Parent
+                entry.Decor[#entry.Decor + 1] = glow
+                state.Glow = glow
+            end
+
+            state.Label = label
+            Live[label] = state
+        end
+    end
+end
+
+local function installThemes(handler)
+    if ThemeHook or type(handler) ~= "table" or type(handler.GenerateArrow) ~= "function" then return end
+    local original = handler.GenerateArrow
+    ThemeHook = { Handler = handler, Original = original }
+    handler.GenerateArrow = function(self, ...)
+        local sprite = original(self, ...)
+        pcall(function()
+            if type(sprite) ~= "table" or Themed[sprite] then return end
+            Themed[sprite] = { Decor = {}, Layers = {} }
+            -- a restyle rebuilds the layers, so the theme goes back on after
+            local rebuild = sprite.Rebuild
+            if type(rebuild) == "function" then
+                rawset(sprite, "Rebuild", function(s, ...)
+                    undecorate(s)
+                    local result = table.pack(rebuild(s, ...))
+                    pcall(decorate, s)
+                    return table.unpack(result, 1, result.n)
+                end)
+            end
+            decorate(sprite)
+        end)
+        return sprite
+    end
+    -- notes the game already built and pooled are rebuilt, so they come out themed
+    pcall(function() handler:ClearNoteVisualCache() end)
+    bridge:SetAttribute("ThemeStatus", "on")
+end
+
+local function removeThemes()
+    if not ThemeHook then return end
+    pcall(function() ThemeHook.Handler.GenerateArrow = ThemeHook.Original end)
+    for sprite in pairs(Themed) do
+        pcall(undecorate, sprite)
+        if rawget(sprite, "Rebuild") then rawset(sprite, "Rebuild", nil) end
+    end
+    ThemeHook = nil
+end
+
+local themeDirty = false
+bridge.AttributeChanged:Connect(function(name)
+    if name:sub(1, 5) == "Theme" and name ~= "ThemeStatus" then themeDirty = true end
+end)
+
+-- the drift, the twinkle and the glow, every frame, for what is on screen
+local TAU = math.pi * 2
+local animator = RunService.RenderStepped:Connect(function()
+    if not ThemeHook then return end
+    if themeDirty then
+        themeDirty = false
+        for sprite in pairs(Themed) do pcall(decorate, sprite) end
+    end
+    local animate = attr("ThemeAnimate", true)
+    local t = os.clock() * attr("ThemeSpeed", 1)
+    for label, state in pairs(Live) do
+        if label.Parent and label.Visible and label.AbsoluteSize.X > 0 then
+            local p = t + state.Phase
+            if animate then
+                state.Gas.Rotation = 35 + 30 * math.sin(p * TAU / 14)
+                state.Gas.Offset = Vector2.new(0.3 * math.sin(p * TAU / 11), 0.25 * math.cos(p * TAU / 17))
+            end
+            local base = label.ImageTransparency
+            if state.Stars then
+                local twinkle = animate and (0.35 + 0.65 * (0.5 + 0.5 * math.sin(p * TAU / 6))) or 0.7
+                state.Stars.ImageTransparency = 1 - (1 - base) * twinkle * 0.9
+                state.Stars.ImageRectOffset = label.ImageRectOffset
+                if animate then state.Sparkle.Offset = Vector2.new(((p * 0.08) % 2) - 1, 0) end
+            end
+            if state.Glow then
+                local pulse = animate and (0.85 + 0.15 * math.sin(p * TAU / 8)) or 1
+                state.Glow.ImageTransparency = 1 - (1 - base) * state.Theme.GlowAlpha * pulse
+                state.Glow.ImageRectOffset = label.ImageRectOffset
+                state.Glow.Position, state.Glow.Size = label.Position, label.Size
+                state.Glow.Visible = true
+            end
+        elseif state.Glow then
+            state.Glow.Visible = false
+        end
+    end
+end)
+
 local candidates = {}
 local function byTime(a, b) return a.Time < b.Time end
 
@@ -291,18 +581,23 @@ local connection
 connection = RunService.Heartbeat:Connect(function(dt)
     if not bridge.Parent or attr("Stop", false) then
         if lastField then pcall(releaseAll, lastField) end
+        pcall(removeThemes)
+        animator:Disconnect()
         connection:Disconnect()
         return
     end
     local owner = bridge:GetAttribute("Owner")
     if owner and owner ~= WORKER_ID then
+        animator:Disconnect()
         connection:Disconnect()
         return
     end
-    if not attr("Enabled", false) then
-        if lastField then pcall(releaseAll, lastField) end
-        return
+    local playing = attr("Enabled", false)
+    if not playing and lastField then
+        pcall(releaseAll, lastField)
+        lastField = nil
     end
+    if not playing and not attr("ThemesOn", false) and not Framework then return end
 
     if not Framework then
         if os.clock() < nextSearch then return end
@@ -314,12 +609,16 @@ connection = RunService.Heartbeat:Connect(function(dt)
             return
         end
         if bridge:GetAttribute("Owner") then
+            animator:Disconnect()
             connection:Disconnect()
             return
         end
         bridge:SetAttribute("Owner", WORKER_ID)
         bridge:SetAttribute("Where", WORKER_ID)
     end
+
+    if attr("ThemesOn", false) and not ThemeHook then pcall(installThemes, Framework.SpriteHandler) end
+    if not playing then return end
 
     local handler = Framework.VSRG and Framework.VSRG.InputHandler
     local field = handler and handler.Field
@@ -1021,6 +1320,16 @@ do
         share:SetText("so: " .. table.concat(parts, ", "))
     end
 
+    chances:AddToggle('ff_perfect', {
+        Text = 'Perfect hits (0.00ms)',
+        Tooltip = 'every note hit dead on its time, over the chances below. exact in game mode, where each press is stamped to the note\'s own time; the screen modes get within a frame',
+        Default = Auto.Perfect,
+        Callback = function(state)
+            Auto.Perfect = state
+            pushSettings()
+        end,
+    })
+
     for _, name in ipairs(GRADE_ORDER) do
         chances:AddSlider('ff_chance_' .. name:lower(), {
             Text = name,
@@ -1109,4 +1418,76 @@ do
         pcall(function() Log:Log(line[1], line[2]) end)
     end
     table.clear(PendingLog)
+end
+
+do
+    local Tab = Window:AddTab('Theme', 'palette', 'Client side note themes')
+
+    local lanes = Tab:AddLeftGroupbox('Note themes', 'palette')
+    lanes:AddLabel('Only you see these. Each lane can have its own theme, or stay on your normal skin.', true)
+
+    local function changed()
+        pushTheme()
+        if themesOn() then startWorkers() end
+    end
+
+    local dropdowns = {}
+    for _, dir in ipairs(DIRECTIONS) do
+        dropdowns[dir] = lanes:AddDropdown('ff_theme_' .. dir:lower(), {
+            Text = dir,
+            Values = THEME_NAMES,
+            Default = Theme[dir],
+            Callback = function(value)
+                Theme[dir] = value or "Default"
+                changed()
+            end,
+        })
+    end
+
+    local allChoice = "Violet Nebula"
+    lanes:AddDropdown('ff_theme_all', {
+        Text = 'Set every lane to',
+        Values = THEME_NAMES,
+        Default = allChoice,
+        Callback = function(value) allChoice = value or "Default" end,
+    })
+    lanes:AddButton({
+        Text = 'Apply to all lanes',
+        Func = function()
+            for _, dir in ipairs(DIRECTIONS) do
+                Theme[dir] = allChoice
+                pcall(function() dropdowns[dir]:SetValue(allChoice) end)
+            end
+            changed()
+        end,
+    })
+
+    local look = Tab:AddRightGroupbox('Look', 'sparkles')
+    look:AddToggle('ff_theme_animate', {
+        Text = 'Animated',
+        Tooltip = 'the colours drift and turn like the website\'s gas clouds, the stars twinkle and the glow breathes',
+        Default = Theme.Animate,
+        Callback = function(v) Theme.Animate = v; changed() end,
+    })
+    look:AddSlider('ff_theme_speed', {
+        Text = 'Animation speed',
+        Min = 0.1, Max = 4, Default = Theme.Speed, Rounding = 1, Suffix = 'x',
+        Callback = function(v) Theme.Speed = v; changed() end,
+    })
+    look:AddToggle('ff_theme_stars', { Text = 'Twinkling stars', Default = Theme.Stars, Callback = function(v) Theme.Stars = v; changed() end })
+    look:AddToggle('ff_theme_glow', { Text = 'Glow', Default = Theme.Glow, Callback = function(v) Theme.Glow = v; changed() end })
+    look:AddToggle('ff_theme_tails', { Text = 'Hold tails too', Default = Theme.Tails, Callback = function(v) Theme.Tails = v; changed() end })
+    look:AddToggle('ff_theme_receptors', {
+        Text = 'Receptors too',
+        Tooltip = 'the arrows notes land on, and the skin previews in menus',
+        Default = Theme.Receptors,
+        Callback = function(v) Theme.Receptors = v; changed() end,
+    })
+
+    local status = look:AddLabel('themes: off', true)
+    every(0.5, function()
+        local hooked = Bridge:GetAttribute("ThemeStatus")
+        status:SetText(themesOn() and ("themes: " .. (hooked or "looking for the game...")) or "themes: off")
+    end)
+    look:AddLabel('Notes already on screen pick up a change straight away. Needs getgc or run_on_actor, like game mode.', true)
 end
