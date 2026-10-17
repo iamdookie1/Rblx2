@@ -65,8 +65,14 @@ local Aim = {
     Predict = true,
     PredictScale = 1,
     ExtraLead = 0,            -- ms, for ping
+    AutoPing = false,         -- add your measured ping to the lead
+    PredictFalls = true,      -- targets in the air follow gravity down to the floor
+    FallbackPart = true,      -- part hidden: use any other part of them that is visible
+    ShowPoint = false,        -- dot where the shot is aimed to land
+    PointColor = Color3.fromRGB(255, 255, 0),
     MaxDistance = 800,
     FOV = true,
+    FOVCenter = true,         -- FOV and crosshair at the middle of the screen, not the mouse
     FOVRadius = 250,
     ShowFOV = true,
     FOVColor = Color3.fromRGB(255, 255, 255),
@@ -87,6 +93,7 @@ local Trigger = {
     Hold = 0.12,              -- s the trigger is held
     Radius = 35,              -- px from crosshair (without silent aim)
     WithSilent = true,        -- with silent aim on, fire whenever there is a target
+    NeedAmmo = true,          -- don't pull the trigger on an empty gun or with the shield up
 }
 
 local Gun = {
@@ -112,6 +119,7 @@ local Esp = {
     Cards = false,
     ShieldState = true,
     Tracers = false,
+    Boxes = false,
     TracerFrom = "Bottom",    -- Bottom / Center / Crosshair
     MaxDistance = 1200,
     Transparency = 0.6,
@@ -310,19 +318,36 @@ end
 -- are moved by the game's interpolation rather than by physics.
 local Motion = setmetatable({}, { __mode = "k" })
 
+-- A short window of samples, velocity taken across the whole window: the
+-- interpolation the game moves others with jitters frame to frame, a window
+-- of ~0.2s doesn't.
+local WINDOW = 0.2
+
 local function updateMotion(entry, now)
     local m = Motion[entry.Model]
     local pos = entry.Root.Position
     if not m then
-        Motion[entry.Model] = { Pos = pos, At = now, Vel = Vector3.zero }
+        Motion[entry.Model] = { Samples = { { pos, now } }, Vel = Vector3.zero }
         return
     end
-    local dt = now - m.At
-    if dt < 1 / 240 then return end
-    local raw = (pos - m.Pos) / dt
-    if raw.Magnitude > 250 then raw = Vector3.zero end -- a teleport, not motion
-    m.Vel = m.Vel:Lerp(raw, math.clamp(dt * 12, 0, 1))
-    m.Pos, m.At = pos, now
+    local samples = m.Samples
+    local last = samples[#samples]
+    if now - last[2] < 1 / 240 then return end
+    if (pos - last[1]).Magnitude > 40 then
+        -- a teleport or respawn, not motion: start over
+        m.Samples, m.Vel = { { pos, now } }, Vector3.zero
+        return
+    end
+    samples[#samples + 1] = { pos, now }
+    while #samples > 2 and now - samples[2][2] >= WINDOW do table.remove(samples, 1) end
+    if #samples > 24 then table.remove(samples, 1) end
+    local first = samples[1]
+    local span = now - first[2]
+    if span >= 0.04 then
+        local raw = (pos - first[1]) / span
+        if raw.Magnitude > 250 then raw = Vector3.zero end
+        m.Vel = m.Vel:Lerp(raw, 0.6)
+    end
 end
 
 local function velocityOf(model)
@@ -345,7 +370,18 @@ local function visible(from, part)
     return hit == nil
 end
 
+-- where the FOV and "lined up" are measured from: the middle of the screen,
+-- or the mouse
 local function mousePos()
+    if Aim.FOVCenter and Camera then return Camera.ViewportSize / 2 end
+    return UserInputService:GetMouseLocation()
+end
+
+-- where the real crosshair is right now, for moving it
+local function cursorPos()
+    if Camera and UserInputService.MouseBehavior == Enum.MouseBehavior.LockCenter then
+        return Camera.ViewportSize / 2
+    end
     return UserInputService:GetMouseLocation()
 end
 
@@ -381,6 +417,8 @@ local function aimPart(model)
     return model:FindFirstChild("HumanoidRootPart")
 end
 
+local FALLBACK_PARTS = { "Head", "UpperTorso", "LowerTorso", "HumanoidRootPart", "LeftUpperArm", "RightUpperArm", "LeftUpperLeg", "RightUpperLeg" }
+
 local Current -- { Model, Player, Part }
 
 local function validTarget(entry, root, fovScale)
@@ -392,9 +430,26 @@ local function validTarget(entry, root, fovScale)
     if not part then return nil end
     local distance = (part.Position - root.Position).Magnitude
     if distance > Aim.MaxDistance then return nil end
-    local gap, onScreen = screenGap(part.Position)
-    if Aim.FOV and (not onScreen or gap > Aim.FOVRadius * fovScale) then return nil end
-    if Aim.VisibleOnly and Camera and not visible(Camera.CFrame.Position, part) then return nil end
+    local function usable(candidate)
+        local gap, onScreen = screenGap(candidate.Position)
+        if Aim.FOV and (not onScreen or gap > Aim.FOVRadius * fovScale) then return nil end
+        if Aim.VisibleOnly and Camera and not visible(Camera.CFrame.Position, candidate) then return nil end
+        return gap
+    end
+    local gap = usable(part)
+    if not gap and Aim.FallbackPart then
+        for _, name in ipairs(FALLBACK_PARTS) do
+            local other = entry.Model:FindFirstChild(name)
+            if other and other ~= part then
+                gap = usable(other)
+                if gap then
+                    part = other
+                    break
+                end
+            end
+        end
+    end
+    if not gap then return nil end
     return part, distance, gap, hp or 100
 end
 
@@ -433,31 +488,72 @@ end
 
 -- Where to send a bullet from origin so it meets the part, flight time and
 -- drop included: the game's own path played forward until the aim settles.
-local function solve(origin, speed, gravity, part, model)
-    local target = part.Position
-    local velocity = Aim.Predict and velocityOf(model) * Aim.PredictScale or Vector3.zero
+local FloorParams = RaycastParams.new()
+FloorParams.FilterType = Enum.RaycastFilterType.Exclude
+
+local function leadTime()
     local extra = Aim.ExtraLead / 1000
-    local aim, t = target, 0
-    for _ = 1, 8 do
+    if Aim.AutoPing then
+        local ok, ping = pcall(function() return LocalPlayer:GetNetworkPing() end)
+        if ok and type(ping) == "number" then extra += math.clamp(ping, 0, 0.5) end
+    end
+    return extra
+end
+
+-- where the part will be t seconds from now: along its velocity, and down
+-- under gravity onto the floor when it is in the air
+local function predictor(part, model)
+    local start = part.Position
+    local velocity = Aim.Predict and velocityOf(model) * Aim.PredictScale or Vector3.zero
+    local falling = Aim.Predict and Aim.PredictFalls and math.abs(velocity.Y) > 3
+    local floorY = -math.huge
+    if falling then
+        FloorParams.FilterDescendantsInstances = { model, LocalPlayer.Character, CharactersFolder, BulletsFolder }
+        local hit = Workspace:Raycast(start, Vector3.new(0, -120, 0), FloorParams)
+        local root = model:FindFirstChild("HumanoidRootPart")
+        -- the part's height above the feet, kept when it lands
+        local above = root and (start.Y - root.Position.Y) + 3 or 3
+        floorY = hit and (hit.Position.Y + above) or (start.Y - 120)
+    end
+    local gravity = Workspace.Gravity
+    return function(t)
+        if not falling then return start + velocity * t end
+        local y = math.max(floorY, start.Y + velocity.Y * t - 0.5 * gravity * t * t)
+        return Vector3.new(start.X + velocity.X * t, y, start.Z + velocity.Z * t)
+    end
+end
+
+-- Where to send a bullet from origin so it meets the part, flight time and
+-- drop included: the game's own path played forward until the aim settles.
+local function solve(origin, speed, gravity, part, model)
+    local at = predictor(part, model)
+    local extra = leadTime()
+    local aim, t = at(extra), 0
+    local predicted = aim
+    for _ = 1, 10 do
         local offset = aim - origin
         if offset.Magnitude < 0.05 then break end
         local unit = offset.Unit
         local horizontal = math.sqrt(unit.X * unit.X + unit.Z * unit.Z)
-        local predicted = target + velocity * (t + extra)
+        predicted = at(t + extra)
         local flatGap = Vector3.new(predicted.X - origin.X, 0, predicted.Z - origin.Z).Magnitude
+        local nextT
         if horizontal > 0.05 then
-            t = flatGap / (speed * horizontal)
+            nextT = flatGap / (speed * horizontal)
         else
-            t = (predicted - origin).Magnitude / speed
+            nextT = (predicted - origin).Magnitude / speed
         end
-        t = math.min(t, 5)
-        predicted = target + velocity * (t + extra)
+        nextT = math.min(nextT, 5)
+        predicted = at(nextT + extra)
         local g = gravity * (math.abs(unit.Y) ^ 4 * 0.5 + 1)
-        aim = predicted + Vector3.new(0, 0.5 * g * t * t, 0)
+        aim = predicted + Vector3.new(0, 0.5 * g * nextT * nextT, 0)
+        local settled = math.abs(nextT - t) < 0.0005
+        t = nextT
+        if settled then break end
     end
     local offset = aim - origin
     if offset.Magnitude < 0.05 then return nil end
-    return offset.Unit, t, target + velocity * (t + extra)
+    return offset.Unit, t, predicted
 end
 
 --// silent aim, spread, recoil, shake ---------------------------------------------
@@ -665,6 +761,10 @@ local function triggerStep()
     if not Trigger.Enabled or TriggerBusy or not Current then return end
     local part = Current.Part
     if not (part and part.Parent) then return end
+    if Trigger.NeedAmmo then
+        if call(Mods.Reload, "GetAmmo") == 0 then return end
+        if call(Mods.Reload, "GetShielding") then return end
+    end
     local onTarget = Aim.Silent and Trigger.WithSilent
     if not onTarget then
         onTarget = screenGap(part.Position) <= Trigger.Radius
@@ -696,12 +796,11 @@ local function assistStep()
     local settings = call(Mods.Cards, "GetBulletSettings")
     local speed = type(settings) == "table" and settings["Bullet Speed"] or 300
     local t = (part.Position - origin).Magnitude / math.max(speed, 1)
-    local velocity = Aim.Predict and velocityOf(Current.Model) * Aim.PredictScale or Vector3.zero
-    local point = part.Position + velocity * (t + Aim.ExtraLead / 1000)
+    local point = predictor(part, Current.Model)(t + leadTime())
     if Assist.Method == "Mouse move" and typeof(mousemoverel) == "function" then
         local screen, onScreen = Camera:WorldToViewportPoint(point)
         if not onScreen then return end
-        local delta = (Vector2.new(screen.X, screen.Y) - mousePos()) * Assist.Smooth
+        local delta = (Vector2.new(screen.X, screen.Y) - cursorPos()) * Assist.Smooth
         pcall(mousemoverel, delta.X, delta.Y)
     else
         local cf = Camera.CFrame
@@ -777,6 +876,7 @@ local function destroyEsp(model)
     pcall(function() objs.Highlight:Destroy() end)
     pcall(function() objs.Billboard:Destroy() end)
     removeDrawing(objs.Tracer)
+    removeDrawing(objs.Box)
     EspObjects[model] = nil
 end
 
@@ -806,6 +906,7 @@ local function buildEsp(model, root)
     billboard.Parent = EspGui
     objs.Highlight, objs.Billboard, objs.Label = hl, billboard, label
     objs.Tracer = newDrawing("Line", { Thickness = 1.5, Visible = false })
+    objs.Box = newDrawing("Square", { Thickness = 1.5, Filled = false, Visible = false })
     EspObjects[model] = objs
     return objs
 end
@@ -875,6 +976,7 @@ task.spawn(function()
                         objs.Billboard.Enabled = #lines > 0
                         objs.Color = color
                         objs.Root = entry.Root
+                        objs.Head = model:FindFirstChild("Head")
                     end
                 end
             end
@@ -891,6 +993,7 @@ end)
 local Draw = {
     Fov = newDrawing("Circle", { Thickness = 1, NumSides = 64, Filled = false, Transparency = 0.7, Visible = false }),
     TargetLine = newDrawing("Line", { Thickness = 1.5, Visible = false }),
+    Point = newDrawing("Circle", { Radius = 4, Thickness = 2, NumSides = 16, Filled = true, Visible = false }),
     StormText = newDrawing("Text", { Size = 18, Center = true, Outline = true, Visible = false }),
 }
 
@@ -943,7 +1046,48 @@ track(RunService.RenderStepped:Connect(function()
             end
         end
 
+        if Draw.Point then
+            local part = Aim.ShowPoint and Current and Current.Part
+            local shown = false
+            if part and part.Parent then
+                local settings = call(Mods.Cards, "GetBulletSettings")
+                local speed = type(settings) == "table" and settings["Bullet Speed"] or 300
+                local gravity = type(settings) == "table" and settings["Bullet Gravity"] or 0
+                local _, _, point = solve(Camera.CFrame.Position, speed, gravity, part, Current.Model)
+                if point then
+                    local p, on = project(point)
+                    if on then
+                        Draw.Point.Position, Draw.Point.Color = p, Aim.PointColor
+                        shown = true
+                    end
+                end
+            end
+            Draw.Point.Visible = shown
+        end
+
         for model, objs in pairs(EspObjects) do
+            local box = objs.Box
+            if box then
+                local root = objs.Root
+                if Esp.Enabled and Esp.Boxes and root and root.Parent and model.Parent then
+                    local head = objs.Head
+                    local topWorld = (head and head.Parent and head.Position or root.Position + Vector3.new(0, 1.5, 0)) + Vector3.new(0, 0.9, 0)
+                    local top, onTop = project(topWorld)
+                    local bottom, onBottom = project(root.Position - Vector3.new(0, 3.2, 0))
+                    if onTop and onBottom then
+                        local height = math.abs(bottom.Y - top.Y)
+                        local width = height * 0.6
+                        box.Size = Vector2.new(width, height)
+                        box.Position = Vector2.new((top.X + bottom.X) / 2 - width / 2, math.min(top.Y, bottom.Y))
+                        box.Color = objs.Color or Esp.EnemyColor
+                        box.Visible = true
+                    else
+                        box.Visible = false
+                    end
+                else
+                    box.Visible = false
+                end
+            end
             local tracer = objs.Tracer
             if tracer then
                 if Esp.Enabled and Esp.Tracers and objs.Root and objs.Root.Parent and model.Parent then
@@ -1076,8 +1220,12 @@ do
     local overview = Tab:AddBigGroupbox('Status', 'gauge')
     local status = overview:AddLabel('-', true)
     every(0.2, function()
-        status:SetText(("target: %s\nsilent shots: %d   trigger pulls: %d   auto shields: %d   bullets in the air: %d"):format(
-            Diag.Target, Diag.SilentShots, Diag.Triggers, Diag.Shields, Diag.Bullets))
+        local ammo = call(Mods.Reload, "GetAmmo")
+        local shieldReady = call(Mods.Reload, "GetShieldable")
+        status:SetText(("target: %s\nammo: %s   shield: %s\nsilent shots: %d   trigger pulls: %d   auto shields: %d   bullets in the air: %d"):format(
+            Diag.Target, ammo ~= nil and tostring(ammo) or "-",
+            call(Mods.Reload, "GetShielding") and "up" or (shieldReady == false and "recharging" or "ready"),
+            Diag.SilentShots, Diag.Triggers, Diag.Shields, Diag.Bullets))
     end)
 
     local silent = Tab:AddLeftGroupbox('Silent aim', 'crosshair')
@@ -1132,6 +1280,12 @@ do
         Default = Aim.SkipShielding,
         Callback = function(v) Aim.SkipShielding = v end,
     })
+    filters:AddToggle('ok_fallback', {
+        Text = 'Any visible part as a fallback',
+        Tooltip = 'when the part you aim at is hidden, use whatever part of them is visible instead of skipping them',
+        Default = Aim.FallbackPart,
+        Callback = function(v) Aim.FallbackPart = v end,
+    })
     filters:AddSlider('ok_maxdist', {
         Text = 'Max distance',
         Min = 50, Max = 2000, Default = Aim.MaxDistance, Rounding = 0, Suffix = ' studs',
@@ -1151,6 +1305,17 @@ do
         Min = 0, Max = 2, Default = Aim.PredictScale, Rounding = 2, Suffix = 'x',
         Callback = function(v) Aim.PredictScale = v end,
     })
+    lead:AddToggle('ok_falls', {
+        Text = 'Predict jumps and falls',
+        Tooltip = 'a target in the air is led along its fall, down to the floor under it',
+        Default = Aim.PredictFalls,
+        Callback = function(v) Aim.PredictFalls = v end,
+    })
+    lead:AddToggle('ok_autoping', {
+        Text = 'Add my ping to the lead',
+        Default = Aim.AutoPing,
+        Callback = function(v) Aim.AutoPing = v end,
+    })
     lead:AddSlider('ok_extra', {
         Text = 'Extra lead for ping',
         Min = 0, Max = 300, Default = Aim.ExtraLead, Rounding = 0, Suffix = ' ms',
@@ -1164,6 +1329,12 @@ do
         Default = Aim.FOV,
         Callback = function(v) Aim.FOV = v end,
     })
+    fov:AddToggle('ok_fov_center', {
+        Text = 'FOV at the middle of the screen',
+        Tooltip = 'on: the FOV circle, target picking and the triggerbot all measure from the middle of the screen. off: from your mouse',
+        Default = Aim.FOVCenter,
+        Callback = function(v) Aim.FOVCenter = v end,
+    })
     fov:AddSlider('ok_fov_radius', {
         Text = 'FOV radius',
         Min = 20, Max = 1000, Default = Aim.FOVRadius, Rounding = 0, Suffix = ' px',
@@ -1171,6 +1342,12 @@ do
     })
     fov:AddToggle('ok_fov_show', { Text = 'Show FOV circle', Default = Aim.ShowFOV, Callback = function(v) Aim.ShowFOV = v end })
         :AddColorPicker('ok_fov_color', { Default = Aim.FOVColor, Title = 'FOV circle', Callback = function(c) Aim.FOVColor = c end })
+    fov:AddToggle('ok_point_show', {
+        Text = 'Show where the shot lands',
+        Tooltip = 'a dot on the spot the shot is aimed at, lead included',
+        Default = Aim.ShowPoint,
+        Callback = function(v) Aim.ShowPoint = v end,
+    }):AddColorPicker('ok_point_color', { Default = Aim.PointColor, Title = 'Shot point', Callback = function(c) Aim.PointColor = c end })
     fov:AddToggle('ok_target_show', { Text = 'Show target', Default = Aim.ShowTarget, Callback = function(v) Aim.ShowTarget = v end })
         :AddColorPicker('ok_target_color', { Default = Aim.TargetColor, Title = 'Target', Callback = function(c) Aim.TargetColor = c end })
 
@@ -1214,6 +1391,12 @@ do
         Tooltip = 'with silent aim on, shoots whenever there is a target, since the shot goes to it anyway',
         Default = Trigger.WithSilent,
         Callback = function(v) Trigger.WithSilent = v end,
+    })
+    trigger:AddToggle('ok_trigger_ammo', {
+        Text = 'Not on an empty gun or shield',
+        Tooltip = 'skips pulling the trigger while you are out of ammo or have your shield up, so it doesn\'t spam the empty sound',
+        Default = Trigger.NeedAmmo,
+        Callback = function(v) Trigger.NeedAmmo = v end,
     })
     trigger:AddSlider('ok_trigger_radius', {
         Text = 'Lined up within',
@@ -1286,6 +1469,7 @@ do
         Callback = function(v) Esp.ShieldState = v end,
     })
     esp:AddToggle('ok_esp_cards', { Text = 'Their cards', Default = Esp.Cards, Callback = function(v) Esp.Cards = v end })
+    esp:AddToggle('ok_esp_boxes', { Text = 'Boxes', Default = Esp.Boxes, Callback = function(v) Esp.Boxes = v end })
     esp:AddToggle('ok_esp_tracers', { Text = 'Tracers', Default = Esp.Tracers, Callback = function(v) Esp.Tracers = v end })
     esp:AddDropdown('ok_esp_tracer_from', {
         Text = 'Tracers from',
