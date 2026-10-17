@@ -330,9 +330,10 @@ local function hitboxOffset()
 end
 
 --// note themes ------------------------------------------------------------
--- Every arrow, note and hold tail is built by Framework.SpriteHandler's
--- GenerateArrow as a LayeredSprite: one ImageLabel per layer, the colourable
--- ones flagged Colorized. A theme sits on those colourable layers: a UIGradient
+-- Only your own field (VSRG.InputHandler.Field) is themed, lane by lane: every
+-- frame its notes, hold tails and (if wanted) receptors are checked and given
+-- their lane's theme. Each is a LayeredSprite: one ImageLabel per layer, the
+-- colourable ones flagged Colorized. A theme sits on those layers: a UIGradient
 -- that drifts and turns like the website's gas clouds (a gradient on an image
 -- only colours the image's own pixels, so it keeps the arrow's shape), a
 -- twinkling star shimmer on top and a soft glow behind.
@@ -378,25 +379,14 @@ local STARS = NumberSequence.new({
 })
 
 local DIRS = { "Left", "Down", "Up", "Right" }
-local Themed = setmetatable({}, { __mode = "k" }) -- sprite -> { Decor = {...}, Labels = {...} }
+local Themed = setmetatable({}, { __mode = "k" }) -- sprite -> { Name, Version, Key, Decor, Layers }
 local Live = setmetatable({}, { __mode = "k" })   -- label -> animation state
 local ThemeHook = nil
+local ThemeVersion = 0
 
 local function dirName(d)
     d = tonumber(d) or 1
     return DIRS[((math.floor(d) - 1) % 4) + 1]
-end
-
-local function themeFor(sprite)
-    local kind = sprite.Type
-    if kind == "Tail" then
-        if not attr("ThemeTails", true) then return nil end
-    elseif kind == "Base" or kind == "Released" then
-        if not attr("ThemeReceptors", false) then return nil end
-    elseif kind ~= "Note" then
-        return nil
-    end
-    return THEMES[attr("Theme" .. dirName(sprite.Direction), "Default")]
 end
 
 local function copyImage(from, to)
@@ -410,10 +400,10 @@ local function copyImage(from, to)
 end
 
 local function undecorate(sprite)
-    local entry = Themed[sprite]
+    local entry = type(sprite) == "table" and Themed[sprite]
     if not entry then return end
+    Themed[sprite] = nil
     for _, obj in ipairs(entry.Decor) do pcall(function() obj:Destroy() end) end
-    table.clear(entry.Decor)
     for _, layer in ipairs(entry.Layers) do
         if rawget(layer, "SetColor") then rawset(layer, "SetColor", nil) end
         local label = layer.Frame
@@ -422,26 +412,34 @@ local function undecorate(sprite)
             pcall(function() label.ImageColor3 = layer.ImageColor3 end)
         end
     end
-    table.clear(entry.Layers)
 end
 
-local function decorate(sprite)
-    local entry = Themed[sprite]
-    if not entry then return end
-    undecorate(sprite)
-    local theme = themeFor(sprite)
+-- the first layer object, to notice when the game rebuilt the sprite's layers
+local function firstLayer(sprite)
+    local sprites = type(sprite) == "table" and sprite.Sprites
+    if type(sprites) ~= "table" then return nil end
+    local _, layer = next(sprites)
+    return layer
+end
+
+local function decorate(sprite, name, kind)
+    local theme = THEMES[name]
     if not theme or type(sprite.Sprites) ~= "table" then return end
+    local entry = { Name = name, Version = ThemeVersion, Key = firstLayer(sprite), Decor = {}, Layers = {} }
+    Themed[sprite] = entry
     local anyColorized = false
     for _, layer in pairs(sprite.Sprites) do
         if type(layer) == "table" and layer.Colorized then anyColorized = true end
     end
     local phase = rng:NextNumber(0, 20)
+    local stars = attr("ThemeStars", true) and kind ~= "Tail"
+    local glowOn = attr("ThemeGlow", true) and kind ~= "Tail"
     for _, layer in pairs(sprite.Sprites) do
         local label = type(layer) == "table" and layer.Frame
         if typeof(label) == "Instance" and label:IsA("ImageLabel") and (layer.Colorized or not anyColorized) then
             entry.Layers[#entry.Layers + 1] = layer
-            -- the game recolours notes through SetColor; while themed, the
-            -- label stays white and the gradient does the colour
+            -- the game recolours through SetColor; while themed the label
+            -- stays white and the gradient does the colour
             rawset(layer, "SetColor", function(self, color) self.ImageColor3 = color or self.ImageColor3 end)
             label.ImageColor3 = Color3.new(1, 1, 1)
 
@@ -451,26 +449,26 @@ local function decorate(sprite)
             gas.Rotation = 35
             gas.Parent = label
             entry.Decor[#entry.Decor + 1] = gas
-            local state = { Gas = gas, Phase = phase, Theme = theme }
+            local state = { Gas = gas, Phase = phase, Theme = theme, Label = label }
 
-            if attr("ThemeStars", true) and sprite.Type ~= "Tail" then
-                local stars = Instance.new("ImageLabel")
-                stars.Name = "FFT_Stars"
-                stars.BackgroundTransparency = 1
-                stars.Size = UDim2.fromScale(1, 1)
-                stars.ImageColor3 = Color3.new(1, 1, 1)
-                stars.ZIndex = label.ZIndex
-                copyImage(label, stars)
+            if stars then
+                local overlay = Instance.new("ImageLabel")
+                overlay.Name = "FFT_Stars"
+                overlay.BackgroundTransparency = 1
+                overlay.Size = UDim2.fromScale(1, 1)
+                overlay.ImageColor3 = Color3.new(1, 1, 1)
+                overlay.ZIndex = label.ZIndex
+                copyImage(label, overlay)
                 local sparkle = Instance.new("UIGradient")
                 sparkle.Transparency = STARS
                 sparkle.Rotation = rng:NextNumber(20, 160)
-                sparkle.Parent = stars
-                stars.Parent = label
-                entry.Decor[#entry.Decor + 1] = stars
-                state.Stars, state.Sparkle = stars, sparkle
+                sparkle.Parent = overlay
+                overlay.Parent = label
+                entry.Decor[#entry.Decor + 1] = overlay
+                state.Stars, state.Sparkle = overlay, sparkle
             end
 
-            if attr("ThemeGlow", true) and sprite.Type ~= "Tail" and label.Parent then
+            if glowOn and label.Parent then
                 local glow = Instance.new("ImageLabel")
                 glow.Name = "FFT_Glow"
                 glow.BackgroundTransparency = 1
@@ -488,67 +486,104 @@ local function decorate(sprite)
                 state.Glow = glow
             end
 
-            state.Label = label
             Live[label] = state
         end
     end
 end
 
-local function installThemes(handler)
-    if ThemeHook or type(handler) ~= "table" or type(handler.GenerateArrow) ~= "function" then return end
-    local original = handler.GenerateArrow
-    ThemeHook = { Handler = handler, Original = original }
-    handler.GenerateArrow = function(self, ...)
-        local sprite = original(self, ...)
-        pcall(function()
-            if type(sprite) ~= "table" or Themed[sprite] then return end
-            Themed[sprite] = { Decor = {}, Layers = {} }
-            -- a restyle rebuilds the layers, so the theme goes back on after
-            local rebuild = sprite.Rebuild
-            if type(rebuild) == "function" then
-                rawset(sprite, "Rebuild", function(s, ...)
-                    undecorate(s)
-                    local result = table.pack(rebuild(s, ...))
-                    pcall(decorate, s)
-                    return table.unpack(result, 1, result.n)
-                end)
-            end
-            decorate(sprite)
-        end)
-        return sprite
+-- makes a sprite wear the wanted theme (nil: none), redoing it when the
+-- settings changed or the game rebuilt its layers
+local function ensure(sprite, name, kind)
+    if type(sprite) ~= "table" then return end
+    local entry = Themed[sprite]
+    if entry then
+        if entry.Name == name and entry.Version == ThemeVersion and entry.Key == firstLayer(sprite) then return end
+        undecorate(sprite)
     end
-    -- notes the game already built and pooled are rebuilt, so they come out themed
-    pcall(function() handler:ClearNoteVisualCache() end)
+    if name and name ~= "Default" then decorate(sprite, name, kind) end
+end
+
+local function isSpecial(note)
+    local kind = type(note.NoteData) == "table" and note.NoteData.Type
+    if not kind then return false end
+    local configs = Framework.Configs and Framework.Configs.VSRG
+    local list = configs and configs.IgnoredNoteTypes or { "Death", "Poison", "Mechanic" }
+    return table.find(list, kind) ~= nil or (configs and configs.DeathNoteTypes and table.find(configs.DeathNoteTypes, kind) ~= nil)
+end
+
+-- your own field only, lane by lane: lanes 1-4 of a 4 key chart are left,
+-- down, up and right; other key counts go by each lane's arrow direction
+local function scanThemes()
+    local handler = Framework.VSRG and Framework.VSRG.InputHandler
+    local field = handler and handler.Field
+    if not field or type(field.Lanes) ~= "table" then return end
+    local fourKey = #field.Lanes == 4
+    local tails = attr("ThemeTails", true)
+    local receptors = attr("ThemeReceptors", false)
+    for index, lane in pairs(field.Lanes) do
+        if type(lane) == "table" then
+            local dir = fourKey and DIRS[index] or dirName(lane.Direction)
+            local name = attr("Theme" .. dir, "Default")
+            if name == "Default" then name = nil end
+            if type(lane.Notes) == "table" then
+                for _, note in pairs(lane.Notes) do
+                    if type(note) == "table" and not note.Cleaned and note.Sprite then
+                        local wanted = name
+                        if wanted and isSpecial(note) then wanted = nil end
+                        ensure(note.Sprite, wanted, "Note")
+                        if note.Streak then ensure(note.Streak, tails and wanted or nil, "Tail") end
+                    end
+                end
+            end
+            local receptorTheme = receptors and name or nil
+            ensure(lane.ReceptorSprite, receptorTheme, "Base")
+            ensure(lane.PressedSprite, receptorTheme, "Base")
+            ensure(lane.ReleasedSprite, receptorTheme, "Base")
+        end
+    end
+end
+
+-- the game hands note visuals back to a shared pool when a note is done; the
+-- theme comes off there, so a pooled note never turns up themed on the other
+-- side
+local function installThemes(handler)
+    if ThemeHook or type(handler) ~= "table" or type(handler.ReleaseNoteVisual) ~= "function" then return end
+    local original = handler.ReleaseNoteVisual
+    ThemeHook = { Handler = handler, Original = original }
+    handler.ReleaseNoteVisual = function(self, bundle, ...)
+        if type(bundle) == "table" then
+            pcall(undecorate, bundle.Sprite)
+            pcall(undecorate, bundle.Streak)
+        end
+        return original(self, bundle, ...)
+    end
     bridge:SetAttribute("ThemeStatus", "on")
 end
 
 local function removeThemes()
     if not ThemeHook then return end
-    pcall(function() ThemeHook.Handler.GenerateArrow = ThemeHook.Original end)
-    for sprite in pairs(Themed) do
-        pcall(undecorate, sprite)
-        if rawget(sprite, "Rebuild") then rawset(sprite, "Rebuild", nil) end
-    end
+    pcall(function() ThemeHook.Handler.ReleaseNoteVisual = ThemeHook.Original end)
+    for sprite in pairs(Themed) do pcall(undecorate, sprite) end
     ThemeHook = nil
 end
 
-local themeDirty = false
 bridge.AttributeChanged:Connect(function(name)
-    if name:sub(1, 5) == "Theme" and name ~= "ThemeStatus" then themeDirty = true end
+    if name:sub(1, 5) == "Theme" and name ~= "ThemeStatus" then ThemeVersion += 1 end
 end)
 
 -- the drift, the twinkle and the glow, every frame, for what is on screen
 local TAU = math.pi * 2
 local animator = RunService.RenderStepped:Connect(function()
     if not ThemeHook then return end
-    if themeDirty then
-        themeDirty = false
-        for sprite in pairs(Themed) do pcall(decorate, sprite) end
-    end
+    pcall(scanThemes)
     local animate = attr("ThemeAnimate", true)
     local t = os.clock() * attr("ThemeSpeed", 1)
     for label, state in pairs(Live) do
-        if label.Parent and label.Visible and label.AbsoluteSize.X > 0 then
+        if not label.Parent then
+            -- the game rebuilt or dropped this layer: its glow goes with it
+            if state.Glow then pcall(function() state.Glow:Destroy() end) end
+            Live[label] = nil
+        elseif label.Visible and label.AbsoluteSize.X > 0 then
             local p = t + state.Phase
             if animate then
                 state.Gas.Rotation = 35 + 30 * math.sin(p * TAU / 14)
@@ -1424,7 +1459,7 @@ do
     local Tab = Window:AddTab('Theme', 'palette', 'Client side note themes')
 
     local lanes = Tab:AddLeftGroupbox('Note themes', 'palette')
-    lanes:AddLabel('Only you see these. Each lane can have its own theme, or stay on your normal skin.', true)
+    lanes:AddLabel('Only you see these, and only on your own side: the opponent\'s notes keep their skin. Each lane can have its own theme, or stay on your normal skin. Death and poison notes are never themed, so you can still tell them apart.', true)
 
     local function changed()
         pushTheme()
@@ -1489,5 +1524,5 @@ do
         local hooked = Bridge:GetAttribute("ThemeStatus")
         status:SetText(themesOn() and ("themes: " .. (hooked or "looking for the game...")) or "themes: off")
     end)
-    look:AddLabel('Notes already on screen pick up a change straight away. Needs getgc or run_on_actor, like game mode.', true)
+    look:AddLabel('Changes show straight away, on notes already on screen too. Needs getgc or run_on_actor, like game mode.', true)
 end
