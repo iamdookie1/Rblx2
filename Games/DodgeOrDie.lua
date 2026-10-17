@@ -25,8 +25,11 @@
 --
 -- Auto dodge presimulates: every frame, for each ball after you, it plays the
 -- ball forward (homing on you at the speed and turn rate it has actually been
--- seen to have) against you standing still and against each dash you have
--- ready, and dashes at the last frame a dash still clears it. All work per
+-- seen to have) against the path you are on and against each dash you have
+-- ready, and dashes at the last frame a dash still clears it. Your path follows
+-- where you are steering (MoveDirection and how it is turning, gravity when in
+-- the air). With better directions on it weighs every way around you and turns
+-- you to face so a ready dash goes that way, as the game dashes along facing. All work per
 -- frame is bounded, nothing yields in the frame loop and a ball sitting on you
 -- costs nothing extra, so a stuck ball can't lag or loop it.
 
@@ -64,6 +67,8 @@ local Dodge = {
     LastMoment = true,        -- dash at the last frame it still works (false: as soon as a hit is coming)
     EarlyWindow = 0.35,       -- seconds before impact when not waiting for the last moment
     WallCheck = true,         -- don't dash into walls
+    WatchMovement = true,     -- play your own path forward along where you are steering, curves included
+    BetterDirections = false, -- try every way around you, turning before the dash, not just left / right / forward
     Practice = true,          -- also dodge practice-area balls
 }
 
@@ -227,69 +232,182 @@ end
 --// presimulation -----------------------------------------------------------
 
 local SIM_STEP = 1 / 90
+local MAX_STEPS = 140 -- 1.5s of look-ahead at most
 
--- How far a dash in a direction carries you over time: the game sets the
--- horizontal velocity once and your humanoid walks it back down, which is
--- close to an exponential settle back to walking pace.
+-- After a dash the game sets your horizontal velocity once and your humanoid
+-- walks it back toward your walking pace, which is close to an exponential
+-- settle. Air control is weaker, so it settles slower in the air.
 local DASH_TAU = 0.14
+local AIR_TAU = 0.3
 
-local function dashSpeed(hum)
-    local amount = 0
+local AIR_STATES = {
+    [Enum.HumanoidStateType.Jumping] = true,
+    [Enum.HumanoidStateType.Freefall] = true,
+    [Enum.HumanoidStateType.FallingDown] = true,
+}
+
+-- the game's own airborne test for dashes (DashHandler)
+local function isAirborne(hum)
+    return hum.FloorMaterial == Enum.Material.Air or AIR_STATES[hum:GetState()] == true
+end
+
+local function dashAmount()
     local upgrades = LocalPlayer:FindFirstChild("Upgrades")
     local dashes = upgrades and upgrades:FindFirstChild("Dashes")
-    if dashes and type(dashes.Value) == "number" then
-        amount = dashes.Value
-        if Upgrades and type(Upgrades.GetEffectiveAmount) == "function" then
-            local ok, effective = pcall(Upgrades.GetEffectiveAmount, dashes.Value)
-            if ok and type(effective) == "number" then amount = effective end
+    if not (dashes and type(dashes.Value) == "number") then return 0 end
+    if Upgrades and type(Upgrades.GetEffectiveAmount) == "function" then
+        local ok, effective = pcall(Upgrades.GetEffectiveAmount, dashes.Value)
+        if ok and type(effective) == "number" then return effective end
+    end
+    return dashes.Value
+end
+
+-- the Shark Fin tool makes the forward roll longer, the way DashHandler's
+-- sharkdash works it out
+local function sharkMultiplier(amount)
+    local equipped = LocalPlayer:FindFirstChild("EquippedTool")
+    if not equipped then return 1 end
+    for _, v in ipairs(equipped:GetChildren()) do
+        if v.Name == "SharkFin" and v.Value == true then
+            local tools = LocalPlayer:FindFirstChild("Tools")
+            local fin = tools and tools:FindFirstChild("SharkFin")
+            local level = fin and type(fin.Value) == "number" and fin.Value or 0
+            return math.clamp(1.75 + level * 0.1, 1, math.max(1, 245 / (120 + amount)))
         end
     end
-    local airborne = hum.FloorMaterial == Enum.Material.Air
-    local speed = airborne and (amount + 50) or (amount + 120)
+    return 1
+end
+
+local function dashSpeed(hum, dir)
+    local amount = dashAmount()
     local char = LocalPlayer.Character
-    if char and CollectionService:HasTag(char, "Shrunk") and not airborne then speed *= 0.6 end
+    local speed
+    if isAirborne(hum) then
+        speed = amount + 50
+    else
+        speed = amount + 120
+        if char and CollectionService:HasTag(char, "Shrunk") then speed *= 0.6 end
+    end
     if char and CollectionService:HasTag(char, "Glitch") then speed *= 1.5 end
+    if dir == "Forward" then speed *= sharkMultiplier(amount) end
     return speed
 end
 
--- Where you would be t seconds after starting a dash of velocity v0, walking
--- at walk afterwards along your current motion.
-local function dashOffset(v0, t)
-    return v0 * DASH_TAU * (1 - math.exp(-t / DASH_TAU))
+-- how far a velocity excess carries you t seconds on, as it settles away
+local function settle(tau, t)
+    return tau * (1 - math.exp(-t / tau))
 end
 
 local WallParams = RaycastParams.new()
 WallParams.FilterType = Enum.RaycastFilterType.Exclude
 
--- How far you can actually dash in a direction before a wall stops you.
-local function freeDistance(root, dir, want)
-    if not Dodge.WallCheck then return want end
-    local char = LocalPlayer.Character
-    local ignore = { char }
+local function wallIgnore()
+    local ignore = { LocalPlayer.Character }
     local folder = ballFolder()
     if folder then ignore[#ignore + 1] = folder end
     WallParams.FilterDescendantsInstances = ignore
+end
+
+-- How far you can actually dash in a direction before a wall stops you.
+local function freeDistance(root, dir, want)
+    if not Dodge.WallCheck then return want end
     local hit = Workspace:Raycast(root.Position, dir * want, WallParams)
     return hit and math.max((hit.Position - root.Position).Magnitude - 1.5, 0) or want
 end
 
--- Closest the ball gets to you over the horizon, and when it first gets
--- within reach. me(t) gives your position t seconds from now.
-local function simulate(ballPos, ballVel, info, me, reach, horizon)
+--// where you are going ---------------------------------------------------------
+-- Watches what you are steering toward (Humanoid.MoveDirection, which follows
+-- your keys, stick and camera) and how steadily it is turning, so your own
+-- path is played forward along the way you are actually heading, curves
+-- included, instead of as a straight line along your current velocity.
+
+local Motion = { Intent = Vector3.zero, Turn = 0, Last = nil }
+
+local function rotateY(v, angle)
+    local c, s = math.cos(angle), math.sin(angle)
+    return Vector3.new(v.X * c + v.Z * s, 0, -v.X * s + v.Z * c)
+end
+
+local function watchMotion(hum, dt)
+    local md = flat(hum.MoveDirection)
+    if md.Magnitude < 0.05 then
+        Motion.Intent, Motion.Last = Vector3.zero, nil
+        Motion.Turn *= 0.8
+        return
+    end
+    md = md.Unit
+    local last = Motion.Last
+    if last and dt > 0 then
+        local angle = math.atan2(last.Z * md.X - last.X * md.Z, last:Dot(md))
+        if math.abs(angle) > math.rad(40) then
+            -- a snap to a new key, not a steady turn
+            Motion.Turn = 0
+        else
+            Motion.Turn += (math.clamp(angle / dt, -8, 8) - Motion.Turn) * 0.25
+        end
+    end
+    Motion.Last, Motion.Intent = md, md
+end
+
+-- Your own path for the next steps if you don't dash: Walk[i] is where your
+-- walking puts you at step i, Decay[i] how much of a velocity excess (a dash
+-- in progress, or you not yet up to pace) has carried you by then.
+local Walk, Decay = {}, {}
+local PathTau = DASH_TAU
+local WalkVelocity = Vector3.zero
+
+local function planPath(root, hum, steps)
+    local here = root.Position
+    local velocity = root.AssemblyLinearVelocity
+    local airborne = isAirborne(hum)
+    PathTau = airborne and AIR_TAU or DASH_TAU
+
+    local heading, speed, turn
+    if Dodge.WatchMovement then
+        heading, speed, turn = Motion.Intent, hum.WalkSpeed, Motion.Turn
+    else
+        local moving = flat(velocity)
+        local capped = math.min(moving.Magnitude, hum.WalkSpeed)
+        heading = moving.Magnitude > 0.1 and moving.Unit or Vector3.zero
+        speed, turn = capped, 0
+    end
+    WalkVelocity = heading * speed
+
+    -- falling: the path follows gravity down to the floor below you
+    local floorY = -math.huge
+    if airborne then
+        local down = Workspace:Raycast(here, Vector3.new(0, -60, 0), WallParams)
+        floorY = down and (here.Y - down.Distance + hum.HipHeight + root.Size.Y / 2) or (here.Y - 60)
+    end
+    local gravity = Workspace.Gravity
+    local x, z = here.X, here.Z
+    for i = 1, steps do
+        local t = i * SIM_STEP
+        local dir = heading
+        if turn ~= 0 then dir = rotateY(heading, math.clamp(turn * t, -math.pi / 2, math.pi / 2)) end
+        x += dir.X * speed * SIM_STEP
+        z += dir.Z * speed * SIM_STEP
+        local y = here.Y
+        if airborne then y = math.max(floorY, here.Y + velocity.Y * t - 0.5 * gravity * t * t) end
+        Walk[i] = Vector3.new(x, y, z)
+        Decay[i] = settle(PathTau, t)
+    end
+    return flat(velocity) - WalkVelocity
+end
+
+-- Closest a ball gets to a path over the steps, and the first time it gets
+-- within reach. path(i, t) is your position at step i.
+local function simulate(ballPos, ballVel, info, path, reach, steps)
     local pos, vel = ballPos, ballVel
     local topSpeed = math.max(info.TopSpeed, vel.Magnitude, 20)
     local accel = math.max(info.Accel, 30)
     local closest, hitAt = math.huge, nil
-    local t = 0
-    local steps = math.ceil(horizon / SIM_STEP)
-    for _ = 1, steps do
-        t += SIM_STEP
-        local target = me(t)
+    for i = 1, steps do
+        local t = i * SIM_STEP
+        local target = path(i, t)
         local to = target - pos
-        local dist = to.Magnitude
-        if dist > 0 then
-            local desired = to.Unit * topSpeed
-            local change = desired - vel
+        if to.Magnitude > 0 then
+            local change = to.Unit * topSpeed - vel
             local maxChange = accel * SIM_STEP
             if change.Magnitude > maxChange then change = change.Unit * maxChange end
             vel += change
@@ -329,6 +447,13 @@ local function dashVector(root, dir)
     return flat(root.CFrame.LookVector).Unit
 end
 
+-- the way to face so that a dash button sends you along dir
+local function facingFor(button, dir)
+    if button == "Right" then return Vector3.new(dir.Z, 0, -dir.X) end
+    if button == "Left" then return Vector3.new(-dir.Z, 0, dir.X) end
+    return dir
+end
+
 -- the game's own dash buttons (mobile controls), pressed through their
 -- connections so its own code runs: cooldowns, grace, animation and sound
 local function buttonFor(dir)
@@ -356,28 +481,39 @@ local function pressButton(dir)
 end
 
 -- the same dash, done here: the grace notice first, then the push
-local function scriptDash(dir, root, hum)
+local function scriptDash(plan, root)
     local grace = remote("MovementGrace")
-    if grace then pcall(function() grace:FireServer("Dash" .. dir) end) end
-    local v = dashVector(root, dir) * dashSpeed(hum)
+    if grace then pcall(function() grace:FireServer("Dash" .. plan.Button) end) end
+    local v = plan.Dir * plan.Speed
     local current = root.AssemblyLinearVelocity
     root.AssemblyLinearVelocity = Vector3.new(v.X, current.Y, v.Z)
     return true
 end
 
-local function doDash(dir, root, hum)
+local function doDash(plan, root)
     local method = Dodge.Method
     local done = false
     if method ~= "Script dash" then
-        done = pressButton(dir)
-        if done then Stats.Method = "game buttons" end
+        local before = root.CFrame
+        if not plan.Natural then
+            -- the game dashes along your facing, so face the way that sends
+            -- this button's dash along the planned direction first
+            local look = facingFor(plan.Button, plan.Dir)
+            root.CFrame = CFrame.lookAt(root.Position, root.Position + look)
+        end
+        done = pressButton(plan.Button)
+        if done then
+            Stats.Method = "game buttons"
+        elseif not plan.Natural then
+            root.CFrame = CFrame.new(root.Position) * before.Rotation
+        end
     end
     if not done and method ~= "Game buttons" then
-        done = scriptDash(dir, root, hum)
+        done = scriptDash(plan, root)
         if done then Stats.Method = "script dash" end
     end
     if done then
-        LastDash[dir] = os.clock()
+        LastDash[plan.Button] = os.clock()
         Stats.Dodges += 1
     end
     return done
@@ -395,7 +531,44 @@ local function canDodge(char)
     return true
 end
 
+local MAX_THREATS = 3     -- balls played forward each frame, nearest first
+local DIRECTIONS = 16     -- directions tried with better directions on
+
 local Threats = {}
+
+-- the dashes to weigh this frame: your three as they are, plus with better
+-- directions every way around you, each done by whichever ready button needs
+-- the least turning to send you there
+local function candidates(root, hum, now)
+    local list = {}
+    local readyList = {}
+    for _, button in ipairs(DIRS) do
+        if (button ~= "Forward" or Dodge.UseForward) and ready(button, now) then
+            readyList[#readyList + 1] = button
+            list[#list + 1] = {
+                Button = button, Dir = dashVector(root, button),
+                Speed = dashSpeed(hum, button), Natural = true,
+            }
+        end
+    end
+    if not Dodge.BetterDirections or #readyList == 0 then return list end
+
+    local sides = {}
+    for _, button in ipairs(readyList) do
+        if button ~= "Forward" then sides[#sides + 1] = button end
+    end
+    local pool = #sides > 0 and sides or readyList -- the forward roll only when no side dash is ready
+    for k = 0, DIRECTIONS - 1 do
+        local dir = rotateY(Vector3.new(0, 0, -1), k * (2 * math.pi / DIRECTIONS))
+        local best, bestDot = nil, -math.huge
+        for _, button in ipairs(pool) do
+            local d = dashVector(root, button):Dot(dir)
+            if d > bestDot then best, bestDot = button, d end
+        end
+        list[#list + 1] = { Button = best, Dir = dir, Speed = dashSpeed(hum, best), Natural = false }
+    end
+    return list
+end
 
 local function dodgeStep(dt)
     local char, root, hum = myCharacter()
@@ -404,6 +577,7 @@ local function dodgeStep(dt)
         Stats.Status = "no character"
         return
     end
+    watchMotion(hum, dt)
 
     local now = os.clock()
     table.clear(Threats)
@@ -412,8 +586,6 @@ local function dodgeStep(dt)
         for _, ball in ipairs(folder:GetChildren()) do
             if ball:IsA("BasePart") and targetsMe(ball, root) then
                 local distance = (ball.Position - root.Position).Magnitude
-                -- at most a handful, nearest first, so a crowd of balls can't
-                -- make a frame expensive
                 if distance < 250 then Threats[#Threats + 1] = { Ball = ball, Distance = distance } end
             end
         end
@@ -425,13 +597,22 @@ local function dodgeStep(dt)
         return
     end
     table.sort(Threats, function(a, b) return a.Distance < b.Distance end)
+    -- only the nearest few are worked on, so a crowd of balls can't make a
+    -- frame expensive
+    for i = #Threats, MAX_THREATS + 1, -1 do Threats[i] = nil end
+    for _, threat in ipairs(Threats) do
+        local ball = threat.Ball
+        threat.Info = observe(ball, now)
+        threat.Pos, threat.Vel = ball.Position, ball.AssemblyLinearVelocity
+        local size = ball.Size
+        threat.Radius = math.max(size.X, size.Y, size.Z) / 2
+        threat.Reach = threat.Radius + 2.2 + Dodge.Margin
+    end
 
     local nearest = Threats[1]
-    local info = observe(nearest.Ball, now)
-    for i = 2, math.min(#Threats, 3) do observe(Threats[i].Ball, now) end
-
-    local ballPos, ballVel = nearest.Ball.Position, nearest.Ball.AssemblyLinearVelocity
-    local closing = ballVel.Magnitude > 1 and ballVel:Dot((root.Position - ballPos).Unit) or 0
+    local ballVel = nearest.Vel
+    local closing = ballVel.Magnitude > 1 and nearest.Distance > 0
+        and ballVel:Dot((root.Position - nearest.Pos).Unit) or 0
     Stats.Threat = {
         Distance = nearest.Distance, Speed = ballVel.Magnitude,
         Eta = closing > 1 and nearest.Distance / closing or nil,
@@ -444,13 +625,11 @@ local function dodgeStep(dt)
 
     -- a ball already inside you: nothing a dash can do this frame, and no
     -- work is spent on it
-    local radius = math.max(nearest.Ball.Size.X, nearest.Ball.Size.Y, nearest.Ball.Size.Z) / 2
-    local reach = radius + 2.2 + Dodge.Margin
-    if nearest.Distance <= radius + 1 then
+    if nearest.Distance <= nearest.Radius + 1 then
         Stats.Status = "ball on you"
         return
     end
-    -- far and slow: skip the simulation entirely
+    -- far and not closing, or still far out: skip the simulation entirely
     if Stats.Threat.Eta == nil and nearest.Distance > 40 then
         Stats.Status = "ball after you, not closing"
         return
@@ -460,56 +639,63 @@ local function dodgeStep(dt)
         return
     end
 
-    local here = root.Position
-    -- your motion split into walking and whatever a dash already in progress
-    -- is still adding, which settles away like any dash does. So a dash that
-    -- already clears the ball isn't followed by a wasted second one.
-    local moving = flat(root.AssemblyLinearVelocity)
-    local walk, extra = moving, Vector3.zero
-    if moving.Magnitude > hum.WalkSpeed * 1.2 then
-        walk = moving.Unit * hum.WalkSpeed
-        extra = moving - walk
+    local steps = math.clamp(math.ceil(Dodge.Horizon / SIM_STEP), 1, MAX_STEPS)
+    wallIgnore()
+    local stayExcess = planPath(root, hum, steps)
+    local function stay(i) return Walk[i] + stayExcess * Decay[i] end
+
+    -- the room a path leaves from every ball (negative: one gets you), and
+    -- the first time one would
+    local function clearance(path)
+        local worst, firstHit = math.huge, nil
+        for _, threat in ipairs(Threats) do
+            local closest, hitAt = simulate(threat.Pos, threat.Vel, threat.Info, path, threat.Reach, steps)
+            worst = math.min(worst, closest - threat.Reach)
+            if hitAt and (not firstHit or hitAt < firstHit) then firstHit = hitAt end
+        end
+        return worst, firstHit
     end
-    local function stay(t) return here + walk * t + dashOffset(extra, t) end
-    local _, hitAt = simulate(ballPos, ballVel, info, stay, reach, Dodge.Horizon)
+
+    local _, hitAt = clearance(stay)
     if not hitAt then
         Stats.Status = "ball after you, it misses"
         return
     end
 
-    -- each dash you have ready, now and one frame from now
-    local frame = math.max(dt, 1 / 120)
-    local speed = dashSpeed(hum)
-    local best, bestGap, nextOk = nil, -math.huge, false
-    for _, dir in ipairs(DIRS) do
-        if (dir ~= "Forward" or Dodge.UseForward) and ready(dir, now) then
-            local vec = dashVector(root, dir)
-            local reachable = freeDistance(root, vec, speed * DASH_TAU)
-            local scale = (speed * DASH_TAU) > 0 and math.clamp(reachable / (speed * DASH_TAU), 0, 1) or 0
-            local v0 = vec * speed * scale
-            local function dashNow(t) return here + dashOffset(v0, t) end
-            local gap = simulate(ballPos, ballVel, info, dashNow, reach, Dodge.Horizon)
-            if gap > bestGap then best, bestGap = dir, gap end
-            if gap > reach then
-                local function dashLater(t)
-                    if t <= frame then return stay(t) end
-                    return stay(frame) + dashOffset(v0, t - frame)
-                end
-                local later = simulate(ballPos, ballVel, info, dashLater, reach, Dodge.Horizon)
-                if later > reach then nextOk = true end
-            end
-        end
-    end
-
-    if not best then
+    local list = candidates(root, hum, now)
+    if #list == 0 then
         Stats.Status = "ball coming, every dash on cooldown"
         return
     end
-    if bestGap <= reach then
+
+    local frame = math.max(dt, 1 / 120)
+    local intent = Motion.Intent
+    for _, plan in ipairs(list) do
+        local full = plan.Speed * PathTau
+        local room = freeDistance(root, plan.Dir, full)
+        local scale = full > 0 and math.clamp(room / full, 0, 1) or 0
+        plan.Excess = plan.Dir * plan.Speed * scale - WalkVelocity
+        local excess = plan.Excess
+        plan.Clear = clearance(function(i) return Walk[i] + excess * Decay[i] end)
+        if plan.Clear > 0 then
+            -- clears it: more room is better up to a point, then keep going
+            -- the way you were heading, and spare the long forward cooldown
+            plan.Score = 1000 + math.min(plan.Clear, 8) * 4
+                + (intent.Magnitude > 0 and intent:Dot(plan.Dir) * 3 or 0)
+                + (plan.Natural and 1.5 or 0)
+                - (plan.Button == "Forward" and 2 or 0)
+        else
+            plan.Score = plan.Clear
+        end
+    end
+    table.sort(list, function(a, b) return a.Score > b.Score end)
+    local best = list[1]
+
+    if best.Clear <= 0 then
         -- nothing clears it: take the dash that gets furthest, at the last
         -- moment, which is the best a person could do too
         if hitAt <= frame * 2 then
-            doDash(best, root, hum)
+            doDash(best, root)
             Stats.Status = "dodged (closest call)"
         else
             Stats.Status = "ball coming, no clean dodge yet"
@@ -519,14 +705,31 @@ local function dodgeStep(dt)
 
     local go
     if Dodge.LastMoment then
-        -- the last frame a dash still clears it
+        -- the last frame a dash still clears it: dash now unless one of the
+        -- best few would still clear it a frame from now
+        local stayAtFrame = stayExcess * settle(PathTau, frame)
+        local nextOk = false
+        for k = 1, math.min(#list, 3) do
+            local plan = list[k]
+            if plan.Clear <= 0 then break end
+            local excess = plan.Excess
+            local later = clearance(function(i, t)
+                if t <= frame then return stay(i) end
+                return Walk[i] + stayAtFrame + excess * settle(PathTau, t - frame)
+            end)
+            if later > 0 then
+                nextOk = true
+                break
+            end
+        end
         go = not nextOk or hitAt <= frame * 2
     else
         go = hitAt <= Dodge.EarlyWindow
     end
     if go then
-        doDash(best, root, hum)
-        Stats.Status = "dodged " .. best:lower()
+        doDash(best, root)
+        Stats.Status = best.Natural and ("dodged " .. best.Button:lower())
+            or ("dodged, %s dash turned to the best way out"):format(best.Button:lower())
     else
         Stats.Status = ("ball coming in %.2fs, waiting for the last moment"):format(hitAt)
     end
@@ -863,6 +1066,20 @@ do
         Tooltip = 'how far ahead each ball is played forward',
         Min = 0.3, Max = 1.5, Default = Dodge.Horizon, Rounding = 2, Suffix = 's',
         Callback = function(v) Dodge.Horizon = v end,
+    })
+
+    tune:AddToggle('dd_watch', {
+        Text = 'Follow where you\'re going',
+        Tooltip = 'plays your own path forward along where you are steering (keys, stick and camera), curves and falling included, instead of a straight line along your current speed. dodges come out more accurate while you move',
+        Default = Dodge.WatchMovement,
+        Callback = function(v) Dodge.WatchMovement = v end,
+    })
+
+    tune:AddToggle('dd_better', {
+        Text = 'Better directions',
+        Tooltip = 'tries 16 directions all around you, not only left, right and forward, and picks the one that clears every ball by the most while keeping you heading your way. you turn to face it for a moment, since the game dashes along your facing',
+        Default = Dodge.BetterDirections,
+        Callback = function(v) Dodge.BetterDirections = v end,
     })
 
     tune:AddToggle('dd_wall', {
