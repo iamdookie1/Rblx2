@@ -63,9 +63,17 @@ local Games = {
     -- [🎃] Dodge or Die (game 9845585365), from its dump's own place id.
     [131794278839305] = { Name = 'Dodge or Die', Script = 'Games/DodgeOrDie.lua' },
     -- OVERKILL (game 7872343282): lobby and match places, both from the
-    -- PlaceIds table in its own Libraries.Shared.
-    [74996816424339] = { Name = 'OVERKILL', Script = 'Games/Overkill.lua' },
-    [101878803733802] = { Name = 'OVERKILL (match)', Script = 'Games/Overkill.lua' },
+    -- PlaceIds table in its own Libraries.Shared. AutoLoad runs it the moment
+    -- it is detected, no button press.
+    [74996816424339] = { Name = 'OVERKILL', Script = 'Games/Overkill.lua', AutoLoad = true },
+    [101878803733802] = { Name = 'OVERKILL (match)', Script = 'Games/Overkill.lua', AutoLoad = true },
+}
+
+-- Whole games by GameId (universe id), for ones whose every place, private
+-- match servers included, should load the same script. Checked when the
+-- place id itself isn't in Games.
+local GameIds = {
+    [7872343282] = { Name = 'OVERKILL', Script = 'Games/Overkill.lua', AutoLoad = true },
 }
 
 -- Games whose other modes (ranked, duels, events...) each have their own place
@@ -329,6 +337,10 @@ local function findGame()
     if match then
         return match
     end
+    match = GameIds[game.GameId]
+    if match then
+        return match
+    end
     for _, entry in ipairs(Fingerprints) do
         local ok, found = pcall(entry.Match)
         if ok and found then
@@ -351,6 +363,11 @@ task.spawn(function()
             DetectedStat.Set(match.Name, Color3.fromRGB(126, 217, 87))
             ScriptStat.Set(match.Script)
             Log:Success(match.Name .. ' detected')
+            if match.AutoLoad then
+                Log:Log('auto loading ' .. match.Name)
+                runScript(match)
+                return
+            end
             Onyx:Notify({
                 Title = 'hub',
                 Content = match.Name .. ' detected. Press "load game" to run it.',
