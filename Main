@@ -60,8 +60,12 @@ local Games = {
     [15172193554] = { Name = 'Blade Ball Aim Trainer', Script = 'Games/BladeBallTrainer.lua' },
     -- [MADNESS] Funky Friday (game 2404080894), from its dump's own place id.
     [6447798030] = { Name = 'Funky Friday', Script = 'Games/FunkyFriday.lua' },
-    -- [🎃] Dodge or Die (game 9845585365), from its dump's own place id.
-    [131794278839305] = { Name = 'Dodge or Die', Script = 'Games/DodgeOrDie.lua' },
+    -- [🎃] Dodge or Die (game 9845585365): every mode's place, from the game's
+    -- own ServerModeConfig. AutoLoad runs it as soon as it is detected.
+    [131794278839305] = { Name = 'Dodge or Die', Script = 'Games/DodgeOrDie.lua', AutoLoad = true },
+    [71180183562074] = { Name = 'Dodge or Die (pro)', Script = 'Games/DodgeOrDie.lua', AutoLoad = true },
+    [137582789522487] = { Name = 'Dodge or Die (beginner)', Script = 'Games/DodgeOrDie.lua', AutoLoad = true },
+    [80635828091097] = { Name = 'Dodge or Die (ranked)', Script = 'Games/DodgeOrDie.lua', AutoLoad = true },
     -- OVERKILL (game 7872343282): lobby and match places, both from the
     -- PlaceIds table in its own Libraries.Shared. AutoLoad runs it the moment
     -- it is detected, no button press.
@@ -74,6 +78,7 @@ local Games = {
 -- place id itself isn't in Games.
 local GameIds = {
     [7872343282] = { Name = 'OVERKILL', Script = 'Games/Overkill.lua', AutoLoad = true },
+    [9845585365] = { Name = 'Dodge or Die', Script = 'Games/DodgeOrDie.lua', AutoLoad = true },
 }
 
 -- Games whose other modes (ranked, duels, events...) each have their own place
@@ -81,6 +86,23 @@ local GameIds = {
 -- game has, so detection doesn't depend on a hard-coded place id. Checked only
 -- when the place id itself isn't in Games.
 local Fingerprints = {
+    -- Dodge or Die in any mode or server we don't know the id of: its own
+    -- ServerModeConfig module and safe-net package, both in ReplicatedStorage.
+    {
+        Name = 'Dodge or Die',
+        Script = 'Games/DodgeOrDie.lua',
+        AutoLoad = true,
+        Match = function()
+            local ReplicatedStorage = game:GetService('ReplicatedStorage')
+            local modules = ReplicatedStorage:FindFirstChild('Modules')
+            local packages = ReplicatedStorage:FindFirstChild('Packages')
+            return modules ~= nil
+                and modules:FindFirstChild('ServerModeConfig') ~= nil
+                and modules:FindFirstChild('UpgradesSharedModule') ~= nil
+                and packages ~= nil
+                and packages:FindFirstChild('safe-net') ~= nil
+        end,
+    },
     -- Blade Ball ships as several places (standard, ranked, limited-time
     -- events...), so instead of chasing every place id we match on things only
     -- Blade Ball has in every mode: the SwordAPI module under ReplicatedStorage
@@ -344,7 +366,7 @@ local function findGame()
     for _, entry in ipairs(Fingerprints) do
         local ok, found = pcall(entry.Match)
         if ok and found then
-            return { Name = entry.Name .. ' (detected)', Script = entry.Script }
+            return { Name = entry.Name .. ' (detected)', Script = entry.Script, AutoLoad = entry.AutoLoad }
         end
     end
     return nil

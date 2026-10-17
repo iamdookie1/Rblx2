@@ -68,7 +68,7 @@ local Dodge = {
     Enabled = false,
     Method = "Auto",          -- Auto / Game buttons / Script dash
     Mode = "Last moment",     -- Last moment / Early
-    SafetyBuffer = 0.08,      -- s: dashes this much before the last possible moment
+    SafetyBuffer = 0.1,       -- s: dashes this much before the last possible moment
     EarlyWindow = 0.3,        -- s before impact, in early mode
     Margin = 1.0,             -- studs of room a dodge should leave
     Horizon = 1.0,            -- s of ball flight played forward
@@ -88,6 +88,22 @@ local Esp = {
     Enabled = false,
     Target = true, Distance = true, Speed = true,
     Warning = true,           -- big warning when a ball is after you
+}
+
+-- the predictor's drawings
+local Predict = {
+    Paths = true,             -- where every ball is about to go
+    PathTime = 1.2,           -- s of path drawn
+    MaxBalls = 8,
+    Impact = true,            -- marker and countdown where a ball would hit you
+    Plan = true,              -- arrow for the dodge it has lined up
+    Ring = true,              -- your hit area at your feet
+    Cooldowns = true,         -- left / right dash cooldown bars
+    TargetLines = false,      -- line from each ball to who it is after
+    SafeColor = Color3.fromRGB(235, 235, 235),
+    NearColor = Color3.fromRGB(255, 190, 60),
+    HitColor = Color3.fromRGB(255, 60, 60),
+    PlanColor = Color3.fromRGB(80, 255, 140),
 }
 
 local God = { Enabled = false }
@@ -206,6 +222,66 @@ local function practiceFolder()
     return nil
 end
 
+-- Any mode, any folder: a ball is a part being pulled by an AlignPosition
+-- (named that, not the human shield's) that isn't part of a character. Every
+-- one that shows up anywhere in the workspace is noted, so modes that keep
+-- their balls somewhere else, or rename the folder, are covered too.
+local Registry = setmetatable({}, { __mode = "k" })
+
+local function consider(obj)
+    if obj.ClassName ~= "AlignPosition" or obj.Name ~= "AlignPosition" then return end
+    local part = obj.Parent
+    if not (part and part:IsA("BasePart")) then return end
+    local model = part:FindFirstAncestorWhichIsA("Model")
+    if model and model:FindFirstChildOfClass("Humanoid") then return end
+    Registry[part] = true
+end
+
+track(Workspace.DescendantAdded:Connect(function(obj)
+    if obj.ClassName == "AlignPosition" then pcall(consider, obj) end
+end))
+task.spawn(function()
+    local ok, all = pcall(function() return Workspace:GetDescendants() end)
+    if not ok then return end
+    for i, obj in ipairs(all) do
+        if obj.ClassName == "AlignPosition" then pcall(consider, obj) end
+        if i % 4000 == 0 then task.wait() end
+    end
+end)
+
+local BallList = {}
+local BallListAt = 0
+
+-- every ball in play right now (practice balls only when wanted)
+local function allBalls()
+    if os.clock() - BallListAt < 1 / 30 then return BallList end
+    BallListAt = os.clock()
+    local list, seen = {}, {}
+    local practice = practiceFolder()
+    local function add(part)
+        if seen[part] or not part.Parent or not part:IsDescendantOf(Workspace) then return end
+        if not Dodge.Practice and practice and part:IsDescendantOf(practice) then return end
+        seen[part] = true
+        list[#list + 1] = part
+    end
+    local folder = ballFolder()
+    if folder then
+        for _, child in ipairs(folder:GetChildren()) do
+            if child:IsA("BasePart") then add(child) end
+        end
+    end
+    if Dodge.Practice and practice then
+        for _, child in ipairs(practice:GetChildren()) do
+            if child:IsA("BasePart") then add(child) end
+        end
+    end
+    for part in pairs(Registry) do
+        if part.Parent then add(part) else Registry[part] = nil end
+    end
+    BallList = list
+    return list
+end
+
 local function ballTarget(ball)
     local align = ball:FindFirstChild("AlignPosition")
     local attachment = align and align.Attachment1
@@ -283,6 +359,9 @@ local function ballInfo(ball, now)
 end
 
 -- what the simulation uses for a ball
+-- learnt from how well predictions match what balls really do
+local Calib = { Accel = 1, Speed = 1 }
+
 local function ballParams(info)
     local vmax = info.MaxVel or info.Top
     local amax
@@ -293,7 +372,10 @@ local function ballParams(info)
     else
         amax = math.max(info.SeenAccel, 40)
     end
-    return { VMax = math.max(vmax, 10), AMax = amax, Resp = info.Resp, Grav = info.Grav, Radius = info.Radius or 1 }
+    return {
+        VMax = math.max(vmax * Calib.Speed, 10), AMax = amax * Calib.Accel,
+        Resp = info.Resp, Grav = info.Grav, Radius = info.Radius or 1,
+    }
 end
 
 local function stepBall(pos, vel, goal, p, dt)
@@ -630,6 +712,7 @@ local function buttonFor(dir)
 end
 
 local ButtonsWork = nil -- learnt: nil unknown, false they did nothing
+track(LocalPlayer.CharacterAdded:Connect(function() ButtonsWork = nil end))
 
 local function pressButton(dir)
     if typeof(getconnections) ~= "function" or ButtonsWork == false then return false end
@@ -751,10 +834,8 @@ end)
 
 --// auto dodge ----------------------------------------------------------------
 
+-- only what stops a dash in every mode; the round tags differ between modes
 local function canDodge(char)
-    if not CollectionService:HasTag(char, "Playing") and not CollectionService:HasTag(char, "Lobby") then
-        return false
-    end
     for _, tag in ipairs({ "Downed", "FreezeTagFrozen", "HumanShield" }) do
         if CollectionService:HasTag(char, tag) then return false end
     end
@@ -766,10 +847,9 @@ local MAX_THREATS = 4
 local function gatherThreats(root, now)
     table.clear(Threats)
     local list = {}
-    local function scan(folder)
-        if not folder then return end
-        for _, ball in ipairs(folder:GetChildren()) do
-            if ball:IsA("BasePart") then
+    local function scan(balls)
+        for _, ball in ipairs(balls) do
+            do
                 local offset = ball.Position - root.Position
                 local distance = offset.Magnitude
                 if distance < 220 then
@@ -784,8 +864,7 @@ local function gatherThreats(root, now)
             end
         end
     end
-    scan(ballFolder())
-    if Dodge.Practice then scan(practiceFolder()) end
+    scan(allBalls())
     if #list == 0 then return end
     -- soonest first, by distance over closing speed
     for _, entry in ipairs(list) do
@@ -817,25 +896,72 @@ local function gatherThreats(root, now)
     end
 end
 
--- model check: how far a 0.25s prediction of the nearest ball misses by
+-- Model check and self-tuning. For the nearest ball after you, its state is
+-- noted along with where you actually go for the next 0.3s; then the ball is
+-- replayed against that real path with a little less and a little more turn
+-- and speed than now, and the scale that lands closest to where the ball
+-- really ended up is leaned toward. Your own movement can't skew it, since the
+-- replay chases where you really went.
 local Check = nil
-local function checkModel(now)
-    if Check and now >= Check.Due then
-        if Check.Ball.Parent then
-            local miss = (Check.Ball.Position - Check.Pos).Magnitude
-            Stats.ModelError = (Stats.ModelError or miss) * 0.8 + miss * 0.2
+local CHECK_TIME = 0.3
+local VARIANTS = { { 1, 1 }, { 0.8, 1 }, { 1.25, 1 }, { 1, 0.9 }, { 1, 1.1 } }
+
+local function trackAt(track, t)
+    local prev = track[1]
+    for i = 2, #track do
+        local point = track[i]
+        if point[1] >= t then
+            local span = point[1] - prev[1]
+            local alpha = span > 0 and (t - prev[1]) / span or 1
+            return prev[2]:Lerp(point[2], math.clamp(alpha, 0, 1))
         end
-        Check = nil
+        prev = point
+    end
+    return prev[2]
+end
+
+local function checkModel(now, root)
+    if Check then
+        if not Check.Ball.Parent then
+            Check = nil
+        else
+            local t = now - Check.Start
+            Check.Track[#Check.Track + 1] = { t, root.Position }
+            if t >= CHECK_TIME then
+                local actual = Check.Ball.Position
+                local errors = {}
+                for v, variant in ipairs(VARIANTS) do
+                    local p = table.clone(Check.Params)
+                    p.AMax *= variant[1]
+                    p.VMax *= variant[2]
+                    local pos, vel = Check.Pos, Check.Vel
+                    local steps = math.floor(t / SIM_STEP)
+                    for i = 1, steps do
+                        pos, vel = stepBall(pos, vel, trackAt(Check.Track, i * SIM_STEP), p, SIM_STEP)
+                    end
+                    errors[v] = (pos - actual).Magnitude
+                end
+                Stats.ModelError = (Stats.ModelError or errors[1]) * 0.8 + errors[1] * 0.2
+                -- lean toward whichever did best, a step at a time
+                local best = 1
+                for v = 2, #VARIANTS do
+                    if errors[v] < errors[best] - 0.05 then best = v end
+                end
+                if best ~= 1 then
+                    Calib.Accel = math.clamp(Calib.Accel * VARIANTS[best][1] ^ 0.35, 0.25, 4)
+                    Calib.Speed = math.clamp(Calib.Speed * VARIANTS[best][2] ^ 0.35, 0.5, 2)
+                end
+                Check = nil
+            end
+            return
+        end
     end
     local threat = Threats[1]
-    if Check or not threat or not threat.Mine then return end
-    local pos, vel = threat.Pos, threat.Vel
-    local steps = math.floor(0.25 / SIM_STEP)
-    if steps > Path.Steps then return end
-    for i = 1, steps do
-        pos, vel = stepBall(pos, vel, stayPath(i), threat.Params, SIM_STEP)
-    end
-    Check = { Ball = threat.Ball, Pos = pos, Due = now + steps * SIM_STEP }
+    if not threat or not threat.Mine or threat.Distance > 80 then return end
+    Check = {
+        Ball = threat.Ball, Pos = threat.Pos, Vel = threat.Vel, Params = threat.Params,
+        Start = now, Track = { { 0, root.Position } },
+    }
 end
 
 local function dodgeStep(dt)
@@ -880,10 +1006,11 @@ local function dodgeStep(dt)
     wallIgnore()
     local steps = math.clamp(math.ceil(Dodge.Horizon / SIM_STEP), 1, MAX_STEPS)
     planPath(root, hum, steps)
-    checkModel(now)
+    checkModel(now, root)
 
     -- staying on your path: a pass closer than half the safety room counts
     -- as a hit, since the model is never perfect
+    Stats.Plan = nil
     local stayRoom, hitAt = clearance(stayPath, steps, Dodge.Margin * 0.5)
     Stats.Threat.Eta = hitAt or Stats.Threat.Eta
     if not hitAt then
@@ -892,7 +1019,7 @@ local function dodgeStep(dt)
     end
     -- only as far ahead as matters: a little past the hit, to see it come back
     local planSteps = steps
-    if hitAt then planSteps = math.clamp(math.ceil((hitAt + 0.45) / SIM_STEP), 1, steps) end
+    if hitAt then planSteps = math.clamp(math.ceil((hitAt + 0.6) / SIM_STEP), 1, steps) end
 
     local frame = math.max(dt, 1 / 240)
     local buffer = math.max(Dodge.SafetyBuffer, frame * 2)
@@ -927,6 +1054,7 @@ local function dodgeStep(dt)
         end
         table.sort(plans, function(a, b) return a.Score > b.Score end)
         local best = plans[1]
+        if best then Stats.Plan = { Dir = best.Dir, Gap = best.Gap, At = now } end
 
         if best then
             -- the room it has to leave: the safety room if any dash manages
@@ -1117,8 +1245,8 @@ task.spawn(function()
             local _, root = myCharacter()
             local seen = {}
             if Esp.Enabled then
-                for _, folder in ipairs({ ballFolder(), Dodge.Practice and practiceFolder() or nil }) do
-                    for _, ball in ipairs(folder and folder:GetChildren() or {}) do
+                for _, folder in ipairs({ allBalls() }) do
+                    for _, ball in ipairs(folder) do
                         if ball:IsA("BasePart") then
                             seen[ball] = true
                             local obj = espFor(ball)
@@ -1155,6 +1283,209 @@ task.spawn(function()
         end)
     end
 end)
+
+--// predictor --------------------------------------------------------------
+-- Every ball played forward with the same model the dodge uses: its path drawn
+-- ahead of it, red where it would hit you, orange where it would pass close;
+-- a countdown where it would hit; the dodge it has lined up as an arrow; your
+-- hit area as a ring; and your two dash cooldowns.
+
+local HasDrawing = typeof(Drawing) == "table" or typeof(Drawing) == "userdata"
+local Drawings = {}
+
+local function newDrawing(kind, props)
+    if not HasDrawing then return nil end
+    local ok, obj = pcall(Drawing.new, kind)
+    if not ok then return nil end
+    for k, v in pairs(props) do pcall(function() obj[k] = v end) end
+    Drawings[#Drawings + 1] = obj
+    return obj
+end
+
+local PATH_POINTS = 14
+local PathLines, ImpactDots, ImpactTexts, TargetLines = {}, {}, {}, {}
+for b = 1, 12 do
+    PathLines[b] = {}
+    for i = 1, PATH_POINTS do PathLines[b][i] = newDrawing("Line", { Thickness = 2, Visible = false }) end
+    ImpactDots[b] = newDrawing("Circle", { Radius = 6, Thickness = 2, NumSides = 20, Filled = false, Visible = false })
+    ImpactTexts[b] = newDrawing("Text", { Size = 15, Center = true, Outline = true, Visible = false })
+    TargetLines[b] = newDrawing("Line", { Thickness = 1, Transparency = 0.6, Visible = false })
+end
+local RING_POINTS = 28
+local RingLines = {}
+for i = 1, RING_POINTS do RingLines[i] = newDrawing("Line", { Thickness = 2, Visible = false }) end
+local PlanLines = {}
+for i = 1, 3 do PlanLines[i] = newDrawing("Line", { Thickness = 3, Visible = false }) end
+local CoolBars = {}
+for i = 1, 2 do
+    CoolBars[i] = {
+        Back = newDrawing("Square", { Filled = true, Color = Color3.fromRGB(20, 20, 20), Transparency = 0.6, Visible = false }),
+        Fill = newDrawing("Square", { Filled = true, Visible = false }),
+        Text = newDrawing("Text", { Size = 14, Center = true, Outline = true, Visible = false }),
+    }
+end
+
+local function project(position)
+    local camera = Workspace.CurrentCamera
+    if not camera then return Vector2.zero, false end
+    local point, onScreen = camera:WorldToViewportPoint(position)
+    return Vector2.new(point.X, point.Y), onScreen and point.Z > 0
+end
+
+local function setLine(line, a, b, color)
+    if not line then return end
+    local pa, onA = project(a)
+    local pb, onB = project(b)
+    if onA and onB then
+        line.From, line.To, line.Color, line.Visible = pa, pb, color, true
+    else
+        line.Visible = false
+    end
+end
+
+local function hide(obj) if obj then obj.Visible = false end end
+
+local PREDICT_STEP = 1 / 60
+
+track(RunService.RenderStepped:Connect(function()
+    if Unloaded or not HasDrawing then return end
+    pcall(function()
+        local _, root, hum = myCharacter()
+        local used = 0
+        if root and (Predict.Paths or Predict.Impact or Predict.TargetLines) then
+            local now = os.clock()
+            local balls = {}
+            for _, ball in ipairs(allBalls()) do
+                local d = (ball.Position - root.Position).Magnitude
+                if d < 250 then balls[#balls + 1] = { Ball = ball, D = d } end
+            end
+            table.sort(balls, function(a, b) return a.D < b.D end)
+            local myVel = Vector3.new(root.AssemblyLinearVelocity.X, 0, root.AssemblyLinearVelocity.Z)
+            if hum and myVel.Magnitude > hum.WalkSpeed * 1.5 then myVel = myVel.Unit * hum.WalkSpeed end
+            local steps = math.clamp(math.floor(Predict.PathTime / PREDICT_STEP), 6, 120)
+            local every = math.max(math.floor(steps / PATH_POINTS), 1)
+            for b = 1, math.min(#balls, Predict.MaxBalls, #PathLines) do
+                used = b
+                local ball = balls[b].Ball
+                local p = ballParams(ballInfo(ball, now))
+                local mine = targetsMe(ball, root)
+                local target = not mine and ballTarget(ball)
+                local targetRoot = target and target:FindFirstChild("HumanoidRootPart")
+                local pos, vel = ball.Position, ball.AssemblyLinearVelocity
+                local prev = pos
+                local seg = 0
+                local hitT, hitPos, closest = nil, nil, math.huge
+                local color = Predict.SafeColor
+                for i = 1, steps do
+                    local t = i * PREDICT_STEP
+                    local me = root.Position + myVel * t
+                    local goal
+                    if mine then
+                        goal = me
+                    elseif targetRoot then
+                        goal = targetRoot.Position + targetRoot.AssemblyLinearVelocity * t
+                    else
+                        goal = pos + vel
+                    end
+                    pos, vel = stepBall(pos, vel, goal, p, PREDICT_STEP)
+                    local gap = bodyGap(pos, me, p.Radius)
+                    if gap < closest then closest = gap end
+                    if not hitT and gap <= 0 then hitT, hitPos = t, pos end
+                    if i % every == 0 and seg < PATH_POINTS then
+                        seg += 1
+                        local c = hitT and Predict.HitColor or (closest <= Dodge.Margin + 1 and Predict.NearColor or Predict.SafeColor)
+                        if Predict.Paths then setLine(PathLines[b][seg], prev, pos, c) else hide(PathLines[b][seg]) end
+                        prev = pos
+                        color = c
+                    end
+                end
+                for i = seg + 1, PATH_POINTS do hide(PathLines[b][i]) end
+                local dot, text = ImpactDots[b], ImpactTexts[b]
+                if Predict.Impact and hitT and hitPos then
+                    local sp, on = project(hitPos)
+                    if dot then dot.Position, dot.Color, dot.Visible = sp, Predict.HitColor, on end
+                    if text then
+                        text.Position, text.Text, text.Color, text.Visible = sp - Vector2.new(0, 18), ("%.2fs"):format(hitT), Predict.HitColor, on
+                    end
+                else
+                    hide(dot)
+                    hide(text)
+                end
+                local line = TargetLines[b]
+                if Predict.TargetLines then
+                    local goal = mine and root or targetRoot
+                    if goal then setLine(line, ball.Position, goal.Position, color) else hide(line) end
+                else
+                    hide(line)
+                end
+            end
+        end
+        for b = used + 1, #PathLines do
+            for i = 1, PATH_POINTS do hide(PathLines[b][i]) end
+            hide(ImpactDots[b])
+            hide(ImpactTexts[b])
+            hide(TargetLines[b])
+        end
+
+        -- your hit area
+        local danger = Stats.Threat and Stats.Threat.Eta and Stats.Threat.Eta < 0.6
+        for i = 1, RING_POINTS do
+            local line = RingLines[i]
+            if line then
+                if Predict.Ring and root and hum then
+                    local feet = root.Position.Y - hum.HipHeight - root.Size.Y / 2 + 0.1
+                    local a0, a1 = (i - 1) / RING_POINTS * math.pi * 2, i / RING_POINTS * math.pi * 2
+                    local r = Body.R
+                    setLine(line,
+                        Vector3.new(root.Position.X + math.cos(a0) * r, feet, root.Position.Z + math.sin(a0) * r),
+                        Vector3.new(root.Position.X + math.cos(a1) * r, feet, root.Position.Z + math.sin(a1) * r),
+                        danger and Predict.HitColor or Predict.PlanColor)
+                else
+                    hide(line)
+                end
+            end
+        end
+
+        -- the dodge it has lined up
+        local plan = Stats.Plan
+        if Predict.Plan and root and plan and os.clock() - plan.At < 0.3 then
+            local from = root.Position
+            local to = from + plan.Dir * 9
+            local side = Vector3.new(-plan.Dir.Z, 0, plan.Dir.X)
+            setLine(PlanLines[1], from, to, Predict.PlanColor)
+            setLine(PlanLines[2], to, to - plan.Dir * 2.5 + side * 1.5, Predict.PlanColor)
+            setLine(PlanLines[3], to, to - plan.Dir * 2.5 - side * 1.5, Predict.PlanColor)
+        else
+            for _, line in ipairs(PlanLines) do hide(line) end
+        end
+
+        -- dash cooldowns
+        local camera = Workspace.CurrentCamera
+        for i, button in ipairs({ "Left", "Right" }) do
+            local bar = CoolBars[i]
+            if Predict.Cooldowns and camera and root then
+                local size = camera.ViewportSize
+                local w, h = 110, 10
+                local x = size.X / 2 + (i == 1 and -w - 10 or 10)
+                local y = size.Y - 120
+                local cd = cooldown(button)
+                local progress = math.clamp((os.clock() - LastDash[button]) / math.max(cd, 0.01), 0, 1)
+                bar.Back.Position, bar.Back.Size, bar.Back.Visible = Vector2.new(x, y), Vector2.new(w, h), true
+                bar.Fill.Position, bar.Fill.Size = Vector2.new(x, y), Vector2.new(w * progress, h)
+                bar.Fill.Color = progress >= 1 and Predict.PlanColor or Predict.NearColor
+                bar.Fill.Visible = true
+                bar.Text.Position = Vector2.new(x + w / 2, y - 17)
+                bar.Text.Text = progress >= 1 and (button:upper() .. " READY") or ("%s %.1fs"):format(button:upper(), cd * (1 - progress))
+                bar.Text.Color = bar.Fill.Color
+                bar.Text.Visible = true
+            else
+                hide(bar.Back)
+                hide(bar.Fill)
+                hide(bar.Text)
+            end
+        end
+    end)
+end))
 
 --// rewards and afk -----------------------------------------------------------
 
@@ -1230,6 +1561,7 @@ local function unload()
     if God.Enabled then setGod(false) end
     if Misc.AntiAfk then pcall(setAntiAfk, false) end
     pcall(function() RunService:UnbindFromRenderStep(STEER_NAME) end)
+    for _, obj in ipairs(Drawings) do pcall(function() obj:Remove() end) end
     pcall(function() EspFolder:Destroy() end)
 end
 
@@ -1271,9 +1603,9 @@ do
         local threat = Stats.Threat
         local threatText = threat and ("%dm, %d/s%s"):format(math.floor(threat.Distance), math.floor(threat.Speed),
             threat.Eta and (", %.2fs"):format(threat.Eta) or "") or "none"
-        status:SetText(("%s\nball after you: %s\ndodges: %d   dash by: %s\nball model off by %s   dash settle %.2fs"):format(
+        status:SetText(("%s\nball after you: %s\ndodges: %d   dash by: %s\nball model off by %s   tuned turn %.2fx speed %.2fx   dash settle %.2fs"):format(
             Stats.Status, threatText, Stats.Dodges, Stats.Method,
-            Stats.ModelError and ("%.1f studs"):format(Stats.ModelError) or "-", DashTau))
+            Stats.ModelError and ("%.1f studs"):format(Stats.ModelError) or "-", Calib.Accel, Calib.Speed, DashTau))
     end)
 
     local dodge = Tab:AddLeftGroupbox('Auto dodge', 'wind')
@@ -1433,6 +1765,30 @@ do
         Default = Esp.Warning,
         Callback = function(v) Esp.Warning = v end,
     })
+
+    local pred = Tab:AddRightGroupbox('Predictor', 'route')
+    pred:AddLabel('Every ball played forward with the same model the auto dodge uses. Red: it would hit you. Orange: it passes close.', true)
+    pred:AddToggle('dd_pred_paths', { Text = 'Ball paths', Default = Predict.Paths, Callback = function(v) Predict.Paths = v end })
+        :AddColorPicker('dd_pred_safe', { Default = Predict.SafeColor, Title = 'Safe path', Callback = function(c) Predict.SafeColor = c end })
+    pred:AddLabel('Passes close'):AddColorPicker('dd_pred_near', { Default = Predict.NearColor, Title = 'Passes close', Callback = function(c) Predict.NearColor = c end })
+    pred:AddLabel('Would hit you'):AddColorPicker('dd_pred_hit', { Default = Predict.HitColor, Title = 'Would hit', Callback = function(c) Predict.HitColor = c end })
+    pred:AddSlider('dd_pred_time', {
+        Text = 'Path length',
+        Min = 0.3, Max = 2, Default = Predict.PathTime, Rounding = 1, Suffix = 's',
+        Callback = function(v) Predict.PathTime = v end,
+    })
+    pred:AddSlider('dd_pred_max', {
+        Text = 'Balls drawn',
+        Min = 1, Max = 12, Default = Predict.MaxBalls, Rounding = 0,
+        Callback = function(v) Predict.MaxBalls = math.floor(v) end,
+    })
+    pred:AddToggle('dd_pred_impact', { Text = 'Impact marker and countdown', Default = Predict.Impact, Callback = function(v) Predict.Impact = v end })
+    pred:AddToggle('dd_pred_plan', { Text = 'Planned dodge arrow', Default = Predict.Plan, Callback = function(v) Predict.Plan = v end })
+        :AddColorPicker('dd_pred_plancolor', { Default = Predict.PlanColor, Title = 'Dodge arrow', Callback = function(c) Predict.PlanColor = c end })
+    pred:AddToggle('dd_pred_ring', { Text = 'Your hit area', Default = Predict.Ring, Callback = function(v) Predict.Ring = v end })
+    pred:AddToggle('dd_pred_cool', { Text = 'Dash cooldown bars', Default = Predict.Cooldowns, Callback = function(v) Predict.Cooldowns = v end })
+    pred:AddToggle('dd_pred_targets', { Text = 'Line to who each ball is after', Default = Predict.TargetLines, Callback = function(v) Predict.TargetLines = v end })
+    if not HasDrawing then pred:AddLabel('Your executor has no Drawing library, so the predictor can\'t draw.', true) end
 end
 
 do
