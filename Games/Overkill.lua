@@ -79,6 +79,8 @@ local Aim = {
     FallbackPart = true,      -- part hidden or arc blocked: use another part of them
     Predict = true,
     PredictScale = 1,
+    UseAccel = true,          -- lead by how they are speeding up and turning, not only their speed
+    SmartPart = true,         -- head shots only when the lead is sure enough, else the torso
     PredictFalls = true,      -- targets in the air follow gravity down to the floor
     AutoLead = true,          -- add the game's draw delay for others and your ping
     InterpDelay = 100,        -- ms the game draws others behind
@@ -107,6 +109,7 @@ local Assist = {
     XScale = 1,
     YScale = 1,
     Jitter = 0,               -- px of random wobble
+    Tracking = 0.6,           -- how much it follows the target's own movement on screen
     SwitchDelay = 0.1,        -- s before pulling onto a new target
     Predict = true,
     OwnFOV = false,           -- a separate, usually smaller, circle for the assist
@@ -117,6 +120,7 @@ local Assist = {
 
 local Trigger = {
     Enabled = false,
+    Mode = "Shot will hit",   -- Shot will hit (plays your next shot forward) / Crosshair on target
     Delay = 0.05,             -- s before the shot
     Hold = 0.12,              -- s the trigger is held
     Radius = 35,              -- px from crosshair (without silent aim)
@@ -128,6 +132,9 @@ local Gun = {
     NoRecoil = false,
     NoShake = false,
     SpreadScale = 1,
+    NoSelfDamage = false,     -- the Self Damage card never hurts you
+    PushScale = 1,            -- the shove back each shot gives you (0 none, above 1 a rocket jump)
+    SprintShoot = false,      -- fire while sprinting
 }
 
 local Shield = {
@@ -140,6 +147,8 @@ local Shield = {
     MinDamage = 0,            -- only bullets doing at least this much
     OnlyLethal = false,       -- only bullets that would kill you
     NotWhileShooting = false, -- the shield stops you shooting
+    BlockCheck = true,        -- ignore bullets that will hit a wall, an object or someone else first
+    Instant = true,           -- decide the moment a shot is fired, not on the next frame
 }
 
 local Esp = {
@@ -168,6 +177,7 @@ local BulletEsp = {
     Ahead = 0.4,              -- s of path drawn ahead
     Color = Color3.fromRGB(255, 220, 90),
     ThreatColor = Color3.fromRGB(255, 50, 50),
+    BlockedColor = Color3.fromRGB(120, 120, 120),
 }
 
 local World = {
@@ -204,6 +214,7 @@ local WANT = {
     Storm = { "Utilities.Storm", "GetDistance" },
     Status = { "Utilities.Status", "GetStatuses" },
     State = { "Utilities.State", "GetBody" },
+    Velocity = { "Utilities.Velocity", "ApplyVelocity" },
 }
 
 local function endsWith(s, suffix)
@@ -387,18 +398,40 @@ local function refreshRoster()
     end
 end
 
--- Velocity of each character measured from its own movement, since the others
--- are moved by the game's interpolation rather than by physics. A short window
--- of samples, velocity taken across the whole window: the interpolation
--- jitters frame to frame, a window of ~0.2s doesn't.
+-- How each character moves, measured from its own positions, since the others
+-- are moved by the game's interpolation rather than by physics. Velocity is the
+-- least-squares fit over the last quarter second (which rides out the frame to
+-- frame jitter of interpolation), carried up to now with the acceleration seen
+-- between the older and newer half of that window. Top speed is remembered, so
+-- a lead never has someone moving faster than they ever have.
 local Motion = setmetatable({}, { __mode = "k" })
-local WINDOW = 0.2
+local WINDOW = 0.25
+
+local function slope(samples, from, to)
+    local n = to - from + 1
+    if n < 2 then return nil end
+    local tMean, pMean = 0, Vector3.zero
+    for i = from, to do
+        tMean += samples[i][2]
+        pMean += samples[i][1]
+    end
+    tMean /= n
+    pMean /= n
+    local num, den = Vector3.zero, 0
+    for i = from, to do
+        local dt = samples[i][2] - tMean
+        num += (samples[i][1] - pMean) * dt
+        den += dt * dt
+    end
+    if den < 1e-7 then return nil end
+    return num / den, tMean
+end
 
 local function updateMotion(entry, now)
     local m = Motion[entry.Model]
     local pos = entry.Root.Position
     if not m then
-        Motion[entry.Model] = { Samples = { { pos, now } }, Vel = Vector3.zero }
+        Motion[entry.Model] = { Samples = { { pos, now } }, Vel = Vector3.zero, Acc = Vector3.zero, Top = 16 }
         return
     end
     local samples = m.Samples
@@ -406,24 +439,30 @@ local function updateMotion(entry, now)
     if now - last[2] < 1 / 240 then return end
     if (pos - last[1]).Magnitude > 40 then
         -- a teleport or respawn, not motion: start over
-        m.Samples, m.Vel = { { pos, now } }, Vector3.zero
+        m.Samples, m.Vel, m.Acc = { { pos, now } }, Vector3.zero, Vector3.zero
         return
     end
     samples[#samples + 1] = { pos, now }
-    while #samples > 2 and now - samples[2][2] >= WINDOW do table.remove(samples, 1) end
-    if #samples > 24 then table.remove(samples, 1) end
-    local first = samples[1]
-    local span = now - first[2]
-    if span >= 0.04 then
-        local raw = (pos - first[1]) / span
-        if raw.Magnitude > 250 then raw = Vector3.zero end
-        m.Vel = m.Vel:Lerp(raw, 0.6)
+    while #samples > 3 and now - samples[2][2] >= WINDOW do table.remove(samples, 1) end
+    if #samples > 40 then table.remove(samples, 1) end
+    local n = #samples
+    if n < 4 or now - samples[1][2] < 0.06 then return end
+    local mid = math.floor(n / 2)
+    local v1, t1 = slope(samples, 1, mid)
+    local v2, t2 = slope(samples, mid, n)
+    if not v2 then return end
+    local acc = Vector3.zero
+    if v1 and t2 - t1 > 0.03 then
+        acc = (v2 - v1) / (t2 - t1)
+        acc = Vector3.new(acc.X, 0, acc.Z) -- up and down is the fall model's job
+        if acc.Magnitude > 150 then acc = acc.Unit * 150 end
     end
-end
-
-local function velocityOf(model)
-    local m = Motion[model]
-    return m and m.Vel or Vector3.zero
+    m.Acc = m.Acc:Lerp(acc, 0.35)
+    -- the newer half's fit is from a moment ago; bring it up to now
+    local vel = v2 + m.Acc * math.clamp(now - t2, 0, 0.15)
+    if vel.Magnitude > 250 then vel = Vector3.zero end
+    m.Vel = m.Vel:Lerp(vel, 0.6)
+    m.Top = math.max(m.Top * 0.997, Vector3.new(m.Vel.X, 0, m.Vel.Z).Magnitude, 16)
 end
 
 --// screen --------------------------------------------------------------------------
@@ -596,11 +635,15 @@ local function leadTime()
     return extra
 end
 
--- where the part will be t seconds from now: along its velocity, and down
--- under gravity onto the floor when it is in the air
+-- where the part will be t seconds from now: along its velocity, bending with
+-- its acceleration for a short while, never faster than it has been seen to
+-- move, and down under gravity onto the floor when it is in the air
 local function predictor(part, model, predict)
     local start = part.Position
-    local velocity = predict and velocityOf(model) * Aim.PredictScale or Vector3.zero
+    local m = Motion[model]
+    local velocity = (predict and m) and m.Vel * Aim.PredictScale or Vector3.zero
+    local acc = (predict and m and Aim.UseAccel) and m.Acc * Aim.PredictScale or Vector3.zero
+    local top = (m and m.Top or 30) * 1.1 * math.max(Aim.PredictScale, 0.01)
     local falling = predict and Aim.PredictFalls and math.abs(velocity.Y) > 3
     local floorY = -math.huge
     if falling then
@@ -612,10 +655,14 @@ local function predictor(part, model, predict)
         floorY = hit and (hit.Position.Y + above) or (start.Y - 120)
     end
     local gravity = Workspace.Gravity
+    local flatVel = Vector3.new(velocity.X, 0, velocity.Z)
     return function(t)
-        if not falling then return start + velocity * t end
-        local y = math.max(floorY, start.Y + velocity.Y * t - 0.5 * gravity * t * t)
-        return Vector3.new(start.X + velocity.X * t, y, start.Z + velocity.Z * t)
+        local bend = math.min(t, 0.35)
+        local flat = flatVel * t + acc * (0.5 * bend * bend)
+        if t > 0 and flat.Magnitude > top * t then flat = flat.Unit * top * t end
+        local y = start.Y
+        if falling then y = math.max(floorY, start.Y + velocity.Y * t - 0.5 * gravity * t * t) end
+        return Vector3.new(start.X + flat.X, y, start.Z + flat.Z)
     end
 end
 
@@ -678,11 +725,30 @@ end
 
 --// silent aim, spread, recoil, shake ---------------------------------------------
 
-local function silentDirection(origin, speed, gravity)
+-- how far off a lead could be for this target: more when they are speeding
+-- up or turning, and the longer the bullet is in the air
+local function leadDoubt(model, flight)
+    local m = Motion[model]
+    if not m then return 0 end
+    local bend = math.min(flight, 0.35)
+    return 0.5 * m.Acc.Magnitude * bend * bend + 0.06 * m.Vel.Magnitude * flight
+end
+
+local function silentDirection(origin, speed, gravity, quiet)
     local target = Current
     if not target then return nil end
     local tried = {}
-    local parts = { target.Part }
+    local parts = {}
+    local preferred = target.Part
+    -- the head is small: when the lead is unsure, the torso first
+    if Aim.SmartPart and preferred and preferred.Name == "Head" then
+        local flight = (preferred.Position - origin).Magnitude / math.max(speed, 1)
+        if leadDoubt(target.Model, flight) > 0.8 then
+            local torso = target.Model:FindFirstChild("UpperTorso") or target.Model:FindFirstChild("Torso")
+            if torso then parts[#parts + 1] = torso end
+        end
+    end
+    parts[#parts + 1] = preferred
     if Aim.FallbackPart then
         for _, name in ipairs(FALLBACK_PARTS) do
             local part = target.Model:FindFirstChild(name)
@@ -694,16 +760,23 @@ local function silentDirection(origin, speed, gravity)
             tried[part] = true
             local dir, flight = solve(origin, speed, gravity, part, target.Model)
             if dir and (not Aim.ArcCheck or arcClear(origin, dir, speed, gravity, flight)) then
-                return dir
+                return dir, part, flight
             end
         end
     end
-    Diag.Blocked += 1
+    if not quiet then Diag.Blocked += 1 end
     return nil
 end
 
+-- the game's own launch maths, kept for the triggerbot to play shots forward
+local OriginalCalculate = Mods.Direction and Mods.Direction.Calculate
+local ShotAt = 0
+
 local SilentHooked = hook(Mods.Direction, "Calculate", function(original)
     return function(origin, cameraCFrame, speed, gravity, ...)
+        -- every real shot comes through here first, so this also marks the
+        -- moment of a shot for the gun tweaks below
+        ShotAt = os.clock()
         local base = original(origin, cameraCFrame, speed, gravity, ...)
         if Unloaded or not Aim.Silent or not Current then return base end
         if Aim.MatchOnly and not inMatch() then return base end
@@ -744,9 +817,64 @@ local ShakeHooked = hook(ScreenShake, "AddShake", function(original)
     end
 end)
 
+-- right after a shot (shootBullet runs through all of these in one go)
+local function justShot()
+    return os.clock() - ShotAt < 0.05
+end
+
+-- The Self Damage card: shootBullet lowers your shown health and then reports
+-- the damage itself with Damage(yourCharacter, amount, time). Both are skipped.
+local SelfDamageHooked = hook(Libs.Remote, "Send", function(original)
+    return function(name, ...)
+        if not Unloaded and Gun.NoSelfDamage and name == "Damage" and justShot() then
+            local who = ...
+            if who ~= nil and who == LocalPlayer.Character then return nil end
+        end
+        return original(name, ...)
+    end
+end)
+hook(Mods.Health, "SetTemporary", function(original)
+    return function(char, value, reason, ...)
+        if not Unloaded and Gun.NoSelfDamage and reason == "Status" and char == LocalPlayer.Character and justShot() then
+            return nil
+        end
+        return original(char, value, reason, ...)
+    end
+end)
+
+-- The shove back every shot gives you is Velocity.ApplyVelocity, called with
+-- no server flag right after the shot. Knockback from others comes with one.
+local PushHooked = hook(Mods.Velocity, "ApplyVelocity", function(original)
+    return function(dir, amount, reduce, fromServer, ...)
+        if not Unloaded and fromServer == nil and type(amount) == "number" and justShot() then
+            if Gun.PushScale <= 0 then return nil end
+            amount *= Gun.PushScale
+        end
+        return original(dir, amount, reduce, fromServer, ...)
+    end
+end)
+
+-- shootBullet refuses to fire while your action is Sprint. Only for it, the
+-- action reads as normal; everything else still sees you sprinting.
+local function calledFromBullets()
+    local ok, src = pcall(debug.info, 3, "s")
+    return ok and type(src) == "string" and src:find("Combat.Bullets", 1, true) ~= nil
+end
+local SprintHooked = hook(Mods.State, "GetAction", function(original)
+    return function(who, ...)
+        local action = original(who, ...)
+        if action == "Sprint" and not Unloaded and Gun.SprintShoot and (who == nil or who == LocalPlayer) and calledFromBullets() then
+            return "Default"
+        end
+        return action
+    end
+end)
+
 --// bullet tracking -----------------------------------------------------------------
 -- Every bullet registered with Trajectory, played forward by the same path
 -- formula the game uses, with the server's corrections and hit notices.
+
+local InstantCheck -- set further down: checks one new bullet against you straight away
 
 local Tracked = {}
 local TrackedCount = 0
@@ -775,6 +903,8 @@ local TrajectoryHooked = hook(Mods.Trajectory, "Add", function(original)
             local isSettings = type(settings) == "table"
             Tracked[id] = {
                 Player = player,
+                Shooter = typeof(player) == "Instance" and player:IsA("Player") and player.Character or nil,
+                Drill = isSettings and (tonumber(settings.Drill) or 0) > 0,
                 Local = isLocal or player == LocalPlayer,
                 Born = os.clock(),
                 Gravity = isSettings and settings["Bullet Gravity"] or 25,
@@ -786,6 +916,7 @@ local TrajectoryHooked = hook(Mods.Trajectory, "Add", function(original)
                     Time = startTime, GravityAt = startTime,
                 } },
             }
+            if Shield.Instant and not (isLocal or player == LocalPlayer) then task.defer(InstantCheck, id) end
         end)
         return original(player, id, startTime, position, direction, settings, isLocal, offset, ...)
     end
@@ -798,6 +929,7 @@ hook(Mods.Trajectory, "AddPath", function(original)
             if b and typeof(position) == "Vector3" and typeof(direction) == "Vector3" and type(time) == "number" then
                 if #b.Paths >= 8 then table.remove(b.Paths, 2) end
                 table.insert(b.Paths, { Pos = position, Dir = direction, Speed = speed or b.Paths[1].Speed, Time = time, GravityAt = time + 0.1 })
+                if Shield.Instant and not b.Local then task.defer(InstantCheck, id) end
             end
         end)
         return original(id, position, direction, speed, time, ...)
@@ -807,7 +939,10 @@ end)
 hook(Mods.Trajectory, "LockOn", function(original)
     return function(id, instance, time, ...)
         local b = Tracked[id]
-        if b then b.LockOn, b.LockTime = instance, time end
+        if b then
+            b.LockOn, b.LockTime = instance, time
+            if Shield.Instant and not b.Local then task.defer(InstantCheck, id) end
+        end
         return original(id, instance, time, ...)
     end
 end)
@@ -892,81 +1027,145 @@ end
 local BODY_RADIUS = 1.25
 
 -- worked out each frame for the shield and the bullet ESP
-local Incoming = {} -- id -> { Now, Ahead, HitIn, Local, Damage }
+local Incoming = {} -- id -> { Now, Ahead, HitIn, Blocked, Local, Damage }
 local SIM_STEP = 1 / 120
+local CHUNK = 6 -- steps per wall check
 
 local function shieldWindow()
     local settings = shieldSettings()
     return settings and settings["Shield Duration"] or 0.4
 end
 
+local ObstacleParams = RaycastParams.new()
+ObstacleParams.FilterType = Enum.RaycastFilterType.Exclude
+ObstacleParams.IgnoreWater = true
+ObstacleParams.RespectCanCollide = true -- what the game's own bullets collide with
+
+local function obstacleIgnore(shooter)
+    local ignore = { LocalPlayer.Character }
+    if BulletsFolder then ignore[#ignore + 1] = BulletsFolder end
+    if CharactersFolder then ignore[#ignore + 1] = CharactersFolder end
+    if shooter then ignore[#ignore + 1] = shooter end
+    ObstacleParams.FilterDescendantsInstances = ignore
+end
+
+-- your body as a capsule from feet to head, carried along your velocity
+local function bodyModel()
+    local root, char = myRoot()
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    if not (root and hum) then return nil end
+    local feet = root.Position.Y - hum.HipHeight - root.Size.Y / 2
+    local head = char:FindFirstChild("Head")
+    local crown = head and (head.Position.Y + head.Size.Y / 2) or (root.Position.Y + 2.5)
+    local base = Vector3.new(root.Position.X, feet + BODY_RADIUS, root.Position.Z)
+    local top = Vector3.new(root.Position.X, math.max(crown - BODY_RADIUS, feet + BODY_RADIUS), root.Position.Z)
+    local vel = root.AssemblyLinearVelocity
+    local airborne = hum.FloorMaterial == Enum.Material.Air
+    local gravity = Workspace.Gravity
+    return {
+        Root = root, Char = char,
+        At = function(t)
+            local shift = vel * t
+            if airborne then shift -= Vector3.new(0, math.min(0.5 * gravity * t * t, 8), 0) end
+            return base + shift, top + shift
+        end,
+    }
+end
+
+local function horizonNow()
+    return math.min(math.max(0.1 + shieldWindow() + 0.25, Shield.Lead + 0.15, BulletEsp.Ahead), 1.2)
+end
+
+-- one bullet: where it is, where it is going, and whether and when it hits
+-- you; a wall, an object or another player in the way first means it doesn't
+local function analyze(b, now, body, horizon)
+    local current = bulletAt(b, now)
+    local entry = { Now = current, Ahead = bulletAt(b, now + BulletEsp.Ahead), Local = b.Local, Damage = b.Damage }
+    local hostile = not b.Local and not (Shield.IgnoreAllies and b.Player and isAlly(b.Player))
+    if not (hostile and body) then return entry end
+    local root, char = body.Root, body.Char
+    local reach = BODY_RADIUS + b.Radius * 0.5 + Shield.Margin
+    local lock = b.LockOn
+    if lock and typeof(lock) == "Instance" and (lock == char or lock:IsDescendantOf(char)) then
+        -- the server has already found this one hits you, and when
+        local at = type(b.LockTime) == "number" and b.LockTime - now
+        local speed = b.Paths[#b.Paths].Speed
+        entry.HitIn = (at and at > -0.05) and math.max(at, 0)
+            or (speed > 0 and (root.Position - current).Magnitude / speed or 0)
+        return entry
+    end
+    if lock then
+        -- locked onto someone else: it ends in them
+        entry.Blocked = true
+        return entry
+    end
+    local path = b.Paths[#b.Paths]
+    local toMe = root.Position - current
+    local distance = toMe.Magnitude
+    local closing = distance < 8 or (distance > 0 and path.Dir:Dot(toMe.Unit) > -0.2)
+    if not closing or distance > path.Speed * horizon + 12 then return entry end
+
+    local walls = Shield.BlockCheck and not b.Drill
+    -- other players near the bullet's line to you could take it first
+    local others = {}
+    if Shield.BlockCheck then
+        local shooter = b.Shooter
+        for _, other in ipairs(Roster) do
+            if other.Model ~= shooter and other.Model.Parent then
+                local p = other.Root.Position
+                if segmentGap(current, root.Position, p, p) < 12 then others[#others + 1] = other.Root end
+            end
+        end
+    end
+    if walls then obstacleIgnore(b.Shooter) end
+
+    local steps = math.clamp(math.ceil(horizon / SIM_STEP), 1, 144)
+    local prev = current
+    local chunkFrom, blockAt = current, nil
+    for i = 1, steps do
+        local t = i * SIM_STEP
+        local point = bulletAt(b, now + t)
+        if walls and (i - 1) % CHUNK == 0 then
+            local chunkEnd = bulletAt(b, now + math.min(i + CHUNK - 1, steps) * SIM_STEP)
+            local hit = Workspace:Raycast(prev, chunkEnd - prev, ObstacleParams)
+            chunkFrom, blockAt = prev, hit and (hit.Position - prev).Magnitude or nil
+        end
+        local lo, hi = body.At(t)
+        local touching = segmentGap(prev, point, lo, hi) <= reach
+        if blockAt and (point - chunkFrom).Magnitude >= blockAt and not (touching and blockAt + reach > (point - chunkFrom).Magnitude) then
+            entry.Blocked = true
+            return entry
+        end
+        if touching then
+            entry.HitIn = t
+            return entry
+        end
+        for _, other in ipairs(others) do
+            local p = other.Position
+            if segmentGap(prev, point, p - Vector3.new(0, 2, 0), p + Vector3.new(0, 1.5, 0)) <= 1.3 + b.Radius * 0.5 then
+                entry.Blocked = true
+                return entry
+            end
+        end
+        prev = point
+    end
+    return entry
+end
+
 local function bulletStep()
     table.clear(Incoming)
     if not (Shield.Auto or BulletEsp.Enabled) then return end
-    local root, char = myRoot()
-    local hum = char and char:FindFirstChildOfClass("Humanoid")
     local now = Workspace:GetServerTimeNow()
     local clock = os.clock()
-
-    -- your body as a capsule from feet to head, carried along your velocity
-    local base, top, vel, airborne
-    if root and hum then
-        local feet = root.Position.Y - hum.HipHeight - root.Size.Y / 2
-        local head = char:FindFirstChild("Head")
-        local crown = head and (head.Position.Y + head.Size.Y / 2) or (root.Position.Y + 2.5)
-        base = Vector3.new(root.Position.X, feet + BODY_RADIUS, root.Position.Z)
-        top = Vector3.new(root.Position.X, math.max(crown - BODY_RADIUS, feet + BODY_RADIUS), root.Position.Z)
-        vel = root.AssemblyLinearVelocity
-        airborne = hum.FloorMaterial == Enum.Material.Air
-    end
-    local gravity = Workspace.Gravity
-    local function bodyAt(t)
-        local shift = vel * t
-        if airborne then shift -= Vector3.new(0, math.min(0.5 * gravity * t * t, 8), 0) end
-        return base + shift, top + shift
-    end
-
-    local horizon = math.min(math.max(0.1 + shieldWindow() + 0.25, Shield.Lead + 0.15, BulletEsp.Ahead), 1.2)
-    local steps = math.clamp(math.ceil(horizon / SIM_STEP), 1, 144)
+    local body = bodyModel()
+    local horizon = horizonNow()
     local count = 0
     for id, b in pairs(Tracked) do
         if clock - b.Born > 10 then
             forget(id)
         elseif now >= b.Paths[1].Time then
             count += 1
-            local current = bulletAt(b, now)
-            local entry = { Now = current, Ahead = bulletAt(b, now + BulletEsp.Ahead), Local = b.Local, Damage = b.Damage }
-            local hostile = not b.Local and not (Shield.IgnoreAllies and b.Player and isAlly(b.Player))
-            if hostile and base then
-                local reach = BODY_RADIUS + b.Radius * 0.5 + Shield.Margin
-                local lock = b.LockOn
-                if lock and typeof(lock) == "Instance" and (lock == char or lock:IsDescendantOf(char)) then
-                    -- the server has already found this one hits you, and when
-                    local at = type(b.LockTime) == "number" and b.LockTime - now
-                    local speed = b.Paths[#b.Paths].Speed
-                    entry.HitIn = (at and at > -0.05) and math.max(at, 0)
-                        or (speed > 0 and (root.Position - current).Magnitude / speed or 0)
-                elseif not lock then
-                    local path = b.Paths[#b.Paths]
-                    local distance = (root.Position - current).Magnitude
-                    -- skip ones that can't reach you in time, or are already past
-                    local closing = path.Dir:Dot((root.Position - current).Unit) > -0.2 or distance < 8
-                    if closing and distance <= path.Speed * horizon + 12 then
-                        local prev = current
-                        for i = 1, steps do
-                            local t = i * SIM_STEP
-                            local point = bulletAt(b, now + t)
-                            local lo, hi = bodyAt(t)
-                            if segmentGap(prev, point, lo, hi) <= reach then
-                                entry.HitIn = t
-                                break
-                            end
-                            prev = point
-                        end
-                    end
-                end
-            end
-            Incoming[id] = entry
+            Incoming[id] = analyze(b, now, body, horizon)
         end
     end
     Diag.Bullets = count
@@ -1014,9 +1213,91 @@ local function shieldStep()
     end
 end
 
+-- a bullet the moment it is fired, corrected or locked on: checked against
+-- you on the spot, and the shield raised there and then if it is time
+InstantCheck = function(id)
+    if Unloaded or not Shield.Auto then return end
+    pcall(function()
+        local b = Tracked[id]
+        if not b then return end
+        local now = Workspace:GetServerTimeNow()
+        Incoming[id] = analyze(b, math.max(now, b.Paths[1].Time), bodyModel(), horizonNow())
+        shieldStep()
+    end)
+end
+
 --// triggerbot ------------------------------------------------------------------------
 
 local TriggerBusy = false
+
+-- where your next shot would start and how it would be aimed, worked out the
+-- way shootBullet does it (camera, muzzle, and the blend when looking down)
+local function shotOrigin()
+    local char = LocalPlayer.Character
+    local root = char and char:FindFirstChild("HumanoidRootPart")
+    if not (root and Camera) then return nil end
+    local gn = char:FindFirstChild("gn", true)
+    local muzzlePos
+    if gn then
+        local muzzle = gn:FindFirstChild("Muzzle", true)
+        muzzlePos = (muzzle and muzzle:IsA("Attachment") and muzzle.WorldCFrame.Position)
+            or (gn:IsA("BasePart") and (gn.CFrame * CFrame.new(0, 0.5, -1.1)).Position) or root.Position
+    else
+        muzzlePos = root.Position
+    end
+    local cam = Camera.CFrame
+    local rel = cam:PointToObjectSpace(muzzlePos)
+    local origin = ((cam - cam.Position + muzzlePos) * CFrame.new(-rel.X, -rel.Y - 1, 2)).Position
+    local up = (math.asin(math.clamp(cam.LookVector.Y, -1, 1)) + math.pi / 2) / math.pi
+    local blend = 0
+    if up > 0.5 then
+        blend = math.clamp((1 - up) / 0.05, 0, 1)
+        origin = origin * blend + muzzlePos * (1 - blend)
+    end
+    return origin, cam * CFrame.Angles(blend * 0.0075, 0, 0)
+end
+
+local function bulletHitbox()
+    local settings = bulletSettings()
+    if settings and Mods.Trajectory and type(Mods.Trajectory.GetSize) == "function" then
+        local ok, _, _, _, hitbox = pcall(Mods.Trajectory.GetSize, settings)
+        if ok and type(hitbox) == "number" then return hitbox end
+    end
+    return 1
+end
+
+-- plays a shot forward against the target's predicted body; true when it
+-- lands on them before anything else
+local function shotWillHit(origin, dir, speed, gravity, model)
+    local troot = model:FindFirstChild("HumanoidRootPart")
+    if not troot then return false end
+    local at = predictor(troot, model, Aim.Predict)
+    local lead = leadTime()
+    local g = dropGravity(gravity, dir)
+    local reach = 1.25 + bulletHitbox() * 0.5
+    setIgnore(ArcParams)
+    local maxT = math.min((troot.Position - origin).Magnitude / math.max(speed, 1) * 1.8 + 0.1, 3)
+    local steps = math.ceil(maxT / SIM_STEP)
+    local prev = origin
+    local chunkFrom, blockAt = origin, nil
+    for i = 1, steps do
+        local t = i * SIM_STEP
+        local point = origin + dir * speed * t - Vector3.new(0, 0.5 * g * t * t, 0)
+        if (i - 1) % CHUNK == 0 then
+            local tEnd = math.min(i + CHUNK - 1, steps) * SIM_STEP
+            local chunkEnd = origin + dir * speed * tEnd - Vector3.new(0, 0.5 * g * tEnd * tEnd, 0)
+            local hit = Workspace:Raycast(prev, chunkEnd - prev, ArcParams)
+            chunkFrom, blockAt = prev, hit and (hit.Position - prev).Magnitude or nil
+        end
+        local c = at(t + lead)
+        if segmentGap(prev, point, c - Vector3.new(0, 2.2, 0), c + Vector3.new(0, 1.6, 0)) <= reach then
+            return not (blockAt and blockAt < (point - chunkFrom).Magnitude - reach)
+        end
+        if blockAt and (point - chunkFrom).Magnitude >= blockAt then return false end
+        prev = point
+    end
+    return false
+end
 
 local function triggerStep()
     if not Trigger.Enabled or TriggerBusy or not Current then return end
@@ -1027,9 +1308,21 @@ local function triggerStep()
         if call(Mods.Reload, "GetAmmo") == 0 then return end
         if call(Mods.Reload, "GetShielding") then return end
     end
-    local onTarget = Aim.Silent and Trigger.WithSilent
-    if not onTarget then
+    local onTarget = false
+    if Trigger.Mode == "Crosshair on target" then
         onTarget = screenGap(part.Position) <= Trigger.Radius
+    else
+        local origin, aimCF = shotOrigin()
+        if not origin then return end
+        local speed, gravity = myBulletSpeed()
+        if Aim.Silent and Trigger.WithSilent then
+            -- silent aim will take this shot: fire when it has a clear one
+            local ok, dir = pcall(silentDirection, origin, speed, gravity, true)
+            onTarget = ok and dir ~= nil
+        elseif OriginalCalculate then
+            local ok, dir = pcall(OriginalCalculate, origin, aimCF, speed, gravity)
+            onTarget = ok and typeof(dir) == "Vector3" and shotWillHit(origin, dir, speed, gravity, Current.Model)
+        end
     end
     if not onTarget then return end
     TriggerBusy = true
@@ -1050,6 +1343,7 @@ end
 --// aim assist --------------------------------------------------------------------------
 
 local AssistModel, AssistSince = nil, 0
+local AssistLast, AssistScreenVel = nil, Vector2.zero
 
 local function assistActive()
     if Assist.ActiveWhen == "Always" then return true end
@@ -1074,6 +1368,7 @@ local function assistStep(dt)
     if not assistActive() then return end
     if Current.Model ~= AssistModel then
         AssistModel, AssistSince = Current.Model, os.clock()
+        AssistLast, AssistScreenVel = nil, Vector2.zero
     end
     if os.clock() - AssistSince < Assist.SwitchDelay then return end
     local part = assistPart(Current)
@@ -1087,7 +1382,16 @@ local function assistStep(dt)
         point = predictor(part, Current.Model, Aim.Predict)(t + leadTime())
     end
     local screen = screenPoint(point)
-    if not screen then return end
+    if not screen then
+        AssistLast = nil
+        return
+    end
+    -- how fast the target is moving across your screen, to keep up with it
+    -- rather than always trailing
+    if AssistLast and dt > 0 then
+        AssistScreenVel = AssistScreenVel:Lerp((screen - AssistLast) / dt, math.clamp(dt * 15, 0, 1))
+    end
+    AssistLast = screen
     local cursor = cursorPos()
     local delta = screen - cursor
     local gap = delta.Magnitude
@@ -1097,7 +1401,8 @@ local function assistStep(dt)
     -- the same feel at any frame rate: strength and speed are per 60fps frame
     local frames = math.clamp(dt * 60, 0.25, 4)
     local share = 1 - (1 - math.clamp(Assist.Strength, 0, 1)) ^ frames
-    local move = Vector2.new(delta.X * share * Assist.XScale, delta.Y * share * Assist.YScale)
+    local follow = AssistScreenVel * dt * Assist.Tracking
+    local move = Vector2.new((delta.X * share + follow.X) * Assist.XScale, (delta.Y * share + follow.Y) * Assist.YScale)
     if Assist.MaxSpeed > 0 and move.Magnitude > Assist.MaxSpeed * frames then
         move = move.Unit * Assist.MaxSpeed * frames
     end
@@ -1457,7 +1762,8 @@ track(RunService.RenderStepped:Connect(function()
                 if used >= #BulletLines then break end
                 if BulletEsp.Own or not entry.Local then
                     used += 1
-                    drawLine(BulletLines[used], entry.Now, entry.Ahead, entry.HitIn and BulletEsp.ThreatColor or BulletEsp.Color)
+                    drawLine(BulletLines[used], entry.Now, entry.Ahead,
+                        entry.HitIn and BulletEsp.ThreatColor or (entry.Blocked and BulletEsp.BlockedColor or BulletEsp.Color))
                 end
             end
         end
@@ -1702,6 +2008,13 @@ do
         Callback = function(v) Aim.Sticky = v end,
     })
 
+    silent:AddToggle('ok_smartpart', {
+        Text = 'Smart aim part',
+        Tooltip = 'aims for the head only when the lead is sure enough to land it, otherwise the bigger torso',
+        Default = Aim.SmartPart,
+        Callback = function(v) Aim.SmartPart = v end,
+    })
+
     silent:AddToggle('ok_arc', {
         Text = 'Check the shot\'s arc',
         Tooltip = 'bullets drop, so a target you can see can still be behind a ledge for the bullet. this checks the real arc and switches part, or leaves the shot alone, when it is blocked',
@@ -1748,6 +2061,12 @@ do
         Text = 'Lead strength',
         Min = 0, Max = 2, Default = Aim.PredictScale, Rounding = 2, Suffix = 'x',
         Callback = function(v) Aim.PredictScale = v end,
+    })
+    lead:AddToggle('ok_accel', {
+        Text = 'Lead turns and speed-ups',
+        Tooltip = 'follows how the target is speeding up and turning for the first moments of the bullet\'s flight, not only its current speed',
+        Default = Aim.UseAccel,
+        Callback = function(v) Aim.UseAccel = v end,
     })
     lead:AddToggle('ok_falls', {
         Text = 'Predict jumps and falls',
@@ -1810,9 +2129,16 @@ do
         Default = false,
         Callback = function(v) Trigger.Enabled = v end,
     }):AddKeyPicker('ok_trigger_key', { Default = 'None', Mode = 'Toggle', SyncToggleState = true, Text = 'Triggerbot' })
+    trigger:AddDropdown('ok_trigger_mode', {
+        Text = 'Fire when',
+        Tooltip = 'shot will hit: plays your next shot forward, drop and their movement included, and fires only if it lands. crosshair on target: when the target is within the distance below',
+        Values = { 'Shot will hit', 'Crosshair on target' },
+        Default = Trigger.Mode,
+        Callback = function(v) Trigger.Mode = v or "Shot will hit" end,
+    })
     trigger:AddToggle('ok_trigger_silent', {
-        Text = 'Fire on any target with silent aim',
-        Tooltip = 'with silent aim on, shoots whenever there is a target, since the shot goes to it anyway',
+        Text = 'With silent aim: fire on a clear shot',
+        Tooltip = 'with silent aim on, fires whenever silent aim has a clear shot at the target',
         Default = Trigger.WithSilent,
         Callback = function(v) Trigger.WithSilent = v end,
     })
@@ -1842,6 +2168,24 @@ do
 
     gun:AddToggle('ok_norecoil', { Text = 'No recoil', Default = false, Callback = function(v) Gun.NoRecoil = v end })
     gun:AddToggle('ok_noshake', { Text = 'No screen shake', Default = false, Callback = function(v) Gun.NoShake = v end })
+    gun:AddToggle('ok_noselfdmg', {
+        Text = 'No self damage',
+        Tooltip = 'the Self Damage card never takes health off you: the game reports that damage from your own client, so it is just not sent',
+        Default = Gun.NoSelfDamage,
+        Callback = function(v) Gun.NoSelfDamage = v end,
+    })
+    gun:AddToggle('ok_sprintshoot', {
+        Text = 'Shoot while sprinting',
+        Tooltip = 'the game won\'t fire while you sprint; this lets it, without changing anything else about sprinting',
+        Default = Gun.SprintShoot,
+        Callback = function(v) Gun.SprintShoot = v end,
+    })
+    gun:AddSlider('ok_push', {
+        Text = 'Shot push-back',
+        Tooltip = 'the shove back each shot gives you. 0 stands you still, above 1 turns shots into rocket jumps',
+        Min = 0, Max = 3, Default = Gun.PushScale, Rounding = 2, Suffix = 'x',
+        Callback = function(v) Gun.PushScale = v end,
+    })
     gun:AddSlider('ok_spread', {
         Text = 'Spread',
         Tooltip = '1x is the game\'s own spread, 0x sends every pellet dead straight',
@@ -1901,6 +2245,12 @@ do
         Tooltip = 'share of the gap closed each frame. low looks human, 1 snaps',
         Min = 0.01, Max = 1, Default = Assist.Strength, Rounding = 2,
         Callback = function(v) Assist.Strength = v end,
+    })
+    feel:AddSlider('ok_assist_tracking', {
+        Text = 'Tracking',
+        Tooltip = 'how much it moves along with the target on its own, so it keeps up instead of trailing behind. 0 only closes the gap',
+        Min = 0, Max = 1.5, Default = Assist.Tracking, Rounding = 2,
+        Callback = function(v) Assist.Tracking = v end,
     })
     feel:AddSlider('ok_assist_maxspeed', {
         Text = 'Max speed',
@@ -1997,6 +2347,18 @@ do
 
     local rules = Tab:AddRightGroupbox('When to use it', 'list-filter')
 
+    rules:AddToggle('ok_shield_block', {
+        Text = 'Ignore bullets that hit something first',
+        Tooltip = 'plays every bullet against the map and the other players on the way: one that ends in a wall, an object or someone else doesn\'t use your shield. bullets that drill through walls still count',
+        Default = Shield.BlockCheck,
+        Callback = function(v) Shield.BlockCheck = v end,
+    })
+    rules:AddToggle('ok_shield_instant', {
+        Text = 'React the moment a shot is fired',
+        Tooltip = 'checks each enemy bullet the instant it appears (and whenever the server corrects it), instead of waiting for the next frame',
+        Default = Shield.Instant,
+        Callback = function(v) Shield.Instant = v end,
+    })
     rules:AddToggle('ok_shield_allies', {
         Text = 'Ignore teammates\' bullets',
         Default = Shield.IgnoreAllies,
@@ -2089,6 +2451,9 @@ do
     bullets:AddLabel('About to hit you'):AddColorPicker('ok_bullets_threat', {
         Default = BulletEsp.ThreatColor, Title = 'About to hit you', Callback = function(c) BulletEsp.ThreatColor = c end,
     })
+    bullets:AddLabel('Will hit something else'):AddColorPicker('ok_bullets_blocked', {
+        Default = BulletEsp.BlockedColor, Title = 'Will hit something else', Callback = function(c) BulletEsp.BlockedColor = c end,
+    })
     bullets:AddToggle('ok_bullets_own', { Text = 'Your own bullets too', Default = BulletEsp.Own, Callback = function(v) BulletEsp.Own = v end })
     bullets:AddSlider('ok_bullets_ahead', {
         Text = 'Path length',
@@ -2152,13 +2517,14 @@ do
     local label = box:AddLabel('-', true)
     every(0.5, function()
         local found = {}
-        for _, name in ipairs({ 'Core', 'Direction', 'Trajectory', 'Recoil', 'Cards', 'Reload', 'Health', 'Storm', 'Status', 'State' }) do
+        for _, name in ipairs({ 'Core', 'Direction', 'Trajectory', 'Recoil', 'Cards', 'Reload', 'Health', 'Storm', 'Status', 'State', 'Velocity' }) do
             found[#found + 1] = ("%s %s"):format(name, Diag.Modules[name] and "ok" or "MISSING")
         end
-        label:SetText(("getgc: %s\n%s\nsilent aim hook: %s   bullet tracker: %s\nspread hook: %s   recoil hook: %s   shake hook: %s\ndrawing: %s   mousemoverel: %s\nbullets in the air: %d"):format(
+        label:SetText(("getgc: %s\n%s\nsilent aim hook: %s   bullet tracker: %s\nspread hook: %s   recoil hook: %s   shake hook: %s\nself damage hook: %s   push hook: %s   sprint hook: %s\ndrawing: %s   mousemoverel: %s\nbullets in the air: %d"):format(
             Diag.Gc and "yes" or "no", table.concat(found, "\n"),
             SilentHooked and "on" or "FAILED", TrajectoryHooked and "on" or "FAILED",
             SpreadHooked and "on" or "FAILED", RecoilHooked and "on" or "FAILED", ShakeHooked and "on" or "FAILED",
+            SelfDamageHooked and "on" or "FAILED", PushHooked and "on" or "FAILED", SprintHooked and "on" or "FAILED",
             HasDrawing and "yes" or "no", typeof(mousemoverel) == "function" and "yes" or "no", Diag.Bullets))
     end)
     box:AddLabel('Silent shots and hits on the Combat tab should climb as you fire at a target. If a hook says FAILED or a module is MISSING, that feature is unavailable on this executor or the game changed.', true)
