@@ -31,7 +31,7 @@
 
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.19"
+local SCRIPT_VERSION = "rewrite-0.5.20"
 
 -- ---------------------------------------------------------------------------
 -- Single instance.
@@ -3176,11 +3176,18 @@ do
         entries[player] = e
         return e
     end
-    -- One driver, loop-paced: every tick, (re)build a billboard for each other
-    -- player and refresh its text. Runs everywhere (lobby and rounds) -- the ESP
-    -- lives entirely in gethui, which the game's own scripts cannot read, so it is
-    -- not a detection surface regardless of where you are.
+    -- One driver, loop-paced. Builds/refreshes a billboard per other player, but
+    -- ONLY while you are in play (a round / lobby training / lobby parry). In the
+    -- plain lobby every billboard is torn down and the loop does nothing -- so the
+    -- script's only continuous lobby activity is gone. This is the kick-isolation
+    -- change: with the engine already asleep in the lobby, ESP was the last
+    -- always-on, game-touching piece. If kicks stop, this was it (and ESP will be
+    -- made lobby-safe); if not, ESP is ruled out.
     local function update()
+        if not in_play() then
+            if next(entries) then clear_all() end
+            return
+        end
         local my = getRoot()
         for _, player in ipairs(Players:GetPlayers()) do
             local e = player ~= LocalPlayer and ensure_entry(player) or nil
