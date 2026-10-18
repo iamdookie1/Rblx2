@@ -51,7 +51,7 @@ local Games = {
     [107232715689665] = { Name = 'Last Letter (pro)', Script = 'Games/LastLetter.lua' },
     [95898962477575] = { Name = 'Last Letter (wilderness)', Script = 'Games/LastLetter.lua' },
     -- Chapter 1 (Farmhouse) of the needle in a haystack game, from its dump.
-    [108628039999641] = { Name = 'Needle in a Haystack', Script = 'Games/NeedleHaystack.lua' },
+    [108628039999641] = { Name = 'Needle in a Haystack', Script = 'Games/NeedleHaystack.lua', AutoLoad = true },
     -- Jailbreak's main place, from the dump's own place id (game 245662005).
     [606849621] = { Name = 'Jailbreak', Script = 'Games/Jailbreak.lua' },
     -- Wall Hop for Brainrots! (game 10004134791), from its dump's own place id.
@@ -79,6 +79,7 @@ local Games = {
 local GameIds = {
     [7872343282] = { Name = 'OVERKILL', Script = 'Games/Overkill.lua', AutoLoad = true },
     [9845585365] = { Name = 'Dodge or Die', Script = 'Games/DodgeOrDie.lua', AutoLoad = true },
+    [10756011174] = { Name = 'Needle in a Haystack', Script = 'Games/NeedleHaystack.lua', AutoLoad = true },
 }
 
 -- Games whose other modes (ranked, duels, events...) each have their own place
@@ -101,6 +102,19 @@ local Fingerprints = {
                 and modules:FindFirstChild('UpgradesSharedModule') ~= nil
                 and packages ~= nil
                 and packages:FindFirstChild('safe-net') ~= nil
+        end,
+    },
+    -- Needle in a Haystack in any place or server: its own remote folder in
+    -- ReplicatedStorage with the hay pick and hay state remotes.
+    {
+        Name = 'Needle in a Haystack',
+        Script = 'Games/NeedleHaystack.lua',
+        AutoLoad = true,
+        Match = function()
+            local folder = game:GetService('ReplicatedStorage'):FindFirstChild('NeedleHaystack')
+            return folder ~= nil
+                and folder:FindFirstChild('PickHay') ~= nil
+                and folder:FindFirstChild('GetHayState') ~= nil
         end,
     },
     -- Blade Ball ships as several places (standard, ranked, limited-time

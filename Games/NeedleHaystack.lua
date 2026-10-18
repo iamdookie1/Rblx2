@@ -1,5 +1,7 @@
 --// Needle in a Haystack (Chapter 1: Farmhouse) ----------------------------------------
--- Built against a script dump of the live game (place 108628039999641, version 1274).
+-- Built against script dumps of the live game (place 108628039999641, versions 1274 and
+-- 1317). The hub's loader finds the game by what's in it (ReplicatedStorage.NeedleHaystack
+-- with its PickHay and GetHayState remotes), so other chapters and places load it too.
 --
 -- What the game's own client scripts show:
 --  * The pile is drawn on the client: Workspace.HaystackClient holds the strands you
@@ -19,7 +21,13 @@
 --  * Special hay is worked out on the client from the round's MutationSeed attribute
 --    (Config.mutationFor(hayId)): Void x20, Rainbow x10, Electric x8, Gold x6, Burnt x4,
 --    Glass x3, Muddy x2, Grassy x1.5, Damp x1.25.
---  * Gems: GemSpawned(id, CFrame), CollectGem:FireServer(id), GemCollected(id, userId).
+--  * Gems: GemSpawned(id, CFrame) draws Workspace.GemsClient.Gem_<id>; the game collects
+--    one you look at within GemConfig.COLLECT_DISTANCE (30) with CollectGem:FireServer(id);
+--    GemCollected(id, userId, value, position) says who got it.
+--  * The needle: once revealed, a part flagged IsNeedleObjective shows up in
+--    Workspace.NeedleObjectiveServer. PickHay:FireServer("Objective") picks it up (your
+--    NeedleOwned attribute turns true) and NeedleHandIn:FireServer() within 14 studs of
+--    Workspace.NPC.Farmer_NPC hands it in and wins the round.
 --  * Tools: DeployDrone:FireServer() (DroneOwned, DroneDeployed), PitchforkDig:FireServer(hayId)
 --    on PitchforkCooldown, VacuumAction "Start" / "Tick"(aim, nozzle, ids) / "Stop" with
 --    VacuumHeat and VacuumState, TntAction "light" then "throw"(cframe, velocity) after
@@ -79,12 +87,15 @@ local S = {
     AutoDrone = false, AutoPitchfork = false, AutoVacuum = false, VacuumStopAt = 100,
     AutoTnt = false, TntTarget = "Special hay, else thickest", TntRange = 45,
     -- gems
-    AutoGems = false, GemTeleport = true, GemReturn = true,
+    AutoGems = false, GemTeleport = true, GemReturn = true, GemRange = 28,
     -- upgrades
     AutoUpgrade = false, UpgradeTracks = {}, UpgradeOnlyOwned = true, KeepCash = 0,
     AutoBuyTools = false, BuyTools = {},
     -- needle
     NeedleAlert = true, NeedleEsp = true, NeedleBeam = true,
+    AutoNeedle = false, NeedleDig = true, AutoHandIn = true,
+    -- self-tests: keep whatever the server really credits
+    PickBoost = false, BoostExtras = 12, FastPick = false,
     -- visuals
     SpecialEsp = false, SpecialTypes = {}, SpecialLabels = true, SpecialMax = 60,
     GemEsp = false, DroneEsp = false, SellEsp = false, PlayerEsp = false,
@@ -335,6 +346,9 @@ local Round = {
     sold = 0, picks = 0, gems = 0, startCash = nil, lastHeld = 0,
 }
 
+-- the auto needle's plan: where to dig, what it is doing
+local NeedleState = { target = nil, lastTry = 0, handAt = 0, status = "Waiting for the needle" }
+
 local Log -- set once the UI exists
 local function logEvent(text, color)
     if Log then
@@ -453,21 +467,51 @@ task.spawn(function()
 end)
 
 --// Gems \\--
-local Gems = {} -- [id] = position
+-- Every gem out, from the game's own events and from its GemsClient folder (in case an
+-- event came before the script did). A gem stays tracked until the game says someone got
+-- it or its model goes, so a collect the server didn't take is simply tried again.
+local Gems = {} -- [id] = { pos, tries, nextTry, model }
 local function gemsFolder()
     return Workspace:FindFirstChild("GemsClient")
 end
-task.spawn(function()
-    local folder = gemsFolder()
-    if folder then
-        for _, m in folder:GetChildren() do
-            local id = tonumber(string.match(m.Name, "^Gem_(%d+)$"))
-            local pos = pivotPos(m)
-            if id and pos then
-                Gems[id] = pos
-            end
-        end
+local function gemIdOf(m)
+    return tonumber(string.match(m.Name, "^Gem_(%d+)$"))
+end
+local function noteGemModel(m)
+    local id = gemIdOf(m)
+    local pos = pivotPos(m)
+    if not id or not pos then
+        return
     end
+    local g = Gems[id]
+    if g then
+        g.pos, g.model = pos, m
+    else
+        Gems[id] = { pos = pos, tries = 0, nextTry = 0, model = m }
+    end
+end
+local WatchedGems
+local function watchGems()
+    local f = gemsFolder()
+    if not f or f == WatchedGems then
+        return
+    end
+    WatchedGems = f
+    for _, m in f:GetChildren() do
+        noteGemModel(m)
+    end
+    bind(f.ChildAdded, function(m)
+        task.defer(noteGemModel, m)
+    end)
+    bind(f.ChildRemoved, function(m)
+        local id = gemIdOf(m)
+        if id and Gems[id] and Gems[id].model == m then
+            Gems[id] = nil
+        end
+    end)
+end
+task.spawn(function()
+    pcall(watchGems)
     local spawned = remote("GemSpawned")
     if spawned then
         bind(spawned.OnClientEvent, function(id, where)
@@ -478,8 +522,10 @@ task.spawn(function()
             if pos then
                 if not Gems[id] then
                     logEvent("A gem showed up", Color3.fromRGB(96, 190, 255))
+                    Gems[id] = { pos = pos, tries = 0, nextTry = 0 }
+                else
+                    Gems[id].pos = pos
                 end
-                Gems[id] = pos
             end
         end)
     end
@@ -826,13 +872,81 @@ local function shopPos()
     return n > 0 and sum / n or nil
 end
 
+-- tool state, filled in by the Tools section below (the farm reads it)
+local Tools
+
 --// Farm \\--
 local Farm = { busy = false, lastPick = 0, recent = {}, lastSell = 0, status = "Idle" }
 
--- The game's own grab: the strand plus the closest ones inside your grab radius.
+-- Self-tests. The client picks which strands go with each pick and how often it picks;
+-- the server decides what it credits. Each pick's result is read off HayHeld, so:
+--  * pick boost sends more strands per pick than your Grasp level, and keeps doing it only
+--    if the server really credits them;
+--  * fast pick shortens the wait between picks and settles on the shortest one the server
+--    still accepts.
+local Probe = {
+    pending = nil,          -- { held, sent, at, boosted }
+    boostTrials = 0, boostGain = 0, boostCapped = false, boostBest = nil,
+    cdFactor = 0.5, cdWindow = {}, status = "",
+}
+
+local function gameGrab()
+    return tonumber(LocalPlayer:GetAttribute("HayGrabCount")) or 1, tonumber(LocalPlayer:GetAttribute("HayGrabRadius")) or 0
+end
+
+-- reads what the last pick earned, before the next one goes out
+local function settleProbe()
+    local p = Probe.pending
+    if not p then
+        return
+    end
+    Probe.pending = nil
+    local held = bag()
+    local gain = held - p.held
+    -- a sale, or another tool working, makes the number meaningless
+    if gain < 0 or Tools and (Tools.vacuumOn or os.clock() - (Tools.pitchforkAt or 0) < 1.2) then
+        return
+    end
+    if S.FastPick then
+        table.insert(Probe.cdWindow, gain > 0)
+        if #Probe.cdWindow >= 8 then
+            local ok = 0
+            for _, v in Probe.cdWindow do
+                if v then
+                    ok += 1
+                end
+            end
+            if ok / #Probe.cdWindow < 0.75 then
+                Probe.cdFactor = math.min(1, Probe.cdFactor + 0.1)
+            elseif ok == #Probe.cdWindow and Probe.cdFactor > 0.2 then
+                Probe.cdFactor = math.max(0.2, Probe.cdFactor - 0.05)
+            end
+            table.clear(Probe.cdWindow)
+        end
+    end
+    if p.boosted then
+        Probe.boostTrials += 1
+        Probe.boostGain += gain
+        Probe.boostBest = math.max(Probe.boostBest or 0, gain)
+        local count = gameGrab()
+        if Probe.boostTrials >= 6 then
+            local avg = Probe.boostGain / Probe.boostTrials
+            if avg <= count + 0.5 then
+                Probe.boostCapped = true
+                logEvent(string.format("Pick boost: the server caps picks at your Grasp level (%d), turned off", count), Color3.fromRGB(255, 170, 80))
+            end
+        end
+    end
+end
+
+-- The game's own grab: the strand plus the closest ones inside your grab radius. With
+-- pick boost on (and not found capped), more strands from a wider circle.
 local function grabExtras(target)
-    local count = tonumber(LocalPlayer:GetAttribute("HayGrabCount")) or 1
-    local radius = tonumber(LocalPlayer:GetAttribute("HayGrabRadius")) or 0
+    local count, radius = gameGrab()
+    if S.PickBoost and not Probe.boostCapped then
+        count = math.max(count, S.BoostExtras + 1)
+        radius = math.max(radius, 4.5)
+    end
     if count <= 1 or radius <= 0 then
         return {}
     end
@@ -882,6 +996,26 @@ local function pickTarget()
     local function fresh(p)
         local id = p:GetAttribute("HayId")
         return id and (not Farm.recent[id] or now - Farm.recent[id] > 1.2)
+    end
+    -- the auto needle first: the hay over and around the needle
+    if S.AutoNeedle and NeedleState.target then
+        local tgt = NeedleState.target
+        local best, bestD
+        for _, p in haysNear(tgt, 5.5) do
+            if fresh(p) then
+                local d = (p.Position - tgt).Magnitude
+                if not bestD or d < bestD then
+                    best, bestD = p, d
+                end
+            end
+        end
+        if best then
+            if (best.Position - hrp.Position).Magnitude > S.PickReach then
+                standAt(tgt)
+                return best, true
+            end
+            return best
+        end
     end
     -- Special strands first: in reach, or worth flying to.
     if S.SpecialFirst or S.ChaseSpecial then
@@ -937,14 +1071,20 @@ local function pickDroppedNear()
 end
 
 local function pickTick()
-    if not S.AutoPick or Farm.busy or inputLocked() or bagFull() then
+    local digging = S.AutoNeedle and NeedleState.target ~= nil
+    if not (S.AutoPick or digging) or Farm.busy or inputLocked() or bagFull() then
         return
     end
-    local cooldown = (tonumber(LocalPlayer:GetAttribute("HayPickCooldown")) or C.PICK_COOLDOWN) + S.PickExtraDelay / 1000
+    local cooldown = (tonumber(LocalPlayer:GetAttribute("HayPickCooldown")) or C.PICK_COOLDOWN)
+    if S.FastPick then
+        cooldown *= Probe.cdFactor
+    end
+    cooldown += S.PickExtraDelay / 1000
     local now = os.clock()
     if now - Farm.lastPick < cooldown then
         return
     end
+    settleProbe()
     if S.PickDropped and pickDroppedNear() then
         Farm.lastPick = now
         return
@@ -962,7 +1102,10 @@ local function pickTick()
     local id = target:GetAttribute("HayId")
     Farm.recent[id] = now
     Farm.lastPick = now
-    fire("PickHay", id, grabExtras(target))
+    local extras = grabExtras(target)
+    Probe.pending = { held = bag(), sent = #extras + 1, at = now,
+        boosted = S.PickBoost and not Probe.boostCapped and #extras + 1 > (gameGrab()) }
+    fire("PickHay", id, extras)
     Round.picks += 1
     Farm.status = "Picking"
     if SpecialParts[target] and multOf(SpecialParts[target]) >= 3 then
@@ -1041,42 +1184,151 @@ local function sellTick()
 end
 
 --// Gems \\--
+-- Gems in range are collected straight away (from beside the pile every gem on it is in
+-- range), each retried until the game says it went, with a rest after a dozen tries. One
+-- out of range is fetched with a quick trip when nothing else is moving you.
+local GemTrip = false
 local function gemTick()
-    if not S.AutoGems or Farm.busy or inputLocked() then
+    if not S.AutoGems or inputLocked() then
+        return
+    end
+    pcall(watchGems)
+    local hrp = rootPart()
+    if not hrp then
+        return
+    end
+    local now = os.clock()
+    local far
+    for id, g in Gems do
+        if g.model and not g.model.Parent then
+            Gems[id] = nil
+        else
+            local d = (g.pos - hrp.Position).Magnitude
+            if d <= S.GemRange then
+                if now >= g.nextTry then
+                    g.tries += 1
+                    g.nextTry = now + 0.35
+                    fire("CollectGem", id)
+                    if g.tries >= 12 then
+                        g.tries, g.nextTry = 0, now + 6
+                    end
+                end
+            elseif now >= g.nextTry and (not far or d < far.d) then
+                far = { id = id, g = g, d = d }
+            end
+        end
+    end
+    if far and S.GemTeleport and not Farm.busy and not GemTrip then
+        GemTrip, Farm.busy = true, true
+        task.spawn(function()
+            local back = hrp.CFrame
+            standAt(far.g.pos)
+            local t = os.clock()
+            while alive() and Gems[far.id] and os.clock() - t < 1.2 do
+                fire("CollectGem", far.id)
+                task.wait(0.2)
+            end
+            if Gems[far.id] then
+                far.g.nextTry = os.clock() + 6
+            end
+            if S.GemReturn and alive() then
+                local r = rootPart()
+                if r then
+                    r.CFrame = back
+                    r.AssemblyLinearVelocity = Vector3.zero
+                end
+            end
+            Farm.busy, GemTrip = false, false
+        end)
+    end
+end
+
+--// Needle \\--
+-- Revealed: dig the hay over and around it (the picks go through auto pick's loop, aimed
+-- at the needle). Claimable: stand by it and pick it up. Holding it: take it to the farmer.
+local function needleObjective()
+    local server = Workspace:FindFirstChild("NeedleObjectiveServer")
+    if not server then
+        return nil
+    end
+    for _, d in server:GetDescendants() do
+        if d:IsA("BasePart") and d:GetAttribute("IsNeedleObjective") then
+            return d
+        end
+    end
+    return nil
+end
+local function farmerNpc()
+    local npc = Workspace:FindFirstChild("NPC")
+    return npc and npc:FindFirstChild("Farmer_NPC")
+end
+
+local function needleTick()
+    if not S.AutoNeedle or inputLocked() then
+        NeedleState.target = nil
+        return
+    end
+    if NH and NH:GetAttribute("WinnerUserId") ~= nil then
+        NeedleState.target, NeedleState.status = nil, "Round won"
         return
     end
     local hrp = rootPart()
     if not hrp then
         return
     end
-    for id, pos in Gems do
-        local d = (pos - hrp.Position).Magnitude
-        if d <= S.PickReach then
-            fire("CollectGem", id)
-            Gems[id] = nil
-            return
-        elseif S.GemTeleport then
-            Farm.busy = true
-            local back = hrp.CFrame
-            standAt(pos)
-            task.wait(0.25)
-            fire("CollectGem", id)
-            task.wait(0.25)
-            if S.GemReturn and alive() then
-                local r = rootPart()
-                if r then
-                    r.CFrame = back
-                end
-            end
-            Gems[id] = nil
-            Farm.busy = false
+    local now = os.clock()
+    if LocalPlayer:GetAttribute("NeedleOwned") == true then
+        NeedleState.target = nil
+        if not S.AutoHandIn then
+            NeedleState.status = "Holding the needle"
             return
         end
+        local npc = farmerNpc()
+        if npc and now - NeedleState.handAt > 0.6 then
+            NeedleState.handAt = now
+            NeedleState.status = "Handing the needle in"
+            local pivot = npc:GetPivot().Position
+            if (hrp.Position - pivot).Magnitude > 10 then
+                Farm.busy = true
+                local toward = Vector3.new(hrp.Position.X - pivot.X, 0, hrp.Position.Z - pivot.Z)
+                toward = toward.Magnitude > 0.1 and toward.Unit or Vector3.new(1, 0, 0)
+                hrp.CFrame = CFrame.lookAt(pivot + toward * 6 + Vector3.new(0, 2, 0), pivot)
+                hrp.AssemblyLinearVelocity = Vector3.zero
+                task.delay(0.25, function()
+                    fire("NeedleHandIn")
+                    Farm.busy = false
+                end)
+            else
+                fire("NeedleHandIn")
+            end
+        end
+        return
+    end
+    local obj = needleObjective()
+    if obj then
+        NeedleState.target = nil
+        if now - NeedleState.lastTry > 0.4 then
+            NeedleState.lastTry = now
+            NeedleState.status = "Grabbing the needle"
+            if (obj.Position - hrp.Position).Magnitude > 10 then
+                standAt(obj.Position)
+            end
+            fire("PickHay", "Objective")
+        end
+        return
+    end
+    local part = Round.needleId and needlePart()
+    if part and S.NeedleDig then
+        NeedleState.target = part.Position
+        NeedleState.status = "Digging to the needle"
+    else
+        NeedleState.target = nil
+        NeedleState.status = Round.needleId and "Needle showing" or "Waiting for the needle"
     end
 end
 
 --// Tools \\--
-local Tools = { pitchforkAt = 0, vacuumOn = false, vacuumTickAt = 0, tntState = "idle", tntReadyAt = 0, droneAt = 0 }
+Tools = { pitchforkAt = 0, vacuumOn = false, vacuumTickAt = 0, tntState = "idle", tntReadyAt = 0, droneAt = 0 }
 
 local function droneTick()
     if not S.AutoDrone or inputLocked() then
@@ -1702,6 +1954,53 @@ do -- Farm
         end,
     })
 
+    local Boost = Tab:AddLeftGroupbox("Self-tests (faster picking)", "flask-conical")
+    Boost:AddLabel("These try more than the game normally sends and keep it only if the server really pays out, read off your bag after every pick.", true)
+    Boost:AddToggle("PickBoost", {
+        Text = "Pick boost",
+        Tooltip = "sends more strands with each pick than your Grasp level. if the server only credits your Grasp amount it turns itself off",
+        Default = S.PickBoost,
+        Callback = function(v)
+            S.PickBoost = v
+            if v then
+                Probe.boostCapped, Probe.boostTrials, Probe.boostGain, Probe.boostBest = false, 0, 0, nil
+            end
+        end,
+    })
+    Boost:AddSlider("BoostExtras", {
+        Text = "Extra strands per pick",
+        Min = 1, Max = 40, Default = S.BoostExtras, Rounding = 0,
+        Callback = function(v)
+            S.BoostExtras = v
+        end,
+    })
+    Boost:AddToggle("FastPick", {
+        Text = "Fast pick",
+        Tooltip = "picks sooner than your Speed level's wait and settles on the shortest wait the server still pays for",
+        Default = S.FastPick,
+        Callback = function(v)
+            S.FastPick = v
+            if v then
+                Probe.cdFactor, Probe.cdWindow = 0.5, {}
+            end
+        end,
+    })
+    local ProbeLabel = Boost:AddLabel("-", true)
+    task.spawn(function()
+        while alive() do
+            pcall(function()
+                local count = gameGrab()
+                local boost = not S.PickBoost and "off"
+                    or Probe.boostCapped and string.format("server caps at %d per pick (off)", count)
+                    or Probe.boostTrials > 0 and string.format("%.1f per pick on average (best %d, Grasp gives %d)", Probe.boostGain / Probe.boostTrials, Probe.boostBest or 0, count)
+                    or "testing..."
+                local fast = S.FastPick and string.format("waiting %d%% of the normal time", math.floor(Probe.cdFactor * 100 + 0.5)) or "off"
+                ProbeLabel:SetText("Pick boost: " .. boost .. "\nFast pick: " .. fast)
+            end)
+            task.wait(0.5)
+        end
+    end)
+
     local Sell = Tab:AddRightGroupbox("Auto sell", "badge-dollar-sign")
     Sell:AddToggle("AutoSell", {
         Text = "Auto sell",
@@ -1745,6 +2044,14 @@ do -- Farm
         Tooltip = "Grabs gems as they pop out of the pile",
         Callback = function(v)
             S.AutoGems = v
+        end,
+    })
+    GemBox:AddSlider("GemRange", {
+        Text = "Collect within",
+        Tooltip = "the game collects a gem up to 30 studs away; 28 leaves a little room",
+        Min = 8, Max = 30, Default = S.GemRange, Rounding = 0, Suffix = " studs",
+        Callback = function(v)
+            S.GemRange = v
         end,
     })
     GemBox:AddToggle("GemTeleport", { Text = "Go to gems out of reach", Default = S.GemTeleport, Callback = function(v)
@@ -1877,6 +2184,39 @@ end
 do -- Visuals
     local Tab = Window:AddTab("Visuals", "eye", "Needle, special hay and more")
     local Needle = Tab:AddLeftGroupbox("Needle", "search")
+    Needle:AddToggle("AutoNeedle", {
+        Text = "Auto needle",
+        Tooltip = "once the needle shows: digs the hay around it, picks it up the moment it can be picked, and hands it to the farmer",
+        Default = S.AutoNeedle,
+        Callback = function(v)
+            S.AutoNeedle = v
+        end,
+    })
+    Needle:AddToggle("NeedleDig", {
+        Text = "Dig to it",
+        Tooltip = "aims your picks at the hay over and around the needle (works even with auto pick off)",
+        Default = S.NeedleDig,
+        Callback = function(v)
+            S.NeedleDig = v
+        end,
+    })
+    Needle:AddToggle("AutoHandIn", {
+        Text = "Hand it in",
+        Tooltip = "takes the needle to the farmer and hands it in as soon as you have it",
+        Default = S.AutoHandIn,
+        Callback = function(v)
+            S.AutoHandIn = v
+        end,
+    })
+    local NeedleStatus = Needle:AddLabel("-", true)
+    task.spawn(function()
+        while alive() do
+            pcall(function()
+                NeedleStatus:SetText("Auto needle: " .. (S.AutoNeedle and NeedleState.status or "off"))
+            end)
+            task.wait(0.4)
+        end
+    end)
     Needle:AddToggle("NeedleAlert", { Text = "Alert when it shows", Default = S.NeedleAlert, Callback = function(v)
         S.NeedleAlert = v
     end })
@@ -2106,6 +2446,7 @@ task.spawn(function()
         pcall(vacuumTick)
         pcall(tntTick)
         pcall(gemTick)
+        pcall(needleTick)
         task.wait(0.05)
     end
     stopVacuum()
