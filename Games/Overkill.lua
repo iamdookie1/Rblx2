@@ -69,7 +69,7 @@ local Aim = {
     Silent = false,
     MatchOnly = false,        -- silent aim and triggerbot only in matches
     HitChance = 100,          -- % of shots that get aimed
-    Part = "Head",            -- Head / Torso / Root / Nearest to crosshair
+    Part = "Torso",           -- Head / Torso / Root / Nearest to crosshair
     Priority = "Crosshair",   -- Crosshair / Distance / Lowest health
     Sticky = true,
     TeamCheck = true,
@@ -80,6 +80,8 @@ local Aim = {
     Predict = true,
     PredictScale = 1,
     UseAccel = true,          -- lead by how they are speeding up and turning, not only their speed
+    Damping = 0.35,           -- trims long leads: people change direction, so far out the lead is shortened
+    AutoTune = true,          -- learn the extra lead that actually lands from the game's own hit results
     SmartPart = true,         -- head shots only when the lead is sure enough, else the torso
     PredictFalls = true,      -- targets in the air follow gravity down to the floor
     AutoLead = true,          -- add the game's draw delay for others and your ping
@@ -126,6 +128,8 @@ local Trigger = {
     Radius = 35,              -- px from crosshair (without silent aim)
     WithSilent = true,        -- with silent aim on, fire whenever there is a target
     NeedAmmo = true,          -- don't pull the trigger on an empty gun or with the shield up
+    AutoAim = false,          -- turn your aim onto the target so your real shot lands, then fire
+    AimStrength = 0.5,        -- share of the way it turns each frame (1 snaps)
 }
 
 local Gun = {
@@ -625,8 +629,54 @@ FloorParams.FilterType = Enum.RaycastFilterType.Exclude
 
 -- how far ahead of what you see a target really is: the game's draw delay for
 -- other players and your ping, plus the manual extra
+-- Self-tuning lead. How far ahead of what you see the server really has a
+-- target depends on things the client can't see (whether the server rewinds
+-- for lag, its tick, everyone's ping), so instead of guessing, each silent
+-- shot tries one of these extra leads and the game's own hit notices say which
+-- ones land. The best is picked more and more often (UCB1), while the others
+-- still get the odd try in case things change.
+local LEAD_ARMS = { -0.1, -0.05, 0, 0.05, 0.1, 0.15, 0.2 }
+local Tune = { Arm = 3, Shots = {}, Hits = {}, Total = 0 }
+for i = 1, #LEAD_ARMS do Tune.Shots[i], Tune.Hits[i] = 0, 0 end
+
+local function pickArm()
+    if not Aim.AutoTune then return nil end
+    local best, bestScore = 3, -math.huge
+    for i = 1, #LEAD_ARMS do
+        local shots = Tune.Shots[i]
+        local score
+        if shots == 0 then
+            score = 10 - math.abs(i - 3) * 0.1 -- untried: around the middle first
+        else
+            score = Tune.Hits[i] / shots + math.sqrt(2 * math.log(math.max(Tune.Total, 1)) / shots) * 0.6
+        end
+        if score > bestScore then best, bestScore = i, score end
+    end
+    return best
+end
+
+local function bestArm()
+    local best, rate = 3, -1
+    for i = 1, #LEAD_ARMS do
+        if Tune.Shots[i] >= 3 then
+            local r = Tune.Hits[i] / Tune.Shots[i]
+            if r > rate then best, rate = i, r end
+        end
+    end
+    return best, rate
+end
+
+local function settleShot(b, hit)
+    if not b or not b.Arm or b.Settled then return end
+    b.Settled = true
+    Tune.Shots[b.Arm] += 1
+    Tune.Total += 1
+    if hit then Tune.Hits[b.Arm] += 1 end
+end
+
 local function leadTime()
     local extra = Aim.ExtraLead / 1000
+    if Aim.AutoTune and Tune.Arm then extra += LEAD_ARMS[Tune.Arm] end
     if Aim.AutoLead then
         extra += Aim.InterpDelay / 1000
         local ok, ping = pcall(function() return LocalPlayer:GetNetworkPing() end)
@@ -656,9 +706,12 @@ local function predictor(part, model, predict)
     end
     local gravity = Workspace.Gravity
     local flatVel = Vector3.new(velocity.X, 0, velocity.Z)
+    local damping = math.max(Aim.Damping, 0)
     return function(t)
         local bend = math.min(t, 0.35)
-        local flat = flatVel * t + acc * (0.5 * bend * bend)
+        -- the further out, the less of the straight-line lead is trusted
+        local reach = t / (1 + damping * t)
+        local flat = flatVel * reach + acc * (0.5 * bend * bend)
         if t > 0 and flat.Magnitude > top * t then flat = flat.Unit * top * t end
         local y = start.Y
         if falling then y = math.max(floorY, start.Y + velocity.Y * t - 0.5 * gravity * t * t) end
@@ -771,6 +824,7 @@ end
 -- the game's own launch maths, kept for the triggerbot to play shots forward
 local OriginalCalculate = Mods.Direction and Mods.Direction.Calculate
 local ShotAt = 0
+local SilentShot = nil
 
 local SilentHooked = hook(Mods.Direction, "Calculate", function(original)
     return function(origin, cameraCFrame, speed, gravity, ...)
@@ -781,11 +835,18 @@ local SilentHooked = hook(Mods.Direction, "Calculate", function(original)
         if Unloaded or not Aim.Silent or not Current then return base end
         if Aim.MatchOnly and not inMatch() then return base end
         if math.random() * 100 > Aim.HitChance then return base end
+        local arm = pickArm()
+        Tune.Arm = arm
         local ok, dir = pcall(silentDirection, origin, speed or 100, gravity or 25)
         if ok and typeof(dir) == "Vector3" then
             Diag.SilentShots += 1
+            -- the bullets this shot makes are tagged with it, to learn from
+            SilentShot = { At = os.clock(), Arm = arm, Target = Current and Current.Model }
+            -- between shots, the visuals, triggerbot and auto aim use the best so far
+            Tune.Arm = (bestArm())
             return dir
         end
+        Tune.Arm = (bestArm())
         return base
     end
 end)
@@ -882,6 +943,7 @@ local MAX_TRACKED = 100
 
 local function forget(id)
     if Tracked[id] then
+        settleShot(Tracked[id], false)
         Tracked[id] = nil
         TrackedCount -= 1
     end
@@ -916,7 +978,11 @@ local TrajectoryHooked = hook(Mods.Trajectory, "Add", function(original)
                     Time = startTime, GravityAt = startTime,
                 } },
             }
-            if Shield.Instant and not (isLocal or player == LocalPlayer) then task.defer(InstantCheck, id) end
+            local mine = isLocal or player == LocalPlayer
+            if mine and SilentShot and SilentShot.Arm and os.clock() - SilentShot.At < 0.05 then
+                Tracked[id].Arm, Tracked[id].Target = SilentShot.Arm, SilentShot.Target
+            end
+            if Shield.Instant and not mine then task.defer(InstantCheck, id) end
         end)
         return original(player, id, startTime, position, direction, settings, isLocal, offset, ...)
     end
@@ -987,6 +1053,7 @@ listen("BulletCollision", function(_, ids, _, instances)
         local hit = instances[i]
         if b and b.Local and typeof(hit) == "Instance" and hit:IsA("Model") and hit ~= LocalPlayer.Character then
             Diag.Hits += 1
+            settleShot(b, true)
         end
     end
 end)
@@ -1299,6 +1366,59 @@ local function shotWillHit(origin, dir, speed, gravity, model)
     return false
 end
 
+-- Where to point the camera so the game's own shot lands on the target: start
+-- at the solved meeting point, play the real shot from that aim, and nudge the
+-- aim by however far it misses, a few times over.
+local function cameraAimPoint(part, model)
+    if not (Camera and OriginalCalculate) then return nil end
+    local origin = shotOrigin()
+    if not origin then return nil end
+    local speed, gravity = myBulletSpeed()
+    local _, flight, predicted = solve(origin, speed, gravity, part, model)
+    if not predicted then return nil end
+    local camPos = Camera.CFrame.Position
+    local look = predicted
+    for _ = 1, 4 do
+        local ok, launch = pcall(OriginalCalculate, origin, CFrame.lookAt(camPos, look), speed, gravity)
+        if not ok or typeof(launch) ~= "Vector3" then break end
+        local g = dropGravity(gravity, launch)
+        local landed = origin + launch * speed * flight - Vector3.new(0, 0.5 * g * flight * flight, 0)
+        local miss = predicted - landed
+        if miss.Magnitude < 0.05 then break end
+        look += miss
+    end
+    return look
+end
+
+-- turns your real aim toward a point, by mouse or camera
+local function turnToward(point, strength, dt)
+    local screen = screenPoint(point)
+    if not screen then return end
+    local cursor = cursorPos()
+    local delta = screen - cursor
+    if delta.Magnitude < 0.5 then return end
+    local frames = math.clamp(dt * 60, 0.25, 4)
+    local share = 1 - (1 - math.clamp(strength, 0, 1)) ^ frames
+    local move = delta * share
+    if Assist.Method == "Mouse move" and typeof(mousemoverel) == "function" then
+        pcall(mousemoverel, move.X, move.Y)
+    else
+        local aimAt = cursor + move
+        local ray = Camera:ViewportPointToRay(aimAt.X, aimAt.Y)
+        local cf = Camera.CFrame
+        Camera.CFrame = CFrame.lookAt(cf.Position, cf.Position + ray.Direction)
+    end
+end
+
+local function triggerAimStep(dt)
+    if not (Trigger.Enabled and Trigger.AutoAim and Current) then return end
+    if Aim.MatchOnly and not inMatch() then return end
+    local part = Current.Part
+    if not (part and part.Parent) then return end
+    local point = cameraAimPoint(part, Current.Model)
+    if point then turnToward(point, Trigger.AimStrength, dt) end
+end
+
 local function triggerStep()
     if not Trigger.Enabled or TriggerBusy or not Current then return end
     if Aim.MatchOnly and not inMatch() then return end
@@ -1459,6 +1579,7 @@ end))
 track(RunService.RenderStepped:Connect(function(dt)
     if Unloaded then return end
     guarded("assist", assistStep, dt)
+    guarded("trigger aim", triggerAimStep, dt)
 end))
 
 --// player ESP --------------------------------------------------------------------------
@@ -1957,11 +2078,14 @@ do
         local ammo = call(Mods.Reload, "GetAmmo")
         local shieldReady = call(Mods.Reload, "GetShieldable")
         local hitRate = Diag.SilentShots > 0 and ("%d%%"):format(math.floor(Diag.Hits / Diag.SilentShots * 100 + 0.5)) or "-"
-        status:SetText(("target: %s   %s\nammo: %s   shield: %s\nsilent shots: %d   hits: %d (%s)   arc blocked: %d   trigger pulls: %d"):format(
+        local arm, armRate = bestArm()
+        local tuned = Aim.AutoTune and (armRate >= 0 and ("   tuned lead %+dms (%d%% of %d)"):format(
+            math.floor(LEAD_ARMS[arm] * 1000), math.floor(armRate * 100 + 0.5), Tune.Shots[arm]) or "   tuning lead...") or ""
+        status:SetText(("target: %s   %s\nammo: %s   shield: %s\nsilent shots: %d   hits: %d (%s)   arc blocked: %d   trigger pulls: %d%s"):format(
             Diag.Target, inMatch() and "in a match" or "in the lobby",
             ammo ~= nil and tostring(ammo) or "-",
             call(Mods.Reload, "GetShielding") and "up" or (shieldReady == false and "recharging" or "ready"),
-            Diag.SilentShots, Diag.Hits, hitRate, Diag.Blocked, Diag.Triggers))
+            Diag.SilentShots, Diag.Hits, hitRate, Diag.Blocked, Diag.Triggers, tuned))
     end)
 
     local silent = Tab:AddLeftGroupbox('Silent aim', 'crosshair')
@@ -2068,6 +2192,25 @@ do
         Default = Aim.UseAccel,
         Callback = function(v) Aim.UseAccel = v end,
     })
+    lead:AddSlider('ok_damping', {
+        Text = 'Strafe damping',
+        Tooltip = 'people change direction, so the longer a shot flies the less of the straight-line lead is used. 0 leads all the way',
+        Min = 0, Max = 2, Default = Aim.Damping, Rounding = 2,
+        Callback = function(v) Aim.Damping = v end,
+    })
+    lead:AddToggle('ok_autotune', {
+        Text = 'Self-tuning lead',
+        Tooltip = 'each silent shot tries a slightly different lead, and the game\'s own hit results teach it which one lands. it gets better the more you shoot',
+        Default = Aim.AutoTune,
+        Callback = function(v) Aim.AutoTune = v end,
+    })
+    lead:AddButton({
+        Text = 'Reset what it learnt',
+        Func = function()
+            for i = 1, #LEAD_ARMS do Tune.Shots[i], Tune.Hits[i] = 0, 0 end
+            Tune.Total = 0
+        end,
+    })
     lead:AddToggle('ok_falls', {
         Text = 'Predict jumps and falls',
         Tooltip = 'a target in the air is led along its fall, down to the floor under it',
@@ -2147,6 +2290,18 @@ do
         Tooltip = 'skips pulling the trigger while you are out of ammo or have your shield up, so it doesn\'t spam the empty sound',
         Default = Trigger.NeedAmmo,
         Callback = function(v) Trigger.NeedAmmo = v end,
+    })
+    trigger:AddToggle('ok_trigger_autoaim', {
+        Text = 'Auto aim',
+        Tooltip = 'turns your aim onto the target, drop and lead included, so your own shot lands, and the triggerbot fires once it will. works without silent aim',
+        Default = Trigger.AutoAim,
+        Callback = function(v) Trigger.AutoAim = v end,
+    })
+    trigger:AddSlider('ok_trigger_aimstrength', {
+        Text = 'Auto aim strength',
+        Tooltip = 'how much of the way it turns each frame. 1 snaps straight on',
+        Min = 0.05, Max = 1, Default = Trigger.AimStrength, Rounding = 2,
+        Callback = function(v) Trigger.AimStrength = v end,
     })
     trigger:AddSlider('ok_trigger_radius', {
         Text = 'Lined up within',
