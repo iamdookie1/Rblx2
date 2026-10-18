@@ -1070,6 +1070,9 @@ end
 -- Whether it worked is read off the game's own count (or your upward speed)
 -- a frame later; if it didn't, Auto does the game's double jump function
 -- directly, and failing that the same two things the script does.
+-- On a phone there is no key to tap: the double jump is a tap on the game's
+-- own touch jump button instead (its DoubleJump listener on that button),
+-- the same thing your thumb does.
 --
 -- Being in the air is tracked here every frame from where you actually are,
 -- not from humanoid state events, so a fall or a knock counts the same as a
@@ -1155,6 +1158,8 @@ local VK_SPACE = 0x20
 
 local function canTap()
     if not keyPress or not keyRelease or not WindowFocused then return false end
+    -- a phone or tablet: no keyboard to tap, the jump button is used instead
+    if UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled then return false end
     if typeof(isrbxactive) == "function" then
         local ok, active = pcall(isrbxactive)
         if ok and active == false then return false end
@@ -1184,12 +1189,51 @@ end))
 
 local FAKE_SPACE = { KeyCode = Enum.KeyCode.Space, UserInputType = Enum.UserInputType.Keyboard }
 
--- the game's double jump done right now: its own function, else its Space
--- handler with a stand-in key; true when its count went up or you shot up
+-- On a phone the game's DoubleJump script listens to the touch jump button
+-- itself (TouchGui.TouchControlFrame.JumpButton, InputBegan). That listener
+-- is found here, so a double jump can be a tap on that button.
+local TouchDJ = { Button = nil, Fn = nil, SearchAt = 0 }
+
+local function touchDJHandler()
+    local gui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    local touchGui = gui and gui:FindFirstChild("TouchGui")
+    local frame = touchGui and touchGui:FindFirstChild("TouchControlFrame")
+    local button = frame and frame:FindFirstChild("JumpButton")
+    if not button then return nil end
+    if TouchDJ.Button ~= button or (not TouchDJ.Fn and os.clock() >= TouchDJ.SearchAt) then
+        TouchDJ.Button, TouchDJ.SearchAt = button, os.clock() + 5
+        TouchDJ.Fn = handlerFrom(button.InputBegan, "DoubleJump")
+    end
+    return TouchDJ.Fn
+end
+
+local function djWorked(root, before, count0)
+    local count1 = gameDJState()
+    return (count0 ~= nil and count1 ~= nil and count1 > count0) or root.AssemblyLinearVelocity.Y > before + 10
+end
+
+-- the game's double jump done right now: a tap on its jump button (phones),
+-- else its own function, else its Space handler with a stand-in key. True
+-- when its count went up or you shot up, and which way did it.
 local function gameAirJump(root)
-    local g = findGameDJ()
-    if not g then return false end
     local before, count0 = root.AssemblyLinearVelocity.Y, gameDJState()
+    local g = findGameDJ()
+    local touch = touchDJHandler()
+    if touch then
+        local finger = {
+            UserInputType = Enum.UserInputType.Touch, UserInputState = Enum.UserInputState.Begin,
+            KeyCode = Enum.KeyCode.Unknown, Position = Vector3.zero, Delta = Vector3.zero,
+        }
+        pcall(touch, finger)
+        -- the finger comes back up, so the button takes the next tap (it
+        -- ignores new ones while one is down). A finger of yours still on the
+        -- button from your jump blocks this the same way; then the next way
+        -- below does it.
+        finger.UserInputState = Enum.UserInputState.End
+        if g and g.Ended then pcall(g.Ended, finger) end
+        if djWorked(root, before, count0) then return true, "jump button" end
+    end
+    if not g then return false end
     if g.Fn then
         pcall(g.Fn)
     else
@@ -1198,8 +1242,7 @@ local function gameAirJump(root)
         pcall(g.Began, FAKE_SPACE, false)
         if g.Ended then pcall(g.Ended, FAKE_SPACE) end
     end
-    local count1 = gameDJState()
-    return (count0 ~= nil and count1 ~= nil and count1 > count0) or root.AssemblyLinearVelocity.Y > before + 10
+    return djWorked(root, before, count0), "game"
 end
 
 local function scriptAirJump(root)
@@ -1212,8 +1255,12 @@ end
 -- the double jump without a key tap: the game's, else the script's
 local function directAirJump(root, method)
     local how = nil
-    if (method == "Auto" or method == "Game") and djTagsOk(LocalPlayer.Character) and gameAirJump(root) then
-        how = "game"
+    local gameDone, gameHow = false, nil
+    if (method == "Auto" or method == "Game") and djTagsOk(LocalPlayer.Character) then
+        gameDone, gameHow = gameAirJump(root)
+    end
+    if gameDone then
+        how = gameHow
     elseif method == "Auto" or method == "Script" then
         scriptAirJump(root)
         how = "script"
@@ -2395,9 +2442,16 @@ do
     local djStatus = move:AddLabel('double jump: -', true)
     local function djFound()
         local g = findGameDJ()
-        local tap = (keyPress and keyRelease) and (Air.KeyWorks == false and "taps didn't reach it" or "space taps") or "no keypress here"
+        local tap
+        if touchDJHandler() then
+            tap = "jump button found"
+        elseif keyPress and keyRelease then
+            tap = Air.KeyWorks == false and "taps didn't reach it" or "space taps"
+        else
+            tap = "no keypress here"
+        end
         if g and g.Fn then return "found, count readable, " .. tap end
-        if g then return "handler found, " .. tap end
+        if g or TouchDJ.Fn then return "handler found, " .. tap end
         return "not found (the script one is used), " .. tap
     end
     every(0.3, function()
@@ -2409,7 +2463,7 @@ do
     end)
     move:AddDropdown('dd_djmethod', {
         Text = 'Double jump with',
-        Tooltip = 'key press: taps Space for real (executor keypress, only while Roblox is focused and you are not typing), so the game takes it exactly like your own jump. game: calls the game\'s double jump function. script: does the same itself. auto: a tap, then the game\'s function if the tap didn\'t take, then the script',
+        Tooltip = 'key press: taps Space for real (executor keypress, only while Roblox is focused and you are not typing), so the game takes it exactly like your own jump. game: on a phone a tap on the game\'s own jump button (its double jump listener on it), else the game\'s double jump function. script: does the same itself. auto: a tap, then the game\'s function if the tap didn\'t take, then the script',
         Values = { 'Auto', 'Key press', 'Game', 'Script' },
         Default = Move.Method,
         Callback = function(v) Move.Method = v or "Auto" end,
