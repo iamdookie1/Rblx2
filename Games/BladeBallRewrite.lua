@@ -31,7 +31,7 @@
 
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.15"
+local SCRIPT_VERSION = "rewrite-0.5.16"
 
 -- ---------------------------------------------------------------------------
 -- Single instance.
@@ -932,6 +932,85 @@ end]]
         if not LocalPlayer:GetAttribute("LobbyTraining") then return false end
         local char, dead = LocalPlayer.Character, Workspace:FindFirstChild("Dead")
         return char ~= nil and dead ~= nil and char.Parent == dead
+    end
+
+    -- ---------- no-hook reflection probe (read-only) ----------
+    -- Step 1 of the hook-free "forge" path. It walks the game's own parry handler
+    -- (UserInputService.InputBegan -> the controller's block handler -> v190 ->
+    -- v50 -> v31, the sender) purely with getconnections + getupvalues and LOGS
+    -- what it finds -- the remote, the 36-char hash, the uid holder and the key
+    -- deriver. It only READS upvalues; it never calls the sender or the deriver,
+    -- so the sender's honeypots (which fire only when it is CALLED) stay quiet.
+    -- Safe to run anywhere. The log tells us the exact upvalue layout to wire the
+    -- live forge (build a token from the key, FireServer ourselves -- no hook).
+    local function reflect_getups()
+        local g = (getgenv and getgenv()) or {}
+        return rawget(g, "getupvalues") or getupvalues or (debug and debug.getupvalues)
+    end
+    local function reflect_connfn(c)
+        for _, k in ipairs({ "Function", "function" }) do
+            local ok, f = pcall(function() return c[k] end)
+            if ok and type(f) == "function" then return f end
+        end
+        return nil
+    end
+    local function reflect_isNet(v)
+        if typeof(v) ~= "table" then return false end
+        local re; pcall(function() re = rawget(v, "RemoteEvent") or v.RemoteEvent end)
+        return type(re) == "function"
+    end
+    local function reflect_classify(v)
+        local t = typeof(v)
+        if t == "string" then return ("string(#%d)%s"):format(#v, #v == 36 and " <-- hash?" or "") end
+        if t == "Instance" then return ("Instance<%s \"%s\">"):format(v.ClassName, v.Name) end
+        if t == "function" then
+            local ok, s = pcall(function() return debug.info(v, "s") end)
+            return "function" .. (ok and (" @" .. tostring(s)) or "")
+        end
+        if t == "table" then return reflect_isNet(v) and "table <-- Net?" or "table" end
+        return t
+    end
+    function Parry.reflectProbe()
+        local getups, getconns = reflect_getups(), getconnections
+        if type(getconns) ~= "function" then logp("reflect: getconnections NOT available on this executor"); return end
+        if type(getups) ~= "function" then logp("reflect: getupvalues NOT available on this executor"); return end
+        local ok, conns = pcall(getconns, UserInputService.InputBegan)
+        if not ok or type(conns) ~= "table" then logp("reflect: getconnections(InputBegan) failed: " .. tostring(conns)); return end
+        logp(("reflect: probing %d InputBegan connections (read-only)..."):format(#conns))
+        local seen, found = {}, {}
+        local function scan(fn, depth)
+            if depth > 5 or type(fn) ~= "function" or seen[fn] then return end
+            seen[fn] = true
+            local ok2, ups = pcall(getups, fn)
+            if not ok2 or type(ups) ~= "table" then return end
+            local has36, hasNet = false, false
+            for _, v in pairs(ups) do
+                if typeof(v) == "string" and #v == 36 then has36 = true end
+                if reflect_isNet(v) then hasNet = true end
+            end
+            if has36 and hasNet then found[#found + 1] = fn end
+            for _, v in pairs(ups) do if type(v) == "function" then scan(v, depth + 1) end end
+        end
+        for _, c in ipairs(conns) do
+            local f = reflect_connfn(c)
+            if f then scan(f, 0) end
+        end
+        if #found == 0 then
+            logp("reflect: no sender candidate (hash + Net in upvalues) reached from InputBegan.")
+            logp("reflect: handler layout differs -- next build will add a getgc fallback.")
+            return
+        end
+        logp(("reflect: %d sender candidate(s) found. Dumping upvalues:"):format(#found))
+        for n, fn in ipairs(found) do
+            local ok3, ups = pcall(getups, fn)
+            local src = select(2, pcall(function() return debug.info(fn, "s") end))
+            logp(("reflect: candidate #%d @%s"):format(n, tostring(src)))
+            if ok3 and type(ups) == "table" then
+                for i, v in pairs(ups) do logp(("   up[%s] = %s"):format(tostring(i), reflect_classify(v))) end
+            end
+            if n >= 2 then break end
+        end
+        logp("reflect: done (nothing was called or fired). Send me these lines.")
     end
 
     -- ---------- token + send ----------
@@ -3208,6 +3287,14 @@ local L_curve = ST:AddLabel("Curve: Camera", true)
 local SB = Tabs.Status:AddRightGroupbox("Build", "info")
 SB:AddLabel("Version: " .. SCRIPT_VERSION)
 SB:AddLabel("Idle = nothing connected. Each feature connects only while it's on.", true)
+SB:AddButton({
+    Text = "No-hook reflect probe",
+    Tooltip = "READ-ONLY test for the hook-free parry. Finds the game's own parry sender via getconnections/getupvalues and logs its layout in the Parry log. Calls nothing and fires nothing -- safe. Run it in a round, then send the 'reflect:' lines.",
+    Func = function()
+        if Parry.reflectProbe then pcall(Parry.reflectProbe) end
+        Notify("Reflect probe", "Ran (read-only). Check the Parry log for the 'reflect:' lines.", 5)
+    end,
+})
 
 local function set(label, text) pcall(function() label:SetText(text) end) end
 StatusHook = function(s, armed)
