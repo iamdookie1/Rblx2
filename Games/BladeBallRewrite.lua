@@ -31,7 +31,7 @@
 
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.18"
+local SCRIPT_VERSION = "rewrite-0.5.19"
 
 -- ---------------------------------------------------------------------------
 -- Single instance.
@@ -992,6 +992,60 @@ end]]
         if n == 0 then logp(("reflect: %s has no upvalues (maybe stripped)"):format(label)) end
         return true
     end
+    local function reflect_trunc(s) s = tostring(s); return #s > 64 and (s:sub(1, 64) .. "..") or s end
+    -- dump a function's string constants (reveals method names, "TIME", marker
+    -- strings, arg patterns -- i.e. the real send logic vs decoy/snitch paths)
+    local function reflect_consts(fn, label)
+        local gc = debug and debug.getconstants
+        if type(gc) ~= "function" then return false end
+        local ok, cs = pcall(gc, fn)
+        if not ok or type(cs) ~= "table" then return true end
+        local out, n = {}, 0
+        for _, c in pairs(cs) do
+            if type(c) == "string" and #c > 0 then n = n + 1; out[#out + 1] = reflect_trunc(c); if n >= 48 then break end end
+        end
+        if #out > 0 then logp(("reflect: %s consts: %s"):format(label, table.concat(out, " | "))) end
+        return true
+    end
+    -- read-only deep dump of the sender: concrete string-upvalue values (hashes /
+    -- keys), the resolved uid, the Net table's keys, and the sender's + nested
+    -- protos' string constants (the real FireServer/token logic usually lives in a
+    -- nested proto). Nothing is called or fired.
+    local function reflect_deep(v31, getups)
+        local ok, ups = pcall(getups, v31)
+        if not ok or type(ups) ~= "table" then return end
+        for i, v in pairs(ups) do
+            if type(v) == "string" then logp(("reflect: up[%s] value = %s"):format(tostring(i), reflect_trunc(v))) end
+            if typeof(v) == "table" and not reflect_isNet(v) then
+                pcall(function()
+                    local idx, tbl = v[1], v[2]
+                    if type(tbl) == "table" and idx ~= nil then
+                        logp(("reflect: up[%s] uid-holder? [1]=%s [3]=%s -> [2][[1]]=%s"):format(
+                            tostring(i), tostring(idx), reflect_trunc(v[3]), reflect_trunc(tbl[idx])))
+                    end
+                end)
+            end
+            if reflect_isNet(v) then
+                pcall(function()
+                    local ks = {}
+                    for k in pairs(v) do ks[#ks + 1] = tostring(k); if #ks >= 14 then break end end
+                    logp(("reflect: up[%s] (Net) keys: %s"):format(tostring(i), table.concat(ks, ", ")))
+                end)
+            end
+        end
+        local gotc = reflect_consts(v31, "v31")
+        if not gotc then logp("reflect: debug.getconstants unavailable") end
+        local gp = debug and debug.getprotos
+        if type(gp) == "function" then
+            local ok2, ps = pcall(gp, v31)
+            if ok2 and type(ps) == "table" then
+                logp(("reflect: v31 has %d nested proto(s)"):format(#ps))
+                for pi, pf in ipairs(ps) do reflect_consts(pf, "proto#" .. pi); if pi >= 6 then break end end
+            end
+        else
+            logp("reflect: debug.getprotos unavailable")
+        end
+    end
     function Parry.reflectProbe()
         local getups = reflect_getups()
         if type(getups) ~= "function" then logp("reflect: getupvalues NOT available on this executor"); return end
@@ -1030,6 +1084,7 @@ end]]
             elseif type(v31) == "function" then
                 logp("reflect: PRY returned a FUNCTION (the sender). Upvalues:")
                 reflect_dump(v31, getups, "v31")
+                reflect_deep(v31, getups)
                 logp("reflect: done (read-only, nothing called/fired). Send me these lines.")
                 return
             elseif type(v31) == "table" then
