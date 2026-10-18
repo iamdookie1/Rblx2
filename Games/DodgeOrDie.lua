@@ -43,6 +43,7 @@ local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local CollectionService = game:GetService("CollectionService")
+local UserInputService = game:GetService("UserInputService")
 local Workspace = workspace
 
 local LocalPlayer = Players.LocalPlayer
@@ -81,6 +82,8 @@ local Dodge = {
     Steer = true,             -- walk / jump clear while both dashes recharge
     SteerWindow = 0.6,        -- s before impact it may take over your movement
     Jump = true,              -- jumping is one of the ways out it may use
+    DoubleJump = true,        -- so is the game's double jump, in the air
+    Combos = true,            -- and a dash with a jump on top
     Practice = true,          -- also dodge practice-area balls
 }
 
@@ -109,6 +112,13 @@ local Predict = {
 local God = { Enabled = false }
 
 local Misc = { AutoDaily = false, AutoQuests = false, AntiAfk = true }
+
+local Move = {
+    AutoDoubleJump = false,   -- after you jump, double jump at the top of it
+    Triple = true,            -- and again at the next top, with the Ninja Jump tool
+    ApexSpeed = 0,            -- jump once rising slower than this (0: the very top)
+    Method = "Auto",          -- Auto / Game / Script
+}
 
 local Stats = { Dodges = 0, Status = "idle", Threat = nil, Method = "-" }
 
@@ -559,7 +569,7 @@ end
 -- falling with gravity onto the floor below), Settle[i] how much of a velocity
 -- change (a dash) has carried you by then.
 local Walk, Fall, Settle = {}, {}, {}
-local Path = { Tau = DashTau, WalkVel = Vector3.zero, Excess = Vector3.zero, Steps = 0, Here = Vector3.zero }
+local Path = { Tau = DashTau, WalkVel = Vector3.zero, Excess = Vector3.zero, Steps = 0, Here = Vector3.zero, FloorRel = 0 }
 
 local function planPath(root, hum, steps)
     local here = root.Position
@@ -579,11 +589,10 @@ local function planPath(root, hum, steps)
     Path.WalkVel = heading * speed
     Path.Excess = flat(velocity) - Path.WalkVel
 
-    local floorY = -math.huge
-    if airborne then
-        local down = Workspace:Raycast(here, Vector3.new(0, -80, 0), WallParams)
-        floorY = down and (here.Y - down.Distance + hum.HipHeight + root.Size.Y / 2) or (here.Y - 80)
-    end
+    local down = Workspace:Raycast(here, Vector3.new(0, -80, 0), WallParams)
+    local floorY = down and (here.Y - down.Distance + hum.HipHeight + root.Size.Y / 2) or (here.Y - 80)
+    Path.FloorRel = math.min(floorY - here.Y, 0)
+    if not airborne then floorY = -math.huge end
     local gravity = Workspace.Gravity
     local x, z = 0, 0
     for i = 1, steps do
@@ -638,24 +647,6 @@ local function stayPath(i)
     return Path.Here + Walk[i] + Path.Excess * Settle[i] + Vector3.new(0, Fall[i], 0)
 end
 
--- a dash along dir at speed v0, now
-local function dashPath(v0)
-    local excess = v0 - Path.WalkVel
-    return function(i)
-        return Path.Here + Walk[i] + excess * Settle[i] + Vector3.new(0, Fall[i], 0)
-    end
-end
-
--- the same dash, made after waiting `wait` seconds on your current path
-local function laterDashPath(v0, wait)
-    local excess = v0 - Path.WalkVel
-    local carried = Path.Excess * settle(Path.Tau, wait)
-    return function(i, t)
-        if t <= wait then return stayPath(i) end
-        return Path.Here + Walk[i] + carried + excess * settle(Path.Tau, t - wait) + Vector3.new(0, Fall[i], 0)
-    end
-end
-
 -- walking a way instead of where you are going (dashes recharging)
 local function walkPath(dir, speed, jumpVel)
     local excess = flat(Path.Excess + Path.WalkVel) - dir * speed
@@ -664,6 +655,33 @@ local function walkPath(dir, speed, jumpVel)
         local y = Fall[i]
         if jumpVel then y = math.max(y, jumpVel * t - 0.5 * gravity * t * t) end
         return Path.Here + dir * speed * t + excess * settle(WALK_TAU, t) + Vector3.new(0, y, 0)
+    end
+end
+
+-- Any way out as a path: a dash (horizontal velocity set to v0), a jump or
+-- double jump (vertical velocity set to vy, then gravity down to the floor),
+-- or both, made after waiting `wait` seconds on your current path.
+local function optionPath(plan, wait)
+    wait = wait or 0
+    local gravity = Workspace.Gravity
+    local excess = plan.V0 and (plan.V0 - Path.WalkVel) or nil
+    local carried = wait > 0 and Path.Excess * settle(Path.Tau, wait) or Vector3.zero
+    local vy = plan.VY
+    local waitIndex = math.clamp(math.floor(wait / SIM_STEP), 0, Path.Steps)
+    local yWait = waitIndex > 0 and Fall[waitIndex] or 0
+    local floor = Path.FloorRel
+    return function(i, t)
+        if t <= wait then return stayPath(i) end
+        local since = t - wait
+        local h
+        if excess then
+            h = Walk[i] + carried + excess * (wait > 0 and settle(Path.Tau, since) or Settle[i])
+        else
+            h = Walk[i] + Path.Excess * Settle[i]
+        end
+        local y = Fall[i]
+        if vy then y = math.max(floor, yWait + vy * since - 0.5 * gravity * since * since) end
+        return Path.Here + Vector3.new(h.X, y, h.Z)
     end
 end
 
@@ -807,6 +825,143 @@ local function watchDash(root, hum)
     end
     if age > 0.8 then DashWatch = nil end
 end
+
+--// double jump ------------------------------------------------------------
+-- The game's DoubleJump script: Space while falling, from 0.175s after leaving
+-- the ground, once (twice with the Ninja Jump tool) until you land. It sends
+-- MovementGrace("DoubleJump") and sets your upward speed to 50 + Jump/3. Its
+-- own key handler is called, so its own count and checks apply; the script
+-- version does the same two things itself, for when the handler can't be found.
+
+local Air = { Since = nil, Used = 0 }
+
+local function jumpUpgrade()
+    local upgrades = LocalPlayer:FindFirstChild("Upgrades")
+    local jump = upgrades and upgrades:FindFirstChild("Jump")
+    local value = jump and tonumber(jump.Value) or 0
+    if Upgrades and type(Upgrades.GetEffectiveAmount) == "function" then
+        local ok, effective = pcall(Upgrades.GetEffectiveAmount, value)
+        if ok and type(effective) == "number" then return effective end
+    end
+    return value
+end
+
+local function airJumpsAllowed()
+    local equipped = LocalPlayer:FindFirstChild("EquippedTool")
+    if equipped then
+        for _, v in ipairs(equipped:GetChildren()) do
+            if v.Name == "NinjaJump" and v.Value == true then return 2 end
+        end
+    end
+    return 1
+end
+
+local function airJumpSpeed()
+    return 50 + jumpUpgrade() / 3
+end
+
+-- the game's own rule for when a double jump goes
+local function airJumpReady(hum)
+    if not hum or hum:GetState() ~= Enum.HumanoidStateType.Freefall then return false end
+    if not Air.Since or os.clock() - Air.Since < 0.18 then return false end
+    return Air.Used < airJumpsAllowed()
+end
+
+local function watchAir(char)
+    local hum = char:WaitForChild("Humanoid", 10)
+    if not hum then return end
+    Air.Since, Air.Used = nil, 0
+    track(hum.StateChanged:Connect(function(_, new)
+        if new == Enum.HumanoidStateType.Jumping or new == Enum.HumanoidStateType.Freefall then
+            Air.Since = Air.Since or os.clock()
+        elseif new == Enum.HumanoidStateType.Landed or new == Enum.HumanoidStateType.Running then
+            Air.Since, Air.Used = nil, 0
+        end
+    end))
+end
+if LocalPlayer.Character then task.spawn(watchAir, LocalPlayer.Character) end
+track(LocalPlayer.CharacterAdded:Connect(function(char) task.spawn(watchAir, char) end))
+
+-- your own Space presses in the air count against the game's limit too
+track(UserInputService.InputBegan:Connect(function(input, processed)
+    if processed or input.KeyCode ~= Enum.KeyCode.Space then return end
+    local char = LocalPlayer.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    if airJumpReady(hum) then Air.Used += 1 end
+end))
+
+local DJHandlers = nil
+local function findDJHandlers()
+    if DJHandlers ~= nil then return DJHandlers end
+    DJHandlers = false
+    if typeof(getconnections) ~= "function" or typeof(debug) ~= "table" or type(debug.info) ~= "function" then return false end
+    local function pick(signal)
+        local ok, list = pcall(getconnections, signal)
+        if not ok or type(list) ~= "table" then return nil end
+        for _, connection in ipairs(list) do
+            local fn = connection.Function
+            if type(fn) == "function" then
+                local okSrc, src = pcall(debug.info, fn, "s")
+                if okSrc and type(src) == "string" and src:find("DoubleJump", 1, true) then return fn end
+            end
+        end
+        return nil
+    end
+    local began = pick(UserInputService.InputBegan)
+    if began then DJHandlers = { Began = began, Ended = pick(UserInputService.InputEnded) } end
+    return DJHandlers
+end
+
+local FAKE_SPACE = { KeyCode = Enum.KeyCode.Space, UserInputType = Enum.UserInputType.Keyboard }
+
+local function doAirJump(root, hum)
+    if not airJumpReady(hum) then return false end
+    local before = root.AssemblyLinearVelocity.Y
+    local done = false
+    if Move.Method ~= "Script" then
+        local handlers = findDJHandlers()
+        if handlers then
+            -- release first, in case Space is still held from your jump
+            if handlers.Ended then pcall(handlers.Ended, FAKE_SPACE) end
+            pcall(handlers.Began, FAKE_SPACE, false)
+            if handlers.Ended then pcall(handlers.Ended, FAKE_SPACE) end
+            done = root.AssemblyLinearVelocity.Y > before + 10
+        end
+    end
+    if not done and Move.Method ~= "Game" then
+        local grace = remote("MovementGrace")
+        if grace then pcall(function() grace:FireServer("DoubleJump") end) end
+        local v = root.AssemblyLinearVelocity
+        root.AssemblyLinearVelocity = Vector3.new(v.X, airJumpSpeed(), v.Z)
+        done = true
+    end
+    if done then Air.Used += 1 end
+    return done
+end
+
+-- auto double jump: after a jump you made yourself, at the top of it
+local ManualJumpAt = 0
+local LastVY = 0
+track(UserInputService.JumpRequest:Connect(function()
+    local char = LocalPlayer.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    if hum and hum.FloorMaterial ~= Enum.Material.Air then ManualJumpAt = os.clock() end
+end))
+
+track(RunService.Heartbeat:Connect(function()
+    if Unloaded or not Move.AutoDoubleJump then return end
+    pcall(function()
+        local _, root, hum = myCharacter()
+        if not root then return end
+        local vy = root.AssemblyLinearVelocity.Y
+        local fresh = os.clock() - ManualJumpAt < 3
+        local wanted = Air.Used == 0 or (Move.Triple and Air.Used < airJumpsAllowed())
+        if fresh and wanted and LastVY > Move.ApexSpeed and vy <= Move.ApexSpeed and airJumpReady(hum) then
+            doAirJump(root, hum)
+        end
+        LastVY = vy
+    end)
+end))
 
 --// steering -----------------------------------------------------------------------
 -- With both dashes recharging, it can still walk you out of the way: for this
@@ -1024,17 +1179,33 @@ local function dodgeStep(dt)
     local frame = math.max(dt, 1 / 240)
     local buffer = math.max(Dodge.SafetyBuffer, frame * 2)
 
-    -- every way around you, by whichever side dash is ready
+    -- every way out: side dashes at every angle, a jump, a double jump, and
+    -- a dash with either on top, all played against every ball
     local readyButtons = {}
     for _, button in ipairs(SIDES) do
         if ready(button, now) then readyButtons[#readyButtons + 1] = button end
     end
+    local airborne = isAirborne(hum)
+    local jumpVel = nil
+    if Dodge.Jump and not airborne then
+        jumpVel = hum.UseJumpPower and hum.JumpPower or math.sqrt(2 * Workspace.Gravity * math.max(hum.JumpHeight, 0))
+        if jumpVel <= 0 then jumpVel = nil end
+    end
+    local airVel = (Dodge.DoubleJump and airborne and airJumpReady(hum)) and airJumpSpeed() or nil
 
+    local intent = Motion.Intent
+    local plans = {}
+    local function consider(plan, cost)
+        plan.Gap = clearance(optionPath(plan), planSteps)
+        local heading = (plan.Dir and intent.Magnitude > 0) and intent:Dot(plan.Dir) * Dodge.KeepHeading or 0
+        plan.Score = math.min(plan.Gap, 10) + heading + (plan.RoomBonus or 0) - cost
+        plans[#plans + 1] = plan
+    end
+
+    local dashes = {}
     if #readyButtons > 0 then
         local speed = dashSpeed(hum)
         local full = speed * Path.Tau
-        local intent = Motion.Intent
-        local plans = {}
         for k = 0, Dodge.Directions - 1 do
             local dir = rotateY(Vector3.new(0, 0, -1), k * (2 * math.pi / Dodge.Directions))
             local room, void = roomFor(root, hum, dir, full)
@@ -1045,95 +1216,116 @@ local function dodgeStep(dt)
                     if d > bestDot then button, bestDot = b, d end
                 end
                 local v0 = dir * speed * (full > 0 and math.clamp(room / full, 0, 1) or 0)
-                local gap = clearance(dashPath(v0), planSteps)
-                local score = math.min(gap, 10)
-                    + (intent.Magnitude > 0 and intent:Dot(dir) * Dodge.KeepHeading or 0)
-                    + (room / math.max(full, 1)) * 0.5
-                plans[#plans + 1] = { Dir = dir, Button = button, Speed = speed, V0 = v0, Gap = gap, Score = score }
-            end
-        end
-        table.sort(plans, function(a, b) return a.Score > b.Score end)
-        local best = plans[1]
-        if best then Stats.Plan = { Dir = best.Dir, Gap = best.Gap, At = now } end
-
-        if best then
-            -- the room it has to leave: the safety room if any dash manages
-            -- that, else just not touching
-            local need = best.Gap > Dodge.Margin and Dodge.Margin or 0
-            if best.Gap > need then
-                local go
-                if Dodge.Mode == "Early" then
-                    go = not hitAt or hitAt <= Dodge.EarlyWindow
-                else
-                    -- the last safe moment: dash now unless one of the best
-                    -- few would still clear it after waiting the buffer
-                    local canWait = false
-                    if hitAt and hitAt > buffer then
-                        for i = 1, math.min(#plans, 4) do
-                            local plan = plans[i]
-                            if plan.Gap <= need then break end
-                            if clearance(laterDashPath(plan.V0, buffer), planSteps) > need then
-                                canWait = true
-                                break
-                            end
-                        end
-                    end
-                    go = not canWait
-                end
-                if go then
-                    if doDash(best, root, hum) then
-                        Stats.Status = ("dodged, %d° %s, %.1f studs clear"):format(
-                            math.floor(math.deg(math.atan2(-best.Dir.X, -best.Dir.Z)) % 360), best.Button:lower(), best.Gap)
-                    else
-                        Stats.Status = "dash failed"
-                    end
-                else
-                    Stats.Status = ("ball in %.2fs, waiting for the last safe moment"):format(hitAt or 0)
-                end
-                return
-            end
-            -- nothing clears it: the dash that gets furthest, at the very end
-            if hitAt and hitAt <= buffer then
-                doDash(best, root, hum)
-                Stats.Status = "dodged (closest call)"
-                return
+                local plan = { Kind = "dash", Dir = dir, Button = button, Speed = speed, V0 = v0,
+                    RoomBonus = (room / math.max(full, 1)) * 0.5 }
+                consider(plan, 0.2)
+                dashes[#dashes + 1] = plan
             end
         end
     end
-
-    -- dashes recharging or no dash helps: walk (and jump) the safest way
-    if Dodge.Steer and hitAt and hitAt <= Dodge.SteerWindow then
-        local speed = hum.WalkSpeed
-        local jumpVel = nil
-        if Dodge.Jump and not isAirborne(hum) then
-            jumpVel = hum.UseJumpPower and hum.JumpPower or math.sqrt(2 * Workspace.Gravity * math.max(hum.JumpHeight, 0))
+    if jumpVel then consider({ Kind = "jump", VY = jumpVel }, 0.1) end
+    if airVel then consider({ Kind = "air", VY = airVel }, 0.5) end
+    if Dodge.Combos and (jumpVel or airVel) and #dashes > 0 then
+        table.sort(dashes, function(a, b) return a.Score > b.Score end)
+        for i = 1, math.min(#dashes, 6) do
+            local d = dashes[i]
+            consider({ Kind = jumpVel and "dash+jump" or "dash+air", Dir = d.Dir, Button = d.Button, Speed = d.Speed,
+                V0 = d.V0, VY = jumpVel or airVel, RoomBonus = d.RoomBonus }, jumpVel and 0.3 or 0.7)
         end
-        local bestDir, bestJump, bestGap = nil, false, stayRoom
+    end
+    table.sort(plans, function(a, b) return a.Score > b.Score end)
+    local best = plans[1]
+    if best and best.Dir then Stats.Plan = { Dir = best.Dir, Gap = best.Gap, At = now } end
+
+    local function execute(plan)
+        local ok = true
+        if plan.V0 then ok = doDash(plan, root, hum) end
+        if plan.Kind == "jump" or plan.Kind == "dash+jump" then
+            hum.Jump = true
+            pcall(function() hum:ChangeState(Enum.HumanoidStateType.Jumping) end)
+        elseif plan.Kind == "air" or plan.Kind == "dash+air" then
+            doAirJump(root, hum)
+        end
+        return ok
+    end
+
+    local function describe(plan)
+        if plan.Kind == "jump" then return "jumped" end
+        if plan.Kind == "air" then return "double jumped" end
+        local angle = math.floor(math.deg(math.atan2(-plan.Dir.X, -plan.Dir.Z)) % 360)
+        local extra = plan.Kind == "dash+jump" and " + jump" or (plan.Kind == "dash+air" and " + double jump" or "")
+        return ("dashed %d° %s%s"):format(angle, plan.Button:lower(), extra)
+    end
+
+    if best then
+        -- the room it has to leave: the safety room if anything manages
+        -- that, else just not touching
+        local need = best.Gap > Dodge.Margin and Dodge.Margin or 0
+        if best.Gap > need then
+            local go
+            if Dodge.Mode == "Early" then
+                go = hitAt <= Dodge.EarlyWindow
+            else
+                -- the last safe moment: act now unless one of the best few
+                -- would still get clear after waiting the buffer
+                local canWait = false
+                if hitAt > buffer then
+                    for i = 1, math.min(#plans, 4) do
+                        local plan = plans[i]
+                        if plan.Gap <= need then break end
+                        if clearance(optionPath(plan, buffer), planSteps) > need then
+                            canWait = true
+                            break
+                        end
+                    end
+                end
+                go = not canWait
+            end
+            if go then
+                if execute(best) then
+                    Stats.Status = ("%s, %.1f studs clear"):format(describe(best), best.Gap)
+                else
+                    Stats.Status = "dash failed"
+                end
+            else
+                Stats.Status = ("ball in %.2fs, waiting for the last safe moment"):format(hitAt)
+            end
+            return
+        end
+        -- nothing clears it: whatever gets furthest, at the very end
+        if hitAt <= buffer then
+            execute(best)
+            Stats.Status = describe(best) .. " (closest call)"
+            return
+        end
+    end
+
+    -- nothing works yet: walk the safest way
+    if Dodge.Steer and hitAt <= Dodge.SteerWindow then
+        local speed = hum.WalkSpeed
+        local bestDir, bestGap = nil, stayRoom
         for k = 0, 15 do
             local dir = rotateY(Vector3.new(0, 0, -1), k * (math.pi / 8))
             local room = roomFor(root, hum, dir, 6)
             if room >= 3 then
                 local gap = clearance(walkPath(dir, speed, nil), planSteps)
-                if gap > bestGap + 0.2 then bestDir, bestJump, bestGap = dir, false, gap end
+                if gap > bestGap + 0.2 then bestDir, bestGap = dir, gap end
             end
         end
-        if jumpVel and jumpVel > 0 then
-            local dir = bestDir or (Path.WalkVel.Magnitude > 0.1 and Path.WalkVel.Unit) or Vector3.zero
-            local gap = clearance(walkPath(dir, dir.Magnitude > 0 and speed or 0, jumpVel), planSteps)
-            if gap > bestGap + 0.2 then bestJump, bestGap = true, gap end
-        end
-        if bestDir or bestJump then
-            SteerDir, SteerJump = bestDir, bestJump
-            Stats.Status = ("dashes recharging, %s%s (%.1f studs)"):format(
-                bestDir and "steering clear" or "", bestJump and (bestDir and " + jump" or "jumping") or "", bestGap)
+        if bestDir then
+            SteerDir = bestDir
+            Stats.Status = ("steering clear (%.1f studs)"):format(bestGap)
             return
         end
     end
-    Stats.Status = #readyButtons == 0 and ("ball in %.2fs, both dashes recharging"):format(hitAt or 0)
-        or ("ball in %.2fs, no clean dodge yet"):format(hitAt or 0)
+    Stats.Status = (#readyButtons == 0 and not jumpVel and not airVel)
+        and ("ball in %.2fs, everything recharging"):format(hitAt)
+        or ("ball in %.2fs, no clean dodge yet"):format(hitAt)
 end
 
-track(RunService.Heartbeat:Connect(function(dt)
+-- before physics each frame, so a dash or jump moves you this very frame
+-- rather than the next
+local function onStep(dt)
     if Unloaded then return end
     local ok, err = pcall(dodgeStep, dt)
     if not ok then
@@ -1144,7 +1336,13 @@ track(RunService.Heartbeat:Connect(function(dt)
             log("Error", "auto dodge: " .. tostring(err))
         end
     end
-end))
+end
+local okPre = pcall(function()
+    track(RunService.PreSimulation:Connect(onStep))
+end)
+if not okPre then
+    track(RunService.Stepped:Connect(function(_, dt) onStep(dt) end))
+end
 
 --// godmode -------------------------------------------------------------------
 -- The game only learns you were hit from your own hit detection scripts.
@@ -1671,6 +1869,20 @@ do
         Callback = function(v) Dodge.Jump = v end,
     })
 
+    dodge:AddToggle('dd_djump', {
+        Text = 'Double jump when it helps',
+        Tooltip = 'in the air, the game\'s double jump is one of the ways out it weighs',
+        Default = Dodge.DoubleJump,
+        Callback = function(v) Dodge.DoubleJump = v end,
+    })
+
+    dodge:AddToggle('dd_combos', {
+        Text = 'Dash + jump combos',
+        Tooltip = 'also weighs a dash with a jump or double jump on top, for balls a dash alone can\'t shake',
+        Default = Dodge.Combos,
+        Callback = function(v) Dodge.Combos = v end,
+    })
+
     dodge:AddToggle('dd_practice', {
         Text = 'Practice area too',
         Default = Dodge.Practice,
@@ -1732,6 +1944,33 @@ do
         Tooltip = 'never dashes somewhere with no floor under it',
         Default = Dodge.VoidCheck,
         Callback = function(v) Dodge.VoidCheck = v end,
+    })
+
+    local move = Tab:AddRightGroupbox('Movement', 'arrow-up')
+    move:AddToggle('dd_autodj', {
+        Text = 'Auto double jump',
+        Tooltip = 'after you jump, uses the game\'s double jump at the very top of it',
+        Default = Move.AutoDoubleJump,
+        Callback = function(v) Move.AutoDoubleJump = v end,
+    }):AddKeyPicker('dd_autodj_key', { Default = 'None', Mode = 'Toggle', SyncToggleState = true, Text = 'Auto double jump' })
+    move:AddToggle('dd_triple', {
+        Text = 'Triple jump too',
+        Tooltip = 'with the Ninja Jump tool, jumps again at the top of the double jump',
+        Default = Move.Triple,
+        Callback = function(v) Move.Triple = v end,
+    })
+    move:AddSlider('dd_apex', {
+        Text = 'Jump when rising slower than',
+        Tooltip = '0 jumps at the very top. higher jumps a little before the top',
+        Min = 0, Max = 30, Default = Move.ApexSpeed, Rounding = 0, Suffix = ' studs/s',
+        Callback = function(v) Move.ApexSpeed = v end,
+    })
+    move:AddDropdown('dd_djmethod', {
+        Text = 'Double jump with',
+        Tooltip = 'game: calls the game\'s own double jump, its limits included. script: does the same itself. auto: the game\'s, else the script',
+        Values = { 'Auto', 'Game', 'Script' },
+        Default = Move.Method,
+        Callback = function(v) Move.Method = v or "Auto" end,
     })
 
     local god = Tab:AddRightGroupbox('Godmode (risky)', 'skull')
