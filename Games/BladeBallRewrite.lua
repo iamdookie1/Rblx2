@@ -31,7 +31,7 @@
 
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.16"
+local SCRIPT_VERSION = "rewrite-0.5.17"
 
 -- ---------------------------------------------------------------------------
 -- Single instance.
@@ -970,16 +970,75 @@ end]]
         if t == "table" then return reflect_isNet(v) and "table <-- Net?" or "table" end
         return t
     end
+    -- dump a function's upvalues (optionally one level into table upvalues) to the log
+    local function reflect_dump(fn, getups, label)
+        local ok, ups = pcall(getups, fn)
+        if not ok or type(ups) ~= "table" then logp(("reflect: getupvalues(%s) failed: %s"):format(label, tostring(ups))); return false end
+        local n = 0
+        for i, v in pairs(ups) do
+            n = n + 1
+            logp(("   %s up[%s] = %s"):format(label, tostring(i), reflect_classify(v)))
+            -- one level into a Net-ish or uid-ish table so we can spot hash/uid strings
+            if typeof(v) == "table" and not reflect_isNet(v) then
+                local ok2 = pcall(function()
+                    local c = 0
+                    for k, vv in pairs(v) do
+                        c = c + 1; if c > 6 then break end
+                        logp(("       .%s = %s"):format(tostring(k), reflect_classify(vv)))
+                    end
+                end)
+            end
+        end
+        if n == 0 then logp(("reflect: %s has no upvalues (maybe stripped)"):format(label)) end
+        return true
+    end
     function Parry.reflectProbe()
-        local getups, getconns = reflect_getups(), getconnections
-        if type(getconns) ~= "function" then logp("reflect: getconnections NOT available on this executor"); return end
+        local getups = reflect_getups()
         if type(getups) ~= "function" then logp("reflect: getupvalues NOT available on this executor"); return end
+        -- Primary: the sender is require(ReplicatedStorage.Controllers.SwordsController.PRY).
+        -- Requiring an already-loaded ModuleScript returns its CACHED value -- no code
+        -- runs, no traps -- and it is the same sender the game uses, so its upvalues
+        -- (remote, hash, uid, key deriver) are readable directly. No getgc, no hook.
+        local pry
+        pcall(function()
+            pry = ReplicatedStorage:FindFirstChild("Controllers")
+            pry = pry and pry:FindFirstChild("SwordsController")
+            pry = pry and pry:FindFirstChild("PRY")
+        end)
+        if pry then
+            logp("reflect: found PRY module; requiring (cached, read-only)...")
+            local ok, v31 = pcall(require, pry)
+            if not ok then
+                logp("reflect: require(PRY) errored: " .. tostring(v31))
+            elseif type(v31) == "function" then
+                logp("reflect: PRY returned a FUNCTION (the sender). Upvalues:")
+                reflect_dump(v31, getups, "v31")
+                logp("reflect: done (read-only, nothing called/fired). Send me these lines.")
+                return
+            elseif type(v31) == "table" then
+                logp("reflect: PRY returned a TABLE; dumping its function fields' upvalues:")
+                local c = 0
+                for k, vv in pairs(v31) do
+                    if type(vv) == "function" then c = c + 1; reflect_dump(vv, getups, "PRY." .. tostring(k)) end
+                    if c > 8 then break end
+                end
+                logp("reflect: done (read-only). Send me these lines.")
+                return
+            else
+                logp("reflect: PRY returned a " .. typeof(v31) .. " (unexpected).")
+            end
+        else
+            logp("reflect: ReplicatedStorage.Controllers.SwordsController.PRY not found (path changed?)")
+        end
+        -- Fallback: walk InputBegan handlers' upvalues (no getgc).
+        local getconns = getconnections
+        if type(getconns) ~= "function" then logp("reflect: getconnections unavailable; cannot fall back"); return end
         local ok, conns = pcall(getconns, UserInputService.InputBegan)
         if not ok or type(conns) ~= "table" then logp("reflect: getconnections(InputBegan) failed: " .. tostring(conns)); return end
-        logp(("reflect: probing %d InputBegan connections (read-only)..."):format(#conns))
+        logp(("reflect: fallback -- scanning %d InputBegan handlers (read-only)..."):format(#conns))
         local seen, found = {}, {}
         local function scan(fn, depth)
-            if depth > 5 or type(fn) ~= "function" or seen[fn] then return end
+            if depth > 6 or type(fn) ~= "function" or seen[fn] then return end
             seen[fn] = true
             local ok2, ups = pcall(getups, fn)
             if not ok2 or type(ups) ~= "table" then return end
@@ -991,26 +1050,14 @@ end]]
             if has36 and hasNet then found[#found + 1] = fn end
             for _, v in pairs(ups) do if type(v) == "function" then scan(v, depth + 1) end end
         end
-        for _, c in ipairs(conns) do
-            local f = reflect_connfn(c)
-            if f then scan(f, 0) end
-        end
+        for _, c in ipairs(conns) do local f = reflect_connfn(c); if f then scan(f, 0) end end
         if #found == 0 then
-            logp("reflect: no sender candidate (hash + Net in upvalues) reached from InputBegan.")
-            logp("reflect: handler layout differs -- next build will add a getgc fallback.")
+            logp("reflect: fallback found no sender candidate either. Send me the PRY lines above.")
             return
         end
-        logp(("reflect: %d sender candidate(s) found. Dumping upvalues:"):format(#found))
-        for n, fn in ipairs(found) do
-            local ok3, ups = pcall(getups, fn)
-            local src = select(2, pcall(function() return debug.info(fn, "s") end))
-            logp(("reflect: candidate #%d @%s"):format(n, tostring(src)))
-            if ok3 and type(ups) == "table" then
-                for i, v in pairs(ups) do logp(("   up[%s] = %s"):format(tostring(i), reflect_classify(v))) end
-            end
-            if n >= 2 then break end
-        end
-        logp("reflect: done (nothing was called or fired). Send me these lines.")
+        logp(("reflect: fallback found %d candidate(s):"):format(#found))
+        for n, fn in ipairs(found) do reflect_dump(fn, getups, "cand" .. n); if n >= 2 then break end end
+        logp("reflect: done (read-only). Send me these lines.")
     end
 
     -- ---------- token + send ----------
