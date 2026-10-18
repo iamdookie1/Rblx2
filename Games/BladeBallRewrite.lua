@@ -31,7 +31,7 @@
 
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.17"
+local SCRIPT_VERSION = "rewrite-0.5.18"
 
 -- ---------------------------------------------------------------------------
 -- Single instance.
@@ -999,14 +999,31 @@ end]]
         -- Requiring an already-loaded ModuleScript returns its CACHED value -- no code
         -- runs, no traps -- and it is the same sender the game uses, so its upvalues
         -- (remote, hash, uid, key deriver) are readable directly. No getgc, no hook.
+        -- Names on this path carry an invisible/odd character (the dump shows
+        -- "SwordsController .PRY" with a stray space), so FindFirstChild by exact
+        -- name misses. Match on alphanumerics only, which drops any such char.
+        local function clean(s) return (tostring(s):gsub("[^%w]", "")) end
         local pry
         pcall(function()
-            pry = ReplicatedStorage:FindFirstChild("Controllers")
-            pry = pry and pry:FindFirstChild("SwordsController")
-            pry = pry and pry:FindFirstChild("PRY")
+            local c = ReplicatedStorage:FindFirstChild("Controllers")
+            local sc = c and c:FindFirstChild("SwordsController")
+            pry = sc and sc:FindFirstChild("PRY")
         end)
+        if not pry then
+            pcall(function()
+                for _, d in ipairs(ReplicatedStorage:GetDescendants()) do
+                    if d:IsA("ModuleScript") and clean(d.Name):upper() == "PRY" then
+                        local p = d.Parent
+                        if p and clean(p.Name):find("[Ss]word") then pry = d; break end
+                        pry = pry or d
+                    end
+                end
+            end)
+        end
         if pry then
-            logp("reflect: found PRY module; requiring (cached, read-only)...")
+            logp(("reflect: found module '%s' at %s"):format(pry.Name, pry:GetFullName()))
+            logp("reflect: name bytes = " .. table.concat({ string.byte(pry.Name, 1, math.min(#pry.Name, 20)) }, ","))
+            logp("reflect: requiring (cached, read-only)...")
             local ok, v31 = pcall(require, pry)
             if not ok then
                 logp("reflect: require(PRY) errored: " .. tostring(v31))
