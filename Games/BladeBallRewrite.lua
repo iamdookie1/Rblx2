@@ -31,7 +31,7 @@
 
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.20"
+local SCRIPT_VERSION = "rewrite-0.5.21"
 
 -- ---------------------------------------------------------------------------
 -- Single instance.
@@ -69,6 +69,26 @@ local function hui()
     local ok, h = pcall(function() return gethui and gethui() end)
     if ok and typeof(h) == 'Instance' then return h end
     return CoreGui
+end
+-- A random, innocuous instance name (no "BB_*" giveaway for a name scan).
+local function randName()
+    local t = {}
+    for i = 1, 12 do t[i] = string.char(math.random(97, 122)) end
+    return table.concat(t)
+end
+-- Park a GUI in the hidden container AND mark it protected where the executor
+-- supports it, so a CoreGui/instance scan the game can run cannot enumerate it.
+-- gethui alone hides it on most executors; protect_gui/protectgui is the
+-- belt-and-braces for builds where it doesn't. Our hand-made GUIs (the mobile
+-- spam switch, ability ESP, overlays) went in with a plain parent and a
+-- distinctive name before this -- unlike the menu library, which protects
+-- itself -- so they were the one scannable thing we left in the lobby.
+local function hideGui(gui)
+    pcall(function() if syn and syn.protect_gui then syn.protect_gui(gui) end end)
+    pcall(function() if protectgui then protectgui(gui) end end)
+    pcall(function() if protect_gui then protect_gui(gui) end end)
+    pcall(function() gui.Parent = hui() end)
+    return gui
 end
 local function getRoot()
     local char = LocalPlayer.Character
@@ -2437,7 +2457,7 @@ do
     function Orb.show()
         if gui or not touchUI then return end
         gui = Instance.new("ScreenGui")
-        gui.Name = "BB_SpamSwitch"; gui.ResetOnSpawn = false; gui.IgnoreGuiInset = true
+        gui.Name = randName(); gui.ResetOnSpawn = false; gui.IgnoreGuiInset = true
         gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling; gui.DisplayOrder = 9999
         root = Instance.new("Frame")
         root.Size = UDim2.fromOffset(W, H); root.AnchorPoint = Vector2.new(0.5, 0.5)
@@ -2505,7 +2525,7 @@ do
                 if i == press_input or i.UserInputType == Enum.UserInputType.MouseButton1 then release_press() end
             end)
         end)
-        gui.Parent = hui()
+        hideGui(gui)
         painted = nil
         paint()
     end
@@ -3062,7 +3082,7 @@ local function speed_color(s)
     return Color3.fromRGB(255, 255, 0)
 end
 local function panel(name, size, pos, title_text)
-    local gui = Instance.new("ScreenGui"); gui.Name = name; gui.ResetOnSpawn = false
+    local gui = Instance.new("ScreenGui"); gui.Name = randName(); gui.ResetOnSpawn = false
     gui.IgnoreGuiInset = true; gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling; gui.DisplayOrder = 999
     local frame = Instance.new("Frame"); frame.Size = size; frame.Position = pos
     frame.BackgroundColor3 = Color3.fromRGB(14, 14, 18); frame.BackgroundTransparency = 0.25
@@ -3080,7 +3100,7 @@ local function panel(name, size, pos, title_text)
         l.TextSize = 14; l.RichText = true; l.TextXAlignment = Enum.TextXAlignment.Left
         return l
     end
-    gui.Parent = hui()
+    hideGui(gui)
     return gui, line
 end
 
@@ -3165,29 +3185,23 @@ do
         if e and e.head == head then return e end
         if e then remove(player) end -- respawned: rebuild on the new head
         local bb = Instance.new('BillboardGui')
-        bb.Name = 'BB_AbilityESP'; bb.Adornee = head; bb.Size = UDim2.new(0, 220, 0, 60)
+        bb.Name = randName(); bb.Adornee = head; bb.Size = UDim2.new(0, 220, 0, 60)
         bb.StudsOffset = Vector3.new(0, EspCfg.Height, 0); bb.AlwaysOnTop = true
         local label = Instance.new('TextLabel')
         label.Size = UDim2.new(1, 0, 1, 0); label.BackgroundTransparency = 1; label.TextColor3 = EspCfg.Color
         label.TextSize = EspCfg.TextSize; label.TextStrokeTransparency = 0; label.Font = Enum.Font.Roboto
         label.RichText = true; label.Visible = false; label.Parent = bb
-        bb.Parent = hui()
+        hideGui(bb)
         e = { bb = bb, label = label, character = character, head = head }
         entries[player] = e
         return e
     end
-    -- One driver, loop-paced. Builds/refreshes a billboard per other player, but
-    -- ONLY while you are in play (a round / lobby training / lobby parry). In the
-    -- plain lobby every billboard is torn down and the loop does nothing -- so the
-    -- script's only continuous lobby activity is gone. This is the kick-isolation
-    -- change: with the engine already asleep in the lobby, ESP was the last
-    -- always-on, game-touching piece. If kicks stop, this was it (and ESP will be
-    -- made lobby-safe); if not, ESP is ruled out.
+    -- One driver, loop-paced: every tick, (re)build a billboard per other player
+    -- and refresh its text. Runs everywhere (lobby and rounds); the billboards are
+    -- parked via hideGui (protected + hidden container), so they are not a scan
+    -- surface. (ESP was ruled out as the idle-kick cause in 0.5.20, so it is no
+    -- longer gated to in_play.)
     local function update()
-        if not in_play() then
-            if next(entries) then clear_all() end
-            return
-        end
         local my = getRoot()
         for _, player in ipairs(Players:GetPlayers()) do
             local e = player ~= LocalPlayer and ensure_entry(player) or nil
