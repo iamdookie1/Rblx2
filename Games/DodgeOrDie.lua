@@ -20,6 +20,11 @@
 --    "Lobby" after 10 seconds, and every ball to "Part".
 --  * Anti cheat: CLIENT_ANTI kicks ("VIM") the moment VirtualInputManager or
 --    VirtualUser exists as a service, so nothing here ever touches either.
+--    The double jump is a real Space tap through the executor's keypress
+--    instead, which the game takes exactly like your own key.
+--  * DashHandler's last-used times and DoubleJump's count are read from the
+--    scripts' locals, so cooldowns and double jumps match the game's own,
+--    your manual dashes and jumps included.
 --    DetectionScript reports known hub GUIs by name, so this one's menu uses
 --    its own names only.
 --
@@ -67,7 +72,7 @@ end
 
 local Dodge = {
     Enabled = false,
-    Method = "Auto",          -- Auto / Game buttons / Script dash
+    Method = "Auto",          -- Auto / Game dash / Game buttons / Script dash
     Mode = "Last moment",     -- Last moment / Early
     SafetyBuffer = 0.1,       -- s: dashes this much before the last possible moment
     EarlyWindow = 0.3,        -- s before impact, in early mode
@@ -118,7 +123,7 @@ local Move = {
     AutoDoubleJump = false,   -- after you jump, double jump at the top of it
     Triple = true,            -- and again at the next top, with the Ninja Jump tool
     ApexSpeed = 0,            -- jump once rising slower than this (0: the very top)
-    Method = "Auto",          -- Auto / Game / Script
+    Method = "Auto",          -- Auto / Key press / Game / Script
 }
 
 local Stats = { Dodges = 0, Status = "idle", Threat = nil, Method = "-" }
@@ -510,6 +515,8 @@ local function wallIgnore()
     WallParams.FilterDescendantsInstances = ignore
 end
 
+local Path -- your path this frame (below); roomFor reads the floor under you from it
+
 -- How much of a dash's travel is really open: walls stop it, and with the void
 -- check a dash that would leave the floor counts as no room at all.
 local function roomFor(root, hum, dir, want)
@@ -520,7 +527,9 @@ local function roomFor(root, hum, dir, want)
     end
     if Dodge.VoidCheck and room > 4 then
         local land = root.Position + dir * room
-        local depth = hum.HipHeight + root.Size.Y / 2 + 12
+        -- measured down to the floor under you, so high in the air (after a
+        -- double jump, say) the floor still counts as floor
+        local depth = hum.HipHeight + root.Size.Y / 2 + 12 - (Path.FloorRel or 0)
         if not Workspace:Raycast(land, Vector3.new(0, -depth, 0), WallParams) then
             -- try halfway, else there is no safe room this way
             local half = root.Position + dir * room * 0.5
@@ -571,7 +580,7 @@ end
 -- falling with gravity onto the floor below), Settle[i] how much of a velocity
 -- change (a dash) has carried you by then.
 local Walk, Fall, Settle = {}, {}, {}
-local Path = { Tau = DashTau, WalkVel = Vector3.zero, Excess = Vector3.zero, Steps = 0, Here = Vector3.zero, FloorRel = 0 }
+Path = { Tau = DashTau, WalkVel = Vector3.zero, Excess = Vector3.zero, Steps = 0, Here = Vector3.zero, FloorRel = 0 }
 
 local function planPath(root, hum, steps)
     local here = root.Position
@@ -742,12 +751,137 @@ local function simulatePlan(plan, wait, steps, hum)
     return function(i) return out[math.clamp(i, 1, steps)] end
 end
 
+--// the game's own movement code ---------------------------------------------
+-- DashHandler and DoubleJump keep their state in locals: when each dash was
+-- last used, and how many double jumps you have had this time in the air. They
+-- are read through the scripts' own key handlers (getconnections, then
+-- getupvalues), so the dodge sees the same cooldowns and the same double jump
+-- count the game does, your own presses included, and can call the game's own
+-- dash and double jump functions.
+
+local getUpvalues = (typeof(getupvalues) == "function" and getupvalues)
+    or (typeof(debug) == "table" and type(debug.getupvalues) == "function" and debug.getupvalues)
+    or nil
+
+local function upvaluesOf(fn)
+    if not getUpvalues or type(fn) ~= "function" then return nil end
+    local ok, list = pcall(getUpvalues, fn)
+    return ok and type(list) == "table" and list or nil
+end
+
+-- a script's handler on a signal, found by the script's name in its source
+local function handlerFrom(signal, name)
+    if typeof(getconnections) ~= "function" or typeof(debug) ~= "table" or type(debug.info) ~= "function" then return nil end
+    local ok, list = pcall(getconnections, signal)
+    if not ok or type(list) ~= "table" then return nil end
+    for _, connection in ipairs(list) do
+        local okFn, fn = pcall(function() return connection.Function end)
+        if okFn and type(fn) == "function" then
+            local okSrc, src = pcall(debug.info, fn, "s")
+            if okSrc and type(src) == "string" and src:find(name, 1, true) then return fn end
+        end
+    end
+    return nil
+end
+
+-- DashHandler: its doDash(side) and its table of when each side was last used
+-- (beside it, the base cooldowns 0.75 / 0.75 / 2, which aren't it)
+local GameDash = { Fn = nil, Times = nil, SearchAt = 0, Works = nil }
+
+local function dashTable(t)
+    return type(t) == "table" and type(rawget(t, "Left")) == "number"
+        and type(rawget(t, "Right")) == "number" and type(rawget(t, "Forward")) == "number"
+end
+
+local function findGameDash()
+    if GameDash.Fn then return GameDash end
+    if os.clock() < GameDash.SearchAt then return nil end
+    GameDash.SearchAt = os.clock() + 5
+    local handler = handlerFrom(UserInputService.InputBegan, "DashHandler")
+    for _, fn in pairs(upvaluesOf(handler) or {}) do
+        if type(fn) == "function" then
+            local tables = {}
+            for _, v in pairs(upvaluesOf(fn) or {}) do
+                if dashTable(v) then tables[#tables + 1] = v end
+            end
+            local times = nil
+            for _, t in ipairs(tables) do
+                local base = t.Left == 0.75 and t.Right == 0.75 and t.Forward == 2
+                if not base then times = t end
+            end
+            if times and #tables == 2 then
+                GameDash.Fn, GameDash.Times = fn, times
+                return GameDash
+            end
+        end
+    end
+    return nil
+end
+
+-- when the game last saw this side's dash, yours or the dodge's
+local function gameDashAt(button)
+    local t = GameDash.Times
+    local v = t and rawget(t, button)
+    return type(v) == "number" and v or -math.huge
+end
+
+-- DoubleJump: the function its Space handler calls, and in it the count of
+-- double jumps this time in the air (the one number it holds) and whether it
+-- is armed yet, 0.175s after leaving the ground (the one true / false). Read
+-- fresh every time rather than by position, so a value turning up later
+-- can't shift them.
+local GameDJ = { Began = nil, Ended = nil, Fn = nil, SearchAt = 0 }
+
+local function djValues(fn)
+    local ups = upvaluesOf(fn)
+    if not ups then return nil end
+    local count, armed, numbers, flags = nil, nil, 0, 0
+    for _, v in pairs(ups) do
+        if type(v) == "number" then
+            count, numbers = v, numbers + 1
+        elseif type(v) == "boolean" then
+            armed, flags = v, flags + 1
+        end
+    end
+    if numbers ~= 1 or flags ~= 1 then return nil end
+    return count, armed
+end
+
+local function findGameDJ()
+    if GameDJ.Fn or os.clock() < GameDJ.SearchAt then return GameDJ.Began and GameDJ or nil end
+    GameDJ.SearchAt = os.clock() + 5
+    local began = handlerFrom(UserInputService.InputBegan, "DoubleJump")
+    if not began then return nil end
+    GameDJ.Began = began
+    GameDJ.Ended = handlerFrom(UserInputService.InputEnded, "DoubleJump")
+    for _, fn in pairs(upvaluesOf(began) or {}) do
+        if type(fn) == "function" and djValues(fn) ~= nil then
+            GameDJ.Fn = fn
+            break
+        end
+    end
+    return GameDJ
+end
+
+-- the game's own double jump count and armed flag, or nil when not readable
+local function gameDJState()
+    local g = findGameDJ()
+    if not g or not g.Fn then return nil end
+    return djValues(g.Fn)
+end
+
 --// dashing -----------------------------------------------------------------
 -- Only the side dashes: the forward roll is slow to come back and not worth it.
 
 local SIDES = { "Left", "Right" }
 local BASE_COOLDOWN = { Left = 0.75, Right = 0.75 }
 local LastDash = { Left = -math.huge, Right = -math.huge }
+
+-- the later of the dodge's last dash and the game's, so a dash you made
+-- yourself counts against the cooldown too
+local function lastDash(button)
+    return math.max(LastDash[button], gameDashAt(button))
+end
 
 local function cooldown(dir)
     local base = BASE_COOLDOWN[dir]
@@ -761,7 +895,7 @@ end
 local function ready(dir, now)
     local char = LocalPlayer.Character
     if char and CollectionService:HasTag(char, "Glitch") then return true end
-    return now - LastDash[dir] >= cooldown(dir) + 0.03
+    return now - lastDash(dir) >= cooldown(dir) + 0.03
 end
 
 local function sideVector(root, dir)
@@ -813,7 +947,19 @@ local function scriptDash(button, dir, root, hum)
     local v = dir * dashSpeed(hum)
     local current = root.AssemblyLinearVelocity
     root.AssemblyLinearVelocity = Vector3.new(v.X, current.Y, v.Z)
+    -- the game's own cooldown starts too, as if it had done the dash
+    if GameDash.Times then pcall(function() GameDash.Times[button] = os.clock() end) end
     return true
+end
+
+-- the game's own doDash(side), the same thing your dash key runs; it took the
+-- dash if it marked the side as used. Second result: whether it was there.
+local function gameDash(button)
+    local g = findGameDash()
+    if not g or GameDash.Works == false then return false, false end
+    local before = gameDashAt(button)
+    pcall(g.Fn, button)
+    return gameDashAt(button) > before, true
 end
 
 -- watched after each dash: did it happen, and how fast it settled
@@ -827,11 +973,20 @@ local function doDash(plan, root, hum)
     -- the game dashes along your facing, so face the way that sends the
     -- button's dash along the planned direction first
     root.CFrame = CFrame.lookAt(root.Position, root.Position + look)
-    if method ~= "Script dash" then
+    local refused = false
+    if method == "Auto" or method == "Game dash" then
+        local found
+        done, found = gameDash(plan.Button)
+        if done then how = "game dash" end
+        -- the game's own dash turned it down (its round tags): its buttons
+        -- would too, so straight to the script dash
+        refused = found and not done
+    end
+    if not done and not refused and (method == "Auto" or method == "Game buttons") then
         done = pressButton(plan.Button)
         if done then how = "game buttons" end
     end
-    if not done and method ~= "Game buttons" then
+    if not done and (method == "Auto" or method == "Script dash") then
         done = scriptDash(plan.Button, plan.Dir, root, hum)
         if done then how = "script dash" end
     end
@@ -860,15 +1015,16 @@ local function watchDash(root, hum)
     if not w.Checked and age > 0.02 then
         w.Checked = true
         if along < w.Speed * 0.35 then
-            if w.How == "game buttons" then
-                ButtonsWork = false
-                log("Warn", "the game's dash buttons did nothing, using the script dash from now on")
-                if Dodge.Method ~= "Game buttons" then scriptDash(w.Button, w.Dir, root, hum) end
+            if w.How == "game buttons" or w.How == "game dash" then
+                if w.How == "game buttons" then ButtonsWork = false else GameDash.Works = false end
+                log("Warn", ("the %s did nothing, using the script dash from now on"):format(w.How))
+                if Dodge.Method == "Auto" then scriptDash(w.Button, w.Dir, root, hum) end
             end
             DashWatch = nil
             return
         end
         if w.How == "game buttons" then ButtonsWork = true end
+        if w.How == "game dash" then GameDash.Works = true end
         w.Start = along
     end
     if w.Checked and w.Start then
@@ -899,18 +1055,27 @@ local function watchDash(root, hum)
 end
 
 --// double jump ------------------------------------------------------------
--- The game's DoubleJump script: Space while in the air, from 0.175s after
--- leaving the ground, once (twice with the Ninja Jump tool) until you land.
--- It sends MovementGrace("DoubleJump") and sets your upward speed to
--- 50 + Jump/3. Its own key handler is called first, so its own count and
--- checks apply; if that does nothing (handler not reachable, or the round's
--- tags don't let it), the same two things are done here.
+-- The game's DoubleJump script: a Space press while falling (the Freefall
+-- state), from 0.175s after leaving the ground, once (twice with the Ninja
+-- Jump tool) until you land, and only with the Playing or Lobby tag and not
+-- Downed or frozen. It sends MovementGrace("DoubleJump") and sets your upward
+-- speed to 50 + Jump/3.
+--
+-- The double jump here is a real Space tap: the executor's keypress sends the
+-- key to the Roblox window the way your keyboard does, so the game's own
+-- script takes it exactly like yours (its count, its checks, its animation).
+-- VirtualInputManager is never used: the game's CLIENT_ANTI kicks the moment
+-- that service exists. A tap only goes when Roblox has focus and no text box
+-- is being typed in, so a space never lands in chat or another window.
+-- Whether it worked is read off the game's own count (or your upward speed)
+-- a frame later; if it didn't, Auto does the game's double jump function
+-- directly, and failing that the same two things the script does.
 --
 -- Being in the air is tracked here every frame from where you actually are,
 -- not from humanoid state events, so a fall or a knock counts the same as a
 -- jump.
 
-local Air = { Since = nil, Used = 0, JumpedAt = 0, Last = "not tried yet" }
+local Air = { Since = nil, Used = 0, JumpedAt = 0, Last = "not tried yet", Sent = nil, KeyMisses = 0, KeyWorks = nil }
 local ManualJumpAt = 0
 
 local function jumpUpgrade()
@@ -956,94 +1121,185 @@ local function trackAir(root, hum)
     end
 end
 
+-- double jumps had this time in the air: the game's own count when readable
+local function airUsed()
+    local count = gameDJState()
+    return count or Air.Used
+end
+
+-- the round tags the game's double jump wants
+local function djTagsOk(char)
+    if not char then return false end
+    if not CollectionService:HasTag(char, "Playing") and not CollectionService:HasTag(char, "Lobby") then return false end
+    return not CollectionService:HasTag(char, "Downed") and not CollectionService:HasTag(char, "FreezeTagFrozen")
+end
+
 -- the game's own rule for when a double jump goes
 local function airJumpReady(hum)
-    if not inAir(hum) or not Air.Since then return false end
-    if os.clock() - Air.Since < 0.18 then return false end
+    if not hum or Air.Sent then return false end -- a tap is on its way
+    if hum:GetState() ~= Enum.HumanoidStateType.Freefall then return false end
+    local count, armed = gameDJState()
+    if count then return armed and count < airJumpsAllowed() end
+    if not Air.Since or os.clock() - Air.Since < 0.18 then return false end
     return Air.Used < airJumpsAllowed()
 end
 
--- your own Space presses in the air count against the game's limit too
+-- Roblox in front and nothing being typed: only then can a tap go to it
+local WindowFocused = true
+track(UserInputService.WindowFocused:Connect(function() WindowFocused = true end))
+track(UserInputService.WindowFocusReleased:Connect(function() WindowFocused = false end))
+
+local keyPress = typeof(keypress) == "function" and keypress or nil
+local keyRelease = typeof(keyrelease) == "function" and keyrelease or nil
+local VK_SPACE = 0x20
+
+local function canTap()
+    if not keyPress or not keyRelease or not WindowFocused then return false end
+    if typeof(isrbxactive) == "function" then
+        local ok, active = pcall(isrbxactive)
+        if ok and active == false then return false end
+    end
+    local okBox, box = pcall(function() return UserInputService:GetFocusedTextBox() end)
+    if not okBox or box ~= nil then return false end
+    local okMenu, menu = pcall(function() return game:GetService("GuiService").MenuIsOpen end)
+    return okMenu and not menu
+end
+
+-- your own Space presses in the air count against the game's limit too (only
+-- needed when the game's count can't be read)
 track(UserInputService.InputBegan:Connect(function(input, processed)
-    if processed or input.KeyCode ~= Enum.KeyCode.Space then return end
+    if processed or input.KeyCode ~= Enum.KeyCode.Space or Air.Sent then return end
+    if gameDJState() then return end
     local char = LocalPlayer.Character
     local hum = char and char:FindFirstChildOfClass("Humanoid")
     if airJumpReady(hum) then Air.Used += 1 end
 end))
-track(UserInputService.JumpRequest:Connect(function() ManualJumpAt = os.clock() end))
-
-local DJHandlers = nil
-local DJSearchAt = 0
-local function findDJHandlers()
-    if DJHandlers then return DJHandlers end
-    if os.clock() < DJSearchAt then return nil end
-    DJSearchAt = os.clock() + 5 -- not found yet: look again in a bit
-    if typeof(getconnections) ~= "function" or typeof(debug) ~= "table" or type(debug.info) ~= "function" then return nil end
-    local function pick(signal)
-        local ok, list = pcall(getconnections, signal)
-        if not ok or type(list) ~= "table" then return nil end
-        for _, connection in ipairs(list) do
-            local fn = connection.Function
-            if type(fn) == "function" then
-                local okSrc, src = pcall(debug.info, fn, "s")
-                if okSrc and type(src) == "string" and src:find("DoubleJump", 1, true) then return fn end
-            end
-        end
-        return nil
-    end
-    local began = pick(UserInputService.InputBegan)
-    if began then DJHandlers = { Began = began, Ended = pick(UserInputService.InputEnded) } end
-    return DJHandlers
-end
+-- a jump you started yourself, from the ground (the dodge's taps don't count)
+track(UserInputService.JumpRequest:Connect(function()
+    if Air.Sent then return end
+    local char = LocalPlayer.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    if hum and hum.FloorMaterial ~= Enum.Material.Air then ManualJumpAt = os.clock() end
+end))
 
 local FAKE_SPACE = { KeyCode = Enum.KeyCode.Space, UserInputType = Enum.UserInputType.Keyboard }
+
+-- the game's double jump done right now: its own function, else its Space
+-- handler with a stand-in key; true when its count went up or you shot up
+local function gameAirJump(root)
+    local g = findGameDJ()
+    if not g then return false end
+    local before, count0 = root.AssemblyLinearVelocity.Y, gameDJState()
+    if g.Fn then
+        pcall(g.Fn)
+    else
+        -- let go first, in case Space is still held from your jump
+        if g.Ended then pcall(g.Ended, FAKE_SPACE) end
+        pcall(g.Began, FAKE_SPACE, false)
+        if g.Ended then pcall(g.Ended, FAKE_SPACE) end
+    end
+    local count1 = gameDJState()
+    return (count0 ~= nil and count1 ~= nil and count1 > count0) or root.AssemblyLinearVelocity.Y > before + 10
+end
+
+local function scriptAirJump(root)
+    local grace = remote("MovementGrace")
+    if grace then pcall(function() grace:FireServer("DoubleJump") end) end
+    local v = root.AssemblyLinearVelocity
+    root.AssemblyLinearVelocity = Vector3.new(v.X, airJumpSpeed(), v.Z)
+end
+
+-- the double jump without a key tap: the game's, else the script's
+local function directAirJump(root, method)
+    local how = nil
+    if (method == "Auto" or method == "Game") and djTagsOk(LocalPlayer.Character) and gameAirJump(root) then
+        how = "game"
+    elseif method == "Auto" or method == "Script" then
+        scriptAirJump(root)
+        how = "script"
+    end
+    if how then
+        Air.Used += 1
+        Air.Last = "worked (" .. how .. ")"
+        return true
+    end
+    Air.Last = findGameDJ() and "the game's double jump did nothing" or "the game's double jump wasn't found"
+    return false
+end
 
 local function doAirJump(root, hum)
     if not airJumpReady(hum) then
         Air.Last = "not ready (" .. (inAir(hum) and "used up or too soon" or "on the ground") .. ")"
         return false
     end
-    local before = root.AssemblyLinearVelocity.Y
-    local done, how = false, nil
-    if Move.Method ~= "Script" then
-        local handlers = findDJHandlers()
-        if handlers then
-            -- release first, in case Space is still held from your jump
-            if handlers.Ended then pcall(handlers.Ended, FAKE_SPACE) end
-            pcall(handlers.Began, FAKE_SPACE, false)
-            if handlers.Ended then pcall(handlers.Ended, FAKE_SPACE) end
-            done = root.AssemblyLinearVelocity.Y > before + 10
-            if done then how = "game" end
+    local method = Move.Method
+    local wantTap = method == "Key press" or (method == "Auto" and Air.KeyWorks ~= false)
+    if wantTap and djTagsOk(LocalPlayer.Character) and canTap() then
+        -- a tap: up first so a Space still held from your jump can't swallow
+        -- it (the game ignores a key that is already down), then down; it
+        -- comes back up a frame later
+        local ok = pcall(function()
+            keyRelease(VK_SPACE)
+            keyPress(VK_SPACE)
+        end)
+        if ok then
+            Air.Sent = { At = os.clock(), VY = root.AssemblyLinearVelocity.Y, Count = gameDJState(), Up = false }
+            Air.Last = "space tapped"
+            return true
         end
     end
-    if not done and Move.Method ~= "Game" then
-        local grace = remote("MovementGrace")
-        if grace then pcall(function() grace:FireServer("DoubleJump") end) end
-        local v = root.AssemblyLinearVelocity
-        root.AssemblyLinearVelocity = Vector3.new(v.X, airJumpSpeed(), v.Z)
-        done, how = true, "script"
+    if method == "Key press" then
+        Air.Last = canTap() and "key press failed" or "key press not possible (no keypress, or Roblox not focused)"
+        return false
     end
-    Air.Last = done and ("worked (" .. how .. ")")
-        or (findDJHandlers() and "the game's double jump did nothing" or "the game's double jump wasn't found")
-    if done then Air.Used += 1 end
-    return done
+    return directAirJump(root, method)
+end
+
+-- the frames after a tap: let the key back up, then see whether the game took
+-- it; if not, Auto does the double jump straight away instead
+local function checkTap(root, hum)
+    local s = Air.Sent
+    if not s then return end
+    local count = gameDJState()
+    local worked = (s.Count ~= nil and count ~= nil and count > s.Count) or root.AssemblyLinearVelocity.Y > s.VY + 10
+    if worked then
+        Air.Sent, Air.KeyMisses, Air.KeyWorks = nil, 0, true
+        Air.Used += 1
+        Air.Last = "worked (space tap)"
+        return
+    end
+    if not s.Up or os.clock() - s.At < 0.12 then return end
+    Air.Sent = nil
+    Air.KeyMisses += 1
+    if Air.KeyMisses >= 3 and Air.KeyWorks ~= true then
+        Air.KeyWorks = false
+        log("Warn", "space taps aren't reaching the game, double jumping through its function instead")
+    end
+    if Move.Method == "Auto" and inAir(hum) then
+        directAirJump(root, "Auto")
+    else
+        Air.Last = "space tap did nothing"
+    end
 end
 
 -- double jumps waiting for the top of a jump: the auto double jump, and the
--- dodge's own apex plans
+-- dodge's own apex plans. The top is a short window rather than one frame, so
+-- a frame where the game isn't ready yet doesn't lose it.
 local ApexWanted = 0  -- os.clock until which the dodge wants one at the top
 local LastVY = 0
+local TopAt = -math.huge
 
 local function apexStep()
     local _, root, hum = myCharacter()
     if not root then return end
     trackAir(root, hum)
+    checkTap(root, hum)
     local vy = root.AssemblyLinearVelocity.Y
-    local atTop = LastVY > Move.ApexSpeed and vy <= Move.ApexSpeed
+    if LastVY > Move.ApexSpeed and vy <= Move.ApexSpeed then TopAt = os.clock() end
     LastVY = vy
-    if not atTop or not airJumpReady(hum) then return end
+    if os.clock() - TopAt > 0.15 or not airJumpReady(hum) then return end
     if os.clock() < ApexWanted then
-        ApexWanted = 0
+        ApexWanted, TopAt = 0, -math.huge
         doAirJump(root, hum)
         return
     end
@@ -1051,13 +1307,30 @@ local function apexStep()
         -- after a jump you made yourself (pressed in the last moments before
         -- you left the ground), not a fall
         local manual = Air.JumpedAt > 0 and math.abs(Air.JumpedAt - ManualJumpAt) < 0.4
-        local wanted = Air.Used == 0 or (Move.Triple and Air.Used < airJumpsAllowed())
-        if manual and wanted then doAirJump(root, hum) end
+        local used = airUsed()
+        local wanted = used == 0 or (Move.Triple and used < airJumpsAllowed())
+        if manual and wanted then
+            TopAt = -math.huge
+            doAirJump(root, hum)
+        end
     end
+end
+
+-- a tap's key comes back up a couple of frames later, whatever happens to
+-- your character meanwhile, so Space is never left held down
+local function releaseTap()
+    local s = Air.Sent
+    if not s then return end
+    if not s.Up and os.clock() - s.At >= 0.03 then
+        s.Up = true
+        if keyRelease then pcall(keyRelease, VK_SPACE) end
+    end
+    if os.clock() - s.At > 0.5 then Air.Sent = nil end
 end
 
 track(RunService.Heartbeat:Connect(function()
     if Unloaded then return end
+    pcall(releaseTap)
     pcall(apexStep)
 end))
 
@@ -1236,6 +1509,7 @@ local function dodgeStep(dt)
         Stats.Status = "no character"
         return
     end
+    findGameDash() -- the game's dash cooldowns, looked for again every few seconds until found
     watchMotion(hum, dt)
     watchDash(root, hum)
     measureBody(char, root)
@@ -1812,7 +2086,7 @@ track(RunService.RenderStepped:Connect(function()
                 local x = size.X / 2 + (i == 1 and -w - 10 or 10)
                 local y = size.Y - 120
                 local cd = cooldown(button)
-                local progress = math.clamp((os.clock() - LastDash[button]) / math.max(cd, 0.01), 0, 1)
+                local progress = math.clamp((os.clock() - lastDash(button)) / math.max(cd, 0.01), 0, 1)
                 bar.Back.Position, bar.Back.Size, bar.Back.Visible = Vector2.new(x, y), Vector2.new(w, h), true
                 bar.Fill.Position, bar.Fill.Size = Vector2.new(x, y), Vector2.new(w * progress, h)
                 bar.Fill.Color = progress >= 1 and Predict.PlanColor or Predict.NearColor
@@ -1903,6 +2177,7 @@ local function unload()
     table.clear(Connections)
     if God.Enabled then setGod(false) end
     if Misc.AntiAfk then pcall(setAntiAfk, false) end
+    if Air.Sent and not Air.Sent.Up and keyRelease then pcall(keyRelease, VK_SPACE) end
     pcall(function() RunService:UnbindFromRenderStep(STEER_NAME) end)
     for _, obj in ipairs(Drawings) do pcall(function() obj:Remove() end) end
     pcall(function() EspFolder:Destroy() end)
@@ -1967,8 +2242,8 @@ do
 
     dodge:AddDropdown('dd_method', {
         Text = 'Dash with',
-        Tooltip = 'game buttons: presses the game\'s own dash buttons, so its own code does the dash (needs getconnections). script dash: does the same dash itself, notice to the server included. auto: buttons when they work, else the script dash',
-        Values = { 'Auto', 'Game buttons', 'Script dash' },
+        Tooltip = 'game dash: calls the game\'s own dash function, the one your dash keys run (needs getconnections and getupvalues). game buttons: presses the game\'s mobile dash buttons. script dash: does the same dash itself, notice to the server included. auto: the game\'s dash, then its buttons, then the script dash',
+        Values = { 'Auto', 'Game dash', 'Game buttons', 'Script dash' },
         Default = Dodge.Method,
         Callback = function(v) Dodge.Method = v or "Auto" end,
     })
@@ -2118,17 +2393,24 @@ do
         Callback = function(v) Move.ApexSpeed = v end,
     })
     local djStatus = move:AddLabel('double jump: -', true)
+    local function djFound()
+        local g = findGameDJ()
+        local tap = (keyPress and keyRelease) and (Air.KeyWorks == false and "taps didn't reach it" or "space taps") or "no keypress here"
+        if g and g.Fn then return "found, count readable, " .. tap end
+        if g then return "handler found, " .. tap end
+        return "not found (the script one is used), " .. tap
+    end
     every(0.3, function()
         local char = LocalPlayer.Character
         local hum = char and char:FindFirstChildOfClass("Humanoid")
         djStatus:SetText(("double jump: %s, %d of %d used\nlast try: %s\ngame's handler: %s"):format(
             airJumpReady(hum) and "ready" or (inAir(hum) and "in the air" or "on the ground"),
-            Air.Used, airJumpsAllowed(), Air.Last, findDJHandlers() and "found" or "not found (the script one is used)"))
+            airUsed(), airJumpsAllowed(), Air.Last, djFound()))
     end)
     move:AddDropdown('dd_djmethod', {
         Text = 'Double jump with',
-        Tooltip = 'game: calls the game\'s own double jump, its limits included. script: does the same itself. auto: the game\'s, else the script',
-        Values = { 'Auto', 'Game', 'Script' },
+        Tooltip = 'key press: taps Space for real (executor keypress, only while Roblox is focused and you are not typing), so the game takes it exactly like your own jump. game: calls the game\'s double jump function. script: does the same itself. auto: a tap, then the game\'s function if the tap didn\'t take, then the script',
+        Values = { 'Auto', 'Key press', 'Game', 'Script' },
         Default = Move.Method,
         Callback = function(v) Move.Method = v or "Auto" end,
     })
