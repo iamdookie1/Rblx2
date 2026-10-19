@@ -68,6 +68,8 @@ local Auto = {
     PressRandomRange = 30, -- % either side of PressHoldMs
     Side = "Auto",       -- screen modes: which field is yours
     Perfect = false,     -- every hit dead on the note: 0.00ms (exact in game mode)
+    SemiLegit = false,   -- game mode: press through the game's touch tiles, so they light up like a finger
+    SemiTiles = true,    -- semi legit: show the touch tiles on PC too
 }
 
 -- client side note themes, one per lane direction, after the website's space
@@ -189,6 +191,8 @@ local function pushSettings()
         Bridge:SetAttribute("Chance" .. name, Auto.Chance[name] or 0)
     end
     Bridge:SetAttribute("Perfect", Auto.Perfect)
+    Bridge:SetAttribute("SemiLegit", Auto.SemiLegit)
+    Bridge:SetAttribute("SemiTiles", Auto.SemiTiles)
 end
 
 local function themesOn()
@@ -317,9 +321,63 @@ local function ignored(note)
     return table.find(list, kind) ~= nil
 end
 
+-- Semi legit: presses go through the game's own touch tiles,
+-- VSRG.HUD.TouchInputs:ToggleKey(lane, down, timestamp), the same path a
+-- finger on a lane's tile takes. The tile lights up and the game calls
+-- HitLane itself, with the timestamp given, so timing is the same.
+local ForcedTiles = nil
+
+local function touchInputs(field)
+    local hud = Framework and Framework.VSRG and Framework.VSRG.HUD
+    local touch = hud and hud.TouchInputs
+    if type(touch) == "table" and touch.Field == field and type(touch.ToggleKey) == "function"
+        and type(touch.Active) == "table" then
+        return touch
+    end
+    return nil
+end
+
+local function press(field, lane, down, at)
+    if attr("SemiLegit", false) then
+        local touch = touchInputs(field)
+        if touch then
+            local held = touch.Active[lane]
+            -- ToggleKey skips HitLane for a tile already down (a press) or
+            -- already let go (a release); those go straight to HitLane
+            if (down and not held) or (not down and held) then
+                if pcall(touch.ToggleKey, touch, lane, down, at) then return end
+            end
+        end
+    end
+    pcall(field.HitLane, field, lane, down, at)
+end
+
+-- the tiles only show for touch input; with "show on PC" they show anyway,
+-- and go back to the game's own choice when it's turned off
+local function restoreTiles()
+    if ForcedTiles then
+        pcall(ForcedTiles.UpdateVisibility, ForcedTiles)
+        ForcedTiles = nil
+    end
+end
+
+local function showTiles(field)
+    local want = attr("SemiLegit", false) and attr("SemiTiles", true)
+    if not want then
+        restoreTiles()
+        return
+    end
+    local touch = touchInputs(field)
+    local frame = touch and touch.TouchInputsFrame
+    if typeof(frame) == "Instance" and not frame.Visible then
+        frame.Visible = true
+        ForcedTiles = touch
+    end
+end
+
 local function releaseAll(field)
     for lane, state in pairs(Lanes) do
-        if state.Down then pcall(field.HitLane, field, lane, false, os.clock()) end
+        if state.Down then press(field, lane, false, os.clock()) end
     end
     table.clear(Lanes)
 end
@@ -616,6 +674,7 @@ local connection
 connection = RunService.Heartbeat:Connect(function(dt)
     if not bridge.Parent or attr("Stop", false) then
         if lastField then pcall(releaseAll, lastField) end
+        pcall(restoreTiles)
         pcall(removeThemes)
         animator:Disconnect()
         connection:Disconnect()
@@ -632,6 +691,7 @@ connection = RunService.Heartbeat:Connect(function(dt)
         pcall(releaseAll, lastField)
         lastField = nil
     end
+    if not playing then pcall(restoreTiles) end
     if not playing and not attr("ThemesOn", false) and not Framework then return end
 
     if not Framework then
@@ -668,6 +728,7 @@ connection = RunService.Heartbeat:Connect(function(dt)
         bridge:SetAttribute("Status", "waiting for a song")
         return
     end
+    pcall(showTiles, field)
 
     local sample = song.TimePositionSample
     local samplePos = sample and sample.Position or song.TimePosition
@@ -741,7 +802,7 @@ connection = RunService.Heartbeat:Connect(function(dt)
                     releaseAt = math.min(releaseAt, (state.LastPress + pressAt) / 2)
                 end
                 if releaseAt <= horizon then
-                    pcall(field.HitLane, field, lane, false, stamp(math.max(releaseAt, state.LastPress)))
+                    press(field, lane, false, stamp(math.max(releaseAt, state.LastPress)))
                     state.Down = false
                 else
                     break
@@ -749,7 +810,7 @@ connection = RunService.Heartbeat:Connect(function(dt)
             end
 
             if not note or pressAt > horizon then break end
-            pcall(field.HitLane, field, lane, true, stamp(pressAt))
+            press(field, lane, true, stamp(pressAt))
             Planned[note] = true
             bump("Grade" .. Plans[note].Grade)
             state.Down = true
@@ -1266,6 +1327,66 @@ local Window = Library:CreateWindow({
 
 Library:OnUnload(unload)
 
+--// chat commands -------------------------------------------------------------
+-- "/e hide" hides the menu's mobile open button and "/e show" brings it back.
+-- The button is Ui3's "Toggle" TextButton in its ScreenGui (made on mobile
+-- only). Commands are caught from every chat path: Player.Chatted, the new
+-- chat's SendingMessage, and its /e emote command, which takes /e messages
+-- before they are sent.
+
+local ButtonHidden = false
+
+local function ui3Button()
+    local gui = Library and Library.ScreenGui
+    if typeof(gui) ~= "Instance" then return nil end
+    for _, child in ipairs(gui:GetChildren()) do
+        if child:IsA("TextButton") and child.Text == "Toggle" then return child end
+    end
+    return nil
+end
+
+local function setButtonHidden(hidden)
+    ButtonHidden = hidden
+    local button = ui3Button()
+    if button then button.Visible = not hidden end
+    log("Info", hidden and "menu button hidden (/e show brings it back)" or "menu button shown")
+end
+
+local LastCommand = { Text = nil, At = 0 }
+local function chatCommand(text)
+    if Unloaded or type(text) ~= "string" then return end
+    local cmd = string.lower(text)
+    cmd = cmd:gsub("%s+", " ")
+    cmd = cmd:match("^%s*(.-)%s*$")
+    if cmd ~= "/e hide" and cmd ~= "/e show" then return end
+    -- the same message can come in through more than one path
+    if LastCommand.Text == cmd and os.clock() - LastCommand.At < 0.5 then return end
+    LastCommand.Text, LastCommand.At = cmd, os.clock()
+    setButtonHidden(cmd == "/e hide")
+end
+
+track(LocalPlayer.Chatted:Connect(chatCommand))
+task.spawn(function()
+    pcall(function()
+        local TextChatService = game:GetService("TextChatService")
+        track(TextChatService.SendingMessage:Connect(function(message) chatCommand(message.Text) end))
+        local commands = TextChatService:WaitForChild("TextChatCommands", 10)
+        local emote = commands and commands:WaitForChild("RBXEmoteCommand", 10)
+        if emote then track(emote.Triggered:Connect(function(_, text) chatCommand(text) end)) end
+    end)
+end)
+
+-- keep it hidden if anything shows it again
+task.spawn(function()
+    while not Unloaded and not Library.Unloaded do
+        if ButtonHidden then
+            local button = ui3Button()
+            if button and button.Visible then button.Visible = false end
+        end
+        task.wait(0.5)
+    end
+end)
+
 local function every(interval, fn)
     task.spawn(function()
         while not Unloaded and not Library.Unloaded do
@@ -1321,6 +1442,26 @@ do
             Auto.Mode = value or "Game"
             releaseScreen()
             if Auto.Enabled and Auto.Mode == "Game" then startWorkers() end
+            pushSettings()
+        end,
+    })
+
+    play:AddToggle('ff_semilegit', {
+        Text = 'Semi legit',
+        Tooltip = 'game mode: every press goes through the game\'s own mobile lane tiles, the way a finger does, so the tiles light up on each note and a recording looks like real pressing. timing stays exact',
+        Default = Auto.SemiLegit,
+        Callback = function(state)
+            Auto.SemiLegit = state
+            pushSettings()
+        end,
+    })
+
+    play:AddToggle('ff_semitiles', {
+        Text = 'Show the tiles on PC too',
+        Tooltip = 'semi legit: the game only shows its touch tiles for touch input. this shows them on PC as well, so the presses can be seen',
+        Default = Auto.SemiTiles,
+        Callback = function(state)
+            Auto.SemiTiles = state
             pushSettings()
         end,
     })
