@@ -66,13 +66,19 @@ end
 local Parry = {
     Enabled = false,
     Timing = 0.25,        -- press once the ball is this share of the window away (the server flags past 0.3)
-    PingComp = true,      -- play the ball forward by your ping
+    Safety = 35,          -- ms: the press always goes at least this long (plus a frame) before the ball arrives
+    PingComp = true,      -- play the ball forward by your latency
     PingScale = 1,
-    Clash = true,         -- in a clash, press as soon as the ball is yours
-    Spam = false,         -- held / toggled by its key
-    SpamCps = 15,
-    Method = "Game",      -- Game: the game's own Deflect / Direct: fire the parry remote
+    Clash = true,         -- clash handling (see ClashMode)
+    ClashMode = "Smart",  -- Smart: timed presses, including just before the ball comes back / Spam: spam while in a clash
+    ClashDistance = 45,   -- how close the other player has to be for a back and forth to count as a clash
+    Spam = false,         -- the spam key
+    SpamCps = 26,
+    Method = "Game",      -- Game: the game's own Deflect / Direct: the parry packet, with the game's effects played here
 }
+
+-- the on screen spam button, for touch screens
+local Pad = { Enabled = false, Size = 70, Held = false, Locked = false }
 
 local Aim = {
     Enabled = false,
@@ -102,7 +108,9 @@ local Library -- the Ui3 menu, loaded last
 --// the game's modules ------------------------------------------------------
 
 local CAM_SYNC = 2.4544348798342524E+76
-local Game = {} -- BR, GameBall, Network, DeflectClass, GameInfo, Deflect (the live ability)
+local PARRY_EVENT = 1.1338355046430509E+76 -- sent to everyone on every parry: (ball position, parrier UserId, speed)
+-- BR, GameBall, Network, DeflectClass, GameInfo, CAnim, Bindables, BallFeel, Deflect (the live ability)
+local Game = {}
 
 local function req(...)
     local node = ReplicatedStorage
@@ -146,36 +154,77 @@ local function ping()
     return ok and type(value) == "number" and math.clamp(value, 0, 0.5) or 0.05
 end
 
+-- How long a press takes to reach the server: Roblox's ping, or what the game
+-- itself measures from its ball snapshots if that is worse.
+local function latency()
+    local measured = Game.BR and tonumber(Game.BR.smoothedAge) or 0
+    return math.clamp(math.max(ping(), measured), 0, 0.5)
+end
+
+-- Who the ball is after. Two places say so: the snapshots, and the target
+-- attribute the server sets the moment it changes target. Whichever changed
+-- last is the newer one.
+local TargetSeen = { Attr = nil, AttrAt = 0, Snap = nil, SnapAt = 0 }
+track(Workspace:GetAttributeChangedSignal("GameBallTarget"):Connect(function()
+    TargetSeen.Attr, TargetSeen.AttrAt = Workspace:GetAttribute("GameBallTarget"), os.clock()
+end))
+
+local function ballTarget(last)
+    local snap = last and last.targetId
+    if snap ~= TargetSeen.Snap then TargetSeen.Snap, TargetSeen.SnapAt = snap, os.clock() end
+    local attr = TargetSeen.Attr
+    if TargetSeen.AttrAt > TargetSeen.SnapAt and type(attr) == "number" and attr > 0 then return attr end
+    return snap
+end
+
 -- The ball at the moment the server would get a press sent now: the latest
--- snapshot replayed forward with the game's own movement.
-local function ballState()
+-- snapshot replayed forward with the game's own movement, homing on where the
+-- server sees you (your position one latency ago). The game's own sampling
+-- stops 0.3s past a snapshot, which on a slow connection froze the ball short
+-- of you at high speed; this plays it forward up to a second.
+local function ballState(dt)
     local br = Game.BR
     if not br or not br.hasState then return nil end
     local history = br.history
     if type(history) ~= "table" or #history == 0 then return nil end
     local now = Workspace:GetServerTimeNow()
-    local lead = Parry.PingComp and ping() * Parry.PingScale or 0
-    local at = now + lead
-    local a, b = history[1], history[2]
-    for i = #history, 1, -1 do
-        if at >= history[i].serverTime then
-            a, b = history[i], history[i + 1]
-            break
-        end
+    local lead = Parry.PingComp and latency() * Parry.PingScale or 0
+    local at = now + lead + (dt or 0) * 0.5
+    local last = history[#history]
+    local root = myRoot()
+    local target = ballTarget(last)
+    local aimAt
+    if target == LocalPlayer.UserId and root then
+        aimAt = root.Position - root.AssemblyLinearVelocity * lead
     end
-    local ok, pos = pcall(br.SampleHistory, br, a, b, at)
-    if not ok or typeof(pos) ~= "Vector3" then
+    local pos
+    if at >= last.serverTime then
+        local ok, result = pcall(br.SimulateFrom, br, last, at - last.serverTime, aimAt or last.targetPosition, 1)
+        if ok and typeof(result) == "Vector3" then pos = result end
+    end
+    if not pos then
+        local a, b = history[1], history[2]
+        for i = #history, 1, -1 do
+            if at >= history[i].serverTime then
+                a, b = history[i], history[i + 1]
+                break
+            end
+        end
+        local ok, result = pcall(br.SampleHistory, br, a, b, at)
+        if ok and typeof(result) == "Vector3" then pos = result end
+    end
+    if not pos then
         local ball = ballPart()
         pos = ball and ball.Position
     end
     if not pos then return nil end
-    local last = history[#history]
     local accel = tonumber(last.accel) or 0
     local top = math.max(tonumber(last.maxSpeed) or 0, tonumber(last.speed) or 0)
     local speed = math.min((tonumber(last.speed) or 0) + accel * math.max(at - last.serverTime, 0), top)
     return {
-        Pos = pos, Speed = speed, Accel = accel, Target = last.targetId,
+        Pos = pos, Speed = speed, Accel = accel, Target = target,
         Grace = last.grace == true, Locked = last.locked == true, Snap = last, Lead = lead,
+        Me = aimAt or (root and root.Position),
     }
 end
 
@@ -185,13 +234,6 @@ local function eta(gap, speed, accel)
     if accel > 1e-4 then return (-speed + math.sqrt(speed * speed + 2 * accel * gap)) / accel end
     if speed > 1e-4 then return gap / speed end
     return math.huge
-end
-
-local function inClash()
-    local gb = Game.GameBall
-    if not gb then return false end
-    local ok, result = pcall(gb.IsInClash, gb, LocalPlayer)
-    return ok and result == true
 end
 
 -- the server's parry window for this speed
@@ -204,9 +246,69 @@ local function window(speed, clash)
     return w
 end
 
+local function clashCooldown(speed)
+    return 0.6 - 0.22 * math.clamp((speed - 16) / 250, 0, 1)
+end
+
 local function myRange()
     local range = LocalPlayer:GetAttribute("DeflectRange")
     return type(range) == "number" and range or 8.5
+end
+
+--// clashes -----------------------------------------------------------------
+-- Every parry is announced to everyone (who, and how fast the ball went). A
+-- clash is you and one other player parrying it back and forth: both of you
+-- parried in the last moments, and they are close. The game's own check
+-- (a parry in the last second, within 35 studs) is used as well.
+
+local Parries = {} -- { By = UserId, At = os.clock(), Speed }
+
+local function noteParry(by, speed)
+    if type(by) ~= "number" then return end
+    Parries[#Parries + 1] = { By = by, At = os.clock(), Speed = tonumber(speed) }
+    if #Parries > 12 then table.remove(Parries, 1) end
+end
+
+local function lastParryBy(id, within)
+    for i = #Parries, 1, -1 do
+        local p = Parries[i]
+        if os.clock() - p.At > within then return nil end
+        if p.By == id then return p end
+    end
+    return nil
+end
+
+-- the player you are in a clash with, or nil
+local function clashPartner()
+    local root = myRoot()
+    if not root or #Parries == 0 then return nil end
+    local newest = Parries[#Parries]
+    if os.clock() - newest.At > 1.4 then return nil end
+    local mine = lastParryBy(LocalPlayer.UserId, 1.6)
+    local other
+    for i = #Parries, 1, -1 do
+        local p = Parries[i]
+        if os.clock() - p.At > 1.6 then break end
+        if p.By ~= LocalPlayer.UserId then
+            other = Players:GetPlayerByUserId(p.By)
+            break
+        end
+    end
+    local otherRoot = other and rootOf(other)
+    if mine and otherRoot and (otherRoot.Position - root.Position).Magnitude <= Parry.ClashDistance then
+        return other
+    end
+    -- the game's own idea of it
+    local gb = Game.GameBall
+    if gb then
+        local ok, inClash = pcall(gb.IsInClash, gb, LocalPlayer)
+        if ok and inClash then
+            local by, to = Workspace:GetAttribute("LastParryBy"), Workspace:GetAttribute("LastParryTarget")
+            local id = by == LocalPlayer.UserId and to or by
+            return type(id) == "number" and Players:GetPlayerByUserId(id) or other
+        end
+    end
+    return nil
 end
 
 --// pressing ----------------------------------------------------------------
@@ -242,17 +344,47 @@ local function typing()
     return focused ~= nil
 end
 
-local function press()
+-- The game counts your clicks over the last second and marks the packet as
+-- spam past 25; spam here runs a little over that, so the oldest clicks are
+-- let go before each press to keep the packet a real one.
+local function trimClicks(d)
+    local clicks = type(d) == "table" and rawget(d, "ClickInstances")
+    if type(clicks) == "table" and #clicks > 20 then
+        local keep = {}
+        for i = #clicks - 19, #clicks do keep[#keep + 1] = clicks[i] end
+        d.ClickInstances = keep
+    end
+end
+
+-- what the game's own block plays on your side: the block animation, the
+-- block feedback, the ball hit sound and effect when it is in range, and the
+-- cooldown on the button
+local function playBlock(d)
+    if d and (tonumber(d.Cooldown) or 0) <= 0 then
+        pcall(function() d:SetCooldown(d:GetBlockCooldown()) end)
+    end
+    if Game.CAnim then pcall(Game.CAnim.SendStatus, Game.CAnim, "BlockStatus", 1) end
+    if Game.Bindables then
+        pcall(function() Game.Bindables:GetEvent("LocalBlockFeedback"):Fire() end)
+    end
+    if Game.BallFeel and type(Game.BallFeel.TryPredictParry) == "function" then
+        pcall(Game.BallFeel.TryPredictParry, myRange())
+    end
+end
+
+local function press(spam)
     if typing() then return false end
-    Stats.Presses += 1
+    if spam then Stats.Spam = (Stats.Spam or 0) + 1 else Stats.Presses += 1 end
     local d = deflect()
     if Parry.Method == "Game" and d then
+        trimClicks(d)
         local ok = pcall(d.Deflect, d)
         if ok then return true end
     end
     -- the same packet the game sends
     local remote = parryRemote()
     if not remote then return false end
+    local wasReady = ready()
     local cam = Workspace.CurrentCamera
     local cf = cam and cam.CFrame or CFrame.identity
     if Aim.Enabled and Aim.Packet and AimTarget then cf = aimCFrame(cf) end
@@ -265,7 +397,13 @@ local function press()
     buffer.writef32(packet, 17, cf.LookVector.Y)
     buffer.writef32(packet, 21, cf.LookVector.Z)
     local ok = pcall(remote.FireServer, remote, packet)
-    if ok and not d then OwnCooldown = os.clock() + (inClash() and 0.6 or 1.45) end
+    if ok and wasReady then
+        playBlock(d)
+        if not d then
+            local speed = Stats.Speed or 16
+            OwnCooldown = os.clock() + (clashPartner() and clashCooldown(speed) or 1.45)
+        end
+    end
     return ok
 end
 
@@ -401,6 +539,10 @@ task.spawn(function()
     Game.Network = (req("TS", "Network", "Network") or {}).Network
     Game.GameInfo = (req("TS", "GameInfo") or {}).GameInfo
     Game.DeflectClass = (req("TS", "Abilities", "DeflectAbility") or {}).DeflectAbility
+    -- what the game's block plays on your side, for the direct packet
+    Game.CAnim = (req("TS", "CAnimationManager") or {}).CAnimationManager
+    Game.Bindables = (req("TS", "BindableManager") or {}).BindableManager
+    Game.BallFeel = req("TS", "BallReplicator", "BallFeel")
     if Unloaded then return end
     -- the live Deflect ability is caught on its per frame tick, so a re-made
     -- one (they are rebuilt whenever abilities sync) is picked up at once
@@ -425,9 +567,10 @@ end)
 --// every frame ---------------------------------------------------------------
 
 local LastTarget = nil
-local LastSpam = 0
 local LastCamSend = 0
+local SpamDebt = 1
 local LastLives = LocalPlayer:GetAttribute("Lives")
+local Announced = false -- parries are coming in from the game's own announcement
 
 track(LocalPlayer:GetAttributeChangedSignal("Lives"):Connect(function()
     local lives = LocalPlayer:GetAttribute("Lives")
@@ -435,83 +578,158 @@ track(LocalPlayer:GetAttributeChangedSignal("Lives"):Connect(function()
     LastLives = lives
 end))
 
-local function step()
-    local root = myRoot()
-    local state = ballState()
-    local mine = state and state.Target == LocalPlayer.UserId
-
-    -- a parry that worked: the ball was yours and went to someone else
-    if state then
-        if LastTarget == LocalPlayer.UserId and state.Target ~= LocalPlayer.UserId and alive(LocalPlayer) then
+-- the game's "someone parried" announcement, to everyone
+task.spawn(function()
+    local ts = ReplicatedStorage:WaitForChild("TS", 20)
+    local folder = ts and ts:WaitForChild("GeneratedNetworkRemotes", 20)
+    local remote = folder and folder:WaitForChild("RE_" .. tostring(PARRY_EVENT), 20)
+    if not remote or Unloaded then return end
+    track(remote.OnClientEvent:Connect(function(_, by, speed)
+        Announced = true
+        noteParry(by, speed)
+        if by == LocalPlayer.UserId then
             Stats.Parries += 1
             RandomPick = nil
         end
-        LastTarget = state.Target
-    end
+    end))
+end)
 
-    -- aim: who the ball goes to next, told to the server ahead of the parry
-    if Aim.Enabled and root then
-        local target = chooseTarget()
-        local changed = target ~= AimTarget
-        AimTarget = target
-        if target and (changed or os.clock() - LastCamSend > 1 / 30) then
-            LastCamSend = os.clock()
-            local cam = Workspace.CurrentCamera
-            sendCamera(aimCFrame(cam and cam.CFrame or root.CFrame))
+local function serverClash()
+    local gb = Game.GameBall
+    if not gb then return false end
+    local ok, result = pcall(gb.IsInClash, gb, LocalPlayer)
+    return ok and result == true
+end
+
+-- the parry decision; runs twice a frame (before drawing and after physics)
+-- so a fast ball is caught as early as possible
+local function decide(state, root, dt)
+    local partner = Parry.Clash and clashPartner() or nil
+    local clash = partner ~= nil
+    local w = window(state.Speed, clash)
+    local me = state.Me or root.Position
+    local dist = (state.Pos - me).Magnitude
+    local t = eta(dist - myRange(), state.Speed, state.Accel)
+    -- the press has to beat the ball by at least a frame and the safety
+    -- margin, and never so early that the window closes before it arrives
+    local floor = math.max(dt, 1 / 240) * 1.5 + Parry.Safety / 1000
+    local limit = math.min(math.max(w * Parry.Timing, floor), w * 0.85)
+    if clash and Parry.ClashMode == "Smart" then limit = w * 0.9 end
+    Stats.LastEta, Stats.LastWindow, Stats.Clash, Stats.Speed, Stats.Distance, Stats.Limit = t, w, clash, state.Speed, dist, limit
+    Stats.Partner = partner
+
+    local mine = state.Target == LocalPlayer.UserId
+    if mine then
+        if not Parry.Enabled then
+            Stats.Status = "ball on you"
+            return
         end
-    elseif AimTarget then
-        AimTarget = nil
-        local cam = Workspace.CurrentCamera
-        if cam then sendCamera(cam.CFrame) end
+        if not ready() then
+            Stats.Status = "block recharging"
+            return
+        end
+        if state.Grace or t <= limit then
+            if press(false) then
+                Stats.Status = ("pressed %.0fms before it lands (window %.0fms%s)"):format(t * 1000, w * 1000, clash and ", clash" or "")
+            end
+        else
+            Stats.Status = ("ball on you, %.0fms out (presses at %.0fms)"):format(t * 1000, limit * 1000)
+        end
+        return
     end
 
-    -- spam, while its key is held or toggled
-    if Parry.Spam and root then
-        local gap = 1 / math.clamp(Parry.SpamCps, 1, 24)
-        if os.clock() - LastSpam >= gap then
-            LastSpam = os.clock()
-            press()
+    -- in a clash the ball comes straight back: press while it is still on
+    -- your partner, so your window is already open when it lands on you. Only
+    -- when the server counts it as a clash too (otherwise a press costs the
+    -- full cooldown)
+    if Parry.Enabled and clash and Parry.ClashMode == "Smart" and state.Target == partner.UserId and ready() and serverClash() then
+        local proot = rootOf(partner)
+        if proot then
+            local theirRange = partner:GetAttribute("DeflectRange")
+            theirRange = type(theirRange) == "number" and theirRange or 8.5
+            local toThem = eta((state.Pos - proot.Position).Magnitude - theirRange, state.Speed, state.Accel)
+            -- their parry speeds it up by 12
+            local back = math.max((proot.Position - me).Magnitude - myRange(), 0) / math.max(state.Speed + 12, 1)
+            local arrive = toThem + back
+            if arrive <= w * 0.75 and press(false) then
+                Stats.Status = ("clash: pressed for the return, %.0fms out"):format(arrive * 1000)
+                return
+            end
+        end
+    end
+    Stats.Status = clash and ("clash with " .. partner.DisplayName) or "ball on someone else"
+end
+
+local function frameStep(dt, phase)
+    local root = myRoot()
+    local state = ballState(dt)
+
+    if phase == "render" then
+        -- without the announcement, a parry is the ball leaving a player who
+        -- is still alive
+        if state then
+            if not Announced and LastTarget and state.Target ~= LastTarget then
+                local from = Players:GetPlayerByUserId(LastTarget)
+                if from and alive(from) then
+                    noteParry(LastTarget)
+                    if LastTarget == LocalPlayer.UserId then
+                        Stats.Parries += 1
+                        RandomPick = nil
+                    end
+                end
+            end
+            LastTarget = state.Target
+        end
+
+        -- aim: who the ball goes to next, told to the server ahead of the parry
+        if Aim.Enabled and root then
+            local target = chooseTarget()
+            local changed = target ~= AimTarget
+            AimTarget = target
+            if target and (changed or os.clock() - LastCamSend > 1 / 30) then
+                LastCamSend = os.clock()
+                local cam = Workspace.CurrentCamera
+                sendCamera(aimCFrame(cam and cam.CFrame or root.CFrame))
+            end
+        elseif AimTarget then
+            AimTarget = nil
+            local cam = Workspace.CurrentCamera
+            if cam then sendCamera(cam.CFrame) end
+        end
+
+        -- spam: the key, the on screen button, or a clash in spam mode; an
+        -- exact rate however the frame rate goes
+        local clashSpam = Parry.Enabled and Parry.Clash and Parry.ClashMode == "Spam" and Stats.Clash
+        if root and (Parry.Spam or Pad.Held or Pad.Locked or clashSpam) then
+            SpamDebt += dt * math.clamp(Parry.SpamCps, 1, 40)
+            local sent = 0
+            while SpamDebt >= 1 and sent < 4 do
+                press(true)
+                SpamDebt -= 1
+                sent += 1
+            end
+            SpamDebt = math.min(SpamDebt, 2)
+        else
+            SpamDebt = 1
         end
     end
 
     if not state or not root then
         Stats.Status = not Game.BR and "loading the game" or (not root and "no character" or "no ball")
-        Stats.LastEta, Stats.LastWindow = nil, nil
+        Stats.LastEta, Stats.LastWindow, Stats.Clash = nil, nil, false
         return
     end
-
-    local dist = (state.Pos - root.Position).Magnitude
-    local clash = inClash()
-    local w = window(state.Speed, clash)
-    local t = eta(dist - myRange(), state.Speed, state.Accel)
-    Stats.LastEta, Stats.LastWindow, Stats.Clash, Stats.Speed, Stats.Distance = t, w, clash, state.Speed, dist
-
-    if not mine then
-        Stats.Status = "ball on someone else"
-        return
-    end
-    if not Parry.Enabled then
-        Stats.Status = "ball on you"
-        return
-    end
-    if not ready() then
-        Stats.Status = "block recharging"
-        return
-    end
-    local limit = (clash and Parry.Clash) and w or w * Parry.Timing
-    if state.Grace or t <= limit then
-        if press() then
-            Stats.Status = ("parried at %.0fms (window %.0fms%s)"):format(t * 1000, w * 1000, clash and ", clash" or "")
-        end
-    else
-        Stats.Status = ("ball on you, %.0fms out (presses at %.0fms)"):format(t * 1000, limit * 1000)
-    end
+    decide(state, root, dt)
 end
 
-track(RunService.RenderStepped:Connect(function()
+track(RunService.RenderStepped:Connect(function(dt)
     if Unloaded then return end
-    local ok, err = pcall(step)
+    local ok, err = pcall(frameStep, dt, "render")
     if not ok then Stats.Status = "error: " .. tostring(err) end
+end))
+track(RunService.Heartbeat:Connect(function(dt)
+    if Unloaded then return end
+    pcall(frameStep, dt, "physics")
 end))
 
 --// visuals --------------------------------------------------------------------
@@ -656,7 +874,7 @@ local function drawStep()
         local x, y = size.X / 2 - w / 2, size.Y - 150
         local shown = math.min(Stats.LastEta or math.huge, Stats.LastWindow * 2)
         BarBack.Position, BarBack.Size, BarBack.Visible = Vector2.new(x, y), Vector2.new(w, h), true
-        local safe = (Stats.Clash and Parry.Clash) and 1 or Parry.Timing
+        local safe = (Stats.Limit or Parry.Timing * Stats.LastWindow) / Stats.LastWindow
         BarSafe.Position, BarSafe.Size, BarSafe.Visible = Vector2.new(x, y), Vector2.new(w * math.clamp(safe / 2, 0, 1), h), true
         BarBall.Position = Vector2.new(x + w * math.clamp(shown / (Stats.LastWindow * 2), 0, 1) - 1, y - 3)
         BarBall.Size, BarBall.Visible = Vector2.new(3, h + 6), mine == true
@@ -699,6 +917,171 @@ track(RunService.RenderStepped:Connect(function()
     pcall(drawStep)
 end))
 
+--// on screen spam button -----------------------------------------------------------
+-- For touch screens: a small round button you can drag anywhere by the bar on
+-- top of it. Hold it to spam; the lock under it keeps spamming without
+-- holding.
+
+local PadGui = Instance.new("ScreenGui")
+PadGui.Name = "PBPad_" .. HttpService:GenerateGUID(false):sub(1, 6)
+PadGui.ResetOnSpawn = false
+PadGui.IgnoreGuiInset = true
+PadGui.DisplayOrder = 60
+PadGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+PadGui.Enabled = false
+do
+    local ok, hui = pcall(function() return gethui and gethui() or game:GetService("CoreGui") end)
+    PadGui.Parent = ok and hui or LocalPlayer:WaitForChild("PlayerGui")
+end
+
+local PAD_DARK = Color3.fromRGB(24, 24, 30)
+local PAD_ON = Color3.fromRGB(235, 70, 70)
+local PAD_TEXT = Color3.fromRGB(240, 240, 245)
+
+local PadFrame = Instance.new("Frame")
+PadFrame.BackgroundTransparency = 1
+PadFrame.AnchorPoint = Vector2.new(1, 0.5)
+PadFrame.Position = UDim2.new(1, -24, 0.55, 0)
+PadFrame.Parent = PadGui
+
+local PadGrip = Instance.new("TextLabel")
+PadGrip.BackgroundColor3 = PAD_DARK
+PadGrip.BackgroundTransparency = 0.25
+PadGrip.Text = "drag"
+PadGrip.TextColor3 = Color3.fromRGB(160, 160, 170)
+PadGrip.Font = Enum.Font.GothamBold
+PadGrip.TextScaled = true
+PadGrip.Active = true
+PadGrip.Parent = PadFrame
+local gripCorner = Instance.new("UICorner")
+gripCorner.CornerRadius = UDim.new(1, 0)
+gripCorner.Parent = PadGrip
+local gripPad = Instance.new("UIPadding")
+gripPad.PaddingTop, gripPad.PaddingBottom = UDim.new(0, 3), UDim.new(0, 3)
+gripPad.Parent = PadGrip
+
+local PadButton = Instance.new("TextButton")
+PadButton.BackgroundColor3 = PAD_DARK
+PadButton.BackgroundTransparency = 0.15
+PadButton.AutoButtonColor = false
+PadButton.Text = ""
+PadButton.Parent = PadFrame
+local buttonCorner = Instance.new("UICorner")
+buttonCorner.CornerRadius = UDim.new(1, 0)
+buttonCorner.Parent = PadButton
+local buttonStroke = Instance.new("UIStroke")
+buttonStroke.Thickness = 2
+buttonStroke.Color = PAD_ON
+buttonStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+buttonStroke.Parent = PadButton
+local PadLabel = Instance.new("TextLabel")
+PadLabel.BackgroundTransparency = 1
+PadLabel.Size = UDim2.fromScale(0.8, 0.55)
+PadLabel.Position = UDim2.fromScale(0.1, 0.18)
+PadLabel.Font = Enum.Font.GothamBlack
+PadLabel.Text = "SPAM"
+PadLabel.TextColor3 = PAD_TEXT
+PadLabel.TextScaled = true
+PadLabel.Parent = PadButton
+local PadRate = Instance.new("TextLabel")
+PadRate.BackgroundTransparency = 1
+PadRate.Size = UDim2.fromScale(0.6, 0.2)
+PadRate.Position = UDim2.fromScale(0.2, 0.68)
+PadRate.Font = Enum.Font.GothamBold
+PadRate.TextColor3 = Color3.fromRGB(190, 190, 200)
+PadRate.TextScaled = true
+PadRate.Parent = PadButton
+
+local PadLock = Instance.new("TextButton")
+PadLock.BackgroundColor3 = PAD_DARK
+PadLock.BackgroundTransparency = 0.25
+PadLock.AutoButtonColor = false
+PadLock.Font = Enum.Font.GothamBold
+PadLock.TextScaled = true
+PadLock.TextColor3 = PAD_TEXT
+PadLock.Parent = PadFrame
+local lockCorner = Instance.new("UICorner")
+lockCorner.CornerRadius = UDim.new(1, 0)
+lockCorner.Parent = PadLock
+local lockPad = Instance.new("UIPadding")
+lockPad.PaddingTop, lockPad.PaddingBottom = UDim.new(0, 3), UDim.new(0, 3)
+lockPad.Parent = PadLock
+
+local function layoutPad()
+    local size = math.clamp(Pad.Size, 44, 140)
+    local bar = math.floor(size * 0.3)
+    PadFrame.Size = UDim2.fromOffset(size, size + bar * 2 + 8)
+    PadGrip.Size = UDim2.fromOffset(math.floor(size * 0.7), bar)
+    PadGrip.Position = UDim2.fromOffset(math.floor(size * 0.15), 0)
+    PadButton.Size = UDim2.fromOffset(size, size)
+    PadButton.Position = UDim2.fromOffset(0, bar + 4)
+    PadLock.Size = UDim2.fromOffset(math.floor(size * 0.7), bar)
+    PadLock.Position = UDim2.fromOffset(math.floor(size * 0.15), size + bar + 8)
+end
+
+local function paintPad()
+    local on = Pad.Held or Pad.Locked
+    PadButton.BackgroundColor3 = on and PAD_ON or PAD_DARK
+    PadRate.Text = ("%d/s"):format(math.floor(Parry.SpamCps + 0.5))
+    PadLock.Text = Pad.Locked and "LOCKED" or "lock"
+    PadLock.BackgroundColor3 = Pad.Locked and PAD_ON or PAD_DARK
+end
+
+layoutPad()
+paintPad()
+
+local function isPress(input)
+    return input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseButton1
+end
+
+-- hold to spam; it stops when that finger lifts, wherever it went
+local PadInput = nil
+PadButton.InputBegan:Connect(function(input)
+    if not isPress(input) then return end
+    PadInput = input
+    Pad.Held = true
+    paintPad()
+end)
+track(UserInputService.InputEnded:Connect(function(input)
+    if PadInput and (input == PadInput or (input.UserInputType == Enum.UserInputType.MouseButton1 and PadInput.UserInputType == Enum.UserInputType.MouseButton1)) then
+        PadInput = nil
+        Pad.Held = false
+        paintPad()
+    end
+end))
+
+PadLock.Activated:Connect(function()
+    Pad.Locked = not Pad.Locked
+    paintPad()
+end)
+
+-- dragging by the bar on top
+do
+    local dragInput, dragStart, startPos
+    PadGrip.InputBegan:Connect(function(input)
+        if isPress(input) then dragInput, dragStart, startPos = input, input.Position, PadFrame.Position end
+    end)
+    track(UserInputService.InputChanged:Connect(function(input)
+        if not dragInput then return end
+        if input == dragInput or (input.UserInputType == Enum.UserInputType.MouseMovement and dragInput.UserInputType == Enum.UserInputType.MouseButton1) then
+            local delta = input.Position - dragStart
+            PadFrame.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+        end
+    end))
+    track(UserInputService.InputEnded:Connect(function(input)
+        if input == dragInput or (dragInput and input.UserInputType == Enum.UserInputType.MouseButton1) then dragInput = nil end
+    end))
+end
+
+local function setPad(on)
+    Pad.Enabled = on
+    PadGui.Enabled = on
+    if not on then
+        Pad.Held, Pad.Locked, PadInput = false, false, nil
+        paintPad()
+    end
+end
+
 --// teardown -----------------------------------------------------------------------
 
 local function unload()
@@ -713,7 +1096,9 @@ local function unload()
     for _, connection in ipairs(Connections) do pcall(function() connection:Disconnect() end) end
     table.clear(Connections)
     for _, obj in ipairs(Drawings) do pcall(function() obj:Remove() end) end
+    Pad.Held, Pad.Locked = false, false
     pcall(function() Holder:Destroy() end)
+    pcall(function() PadGui:Destroy() end)
 end
 
 Genv.__PhantomBallStop = function()
@@ -760,7 +1145,7 @@ do
     local status = overview:AddLabel('status: loading', true)
     every(0.15, function()
         cards:SetValue('Parries', tostring(Stats.Parries))
-        cards:SetValue('Presses', tostring(Stats.Presses))
+        cards:SetValue('Presses', tostring(Stats.Presses) .. ((Stats.Spam or 0) > 0 and (" +" .. Stats.Spam) or ""))
         cards:SetValue('Lives lost', tostring(Stats.Misses))
         cards:SetValue('Ball speed', Stats.Speed and ("%.0f"):format(Stats.Speed) or '-')
         status:SetText(("status: %s\nping %.0fms   %s"):format(Stats.Status, ping() * 1000,
@@ -779,9 +1164,15 @@ do
         Min = 0.05, Max = 0.6, Default = Parry.Timing, Rounding = 2,
         Callback = function(v) Parry.Timing = v end,
     })
+    parry:AddSlider('pb_safety', {
+        Text = 'Safety margin',
+        Tooltip = 'the press always goes at least this long, plus a frame, before the ball reaches you, whatever the share above says. this is what keeps a very fast ball from slipping past between two frames',
+        Min = 0, Max = 120, Default = Parry.Safety, Rounding = 0, Suffix = 'ms',
+        Callback = function(v) Parry.Safety = v end,
+    })
     parry:AddToggle('pb_pingcomp', {
         Text = 'Ping compensation',
-        Tooltip = 'plays the ball forward by your ping, to where it is when the server gets the press',
+        Tooltip = 'plays the ball forward by your latency (roblox\'s ping, or what the game measures off its ball updates if worse), to where it is when the server gets the press',
         Default = Parry.PingComp,
         Callback = function(v) Parry.PingComp = v end,
     })
@@ -792,29 +1183,66 @@ do
     })
     parry:AddDropdown('pb_method', {
         Text = 'Press with',
-        Tooltip = 'game: the game\'s own block (animation, sound, cooldown on screen). direct: sends the same packet straight to the parry remote',
+        Tooltip = 'game: the game\'s own block. direct: sends the same packet straight to the parry remote, and plays what the game would (block animation, feedback, hit sound and effect, cooldown on the button)',
         Values = { 'Game', 'Direct' },
         Default = Parry.Method,
         Callback = function(v) Parry.Method = v or "Game" end,
     })
 
-    local clash = Tab:AddRightGroupbox('Clash + spam', 'zap')
+    local clash = Tab:AddRightGroupbox('Clash', 'zap')
     clash:AddToggle('pb_clash', {
         Text = 'Auto clash',
-        Tooltip = 'in a clash (a parry back and forth within 35 studs) it presses as soon as the ball is yours and the short clash cooldown is up',
+        Tooltip = 'a clash is you and one other player sending it back and forth: both parried in the last moment and they are close. told by the game\'s own parry announcements, and the game\'s own clash check',
         Default = Parry.Clash,
         Callback = function(v) Parry.Clash = v end,
     })
-    clash:AddToggle('pb_spam', {
+    clash:AddDropdown('pb_clash_mode', {
+        Text = 'In a clash',
+        Tooltip = 'smart: presses the moment the ball is yours, and presses ahead while it is on your partner so your window is already open when it comes back (only when the server counts it as a clash too). spam: spams the block for as long as the clash lasts',
+        Values = { 'Smart', 'Spam' },
+        Default = Parry.ClashMode,
+        Callback = function(v) Parry.ClashMode = v or "Smart" end,
+    })
+    clash:AddSlider('pb_clash_dist', {
+        Text = 'Clash distance',
+        Min = 15, Max = 80, Default = Parry.ClashDistance, Rounding = 0, Suffix = ' studs',
+        Callback = function(v) Parry.ClashDistance = v end,
+    })
+    local clashStatus = clash:AddLabel('clash: -', true)
+    every(0.2, function()
+        clashStatus:SetText(Stats.Clash and Stats.Partner and ("clash: with " .. Stats.Partner.DisplayName) or "clash: none")
+    end)
+
+    local spam = Tab:AddRightGroupbox('Spam', 'mouse-pointer-click')
+    spam:AddToggle('pb_spam', {
         Text = 'Spam',
-        Tooltip = 'presses the block over and over while on (hold the key by default). kept under the game\'s 25 clicks a second limit',
+        Tooltip = 'presses the block over and over while on (hold the key by default)',
         Default = false,
         Callback = function(v) Parry.Spam = v end,
     }):AddKeyPicker('pb_spam_key', { Default = 'None', Mode = 'Hold', SyncToggleState = true, Text = 'Spam' })
-    clash:AddSlider('pb_cps', {
-        Text = 'Spam clicks a second',
-        Min = 2, Max = 24, Default = Parry.SpamCps, Rounding = 0,
-        Callback = function(v) Parry.SpamCps = v end,
+    spam:AddSlider('pb_cps', {
+        Text = 'Clicks a second',
+        Tooltip = 'the game counts 25 a second as real; spam runs a little over, and the game\'s own count is kept under its limit so every packet still counts',
+        Min = 5, Max = 30, Default = Parry.SpamCps, Rounding = 0, Suffix = '/s',
+        Callback = function(v)
+            Parry.SpamCps = v
+            paintPad()
+        end,
+    })
+    spam:AddToggle('pb_pad', {
+        Text = 'Spam button on screen',
+        Tooltip = 'a small button for touch screens: hold it to spam, drag it by the bar on top, lock keeps it spamming',
+        Default = UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled,
+        Callback = function(v) setPad(v) end,
+    })
+    if UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled then setPad(true) end
+    spam:AddSlider('pb_pad_size', {
+        Text = 'Button size',
+        Min = 44, Max = 140, Default = Pad.Size, Rounding = 0, Suffix = 'px',
+        Callback = function(v)
+            Pad.Size = v
+            layoutPad()
+        end,
     })
 end
 
