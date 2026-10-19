@@ -673,8 +673,9 @@ local function newContext()
         stats = {
             instances = 0, scripts = 0, duplicates = 0, defaults = 0, serverScripts = 0,
             failures = 0, constants = 0, suspects = 0, remotes = 0, values = 0, interactables = 0,
-            collapsed = 0, hidden = 0, tags = 0, texts = 0,
+            collapsed = 0, hidden = 0, tags = 0, texts = 0, remotesLeftOut = 0,
         },
+        myPath = "Players." .. LocalPlayer.Name .. ".",
         timings = {},
         characters = characters,
         classCount = {},
@@ -837,8 +838,17 @@ local function visit(ctx, frame)
         end
     elseif REMOTE_CLASSES[className] then
         if Config.Remotes then
-            ctx.remotes[#ctx.remotes + 1] = { inst = inst, parent = parentPathOf(path), name = frame.label or inst.Name, className = className }
-            stats.remotes = stats.remotes + 1
+            -- a gui's own bindables (particle emitters, tweens) and the copies
+            -- inside every other player are noise in the list; they stay in
+            -- the tree
+            local guiBindable = frame.inGui and (className == "BindableEvent" or className == "BindableFunction")
+            local otherPlayer = path:sub(1, 8) == "Players." and path:sub(1, #ctx.myPath) ~= ctx.myPath
+            if guiBindable or otherPlayer then
+                stats.remotesLeftOut = stats.remotesLeftOut + 1
+            else
+                ctx.remotes[#ctx.remotes + 1] = { inst = inst, parent = parentPathOf(path), name = frame.label or inst.Name, className = className }
+                stats.remotes = stats.remotes + 1
+            end
         end
     elseif INTERACT_CLASSES[className] and Config.Interactables then
         ctx.interactables[#ctx.interactables + 1] = { inst = inst, className = className, path = path }
@@ -1135,6 +1145,10 @@ local function writeRemotes(ctx, out)
         if a.parent ~= b.parent then return a.parent < b.parent end
         return a.name < b.name
     end)
+    if ctx.stats.remotesLeftOut > 0 then
+        out:line(("(%d left out: bindables inside guis and other players' copies - they're in the tree)"):format(ctx.stats.remotesLeftOut))
+        out:line("")
+    end
     if Config.Listeners and not Has.connections then
         out:line("(listeners need getconnections, which this executor does not have)")
         out:line("")
@@ -1253,11 +1267,22 @@ local function writeTags(out)
     out:line("your character's tags: " .. (mine and table.concat(mine, ", ") or "none"))
 end
 
--- a table's fields, one level down, with functions given as signatures
+-- a table's fields, one level down, with functions given as signatures. Keys
+-- that all hold the same table (a shared runtime library under every module
+-- name, say) come out once, on one line.
 local function describeTable(out, tbl, indent, limit)
     local keys = {}
     for key in pairs(tbl) do keys[#keys + 1] = key end
     table.sort(keys, function(a, b) return tostring(a) < tostring(b) end)
+    local holders = {}
+    for _, key in ipairs(keys) do
+        local value = rawget(tbl, key)
+        if type(value) == "table" then
+            holders[value] = holders[value] or {}
+            table.insert(holders[value], tostring(key))
+        end
+    end
+    local printed = {}
     for i, key in ipairs(keys) do
         if i > limit then
             out:line(indent .. ("... +%d more"):format(#keys - limit))
@@ -1265,6 +1290,14 @@ local function describeTable(out, tbl, indent, limit)
         end
         local value = rawget(tbl, key)
         local label = pad(tostring(key), 28)
+        local shared = type(value) == "table" and holders[value]
+        if shared and #shared > 1 then
+            if printed[value] then continue end
+            printed[value] = true
+            local names = table.concat(shared, ", ")
+            if #names > 240 then names = names:sub(1, 240) .. "..." end
+            label = ("%s  (%d keys, all the same table)  "):format(names, #shared)
+        end
         if type(value) == "function" then
             local where = whereIs(value)
             local line = where and where:match(":(%d+)$")
