@@ -62,6 +62,9 @@ local Games = {
     [6447798030] = { Name = 'Funky Friday', Script = 'Games/FunkyFriday.lua' },
     [12979690461] = { Name = 'Phantom Ball', Script = 'Games/PhantomBall.lua', AutoLoad = true },
     [185655149] = { Name = 'Welcome to Bloxburg', Script = 'Games/Bloxburg.lua' },
+    -- Break In 2 (Story) by Cracky4 (game 4807308814): the story level's place,
+    -- from its dump. The lobby (13864661000) is left out on purpose.
+    [13864667823] = { Name = 'Break In 2', Script = 'Games/BreakIn2.lua' },
     -- [🎃] Dodge or Die (game 9845585365): every mode's place, from the game's
     -- own ServerModeConfig. AutoLoad runs it as soon as it is detected.
     [131794278839305] = { Name = 'Dodge or Die', Script = 'Games/DodgeOrDie.lua', AutoLoad = true },
