@@ -1,17 +1,21 @@
 --// Break In 2 (Story) -- the story level (place 13864667823, game 4807308814).
 --
--- Built against a script dump of the live game (version 1732). This version
--- does every job the way a player does it, so the server gets exactly what it
--- would from real play. The first version tried shortcuts the server checks
--- and undoes:
---  * levels: the server tracks XP itself; a report it didn't see earned is
---    answered with PlayerGainedXp:FireClient, which drops the stat back to 1.
---    So training runs the real treadmill, bench press and book: the game's
---    own machine click, its own input handler, its own XP ticks.
---  * fighting: damage is worked out by the game's swing (strength, weapon
---    level, combo, targets per swing, its 8.5 x 7.5 x 13 hitbox). So the
---    farm stands you in front of a bad guy and presses the game's own hit
---    button (BindableEvents.MobileHit) with your weapon really equipped.
+-- Built against a script dump of the live game (version 1732). What the
+-- game's own client code shows, and how each feature uses it:
+--  * hits: the client sends HitBadguy(enemy, damage, weaponLevel) after
+--    WeaponCheck(strength, 1). The server takes the hit from any distance but
+--    only with the damage the game's swing would send: 10 x a strength factor
+--    x a weapon factor (WeaponsModule's t3 / t4 tables), the finisher 996 at
+--    5 health or less, the equipped weapon's level, at the swing's own pace.
+--    The kill aura sends exactly that.
+--  * levels: every XP tick the client sends PlayerGainedXp(level, stat, xp),
+--    and LevelToServer(level, stat) when a level fills. A jump the server
+--    didn't see ticked up to is answered with PlayerGainedXp:FireClient,
+--    which drops the stat back to 1. Fast level up sends the same ticks the
+--    gym does (+2 speed, +6.75 strength, the game's largest), back to back,
+--    and slows itself down whenever the server answers with a reset.
+--  * spawning: the vending claim, Vending(3, item, machine, you, ...), names
+--    its item from the client.
 --  * food heals only while the food is in your hand, so it's equipped and
 --    used through the game's own click handler.
 --  * pickups, crates, vending, trash cans, bikes and Uncle Pete are clicked
@@ -96,10 +100,18 @@ local S = {
     God = false,
     NoCatch = false,
     NoLobby = false,
-    -- training
-    Treadmill = false,
-    Bench = false,
-    Read = false,
+    KillAura = false,
+    AuraRange = 300,
+    AuraTargets = 0,      -- 0: as many as the game's swing hits at your strength
+    -- levels
+    FastSpeed = false,
+    FastStrength = false,
+    LevelCover = true,    -- sit on the matching gym machine while it runs
+    LevelMethod = "XP ticks",
+    -- spawning
+    SpawnItem = "Crowbar3",
+    SpawnWay = "Vending",
+    SpawnCount = 1,
     -- items
     AutoEat = false,
     EatBelow = 100,
@@ -154,11 +166,6 @@ local function mod(name)
         return result
     end
     return nil
-end
-
-local function speedLevel()
-    local ss = mod("StrengthService")
-    return ss and tonumber(ss.level) or 1
 end
 
 local function strengthLevel()
@@ -589,6 +596,81 @@ loop(0.08, function()
     swing()
 end)
 
+-- The kill aura: the hit request the game's swing makes, for every bad guy in
+-- range, with the damage that swing would carry. From WeaponsModule:
+--   damage = 10 x t3[strength] x t4[weapon level], with t3 swapped for the
+--   weapon's own entry on a weak weapon at high strength; 996 (the finisher)
+--   at 5 health or less; t8[strength] targets per swing; t2[strength] seconds
+--   between swings. Your special weapon (the server names it) counts as 5.
+local T2 = { 0.9, 0.55, 0.39, 0.37, 0.3 }
+local T3 = { 0.6, 0.8, 1.1, 1.4, 1.8 }
+local T4 = { 0.5, 1, 1.5, 1.8, 2.2 }
+local T8 = { 1, 1, 2, 3, 3 }
+local SpecialWeapon = nil
+
+if remote("WhatsDaWep") then
+    track(remote("WhatsDaWep").OnClientEvent:Connect(function(name) SpecialWeapon = name end))
+    task.delay(1, function() fire("WhatsDaWep") end)
+end
+
+local function hitDamage(level, weaponLevel)
+    local v = T3[level]
+    if level == 3 then
+        if weaponLevel == 1 then v = math.max(T3[weaponLevel], 1) end
+    elseif level == 4 or level == 5 then
+        if weaponLevel < 3 then v = math.max(T3[weaponLevel], 1) end
+    end
+    return 10 * v * T4[weaponLevel]
+end
+
+local function auraLevel()
+    return math.clamp(math.floor(strengthLevel()), 1, 5)
+end
+
+loop(function() return T2[auraLevel()] + 0.03 end, function()
+    if not S.KillAura then return end
+    local _, root = myChar()
+    if not root then return end
+    local wep = weapon()
+    if not wep then
+        Status.Farm = "kill aura: no weapon (get a crowbar from the rack)"
+        return
+    end
+    if wep.Parent ~= LocalPlayer.Character and not equip(wep) then return end
+    local targets = {}
+    for _, enemy in ipairs(enemies()) do
+        local part = rootOf(enemy)
+        if part then
+            local d = (part.Position - root.Position).Magnitude
+            if d <= S.AuraRange then targets[#targets + 1] = { Model = enemy, Dist = d } end
+        end
+    end
+    if #targets == 0 then
+        Status.Farm = "kill aura: no bad guys in range"
+        return
+    end
+    table.sort(targets, function(x, y) return x.Dist < y.Dist end)
+    local level = auraLevel()
+    local weaponLevel = math.clamp(wep.WeaponLevel.Value, 1, 5)
+    if SpecialWeapon and wep.Name == SpecialWeapon then weaponLevel = 5 end
+    local damage = hitDamage(level, weaponLevel)
+    local cap = S.AuraTargets > 0 and S.AuraTargets or T8[level]
+    fire("WeaponCheck", level, 1)
+    local hit = 0
+    for _, entry in ipairs(targets) do
+        local hum = entry.Model:FindFirstChildOfClass("Humanoid")
+        if hum and hum.Health > 0 then
+            if hum.Health <= 5 then
+                fire("HitBadguy", entry.Model, 996)
+            elseif hit < cap then
+                fire("HitBadguy", entry.Model, damage, weaponLevel)
+                hit += 1
+            end
+        end
+    end
+    Status.Farm = ("kill aura: %d in range, %.1f damage a hit"):format(#targets, damage)
+end)
+
 -- Scary Mary: when she's stunned (stars over her head) the key on her back
 -- can be turned: its click, from within its 12 stud reach
 loop(0.3, function()
@@ -605,13 +687,7 @@ loop(0.3, function()
     task.wait(1)
 end)
 
---// training ----------------------------------------------------------------
--- Treadmill (Speed): the machine's own start click, then you're kept on the
--- target spot the game lights up (standing on it is the bonus XP), never
--- touching the back of the cage. The game ticks the XP itself every 3s.
--- Bench press (Strength): the machine's own start click, then the game's own
--- click handler, which lifts, and fills the bonus bar when one comes up.
--- Book (both, Nerd role): the game's own reading, with its quiz answered.
+--// gym machines ------------------------------------------------------------
 
 local Training = { Machine = nil }
 
@@ -638,6 +714,7 @@ local function freeMachine(folderName, machineName)
     return best
 end
 
+-- the machine's own start click, as walking up to it and clicking does
 local function startMachine(eq)
     local start = eq and eq:FindFirstChild("StartPart")
     local detector = start and start:FindFirstChildOfClass("ClickDetector")
@@ -656,155 +733,116 @@ local function leaveMachine()
     Training.Machine = nil
 end
 
--- the spot the game lights up on the treadmill, and its touch sensor
-local function treadmillTarget(eq)
-    local options = eq:FindFirstChild("TredmillOptions")
-    for _, spot in ipairs(options and options:GetChildren() or {}) do
-        local decal = spot:FindFirstChild("Decal")
-        if spot:IsA("BasePart") and decal and math.abs(decal.Transparency - 0.6) < 0.01 then
-            local sensor
-            for _, child in ipairs(spot:GetChildren()) do
-                if child:IsA("BasePart") and not child:FindFirstChild("Decal") then sensor = child end
-            end
-            return spot, sensor
-        end
-    end
-    return nil
+--// levels ------------------------------------------------------------------
+
+local LEVELS = { Speed = { 12, 35, 63, 92, 107 }, Strength = { 12, 39, 80, 118, 130 } }
+local SPEED_WALK = { 16, 16.5, 17, 18, 20 }
+local MACHINE_FOR_STAT = { Speed = { "Tredmills", "Tredmill" }, Strength = { "BenchPresses", "BenchPress" } }
+
+local LevelUp = {
+    Speed = { Interval = 0.25, Resets = 0, Ticks = 0 },
+    Strength = { Interval = 0.25, Resets = 0, Ticks = 0 },
+}
+
+-- a tick the server didn't believe comes back as PlayerGainedXp(stat): the
+-- game drops the stat to 1, and this halves the pace for that stat
+if remote("PlayerGainedXp") then
+    track(remote("PlayerGainedXp").OnClientEvent:Connect(function(stat)
+        local st = LevelUp[stat == "Speed" and "Speed" or "Strength"]
+        st.Resets += 1
+        st.Interval = math.min(st.Interval * 2, 3.2)
+    end))
 end
 
-local LastSensor = nil
+local function statFields(stat)
+    if stat == "Speed" then return "level", "xp" end
+    return "level2", "xp2"
+end
 
--- keeps you on the lit spot every frame while on the treadmill
-track(RunService.Heartbeat:Connect(function()
-    if Unloaded or not S.Treadmill or not Training.Machine or Training.Machine.Name ~= "Tredmill" then return end
-    pcall(function()
-        local eq = Training.Machine
-        local _, root = myChar()
-        local here = eq:FindFirstChild("WorkoutHere")
-        if not root or not here then return end
-        local spot, sensor = treadmillTarget(eq)
-        local rotation = here.CFrame - here.CFrame.Position
-        local target = spot and Vector3.new(spot.Position.X, root.Position.Y, spot.Position.Z) or Vector3.new(here.Position.X, root.Position.Y, here.Position.Z)
-        root.CFrame = CFrame.new(target) * rotation
-        root.AssemblyLinearVelocity = Vector3.zero
-        if sensor and sensor ~= LastSensor then
-            LastSensor = sensor
-            task.spawn(touch, sensor)
-        end
-    end)
-end))
+local function statLevel(stat)
+    local ss = mod("StrengthService")
+    local lf = statFields(stat)
+    return ss and tonumber(ss[lf]) or 1
+end
 
-loop(1, function()
-    if not S.Treadmill then return end
-    if speedLevel() >= 5 then
-        if myMachine("Tredmills", "Tredmill") then leaveMachine() end
-        S.Treadmill = false
-        Status.Train = "speed is maxed"
-        notify("Speed is level 5")
-        return
+local function levelUpVisuals(stat, level)
+    local ss = mod("StrengthService")
+    local bars = mod("LevelBarService")
+    if bars and type(bars.lvlUp) == "function" then pcall(bars.lvlUp, stat, level) end
+    -- speed 3 opens the attic shortcut; the game does it inside its own tick
+    if stat == "Speed" and level == 3 and ss then
+        pcall(function()
+            local env = getfenv(ss.tickXP)
+            if type(env.doLadder) == "function" then env.doLadder() end
+        end)
     end
-    local eq = myMachine("Tredmills", "Tredmill")
-    if eq then
-        Training.Machine = eq
-        local ss = mod("StrengthService")
-        Status.Train = ("treadmill: speed %d, xp %.1f"):format(speedLevel(), ss and ss.xp or 0)
-        return
-    end
-    Training.Machine = nil
-    local free = freeMachine("Tredmills", "Tredmill")
-    if not free then
-        Status.Train = "every treadmill is taken"
-        return
-    end
-    Status.Train = "getting on a treadmill"
-    if startMachine(free) then Training.Machine = free end
-end)
+end
 
-loop(0.12, function()
-    if not S.Bench then return end
-    if strengthLevel() >= 5 then
-        if myMachine("BenchPresses", "BenchPress") then leaveMachine() end
-        S.Bench = false
-        Status.Train = "strength is maxed"
-        notify("Strength is level 5")
-        return
+-- one XP tick, exactly as the game's own tickXP / tickXP2 sends it
+local function xpTick(stat)
+    local ss = mod("StrengthService")
+    if not ss then return false end
+    local lf, xf = statFields(stat)
+    local level = tonumber(ss[lf]) or 1
+    if level >= 5 then return false end
+    local xp = (tonumber(ss[xf]) or 0) + (stat == "Speed" and 2 or 6.75)
+    if xp >= LEVELS[stat][level] then
+        level += 1
+        xp = level >= 5 and 1 or 0
+        ss[lf], ss[xf] = level, xp
+        fire("LevelToServer", level, stat)
+        fire("SweatSound")
+        if stat == "Speed" then fire("Walkspeeder2", SPEED_WALK[level]) end
+        levelUpVisuals(stat, level)
+    else
+        ss[xf] = xp
     end
-    local eq = myMachine("BenchPresses", "BenchPress")
-    if not eq then
-        Training.Machine = nil
-        local free = freeMachine("BenchPresses", "BenchPress")
-        if not free then
-            Status.Train = "every bench is taken"
-            task.wait(1)
+    local bars = mod("LevelBarService")
+    if bars and type(bars.tickXp) == "function" then pcall(bars.tickXp, stat, xp, level) end
+    fire("PlayerGainedXp", level, stat, xp)
+    LevelUp[stat].Ticks += 1
+    return true
+end
+
+-- the other way: only the level reports, one level at a time
+local function levelReport(stat)
+    local ss = mod("StrengthService")
+    if not ss then return false end
+    local lf, xf = statFields(stat)
+    local level = (tonumber(ss[lf]) or 1) + 1
+    if level > 5 then return false end
+    ss[lf], ss[xf] = level, level >= 5 and 1 or 0
+    fire("LevelToServer", level, stat)
+    if stat == "Speed" then fire("Walkspeeder2", SPEED_WALK[level]) end
+    levelUpVisuals(stat, level)
+    LevelUp[stat].Ticks += 1
+    return true
+end
+
+local function runLevelUp(stat, key)
+    loop(function() return LevelUp[stat].Interval end, function()
+        if not S[key] then return end
+        if statLevel(stat) >= 5 then
+            S[key] = false
+            notify(stat .. " is level 5")
+            if Training.Machine then leaveMachine() end
             return
         end
-        Status.Train = "getting on a bench"
-        if startMachine(free) then
-            Training.Machine = free
-            -- the server hands over the bar once the bench is yours
-            waitFor(8, function() return LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("BarTool") ~= nil end)
+        if S.LevelCover then
+            local m = MACHINE_FOR_STAT[stat]
+            local eq = myMachine(m[1], m[2])
+            if not eq then
+                local free = freeMachine(m[1], m[2])
+                if free and startMachine(free) then Training.Machine = free end
+            else
+                Training.Machine = eq
+            end
         end
-        return
-    end
-    Training.Machine = eq
-    if not (LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("BarTool")) then
-        Status.Train = "waiting for the bar"
-        return
-    end
-    local ss = mod("StrengthService")
-    Status.Train = ("bench: strength %d, xp %.1f"):format(strengthLevel(), ss and ss.xp2 or 0)
-    -- a lift is a click released in the world
-    gameClick(UserInputService.InputEnded, "GymService", Enum.UserInputState.End)
-end)
-
--- the book's quiz: "a + b" / "a - b", the button whose answer matches
-local function answerQuiz()
-    local gui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
-    local book = gui and path(gui, "Book/Book/Book")
-    if not book or not book.Visible then return false end
-    local question = book:FindFirstChild("Question")
-    local a, op, b = tostring(question and question.Text or ""):match("(%d+)%s*([%+%-])%s*(%d+)")
-    if not a then return false end
-    local answer = op == "+" and (tonumber(a) + tonumber(b)) or (tonumber(a) - tonumber(b))
-    for i = 1, 3 do
-        local button = book:FindFirstChild("Button" .. i)
-        local label = button and button:FindFirstChild("Answer")
-        if label and button.Visible and label.Text == tostring(answer) then
-            task.wait(0.4 + math.random() * 0.6)
-            return fireGui(button)
-        end
-    end
-    return false
+        if S.LevelMethod == "Level reports" then levelReport(stat) else xpTick(stat) end
+    end)
 end
-
-loop(0.5, function()
-    if not S.Read then return end
-    if speedLevel() >= 5 and strengthLevel() >= 5 then
-        S.Read = false
-        Status.Train = "both stats are maxed"
-        return
-    end
-    local gs = mod("GymService")
-    local book = findTool("Book")
-    if not book then
-        Status.Train = "reading needs the Book (Nerd role)"
-        return
-    end
-    if gs and gs.isReading then
-        Status.Train = ("reading: speed %d, strength %d"):format(speedLevel(), strengthLevel())
-        answerQuiz()
-        return
-    end
-    if not equip(book) then return end
-    task.wait(0.3)
-    Status.Train = "opening the book"
-    if gs and type(gs.startReading) == "function" then
-        pcall(gs.startReading)
-    else
-        gameClick(UserInputService.InputBegan, "BookToolClient", Enum.UserInputState.Begin)
-    end
-    task.wait(1)
-end)
+runLevelUp("Speed", "FastSpeed")
+runLevelUp("Strength", "FastStrength")
 
 --// food --------------------------------------------------------------------
 -- Eating: the food in hand, used through the game's own click handler
@@ -852,8 +890,6 @@ end
 loop(2, function()
     if not S.AutoEat or Energy >= S.EatBelow then return end
     if not myChar() then return end
-    -- the bench and reading stop if you take something else in hand
-    if (S.Bench or S.Read) and Training.Machine then return end
     eatOnce()
 end)
 
@@ -1022,6 +1058,66 @@ local function buyFrom(machine)
     local owner = price:FindFirstChild("Owner")
     if owner and not waitFor(10, function() return owner.Value == LocalPlayer.Name end) then return false, "machine didn't open" end
     return true, "bought"
+end
+
+--// spawning ----------------------------------------------------------------
+-- Every request the game's client uses to hand out an item, with any item
+-- name. The vending claim is the one known to work.
+
+local ITEMS = {
+    "Crowbar3", "Crowbar2", "Crowbar1", "Bat", "LinkedSword", "Broom", "Pitchfork", "Hammer", "Wrench",
+    "Apple", "Cookie", "Pizza", "GoldPizza", "RainbowPizza", "GoldenApple", "BloxyCola", "ExpiredBloxyCola", "Chips",
+    "Lollipop", "Bottle", "MedKit", "Book", "Phone", "Key", "GoldKey", "Battery", "Ladder", "Louise",
+    "Desert Storm Army Vest", "Vest",
+}
+
+local MACHINE_FOR = {
+    Apple = "Food", Cookie = "Food", Pizza = "Food", Chips = "Food", GoldPizza = "Food", RainbowPizza = "Food", GoldenApple = "Food",
+    BloxyCola = "Drinks", ExpiredBloxyCola = "Drinks", Key = "Drinks", GoldKey = "Drinks",
+    Crowbar1 = "Weapons", Crowbar2 = "Weapons", Crowbar3 = "Weapons", Bat = "Weapons", Broom = "Weapons",
+    Pitchfork = "Weapons", Hammer = "Weapons", Wrench = "Weapons", LinkedSword = "Weapons",
+    ["Desert Storm Army Vest"] = "Armor", Vest = "Armor",
+}
+
+local VendingId = 1000
+
+local SPAWN_WAYS = {
+    { Name = "Vending", Try = function(item)
+        VendingId += 1
+        fire("Vending", 3, item, MACHINE_FOR[item] or "Food", LocalPlayer.Name, nil, VendingId)
+    end },
+    { Name = "GiveTool", Try = function(item) fire("GiveTool", item); fire("GiveTool", item, true) end },
+    { Name = "Crate", Try = function(item)
+        local hidden = Workspace:FindFirstChild("Hidden")
+        local spot = hidden and (hidden:FindFirstChild(item) or hidden:FindFirstChild("RainbowPizza") or hidden:FindFirstChild("Bottle"))
+        local boxes = Workspace:FindFirstChild("Boxes")
+        spot = spot or (boxes and boxes:GetChildren()[1])
+        if spot then fire("BoxEvent", 2, spot, item) end
+    end },
+    { Name = "Stack", Try = function(item)
+        if item == "Pizza" or item == "BloxyCola" then fire("StackItem", item) end
+    end },
+}
+
+local function countTool(name)
+    local n = 0
+    for _, t in ipairs(tools()) do
+        if t.Name == name then n += 1 end
+    end
+    local char = LocalPlayer.Character
+    if char and char:FindFirstChild(name) and not char[name]:IsA("Tool") then n += 1 end
+    return n
+end
+
+local function spawnItem(item, way)
+    local before = countTool(item)
+    for _, w in ipairs(SPAWN_WAYS) do
+        if way == "Auto" or way == w.Name then
+            pcall(w.Try, item)
+            if waitFor(1.5, function() return countTool(item) > before end) then return true, w.Name end
+        end
+    end
+    return false, nil
 end
 
 --// story -------------------------------------------------------------------
@@ -1245,17 +1341,12 @@ local function setSpeedLocks(off)
     end
 end
 
--- speed is left alone while training: the treadmill sets its own pace and
--- reading stops the moment you move
-local function training()
-    return Training.Machine ~= nil or (S.Read and mod("GymService") and mod("GymService").isReading)
-end
 
 track(RunService.Heartbeat:Connect(function()
     if Unloaded then return end
     pcall(function()
         local _, _, hum = myChar()
-        if not hum or training() then return end
+        if not hum then return end
         if S.Speed and hum.WalkSpeed ~= S.SpeedValue then hum.WalkSpeed = S.SpeedValue end
         if S.Jump then
             hum.UseJumpPower = true
@@ -1551,7 +1642,14 @@ end
 do
     local Tab = Window:AddTab('Combat', 'swords', 'Fights')
 
-    local farm = Tab:AddLeftGroupbox('Fighting', 'crosshair')
+    local aura = Tab:AddLeftGroupbox('Kill aura', 'crosshair')
+    toggle(aura, 'bi_aura', 'Kill aura', 'KillAura', 'hits every bad guy in range with the exact hit your swing would make (damage from your strength and weapon), at the swing\'s own pace. your weapon is held while it runs')
+        :AddKeyPicker('bi_aura_key', { Default = 'None', Mode = 'Toggle', SyncToggleState = true, Text = 'Kill aura' })
+    aura:AddSlider('bi_aura_range', { Text = 'Range', Min = 10, Max = 1000, Default = S.AuraRange, Rounding = 0, Suffix = ' studs', Callback = function(v) S.AuraRange = v end })
+    aura:AddSlider('bi_aura_targets', { Text = 'Targets per swing (0 = game\'s)', Tooltip = 'the game\'s swing hits 1 at strength 1-2, 2 at 3, 3 at 4-5. low bad guys are finished off regardless', Min = 0, Max = 10, Default = S.AuraTargets, Rounding = 0, Callback = function(v) S.AuraTargets = v end })
+    aura:AddLabel('Damage grows with strength: max strength first (Levels tab) and get the best weapon you can (the spawner can give a Crowbar3).', true)
+
+    local farm = Tab:AddLeftGroupbox('Fighting', 'swords')
     toggle(farm, 'bi_farm', 'Auto farm bad guys', 'Farm', 'goes to the nearest bad guy, stands in front of it and swings with the game\'s own hit button, your weapon in hand. damage is the game\'s own (it grows with strength and weapon)')
         :AddKeyPicker('bi_farm_key', { Default = 'None', Mode = 'Toggle', SyncToggleState = true, Text = 'Auto farm' })
     toggle(farm, 'bi_swing', 'Auto swing (stay put)', 'Swing', 'swings whenever a bad guy is within reach, without moving you')
@@ -1580,20 +1678,26 @@ do
 end
 
 do
-    local Tab = Window:AddTab('Training', 'dumbbell', 'Speed and strength')
+    local Tab = Window:AddTab('Levels', 'trending-up', 'Speed and strength')
 
-    local box = Tab:AddLeftGroupbox('Gym', 'dumbbell')
-    box:AddLabel('The server keeps your XP, so levels are earned on the real equipment: this does the training for you, at the game\'s own pace (a few minutes per stat).', true)
-    toggle(box, 'bi_tread', 'Auto treadmill (speed)', 'Treadmill', 'gets on a free treadmill and keeps you on the lit spot for the bonus XP until speed is 5')
-    toggle(box, 'bi_bench', 'Auto bench press (strength)', 'Bench', 'gets on a free bench and lifts with the game\'s own click, filling the bonus bar, until strength is 5')
-    toggle(box, 'bi_read', 'Auto read (Book role)', 'Read', 'reads the book and answers its quiz; trains both stats. needs the Book')
+    local box = Tab:AddLeftGroupbox('Fast level up', 'zap')
+    box:AddLabel('Sends the XP updates the gym sends while you train, back to back, and the level ups when each bar fills. If the server answers with a reset (your level drops to 1) it halves the pace for that stat and keeps going, so it settles on the fastest pace the server takes.', true)
+    toggle(box, 'bi_fastspeed', 'Level up speed', 'FastSpeed')
+    toggle(box, 'bi_faststrength', 'Level up strength', 'FastStrength')
+    toggle(box, 'bi_levelcover', 'Sit on the gym machine while it runs', 'LevelCover', 'gets on a free treadmill (speed) or bench (strength) first, the way a player would be when training')
+    box:AddDropdown('bi_levelmethod', { Text = 'Method', Values = { "XP ticks", "Level reports" }, Default = S.LevelMethod, Tooltip = 'XP ticks: the gym\'s own updates. Level reports: only the level up messages, one level at a time', Callback = function(v) S.LevelMethod = v or S.LevelMethod end })
+    box:AddSlider('bi_levelpace', { Text = 'Start pace', Min = 0.05, Max = 3, Default = 0.25, Rounding = 2, Suffix = 's', Callback = function(v)
+        LevelUp.Speed.Interval, LevelUp.Strength.Interval = v, v
+    end })
     local status = box:AddLabel('-', true)
     every(0.5, function()
         local ss = mod("StrengthService")
-        status:SetText(("%s\nspeed %d (xp %.1f)   strength %d (xp %.1f)"):format(Status.Train, speedLevel(), ss and ss.xp or 0, strengthLevel(), ss and ss.xp2 or 0))
+        status:SetText(("speed %d (xp %.1f): every %.2fs, %d sent, %d resets\nstrength %d (xp %.1f): every %.2fs, %d sent, %d resets"):format(
+            statLevel("Speed"), ss and ss.xp or 0, LevelUp.Speed.Interval, LevelUp.Speed.Ticks, LevelUp.Speed.Resets,
+            statLevel("Strength"), ss and ss.xp2 or 0, LevelUp.Strength.Interval, LevelUp.Strength.Ticks, LevelUp.Strength.Resets))
     end)
     box:AddButton({ Text = 'Get off the machine', Func = function()
-        S.Treadmill, S.Bench = false, false
+        S.FastSpeed, S.FastStrength = false, false
         leaveMachine()
     end })
 end
@@ -1631,6 +1735,28 @@ do
             end,
         })
     end
+
+    local spawner = Tab:AddRightGroupbox('Item spawner', 'sparkles')
+    spawner:AddLabel('Vending is the way that worked. The others are tried by Auto too.', true)
+    spawner:AddDropdown('bi_spawn_item', { Text = 'Item', Values = ITEMS, Default = S.SpawnItem, Searchable = true, Callback = function(v) S.SpawnItem = v or S.SpawnItem end })
+    local ways = { "Vending", "Auto" }
+    for _, w in ipairs(SPAWN_WAYS) do if w.Name ~= "Vending" then ways[#ways + 1] = w.Name end end
+    spawner:AddDropdown('bi_spawn_way', { Text = 'Way', Values = ways, Default = S.SpawnWay, Callback = function(v) S.SpawnWay = v or S.SpawnWay end })
+    spawner:AddSlider('bi_spawn_count', { Text = 'How many', Min = 1, Max = 20, Default = S.SpawnCount, Rounding = 0, Callback = function(v) S.SpawnCount = v end })
+    local spawnResult = spawner:AddLabel('', true)
+    spawner:AddButton({
+        Text = 'Spawn',
+        Func = function()
+            task.spawn(function()
+                local got, how = 0, nil
+                for _ = 1, S.SpawnCount do
+                    local ok, way = spawnItem(S.SpawnItem, S.SpawnWay)
+                    if ok then got += 1; how = way end
+                end
+                spawnResult:SetText(got > 0 and ("got %d %s (%s)"):format(got, S.SpawnItem, tostring(how)) or ("the server didn't give " .. S.SpawnItem))
+            end)
+        end,
+    })
 
     local swap = Tab:AddRightGroupbox('Item swap', 'repeat')
     swap:AddLabel('The game\'s client says which item it takes from a vending machine and from a drawer. These change that to the item you pick, on a real buy or pickup. Whether the server allows a given item is only known by trying.', true)
