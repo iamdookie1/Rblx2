@@ -31,7 +31,7 @@
 
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.33"
+local SCRIPT_VERSION = "rewrite-0.5.34"
 
 -- ---------------------------------------------------------------------------
 -- Single instance.
@@ -1106,7 +1106,7 @@ end]]
     end
     -- Find the LIVE sender closure the game actually runs, via getgc(false) --
     -- functions only, NOT the heap-walking getgc(true) that crashed. Run ONCE per
-    -- session, in its own thread, time-sliced (4ms a frame) so it never stalls a
+    -- session, in its own thread, 300 entries a frame so it never stalls a
     -- frame; until it finishes (or if it finds nothing) callers get nil and use
     -- require(PRY). Only a function whose source is the PRY module itself
     -- (SwordsController.PRY) counts -- 0.5.29/30 took the first function from
@@ -1122,12 +1122,11 @@ end]]
         task.spawn(function()
             local list
             pcall(function() list = getgc(false) end)
-            local t0 = os.clock()
             if type(list) == "table" then
                 for idx = 1, #list do
                     if not is_live() then break end
                     local o = list[idx]
-                    if type(o) == "function" then
+                    if type(o) == "function" and GC.is_lua(o) then
                         local oks, src = pcall(debug.info, o, "s")
                         if oks and type(src) == "string" and GC.clean(src):find("SwordsControllerPRY$") then
                             local oku, ups = pcall(getups, o)
@@ -1149,9 +1148,9 @@ end]]
                             end
                         end
                     end
-                    -- time-sliced (4ms a frame), not every 300 entries: same
-                    -- smoothness, many times fewer frames to finish
-                    if idx % 64 == 0 and os.clock() - t0 > 0.004 then task.wait(); t0 = os.clock() end
+                    -- 300 entries a frame, as 0.5.31 (which finished the scan); the
+                    -- 0.5.32 4ms time slice crashed the client right after it began
+                    if idx % 300 == 0 then task.wait() end
                 end
             end
             list = nil
@@ -1367,11 +1366,17 @@ end]]
         if not b then
             local getups = reflect_getups()
             if type(getups) ~= "function" then return nil, "getupvalues unavailable", true end
-            local v31 = forge_gc_sender(getups)
-            if type(v31) ~= "function" and not gc_scan.done then return nil, "scanning for the PRY sender...", false end
+            -- the sender is what the (already loaded) PRY module returned: read
+            -- that first -- instant, no heap scan. The getgc scan only runs if
+            -- the module can't be read.
+            local v31 = gc_scan.sender
             if type(v31) ~= "function" then
                 local pry = forge_find_pry()
                 if pry then local ok, m = pcall(require, pry); if ok and type(m) == "function" then v31 = m end end
+            end
+            if type(v31) ~= "function" then
+                v31 = forge_gc_sender(getups)
+                if type(v31) ~= "function" and not gc_scan.done then return nil, "scanning for the PRY sender...", false end
             end
             if type(v31) ~= "function" then return nil, "sender not found (getgc + require(PRY) both failed)", true end
             local ok2, ups = pcall(getups, v31)
