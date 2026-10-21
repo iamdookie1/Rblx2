@@ -31,7 +31,7 @@
 
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.32"
+local SCRIPT_VERSION = "rewrite-0.5.33"
 
 -- ---------------------------------------------------------------------------
 -- Single instance.
@@ -1221,39 +1221,54 @@ end]]
             return ("%08x%08x%08x%08x%08x%08x%08x%08x"):format(h0, h1, h2, h3, h4, h5, h6, h7)
         end
     end
-    -- Every string the sender can reach in two steps: its upvalues and constants,
-    -- its function upvalues' constants, and the string fields of its table
-    -- upvalues (the Net table included). The name it asks Net for -- and any
-    -- salt the name is hashed with -- is among them.
+    -- The strings the sender holds: its constants and its Lua function upvalues'
+    -- constants (names), plus its string upvalues and the raw string fields of its
+    -- table upvalues (salt candidates). Crash-safe on purpose: getconstants only
+    -- on Lua closures (on a C closure it can take the client down -- 0.5.32 ran
+    -- it on every function in the Net table and crashed), tables read raw with
+    -- next (no __iter / __index into game code), and everything capped.
+    function GC.is_lua(f)
+        if type(f) ~= "function" then return false end
+        if type(iscclosure) == "function" then
+            local ok, c = pcall(iscclosure, f)
+            if ok then return not c end
+        end
+        local ok, src = pcall(debug.info, f, "s")
+        return ok and src ~= "[C]"
+    end
     function GC.sender_strings(sender, ups)
-        local set, list = {}, {}
-        local function take(s)
-            if type(s) == "string" and #s > 0 and #s <= 128 and not set[s] then set[s] = true; list[#list + 1] = s end
+        local set, names, salts = {}, {}, {}
+        local function take(s, into, cap)
+            if type(s) == "string" and #s > 0 and #s <= 64 and not set[s] and #into < cap then
+                set[s] = true; into[#into + 1] = s
+            end
         end
         local getc = (debug and debug.getconstants) or getconstants
         local function consts(f)
-            if type(getc) ~= "function" then return end
+            if type(getc) ~= "function" or not GC.is_lua(f) then return end
             local ok, cs = pcall(getc, f)
-            if ok and type(cs) == "table" then for _, c in pairs(cs) do take(c) end end
-        end
-        local function fields(t)
-            pcall(function()
-                local n = 0
-                for k, v in pairs(t) do
-                    take(k); take(v)
-                    if type(v) == "function" then consts(v) end
-                    n = n + 1; if n >= 200 then break end
-                end
-            end)
+            if ok and type(cs) == "table" then
+                for i = 1, math.min(#cs, 256) do take(cs[i], names, 96) end
+            end
         end
         consts(sender)
+        for i = 1, 64 do if type(ups[i]) == "function" then consts(ups[i]) end end
         for i = 1, 64 do
             local v = ups[i]
-            if type(v) == "string" then take(v)
-            elseif type(v) == "function" then consts(v)
-            elseif typeof(v) == "table" then fields(v) end
+            if type(v) == "string" then take(v, salts, 24)
+            elseif type(v) == "table" then
+                pcall(function()
+                    local n, k, fv = 0, next(v)
+                    while k ~= nil and n < 64 do
+                        take(k, salts, 24); take(fv, salts, 24)
+                        n = n + 1; k, fv = next(v, k)
+                    end
+                end)
+            end
         end
-        return list
+        local all = table.clone(names)
+        for _, x in ipairs(salts) do all[#all + 1] = x end
+        return all, salts
     end
     -- Identify the parry remote among the Net children (run once per server, in
     -- its own thread, time-sliced so it never stalls a frame). Tried in order:
@@ -1277,7 +1292,7 @@ end]]
                     if hex then byHex[hex:lower()] = c end
                 end
             end
-            local strs = GC.sender_strings(sender, ups)
+            local strs, salts = GC.sender_strings(sender, ups)
             local found, how
             for _, s in ipairs(strs) do
                 if byName[s] then found, how = byName[s], "name '" .. s .. "'"; break end
@@ -1288,12 +1303,14 @@ end]]
                     local function dig(t, depth)
                         if found or budget <= 0 or depth > 3 or seen[t] then return end
                         seen[t] = true; budget = budget - 1
-                        for k, v in pairs(t) do
+                        local k, v = next(t)
+                        while k ~= nil do
                             if typeof(v) == "Instance" and v.ClassName == "RemoteEvent" and not skip[v] and type(k) == "string" then
                                 for _, s in ipairs(strs) do
                                     if k == s then found, how = v, "Net cache '" .. s .. "'"; return end
                                 end
-                            elseif typeof(v) == "table" then dig(v, depth + 1) end
+                            elseif type(v) == "table" then dig(v, depth + 1) end
+                            k, v = next(t, k)
                         end
                     end
                     dig(net_tbl, 0)
@@ -1301,20 +1318,24 @@ end]]
             end
             if not found and next(byHex) then
                 local t0 = os.clock()
-                local function try(m, label)
+                local function try(m)
                     local c = byHex[GC.sha256(m)]
-                    if c then found, how = c, label end
                     if os.clock() - t0 > 0.004 then task.wait(); t0 = os.clock() end
-                    return c ~= nil
+                    return c
                 end
                 for _, s in ipairs(strs) do
-                    if try(s, "sha256('" .. s .. "')") then break end
+                    local c = try(s)
+                    if c then found, how = c, "sha256('" .. s .. "')"; break end
                 end
-                if not found then
-                    for _, s in ipairs(strs) do
-                        if found or not is_live() then break end
-                        for _, t in ipairs(strs) do
-                            if s ~= t and (try(s .. t, "sha256(s..t) s='" .. s .. "'") or try(t .. s, "sha256(t..s) s='" .. s .. "'")) then break end
+                -- name + salt either way round: names x salts only (<= 120 x 24)
+                for _, s in ipairs(strs) do
+                    if found or not is_live() then break end
+                    for _, t in ipairs(salts) do
+                        if s ~= t then
+                            local c = try(s .. t)
+                            if c then found, how = c, ("sha256('%s' .. salt#%d)"):format(s, #t); break end
+                            c = try(t .. s)
+                            if c then found, how = c, ("sha256(salt#%d .. '%s')"):format(#t, s); break end
                         end
                     end
                 end
