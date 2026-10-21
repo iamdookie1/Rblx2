@@ -7,13 +7,13 @@
 --    only with the damage the game's swing would send: 10 x a strength factor
 --    x a weapon factor (WeaponsModule's t3 / t4 tables), the finisher 996 at
 --    5 health or less, the equipped weapon's level, at the swing's own pace.
---    The kill aura sends exactly that.
---  * levels: every XP tick the client sends PlayerGainedXp(level, stat, xp),
---    and LevelToServer(level, stat) when a level fills. A jump the server
---    didn't see ticked up to is answered with PlayerGainedXp:FireClient,
---    which drops the stat back to 1. Fast level up sends the same ticks the
---    gym does (+2 speed, +6.75 strength, the game's largest), back to back,
---    and slows itself down whenever the server answers with a reset.
+--    The kill aura sends exactly that, and one hit sends the 996 finisher for
+--    every target so each bad guy drops in one.
+--  * levels: the server resets any level it didn't see earned (it fires
+--    PlayerGainedXp back, which StrengthService turns into level 1). Force
+--    level doesn't race that: it holds the client's level every frame, so a
+--    reset lands and the next frame puts it back. The held level drives hit
+--    damage and the game's own client gates (crates 2+, tree 3+, door locks).
 --  * spawning: the vending claim, Vending(3, item, machine, you, ...), names
 --    its item from the client.
 --  * food heals only while the food is in your hand, so it's equipped and
@@ -103,11 +103,11 @@ local S = {
     KillAura = false,
     AuraRange = 300,
     AuraTargets = 0,      -- 0: as many as the game's swing hits at your strength
-    -- levels
-    FastSpeed = false,
-    FastStrength = false,
-    LevelCover = true,    -- sit on the matching gym machine while it runs
-    LevelMethod = "XP ticks",
+    OneHit = false,       -- send the game's finisher (996) for every target
+    -- levels (held on the client, never reset)
+    ForceSpeed = false,
+    ForceStrength = false,
+    ForceLevel = 5,
     -- spawning
     SpawnItem = "Crowbar3",
     SpawnWay = "Vending",
@@ -127,6 +127,7 @@ local S = {
     AutoBike = false,
     AutoBatteries = false,
     AutoMary = false,
+    AutoBosses = false,
     AutoVote = false,
     VoteFor = "Ending1",
     -- movement
@@ -660,7 +661,9 @@ loop(function() return T2[auraLevel()] + 0.03 end, function()
     for _, entry in ipairs(targets) do
         local hum = entry.Model:FindFirstChildOfClass("Humanoid")
         if hum and hum.Health > 0 then
-            if hum.Health <= 5 then
+            -- 996 is the finisher value the game itself sends on a low-health
+            -- enemy, so the server accepts it; one-hit sends it for everyone
+            if S.OneHit or hum.Health <= 5 then
                 fire("HitBadguy", entry.Model, 996)
             elseif hit < cap then
                 fire("HitBadguy", entry.Model, damage, weaponLevel)
@@ -668,91 +671,64 @@ loop(function() return T2[auraLevel()] + 0.03 end, function()
             end
         end
     end
-    Status.Farm = ("kill aura: %d in range, %.1f damage a hit"):format(#targets, damage)
+    Status.Farm = S.OneHit and ("kill aura (one hit): %d in range"):format(#targets)
+        or ("kill aura: %d in range, %.1f damage a hit"):format(#targets, damage)
 end)
 
--- Scary Mary: when she's stunned (stars over her head) the key on her back
--- can be turned: its click, from within its 12 stud reach
+-- Bosses only take damage in their own window, and each sends its own remote:
+--  * Scary Mary, while stunned (stars over her head): turn the key on her
+--    back, which fires DamageMary; the remote is also fired straight, to take
+--    every life the stun allows instead of one.
+--  * Bradley (AgentBoss), while dizzy (the game tags him "hittable"):
+--    DamageBradley, the same remote his dizzy hit sends.
+-- Everything else (the pizza boss, the brute, the final waves) is a normal
+-- bad guy to the kill aura, so one-hit clears them.
 loop(0.3, function()
-    if not S.AutoMary then return end
+    if not S.AutoMary and not S.AutoBosses then return end
     local mary = Workspace:FindFirstChild("Villainess")
     local stars = mary and path(mary, "Head2/Stars")
-    if not (stars and stars.Enabled) then return end
-    local key = path(mary, "RoboBackKey/Handle/SpinnerClick")
-    if not key then return end
-    goNear(key, 8)
-    touch(key)
-    local detector = key:FindFirstChildOfClass("ClickDetector")
-    if detector then click(detector) end
-    task.wait(1)
-end)
-
---// gym machines ------------------------------------------------------------
-
-local Training = { Machine = nil }
-
-local function myMachine(folderName, machineName)
-    local folder = Workspace:FindFirstChild(folderName)
-    for _, eq in ipairs(folder and folder:GetChildren() or {}) do
-        local owner = eq:FindFirstChild("Owner")
-        if eq.Name == machineName and owner and owner.Value == LocalPlayer.Name then return eq end
-    end
-    return nil
-end
-
-local function freeMachine(folderName, machineName)
-    local folder = Workspace:FindFirstChild(folderName)
-    local best, bestDist = nil, math.huge
-    for _, eq in ipairs(folder and folder:GetChildren() or {}) do
-        local owner = eq:FindFirstChild("Owner")
-        local start = eq:FindFirstChild("StartPart")
-        if eq.Name == machineName and owner and owner.Value == "" and start then
-            local d = distance(start.Position)
-            if d < bestDist then best, bestDist = eq, d end
+    if stars and stars.Enabled then
+        local key = path(mary, "RoboBackKey/Handle/SpinnerClick")
+        if key then
+            goNear(key, 8)
+            touch(key)
+            local detector = key:FindFirstChildOfClass("ClickDetector")
+            if detector then click(detector) end
+            if S.AutoBosses then
+                for _ = 1, 3 do
+                    fire("DamageMary")
+                    task.wait(0.1)
+                end
+            end
+            Status.Story = "turning Mary's key"
+            task.wait(0.8)
         end
     end
-    return best
-end
-
--- the machine's own start click, as walking up to it and clicking does
-local function startMachine(eq)
-    local start = eq and eq:FindFirstChild("StartPart")
-    local detector = start and start:FindFirstChildOfClass("ClickDetector")
-    if not detector then return false end
-    goNear(start, 8)
-    click(detector)
-    return waitFor(4, function()
-        local owner = eq:FindFirstChild("Owner")
-        return owner ~= nil and owner.Value == LocalPlayer.Name
-    end)
-end
-
-local function leaveMachine()
-    local _, _, hum = myChar()
-    if hum then hum.Jump = true end
-    Training.Machine = nil
-end
+    if S.AutoBosses then
+        local agent = Workspace:FindFirstChild("AgentBoss")
+        if agent and agent:FindFirstChild("hittable") then
+            fire("DamageBradley")
+            Status.Story = "hitting Bradley"
+        end
+    end
+end)
 
 --// levels ------------------------------------------------------------------
+-- The server keeps its own count of your training and resets any level it did
+-- not see earned: it fires PlayerGainedXp back, which the game's own
+-- StrengthService turns into level 1. Racing that is exactly what the old
+-- auto-train did, and why it kept resetting. This does not race it: it holds
+-- the client's level where you set it, every frame, so nothing can drop it no
+-- matter how fast you go. A reset lands and the next frame puts it straight
+-- back.
+--
+-- Holding the client level drives your hit damage and the gates the game
+-- checks on your side: opening crates (2+), chopping the Larry tree (3+) and
+-- breaking the locked doors. Walk speed is applied by the server, so set that
+-- on the Player tab. We also nudge the server (LevelToServer / Walkspeeder2)
+-- once a second in case it takes it.
 
-local LEVELS = { Speed = { 12, 35, 63, 92, 107 }, Strength = { 12, 39, 80, 118, 130 } }
 local SPEED_WALK = { 16, 16.5, 17, 18, 20 }
-local MACHINE_FOR_STAT = { Speed = { "Tredmills", "Tredmill" }, Strength = { "BenchPresses", "BenchPress" } }
-
-local LevelUp = {
-    Speed = { Interval = 0.25, Resets = 0, Ticks = 0 },
-    Strength = { Interval = 0.25, Resets = 0, Ticks = 0 },
-}
-
--- a tick the server didn't believe comes back as PlayerGainedXp(stat): the
--- game drops the stat to 1, and this halves the pace for that stat
-if remote("PlayerGainedXp") then
-    track(remote("PlayerGainedXp").OnClientEvent:Connect(function(stat)
-        local st = LevelUp[stat == "Speed" and "Speed" or "Strength"]
-        st.Resets += 1
-        st.Interval = math.min(st.Interval * 2, 3.2)
-    end))
-end
 
 local function statFields(stat)
     if stat == "Speed" then return "level", "xp" end
@@ -765,84 +741,36 @@ local function statLevel(stat)
     return ss and tonumber(ss[lf]) or 1
 end
 
-local function levelUpVisuals(stat, level)
-    local ss = mod("StrengthService")
-    local bars = mod("LevelBarService")
-    if bars and type(bars.lvlUp) == "function" then pcall(bars.lvlUp, stat, level) end
-    -- speed 3 opens the attic shortcut; the game does it inside its own tick
-    if stat == "Speed" and level == 3 and ss then
-        pcall(function()
-            local env = getfenv(ss.tickXP)
-            if type(env.doLadder) == "function" then env.doLadder() end
-        end)
-    end
-end
+local Forced = { Speed = { Held = 0, Nudged = 0 }, Strength = { Held = 0, Nudged = 0 } }
 
--- one XP tick, exactly as the game's own tickXP / tickXP2 sends it
-local function xpTick(stat)
+local function forceStat(stat, level)
     local ss = mod("StrengthService")
-    if not ss then return false end
+    if not ss then return end
     local lf, xf = statFields(stat)
-    local level = tonumber(ss[lf]) or 1
-    if level >= 5 then return false end
-    local xp = (tonumber(ss[xf]) or 0) + (stat == "Speed" and 2 or 6.75)
-    if xp >= LEVELS[stat][level] then
-        level += 1
-        xp = level >= 5 and 1 or 0
-        ss[lf], ss[xf] = level, xp
+    if tonumber(ss[lf]) ~= level then
+        ss[lf] = level
+        ss[xf] = level >= 5 and 1 or 0
+        Forced[stat].Held += 1
+        -- the attic shortcut the game opens at speed 3, re-run on a correction
+        if stat == "Speed" and level >= 3 then
+            pcall(function()
+                local env = getfenv(ss.tickXP)
+                if type(env.doLadder) == "function" then env.doLadder() end
+            end)
+        end
+    end
+    if os.clock() - Forced[stat].Nudged > 1 then
+        Forced[stat].Nudged = os.clock()
         fire("LevelToServer", level, stat)
-        fire("SweatSound")
-        if stat == "Speed" then fire("Walkspeeder2", SPEED_WALK[level]) end
-        levelUpVisuals(stat, level)
-    else
-        ss[xf] = xp
+        if stat == "Speed" then fire("Walkspeeder2", SPEED_WALK[math.clamp(level, 1, 5)]) end
     end
-    local bars = mod("LevelBarService")
-    if bars and type(bars.tickXp) == "function" then pcall(bars.tickXp, stat, xp, level) end
-    fire("PlayerGainedXp", level, stat, xp)
-    LevelUp[stat].Ticks += 1
-    return true
 end
 
--- the other way: only the level reports, one level at a time
-local function levelReport(stat)
-    local ss = mod("StrengthService")
-    if not ss then return false end
-    local lf, xf = statFields(stat)
-    local level = (tonumber(ss[lf]) or 1) + 1
-    if level > 5 then return false end
-    ss[lf], ss[xf] = level, level >= 5 and 1 or 0
-    fire("LevelToServer", level, stat)
-    if stat == "Speed" then fire("Walkspeeder2", SPEED_WALK[level]) end
-    levelUpVisuals(stat, level)
-    LevelUp[stat].Ticks += 1
-    return true
-end
-
-local function runLevelUp(stat, key)
-    loop(function() return LevelUp[stat].Interval end, function()
-        if not S[key] then return end
-        if statLevel(stat) >= 5 then
-            S[key] = false
-            notify(stat .. " is level 5")
-            if Training.Machine then leaveMachine() end
-            return
-        end
-        if S.LevelCover then
-            local m = MACHINE_FOR_STAT[stat]
-            local eq = myMachine(m[1], m[2])
-            if not eq then
-                local free = freeMachine(m[1], m[2])
-                if free and startMachine(free) then Training.Machine = free end
-            else
-                Training.Machine = eq
-            end
-        end
-        if S.LevelMethod == "Level reports" then levelReport(stat) else xpTick(stat) end
-    end)
-end
-runLevelUp("Speed", "FastSpeed")
-runLevelUp("Strength", "FastStrength")
+track(RunService.Heartbeat:Connect(function()
+    if Unloaded then return end
+    if S.ForceSpeed then forceStat("Speed", S.ForceLevel) end
+    if S.ForceStrength then forceStat("Strength", S.ForceLevel) end
+end))
 
 --// food --------------------------------------------------------------------
 -- Eating: the food in hand, used through the game's own click handler
@@ -1576,7 +1504,6 @@ task.delay(3, function() if S.AntiAfk and not Unloaded then setAntiAfk(true) end
 
 local function unload()
     if Unloaded then return end
-    if Training.Machine then pcall(leaveMachine) end
     for key, value in pairs(S) do
         if value == true then S[key] = false end
     end
@@ -1646,8 +1573,9 @@ do
     toggle(aura, 'bi_aura', 'Kill aura', 'KillAura', 'hits every bad guy in range with the exact hit your swing would make (damage from your strength and weapon), at the swing\'s own pace. your weapon is held while it runs')
         :AddKeyPicker('bi_aura_key', { Default = 'None', Mode = 'Toggle', SyncToggleState = true, Text = 'Kill aura' })
     aura:AddSlider('bi_aura_range', { Text = 'Range', Min = 10, Max = 1000, Default = S.AuraRange, Rounding = 0, Suffix = ' studs', Callback = function(v) S.AuraRange = v end })
-    aura:AddSlider('bi_aura_targets', { Text = 'Targets per swing (0 = game\'s)', Tooltip = 'the game\'s swing hits 1 at strength 1-2, 2 at 3, 3 at 4-5. low bad guys are finished off regardless', Min = 0, Max = 10, Default = S.AuraTargets, Rounding = 0, Callback = function(v) S.AuraTargets = v end })
-    aura:AddLabel('Damage grows with strength: max strength first (Levels tab) and get the best weapon you can (the spawner can give a Crowbar3).', true)
+    toggle(aura, 'bi_onehit', 'One hit', 'OneHit', 'sends the finisher (the hit the game itself does on a nearly-dead bad guy) for every target, so each one goes down in a single hit. uses the game\'s own finisher value, so the server takes it')
+    aura:AddSlider('bi_aura_targets', { Text = 'Targets per swing (0 = game\'s)', Tooltip = 'only matters with one hit off. the game\'s swing hits 1 at strength 1-2, 2 at 3, 3 at 4-5. low bad guys are finished off regardless', Min = 0, Max = 10, Default = S.AuraTargets, Rounding = 0, Callback = function(v) S.AuraTargets = v end })
+    aura:AddLabel('With one hit off, damage grows with strength: force strength up (Levels tab) and get the best weapon you can (the spawner can give a Crowbar3).', true)
 
     local farm = Tab:AddLeftGroupbox('Fighting', 'swords')
     toggle(farm, 'bi_farm', 'Auto farm bad guys', 'Farm', 'goes to the nearest bad guy, stands in front of it and swings with the game\'s own hit button, your weapon in hand. damage is the game\'s own (it grows with strength and weapon)')
@@ -1680,26 +1608,16 @@ end
 do
     local Tab = Window:AddTab('Levels', 'trending-up', 'Speed and strength')
 
-    local box = Tab:AddLeftGroupbox('Fast level up', 'zap')
-    box:AddLabel('Sends the XP updates the gym sends while you train, back to back, and the level ups when each bar fills. If the server answers with a reset (your level drops to 1) it halves the pace for that stat and keeps going, so it settles on the fastest pace the server takes.', true)
-    toggle(box, 'bi_fastspeed', 'Level up speed', 'FastSpeed')
-    toggle(box, 'bi_faststrength', 'Level up strength', 'FastStrength')
-    toggle(box, 'bi_levelcover', 'Sit on the gym machine while it runs', 'LevelCover', 'gets on a free treadmill (speed) or bench (strength) first, the way a player would be when training')
-    box:AddDropdown('bi_levelmethod', { Text = 'Method', Values = { "XP ticks", "Level reports" }, Default = S.LevelMethod, Tooltip = 'XP ticks: the gym\'s own updates. Level reports: only the level up messages, one level at a time', Callback = function(v) S.LevelMethod = v or S.LevelMethod end })
-    box:AddSlider('bi_levelpace', { Text = 'Start pace', Min = 0.05, Max = 3, Default = 0.25, Rounding = 2, Suffix = 's', Callback = function(v)
-        LevelUp.Speed.Interval, LevelUp.Strength.Interval = v, v
-    end })
+    local box = Tab:AddLeftGroupbox('Force level', 'zap')
+    box:AddLabel('Holds your level where you set it and will not reset, however fast. It drives your hit damage and the things the game checks on your side: opening crates (2+), chopping the Larry tree (3+) and breaking locked doors. Walk speed is set by the server, so use the Walk speed slider on the Player tab for that.', true)
+    box:AddSlider('bi_forcelevel', { Text = 'Hold at level', Min = 1, Max = 5, Default = S.ForceLevel, Rounding = 0, Callback = function(v) S.ForceLevel = v end })
+    toggle(box, 'bi_forcespeed', 'Force speed level', 'ForceSpeed')
+    toggle(box, 'bi_forcestrength', 'Force strength level', 'ForceStrength')
     local status = box:AddLabel('-', true)
     every(0.5, function()
-        local ss = mod("StrengthService")
-        status:SetText(("speed %d (xp %.1f): every %.2fs, %d sent, %d resets\nstrength %d (xp %.1f): every %.2fs, %d sent, %d resets"):format(
-            statLevel("Speed"), ss and ss.xp or 0, LevelUp.Speed.Interval, LevelUp.Speed.Ticks, LevelUp.Speed.Resets,
-            statLevel("Strength"), ss and ss.xp2 or 0, LevelUp.Strength.Interval, LevelUp.Strength.Ticks, LevelUp.Strength.Resets))
+        status:SetText(("speed level %d   strength level %d\nheld through %d resets (speed) / %d (strength)"):format(
+            statLevel("Speed"), statLevel("Strength"), Forced.Speed.Held, Forced.Strength.Held))
     end)
-    box:AddButton({ Text = 'Get off the machine', Func = function()
-        S.FastSpeed, S.FastStrength = false, false
-        leaveMachine()
-    end })
 end
 
 do
@@ -1773,6 +1691,7 @@ do
     toggle(quest, 'bi_pete', 'Auto Uncle Pete', 'AutoPete', 'talks to him once (his kill count only starts then) and takes each reward as soon as it\'s ready', function(v) if v then task.spawn(clickPete) end end)
     toggle(quest, 'bi_bike', 'Auto generator bike', 'AutoBike', 'when the power is out, gets on a free bike (it pedals itself) and sprints once you have speed 3')
     toggle(quest, 'bi_batteries', 'Auto batteries', 'AutoBatteries', 'when the battery hunt starts, searches the two trash cans that hold them, picks them up and places them')
+    toggle(quest, 'bi_bosses_auto', 'Auto bosses', 'AutoBosses', 'damages each boss in its own window: turns and spams Mary\'s key while she is stunned, hits Bradley while he is dizzy. the pizza boss and brute are cleared by the kill aura')
     quest:AddButton({ Text = 'Do the batteries now', Func = function() task.spawn(Genv.__BreakIn2Batteries) end })
     local storyStatus = quest:AddLabel('', true)
     every(1, function() storyStatus:SetText(Status.Story) end)
@@ -1795,7 +1714,7 @@ end
 do
     local Tab = Window:AddTab('Player', 'user', 'Movement')
     local move = Tab:AddLeftGroupbox('Movement', 'footprints')
-    toggle(move, 'bi_speed', 'Walk speed', 'Speed', 'held every frame; cutscene speed locks are switched off while it\'s on. paused while training', function(v) setSpeedLocks(v or S.Jump) end)
+    toggle(move, 'bi_speed', 'Walk speed', 'Speed', 'held every frame; cutscene speed locks are switched off while it\'s on', function(v) setSpeedLocks(v or S.Jump) end)
     move:AddSlider('bi_speedv', { Text = 'Speed', Min = 16, Max = 120, Default = S.SpeedValue, Rounding = 0, Callback = function(v) S.SpeedValue = v end })
     toggle(move, 'bi_jump', 'Jump power', 'Jump', nil, function(v) setSpeedLocks(v or S.Speed) end)
     move:AddSlider('bi_jumpv', { Text = 'Jump', Min = 30, Max = 200, Default = S.JumpValue, Rounding = 0, Callback = function(v) S.JumpValue = v end })
