@@ -31,7 +31,7 @@
 
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.29"
+local SCRIPT_VERSION = "rewrite-0.5.30"
 
 -- ---------------------------------------------------------------------------
 -- Single instance.
@@ -1150,37 +1150,54 @@ end]]
     -- different module instance whose upvalues don't match the real packet (the
     -- cause of the key MISMATCH). Cheap filter first (source contains "Sword")
     -- before any getupvalues, and stop on the first match.
-    local forge_sender_cache
+    -- The scan runs ONCE per session, in its own thread, yielding every 300
+    -- entries so it never stalls a frame. Until it finishes (or if it finds
+    -- nothing) callers get nil and use require(PRY) instead. Before 0.5.30 a miss
+    -- wasn't cached, so prime_capture re-ran the whole getgc walk EVERY FRAME --
+    -- that is what crashed the game.
+    local gc_scan = { sender = nil, started = false, done = false }
     local function forge_gc_sender(getups)
-        if typeof(forge_sender_cache) == "function" then return forge_sender_cache end
-        if type(getgc) ~= "function" or type(getups) ~= "function" then return nil end
-        pcall(function()
-            for _, o in ipairs(getgc(false)) do
-                if type(o) == "function" then
-                    local oks, src = pcall(debug.info, o, "s")
-                    if oks and type(src) == "string" and src:find("Sword") then
-                        local oku, ups = pcall(getups, o)
-                        if oku and type(ups) == "table" then
-                            local n36, nFn, hasNet, hasUid = 0, 0, false, false
-                            for i = 1, 64 do
-                                local v = ups[i]
-                                if v ~= nil then
-                                    if type(v) == "string" and #v == 36 then n36 = n36 + 1
-                                    elseif type(v) == "function" then nFn = nFn + 1
-                                    elseif reflect_isNet(v) then hasNet = true
-                                    elseif typeof(v) == "table" then
-                                        local s = false; pcall(function() s = v[1] ~= nil and type(v[2]) == "table" end)
-                                        if s then hasUid = true end
+        if typeof(gc_scan.sender) == "function" then return gc_scan.sender end
+        if gc_scan.started or type(getgc) ~= "function" or type(getups) ~= "function" then return nil end
+        gc_scan.started = true
+        task.spawn(function()
+            local list
+            pcall(function() list = getgc(false) end)
+            if type(list) == "table" then
+                for idx = 1, #list do
+                    if not is_live() then break end
+                    local o = list[idx]
+                    if type(o) == "function" then
+                        local oks, src = pcall(debug.info, o, "s")
+                        if oks and type(src) == "string" and src:find("Sword") then
+                            local oku, ups = pcall(getups, o)
+                            if oku and type(ups) == "table" then
+                                local n36, nFn, hasNet, hasUid = 0, 0, false, false
+                                for i = 1, 64 do
+                                    local v = ups[i]
+                                    if v ~= nil then
+                                        if type(v) == "string" and #v == 36 then n36 = n36 + 1
+                                        elseif type(v) == "function" then nFn = nFn + 1
+                                        elseif reflect_isNet(v) then hasNet = true
+                                        elseif typeof(v) == "table" then
+                                            local s = false; pcall(function() s = v[1] ~= nil and type(v[2]) == "table" end)
+                                            if s then hasUid = true end
+                                        end
                                     end
                                 end
+                                if n36 >= 1 and nFn >= 1 and hasNet and hasUid then gc_scan.sender = o; break end
                             end
-                            if n36 >= 1 and nFn >= 1 and hasNet and hasUid then forge_sender_cache = o; return end
                         end
                     end
+                    if idx % 300 == 0 then task.wait() end
                 end
             end
+            list = nil
+            gc_scan.done = true
+            logp(gc_scan.sender and "getgc: live sender found (cached for the session)"
+                or "getgc: scan finished, sender not found -- using require(PRY)")
         end)
-        return forge_sender_cache
+        return nil
     end
     -- Read the LIVE sender's upvalues once (index order, deterministic): the parry
     -- RemoteEvents, hash GUIDs, the key deriver, the Net table and the resolved uid.
@@ -1247,14 +1264,17 @@ end]]
     -- Remote/hash/shape are tunable with getgenv().GcRemoteIdx / GcHashIdx /
     -- GcBall2 when the defaults don't land. Called from the capture points below
     -- in place of arming a hook.
+    local gc_fail_at = -math.huge
     local function gc_capture()
+        -- a failed attempt is retried at most once a second (callers run per frame)
+        if clock_() - gc_fail_at < 1 then return false end
         local r, err = forge_resolve()
-        if not r then logp("getgc: " .. tostring(err)); return false end
+        if not r then gc_fail_at = clock_(); logp("getgc: " .. tostring(err)); return false end
         local remote, how = forge_remote_for(r)
-        if typeof(remote) ~= "Instance" then logp("getgc: no parry remote resolved"); return false end
+        if typeof(remote) ~= "Instance" then gc_fail_at = clock_(); logp("getgc: no parry remote resolved"); return false end
         local hi = math.clamp(tonumber(getgenv().GcHashIdx) or 1, 1, #r.guids)
         local keyStr = forge_derive(r.deriver, r.uid)
-        if type(keyStr) ~= "string" or #keyStr == 0 then logp("getgc: key derivation returned nothing"); return false end
+        if type(keyStr) ~= "string" or #keyStr == 0 then gc_fail_at = clock_(); logp("getgc: key derivation returned nothing"); return false end
         local text = tostring(math.floor(Workspace:GetServerTimeNow() * 100))
         local key = table.create(#text)
         for i = 1, #text do key[i] = string.byte(keyStr, (i - 1) % #keyStr + 1) end
