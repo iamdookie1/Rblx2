@@ -31,7 +31,7 @@
 
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.25"
+local SCRIPT_VERSION = "rewrite-0.5.26"
 
 -- ---------------------------------------------------------------------------
 -- Single instance.
@@ -1107,20 +1107,66 @@ end]]
         coroutine.resume(co)
         return keyStr
     end
+    -- getgc scan -- READ-ONLY. Tampers with nothing (no hook, no setupvalue, no
+    -- rawset) and writes no globals (_G / shared / getgenv untouched). One pass:
+    --   * finds the live sender closure by source + upvalue signature -- the exact
+    --     one the game runs, without require (so the game's require-proxy never
+    --     sees us), and
+    --   * collects RemoteEvent instances off the heap as extra remote candidates,
+    --     since the real parry remote is resolved through Net at call time and is
+    --     not one of the sender's own upvalues.
+    local function forge_gc_scan()
+        if type(getgc) ~= "function" then return nil, {} end
+        local getups = reflect_getups()
+        local sender, remotes, seen = nil, {}, {}
+        pcall(function()
+            for _, o in ipairs(getgc(true)) do
+                local t = type(o)
+                if t == "function" and not sender and type(getups) == "function" then
+                    local oks, src = pcall(debug.info, o, "s")
+                    if oks and type(src) == "string" and src:find("Sword") then
+                        local oku, ups = pcall(getups, o)
+                        if oku and type(ups) == "table" then
+                            local n36, hasFn, hasUid, hasNet = 0, false, false, false
+                            for _, v in pairs(ups) do
+                                if type(v) == "string" and #v == 36 then n36 = n36 + 1
+                                elseif type(v) == "function" then hasFn = true
+                                elseif reflect_isNet(v) then hasNet = true
+                                elseif typeof(v) == "table" then
+                                    local s = false; pcall(function() s = v[1] ~= nil and type(v[2]) == "table" end)
+                                    if s then hasUid = true end
+                                end
+                            end
+                            if n36 >= 1 and hasFn and hasUid and hasNet then sender = o end
+                        end
+                    end
+                elseif t == "userdata" and typeof(o) == "Instance" and not seen[o] and o.ClassName == "RemoteEvent" then
+                    seen[o] = true; remotes[#remotes + 1] = o
+                end
+            end
+        end)
+        return sender, remotes
+    end
     -- Read the sender's upvalues once: the parry RemoteEvents, hash GUIDs, the key
-    -- deriver and the resolved uid. Returns a table or nil + reason. Read-only.
+    -- deriver, the Net table and the resolved uid. Read-only. Prefers the live
+    -- sender from getgc; falls back to require(PRY).
     local function forge_resolve()
         local getups = reflect_getups()
         if type(getups) ~= "function" then return nil, "getupvalues unavailable" end
-        local pry = forge_find_pry()
-        if not pry then return nil, "PRY module not found" end
-        local ok, v31 = pcall(require, pry)
-        if not ok or type(v31) ~= "function" then return nil, "require(PRY) did not return the sender" end
+        local v31, gcRemotes = forge_gc_scan()
+        if type(v31) ~= "function" then
+            local pry = forge_find_pry()
+            if not pry then return nil, "sender not found (getgc empty, PRY module missing)" end
+            local ok, m = pcall(require, pry)
+            if not ok or type(m) ~= "function" then return nil, "sender not found (getgc empty, require(PRY) not a function)" end
+            v31 = m
+        end
         local ok2, ups = pcall(getups, v31)
         if not ok2 or type(ups) ~= "table" then return nil, "getupvalues(v31) failed" end
-        local remotes, guids, strings, deriver, uidHolder, net = {}, {}, {}, nil, nil, nil
+        local remotes, guids, strings, deriver, uidHolder, net, seen = {}, {}, {}, nil, nil, nil, {}
         for _, v in pairs(ups) do
-            if typeof(v) == "Instance" and v.ClassName == "RemoteEvent" then remotes[#remotes + 1] = v
+            if typeof(v) == "Instance" and v.ClassName == "RemoteEvent" then
+                if not seen[v] then seen[v] = true; remotes[#remotes + 1] = v end
             elseif type(v) == "string" then
                 strings[#strings + 1] = v
                 if #v == 36 then guids[#guids + 1] = v end
@@ -1132,6 +1178,9 @@ end]]
                 if shaped then uidHolder = v end
             end
         end
+        -- merge the heap RemoteEvents (the real parry remote lives here, not in the
+        -- upvalues) so calibration can match it and forging can reach it
+        for _, rr in ipairs(gcRemotes) do if not seen[rr] then seen[rr] = true; remotes[#remotes + 1] = rr end end
         if #guids == 0 or not deriver or not uidHolder then
             return nil, ("incomplete (remotes %d, hashes %d, deriver %s, uid-holder %s)"):format(
                 #remotes, #guids, tostring(deriver ~= nil), tostring(uidHolder ~= nil))
