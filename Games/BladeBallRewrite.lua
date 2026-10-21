@@ -31,7 +31,7 @@
 
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.21"
+local SCRIPT_VERSION = "rewrite-0.5.22"
 
 -- ---------------------------------------------------------------------------
 -- Single instance.
@@ -627,312 +627,217 @@ do
         return curve_cache.look
     end
 
-    -- ---------- capture hook (rewritten: pluggable interceptors, one shared body) ----------
-    -- WHAT THIS DOES. Blade Ball signs each parry with a token = the current
-    -- server time XOR a secret per-remote key, sent through a sleitnick Net
-    -- RemoteEvent's FireServer. We can't read the key, but we can watch ONE real
-    -- block press go out, grab the exact args the game sent, and recover the key
-    -- by XOR-ing the token against the server time we know it stamped. From then
-    -- on `send` (token + send, below) forges its own token for any server time and
-    -- fires the same remote -- a parry with no key press.
+    -- ---------- capture hook (BladeBall.lua v63 @5a84254, ported verbatim) ----------
+    -- Swapped in from the proven legacy script per request, in place of the
+    -- rewrite's own hook. The hook exists only for the one capture press. While
+    -- up it sits on the game's call stack, so the bodies: reject non-parry calls
+    -- on the cheapest check first (arg count); are compiled under the Net module's
+    -- chunk name so debug.info shows a game path, not ours; run in a clean game
+    -- env (getrenv globals, no writefile); and call nothing of ours -- they drop
+    -- the send into `box` and pass the call straight on. Our own thread reads the
+    -- box and takes the hook down the moment the parry is in (H.check right after
+    -- the press -> 0 frames up when the game sends inside the press).
     --
-    -- So the hook only needs to be up for the single press that rides a real,
-    -- well-timed parry, and it comes down the frame it reads the packet. Three
-    -- ways to raise it, picked by the "Capture hook" dropdown (getgenv.CaptureHook):
-    -- an executor `oth` helper, hookfunction on the remote's own FireServer, or
-    -- hookmetamethod __namecall. "Both" raises a FireServer channel (oth if it can
-    -- be removed cleanly, else hookfunction) AND __namecall at once, which caught
-    -- the packet on the first press most reliably.
-    --
-    -- STEALTH. The body runs the real call in pcall and, on error, re-raises it
-    -- stamped with the GAME's calling line, never the hook's -- a probe that makes
-    -- FireServer error can't tell a hooked remote from a clean one by the stack.
-    -- It is compiled with loadstring under the Net module's own chunk name so
-    -- debug.info reports that source, not ours; where loadstring is missing we
-    -- fall back to a plain closure that still skips our own frames when stamping.
+    -- Capture hook dropdown (getgenv.CaptureHook): "Namecall" (__namecall only),
+    -- "FireServer" (the FireServer function only), "Both". v63 has no "oth" mode,
+    -- so an "oth" setting hooks both channels (it is neither "Namecall" nor
+    -- "FireServer"), which still captures.
 
+    -- cached globals the ported hook / body use
+    local pcall_, type_, typeof_, tostring_ = pcall, type, typeof, tostring
+    local floor_, bxor_, byte_, select_ = math.floor, bit32.bxor, string.byte, select
     local hookfunction_      = hookfunction
-    local restorefunction_   = restorefunction
+    local restore_           = restorefunction
     local hookmetamethod_    = hookmetamethod
     local getnamecallmethod_ = getnamecallmethod
-    local setreadonly_       = setreadonly or make_writeable
-    local isreadonly_        = isreadonly
     local getrawmetatable_   = getrawmetatable
+    local setreadonly_       = setreadonly or make_writeable
     local newcclosure_       = newcclosure or function(f) return f end
-    local oth_hook, oth_unhook do
-        local lib = rawget(getgenv(), "oth")
-        if type(lib) ~= 'table' then pcall(function() lib = oth end) end
-        if type(lib) == 'table' then
-            if type(lib.hook) == 'function' then oth_hook = lib.hook end
-            if type(lib.unhook) == 'function' then oth_unhook = lib.unhook end
-        end
-    end
+    local flight = logp
     -- the remote's FireServer, resolved in Parry.resolve() (never at load)
     local FIRE_FN
+    local JOB_ID = game.JobId
 
-    -- the Net module's chunk name: the compiled body hides under it
-    local NET_CHUNK = "ReplicatedStorage.Packages._Index.sleitnick_net@0.1.0.net"
+    local H = { fire = nil, nc = nil, want = false, until_t = 0 }
 
-    -- shared capture queue: the body (game thread) pushes raw FireServer calls
-    -- here; the reader (a task) drains them. Entry = { self, {args...}, serverTime }
-    local Q = { want = false, list = {}, now = nil, ws = Workspace }
+    -- Which hook(s) a capture press uses (Parry tab -> "Capture hook").
+    local function capture_method() return getgenv().CaptureHook or "Namecall" end
+    Core.capture_method = capture_method
 
-    -- hook state. fireOrig / ncOrig are holder tables the compiled bodies close
-    -- over, so a hook left in place (an `oth` with no unhook) keeps calling the
-    -- right original even after we "take it down". fireChan names which FireServer
-    -- channel is currently up ("oth" or "hookfn").
-    local H = {
-        fireChan = nil, ncUp = false,
-        fireOrig = { fn = nil }, ncOrig = { fn = nil },
-        oth_kept = nil, want = false, until_t = 0,
-        up_at = nil, down_at = nil, ups = 0,
-    }
-
-    -- One source for both channels. `namecall` true adds the __namecall guard
-    -- (only FireServer namecalls are ours); false is the FireServer function itself.
-    local BODY_SRC = [[
-local Q, orig, getncm, namecall, sel, pc, err, info, typ, find, me = ...
-local function restamp(ok, ...)
-    if ok then return ... end
-    local e = ...
-    if typ(e) == "string" and not find(e, "^[^\n]-:%d+: ") then
-        for lvl = 2, 12 do
-            local src, line = info(lvl, "sl")
-            if src == nil then break end
-            if src ~= "[C]" and src ~= me and line and line > 0 then
-                e = src .. ":" .. line .. ": " .. e
-                break
-            end
-        end
-    end
-    return err(e, 0)
-end
-return function(self, ...)
-    local l = Q.list
-    if Q.want and #l < 4 and (not namecall or getncm() == "FireServer") and sel("#", ...) >= 6 then
-        l[#l + 1] = { self, { ... }, Q.now(Q.ws) }
-    end
-    return restamp(pc(orig.fn, self, ...))
-end]]
-
-    -- Plain-closure equivalent for executors with no loadstring: no disguised
-    -- chunk name, but still re-stamps errors with the game's line (our own frames,
-    -- identified by this file's source, are skipped).
-    local function fallback_body(namecall, orig)
-        local own_src; pcall(function() own_src = debug.info(1, "s") end)
-        local function restamp(ok, ...)
-            if ok then return ... end
-            local e = ...
-            if type(e) == "string" and not string.find(e, "^[^\n]-:%d+: ") then
-                for lvl = 2, 12 do
-                    local src, line = debug.info(lvl, "sl")
-                    if src == nil then break end
-                    if src ~= "[C]" and src ~= own_src and line and line > 0 then
-                        e = src .. ":" .. line .. ": " .. e
-                        break
-                    end
-                end
-            end
-            return error(e, 0)
-        end
-        return function(self, ...)
-            local l = Q.list
-            if Q.want and #l < 4 and (not namecall or getnamecallmethod_() == "FireServer") and select("#", ...) >= 6 then
-                l[#l + 1] = { self, { ... }, Q.now(Q.ws) }
-            end
-            return restamp(pcall(orig.fn, self, ...))
-        end
-    end
-    local function build_body(namecall, orig)
-        local ok, fn = pcall(function()
-            local factory = loadstring and loadstring(BODY_SRC, "=" .. NET_CHUNK)
-            if type(factory) ~= 'function' then return nil end
-            if setfenv then pcall(setfenv, factory, {}) end
-            return factory(Q, orig, getnamecallmethod_ or function() return "FireServer" end, namecall,
-                select, pcall, error, debug.info, type, string.find, NET_CHUNK)
-        end)
-        if ok and type(fn) == 'function' then return fn end
-        return fallback_body(namecall, orig)
-    end
-    -- Built the first time a hook actually goes up, never at load: until then no
-    -- compiled body, no chunk under the game's module name, no debug.info call and
-    -- no read of GetServerTimeNow exists. Keypress-only or capture-free sessions
-    -- never build them.
-    local FIRE_BODY, NC_BODY
-    local function ensure_bodies()
-        if FIRE_BODY and NC_BODY then return end
-        Q.now = Q.now or Workspace.GetServerTimeNow
-        FIRE_BODY = FIRE_BODY or build_body(false, H.fireOrig)
-        NC_BODY   = NC_BODY   or build_body(true,  H.ncOrig)
-    end
-
-    -- Which channels a dropdown choice can raise on this executor. Resolving "oth"
-    -- down to another method when its hook can't be removed cleanly keeps a
-    -- lingering pass-through FireServer hook (the easiest thing a scan finds) from
-    -- being the only thing on offer.
-    local function can_fire_hookfn() return hookfunction_ and type(FIRE_FN) == 'function' end
-    local function can_fire_oth()    return oth_hook and oth_unhook and type(FIRE_FN) == 'function' end
-    local function can_namecall()    return hookmetamethod_ and getnamecallmethod_ end
-    local function capture_method()
-        local m = getgenv().CaptureHook or "Both"
-        if m == "oth" and not can_fire_oth() then
-            m = can_fire_hookfn() and "FireServer" or "Namecall"
-        end
-        return m
-    end
-
+    -- __namecall goes back exactly: the original function object written straight
+    -- into the metatable (hookmetamethod can re-wrap it on some executors).
     local function restore_namecall(original)
-        local ok = pcall(function()
+        local ok = pcall_(function()
             local mt = getrawmetatable_(game)
-            local was_ro = isreadonly_ and isreadonly_(mt)
+            local was_ro = isreadonly and isreadonly(mt)
             setreadonly_(mt, false)
             rawset(mt, "__namecall", original)
             if was_ro ~= false then setreadonly_(mt, true) end
         end)
-        if not ok then pcall(hookmetamethod_, game, "__namecall", original) end
-    end
-    -- Take every raised channel back down. A FireServer hookfunction is restored
-    -- (or re-pointed at the original where there's no restorefunction); __namecall
-    -- is put back by writing the original straight into the metatable. An oth hook
-    -- comes off with oth.unhook; where that doesn't exist it's LEFT in place
-    -- passing every call through, and the next capture reuses it instead of
-    -- stacking another. Each channel is up only for the one press and comes down
-    -- the frame its packet is read.
-    local function unhook()
-        local fireChan, ncUp = H.fireChan, H.ncUp
-        H.fireChan, H.ncUp, H.want, Q.want = nil, false, false, false
-        if not (fireChan or ncUp) then return end
-        H.down_at = clock_()
-        local how
-        if fireChan == "oth" then
-            if oth_unhook and pcall(oth_unhook, FIRE_FN) then
-                how, H.oth_kept = "oth hook removed", nil
-            else
-                H.oth_kept = H.fireOrig.fn
-                how = "oth hook LEFT IN PLACE (this executor's oth has no unhook) -- pass-through"
-            end
-        elseif fireChan == "hookfn" then
-            if restorefunction_ and pcall(restorefunction_, FIRE_FN) then how = "FireServer hook restored"
-            else pcall(hookfunction_, FIRE_FN, H.fireOrig.fn); how = "FireServer hook re-pointed at the original" end
-        end
-        if ncUp then restore_namecall(H.ncOrig.fn); how = (how and how .. ", " or "") .. "__namecall restored" end
-        logp("hook down: " .. tostring(how))
-    end
-    function Parry.hookState()
-        local now = clock_()
-        if H.fireChan or H.ncUp then return ("UP right now (capturing, up %.2fs)"):format(now - (H.up_at or now)) end
-        if H.oth_kept then return "oth hook left in place (pass-through)" end
-        if not H.up_at then return "none -- never put up this session" end
-        return ("none -- last up %.1fs ago, down %.1fs ago (%d time(s) this session)"):format(
-            now - H.up_at, now - (H.down_at or now), H.ups)
+        if not ok then pcall_(hookmetamethod_, game, "__namecall", original) end
     end
 
-    local JOB_ID = game.JobId
-    -- CAPTURE RIDES ON A REAL PARRY. A capture is taken only from a block press
-    -- that is a well-timed parry anyway (auto parry / triggerbot / spam decided a
-    -- parry is due and has no usable capture): the hook goes up for that one press
-    -- and comes down the frame its packet is read. Captures are kept per place
-    -- (match / lobby training) so a training packet is never sent in a match.
-    local Capture = { armed_at = 0, dry = 0, last_spam_key = -math.huge, lat = nil, last_press = -math.huge, since = nil }
-    local function window_base()
-        -- about twice the measured send latency plus 40ms, clamped 0.1-0.3s
-        -- (0.25s until the first capture has measured it)
-        return Capture.lat and math.clamp(Capture.lat * 2 + 0.04, 0.1, 0.3) or 0.25
-    end
-    -- Hook window: window_base, stretched after dry presses (x1.5, x2 ... <= 0.45s);
-    -- it comes down the moment the packet is read anyway.
-    local function capture_window()
-        return math.min(window_base() * (1 + 0.5 * Capture.dry), 0.45)
-    end
-
-    -- Parse one intercepted FireServer call into a capture. The parry packet is a
-    -- RemoteEvent call of (hash: 36-char GUID that is not the JobId, uid: string,
-    -- token: string, then either number-window + CFrame, or CFrame + CFrame) with
-    -- >= 6 args. We know the server time the game stamped (entry[3]); the token
-    -- XORed against it recovers the per-remote key `send` later forges tokens with.
-    local function decode(entry)
-        local self, a, when = entry[1], entry[2], entry[3]
-        local a1, a2, a3, a4, a5 = a[1], a[2], a[3], a[4], a[5]
-        if typeof(self) ~= 'Instance' or self.ClassName ~= 'RemoteEvent' then return false end
-        if type(a1) ~= 'string' or #a1 ~= 36 or a1 == JOB_ID then return false end
-        if type(a2) ~= 'string' or type(a3) ~= 'string' then return false end
-        local ball2
-        if type(a4) == 'number' and typeof(a5) == 'CFrame' then ball2 = false
-        elseif typeof(a4) == 'CFrame' and typeof(a5) == 'CFrame' then ball2 = true
-        else return false end
-        local text = tostring(math.floor(when * 100))
-        if #a3 ~= #text then return false end
-        local key = table.create(#text)
-        for i = 1, #text do key[i] = bit32.bxor(string.byte(a3, i), (string.byte(text, i) + i) % 256) end
-        Core.gen = Core.gen + 1
-        Core.cap = { remote = self, hash = a1, uid = a2, key = key, len = #text, ctx = Core.ctx,
-            ball2 = ball2, win = (not ball2) and a4 or nil,
-            id = Core.gen, lat = clock_() - Capture.armed_at, sent = 0, landed = 0 }
+    -- Builds the capture from a send, on OUR thread (never inside the game's call).
+    -- t is the server time the hook read at the moment of the send.
+    local function learn(remote, hash, uid, token, a4, t)
+        local text = tostring_(floor_(t * 100))
+        if #token ~= #text then return end
+        local key = {}
+        for i = 1, #text do key[i] = bxor_(byte_(token, i), (byte_(text, i) + i) % 256) end
+        local prev = Core.cap
+        Core.cap = { remote = remote, hash = hash, uid = uid, key = key, len = #text, ball2 = typeof_(a4) == "CFrame" }
         Core.misses, Core.pending = 0, nil
-        -- how long the game took to send after the press: the hook window is sized
-        -- from this (smoothed), so it's only up as long as it needs to be
-        local took = clock_() - Capture.armed_at
-        if took > 0 and took < 0.5 then Capture.lat = Capture.lat and (Capture.lat * 0.5 + took * 0.5) or took end
-        logp(("captured the parry packet (%s, %s) %.0fms after the press -- hook window now %.0fms"):format(
-            capture_method(), Core.ctx, took * 1000, window_base() * 1000))
-        return true
+        Core.new_capture = { prev = prev }
     end
 
-    -- Raise the channels capture_method() asks for; false if none went up (nothing
-    -- to hook with on this executor).
-    local function raise_hooks()
-        ensure_bodies()
-        local method = capture_method()
-        if method ~= "Namecall" then
-            if (method == "oth" or method == "Both") and can_fire_oth() then
-                if H.oth_kept then
-                    H.fireOrig.fn, H.fireChan = H.oth_kept, "oth"
-                else
-                    local ok, old = pcall(oth_hook, FIRE_FN, FIRE_BODY)
-                    if ok and type(old) == 'function' then H.fireOrig.fn, H.fireChan = old, "oth" end
-                end
-            elseif can_fire_hookfn() then
-                local ok, old = pcall(hookfunction_, FIRE_FN, newcclosure_(FIRE_BODY))
-                if ok and type(old) == 'function' then H.fireOrig.fn, H.fireChan = old, "hookfn" end
-            end
+    -- A real parry: (hash, id, token, window, cameraCF, points, aim, flag), or on
+    -- UseBall2 servers (hash, id, token, cameraCF, mouseCF, flag). Decoy reports
+    -- (JobId first) never match.
+    local function inspect(entry)
+        local self, a = entry[1], entry[3]
+        local a1, a2, a3, a4, a5 = a[1], a[2], a[3], a[4], a[5]
+        if typeof_(self) == 'Instance' and self.ClassName == 'RemoteEvent'
+            and type_(a1) == 'string' and #a1 == 36 and a1 ~= JOB_ID and type_(a2) == 'string' and type_(a3) == 'string'
+            and ((type_(a4) == 'number' and typeof_(a5) == 'CFrame') or (typeof_(a4) == 'CFrame' and typeof_(a5) == 'CFrame')) then
+            learn(self, a1, a2, a3, a4, entry[4])
+            return true
         end
-        if (method == "Namecall" or method == "Both") and can_namecall() then
-            local ok, old = pcall(hookmetamethod_, game, "__namecall", newcclosure_(NC_BODY))
-            if ok and type(old) == 'function' then H.ncOrig.fn, H.ncUp = old, true end
-        end
-        return H.fireChan ~= nil or H.ncUp
+        return false
     end
-    -- Hook up for one press, at most `window` seconds; down the frame the packet
-    -- is read. Works with or without a current capture (a refresh replaces it).
-    local function arm(window)
-        if not is_live() then return false end
-        H.want, H.until_t = true, clock_() + (window or 0.25)
-        Capture.armed_at = clock_()
-        if H.fireChan or H.ncUp then return true end
-        Q.list = {}
-        if not raise_hooks() then H.want, Q.want = false, false; return false end
-        H.up_at, H.ups = clock_(), H.ups + 1
-        Q.want = true
-        local gen0 = Core.gen
-        task.spawn(function()
-            while (H.fireChan or H.ncUp) and clock_() < H.until_t do
-                task.wait()
-                local l = Q.list
-                for i = 1, #l do if pcall(decode, l[i]) and Core.gen ~= gen0 then break end end
-                if Core.gen ~= gen0 then break end
+
+    -- ISOLATED HOOK BODIES. Compiled under the Net module's chunk name, run in a
+    -- clean game env, and cut off from us: they drop the send into `box` and pass
+    -- the call straight on. The cheapest check (arg count) is first, so almost
+    -- every call the game makes while the hook is up costs one select() before
+    -- passing on.
+    local box = { want = false, nc = nil, fire = nil, list = {}, ws = Workspace, now = Workspace.GetServerTimeNow }
+    local HOOK_NAME = "=ReplicatedStorage.Packages._Index.sleitnick_net@0.1.0.net"
+    local NC_SRC = [[
+local box, getncm, sel = ...
+return function(self, ...)
+    if sel("#", ...) >= 6 and box.want and getncm() == "FireServer" then
+        local l = box.list
+        if #l < 4 then l[#l + 1] = {self, sel("#", ...), {...}, box.now(box.ws)} end
+    end
+    return box.nc(self, ...)
+end]]
+    local FIRE_SRC = [[
+local box, sel = ...
+return function(self, ...)
+    if sel("#", ...) >= 6 and box.want then
+        local l = box.list
+        if #l < 4 then l[#l + 1] = {self, sel("#", ...), {...}, box.now(box.ws)} end
+    end
+    return box.fire(self, ...)
+end]]
+    local CLEAN_ENV
+    do
+        local ok, renv = pcall(function() return getrenv and getrenv() end)
+        CLEAN_ENV = (ok and type(renv) == 'table' and renv.writefile == nil) and setmetatable({}, { __index = renv }) or {}
+    end
+    local function build_body(src, ...)
+        local args = table.pack(...)
+        local ok, fn = pcall(function()
+            local factory = loadstring(src, HOOK_NAME)
+            if setfenv then setfenv(factory, CLEAN_ENV) end
+            return factory(table.unpack(args, 1, args.n))
+        end)
+        return ok and type(fn) == 'function' and fn or nil
+    end
+    local NC_BODY = build_body(NC_SRC, box, getnamecallmethod_ or function() return nil end, select)
+    local FIRE_BODY = build_body(FIRE_SRC, box, select)
+    Core.isolated = NC_BODY ~= nil and FIRE_BODY ~= nil
+    -- No loadstring on this executor: same bodies, just not disguised.
+    if not NC_BODY then
+        NC_BODY = function(self, ...)
+            if select_("#", ...) >= 6 and box.want and getnamecallmethod_() == "FireServer" then
+                local l = box.list
+                if #l < 4 then l[#l + 1] = { self, select_("#", ...), { ... }, box.now(box.ws) } end
             end
+            return box.nc(self, ...)
+        end
+    end
+    if not FIRE_BODY then
+        FIRE_BODY = function(self, ...)
+            if select_("#", ...) >= 6 and box.want then
+                local l = box.list
+                if #l < 4 then l[#l + 1] = { self, select_("#", ...), { ... }, box.now(box.ws) } end
+            end
+            return box.fire(self, ...)
+        end
+    end
+
+    local function unhook()
+        local fire, nc = H.fire, H.nc
+        H.fire, H.nc, H.want, box.want = nil, nil, false, false
+        if fire and not (restore_ and pcall_(restore_, FIRE_FN)) then pcall_(hookfunction_, FIRE_FN, fire) end
+        if nc then restore_namecall(nc) end
+        box.nc, box.fire = nil, nil
+    end
+    Core.unhook = unhook
+
+    -- Up for one capture press. Our thread watches the box every frame; the first
+    -- real parry in it becomes the capture and the hook comes off. H.check lets a
+    -- caller take it down synchronously right after the press (0 frames up when
+    -- the game sent inside the press).
+    local function arm(hold)
+        if Core.cap or not is_live() then return false end
+        H.want, H.until_t = true, clock_() + (hold or 0.2)
+        if H.fire or H.nc then return true end
+        box.list = {}
+        local method = capture_method()
+        if method ~= "Namecall" and hookfunction_ and FIRE_FN then
+            local ok, old = pcall(hookfunction_, FIRE_FN, newcclosure_(FIRE_BODY))
+            if ok and type(old) == 'function' then H.fire, box.fire = old, old end
+        end
+        if method ~= "FireServer" and hookmetamethod_ and getnamecallmethod_ then
+            local ok, old = pcall(hookmetamethod_, game, "__namecall", newcclosure_(NC_BODY))
+            if ok and type(old) == 'function' then H.nc, box.nc = old, old end
+        end
+        if not (H.fire or H.nc) then H.want = false; return false end
+        box.want = true
+        local up_at = clock_()
+        local done = false
+        local function finish()
+            if done then return end
+            done = true
             unhook()
-            Q.list = {}
-            if Core.gen == gen0 then
-                Capture.dry = Capture.dry + 1
-                logp(("capture: nothing readable within %.2fs (try %d) -- the next parry tries again"):format(
-                    clock_() - Capture.armed_at, Capture.dry))
-            else
-                Capture.dry = 0
+            box.list = {}
+            pcall(flight, ("hook (%s) was up %.1fms -- %s"):format(capture_method(), (clock_() - up_at) * 1000,
+                Core.cap and "caught the parry" or "nothing caught"))
+        end
+        -- Checks what the hook has seen; takes it down the moment the parry is in.
+        H.check = function()
+            if done then return true end
+            local l = box.list
+            for i = 1, #l do
+                if pcall_(inspect, l[i]) and Core.cap then break end
             end
+            if Core.cap then finish(); return true end
+            return false
+        end
+        task.spawn(function()
+            while not done and (H.fire or H.nc) and clock_() < H.until_t do
+                task.wait()
+                if H.check() then return end
+            end
+            finish()
         end)
         return true
     end
+
+    -- hook state line for the Status tab / flight log
+    function Parry.hookState()
+        if H.fire or H.nc then return "UP right now (capturing)" end
+        return "down"
+    end
+
+    -- ---------- glue the rest of the rewrite calls ----------
+    -- Kept from the rewrite so nothing outside the hook changes. The v63 hook does
+    -- not size its own window or track dry/lat, so capture_window is a fixed hold
+    -- and the Capture table just carries the fields prime_capture / spam read.
+    local Capture = { armed_at = 0, dry = 0, last_spam_key = -math.huge, lat = nil, last_press = -math.huge, since = nil }
+    local function capture_window() return 0.2 end
     local function pressBlockKey()
         if not is_live() then return false end
         Core.last_send_at = clock_()
@@ -943,10 +848,14 @@ end]]
         return true
     end
     -- a native block press (the game sends the parry and animates it); with
-    -- capture = true the hook is up for it so its packet becomes the capture
+    -- capture = true the hook is up for it so its packet becomes the capture.
+    -- H.check right after the press takes the hook down inside the press when the
+    -- game already sent (0 frames up).
     local function key_parry(capture)
         if capture then arm(capture_window()) end
-        return pressBlockKey()
+        local r = pressBlockKey()
+        if capture and H.check then H.check() end
+        return r
     end
     local function in_lobby_training()
         if not LocalPlayer:GetAttribute("LobbyTraining") then return false end
