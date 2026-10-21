@@ -31,7 +31,7 @@
 
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.23"
+local SCRIPT_VERSION = "rewrite-0.5.24"
 
 -- ---------------------------------------------------------------------------
 -- Single instance.
@@ -1107,15 +1107,17 @@ end]]
         coroutine.resume(co)
         return keyStr
     end
-    function Parry.forgeCapture()
+    -- Read the sender's upvalues once: the parry RemoteEvents, hash GUIDs, the key
+    -- deriver and the resolved uid. Returns a table or nil + reason. Read-only.
+    local function forge_resolve()
         local getups = reflect_getups()
-        if type(getups) ~= "function" then logp("forge: getupvalues unavailable"); return false end
+        if type(getups) ~= "function" then return nil, "getupvalues unavailable" end
         local pry = forge_find_pry()
-        if not pry then logp("forge: PRY module not found"); return false end
+        if not pry then return nil, "PRY module not found" end
         local ok, v31 = pcall(require, pry)
-        if not ok or type(v31) ~= "function" then logp("forge: require(PRY) did not return the sender"); return false end
+        if not ok or type(v31) ~= "function" then return nil, "require(PRY) did not return the sender" end
         local ok2, ups = pcall(getups, v31)
-        if not ok2 or type(ups) ~= "table" then logp("forge: getupvalues(v31) failed"); return false end
+        if not ok2 or type(ups) ~= "table" then return nil, "getupvalues(v31) failed" end
         local remotes, guids, deriver, uidHolder = {}, {}, nil, nil
         for _, v in pairs(ups) do
             if typeof(v) == "Instance" and v.ClassName == "RemoteEvent" then remotes[#remotes + 1] = v
@@ -1128,26 +1130,70 @@ end]]
             end
         end
         if #remotes == 0 or #guids == 0 or not deriver or not uidHolder then
-            logp(("forge: incomplete (remotes %d, hashes %d, deriver %s, uid-holder %s)"):format(
-                #remotes, #guids, tostring(deriver ~= nil), tostring(uidHolder ~= nil)))
-            return false
+            return nil, ("incomplete (remotes %d, hashes %d, deriver %s, uid-holder %s)"):format(
+                #remotes, #guids, tostring(deriver ~= nil), tostring(uidHolder ~= nil))
         end
         local uid; pcall(function() uid = uidHolder[2][uidHolder[1]] end)
-        if type(uid) ~= "string" then logp("forge: could not resolve uid"); return false end
-        local ri = math.clamp(tonumber(getgenv().ForgeRemoteIdx) or 1, 1, #remotes)
-        local hi = math.clamp(tonumber(getgenv().ForgeHashIdx) or 1, 1, #guids)
-        local remote, hash = remotes[ri], guids[hi]
-        local keyStr = forge_derive(deriver, uid)
+        if type(uid) ~= "string" then return nil, "could not resolve uid" end
+        return { remotes = remotes, guids = guids, deriver = deriver, uid = uid }
+    end
+    function Parry.forgeCapture()
+        local r, err = forge_resolve()
+        if not r then logp("forge: " .. tostring(err)); return false end
+        local ri = math.clamp(tonumber(getgenv().ForgeRemoteIdx) or 1, 1, #r.remotes)
+        local hi = math.clamp(tonumber(getgenv().ForgeHashIdx) or 1, 1, #r.guids)
+        local keyStr = forge_derive(r.deriver, r.uid)
         if type(keyStr) ~= "string" or #keyStr == 0 then logp("forge: key derivation returned nothing"); return false end
         local text = tostring(math.floor(Workspace:GetServerTimeNow() * 100))
         local key = table.create(#text)
         for i = 1, #text do key[i] = string.byte(keyStr, (i - 1) % #keyStr + 1) end
-        Core.cap = { remote = remote, hash = hash, uid = uid, key = key, len = #text,
+        Core.cap = { remote = r.remotes[ri], hash = r.guids[hi], uid = r.uid, key = key, len = #text,
             ball2 = getgenv().ForgeBall2 and true or false }
         Core.misses, Core.pending = 0, nil
         logp(("forge: cap set (no hook) -- remote #%d/%d '%s', hash #%d/%d %s, uid %s, key %d, ball2 %s"):format(
-            ri, #remotes, remote.Name, hi, #guids, hash, uid, #keyStr, tostring(Core.cap.ball2)))
+            ri, #r.remotes, r.remotes[ri].Name, hi, #r.guids, r.guids[hi], r.uid, #keyStr, tostring(Core.cap.ball2)))
         return true
+    end
+    -- CALIBRATION. Uses one REAL packet (captured by the hook) as an oracle to
+    -- nail the forge settings deterministically -- which remote, which hash, which
+    -- packet shape, and whether our reflected key derivation reproduces the game's
+    -- real key. Run it right after a real hook capture (ForgeNoHook OFF, parry
+    -- once), then turn ForgeNoHook ON and forging uses the proven settings.
+    function Parry.forgeCalibrate()
+        local cap = Core.cap
+        if not cap or typeof(cap.remote) ~= "Instance" then
+            logp("calibrate: no capture yet -- turn OFF No-hook forge, parry once so the hook captures a real packet, then calibrate")
+            return false
+        end
+        local r, err = forge_resolve()
+        if not r then logp("calibrate: " .. tostring(err)); return false end
+        local ri; for i, rem in ipairs(r.remotes) do if rem == cap.remote then ri = i; break end end
+        local hi; for i, h in ipairs(r.guids) do if h == cap.hash then hi = i; break end end
+        local uidMatch = r.uid == cap.uid
+        -- re-derive the key and compare element-wise to the real key the hook
+        -- extracted -- this proves whether deriver(uid,"TIME") IS the game's key
+        local keyStr = forge_derive(r.deriver, r.uid)
+        local keyMatch = type(keyStr) == "string" and #keyStr > 0 and cap.len ~= nil
+        if keyMatch then
+            for i = 1, cap.len do
+                if cap.key[i] ~= string.byte(keyStr, (i - 1) % #keyStr + 1) then keyMatch = false; break end
+            end
+        end
+        if ri then getgenv().ForgeRemoteIdx = ri end
+        if hi then getgenv().ForgeHashIdx = hi end
+        getgenv().ForgeBall2 = cap.ball2 and true or false
+        logp(("calibrate: remote %s, hash %s, uid %s, key %s, ball2 %s"):format(
+            ri and ("#" .. ri .. "/" .. #r.remotes) or "NO MATCH (real remote not among upvalues)",
+            hi and ("#" .. hi .. "/" .. #r.guids) or "NO MATCH (real hash not among upvalues)",
+            uidMatch and "match" or ("MISMATCH (reflected " .. tostring(r.uid) .. " vs real " .. tostring(cap.uid) .. ")"),
+            keyMatch and "MATCH (reflected derivation reproduces the real key)" or "MISMATCH (derivation is not the key -- forge can't work as-is)",
+            tostring(cap.ball2)))
+        if ri and hi and keyMatch then
+            logp(("calibrate: set ForgeRemoteIdx=%d ForgeHashIdx=%d ForgeBall2=%s -- turn No-hook forge ON now"):format(ri, hi, tostring(getgenv().ForgeBall2)))
+        else
+            logp("calibrate: not fully solved -- send me this line; the key MISMATCH especially tells me the derivation is wrong")
+        end
+        return ri ~= nil and hi ~= nil and keyMatch
     end
 
     -- ---------- token + send ----------
@@ -3454,6 +3500,14 @@ SB:AddButton({
     Func = function()
         local ok = Parry.forgeCapture and Parry.forgeCapture()
         Notify("Forge", ok and "Capture forged -- check the 'forge:' log line." or "Forge failed -- check the 'forge:' log line.", 5)
+    end,
+})
+SB:AddButton({
+    Text = "Calibrate forge (needs 1 hook capture)",
+    Tooltip = "Turn OFF No-hook forge, use Remote mode and parry once so the hook captures a real packet, then press this. It matches the real remote/hash/shape against the reflected upvalues and checks the key derivation, auto-setting ForgeRemoteIdx/ForgeHashIdx/ForgeBall2. Then turn No-hook forge ON.",
+    Func = function()
+        local ok = Parry.forgeCalibrate and Parry.forgeCalibrate()
+        Notify("Calibrate", ok and "Solved -- settings applied. Turn No-hook forge ON." or "Not solved -- check the 'calibrate:' log line and send it to me.", 6)
     end,
 })
 
