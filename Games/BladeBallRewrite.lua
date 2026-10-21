@@ -31,7 +31,7 @@
 
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.26"
+local SCRIPT_VERSION = "rewrite-0.5.27"
 
 -- ---------------------------------------------------------------------------
 -- Single instance.
@@ -1107,60 +1107,55 @@ end]]
         coroutine.resume(co)
         return keyStr
     end
-    -- getgc scan -- READ-ONLY. Tampers with nothing (no hook, no setupvalue, no
-    -- rawset) and writes no globals (_G / shared / getgenv untouched). One pass:
-    --   * finds the live sender closure by source + upvalue signature -- the exact
-    --     one the game runs, without require (so the game's require-proxy never
-    --     sees us), and
-    --   * collects RemoteEvent instances off the heap as extra remote candidates,
-    --     since the real parry remote is resolved through Net at call time and is
-    --     not one of the sender's own upvalues.
-    local function forge_gc_scan()
-        if type(getgc) ~= "function" then return nil, {} end
-        local getups = reflect_getups()
-        local sender, remotes, seen = nil, {}, {}
-        pcall(function()
-            for _, o in ipairs(getgc(true)) do
-                local t = type(o)
-                if t == "function" and not sender and type(getups) == "function" then
-                    local oks, src = pcall(debug.info, o, "s")
-                    if oks and type(src) == "string" and src:find("Sword") then
-                        local oku, ups = pcall(getups, o)
-                        if oku and type(ups) == "table" then
-                            local n36, hasFn, hasUid, hasNet = 0, false, false, false
-                            for _, v in pairs(ups) do
-                                if type(v) == "string" and #v == 36 then n36 = n36 + 1
-                                elseif type(v) == "function" then hasFn = true
-                                elseif reflect_isNet(v) then hasNet = true
-                                elseif typeof(v) == "table" then
-                                    local s = false; pcall(function() s = v[1] ~= nil and type(v[2]) == "table" end)
-                                    if s then hasUid = true end
-                                end
-                            end
-                            if n36 >= 1 and hasFn and hasUid and hasNet then sender = o end
-                        end
+    -- Chase pointers from the Net client (the sender's own Net upvalue) down to
+    -- the cached parry RemoteEvent. This reads the SAME memory the real remote
+    -- lives in -- the Net name->remote cache -- by following the Net table's
+    -- fields and its methods' upvalues, bounded in depth and in a node budget. It
+    -- is pure reads, it never walks the whole heap (getgc(true) over every object
+    -- is what froze the client), so it cannot crash the game. No tamper, no
+    -- globals (_G / shared / getgenv all untouched).
+    local function forge_net_remotes(net, getups)
+        local out, seen, visited, budget = {}, {}, {}, 600
+        local function add(x)
+            if typeof(x) == "Instance" and x.ClassName == "RemoteEvent" and not seen[x] then
+                seen[x] = true; out[#out + 1] = x
+            end
+        end
+        local function dig(v, depth)
+            if budget <= 0 or depth > 4 or v == nil then return end
+            local t = type(v)
+            if t == "table" then
+                if visited[v] then return end
+                visited[v] = true; budget = budget - 1
+                for _, vv in pairs(v) do
+                    if typeof(vv) == "Instance" then add(vv)
+                    elseif type(vv) == "table" or type(vv) == "function" then dig(vv, depth + 1) end
+                end
+            elseif t == "function" and type(getups) == "function" then
+                if visited[v] then return end
+                visited[v] = true; budget = budget - 1
+                local ok, ups = pcall(getups, v)
+                if ok and type(ups) == "table" then
+                    for _, u in pairs(ups) do
+                        if typeof(u) == "Instance" then add(u)
+                        elseif type(u) == "table" or type(u) == "function" then dig(u, depth + 1) end
                     end
-                elseif t == "userdata" and typeof(o) == "Instance" and not seen[o] and o.ClassName == "RemoteEvent" then
-                    seen[o] = true; remotes[#remotes + 1] = o
                 end
             end
-        end)
-        return sender, remotes
+        end
+        pcall(dig, net, 0)
+        return out
     end
     -- Read the sender's upvalues once: the parry RemoteEvents, hash GUIDs, the key
-    -- deriver, the Net table and the resolved uid. Read-only. Prefers the live
-    -- sender from getgc; falls back to require(PRY).
+    -- deriver, the Net table and the resolved uid. Read-only. Sender via require
+    -- (cached module; instant), real remote via the Net cache dig above.
     local function forge_resolve()
         local getups = reflect_getups()
         if type(getups) ~= "function" then return nil, "getupvalues unavailable" end
-        local v31, gcRemotes = forge_gc_scan()
-        if type(v31) ~= "function" then
-            local pry = forge_find_pry()
-            if not pry then return nil, "sender not found (getgc empty, PRY module missing)" end
-            local ok, m = pcall(require, pry)
-            if not ok or type(m) ~= "function" then return nil, "sender not found (getgc empty, require(PRY) not a function)" end
-            v31 = m
-        end
+        local pry = forge_find_pry()
+        if not pry then return nil, "PRY module not found" end
+        local ok, v31 = pcall(require, pry)
+        if not ok or type(v31) ~= "function" then return nil, "require(PRY) did not return the sender" end
         local ok2, ups = pcall(getups, v31)
         if not ok2 or type(ups) ~= "table" then return nil, "getupvalues(v31) failed" end
         local remotes, guids, strings, deriver, uidHolder, net, seen = {}, {}, {}, nil, nil, nil, {}
@@ -1178,9 +1173,12 @@ end]]
                 if shaped then uidHolder = v end
             end
         end
-        -- merge the heap RemoteEvents (the real parry remote lives here, not in the
-        -- upvalues) so calibration can match it and forging can reach it
-        for _, rr in ipairs(gcRemotes) do if not seen[rr] then seen[rr] = true; remotes[#remotes + 1] = rr end end
+        -- the real parry remote is in the Net cache, not the upvalues: dig it out
+        if net then
+            for _, rr in ipairs(forge_net_remotes(net, getups)) do
+                if not seen[rr] then seen[rr] = true; remotes[#remotes + 1] = rr end
+            end
+        end
         if #guids == 0 or not deriver or not uidHolder then
             return nil, ("incomplete (remotes %d, hashes %d, deriver %s, uid-holder %s)"):format(
                 #remotes, #guids, tostring(deriver ~= nil), tostring(uidHolder ~= nil))
