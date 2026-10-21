@@ -31,7 +31,7 @@
 
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.22"
+local SCRIPT_VERSION = "rewrite-0.5.23"
 
 -- ---------------------------------------------------------------------------
 -- Single instance.
@@ -1061,6 +1061,95 @@ end]]
         logp("reflect: done (read-only). Send me these lines.")
     end
 
+    -- ---------- no-hook forge (reflection -> key -> Core.cap) ----------
+    -- Enabled with getgenv().ForgeNoHook = true (OFF by default). Reads the
+    -- sender's upvalues (require(PRY) + getupvalues -- cached module, no code runs,
+    -- no hook) to get the parry remote, the hash, the uid and the key deriver,
+    -- derives the key and builds Core.cap so the normal remote send() forges tokens
+    -- for every parry -- nothing is ever hooked.
+    --
+    -- WHICH remote/hash: the sender holds TWO parry RemoteEvents and THREE hash
+    -- GUIDs, and from a static read I cannot tell the real pair from a decoy/snitch
+    -- path. It fires remotes[getgenv().ForgeRemoteIdx or 1] with
+    -- guids[getgenv().ForgeHashIdx or 1]; getgenv().ForgeBall2 flips the packet
+    -- shape. DIAL THESE ON AN ALT: the right combo lands parries; a wrong one just
+    -- won't -- or, worst case, hits a decoy -- so never first-run this on your main.
+    local function forge_find_pry()
+        local function clean(s) return (tostring(s):gsub("[^%w]", "")) end
+        local p
+        pcall(function()
+            local c = ReplicatedStorage:FindFirstChild("Controllers")
+            local sc = c and c:FindFirstChild("SwordsController")
+            p = sc and sc:FindFirstChild("PRY")
+        end)
+        if not p then
+            pcall(function()
+                for _, d in ipairs(ReplicatedStorage:GetDescendants()) do
+                    if d:IsA("ModuleScript") and clean(d.Name):upper() == "PRY" then
+                        local par = d.Parent
+                        if par and clean(par.Name):find("[Ss]word") then p = d; break end
+                        p = p or d
+                    end
+                end
+            end)
+        end
+        return p
+    end
+    -- Call the game's key deriver in a clean, isolated context: a fresh thread
+    -- whose frames carry no `writefile` env, so if the deriver shares the sender's
+    -- getfenv honeypot it still sees nothing of ours. (The honeypots live in the
+    -- sender, which we never call; this is belt-and-braces for the deriver.)
+    local function forge_derive(deriver, uid)
+        local keyStr
+        local body = function() keyStr = deriver(uid, "TIME") end
+        pcall(function() if setfenv then setfenv(body, setmetatable({}, { __index = function() return nil end })) end end)
+        local co = coroutine.create(function() pcall(body) end)
+        coroutine.resume(co)
+        return keyStr
+    end
+    function Parry.forgeCapture()
+        local getups = reflect_getups()
+        if type(getups) ~= "function" then logp("forge: getupvalues unavailable"); return false end
+        local pry = forge_find_pry()
+        if not pry then logp("forge: PRY module not found"); return false end
+        local ok, v31 = pcall(require, pry)
+        if not ok or type(v31) ~= "function" then logp("forge: require(PRY) did not return the sender"); return false end
+        local ok2, ups = pcall(getups, v31)
+        if not ok2 or type(ups) ~= "table" then logp("forge: getupvalues(v31) failed"); return false end
+        local remotes, guids, deriver, uidHolder = {}, {}, nil, nil
+        for _, v in pairs(ups) do
+            if typeof(v) == "Instance" and v.ClassName == "RemoteEvent" then remotes[#remotes + 1] = v
+            elseif type(v) == "string" and #v == 36 then guids[#guids + 1] = v
+            elseif type(v) == "function" and not deriver then deriver = v
+            elseif typeof(v) == "table" and not reflect_isNet(v) and not uidHolder then
+                local shaped = false
+                pcall(function() shaped = v[1] ~= nil and type(v[2]) == "table" end)
+                if shaped then uidHolder = v end
+            end
+        end
+        if #remotes == 0 or #guids == 0 or not deriver or not uidHolder then
+            logp(("forge: incomplete (remotes %d, hashes %d, deriver %s, uid-holder %s)"):format(
+                #remotes, #guids, tostring(deriver ~= nil), tostring(uidHolder ~= nil)))
+            return false
+        end
+        local uid; pcall(function() uid = uidHolder[2][uidHolder[1]] end)
+        if type(uid) ~= "string" then logp("forge: could not resolve uid"); return false end
+        local ri = math.clamp(tonumber(getgenv().ForgeRemoteIdx) or 1, 1, #remotes)
+        local hi = math.clamp(tonumber(getgenv().ForgeHashIdx) or 1, 1, #guids)
+        local remote, hash = remotes[ri], guids[hi]
+        local keyStr = forge_derive(deriver, uid)
+        if type(keyStr) ~= "string" or #keyStr == 0 then logp("forge: key derivation returned nothing"); return false end
+        local text = tostring(math.floor(Workspace:GetServerTimeNow() * 100))
+        local key = table.create(#text)
+        for i = 1, #text do key[i] = string.byte(keyStr, (i - 1) % #keyStr + 1) end
+        Core.cap = { remote = remote, hash = hash, uid = uid, key = key, len = #text,
+            ball2 = getgenv().ForgeBall2 and true or false }
+        Core.misses, Core.pending = 0, nil
+        logp(("forge: cap set (no hook) -- remote #%d/%d '%s', hash #%d/%d %s, uid %s, key %d, ball2 %s"):format(
+            ri, #remotes, remote.Name, hi, #guids, hash, uid, #keyStr, tostring(Core.cap.ball2)))
+        return true
+    end
+
     -- ---------- token + send ----------
     local tok_cache = { cap = nil, text = nil, tok = nil }
     local function make_token(cap)
@@ -1674,6 +1763,13 @@ end]]
     end
     local function fire(st, now, via, info, ball)
         local how
+        -- no-hook forge mode: get / refresh the capture by reflection (never a
+        -- hook press), and if that can't produce one, skip rather than fall back
+        -- to a hook.
+        if getgenv().ForgeNoHook and S.parry_mode ~= "Keypress" then
+            if not Core.cap or Core.misses >= 1 then Core.cap = nil; pcall(Parry.forgeCapture) end
+            if not Core.cap then return false end
+        end
         -- no capture yet, or the last remote parry went unanswered (the capture
         -- may be stale): this parry is a native press, which parries by itself
         -- and takes / refreshes the capture on the way
@@ -1873,6 +1969,9 @@ end]]
     end
     local function prime_capture(now)
         if Core.cap or not needs_capture() then return end
+        -- no-hook forge mode: build the capture by reflection instead of a hook
+        -- press; no VirtualInputManager, no hook, nothing to scan.
+        if getgenv().ForgeNoHook then pcall(Parry.forgeCapture); return end
         if not (in_match() or in_lobby_training()) or not canParryNow() then Capture.since = nil; return end
         Capture.since = Capture.since or now
         if now - Capture.since < 1 or now - Capture.last_press < 1.4 then return end
@@ -3342,6 +3441,19 @@ SB:AddButton({
     Func = function()
         if Parry.reflectProbe then pcall(Parry.reflectProbe) end
         Notify("Reflect probe", "Ran (read-only). Check the Parry log for the 'reflect:' lines.", 5)
+    end,
+})
+SB:AddToggle("ForgeNoHook", {
+    Text = "No-hook forge (experimental)", Default = false,
+    Tooltip = "Parry by forging the token from the sender's own key (reflection, NO hook) instead of capturing with a hook. Picks remote/hash it can't fully verify, so TEST ON AN ALT first. Tune getgenv().ForgeRemoteIdx (1-2), ForgeHashIdx (1-3), ForgeBall2 if parries don't land; watch the 'forge:' log lines.",
+    Callback = function(v) getgenv().ForgeNoHook = v and true or nil end,
+})
+SB:AddButton({
+    Text = "Forge capture now (test)",
+    Tooltip = "One-shot: build the capture by reflection right now and log what it resolved. Reads upvalues + calls the key deriver; it does not fire. Use with Remote parry mode.",
+    Func = function()
+        local ok = Parry.forgeCapture and Parry.forgeCapture()
+        Notify("Forge", ok and "Capture forged -- check the 'forge:' log line." or "Forge failed -- check the 'forge:' log line.", 5)
     end,
 })
 
