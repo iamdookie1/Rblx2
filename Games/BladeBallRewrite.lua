@@ -31,7 +31,7 @@
 
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.28"
+local SCRIPT_VERSION = "rewrite-0.5.29"
 
 -- ---------------------------------------------------------------------------
 -- Single instance.
@@ -782,6 +782,7 @@ end]]
     -- the game sent inside the press).
     local function arm(hold)
         if Core.cap or not is_live() then return false end
+        if capture_method() == "getgc" then return false end -- getgc method never hooks
         H.want, H.until_t = true, clock_() + (hold or 0.2)
         if H.fire or H.nc then return true end
         box.list = {}
@@ -1061,19 +1062,16 @@ end]]
         logp("reflect: done (read-only). Send me these lines.")
     end
 
-    -- ---------- no-hook forge (reflection -> key -> Core.cap) ----------
-    -- Enabled with getgenv().ForgeNoHook = true (OFF by default). Reads the
-    -- sender's upvalues (require(PRY) + getupvalues -- cached module, no code runs,
-    -- no hook) to get the parry remote, the hash, the uid and the key deriver,
-    -- derives the key and builds Core.cap so the normal remote send() forges tokens
-    -- for every parry -- nothing is ever hooked.
+    -- ---------- getgc capture backend (CaptureHook = "getgc") ----------
+    -- Reads the game's live sender via getgc(false) + getupvalues to get the parry
+    -- remote, hash, uid and key deriver, derives the key and builds Core.cap so the
+    -- normal remote send() forges tokens -- NO hook, NO key press, nothing to scan.
     --
-    -- WHICH remote/hash: the sender holds TWO parry RemoteEvents and THREE hash
-    -- GUIDs, and from a static read I cannot tell the real pair from a decoy/snitch
-    -- path. It fires remotes[getgenv().ForgeRemoteIdx or 1] with
-    -- guids[getgenv().ForgeHashIdx or 1]; getgenv().ForgeBall2 flips the packet
-    -- shape. DIAL THESE ON AN ALT: the right combo lands parries; a wrong one just
-    -- won't -- or, worst case, hits a decoy -- so never first-run this on your main.
+    -- WHICH remote/hash: the sender holds multiple parry RemoteEvents and hash
+    -- GUIDs; from a static read the real pair can't be told from a decoy, so it
+    -- uses remotes[getgenv().GcRemoteIdx or 1] and guids[getgenv().GcHashIdx or 1],
+    -- with getgenv().GcBall2 for the packet shape. DIAL THESE ON AN ALT: the right
+    -- combo lands parries; a wrong one just won't -- so prove it on an alt first.
     local function forge_find_pry()
         local function clean(s) return (tostring(s):gsub("[^%w]", "")) end
         local p
@@ -1146,31 +1144,75 @@ end]]
         pcall(dig, net, 0)
         return out
     end
-    -- Read the sender's upvalues once: the parry RemoteEvents, hash GUIDs, the key
-    -- deriver, the Net table and the resolved uid. Read-only. Sender via require
-    -- (cached module; instant), real remote via the Net cache dig above.
+    -- Find the LIVE sender closure the game actually runs, via getgc(false) --
+    -- functions only, NOT the heap-walking getgc(true) that crashed. Run once and
+    -- cached. This beats require(PRY): the game's require-proxy can hand back a
+    -- different module instance whose upvalues don't match the real packet (the
+    -- cause of the key MISMATCH). Cheap filter first (source contains "Sword")
+    -- before any getupvalues, and stop on the first match.
+    local forge_sender_cache
+    local function forge_gc_sender(getups)
+        if typeof(forge_sender_cache) == "function" then return forge_sender_cache end
+        if type(getgc) ~= "function" or type(getups) ~= "function" then return nil end
+        pcall(function()
+            for _, o in ipairs(getgc(false)) do
+                if type(o) == "function" then
+                    local oks, src = pcall(debug.info, o, "s")
+                    if oks and type(src) == "string" and src:find("Sword") then
+                        local oku, ups = pcall(getups, o)
+                        if oku and type(ups) == "table" then
+                            local n36, nFn, hasNet, hasUid = 0, 0, false, false
+                            for i = 1, 64 do
+                                local v = ups[i]
+                                if v ~= nil then
+                                    if type(v) == "string" and #v == 36 then n36 = n36 + 1
+                                    elseif type(v) == "function" then nFn = nFn + 1
+                                    elseif reflect_isNet(v) then hasNet = true
+                                    elseif typeof(v) == "table" then
+                                        local s = false; pcall(function() s = v[1] ~= nil and type(v[2]) == "table" end)
+                                        if s then hasUid = true end
+                                    end
+                                end
+                            end
+                            if n36 >= 1 and nFn >= 1 and hasNet and hasUid then forge_sender_cache = o; return end
+                        end
+                    end
+                end
+            end
+        end)
+        return forge_sender_cache
+    end
+    -- Read the LIVE sender's upvalues once (index order, deterministic): the parry
+    -- RemoteEvents, hash GUIDs, the key deriver, the Net table and the resolved uid.
+    -- Read-only. Sender via getgc(false) once (require(PRY) as fallback), real
+    -- remote dug from the Net cache.
     local function forge_resolve()
         local getups = reflect_getups()
         if type(getups) ~= "function" then return nil, "getupvalues unavailable" end
-        local pry = forge_find_pry()
-        if not pry then return nil, "PRY module not found" end
-        local ok, v31 = pcall(require, pry)
-        if not ok or type(v31) ~= "function" then return nil, "require(PRY) did not return the sender" end
+        local v31 = forge_gc_sender(getups)
+        if type(v31) ~= "function" then
+            local pry = forge_find_pry()
+            if pry then local ok, m = pcall(require, pry); if ok and type(m) == "function" then v31 = m end end
+        end
+        if type(v31) ~= "function" then return nil, "sender not found (getgc + require(PRY) both failed)" end
         local ok2, ups = pcall(getups, v31)
         if not ok2 or type(ups) ~= "table" then return nil, "getupvalues(v31) failed" end
         local remotes, guids, strings, deriver, uidHolder, net, seen = {}, {}, {}, nil, nil, nil, {}
-        for _, v in pairs(ups) do
-            if typeof(v) == "Instance" and v.ClassName == "RemoteEvent" then
-                if not seen[v] then seen[v] = true; remotes[#remotes + 1] = v end
-            elseif type(v) == "string" then
-                strings[#strings + 1] = v
-                if #v == 36 then guids[#guids + 1] = v end
-            elseif type(v) == "function" and not deriver then deriver = v
-            elseif reflect_isNet(v) then net = net or v
-            elseif typeof(v) == "table" and not uidHolder then
-                local shaped = false
-                pcall(function() shaped = v[1] ~= nil and type(v[2]) == "table" end)
-                if shaped then uidHolder = v end
+        for i = 1, 64 do   -- INDEX ORDER (pairs is non-deterministic; deriver must be stable)
+            local v = ups[i]
+            if v ~= nil then
+                if typeof(v) == "Instance" and v.ClassName == "RemoteEvent" then
+                    if not seen[v] then seen[v] = true; remotes[#remotes + 1] = v end
+                elseif type(v) == "string" then
+                    strings[#strings + 1] = v
+                    if #v == 36 then guids[#guids + 1] = v end
+                elseif type(v) == "function" and not deriver then deriver = v
+                elseif reflect_isNet(v) then net = net or v
+                elseif typeof(v) == "table" and not uidHolder then
+                    local shaped = false
+                    pcall(function() shaped = v[1] ~= nil and type(v[2]) == "table" end)
+                    if shaped then uidHolder = v end
+                end
             end
         end
         -- the real parry remote is in the Net cache, not the upvalues: dig it out
@@ -1192,89 +1234,35 @@ end]]
     -- instance stashed by calibration from a hook capture; (2) net:RemoteEvent(the
     -- discovered name); (3) as a last resort an upvalue RemoteEvent (likely wrong).
     local function forge_remote_for(r)
-        local remote = Core.forge_remote
-        if typeof(remote) == "Instance" and remote.Parent then return remote, "stashed real" end
-        local name = getgenv().ForgeRemoteName
+        local name = getgenv().GcRemoteName
         if r.net and type(name) == "string" then
             local ok, res = pcall(function() return r.net:RemoteEvent(name) end)
             if ok and typeof(res) == "Instance" and res.Parent then return res, "net:RemoteEvent('" .. name .. "')" end
         end
-        local ri = math.clamp(tonumber(getgenv().ForgeRemoteIdx) or 1, 1, math.max(#r.remotes, 1))
-        return r.remotes[ri], "upvalue #" .. ri .. " (unverified)"
+        local ri = math.clamp(tonumber(getgenv().GcRemoteIdx) or 1, 1, math.max(#r.remotes, 1))
+        return r.remotes[ri], "#" .. ri .. "/" .. #r.remotes
     end
-    function Parry.forgeCapture()
-        -- Primary: replay the full real capture the calibration stashed (remote +
-        -- real key + hash + uid + shape). It is the game's own data, so it is
-        -- always valid; make_token re-derives a fresh token per send. No hook, no
-        -- deriver -- immune to the game changing its key derivation.
-        local fc = Core.forge_cap
-        if type(fc) == "table" and typeof(fc.remote) == "Instance" and fc.remote.Parent and type(fc.key) == "table" then
-            local key = table.create(#fc.key)
-            for i = 1, #fc.key do key[i] = fc.key[i] end
-            Core.cap = { remote = fc.remote, hash = fc.hash, uid = fc.uid, key = key, len = fc.len, ball2 = fc.ball2 }
-            Core.misses, Core.pending = 0, nil
-            return true
-        end
-        -- Fallback: pure reflection (no capture). Needs a working key derivation,
-        -- which a game update can change -- so the stash above is preferred.
+    -- THE getgc CAPTURE METHOD (CaptureHook = "getgc"). Build Core.cap from the
+    -- live sender by reflection -- no FireServer/__namecall hook, no key press.
+    -- Remote/hash/shape are tunable with getgenv().GcRemoteIdx / GcHashIdx /
+    -- GcBall2 when the defaults don't land. Called from the capture points below
+    -- in place of arming a hook.
+    local function gc_capture()
         local r, err = forge_resolve()
-        if not r then logp("forge: " .. tostring(err) .. " (no calibrated capture stashed -- run Calibrate)"); return false end
+        if not r then logp("getgc: " .. tostring(err)); return false end
         local remote, how = forge_remote_for(r)
-        if typeof(remote) ~= "Instance" then logp("forge: no parry remote (run Calibrate after one hook capture)"); return false end
-        local hi = math.clamp(tonumber(getgenv().ForgeHashIdx) or 1, 1, #r.guids)
+        if typeof(remote) ~= "Instance" then logp("getgc: no parry remote resolved"); return false end
+        local hi = math.clamp(tonumber(getgenv().GcHashIdx) or 1, 1, #r.guids)
         local keyStr = forge_derive(r.deriver, r.uid)
-        if type(keyStr) ~= "string" or #keyStr == 0 then logp("forge: key derivation returned nothing"); return false end
+        if type(keyStr) ~= "string" or #keyStr == 0 then logp("getgc: key derivation returned nothing"); return false end
         local text = tostring(math.floor(Workspace:GetServerTimeNow() * 100))
         local key = table.create(#text)
         for i = 1, #text do key[i] = string.byte(keyStr, (i - 1) % #keyStr + 1) end
         Core.cap = { remote = remote, hash = r.guids[hi], uid = r.uid, key = key, len = #text,
-            ball2 = getgenv().ForgeBall2 and true or false }
+            ball2 = getgenv().GcBall2 and true or false }
         Core.misses, Core.pending = 0, nil
-        logp(("forge: cap set via derivation (no stash) -- remote %s '%s', hash #%d/%d, key %d"):format(
-            how, remote.Name, hi, #r.guids, #keyStr))
-        return true
-    end
-    -- CALIBRATION. One REAL packet (captured by the hook) is the oracle. It stashes
-    -- the FULL real capture (remote + key + hash + uid + shape) for the forge to
-    -- replay -- always correct, no deriver -- and logs whether reflection could
-    -- also reproduce it (diagnostics for a future zero-capture path).
-    function Parry.forgeCalibrate()
-        local cap = Core.cap
-        if not cap or typeof(cap.remote) ~= "Instance" or type(cap.key) ~= "table" then
-            logp("calibrate: no real capture yet -- ForgeNoHook OFF, Remote mode, parry once so the hook captures a real packet, then calibrate")
-            return false
-        end
-        -- stash the full real capture: this is exactly what forging replays
-        local keyCopy = table.create(#cap.key)
-        for i = 1, #cap.key do keyCopy[i] = cap.key[i] end
-        Core.forge_cap = { remote = cap.remote, hash = cap.hash, uid = cap.uid, key = keyCopy,
-            len = cap.len, ball2 = cap.ball2 and true or false }
-        Core.forge_remote = cap.remote
-        logp(("calibrate: stashed full real capture -- remote '%s', hash %s, uid %s, key %d bytes, ball2 %s -- forge replays it (no hook, no deriver)"):format(
-            cap.remote.Name, tostring(cap.hash), tostring(cap.uid), #cap.key, tostring(cap.ball2)))
-        -- diagnostics for the reflection path (so I can see why the derivation drifted)
-        local r = forge_resolve()
-        if r then
-            local ri; for i, rem in ipairs(r.remotes) do if rem == cap.remote then ri = i; break end end
-            local hi; for i, h in ipairs(r.guids) do if h == cap.hash then hi = i; break end end
-            if ri then getgenv().ForgeRemoteIdx = ri end
-            if hi then getgenv().ForgeHashIdx = hi end
-            getgenv().ForgeBall2 = cap.ball2 and true or false
-            local keyStr = forge_derive(r.deriver, r.uid)
-            local km = type(keyStr) == "string" and #keyStr > 0 and cap.len ~= nil
-            if km then for i = 1, cap.len do if cap.key[i] ~= string.byte(keyStr, (i - 1) % #keyStr + 1) then km = false; break end end end
-            local rk = {}; for i = 1, math.min(cap.len or #cap.key, 10) do rk[i] = string.format("%02x", cap.key[i]) end
-            local dk = {}; if type(keyStr) == "string" then for i = 1, math.min(#keyStr, 10) do dk[i] = string.format("%02x", string.byte(keyStr, i)) end end
-            logp(("calibrate(reflect): remote %s, hash %s, uid %s, key %s"):format(
-                ri and ("#" .. ri) or "not in upvalues/net", hi and ("#" .. hi) or "not found",
-                (r.uid == cap.uid) and "match" or "MISMATCH", km and "MATCH" or "MISMATCH"))
-            logp(("calibrate(reflect): realkey[1..10]=%s len=%s ; deriverkey[1..10]=%s len=%s"):format(
-                table.concat(rk, " "), tostring(cap.len),
-                table.concat(dk, " "), type(keyStr) == "string" and #keyStr or "nil"))
-        else
-            logp("calibrate(reflect): forge_resolve failed -- stash still set, forge will replay it")
-        end
-        logp("calibrate: DONE -- turn No-hook forge ON; it replays the stashed real capture")
+        logp(("getgc: cap set (no hook) -- remote %s '%s', hash #%d/%d, key %d, ball2 %s"):format(
+            how, remote.Name, hi, #r.guids, #keyStr, tostring(Core.cap.ball2)))
         return true
     end
 
@@ -1810,6 +1798,11 @@ end]]
         if SP.mode == "Keypress" and Pump.frame_fires >= 1 then return false end
         local ok, remote = false, false
         if SP.mode == "Keypress" then ok = pressBlockKey()
+        elseif not Core.cap and capture_method() == "getgc" then
+            -- getgc method: resolve the capture by reflection (no hook, no press)
+            if clock_() - Capture.last_spam_key < 0.3 then return false end
+            Capture.last_spam_key = clock_()
+            if gc_capture() then ok = send(true) == "sent"; remote = ok end
         elseif not Core.cap then
             -- no capture yet: a native press (it parries by itself) that also
             -- captures, at most one per 0.3s until the packet is in
@@ -1891,11 +1884,11 @@ end]]
     end
     local function fire(st, now, via, info, ball)
         local how
-        -- no-hook forge mode: get / refresh the capture by reflection (never a
-        -- hook press), and if that can't produce one, skip rather than fall back
-        -- to a hook.
-        if getgenv().ForgeNoHook and S.parry_mode ~= "Keypress" then
-            if not Core.cap or Core.misses >= 1 then Core.cap = nil; pcall(Parry.forgeCapture) end
+        -- getgc capture method: get / refresh the capture by reflection (never a
+        -- hook, never a press), and if that can't produce one, skip rather than
+        -- fall back to a hook.
+        if capture_method() == "getgc" and S.parry_mode ~= "Keypress" then
+            if not Core.cap or Core.misses >= 1 then Core.cap = nil; pcall(gc_capture) end
             if not Core.cap then return false end
         end
         -- no capture yet, or the last remote parry went unanswered (the capture
@@ -2097,9 +2090,9 @@ end]]
     end
     local function prime_capture(now)
         if Core.cap or not needs_capture() then return end
-        -- no-hook forge mode: build the capture by reflection instead of a hook
+        -- getgc capture method: build the capture by reflection instead of a hook
         -- press; no VirtualInputManager, no hook, nothing to scan.
-        if getgenv().ForgeNoHook then pcall(Parry.forgeCapture); return end
+        if capture_method() == "getgc" then pcall(gc_capture); return end
         if not (in_match() or in_lobby_training()) or not canParryNow() then Capture.since = nil; return end
         Capture.since = Capture.since or now
         if now - Capture.since < 1 or now - Capture.last_press < 1.4 then return end
@@ -2758,8 +2751,8 @@ AP:AddDropdown("TargetMode", {
     Callback = function(v) Parry.setTargetMode(v) end,
 })
 AP:AddDropdown("CaptureHook", {
-    Values = { "oth", "Namecall", "FireServer", "Both" }, Default = "Both", Text = "Capture hook",
-    Tooltip = "How the parry packet is captured. 'Both' (oth + Namecall) caught it on the first press most reliably on Delta; 'oth' alone often came up empty.",
+    Values = { "getgc", "Namecall", "FireServer", "Both" }, Default = "Both", Text = "Capture hook",
+    Tooltip = "How the parry capture is obtained. Namecall/FireServer/Both briefly hook to catch a real press. 'getgc' uses NO hook and NO press: it reads the game's live sender (getgc) and builds the capture by reflection. If getgc parries don't land, tune getgenv().GcRemoteIdx (1..n), GcHashIdx (1..n), GcBall2 (true/false).",
     Callback = function(v) getgenv().CaptureHook = v end,
 })
 AP:AddButton({
@@ -3563,35 +3556,6 @@ local L_curve = ST:AddLabel("Curve: Camera", true)
 local SB = Tabs.Status:AddRightGroupbox("Build", "info")
 SB:AddLabel("Version: " .. SCRIPT_VERSION)
 SB:AddLabel("Idle = nothing connected. Each feature connects only while it's on.", true)
-SB:AddButton({
-    Text = "No-hook reflect probe",
-    Tooltip = "READ-ONLY test for the hook-free parry. Finds the game's own parry sender via getconnections/getupvalues and logs its layout in the Parry log. Calls nothing and fires nothing -- safe. Run it in a round, then send the 'reflect:' lines.",
-    Func = function()
-        if Parry.reflectProbe then pcall(Parry.reflectProbe) end
-        Notify("Reflect probe", "Ran (read-only). Check the Parry log for the 'reflect:' lines.", 5)
-    end,
-})
-SB:AddToggle("ForgeNoHook", {
-    Text = "No-hook forge (experimental)", Default = false,
-    Tooltip = "Parry by forging the token from the sender's own key (reflection, NO hook) instead of capturing with a hook. Picks remote/hash it can't fully verify, so TEST ON AN ALT first. Tune getgenv().ForgeRemoteIdx (1-2), ForgeHashIdx (1-3), ForgeBall2 if parries don't land; watch the 'forge:' log lines.",
-    Callback = function(v) getgenv().ForgeNoHook = v and true or nil end,
-})
-SB:AddButton({
-    Text = "Forge capture now (test)",
-    Tooltip = "One-shot: build the capture by reflection right now and log what it resolved. Reads upvalues + calls the key deriver; it does not fire. Use with Remote parry mode.",
-    Func = function()
-        local ok = Parry.forgeCapture and Parry.forgeCapture()
-        Notify("Forge", ok and "Capture forged -- check the 'forge:' log line." or "Forge failed -- check the 'forge:' log line.", 5)
-    end,
-})
-SB:AddButton({
-    Text = "Calibrate forge (needs 1 hook capture)",
-    Tooltip = "Turn OFF No-hook forge, use Remote mode and parry once so the hook captures a real packet, then press this. It matches the real remote/hash/shape against the reflected upvalues and checks the key derivation, auto-setting ForgeRemoteIdx/ForgeHashIdx/ForgeBall2. Then turn No-hook forge ON.",
-    Func = function()
-        local ok = Parry.forgeCalibrate and Parry.forgeCalibrate()
-        Notify("Calibrate", ok and "Solved -- settings applied. Turn No-hook forge ON." or "Not solved -- check the 'calibrate:' log line and send it to me.", 6)
-    end,
-})
 
 local function set(label, text) pcall(function() label:SetText(text) end) end
 StatusHook = function(s, armed)
