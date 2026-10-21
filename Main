@@ -65,6 +65,8 @@ local Games = {
     -- Break In 2 (Story) by Cracky4 (game 4807308814): the story level's place,
     -- from its dump. The lobby (13864661000) is left out on purpose.
     [13864667823] = { Name = 'Break In 2', Script = 'Games/BreakIn2.lua' },
+    -- Crunch Leaves (game 10764755131), from its dump's own place id.
+    [98218013791770] = { Name = 'Crunch Leaves', Script = 'Games/CrunchLeaves.lua' },
     -- [🎃] Dodge or Die (game 9845585365): every mode's place, from the game's
     -- own ServerModeConfig. AutoLoad runs it as soon as it is detected.
     [131794278839305] = { Name = 'Dodge or Die', Script = 'Games/DodgeOrDie.lua', AutoLoad = true },
@@ -87,6 +89,7 @@ local GameIds = {
     [10756011174] = { Name = 'Needle in a Haystack', Script = 'Games/NeedleHaystack.lua', AutoLoad = true },
     [4538598064] = { Name = 'Phantom Ball', Script = 'Games/PhantomBall.lua', AutoLoad = true },
     [88070565] = { Name = 'Welcome to Bloxburg', Script = 'Games/Bloxburg.lua' },
+    [10764755131] = { Name = 'Crunch Leaves', Script = 'Games/CrunchLeaves.lua' },
 }
 
 -- Games whose other modes (ranked, duels, events...) each have their own place
