@@ -31,7 +31,7 @@
 
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.24"
+local SCRIPT_VERSION = "rewrite-0.5.25"
 
 -- ---------------------------------------------------------------------------
 -- Single instance.
@@ -1118,41 +1118,115 @@ end]]
         if not ok or type(v31) ~= "function" then return nil, "require(PRY) did not return the sender" end
         local ok2, ups = pcall(getups, v31)
         if not ok2 or type(ups) ~= "table" then return nil, "getupvalues(v31) failed" end
-        local remotes, guids, deriver, uidHolder = {}, {}, nil, nil
+        local remotes, guids, strings, deriver, uidHolder, net = {}, {}, {}, nil, nil, nil
         for _, v in pairs(ups) do
             if typeof(v) == "Instance" and v.ClassName == "RemoteEvent" then remotes[#remotes + 1] = v
-            elseif type(v) == "string" and #v == 36 then guids[#guids + 1] = v
+            elseif type(v) == "string" then
+                strings[#strings + 1] = v
+                if #v == 36 then guids[#guids + 1] = v end
             elseif type(v) == "function" and not deriver then deriver = v
-            elseif typeof(v) == "table" and not reflect_isNet(v) and not uidHolder then
+            elseif reflect_isNet(v) then net = net or v
+            elseif typeof(v) == "table" and not uidHolder then
                 local shaped = false
                 pcall(function() shaped = v[1] ~= nil and type(v[2]) == "table" end)
                 if shaped then uidHolder = v end
             end
         end
-        if #remotes == 0 or #guids == 0 or not deriver or not uidHolder then
+        if #guids == 0 or not deriver or not uidHolder then
             return nil, ("incomplete (remotes %d, hashes %d, deriver %s, uid-holder %s)"):format(
                 #remotes, #guids, tostring(deriver ~= nil), tostring(uidHolder ~= nil))
         end
         local uid; pcall(function() uid = uidHolder[2][uidHolder[1]] end)
         if type(uid) ~= "string" then return nil, "could not resolve uid" end
-        return { remotes = remotes, guids = guids, deriver = deriver, uid = uid }
+        return { remotes = remotes, guids = guids, strings = strings, deriver = deriver, uid = uid, net = net }
+    end
+    -- Resolve the parry remote for forging. The real one is NOT a direct upvalue
+    -- (the sender gets it from Net by name at call time), so prefer: (1) the real
+    -- instance stashed by calibration from a hook capture; (2) net:RemoteEvent(the
+    -- discovered name); (3) as a last resort an upvalue RemoteEvent (likely wrong).
+    local function forge_remote_for(r)
+        local remote = Core.forge_remote
+        if typeof(remote) == "Instance" and remote.Parent then return remote, "stashed real" end
+        local name = getgenv().ForgeRemoteName
+        if r.net and type(name) == "string" then
+            local ok, res = pcall(function() return r.net:RemoteEvent(name) end)
+            if ok and typeof(res) == "Instance" and res.Parent then return res, "net:RemoteEvent('" .. name .. "')" end
+        end
+        local ri = math.clamp(tonumber(getgenv().ForgeRemoteIdx) or 1, 1, math.max(#r.remotes, 1))
+        return r.remotes[ri], "upvalue #" .. ri .. " (unverified)"
     end
     function Parry.forgeCapture()
         local r, err = forge_resolve()
         if not r then logp("forge: " .. tostring(err)); return false end
-        local ri = math.clamp(tonumber(getgenv().ForgeRemoteIdx) or 1, 1, #r.remotes)
+        local remote, how = forge_remote_for(r)
+        if typeof(remote) ~= "Instance" then logp("forge: no parry remote (run Calibrate after one hook capture)"); return false end
         local hi = math.clamp(tonumber(getgenv().ForgeHashIdx) or 1, 1, #r.guids)
         local keyStr = forge_derive(r.deriver, r.uid)
         if type(keyStr) ~= "string" or #keyStr == 0 then logp("forge: key derivation returned nothing"); return false end
         local text = tostring(math.floor(Workspace:GetServerTimeNow() * 100))
         local key = table.create(#text)
         for i = 1, #text do key[i] = string.byte(keyStr, (i - 1) % #keyStr + 1) end
-        Core.cap = { remote = r.remotes[ri], hash = r.guids[hi], uid = r.uid, key = key, len = #text,
+        Core.cap = { remote = remote, hash = r.guids[hi], uid = r.uid, key = key, len = #text,
             ball2 = getgenv().ForgeBall2 and true or false }
         Core.misses, Core.pending = 0, nil
-        logp(("forge: cap set (no hook) -- remote #%d/%d '%s', hash #%d/%d %s, uid %s, key %d, ball2 %s"):format(
-            ri, #r.remotes, r.remotes[ri].Name, hi, #r.guids, r.guids[hi], r.uid, #keyStr, tostring(Core.cap.ball2)))
+        logp(("forge: cap set (no hook) -- remote %s '%s', hash #%d/%d %s, uid %s, key %d, ball2 %s"):format(
+            how, remote.Name, hi, #r.guids, r.guids[hi], r.uid, #keyStr, tostring(Core.cap.ball2)))
         return true
+    end
+    -- CALIBRATION. Uses one REAL packet (captured by the hook) as an oracle to
+    -- nail the forge settings deterministically -- which hash, which packet shape,
+    -- whether our reflected key derivation reproduces the game's real key, and the
+    -- real parry remote (which is NOT a direct upvalue). Run it right after a real
+    -- hook capture (ForgeNoHook OFF, parry once), then turn ForgeNoHook ON.
+    function Parry.forgeCalibrate()
+        local cap = Core.cap
+        if not cap or typeof(cap.remote) ~= "Instance" then
+            logp("calibrate: no capture yet -- turn OFF No-hook forge, parry once so the hook captures a real packet, then calibrate")
+            return false
+        end
+        local r, err = forge_resolve()
+        if not r then logp("calibrate: " .. tostring(err)); return false end
+        local ri; for i, rem in ipairs(r.remotes) do if rem == cap.remote then ri = i; break end end
+        local hi; for i, h in ipairs(r.guids) do if h == cap.hash then hi = i; break end end
+        local uidMatch = r.uid == cap.uid
+        local keyStr = forge_derive(r.deriver, r.uid)
+        local keyMatch = type(keyStr) == "string" and #keyStr > 0 and cap.len ~= nil
+        if keyMatch then
+            for i = 1, cap.len do
+                if cap.key[i] ~= string.byte(keyStr, (i - 1) % #keyStr + 1) then keyMatch = false; break end
+            end
+        end
+        if ri then getgenv().ForgeRemoteIdx = ri end
+        if hi then getgenv().ForgeHashIdx = hi end
+        getgenv().ForgeBall2 = cap.ball2 and true or false
+        -- stash the proven real remote so the forge fires on exactly what the game
+        -- uses (it is not a direct upvalue), and try to find its Net name so later
+        -- forges need no capture at all
+        Core.forge_remote = cap.remote
+        logp(("calibrate: hash %s, uid %s, key %s, ball2 %s; stashed real remote '%s'"):format(
+            hi and ("#" .. hi .. "/" .. #r.guids) or "NO MATCH",
+            uidMatch and "match" or "MISMATCH",
+            keyMatch and "MATCH" or "MISMATCH (derivation is not the key)",
+            tostring(cap.ball2), cap.remote.Name))
+        local nameFound
+        if r.net then
+            for _, s in ipairs(r.strings) do
+                local ok, res = pcall(function() return r.net:RemoteEvent(s) end)
+                if ok and res == cap.remote then nameFound = s; break end
+            end
+        end
+        if nameFound then
+            getgenv().ForgeRemoteName = nameFound
+            logp(("calibrate: real remote resolves via net:RemoteEvent('%s') -- pure-reflection remote (no capture needed next time)"):format(nameFound))
+        else
+            logp("calibrate: real remote's Net name not found among upvalues -- forging uses the stashed instance (one capture per session)")
+        end
+        if hi and keyMatch then
+            logp("calibrate: solved -- turn No-hook forge ON now")
+        else
+            logp("calibrate: not fully solved -- send me this line")
+        end
+        return hi ~= nil and keyMatch
     end
     -- CALIBRATION. Uses one REAL packet (captured by the hook) as an oracle to
     -- nail the forge settings deterministically -- which remote, which hash, which
