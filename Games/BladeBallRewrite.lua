@@ -31,7 +31,7 @@
 
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.34"
+local SCRIPT_VERSION = "rewrite-0.5.35"
 
 -- ---------------------------------------------------------------------------
 -- Single instance.
@@ -1270,13 +1270,23 @@ end]]
         return all, salts
     end
     -- Identify the parry remote among the Net children (run once per server, in
-    -- its own thread, time-sliced so it never stalls a frame). Tried in order:
-    --   1. a child named exactly like a sender string (unhashed Net);
-    --   2. a string-keyed cache in the Net table mapping a sender string to a remote;
-    --   3. "RE/" .. sha256(s), sha256(s .. t), sha256(t .. s) for sender strings s, t.
-    -- The RemoteEvents held as sender upvalues are never the parry remote
-    -- (calibration against a real packet), so they are excluded.
+    -- its own thread, time-sliced so it never stalls a frame).
+    --
+    -- The sender asks Net for a remote by a short opaque name held as a constant
+    -- (e.g. "494kjkdf", "64565gfdd"); Net maps it to a per-server child named
+    -- "RE/<sha256>". Each candidate name is resolved, in order, by:
+    --   1. an exact child name;
+    --   2. "RE/" .. sha256 of the name alone or joined with a salt (the sender's
+    --      strings, Net.RemoteEvent's own strings, JobId / PlaceId / GameId);
+    --   3. Net's own RemoteEvent(name) -- run in a coroutine and dropped if it
+    --      would yield, so an unknown name can never hang us.
+    -- Of the names that resolve, the one on the real send path wins: the last
+    -- one before "TIME" (the key derivation) in the sender's constants; the
+    -- name next to "JobId" is the decoy report. getgenv().GcRemotePick = "<name>"
+    -- forces one. RemoteEvents held as sender upvalues are never the parry remote.
     GC.rem = { state = nil, remote = nil, how = nil }
+    GC.WORDS = {}
+    for w in ("debug info s FireServer game JobId pcall writefile TIME workspace GetServerTimeNow math floor tostring string byte bit32 bxor char table concat random RemoteEvent UnreliableRemoteEvent Clean RemoteFunction Handle ConnectUnreliable Invoke Connect"):gmatch("%S+") do GC.WORDS[w] = true end
     function GC.find_remote(sender, ups, net_mod, net_tbl)
         GC.rem.state = "running"
         task.spawn(function()
@@ -1291,68 +1301,105 @@ end]]
                     if hex then byHex[hex:lower()] = c end
                 end
             end
-            local strs, salts = GC.sender_strings(sender, ups)
-            local found, how
-            for _, s in ipairs(strs) do
-                if byName[s] then found, how = byName[s], "name '" .. s .. "'"; break end
+            local all, salts = GC.sender_strings(sender, ups)
+            -- candidate names: the sender's opaque identifier-like constants
+            local cands = {}
+            for _, s in ipairs(all) do
+                if not GC.WORDS[s] and s:match("^%w+$") and #s >= 4 and #s <= 24 and s:find("%d") and s:find("%a") then
+                    cands[#cands + 1] = s
+                end
             end
-            if not found and net_tbl then
-                pcall(function()
-                    local seen, budget = {}, 300
-                    local function dig(t, depth)
-                        if found or budget <= 0 or depth > 3 or seen[t] then return end
-                        seen[t] = true; budget = budget - 1
-                        local k, v = next(t)
-                        while k ~= nil do
-                            if typeof(v) == "Instance" and v.ClassName == "RemoteEvent" and not skip[v] and type(k) == "string" then
-                                for _, s in ipairs(strs) do
-                                    if k == s then found, how = v, "Net cache '" .. s .. "'"; return end
-                                end
-                            elseif type(v) == "table" then dig(v, depth + 1) end
-                            k, v = next(t, k)
+            -- more salts: Net.RemoteEvent's own strings + server identity
+            local netfn
+            pcall(function() netfn = rawget(net_tbl, "RemoteEvent") or net_tbl.RemoteEvent end)
+            local extra = {}
+            if type(netfn) == "function" then
+                local getups = reflect_getups()
+                local nups = {}
+                if type(getups) == "function" then local ok, u = pcall(getups, netfn); if ok and type(u) == "table" then nups = u end end
+                local nstr = GC.sender_strings(netfn, nups)
+                for _, x in ipairs(nstr) do extra[#extra + 1] = x end
+            end
+            pcall(function() extra[#extra + 1] = game.JobId end)
+            pcall(function() extra[#extra + 1] = tostring(game.PlaceId) end)
+            pcall(function() extra[#extra + 1] = tostring(game.GameId) end)
+            local saltset = {}
+            for _, x in ipairs(salts) do saltset[x] = true end
+            for _, x in ipairs(extra) do if not saltset[x] and #salts < 48 then saltset[x] = true; salts[#salts + 1] = x end end
+            local t0 = os.clock()
+            local function hit(m)
+                local c = byHex[GC.sha256(m)]
+                if os.clock() - t0 > 0.004 then task.wait(); t0 = os.clock() end
+                return c
+            end
+            local resolved = {}
+            for _, name in ipairs(cands) do
+                if not is_live() then break end
+                local c, how = byName[name], "exact name"
+                if not c and next(byHex) then
+                    c = hit(name); how = "sha256(name)"
+                    if not c then
+                        for _, t in ipairs(salts) do
+                            for _, sep in ipairs({ "", "/", ":", "_", "-", "." }) do
+                                c = hit(name .. sep .. t)
+                                if c then how = ("sha256(name..'%s'..salt#%d)"):format(sep, #t); break end
+                                c = hit(t .. sep .. name)
+                                if c then how = ("sha256(salt#%d..'%s'..name)"):format(#t, sep); break end
+                            end
+                            if c then break end
                         end
                     end
-                    dig(net_tbl, 0)
-                end)
-            end
-            if not found and next(byHex) then
-                local t0 = os.clock()
-                local function try(m)
-                    local c = byHex[GC.sha256(m)]
-                    if os.clock() - t0 > 0.004 then task.wait(); t0 = os.clock() end
-                    return c
                 end
-                for _, s in ipairs(strs) do
-                    local c = try(s)
-                    if c then found, how = c, "sha256('" .. s .. "')"; break end
-                end
-                -- name + salt either way round: names x salts only (<= 120 x 24)
-                for _, s in ipairs(strs) do
-                    if found or not is_live() then break end
-                    for _, t in ipairs(salts) do
-                        if s ~= t then
-                            local c = try(s .. t)
-                            if c then found, how = c, ("sha256('%s' .. salt#%d)"):format(s, #t); break end
-                            c = try(t .. s)
-                            if c then found, how = c, ("sha256(salt#%d .. '%s')"):format(#t, s); break end
-                        end
+                if not c and type(netfn) == "function" then
+                    -- Net's own lookup: kept only if it returns without yielding
+                    local co = coroutine.create(function() return netfn(net_tbl, name) end)
+                    local ok, r = coroutine.resume(co)
+                    if ok and coroutine.status(co) == "dead" and typeof(r) == "Instance" and r:IsA("RemoteEvent") and not skip[r] then
+                        c, how = r, "Net:RemoteEvent"
                     end
                 end
+                if c then resolved[#resolved + 1] = { name = name, remote = c, how = how } end
             end
-            GC.rem.remote, GC.rem.how = found, how
-            GC.rem.state = found and "found" or "failed"
-            if found then
-                logp(("getgc: parry remote '%s' identified via %s"):format(found.Name, tostring(how)))
+            -- pick the one on the real send path
+            local pick
+            local forced = getgenv().GcRemotePick
+            for _, r in ipairs(resolved) do if r.name == forced then pick = r end end
+            if not pick and #resolved > 0 then
+                local order = {}
+                for i, s in ipairs(all) do order[s] = order[s] or i end
+                local tIdx = order["TIME"] or math.huge
+                for _, r in ipairs(resolved) do
+                    local i = order[r.name] or 0
+                    if i < tIdx and (not pick or i > (order[pick.name] or 0)) then pick = r end
+                end
+                pick = pick or resolved[#resolved]
+            end
+            local list = {}
+            for i, r in ipairs(resolved) do list[i] = ("%s->%s via %s"):format(r.name, r.remote.Name:sub(1, 12), r.how) end
+            if pick then
+                GC.rem.remote, GC.rem.how = pick.remote, ("'%s' (%s)"):format(pick.name, pick.how)
+                GC.rem.state = "found"
+                logp(("getgc: parry remote '%s' = name '%s' via %s; all resolved: %s"):format(
+                    pick.remote.Name, pick.name, pick.how, table.concat(list, ", ")))
             else
-                -- one-time diagnostics so the next fix works from data, not guesses
+                GC.rem.state = "failed"
+                local hx = 0; for _ in pairs(byHex) do hx = hx + 1 end
+                logp(("getgc: parry remote NOT identified -- %d Net remotes (%d RE/ hashed), candidates: %s; Net.RemoteEvent is %s"):format(
+                    count, hx, table.concat(cands, ", "), type(netfn) == "function" and (GC.is_lua(netfn) and "Lua" or "C") or "missing"))
                 local show = {}
-                for i = 1, math.min(#strs, 40) do
-                    local s = strs[i]
+                for i = 1, math.min(#extra, 30) do
+                    local s = extra[i]
                     show[i] = (#s > 24) and (s:sub(1, 24) .. "..(" .. #s .. ")") or s
                 end
-                logp(("getgc: parry remote NOT identified -- %d Net remotes (%d RE/ hashed), %d sender strings"):format(
-                    count, (function() local n = 0; for _ in pairs(byHex) do n = n + 1 end; return n end)(), #strs))
-                logp("getgc: sender strings: " .. table.concat(show, " | "))
+                logp("getgc: Net.RemoteEvent strings: " .. table.concat(show, " | "))
+                -- the non-RE/ children (first few names) for the next fix
+                local other = {}
+                for _, c in ipairs(net_mod:GetChildren()) do
+                    if c.ClassName == "RemoteEvent" and not c.Name:match("^RE/%x+$") then
+                        other[#other + 1] = c.Name:sub(1, 20); if #other >= 6 then break end
+                    end
+                end
+                logp("getgc: other Net remote names: " .. table.concat(other, " | "))
             end
         end)
     end
