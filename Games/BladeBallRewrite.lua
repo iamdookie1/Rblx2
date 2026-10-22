@@ -31,7 +31,7 @@
 
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.40"
+local SCRIPT_VERSION = "rewrite-0.5.41"
 
 -- ---------------------------------------------------------------------------
 -- Single instance.
@@ -1247,9 +1247,37 @@ end]], chunk, fn, out, ...)
             end
             GC.log("getgc: step 1a -- sender acquired via " .. src)
             if step < 1 then return nil, "stopped after acquiring the sender (GcStep<1): no getupvalues, no game code", false end
-            GC.log("getgc: step 1b -- reading upvalues (getupvalues)")
-            local ok2, ups = pcall(getups, v31)
-            if not ok2 or type(ups) ~= "table" then return nil, "getupvalues(sender) failed", true end
+            -- getupvalues inline on the GAME thread is what kicks: the getgc scan
+            -- reads the SAME upvalues on its own spawned thread and does NOT kick.
+            -- So extract on a clean isolated thread -- getupvalues and the source
+            -- read (debug.info) run there, tagged with the PRY module's path; the
+            -- game thread only reads and parses the result (pure Lua, no
+            -- reflection). GcChunk=false skips the debug.info source read.
+            if not GC.ext then
+                local chunk_guess
+                pcall(function() local p = forge_find_pry(); if p then chunk_guess = p:GetFullName() end end)
+                local info = (getgenv().GcChunk ~= false) and debug.info or nil
+                local out = { done = false, at = clock_() }
+                local body = build_body([[
+local getups, info, sender, out = ...
+return function()
+    out.ups = getups(sender)
+    if info then out.ok2, out.src = pcall(info, sender, "s") end
+    out.done = true
+end]], chunk_guess, getups, info, v31, out)
+                if not body then return nil, "could not build a clean extractor (no loadstring?)", true end
+                task.spawn(body)
+                GC.ext = out
+                GC.log("getgc: step 1b -- extracting upvalues on a clean thread (off the game thread)")
+            end
+            if not GC.ext.done then
+                if clock_() - GC.ext.at < 3 then return nil, "extracting the sender's upvalues (clean thread)...", false end
+                GC.ext = nil
+                return nil, "upvalue extraction never returned", true
+            end
+            local ups = GC.ext.ups
+            if type(ups) ~= "table" then GC.ext = nil; return nil, "getupvalues(sender) returned no table", true end
+            local chunk = GC.ext.ok2 and GC.ext.src or nil
             local guids, deriver, uidHolder, net, name, hash = {}, nil, nil, nil, nil, nil
             for i = 1, 64 do
                 local v = ups[i]
@@ -1275,25 +1303,11 @@ end]], chunk, fn, out, ...)
             end
             local uid; pcall(function() uid = uidHolder[2][uidHolder[1]] end)
             if type(uid) ~= "string" then return nil, "could not resolve uid", true end
-            -- NOTE: no debug.info here. 0.5.37 read the sender's source with
-            -- debug.info(v31,"s") in this block; it is now deferred to step 2 so
-            -- GcStep=1 is getupvalues ONLY. If GcStep=1 stops kicking, debug.info
-            -- on the sender was the leak.
-            b = { guids = guids, hash = hash, name = name, deriver = deriver, uid = uid, net = net, sender = v31 }
+            b = { guids = guids, hash = hash, name = name, deriver = deriver, uid = uid, net = net, sender = v31, chunk = chunk }
             GC.base = b
-            GC.log(("getgc: step 1/4 -- upvalues read via getupvalues (name ok, %d hashes, uid ok); no debug.info"):format(#guids))
+            GC.log(("getgc: step 1/4 -- upvalues extracted off the game thread (name ok, %d hashes, uid ok)"):format(#guids))
         end
-        if step < 2 then return nil, "stopped after step 1 (GcStep=1): getupvalues only, no debug.info, no Net, no deriver", false end
-        -- the sender's source, for the clean-thread call disguise. Deferred to
-        -- here (not in the step-1 block) and skippable with GcChunk=false: if the
-        -- Net/deriver calls land fine without it, debug.info is not needed.
-        if b.chunk == nil and not b.chunk_tried then
-            b.chunk_tried = true
-            if getgenv().GcChunk ~= false then
-                GC.log("getgc: step 2/4 -- reading sender source (debug.info) for call disguise")
-                pcall(function() b.chunk = debug.info(b.sender, "s") end)
-            end
-        end
+        if step < 2 then return nil, "stopped after step 1 (GcStep=1): extraction only, no Net, no deriver", false end
         -- the remote: Net:RemoteEvent(name), on a clean thread; it may take a
         -- frame (Net can wait for the child), so poll the result
         GC.log("getgc: step 3/4 -- calling Net:RemoteEvent(name) on a clean thread")
@@ -1338,7 +1352,7 @@ end]], chunk, fn, out, ...)
             GC.log("getgc: step 4/4 -- calling the key deriver on a clean thread")
             local keyStr = forge_derive(r.deriver, r.uid, r.chunk)
             if type(keyStr) ~= "string" or #keyStr == 0 then
-                GC.res, GC.base = nil, nil; gc_fail_at = clock_(); GC.log("getgc: key derivation returned nothing"); return false
+                GC.res, GC.base, GC.ext = nil, nil, nil; gc_fail_at = clock_(); GC.log("getgc: key derivation returned nothing"); return false
             end
             r.key = keyStr
         end
