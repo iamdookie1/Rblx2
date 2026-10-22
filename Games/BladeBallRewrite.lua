@@ -31,7 +31,7 @@
 
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.42"
+local SCRIPT_VERSION = "rewrite-0.5.43"
 
 -- ---------------------------------------------------------------------------
 -- Single instance.
@@ -1088,10 +1088,6 @@ end]]
         end
         return p
     end
-    -- Find the LIVE sender via getgc(false) -- a require-free alternative
-    -- acquisition (GcSender="getgc"). Reads candidate upvalues on its OWN
-    -- spawned thread only to identify the sender; the default path never runs it
-    -- (require(PRY) returns the sender directly, no getupvalues at all).
     local GC = { last_msg = nil }
     function GC.clean(s) return (tostring(s):gsub("[^%w]", "")) end
     function GC.is_lua(f)
@@ -1103,11 +1099,39 @@ end]]
         local ok, src = pcall(debug.info, f, "s")
         return ok and src ~= "[C]"
     end
-    local gc_scan = { sender = nil, started = false, done = false }
+    -- The game's own F-key parry handler v186 (SwordsController, Bbs dump):
+    --   v7.InputBegan:Connect(function(p32,p33) if ... UseBind(p32,"Block") then v186() end end)
+    --   local function v186(p31) xpcall(...Deactivate...);
+    --       return not not v49(v184.CharacterSword or "Base Sword",
+    --           v184.SwordType or "Single", v184.AnimationCollection or "Single", not not p31) end
+    -- v186 -> v49 computes the SERVER-VALIDATED parry window (n6, from timesParried:
+    -- 1.5/1.25/1.0/0.75/0.625...), builds the target points, PLAYS the parry
+    -- animation, and only then calls the real sender v31. Calling v31 raw (0.5.42)
+    -- skipped the window and the animation -> server kicked "[CODE HSH-2]". So call
+    -- v186() with no args, exactly as the key press does -- the game does the rest.
+    -- v186 is identified by its string constants ("CharacterSword","Base Sword",
+    -- "AnimationCollection") via getconstants -- NOT getupvalues (the detected op).
+    local function fn_consts(f)
+        local gc = (debug and debug.getconstants) or getconstants
+        if type(gc) ~= "function" then return nil end
+        local ok, cs = pcall(gc, f)
+        return ok and type(cs) == "table" and cs or nil
+    end
+    local function is_handler(o)
+        local cs = fn_consts(o)
+        if not cs then return false end
+        local hasCS, hasBase, hasAC = false, false, false
+        for _, c in pairs(cs) do
+            if c == "CharacterSword" then hasCS = true
+            elseif c == "Base Sword" then hasBase = true
+            elseif c == "AnimationCollection" then hasAC = true end
+        end
+        return hasCS and hasBase and hasAC
+    end
+    local gc_scan = { handler = nil, started = false, done = false }
     local function gc_scan_start()
         if gc_scan.started then return end
-        local getups = reflect_getups()
-        if type(getgc) ~= "function" or type(getups) ~= "function" then gc_scan.done = true; return end
+        if type(getgc) ~= "function" then gc_scan.done = true; return end
         gc_scan.started = true
         task.spawn(function()
             local list
@@ -1118,23 +1142,10 @@ end]]
                     local o = list[idx]
                     if type(o) == "function" and GC.is_lua(o) then
                         local oks, src = pcall(debug.info, o, "s")
-                        if oks and type(src) == "string" and GC.clean(src):find("SwordsControllerPRY$") then
-                            local oku, ups = pcall(getups, o)
-                            if oku and type(ups) == "table" then
-                                local n36, nFn, hasNet, hasUid = 0, 0, false, false
-                                for i = 1, 64 do
-                                    local v = ups[i]
-                                    if v ~= nil then
-                                        if type(v) == "string" and #v == 36 then n36 = n36 + 1
-                                        elseif type(v) == "function" then nFn = nFn + 1
-                                        elseif reflect_isNet(v) then hasNet = true
-                                        elseif typeof(v) == "table" then
-                                            local s = false; pcall(function() s = v[1] ~= nil and type(v[2]) == "table" end)
-                                            if s then hasUid = true end
-                                        end
-                                    end
-                                end
-                                if n36 >= 1 and nFn >= 1 and hasNet and hasUid then gc_scan.sender = o; break end
+                        if oks and type(src) == "string" then
+                            local c = GC.clean(src)
+                            if c:find("SwordsController") and not c:find("PRY") and is_handler(o) then
+                                gc_scan.handler = o; break
                             end
                         end
                     end
@@ -1143,26 +1154,12 @@ end]]
             end
             list = nil
             gc_scan.done = true
-            logp(gc_scan.sender and "getgc: live PRY sender found (getgc)"
-                or "getgc: getgc scan finished, sender not found")
+            logp(gc_scan.handler and "getgc: parry handler (v186) found -- calling it directly"
+                or "getgc: parry handler not found in scan")
         end)
     end
 
-    -- ---------- getgc: CALL the game's own sender (no upvalues, no key) ----------
-    -- SwordsController.PRY (Tools/Bbs dumps): `local v31 = require(script.PRY)`,
-    -- and the game parries by CALLING v31:
-    --     v31(window, Camera.CFrame, points, aim, flag)   -- normal
-    --     v31(Camera.CFrame, mouseLookCF, flag)           -- UseBall2 servers
-    -- v31 is the sender closure: called, it builds the real token from the real
-    -- per-account key and fires the real remote (plus the game's own random
-    -- decoys) -- a genuine parry, indistinguishable from the player's. We never
-    -- read its upvalues (that getupvalues is what BAC kicked on), derive a key,
-    -- resolve a remote or forge a packet. Its only guards are two honeypots at
-    -- the top -- debug.info globally hooked, or writefile reachable via a
-    -- getfenv(i) stack-walk (i = 1..10) -- so the call must run on a thread whose
-    -- only frames are the sender and ONE clean-env wrapper: no writefile in any
-    -- frame's env, tagged with the sender's own chunk. Acquire with require(PRY)
-    -- (the game's own path; cached, so no module re-run), never getupvalues.
+    -- ---------- getgc: CALL the game's own parry handler (no upvalues, no key) ----
     local gc_fail_at = -math.huge
     function GC.log(msg) if msg ~= GC.last_msg then GC.last_msg = msg; logp(msg) end end
     local function gc_acquire()
@@ -1171,64 +1168,76 @@ end]]
             return true
         end
         if clock_() - gc_fail_at < 1 then return false end
-        local want = getgenv().GcSender or "require"
-        local fn
-        if want ~= "require" and type(gc_scan.sender) == "function" then fn = gc_scan.sender end
-        if not fn and want ~= "getgc" then
+        -- "handler" (default) = call v186 (the real F-key handler, found via getgc);
+        -- "pry" = call the raw sender v31 from require(PRY) (0.5.42 behaviour, for
+        -- comparison only -- it sends the wrong window and HSH-2 kicks).
+        local mode = getgenv().GcSender or "handler"
+        local fn, kind
+        if mode == "pry" then
             local pry = forge_find_pry()
-            if pry then local ok, m = pcall(require, pry); if ok and type(m) == "function" then fn = m end end
+            if pry then local ok, m = pcall(require, pry); if ok and type(m) == "function" then fn, kind = m, "pry" end end
+        else
+            if type(gc_scan.handler) == "function" then fn, kind = gc_scan.handler, "handler"
+            else
+                gc_scan_start()
+                if not gc_scan.done then return false end     -- still scanning; quiet
+                fn = gc_scan.handler; if type(fn) == "function" then kind = "handler" end
+            end
         end
-        if not fn and want ~= "require" then
-            gc_scan_start()
-            if not gc_scan.done then return false end     -- still scanning; quiet
-            fn = gc_scan.sender
-        end
-        if type(fn) ~= "function" then gc_fail_at = clock_(); GC.log("getgc: sender not found (sender=" .. want .. ")"); return false end
+        if type(fn) ~= "function" then gc_fail_at = clock_(); GC.log("getgc: parry function not found (mode=" .. mode .. ")"); return false end
         -- the ONE clean dispatcher, built once. task.spawn(dispatcher) runs it as
-        -- the thread's main function, so inside the sender getfenv(2) is this
-        -- clean wrapper (writefile nil) and getfenv(3+) is empty -- both honeypots
-        -- pass. GcChunk=false skips the single debug.info source read.
+        -- the thread's main function, so when the sender's getfenv(i) stack-walk
+        -- runs (inside v31, reached via v186->v49), every frame up to ours is game
+        -- code and the top frame is this clean wrapper (writefile nil) -- both
+        -- honeypots pass. GcChunk=false skips the single debug.info source read.
         local chunk
         if getgenv().GcChunk ~= false then pcall(function() chunk = debug.info(fn, "s") end) end
-        local job = {}
+        local job = { n = 0 }
         local disp = build_body([[
-local job, sender = ...
-return function() sender(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
+local job, fn = ...
+return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         if type(disp) ~= "function" then gc_fail_at = clock_(); GC.log("getgc: could not build a clean dispatcher (no loadstring?)"); return false end
-        GC.sender, GC.job, GC.dispatcher = fn, job, disp
+        GC.fn, GC.kind, GC.job, GC.dispatcher = fn, kind, job, disp
         Core.cap = { gc = true }
         Core.misses, Core.pending = 0, nil
-        GC.log("getgc: sender acquired (" .. want .. ") -- parrying by calling the game's own sender (no upvalues, no key, no forge)")
+        GC.log("getgc: parry acquired (" .. kind .. ") -- calling the game's own parry function (no upvalues, no key, no forge)")
         return true
     end
-    -- fire one real parry: set the args, run the sender on a fresh clean thread
+    -- fire one real parry on a fresh clean thread
     local function gc_fire(spam)
         if type(GC.dispatcher) ~= "function" then return "unarmed" end
         if not is_live() then return "blocked" end
         if not canParryNow() then return "blocked" end
         if not spam and not gate_open() then return "blocked" end
-        local cam = Workspace.CurrentCamera
-        if not cam then return "blocked" end
-        local window = parry_window()
-        local points, aim = packet_parts(cam)
-        local name, _, mode = choose_target(cam)
-        if name and mode ~= "Cursor" then local sp = points[name]; if sp then aim = { sp.X, sp.Y } end end
-        local cf = cam.CFrame
-        local look = curve_look_cached(cam)
-        if look then local o = cf.Position; cf = CFrame.lookAt(o, o + look) end
         if not spam then gate_start() end
         Core.last_send_at = clock_()
         local job = GC.job
-        if getgenv().GcBall2 then
-            local ray = cam:ScreenPointToRay(aim[1], aim[2], 0)
-            job[1], job[2], job[3], job[4], job[5] = cf, CFrame.lookAt(ray.Origin, ray.Origin + ray.Direction), false, nil, nil
-            job.n = 3
+        if GC.kind == "handler" then
+            -- v186(): no args, exactly as the F-key / tap handler calls it. v186 ->
+            -- v49 builds the correct window, targets and animation and fires itself.
+            job.n = 0
         else
-            job[1], job[2], job[3], job[4], job[5] = window, cf, points, aim, false
-            job.n = 5
+            -- raw sender v31(window, cameraCF, points, aim, flag) -- comparison only
+            local cam = Workspace.CurrentCamera
+            if not cam then return "blocked" end
+            local window = parry_window()
+            local points, aim = packet_parts(cam)
+            local name, _, mode = choose_target(cam)
+            if name and mode ~= "Cursor" then local sp = points[name]; if sp then aim = { sp.X, sp.Y } end end
+            local cf = cam.CFrame
+            local look = curve_look_cached(cam)
+            if look then local o = cf.Position; cf = CFrame.lookAt(o, o + look) end
+            if getgenv().GcBall2 then
+                local ray = cam:ScreenPointToRay(aim[1], aim[2], 0)
+                job[1], job[2], job[3], job[4], job[5] = cf, CFrame.lookAt(ray.Origin, ray.Origin + ray.Direction), false, nil, nil
+                job.n = 3
+            else
+                job[1], job[2], job[3], job[4], job[5] = window, cf, points, aim, false
+                job.n = 5
+            end
         end
         task.spawn(GC.dispatcher)
-        if not spam then Core.pending = clock_() + window + ping_s() + 0.25 end
+        if not spam then Core.pending = clock_() + (parry_window() or 0.5) + ping_s() + 0.25 end
         return "sent"
     end
 
@@ -1782,6 +1791,8 @@ return function() sender(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         end
         Pump.frame_fires = Pump.frame_fires + 1
         if ok then SpamMeter.count = SpamMeter.count + 1 end
+        -- getgc's handler plays the game's own swing; don't add ours on top
+        if capture_method() == "getgc" then remote = false end
         Pump.remote_sent = Pump.remote_sent or remote
         return ok
     end
@@ -1871,7 +1882,9 @@ return function() sender(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         else
             if send(false) ~= "sent" then return false end
             how = "remote"
-            Anim.block() -- a remote parry has no swing of its own; the key and abilities do
+            -- getgc calls the game's own parry handler, which plays the real
+            -- swing; only a forged remote parry needs our animation
+            if capture_method() ~= "getgc" then Anim.block() end
         end
         Core.last_parry = { t = now, via = via, info = info }
         -- a key press is answered (or not) like a remote parry: same miss check
@@ -2720,7 +2733,7 @@ AP:AddDropdown("TargetMode", {
 })
 AP:AddDropdown("CaptureHook", {
     Values = { "getgc", "Namecall", "FireServer", "Both" }, Default = "Both", Text = "Capture hook",
-    Tooltip = "How the parry is sent. Namecall/FireServer/Both briefly hook to catch a real press. 'getgc' uses NO hook, NO press, NO getupvalues: it acquires the game's own parry sender and calls it on a clean thread, so the game builds the real token and fires the real remote itself. getgenv().GcSender ('require'/'getgc'), GcBall2, GcChunk override.",
+    Tooltip = "How the parry is sent. Namecall/FireServer/Both briefly hook to catch a real press. 'getgc' uses NO hook, NO press, NO getupvalues: it finds the game's own F-key parry handler (v186) via getgc and calls it, so the game builds the server-validated window, plays the real swing and fires the real remote itself. getgenv().GcSender ('handler'/'pry'), GcChunk override.",
     Callback = function(v) getgenv().CaptureHook = v end,
 })
 AP:AddButton({
