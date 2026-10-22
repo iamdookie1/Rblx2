@@ -31,7 +31,7 @@
 
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.45"
+local SCRIPT_VERSION = "rewrite-0.5.46"
 
 -- ---------------------------------------------------------------------------
 -- Single instance.
@@ -751,27 +751,29 @@ end]]
         end)
         return ok and type(fn) == 'function' and fn or nil
     end
-    local NC_BODY = build_body(NC_SRC, HOOK_NAME, box, getnamecallmethod_ or function() return nil end, select)
-    local FIRE_BODY = build_body(FIRE_SRC, HOOK_NAME, box, select)
-    Core.isolated = NC_BODY ~= nil and FIRE_BODY ~= nil
-    -- No loadstring on this executor: same bodies, just not disguised.
-    if not NC_BODY then
-        NC_BODY = function(self, ...)
-            if select_("#", ...) >= 6 and box.want and getnamecallmethod_() == "FireServer" then
-                local l = box.list
-                if #l < 4 then l[#l + 1] = { self, select_("#", ...), { ... }, box.now(box.ws) } end
-            end
-            return box.nc(self, ...)
+    -- PLAIN closures -- NO loadstring, NO chunk-name disguise. The old isolated
+    -- bodies were compiled at LOAD under a chunk name that impersonated the real
+    -- Net module path (=ReplicatedStorage...sleitnick_net....net); creating that
+    -- impostor chunk at load is what the anticheat kicked on in the lobby (with
+    -- every feature off, hook never armed). It bought nothing: the sender's two
+    -- honeypots (debug.info hooked, writefile in a getfenv(i) walk) run at the
+    -- TOP of the sender, BEFORE it calls FireServer, so our hook is never on the
+    -- stack during that walk -- the hook body's env/name is irrelevant to them.
+    -- So these are ordinary closures, built with no loadstring at all.
+    Core.isolated = false
+    local NC_BODY = function(self, ...)
+        if select_("#", ...) >= 6 and box.want and getnamecallmethod_() == "FireServer" then
+            local l = box.list
+            if #l < 4 then l[#l + 1] = { self, select_("#", ...), { ... }, box.now(box.ws) } end
         end
+        return box.nc(self, ...)
     end
-    if not FIRE_BODY then
-        FIRE_BODY = function(self, ...)
-            if select_("#", ...) >= 6 and box.want then
-                local l = box.list
-                if #l < 4 then l[#l + 1] = { self, select_("#", ...), { ... }, box.now(box.ws) } end
-            end
-            return box.fire(self, ...)
+    local FIRE_BODY = function(self, ...)
+        if select_("#", ...) >= 6 and box.want then
+            local l = box.list
+            if #l < 4 then l[#l + 1] = { self, select_("#", ...), { ... }, box.now(box.ws) } end
         end
+        return box.fire(self, ...)
     end
 
     local function unhook()
