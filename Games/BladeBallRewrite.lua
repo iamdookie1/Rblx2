@@ -31,7 +31,7 @@
 
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.39"
+local SCRIPT_VERSION = "rewrite-0.5.40"
 
 -- ---------------------------------------------------------------------------
 -- Single instance.
@@ -1275,12 +1275,25 @@ end]], chunk, fn, out, ...)
             end
             local uid; pcall(function() uid = uidHolder[2][uidHolder[1]] end)
             if type(uid) ~= "string" then return nil, "could not resolve uid", true end
-            local chunk; pcall(function() chunk = debug.info(v31, "s") end)
-            b = { guids = guids, hash = hash, name = name, deriver = deriver, uid = uid, net = net, chunk = chunk }
+            -- NOTE: no debug.info here. 0.5.37 read the sender's source with
+            -- debug.info(v31,"s") in this block; it is now deferred to step 2 so
+            -- GcStep=1 is getupvalues ONLY. If GcStep=1 stops kicking, debug.info
+            -- on the sender was the leak.
+            b = { guids = guids, hash = hash, name = name, deriver = deriver, uid = uid, net = net, sender = v31 }
             GC.base = b
-            GC.log(("getgc: step 2/4 -- upvalues read (name ok, %d hashes, uid ok), no game code called yet"):format(#guids))
+            GC.log(("getgc: step 1/4 -- upvalues read via getupvalues (name ok, %d hashes, uid ok); no debug.info"):format(#guids))
         end
-        if step < 2 then return nil, "stopped after step 2 (GcStep=1): upvalues only, no Net, no deriver", false end
+        if step < 2 then return nil, "stopped after step 1 (GcStep=1): getupvalues only, no debug.info, no Net, no deriver", false end
+        -- the sender's source, for the clean-thread call disguise. Deferred to
+        -- here (not in the step-1 block) and skippable with GcChunk=false: if the
+        -- Net/deriver calls land fine without it, debug.info is not needed.
+        if b.chunk == nil and not b.chunk_tried then
+            b.chunk_tried = true
+            if getgenv().GcChunk ~= false then
+                GC.log("getgc: step 2/4 -- reading sender source (debug.info) for call disguise")
+                pcall(function() b.chunk = debug.info(b.sender, "s") end)
+            end
+        end
         -- the remote: Net:RemoteEvent(name), on a clean thread; it may take a
         -- frame (Net can wait for the child), so poll the result
         GC.log("getgc: step 3/4 -- calling Net:RemoteEvent(name) on a clean thread")
