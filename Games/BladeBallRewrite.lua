@@ -31,7 +31,7 @@
 
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.35"
+local SCRIPT_VERSION = "rewrite-0.5.36"
 
 -- ---------------------------------------------------------------------------
 -- Single instance.
@@ -1067,10 +1067,9 @@ end]]
     -- remote, hash, uid and key deriver, derives the key and builds Core.cap so the
     -- normal remote send() forges tokens -- NO hook, NO key press, nothing to scan.
     --
-    -- WHICH remote/hash: the remote is the Net child the sender names (never a
-    -- RemoteEvent upvalue); the hash defaults to #2 of the sender's GUIDs, the
-    -- one calibration against a real packet picked. getgenv().GcRemoteName /
-    -- GcRemoteIdx / GcHashIdx / GcBall2 override.
+    -- WHICH remote/hash: straight from the sender's code (see forge_resolve):
+    -- Net:RemoteEvent(<name upvalue>) and the GUID right after the name.
+    -- getgenv().GcHashIdx / GcBall2 override.
     local function forge_find_pry()
         local function clean(s) return (tostring(s):gsub("[^%w]", "")) end
         local p
@@ -1091,18 +1090,6 @@ end]]
             end)
         end
         return p
-    end
-    -- Call the game's key deriver in a clean, isolated context: a fresh thread
-    -- whose frames carry no `writefile` env, so if the deriver shares the sender's
-    -- getfenv honeypot it still sees nothing of ours. (The honeypots live in the
-    -- sender, which we never call; this is belt-and-braces for the deriver.)
-    local function forge_derive(deriver, uid)
-        local keyStr
-        local body = function() keyStr = deriver(uid, "TIME") end
-        pcall(function() if setfenv then setfenv(body, setmetatable({}, { __index = function() return nil end })) end end)
-        local co = coroutine.create(function() pcall(body) end)
-        coroutine.resume(co)
-        return keyStr
     end
     -- Find the LIVE sender closure the game actually runs, via getgc(false) --
     -- functions only, NOT the heap-walking getgc(true) that crashed. Run ONCE per
@@ -1160,72 +1147,6 @@ end]]
         end)
         return nil
     end
-    -- The sleitnick Net module: the remotes Net:RemoteEvent(name) hands out are
-    -- its children. Read with GetChildren only (Net:RemoteEvent on the client
-    -- WaitForChild()s an unknown name -- it can hang the calling thread).
-    function GC.net_module()
-        local idx
-        pcall(function() idx = ReplicatedStorage.Packages._Index end)
-        if not idx then return nil end
-        for _, c in ipairs(idx:GetChildren()) do
-            if c.Name:find("sleitnick_net", 1, true) then
-                local m = c:FindFirstChild("net")
-                if m then return m end
-            end
-        end
-        return nil
-    end
-    -- SHA-256 (hex). The Net children are named "RE/<sha256 hex>" and the names
-    -- change every server, so the plain name the sender asks for never equals a
-    -- child's name -- it has to be hashed to be matched.
-    do
-        local band, bor, bxor, bnot, rrot, rshift = bit32.band, bit32.bor, bit32.bxor, bit32.bnot, bit32.rrotate, bit32.rshift
-        local K = {
-            0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
-            0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
-            0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
-            0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
-            0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
-            0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
-            0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
-            0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
-        }
-        local w = table.create(64, 0)
-        function GC.sha256(msg)
-            local len = #msg
-            msg = msg .. "\128" .. string.rep("\0", (55 - len) % 64) .. string.pack(">I8", len * 8)
-            local h0, h1, h2, h3 = 0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a
-            local h4, h5, h6, h7 = 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19
-            for p = 1, #msg, 64 do
-                for i = 1, 16 do w[i] = string.unpack(">I4", msg, p + (i - 1) * 4) end
-                for i = 17, 64 do
-                    local a, b = w[i - 15], w[i - 2]
-                    local s0 = bxor(rrot(a, 7), rrot(a, 18), rshift(a, 3))
-                    local s1 = bxor(rrot(b, 17), rrot(b, 19), rshift(b, 10))
-                    w[i] = (w[i - 16] + s0 + w[i - 7] + s1) % 4294967296
-                end
-                local a, b, c, d, e, f, g, h = h0, h1, h2, h3, h4, h5, h6, h7
-                for i = 1, 64 do
-                    local S1 = bxor(rrot(e, 6), rrot(e, 11), rrot(e, 25))
-                    local ch = bxor(band(e, f), band(bnot(e), g))
-                    local t1 = (h + S1 + ch + K[i] + w[i]) % 4294967296
-                    local S0 = bxor(rrot(a, 2), rrot(a, 13), rrot(a, 22))
-                    local maj = bxor(band(a, b), band(a, c), band(b, c))
-                    local t2 = (S0 + maj) % 4294967296
-                    h, g, f, e, d, c, b, a = g, f, e, (d + t1) % 4294967296, c, b, a, (t1 + t2) % 4294967296
-                end
-                h0, h1, h2, h3 = (h0 + a) % 4294967296, (h1 + b) % 4294967296, (h2 + c) % 4294967296, (h3 + d) % 4294967296
-                h4, h5, h6, h7 = (h4 + e) % 4294967296, (h5 + f) % 4294967296, (h6 + g) % 4294967296, (h7 + h) % 4294967296
-            end
-            return ("%08x%08x%08x%08x%08x%08x%08x%08x"):format(h0, h1, h2, h3, h4, h5, h6, h7)
-        end
-    end
-    -- The strings the sender holds: its constants and its Lua function upvalues'
-    -- constants (names), plus its string upvalues and the raw string fields of its
-    -- table upvalues (salt candidates). Crash-safe on purpose: getconstants only
-    -- on Lua closures (on a C closure it can take the client down -- 0.5.32 ran
-    -- it on every function in the Net table and crashed), tables read raw with
-    -- next (no __iter / __index into game code), and everything capped.
     function GC.is_lua(f)
         if type(f) ~= "function" then return false end
         if type(iscclosure) == "function" then
@@ -1235,180 +1156,50 @@ end]]
         local ok, src = pcall(debug.info, f, "s")
         return ok and src ~= "[C]"
     end
-    function GC.sender_strings(sender, ups)
-        local set, names, salts = {}, {}, {}
-        local function take(s, into, cap)
-            if type(s) == "string" and #s > 0 and #s <= 64 and not set[s] and #into < cap then
-                set[s] = true; into[#into + 1] = s
-            end
-        end
-        local getc = (debug and debug.getconstants) or getconstants
-        local function consts(f)
-            if type(getc) ~= "function" or not GC.is_lua(f) then return end
-            local ok, cs = pcall(getc, f)
-            if ok and type(cs) == "table" then
-                for i = 1, math.min(#cs, 256) do take(cs[i], names, 96) end
-            end
-        end
-        consts(sender)
-        for i = 1, 64 do if type(ups[i]) == "function" then consts(ups[i]) end end
-        for i = 1, 64 do
-            local v = ups[i]
-            if type(v) == "string" then take(v, salts, 24)
-            elseif type(v) == "table" then
-                pcall(function()
-                    local n, k, fv = 0, next(v)
-                    while k ~= nil and n < 64 do
-                        take(k, salts, 24); take(fv, salts, 24)
-                        n = n + 1; k, fv = next(v, k)
-                    end
-                end)
-            end
-        end
-        local all = table.clone(names)
-        for _, x in ipairs(salts) do all[#all + 1] = x end
-        return all, salts
-    end
-    -- Identify the parry remote among the Net children (run once per server, in
-    -- its own thread, time-sliced so it never stalls a frame).
+    -- The PRY sender, from Tools/Dump.txt (SwordsController.PRY, "X"):
     --
-    -- The sender asks Net for a remote by a short opaque name held as a constant
-    -- (e.g. "494kjkdf", "64565gfdd"); Net maps it to a per-server child named
-    -- "RE/<sha256>". Each candidate name is resolved, in order, by:
-    --   1. an exact child name;
-    --   2. "RE/" .. sha256 of the name alone or joined with a salt (the sender's
-    --      strings, Net.RemoteEvent's own strings, JobId / PlaceId / GameId);
-    --   3. Net's own RemoteEvent(name) -- run in a coroutine and dropped if it
-    --      would yield, so an unknown name can never hang us.
-    -- Of the names that resolve, the one on the real send path wins: the last
-    -- one before "TIME" (the key derivation) in the sender's constants; the
-    -- name next to "JobId" is the decoy report. getgenv().GcRemotePick = "<name>"
-    -- forces one. RemoteEvents held as sender upvalues are never the parry remote.
-    GC.rem = { state = nil, remote = nil, how = nil }
-    GC.WORDS = {}
-    for w in ("debug info s FireServer game JobId pcall writefile TIME workspace GetServerTimeNow math floor tostring string byte bit32 bxor char table concat random RemoteEvent UnreliableRemoteEvent Clean RemoteFunction Handle ConnectUnreliable Invoke Connect"):gmatch("%S+") do GC.WORDS[w] = true end
-    function GC.find_remote(sender, ups, net_mod, net_tbl)
-        GC.rem.state = "running"
-        task.spawn(function()
-            local skip = {}
-            for i = 1, 64 do if typeof(ups[i]) == "Instance" then skip[ups[i]] = true end end
-            local byName, byHex, count = {}, {}, 0
-            for _, c in ipairs(net_mod:GetChildren()) do
-                if c.ClassName == "RemoteEvent" and not skip[c] then
-                    count = count + 1
-                    byName[c.Name] = c
-                    local hex = c.Name:match("^RE/(%x+)$")
-                    if hex then byHex[hex:lower()] = c end
-                end
-            end
-            local all, salts = GC.sender_strings(sender, ups)
-            -- candidate names: the sender's opaque identifier-like constants
-            local cands = {}
-            for _, s in ipairs(all) do
-                if not GC.WORDS[s] and s:match("^%w+$") and #s >= 4 and #s <= 24 and s:find("%d") and s:find("%a") then
-                    cands[#cands + 1] = s
-                end
-            end
-            -- more salts: Net.RemoteEvent's own strings + server identity
-            local netfn
-            pcall(function() netfn = rawget(net_tbl, "RemoteEvent") or net_tbl.RemoteEvent end)
-            local extra = {}
-            if type(netfn) == "function" then
-                local getups = reflect_getups()
-                local nups = {}
-                if type(getups) == "function" then local ok, u = pcall(getups, netfn); if ok and type(u) == "table" then nups = u end end
-                local nstr = GC.sender_strings(netfn, nups)
-                for _, x in ipairs(nstr) do extra[#extra + 1] = x end
-            end
-            pcall(function() extra[#extra + 1] = game.JobId end)
-            pcall(function() extra[#extra + 1] = tostring(game.PlaceId) end)
-            pcall(function() extra[#extra + 1] = tostring(game.GameId) end)
-            local saltset = {}
-            for _, x in ipairs(salts) do saltset[x] = true end
-            for _, x in ipairs(extra) do if not saltset[x] and #salts < 48 then saltset[x] = true; salts[#salts + 1] = x end end
-            local t0 = os.clock()
-            local function hit(m)
-                local c = byHex[GC.sha256(m)]
-                if os.clock() - t0 > 0.004 then task.wait(); t0 = os.clock() end
-                return c
-            end
-            local resolved = {}
-            for _, name in ipairs(cands) do
-                if not is_live() then break end
-                local c, how = byName[name], "exact name"
-                if not c and next(byHex) then
-                    c = hit(name); how = "sha256(name)"
-                    if not c then
-                        for _, t in ipairs(salts) do
-                            for _, sep in ipairs({ "", "/", ":", "_", "-", "." }) do
-                                c = hit(name .. sep .. t)
-                                if c then how = ("sha256(name..'%s'..salt#%d)"):format(sep, #t); break end
-                                c = hit(t .. sep .. name)
-                                if c then how = ("sha256(salt#%d..'%s'..name)"):format(#t, sep); break end
-                            end
-                            if c then break end
-                        end
-                    end
-                end
-                if not c and type(netfn) == "function" then
-                    -- Net's own lookup: kept only if it returns without yielding
-                    local co = coroutine.create(function() return netfn(net_tbl, name) end)
-                    local ok, r = coroutine.resume(co)
-                    if ok and coroutine.status(co) == "dead" and typeof(r) == "Instance" and r:IsA("RemoteEvent") and not skip[r] then
-                        c, how = r, "Net:RemoteEvent"
-                    end
-                end
-                if c then resolved[#resolved + 1] = { name = name, remote = c, how = how } end
-            end
-            -- pick the one on the real send path
-            local pick
-            local forced = getgenv().GcRemotePick
-            for _, r in ipairs(resolved) do if r.name == forced then pick = r end end
-            if not pick and #resolved > 0 then
-                local order = {}
-                for i, s in ipairs(all) do order[s] = order[s] or i end
-                local tIdx = order["TIME"] or math.huge
-                for _, r in ipairs(resolved) do
-                    local i = order[r.name] or 0
-                    if i < tIdx and (not pick or i > (order[pick.name] or 0)) then pick = r end
-                end
-                pick = pick or resolved[#resolved]
-            end
-            local list = {}
-            for i, r in ipairs(resolved) do list[i] = ("%s->%s via %s"):format(r.name, r.remote.Name:sub(1, 12), r.how) end
-            if pick then
-                GC.rem.remote, GC.rem.how = pick.remote, ("'%s' (%s)"):format(pick.name, pick.how)
-                GC.rem.state = "found"
-                logp(("getgc: parry remote '%s' = name '%s' via %s; all resolved: %s"):format(
-                    pick.remote.Name, pick.name, pick.how, table.concat(list, ", ")))
-            else
-                GC.rem.state = "failed"
-                local hx = 0; for _ in pairs(byHex) do hx = hx + 1 end
-                logp(("getgc: parry remote NOT identified -- %d Net remotes (%d RE/ hashed), candidates: %s; Net.RemoteEvent is %s"):format(
-                    count, hx, table.concat(cands, ", "), type(netfn) == "function" and (GC.is_lua(netfn) and "Lua" or "C") or "missing"))
-                local show = {}
-                for i = 1, math.min(#extra, 30) do
-                    local s = extra[i]
-                    show[i] = (#s > 24) and (s:sub(1, 24) .. "..(" .. #s .. ")") or s
-                end
-                logp("getgc: Net.RemoteEvent strings: " .. table.concat(show, " | "))
-                -- the non-RE/ children (first few names) for the next fix
-                local other = {}
-                for _, c in ipairs(net_mod:GetChildren()) do
-                    if c.ClassName == "RemoteEvent" and not c.Name:match("^RE/%x+$") then
-                        other[#other + 1] = c.Name:sub(1, 20); if #other >= 6 then break end
-                    end
-                end
-                logp("getgc: other Net remote names: " .. table.concat(other, " | "))
-            end
-        end)
+    --   if debug.info(debug.info, "s") ~= "[C]" then v663:FireServer(JobId, "494kjkdf", ...) end  -- kick report
+    --   for i = 1, 10 do if getfenv(i).writefile then v661:FireServer(JobId, "64565gfdd", ...) end end -- kick report
+    --   key = v658(uid, "TIME"); token[i] = char(bxor((byte(text, i) + i) % 256, byte(key, (i-1) % #key + 1)))
+    --   Net:RemoteEvent(v662):FireServer(v660, uid, token, ...)          -- THE parry
+    --
+    -- Its upvalues, in order: v663 decoy remote, v661 decoy remote, v667 uid
+    -- holder, v658 key deriver, v666 decoy hash, v659 Net, v662 remote NAME (the
+    -- only non-GUID string), v660 REAL hash (the GUID right after the name), v665
+    -- decoy hash. Net turns the name into a per-server "RE/<sha256>" child with a
+    -- server salt, so it can't be computed -- the remote is obtained exactly as
+    -- the game does it: Net:RemoteEvent(name).
+    --
+    -- Every call into game code (Net, the deriver) runs on its own thread whose
+    -- only frame is a clean function: compiled under Net's chunk name, in a clean
+    -- game env with no writefile. If those functions ever walk the stack like the
+    -- sender does (getfenv(i).writefile / debug.info) they see nothing of ours.
+    function GC.clean_call(fn, ...)
+        -- no pcall in the body: a C frame between them could expose the
+        -- thread's globals to a getfenv walk. An error just ends the thread
+        -- with done = false, which the caller times out.
+        local out = { done = false, at = clock_() }
+        local body = build_body([[
+local fn, out, a, b, c = ...
+return function()
+    out.r = fn(a, b, c)
+    out.ok, out.done = true, true
+end]], fn, out, ...)
+        if not body then return nil, "clean body unavailable" end
+        task.spawn(body)
+        return out
     end
-    -- Read the LIVE sender ONCE per session (index order, deterministic): hash
-    -- GUIDs, the key deriver, the uid and the parry remote. Read-only. Cached:
-    -- 0.5.30 re-read everything (getupvalues, a 600-node Net dig, the deriver)
-    -- on every miss and every spam tick, piling up until the game crashed.
+    local function forge_derive(deriver, uid)
+        local out = GC.clean_call(deriver, uid, "TIME")
+        if out and out.done and out.ok and type(out.r) == "string" then return out.r end
+        return nil
+    end
+    -- Read the sender ONCE per session (upvalue index order, deterministic).
+    -- Read-only; the remote comes from Net:RemoteEvent(name) once per server.
+    GC.rem = { out = nil, name = nil }
     local function forge_resolve()
         if GC.res and GC.res.remote.Parent then return GC.res end
+        GC.res = nil
         local b = GC.base
         if not b then
             local getups = reflect_getups()
@@ -1428,13 +1219,17 @@ end]]
             if type(v31) ~= "function" then return nil, "sender not found (getgc + require(PRY) both failed)", true end
             local ok2, ups = pcall(getups, v31)
             if not ok2 or type(ups) ~= "table" then return nil, "getupvalues(sender) failed", true end
-            local guids, deriver, uidHolder, net_tbl = {}, nil, nil, nil
+            local guids, deriver, uidHolder, net, name, hash = {}, nil, nil, nil, nil, nil
             for i = 1, 64 do
                 local v = ups[i]
                 if v ~= nil then
-                    if type(v) == "string" and #v == 36 then guids[#guids + 1] = v
+                    if type(v) == "string" then
+                        if #v == 36 then
+                            guids[#guids + 1] = v
+                            if name and not hash then hash = v end -- the GUID right after the name
+                        elseif not name then name = v end
                     elseif type(v) == "function" and not deriver then deriver = v
-                    elseif reflect_isNet(v) then net_tbl = net_tbl or v
+                    elseif reflect_isNet(v) then net = net or v
                     elseif typeof(v) == "table" and not uidHolder then
                         local shaped = false
                         pcall(function() shaped = v[1] ~= nil and type(v[2]) == "table" end)
@@ -1442,39 +1237,42 @@ end]]
                     end
                 end
             end
-            if #guids == 0 or not deriver or not uidHolder then
-                return nil, ("incomplete (hashes %d, deriver %s, uid-holder %s)"):format(
-                    #guids, tostring(deriver ~= nil), tostring(uidHolder ~= nil)), true
+            if not (name and hash and deriver and uidHolder and net) then
+                return nil, ("incomplete (name %s, hash %s, deriver %s, uid-holder %s, net %s)"):format(
+                    tostring(name ~= nil), tostring(hash ~= nil), tostring(deriver ~= nil),
+                    tostring(uidHolder ~= nil), tostring(net ~= nil)), true
             end
             local uid; pcall(function() uid = uidHolder[2][uidHolder[1]] end)
             if type(uid) ~= "string" then return nil, "could not resolve uid", true end
-            b = { sender = v31, ups = ups, guids = guids, deriver = deriver, uid = uid, net_tbl = net_tbl }
+            b = { guids = guids, hash = hash, name = name, deriver = deriver, uid = uid, net = net }
             GC.base = b
         end
-        local net = GC.net_module()
-        if not net then return nil, "Net module not found", true end
-        local custom = getgenv().GcRemoteName
-        local remote, how
-        if type(custom) == "string" then
-            remote = net:FindFirstChild(custom)
-            how = "GcRemoteName"
-            if not (remote and remote.ClassName == "RemoteEvent") then return nil, "GcRemoteName '" .. custom .. "' not found under Net", true end
-        else
-            if GC.rem.state == nil or (GC.rem.state == "found" and not (GC.rem.remote and GC.rem.remote.Parent)) then
-                GC.find_remote(b.sender, b.ups, net, b.net_tbl)
-            end
-            if GC.rem.state == "running" then return nil, "identifying the parry remote...", false end
-            if GC.rem.state ~= "found" then return nil, "parry remote not identified (sent the diagnostics above)", true end
-            remote, how = GC.rem.remote, GC.rem.how
+        -- the remote: Net:RemoteEvent(name), on a clean thread; it may take a
+        -- frame (Net can wait for the child), so poll the result
+        local o = GC.rem.out
+        if not o or (o.done and not (o.ok and typeof(o.r) == "Instance" and o.r.Parent)) then
+            local m; pcall(function() m = b.net.RemoteEvent end)
+            if type(m) ~= "function" then return nil, "Net.RemoteEvent missing", true end
+            o = GC.clean_call(m, b.net, b.name)
+            if not o then return nil, "could not build a clean caller (no loadstring?)", true end
+            GC.rem.out = o
         end
-        GC.res = { guids = b.guids, deriver = b.deriver, uid = b.uid, remote = remote, how = how }
+        if not o.done then
+            if clock_() - o.at < 3 then return nil, "asking Net for the parry remote...", false end
+            GC.rem.out = nil
+            return nil, "Net:RemoteEvent(name) never returned", true
+        end
+        if not (o.ok and typeof(o.r) == "Instance" and o.r:IsA("RemoteEvent")) then
+            GC.rem.out = nil
+            return nil, "Net:RemoteEvent(name) failed: " .. tostring(o.r), true
+        end
+        GC.res = { guids = b.guids, hash = b.hash, deriver = b.deriver, uid = b.uid, remote = o.r }
         return GC.res
     end
     -- THE getgc CAPTURE METHOD (CaptureHook = "getgc"). Build Core.cap from the
     -- live sender by reflection -- no FireServer/__namecall hook, no key press.
     -- Resolution happens once; after that this only rebuilds Core.cap from the
-    -- cache. Hash defaults to #2 (what calibration against a real packet
-    -- picked); getgenv().GcHashIdx / GcRemoteName / GcBall2 tune it.
+    -- cache. getgenv().GcHashIdx / GcBall2 override the hash / packet shape.
     local gc_fail_at = -math.huge
     function GC.log(msg) if msg ~= GC.last_msg then GC.last_msg = msg; logp(msg) end end
     local function gc_capture()
@@ -1494,15 +1292,17 @@ end]]
             r.key = keyStr
         end
         local keyStr = r.key
-        local hi = math.clamp(tonumber(getgenv().GcHashIdx) or 2, 1, #r.guids)
+        local hi = tonumber(getgenv().GcHashIdx)
+        local hash = hi and r.guids[math.clamp(hi, 1, #r.guids)] or r.hash
         local text = tostring(math.floor(Workspace:GetServerTimeNow() * 100))
         local key = table.create(#text)
         for i = 1, #text do key[i] = string.byte(keyStr, (i - 1) % #keyStr + 1) end
-        Core.cap = { remote = r.remote, hash = r.guids[hi], uid = r.uid, key = key, len = #text,
+        Core.cap = { remote = r.remote, hash = hash, uid = r.uid, key = key, len = #text,
             ball2 = getgenv().GcBall2 and true or false }
         Core.misses, Core.pending = 0, nil
-        GC.log(("getgc: cap set (no hook) -- remote '%s' via %s, hash #%d/%d, key %d, ball2 %s"):format(
-            r.remote.Name, tostring(r.how), hi, #r.guids, #keyStr, tostring(Core.cap.ball2)))
+        local hn = 0; for i, g in ipairs(r.guids) do if g == hash then hn = i end end
+        GC.log(("getgc: cap set (no hook) -- remote '%s' via Net:RemoteEvent, hash #%d/%d, key %d, ball2 %s"):format(
+            r.remote.Name, hn, #r.guids, #keyStr, tostring(Core.cap.ball2)))
         return true
     end
 
@@ -2992,7 +2792,7 @@ AP:AddDropdown("TargetMode", {
 })
 AP:AddDropdown("CaptureHook", {
     Values = { "getgc", "Namecall", "FireServer", "Both" }, Default = "Both", Text = "Capture hook",
-    Tooltip = "How the parry capture is obtained. Namecall/FireServer/Both briefly hook to catch a real press. 'getgc' uses NO hook and NO press: it reads the game's live sender (getgc) and builds the capture by reflection. If getgc parries don't land, tune getgenv().GcRemoteIdx (1..n), GcHashIdx (1..n), GcBall2 (true/false).",
+    Tooltip = "How the parry capture is obtained. Namecall/FireServer/Both briefly hook to catch a real press. 'getgc' uses NO hook and NO press: it reads the game's live sender (getgc) and builds the capture by reflection. The remote and hash come straight from the sender's code; getgenv().GcHashIdx / GcBall2 override.",
     Callback = function(v) getgenv().CaptureHook = v end,
 })
 AP:AddButton({
