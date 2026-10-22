@@ -31,7 +31,7 @@
 
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.49"
+local SCRIPT_VERSION = "rewrite-0.5.50"
 
 -- ---------------------------------------------------------------------------
 -- Single instance.
@@ -300,9 +300,8 @@ do
         auto_ability = false, cooldown_protection = false,
     }
     local SP = {
-        manual = false, auto = false, mode = "Remote", max_rate = 1000, upload_kbps = 0,
+        manual = false, auto = false, mode = "Remote", max_rate = 1000,
         smart = true, range_bonus = 0, hold = 0.15, sensitivity = 1.3, predictive = true,
-        factor = 1, guard_at = -1,
     }
     -- detection state (written by the detection features, read here)
     local Det = { infinity = false, deathslash = false, timehole = false, slashes = false, phantom_until = 0 }
@@ -1774,16 +1773,6 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         end
         return false
     end
-    local function upload_factor(now)
-        if SP.upload_kbps <= 0 then SP.factor = 1; return 1 end
-        if now - SP.guard_at < 0.1 then return SP.factor end
-        SP.guard_at = now
-        local ok, kbps = pcall(function() return Stats.DataSendKbps end)
-        if ok and type(kbps) == 'number' and kbps > 0 then
-            SP.factor = math.clamp(SP.factor * math.clamp(SP.upload_kbps / kbps, 0.5, 1.15), 0.1, 1)
-        end
-        return SP.factor
-    end
     local function fire_one()
         if Pump.fired_frame ~= Pump.frame then Pump.fired_frame, Pump.frame_fires = Pump.frame, 0 end
         if SP.mode == "Keypress" and Pump.frame_fires >= 1 then return false end
@@ -1831,7 +1820,8 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         -- Smart stop: manual spam holds fire while nothing is a threat
         if source == "manual" and SP.smart and not focus then Pump.credit, Pump.on, Pump.waiting = 0, false, true; return end
         Pump.waiting = false
-        local rate = math.clamp(SP.max_rate or 1000, 1, 2000) * upload_factor(now)
+        -- the rate is EXACTLY the slider value (20-2000/s), no network throttle.
+        local rate = math.clamp(SP.max_rate or 1000, 1, 2000)
         if SP.mode == "Keypress" then rate = math.min(rate, 1 / frame_dt) end
         rate = math.max(rate, 1)
         local cap = 1 + rate * math.max(frame_dt * 2.2, 0.05)
@@ -3020,11 +3010,6 @@ MS:AddSlider("SpamMaxRate", {
     Text = "Rate", Default = 1000, Min = 20, Max = 2000, Rounding = 0, Suffix = "/s",
     Tooltip = "Parries a second for manual and auto spam. The actual rate is held at this value at any FPS.",
     Callback = function(v) SP.max_rate = v end,
-})
-MS:AddSlider("SpamUploadLimit", {
-    Text = "Upload limit", Default = 0, Min = 0, Max = 1500, Rounding = 0, Suffix = " kbps",
-    Tooltip = "0 = off. Set ~200-400 if spam makes your movement rubber-band.",
-    Callback = function(v) SP.upload_kbps = v end,
 })
 local SpamRateLabel = MS:AddLabel("Actual: 0/s", true)
 
