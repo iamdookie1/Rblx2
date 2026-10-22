@@ -31,7 +31,7 @@
 
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.36"
+local SCRIPT_VERSION = "rewrite-0.5.37"
 
 -- ---------------------------------------------------------------------------
 -- Single instance.
@@ -735,17 +735,17 @@ end]]
         local ok, renv = pcall(function() return getrenv and getrenv() end)
         CLEAN_ENV = (ok and type(renv) == 'table' and renv.writefile == nil) and setmetatable({}, { __index = renv }) or {}
     end
-    local function build_body(src, ...)
+    local function build_body(src, chunk, ...)
         local args = table.pack(...)
         local ok, fn = pcall(function()
-            local factory = loadstring(src, HOOK_NAME)
+            local factory = loadstring(src, chunk or HOOK_NAME)
             if setfenv then setfenv(factory, CLEAN_ENV) end
             return factory(table.unpack(args, 1, args.n))
         end)
         return ok and type(fn) == 'function' and fn or nil
     end
-    local NC_BODY = build_body(NC_SRC, box, getnamecallmethod_ or function() return nil end, select)
-    local FIRE_BODY = build_body(FIRE_SRC, box, select)
+    local NC_BODY = build_body(NC_SRC, HOOK_NAME, box, getnamecallmethod_ or function() return nil end, select)
+    local FIRE_BODY = build_body(FIRE_SRC, HOOK_NAME, box, select)
     Core.isolated = NC_BODY ~= nil and FIRE_BODY ~= nil
     -- No loadstring on this executor: same bodies, just not disguised.
     if not NC_BODY then
@@ -1174,23 +1174,25 @@ end]]
     -- only frame is a clean function: compiled under Net's chunk name, in a clean
     -- game env with no writefile. If those functions ever walk the stack like the
     -- sender does (getfenv(i).writefile / debug.info) they see nothing of ours.
-    function GC.clean_call(fn, ...)
+    function GC.clean_call(fn, chunk, ...)
         -- no pcall in the body: a C frame between them could expose the
         -- thread's globals to a getfenv walk. An error just ends the thread
-        -- with done = false, which the caller times out.
+        -- with done = false, which the caller times out. chunk is the source
+        -- name our frame reports (debug.info(.,"s")): the sender's own source,
+        -- so a caller-check inside fn sees the game path it expects, not ours.
         local out = { done = false, at = clock_() }
         local body = build_body([[
 local fn, out, a, b, c = ...
 return function()
     out.r = fn(a, b, c)
     out.ok, out.done = true, true
-end]], fn, out, ...)
+end]], chunk, fn, out, ...)
         if not body then return nil, "clean body unavailable" end
         task.spawn(body)
         return out
     end
-    local function forge_derive(deriver, uid)
-        local out = GC.clean_call(deriver, uid, "TIME")
+    local function forge_derive(deriver, uid, chunk)
+        local out = GC.clean_call(deriver, chunk, uid, "TIME")
         if out and out.done and out.ok and type(out.r) == "string" then return out.r end
         return nil
     end
@@ -1244,7 +1246,8 @@ end]], fn, out, ...)
             end
             local uid; pcall(function() uid = uidHolder[2][uidHolder[1]] end)
             if type(uid) ~= "string" then return nil, "could not resolve uid", true end
-            b = { guids = guids, hash = hash, name = name, deriver = deriver, uid = uid, net = net }
+            local chunk; pcall(function() chunk = debug.info(v31, "s") end)
+            b = { guids = guids, hash = hash, name = name, deriver = deriver, uid = uid, net = net, chunk = chunk }
             GC.base = b
         end
         -- the remote: Net:RemoteEvent(name), on a clean thread; it may take a
@@ -1253,7 +1256,7 @@ end]], fn, out, ...)
         if not o or (o.done and not (o.ok and typeof(o.r) == "Instance" and o.r.Parent)) then
             local m; pcall(function() m = b.net.RemoteEvent end)
             if type(m) ~= "function" then return nil, "Net.RemoteEvent missing", true end
-            o = GC.clean_call(m, b.net, b.name)
+            o = GC.clean_call(m, b.chunk, b.net, b.name)
             if not o then return nil, "could not build a clean caller (no loadstring?)", true end
             GC.rem.out = o
         end
@@ -1266,7 +1269,7 @@ end]], fn, out, ...)
             GC.rem.out = nil
             return nil, "Net:RemoteEvent(name) failed: " .. tostring(o.r), true
         end
-        GC.res = { guids = b.guids, hash = b.hash, deriver = b.deriver, uid = b.uid, remote = o.r }
+        GC.res = { guids = b.guids, hash = b.hash, deriver = b.deriver, uid = b.uid, remote = o.r, chunk = b.chunk }
         return GC.res
     end
     -- THE getgc CAPTURE METHOD (CaptureHook = "getgc"). Build Core.cap from the
@@ -1285,7 +1288,7 @@ end]], fn, out, ...)
             GC.log("getgc: " .. tostring(err)); return false
         end
         if not r.key then
-            local keyStr = forge_derive(r.deriver, r.uid)
+            local keyStr = forge_derive(r.deriver, r.uid, r.chunk)
             if type(keyStr) ~= "string" or #keyStr == 0 then
                 GC.res, GC.base = nil, nil; gc_fail_at = clock_(); GC.log("getgc: key derivation returned nothing"); return false
             end
