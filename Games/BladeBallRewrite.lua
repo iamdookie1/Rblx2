@@ -31,7 +31,7 @@
 
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.38"
+local SCRIPT_VERSION = "rewrite-0.5.39"
 
 -- ---------------------------------------------------------------------------
 -- Single instance.
@@ -1202,34 +1202,52 @@ end]], chunk, fn, out, ...)
     -- Each step is logged (the log is written to file, so the LAST line before a
     -- kick names the step that tripped it) and gated by getgenv().GcStep:
     --   nil/3 = full (sender -> upvalues -> Net -> deriver, the normal path)
+    --     0.5 = stop right after acquiring the sender (no getupvalues, no
+    --           debug.info, no game code) -- isolates HOW we get the sender
     --       1 = stop after reading the sender's upvalues (no Net, no deriver)
     --       2 = also call Net, but stop before the deriver
-    -- Set GcStep = 1, rejoin: if it still kicks, the leak is getgc/require/
-    -- getupvalues itself. GcStep = 2 kicks but 1 doesn't -> the Net call.
-    -- Full kicks but 2 doesn't -> the deriver.
+    --
+    -- HOW the sender is acquired is getgenv().GcSender:
+    --   nil/"auto" = already-found getgc sender, else require(PRY), else getgc scan
+    --   "getgc"    = ONLY the getgc(false) scan -- never calls require
+    --   "require"  = ONLY require(PRY)
+    -- GcStep=1 kicks with nothing but the sender + upvalues read, so the leak is
+    -- in acquisition. Blade Ball hooks require and checks the caller, so a
+    -- non-game require(PRY) is a known kick. Test: GcSender="getgc", GcStep=0.5
+    -- (pure memory read, no require) -- if that survives, we never require again.
     GC.rem = { out = nil, name = nil }
     local function forge_resolve()
         if GC.res and GC.res.remote.Parent then return GC.res end
         GC.res = nil
         local step = tonumber(getgenv().GcStep) or 3
+        local want = getgenv().GcSender or "auto"
         local b = GC.base
         if not b then
             local getups = reflect_getups()
             if type(getups) ~= "function" then return nil, "getupvalues unavailable", true end
-            -- the sender is what the (already loaded) PRY module returned: read
-            -- that first -- instant, no heap scan. The getgc scan only runs if
-            -- the module can't be read.
-            local v31, src = gc_scan.sender, "getgc"
-            if type(v31) ~= "function" then
+            -- Acquire the sender. Prefer a getgc sender already found (no new
+            -- work, no require). require(PRY) is a game call Blade Ball can trap,
+            -- so it is used only when allowed and only if getgc has not found it.
+            local v31, src
+            if type(gc_scan.sender) == "function" then v31, src = gc_scan.sender, "getgc" end
+            if not v31 and want ~= "require" then
+                v31 = forge_gc_sender(getups)   -- starts/continues the getgc scan
+                if type(v31) == "function" then src = "getgc" end
+                if not v31 and want == "getgc" and not gc_scan.done then
+                    return nil, "scanning for the PRY sender (getgc only, no require)...", false
+                end
+            end
+            if not v31 and want ~= "getgc" then
                 local pry = forge_find_pry()
                 if pry then local ok, m = pcall(require, pry); if ok and type(m) == "function" then v31, src = m, "require(PRY)" end end
             end
             if type(v31) ~= "function" then
-                v31 = forge_gc_sender(getups)
-                if type(v31) ~= "function" and not gc_scan.done then return nil, "scanning for the PRY sender...", false end
+                if not gc_scan.done and want ~= "require" then return nil, "scanning for the PRY sender...", false end
+                return nil, "sender not found (sender=" .. want .. ")", true
             end
-            if type(v31) ~= "function" then return nil, "sender not found (getgc + require(PRY) both failed)", true end
-            GC.log("getgc: step 1/4 -- sender acquired via " .. src .. ", reading upvalues")
+            GC.log("getgc: step 1a -- sender acquired via " .. src)
+            if step < 1 then return nil, "stopped after acquiring the sender (GcStep<1): no getupvalues, no game code", false end
+            GC.log("getgc: step 1b -- reading upvalues (getupvalues)")
             local ok2, ups = pcall(getups, v31)
             if not ok2 or type(ups) ~= "table" then return nil, "getupvalues(sender) failed", true end
             local guids, deriver, uidHolder, net, name, hash = {}, nil, nil, nil, nil, nil
