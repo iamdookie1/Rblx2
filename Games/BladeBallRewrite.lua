@@ -31,7 +31,7 @@
 
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.50"
+local SCRIPT_VERSION = "rewrite-0.5.51"
 
 -- ---------------------------------------------------------------------------
 -- Single instance.
@@ -292,7 +292,7 @@ do
     local S = {
         autoparry = false, triggerbot = false, parry_mode = "Remote",
         preparry = false, preparry_range = 20, hp_preparry = false,
-        anticurve = "Smart", dot_threshold = 0.5, curve_bias = 0.5,
+        anticurve = "Smart", dot_threshold = 0.5, curve_bias = 0.5, close_anticurve = true, close_range = 30,
         accuracy = 50, accuracy_base = 50, divisor_multiplier = 1.1, timing_mult = 1,
         extra_distance = 0, ping_compensation = false, retry_delay = 1,
         random_accuracy = false, random_accuracy_amount = 10,
@@ -1813,24 +1813,29 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         local elapsed = math.min(now - Pump.last, 0.25)
         Pump.last = now
         local span = now - SpamMeter.since
-        if span >= 0.5 then SpamMeter.rate, SpamMeter.count, SpamMeter.since = SpamMeter.count / span, 0, now end
+        if span >= 1 then SpamMeter.rate, SpamMeter.count, SpamMeter.since = SpamMeter.count / span, 0, now end
         local source = current_source(now)
-        if not source or not LocalPlayer.Character then Pump.credit, Pump.on, Pump.waiting = 0, false, false; return end
+        if not source or not LocalPlayer.Character then Pump.on, Pump.waiting = false, false; return end
         local focus = spam_focus()
         -- Smart stop: manual spam holds fire while nothing is a threat
-        if source == "manual" and SP.smart and not focus then Pump.credit, Pump.on, Pump.waiting = 0, false, true; return end
+        if source == "manual" and SP.smart and not focus then Pump.on, Pump.waiting = false, true; return end
         Pump.waiting = false
         -- the rate is EXACTLY the slider value (20-2000/s), no network throttle.
         local rate = math.clamp(SP.max_rate or 1000, 1, 2000)
         if SP.mode == "Keypress" then rate = math.min(rate, 1 / frame_dt) end
         rate = math.max(rate, 1)
-        local cap = 1 + rate * math.max(frame_dt * 2.2, 0.05)
-        if Pump.on then Pump.credit = math.min(Pump.credit + elapsed * rate, cap)
-        else Pump.credit, Pump.on = 1, true end
+        -- STRICT time bucket: the number allowed so far is rate x (time since the
+        -- bucket started); fire until sent reaches it, so the average is exactly
+        -- the slider at any FPS (a long frame pays exactly what it owes). When a
+        -- fire is blocked (stunned, respawn, no capture), the owed backlog is
+        -- forgiven -- the start slides to now -- so it never bursts over the rate
+        -- once it can fire again.
+        if not Pump.on or Pump.rate ~= rate then Pump.on, Pump.rate, Pump.t0, Pump.sent = true, rate, now, 0 end
+        local allowed = math.floor((now - Pump.t0) * rate) + 1
         local sent = false
-        while Pump.credit >= 1 - 1e-6 do
-            if not fire_one() then break end -- can't go right now: keep the credit
-            Pump.credit = Pump.credit - 1
+        while Pump.sent < allowed do
+            if not fire_one() then Pump.t0 = now - (Pump.sent - 1) / rate; break end
+            Pump.sent = Pump.sent + 1
             sent = true
         end
         -- one animation call per tick, through the held-key gate, and only for
@@ -1843,10 +1848,14 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         local source = current_source(clock_())
         if not source or not LocalPlayer.Character then return end
         if source == "manual" and SP.smart and not spam_focus() then return end
-        Pump.on = true
-        -- borrowed from the next tick's credit, so the average stays on target
+        -- counted against the same bucket (at most one ahead of it), so instant
+        -- fires on retarget / parry success never push the average over the slider
+        local now = clock_()
+        local rate = math.max(math.clamp(SP.max_rate or 1000, 1, 2000), 1)
+        if not Pump.on or Pump.rate ~= rate then Pump.on, Pump.rate, Pump.t0, Pump.sent = true, rate, now, 0 end
+        if Pump.sent > math.floor((now - Pump.t0) * rate) + 1 then return end
         if fire_one() then
-            Pump.credit = math.max(Pump.credit - 1, -1)
+            Pump.sent = Pump.sent + 1
             if Pump.remote_sent then Anim.spamBlock() end
         end
         Pump.remote_sent = false
@@ -1954,11 +1963,32 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
             -- Its velocity may still be the pre-flip one, so eta is the simple
             -- distance/speed with a +20% penalty when it still reads as flying
             -- away. This commits a frame or two earlier than the estimator path.
-            local eta = dist / speed * (heading < 0 and 1.2 or 1)
+            -- The ball homes to its target, so it WILL turn to us: fire off the
+            -- event itself, whatever it reads now. Its velocity is still the
+            -- pre-flip one, so pad the path for the turn it has to make (straight
+            -- in: x1.0, side-on: x1.3, full reversal: x1.6) -- over-estimating only
+            -- delays us to the next frame point, under-estimating would fire early.
+            local eta = rem / speed * (1 + 0.3 * (1 - heading))
             info.eta = eta
-            if eta <= lead and heading >= 0 then return fire(st, now, "instant retarget", info, ball) end
-            return
+            if eta <= lead then return fire(st, now, "instant retarget", info, ball) end
+            -- not yet: fall through to the close-range check / next frame point
         end
+        -- CLOSE-RANGE ANTI-CURVE: a ball curved at us from close range reads
+        -- side-on (low heading), so the estimators below can call it "away" and
+        -- hold until it hits. Inside close range, anything not clearly flying away
+        -- is taken as incoming: arrival = remaining distance over speed, padded
+        -- for the arc it still has to bend through (x1 straight .. x1.4 side-on).
+        if S.close_anticurve and heading > -0.5 then
+            local close = math.max(S.close_range or 30, speed * 0.22)
+            if dist <= close then
+                local eta_c = rem / speed * (1 + 0.4 * (1 - math.max(heading, 0)))
+                if eta_c <= lead then
+                    info.eta = eta_c
+                    return fire(st, now, via == "retarget" and "instant retarget" or "close anti-curve", info, ball)
+                end
+            end
+        end
+        if via == "retarget" then return end
         local mode = S.anticurve
         local eta = straight
         if mode == "Off" then
@@ -2765,6 +2795,16 @@ AP:AddSlider("CurveBias", {
     Text = "Curve early bias", Default = 50, Min = 0, Max = 100, Rounding = 0, Suffix = "%",
     Tooltip = "Smart mode: how much earlier to parry a curving ball (inside the window, early is safe).",
     Callback = function(v) S.curve_bias = v / 100 end,
+})
+AP:AddToggle("CloseAntiCurve", {
+    Text = "Close-range anti curve", Default = true,
+    Tooltip = "Inside close range, a ball curved at you (reads side-on) is treated as incoming and parried on time instead of held until it hits.",
+    Callback = function(v) S.close_anticurve = v end,
+})
+AP:AddSlider("CloseRange", {
+    Text = "Close range", Default = 30, Min = 10, Max = 60, Rounding = 0, Suffix = " studs",
+    Tooltip = "Distance inside which close-range anti curve applies (grows with ball speed).",
+    Callback = function(v) S.close_range = v end,
 })
 AP:AddSlider("DotThreshold", {
     Text = "Dot threshold", Default = 0.5, Min = -0.2, Max = 0.95, Rounding = 2,
