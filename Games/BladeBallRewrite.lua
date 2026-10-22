@@ -31,7 +31,7 @@
 
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.43"
+local SCRIPT_VERSION = "rewrite-0.5.44"
 
 -- ---------------------------------------------------------------------------
 -- Single instance.
@@ -1780,8 +1780,9 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
             Capture.last_spam_key = clock_()
             if gc_acquire() then ok = send(true) == "sent"; remote = ok end
         elseif not Core.cap then
-            -- no capture yet: a native press (it parries by itself) that also
-            -- captures, at most one per 0.3s until the packet is in
+            -- no capture yet. Default: wait for the player's own real parry (no
+            -- synthetic press). CaptureInject bootstraps with a native press.
+            if not getgenv().CaptureInject then return false end
             if clock_() - Capture.last_spam_key < 0.3 then return false end
             Capture.last_spam_key = clock_()
             ok = key_parry(true)
@@ -1869,11 +1870,17 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
             if not Core.cap then pcall(gc_acquire) end
             if not Core.cap then return false end
         end
+        -- Wait-for-your-parry hook capture (the default): never synthesize a press
+        -- to capture or refresh -- forge only once the player's own parry has been
+        -- read. With no key yet, do nothing and let prime_capture read the next
+        -- real block. getgenv().CaptureInject restores the synthetic bootstrap.
+        local hookmode = capture_method() ~= "getgc" and S.parry_mode ~= "Keypress"
+        if hookmode and not getgenv().CaptureInject and not Core.cap then return false end
         -- no capture yet, or the last remote parry went unanswered (the capture
         -- may be stale): this parry is a native press, which parries by itself
-        -- and takes / refreshes the capture on the way. getgc never goes "fresh"
-        -- (it has no key/capture to refresh -- it calls the game's own sender).
-        local fresh = S.parry_mode ~= "Keypress" and capture_method() ~= "getgc" and (not Core.cap or Core.misses >= 1)
+        -- and takes / refreshes the capture on the way. Only with CaptureInject;
+        -- getgc never goes "fresh" (it calls the game's own sender).
+        local fresh = hookmode and getgenv().CaptureInject and (not Core.cap or Core.misses >= 1)
         if try_ability() then how = "ability"
         elseif S.parry_mode == "Keypress" or fresh then
             if not gate_open() or not canParryNow() then return false end
@@ -2071,22 +2078,41 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
     end
     local function prime_capture(now)
         if Core.cap or not needs_capture() then return end
-        -- getgc capture method: build the capture by reflection instead of a hook
-        -- press; no VirtualInputManager, no hook, nothing to scan.
         if capture_method() == "getgc" then pcall(gc_acquire); return end
         if not (in_match() or in_lobby_training()) or not canParryNow() then Capture.since = nil; return end
         Capture.since = Capture.since or now
-        if now - Capture.since < 1 or now - Capture.last_press < 1.4 then return end
-        if Capture.dry >= 3 then
-            if now - Capture.last_press < 20 then return end
-            Capture.dry = 0
+        -- Synthetic-press bootstrap (opt in with getgenv().CaptureInject): when no
+        -- ball is near, a VirtualInputManager Block press goes out and the hook
+        -- reads its packet. Off by default -- synthetic input can be flagged, and
+        -- a press that does not actually parry captures nothing.
+        if getgenv().CaptureInject then
+            if now - Capture.since < 1 or now - Capture.last_press < 1.4 then return end
+            if Capture.dry >= 3 then
+                if now - Capture.last_press < 20 then return end
+                Capture.dry = 0
+            end
+            if not gate_open() or not capture_safe() then return end
+            Capture.last_press = now
+            local window = capture_window()
+            if arm(window) then
+                pressBlockKey(); gate_start()
+                logp(("capture press (%s, %s, hook up <= %.0fms, no ball near)"):format(capture_method(), Core.ctx, window * 1000))
+            end
+            return
         end
-        if not gate_open() or not capture_safe() then return end
+        -- Default: capture the player's OWN real parry. Arm the hook only when a
+        -- ball is actually incoming (capture_safe() is false) -- i.e. the moment
+        -- the player presses Block -- so the hook is up only briefly and reads one
+        -- genuine outgoing parry. inspect accepts only a real parry packet, so a
+        -- mis-timed or non-parrying click never captures, and nothing synthetic
+        -- is ever sent. The player blocks the first ball themselves; auto-forge
+        -- (curve, targeting, every option) takes over the instant the key is in.
+        if capture_safe() then return end
+        if now - Capture.last_press < 0.35 then return end
         Capture.last_press = now
-        local window = capture_window()
-        if arm(window) then
-            pressBlockKey(); gate_start()
-            logp(("capture press (%s, %s, hook up <= %.0fms, no ball near)"):format(capture_method(), Core.ctx, window * 1000))
+        if arm(0.7) and now - (Capture.notified or 0) > 5 then
+            Capture.notified = now
+            logp("capture: block the ball yourself once -- the hook reads that one real parry, then auto-forge takes over (" .. capture_method() .. ")")
         end
     end
 
@@ -2733,7 +2759,7 @@ AP:AddDropdown("TargetMode", {
 })
 AP:AddDropdown("CaptureHook", {
     Values = { "getgc", "Namecall", "FireServer", "Both" }, Default = "Both", Text = "Capture hook",
-    Tooltip = "How the parry is sent. Namecall/FireServer/Both briefly hook to catch a real press. 'getgc' uses NO hook, NO press, NO getupvalues: it finds the game's own F-key parry handler (v186) via getgc and calls it, so the game builds the server-validated window, plays the real swing and fires the real remote itself. getgenv().GcSender ('handler'/'pry'), GcChunk override.",
+    Tooltip = "How the key is captured, then every parry is forged (so curve, targeting and all options work). Namecall/FireServer/Both briefly hook ONE real parry you make yourself to read the key, then the hook comes down -- no synthetic clicks (getgenv().CaptureInject re-enables them). Block the first ball yourself; auto-forge takes over once the key is in. 'getgc' is reflection-based and gets detected -- avoid.",
     Callback = function(v) getgenv().CaptureHook = v end,
 })
 AP:AddButton({
