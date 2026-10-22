@@ -31,7 +31,7 @@
 
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.44"
+local SCRIPT_VERSION = "rewrite-0.5.45"
 
 -- ---------------------------------------------------------------------------
 -- Single instance.
@@ -661,7 +661,14 @@ do
     local H = { fire = nil, nc = nil, want = false, until_t = 0 }
 
     -- Which hook(s) a capture press uses (Parry tab -> "Capture hook").
-    local function capture_method() return getgenv().CaptureHook or "Namecall" end
+    -- getgc (reflection: getgc/getupvalues/getconstants) is detected -- it kicks
+    -- even from the lobby, and getgenv().CaptureHook persists across reloads, so
+    -- a stale "getgc" is migrated to "Both" here and can never run the scan again.
+    local function capture_method()
+        local m = getgenv().CaptureHook
+        if m == nil or m == "getgc" then m = "Both" end
+        return m
+    end
     Core.capture_method = capture_method
 
     -- __namecall goes back exactly: the original function object written straight
@@ -2758,7 +2765,7 @@ AP:AddDropdown("TargetMode", {
     Callback = function(v) Parry.setTargetMode(v) end,
 })
 AP:AddDropdown("CaptureHook", {
-    Values = { "getgc", "Namecall", "FireServer", "Both" }, Default = "Both", Text = "Capture hook",
+    Values = { "Namecall", "FireServer", "Both" }, Default = "Both", Text = "Capture hook",
     Tooltip = "How the key is captured, then every parry is forged (so curve, targeting and all options work). Namecall/FireServer/Both briefly hook ONE real parry you make yourself to read the key, then the hook comes down -- no synthetic clicks (getgenv().CaptureInject re-enables them). Block the first ball yourself; auto-forge takes over once the key is in. 'getgc' is reflection-based and gets detected -- avoid.",
     Callback = function(v) getgenv().CaptureHook = v end,
 })
