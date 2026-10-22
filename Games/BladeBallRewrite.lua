@@ -31,7 +31,7 @@
 
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.47"
+local SCRIPT_VERSION = "rewrite-0.5.48"
 
 -- ---------------------------------------------------------------------------
 -- Single instance.
@@ -2114,19 +2114,40 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
             end
             return
         end
-        -- Default: capture the player's OWN real parry. Arm the hook only when a
-        -- ball is actually incoming (capture_safe() is false) -- i.e. the moment
-        -- the player presses Block -- so the hook is up only briefly and reads one
-        -- genuine outgoing parry. inspect accepts only a real parry packet, so a
-        -- mis-timed or non-parrying click never captures, and nothing synthetic
-        -- is ever sent. The player blocks the first ball themselves; auto-forge
-        -- (curve, targeting, every option) takes over the instant the key is in.
-        if capture_safe() then return end
-        if now - Capture.last_press < 0.35 then return end
+        -- Default: capture the player's OWN real parry. Arm the hook ONLY when a
+        -- ball is actually targeting the player and arriving -- i.e. a real parry
+        -- is genuinely about to happen -- NOT on any nearby ball or screen tap.
+        -- capture_safe() was too loose (any ball within 20 studs, no targeting
+        -- check), so on mobile it armed on taps/passing balls that would never
+        -- parry. parry_imminent() requires target == me and an incoming path, so
+        -- the hook is up only for the fraction of a second the player blocks.
+        -- inspect still accepts only a genuine parry packet; nothing synthetic.
+        -- parry imminent = a ball targeting the player, point blank or arriving
+        -- within reach + the window (inlined; the outer scope is at its local cap)
+        local imminent = false
+        do
+            local root = getRoot()
+            if root then
+                local horizon = reach_time() + (parry_window() or 0.5)
+                for _, ball in ipairs(get_live_balls()) do
+                    if ball:GetAttribute('target') == me then
+                        local vel = ball_velocity(ball)
+                        local speed = vel.Magnitude
+                        local off = root.Position - ball.Position
+                        local d = off.Magnitude
+                        if d <= 18 or (speed > 1 and d > 0.01 and (vel / speed):Dot(off / d) > 0 and d / speed <= horizon) then
+                            imminent = true; break
+                        end
+                    end
+                end
+            end
+        end
+        if not imminent then return end
+        if now - Capture.last_press < 0.3 then return end
         Capture.last_press = now
-        if arm(0.7) and now - (Capture.notified or 0) > 5 then
+        if arm(0.5) and now - (Capture.notified or 0) > 5 then
             Capture.notified = now
-            logp("capture: block the ball yourself once -- the hook reads that one real parry, then auto-forge takes over (" .. capture_method() .. ")")
+            logp("capture: block this ball yourself -- the hook reads that one real parry, then auto-forge takes over (" .. capture_method() .. ")")
         end
     end
 
