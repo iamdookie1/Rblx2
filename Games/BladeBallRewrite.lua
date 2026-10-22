@@ -31,7 +31,7 @@
 
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.48"
+local SCRIPT_VERSION = "rewrite-0.5.49"
 
 -- ---------------------------------------------------------------------------
 -- Single instance.
@@ -664,9 +664,15 @@ do
     -- getgc (reflection: getgc/getupvalues/getconstants) is detected -- it kicks
     -- even from the lobby, and getgenv().CaptureHook persists across reloads, so
     -- a stale "getgc" is migrated to "Both" here and can never run the scan again.
+    -- Default "Namecall": a __namecall hook (hookmetamethod) lives in game's
+    -- LOCKED metatable, which a game LocalScript cannot read (getrawmetatable is
+    -- exploit-only) -- so the anticheat cannot see it. "Both"/"FireServer" also
+    -- replace the shared FireServer function, whose identity a game script CAN
+    -- cache and compare, so they are the detectable ones. getgc (reflection) is
+    -- always migrated away.
     local function capture_method()
         local m = getgenv().CaptureHook
-        if m == nil or m == "getgc" then m = "Both" end
+        if m == nil or m == "getgc" then m = "Namecall" end
         return m
     end
     Core.capture_method = capture_method
@@ -2145,7 +2151,8 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         if not imminent then return end
         if now - Capture.last_press < 0.3 then return end
         Capture.last_press = now
-        if arm(0.5) and now - (Capture.notified or 0) > 5 then
+        -- short window = less time the hook is up; tune with getgenv().CaptureWindow
+        if arm(math.clamp(tonumber(getgenv().CaptureWindow) or 0.4, 0.12, 1.5)) and now - (Capture.notified or 0) > 5 then
             Capture.notified = now
             logp("capture: block this ball yourself -- the hook reads that one real parry, then auto-forge takes over (" .. capture_method() .. ")")
         end
@@ -2793,8 +2800,8 @@ AP:AddDropdown("TargetMode", {
     Callback = function(v) Parry.setTargetMode(v) end,
 })
 AP:AddDropdown("CaptureHook", {
-    Values = { "Namecall", "FireServer", "Both" }, Default = "Both", Text = "Capture hook",
-    Tooltip = "How the key is captured, then every parry is forged (so curve, targeting and all options work). Namecall/FireServer/Both briefly hook ONE real parry you make yourself to read the key, then the hook comes down -- no synthetic clicks (getgenv().CaptureInject re-enables them). Block the first ball yourself; auto-forge takes over once the key is in. 'getgc' is reflection-based and gets detected -- avoid.",
+    Values = { "Namecall", "FireServer", "Both" }, Default = "Namecall", Text = "Capture hook",
+    Tooltip = "How the key is captured, then every parry is forged (curve, targeting, all options work). Default Namecall uses a __namecall hook (hookmetamethod) that lives in game's locked metatable -- a game script cannot see it, so it is the stealthiest. FireServer/Both also hook the shared FireServer function (identity a game script can compare) -- less stealthy but catch every parry. The hook is up only the instant you block a real incoming ball, then comes down. getgenv().CaptureWindow tunes the up-time; CaptureInject re-enables synthetic presses.",
     Callback = function(v) getgenv().CaptureHook = v end,
 })
 AP:AddButton({
