@@ -31,7 +31,7 @@
 
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.41"
+local SCRIPT_VERSION = "rewrite-0.5.42"
 
 -- ---------------------------------------------------------------------------
 -- Single instance.
@@ -1063,13 +1063,10 @@ end]]
     end
 
     -- ---------- getgc capture backend (CaptureHook = "getgc") ----------
-    -- Reads the game's live sender via getgc(false) + getupvalues to get the parry
-    -- remote, hash, uid and key deriver, derives the key and builds Core.cap so the
-    -- normal remote send() forges tokens -- NO hook, NO key press, nothing to scan.
-    --
-    -- WHICH remote/hash: straight from the sender's code (see forge_resolve):
-    -- Net:RemoteEvent(<name upvalue>) and the GUID right after the name.
-    -- getgenv().GcHashIdx / GcBall2 override.
+    -- No hook, no key press, no getupvalues, no forging: it acquires the game's
+    -- own parry sender closure (require(PRY), or a getgc scan) and parries by
+    -- CALLING it on a clean thread -- the game builds the real token and fires
+    -- the real remote itself. See the gc_acquire / gc_fire block below.
     local function forge_find_pry()
         local function clean(s) return (tostring(s):gsub("[^%w]", "")) end
         local p
@@ -1091,20 +1088,26 @@ end]]
         end
         return p
     end
-    -- Find the LIVE sender closure the game actually runs, via getgc(false) --
-    -- functions only, NOT the heap-walking getgc(true) that crashed. Run ONCE per
-    -- session, in its own thread, 300 entries a frame so it never stalls a
-    -- frame; until it finishes (or if it finds nothing) callers get nil and use
-    -- require(PRY). Only a function whose source is the PRY module itself
-    -- (SwordsController.PRY) counts -- 0.5.29/30 took the first function from
-    -- ANY "Sword" source with a similar upvalue shape, which could be a different
-    -- SwordsController sender (found "something", never parried).
-    local GC = { res = nil, last_msg = nil }
+    -- Find the LIVE sender via getgc(false) -- a require-free alternative
+    -- acquisition (GcSender="getgc"). Reads candidate upvalues on its OWN
+    -- spawned thread only to identify the sender; the default path never runs it
+    -- (require(PRY) returns the sender directly, no getupvalues at all).
+    local GC = { last_msg = nil }
     function GC.clean(s) return (tostring(s):gsub("[^%w]", "")) end
+    function GC.is_lua(f)
+        if type(f) ~= "function" then return false end
+        if type(iscclosure) == "function" then
+            local ok, c = pcall(iscclosure, f)
+            if ok then return not c end
+        end
+        local ok, src = pcall(debug.info, f, "s")
+        return ok and src ~= "[C]"
+    end
     local gc_scan = { sender = nil, started = false, done = false }
-    local function forge_gc_sender(getups)
-        if typeof(gc_scan.sender) == "function" then return gc_scan.sender end
-        if gc_scan.started or type(getgc) ~= "function" or type(getups) ~= "function" then return nil end
+    local function gc_scan_start()
+        if gc_scan.started then return end
+        local getups = reflect_getups()
+        if type(getgc) ~= "function" or type(getups) ~= "function" then gc_scan.done = true; return end
         gc_scan.started = true
         task.spawn(function()
             local list
@@ -1135,240 +1138,98 @@ end]]
                             end
                         end
                     end
-                    -- 300 entries a frame, as 0.5.31 (which finished the scan); the
-                    -- 0.5.32 4ms time slice crashed the client right after it began
                     if idx % 300 == 0 then task.wait() end
                 end
             end
             list = nil
             gc_scan.done = true
-            logp(gc_scan.sender and "getgc: live PRY sender found (cached for the session)"
-                or "getgc: scan finished, PRY sender not found -- using require(PRY)")
+            logp(gc_scan.sender and "getgc: live PRY sender found (getgc)"
+                or "getgc: getgc scan finished, sender not found")
         end)
-        return nil
     end
-    function GC.is_lua(f)
-        if type(f) ~= "function" then return false end
-        if type(iscclosure) == "function" then
-            local ok, c = pcall(iscclosure, f)
-            if ok then return not c end
-        end
-        local ok, src = pcall(debug.info, f, "s")
-        return ok and src ~= "[C]"
-    end
-    -- The PRY sender, from Tools/Dump.txt (SwordsController.PRY, "X"):
-    --
-    --   if debug.info(debug.info, "s") ~= "[C]" then v663:FireServer(JobId, "494kjkdf", ...) end  -- kick report
-    --   for i = 1, 10 do if getfenv(i).writefile then v661:FireServer(JobId, "64565gfdd", ...) end end -- kick report
-    --   key = v658(uid, "TIME"); token[i] = char(bxor((byte(text, i) + i) % 256, byte(key, (i-1) % #key + 1)))
-    --   Net:RemoteEvent(v662):FireServer(v660, uid, token, ...)          -- THE parry
-    --
-    -- Its upvalues, in order: v663 decoy remote, v661 decoy remote, v667 uid
-    -- holder, v658 key deriver, v666 decoy hash, v659 Net, v662 remote NAME (the
-    -- only non-GUID string), v660 REAL hash (the GUID right after the name), v665
-    -- decoy hash. Net turns the name into a per-server "RE/<sha256>" child with a
-    -- server salt, so it can't be computed -- the remote is obtained exactly as
-    -- the game does it: Net:RemoteEvent(name).
-    --
-    -- Every call into game code (Net, the deriver) runs on its own thread whose
-    -- only frame is a clean function: compiled under Net's chunk name, in a clean
-    -- game env with no writefile. If those functions ever walk the stack like the
-    -- sender does (getfenv(i).writefile / debug.info) they see nothing of ours.
-    function GC.clean_call(fn, chunk, ...)
-        -- no pcall in the body: a C frame between them could expose the
-        -- thread's globals to a getfenv walk. An error just ends the thread
-        -- with done = false, which the caller times out. chunk is the source
-        -- name our frame reports (debug.info(.,"s")): the sender's own source,
-        -- so a caller-check inside fn sees the game path it expects, not ours.
-        local out = { done = false, at = clock_() }
-        local body = build_body([[
-local fn, out, a, b, c = ...
-return function()
-    out.r = fn(a, b, c)
-    out.ok, out.done = true, true
-end]], chunk, fn, out, ...)
-        if not body then return nil, "clean body unavailable" end
-        task.spawn(body)
-        return out
-    end
-    local function forge_derive(deriver, uid, chunk)
-        local out = GC.clean_call(deriver, chunk, uid, "TIME")
-        if out and out.done and out.ok and type(out.r) == "string" then return out.r end
-        return nil
-    end
-    -- Read the sender ONCE per session (upvalue index order, deterministic).
-    -- Read-only; the remote comes from Net:RemoteEvent(name) once per server.
-    --
-    -- Each step is logged (the log is written to file, so the LAST line before a
-    -- kick names the step that tripped it) and gated by getgenv().GcStep:
-    --   nil/3 = full (sender -> upvalues -> Net -> deriver, the normal path)
-    --     0.5 = stop right after acquiring the sender (no getupvalues, no
-    --           debug.info, no game code) -- isolates HOW we get the sender
-    --       1 = stop after reading the sender's upvalues (no Net, no deriver)
-    --       2 = also call Net, but stop before the deriver
-    --
-    -- HOW the sender is acquired is getgenv().GcSender:
-    --   nil/"auto" = already-found getgc sender, else require(PRY), else getgc scan
-    --   "getgc"    = ONLY the getgc(false) scan -- never calls require
-    --   "require"  = ONLY require(PRY)
-    -- GcStep=1 kicks with nothing but the sender + upvalues read, so the leak is
-    -- in acquisition. Blade Ball hooks require and checks the caller, so a
-    -- non-game require(PRY) is a known kick. Test: GcSender="getgc", GcStep=0.5
-    -- (pure memory read, no require) -- if that survives, we never require again.
-    GC.rem = { out = nil, name = nil }
-    local function forge_resolve()
-        if GC.res and GC.res.remote.Parent then return GC.res end
-        GC.res = nil
-        local step = tonumber(getgenv().GcStep) or 3
-        local want = getgenv().GcSender or "auto"
-        local b = GC.base
-        if not b then
-            local getups = reflect_getups()
-            if type(getups) ~= "function" then return nil, "getupvalues unavailable", true end
-            -- Acquire the sender. Prefer a getgc sender already found (no new
-            -- work, no require). require(PRY) is a game call Blade Ball can trap,
-            -- so it is used only when allowed and only if getgc has not found it.
-            local v31, src
-            if type(gc_scan.sender) == "function" then v31, src = gc_scan.sender, "getgc" end
-            if not v31 and want ~= "require" then
-                v31 = forge_gc_sender(getups)   -- starts/continues the getgc scan
-                if type(v31) == "function" then src = "getgc" end
-                if not v31 and want == "getgc" and not gc_scan.done then
-                    return nil, "scanning for the PRY sender (getgc only, no require)...", false
-                end
-            end
-            if not v31 and want ~= "getgc" then
-                local pry = forge_find_pry()
-                if pry then local ok, m = pcall(require, pry); if ok and type(m) == "function" then v31, src = m, "require(PRY)" end end
-            end
-            if type(v31) ~= "function" then
-                if not gc_scan.done and want ~= "require" then return nil, "scanning for the PRY sender...", false end
-                return nil, "sender not found (sender=" .. want .. ")", true
-            end
-            GC.log("getgc: step 1a -- sender acquired via " .. src)
-            if step < 1 then return nil, "stopped after acquiring the sender (GcStep<1): no getupvalues, no game code", false end
-            -- getupvalues inline on the GAME thread is what kicks: the getgc scan
-            -- reads the SAME upvalues on its own spawned thread and does NOT kick.
-            -- So extract on a clean isolated thread -- getupvalues and the source
-            -- read (debug.info) run there, tagged with the PRY module's path; the
-            -- game thread only reads and parses the result (pure Lua, no
-            -- reflection). GcChunk=false skips the debug.info source read.
-            if not GC.ext then
-                local chunk_guess
-                pcall(function() local p = forge_find_pry(); if p then chunk_guess = p:GetFullName() end end)
-                local info = (getgenv().GcChunk ~= false) and debug.info or nil
-                local out = { done = false, at = clock_() }
-                local body = build_body([[
-local getups, info, sender, out = ...
-return function()
-    out.ups = getups(sender)
-    if info then out.ok2, out.src = pcall(info, sender, "s") end
-    out.done = true
-end]], chunk_guess, getups, info, v31, out)
-                if not body then return nil, "could not build a clean extractor (no loadstring?)", true end
-                task.spawn(body)
-                GC.ext = out
-                GC.log("getgc: step 1b -- extracting upvalues on a clean thread (off the game thread)")
-            end
-            if not GC.ext.done then
-                if clock_() - GC.ext.at < 3 then return nil, "extracting the sender's upvalues (clean thread)...", false end
-                GC.ext = nil
-                return nil, "upvalue extraction never returned", true
-            end
-            local ups = GC.ext.ups
-            if type(ups) ~= "table" then GC.ext = nil; return nil, "getupvalues(sender) returned no table", true end
-            local chunk = GC.ext.ok2 and GC.ext.src or nil
-            local guids, deriver, uidHolder, net, name, hash = {}, nil, nil, nil, nil, nil
-            for i = 1, 64 do
-                local v = ups[i]
-                if v ~= nil then
-                    if type(v) == "string" then
-                        if #v == 36 then
-                            guids[#guids + 1] = v
-                            if name and not hash then hash = v end -- the GUID right after the name
-                        elseif not name then name = v end
-                    elseif type(v) == "function" and not deriver then deriver = v
-                    elseif reflect_isNet(v) then net = net or v
-                    elseif typeof(v) == "table" and not uidHolder then
-                        local shaped = false
-                        pcall(function() shaped = v[1] ~= nil and type(v[2]) == "table" end)
-                        if shaped then uidHolder = v end
-                    end
-                end
-            end
-            if not (name and hash and deriver and uidHolder and net) then
-                return nil, ("incomplete (name %s, hash %s, deriver %s, uid-holder %s, net %s)"):format(
-                    tostring(name ~= nil), tostring(hash ~= nil), tostring(deriver ~= nil),
-                    tostring(uidHolder ~= nil), tostring(net ~= nil)), true
-            end
-            local uid; pcall(function() uid = uidHolder[2][uidHolder[1]] end)
-            if type(uid) ~= "string" then return nil, "could not resolve uid", true end
-            b = { guids = guids, hash = hash, name = name, deriver = deriver, uid = uid, net = net, sender = v31, chunk = chunk }
-            GC.base = b
-            GC.log(("getgc: step 1/4 -- upvalues extracted off the game thread (name ok, %d hashes, uid ok)"):format(#guids))
-        end
-        if step < 2 then return nil, "stopped after step 1 (GcStep=1): extraction only, no Net, no deriver", false end
-        -- the remote: Net:RemoteEvent(name), on a clean thread; it may take a
-        -- frame (Net can wait for the child), so poll the result
-        GC.log("getgc: step 3/4 -- calling Net:RemoteEvent(name) on a clean thread")
-        local o = GC.rem.out
-        if not o or (o.done and not (o.ok and typeof(o.r) == "Instance" and o.r.Parent)) then
-            local m; pcall(function() m = b.net.RemoteEvent end)
-            if type(m) ~= "function" then return nil, "Net.RemoteEvent missing", true end
-            o = GC.clean_call(m, b.chunk, b.net, b.name)
-            if not o then return nil, "could not build a clean caller (no loadstring?)", true end
-            GC.rem.out = o
-        end
-        if not o.done then
-            if clock_() - o.at < 3 then return nil, "asking Net for the parry remote...", false end
-            GC.rem.out = nil
-            return nil, "Net:RemoteEvent(name) never returned", true
-        end
-        if not (o.ok and typeof(o.r) == "Instance" and o.r:IsA("RemoteEvent")) then
-            GC.rem.out = nil
-            return nil, "Net:RemoteEvent(name) failed: " .. tostring(o.r), true
-        end
-        GC.log("getgc: step 3/4 ok -- remote '" .. o.r.Name .. "' resolved")
-        if step < 3 then return nil, "stopped after step 3 (GcStep=2): remote ok, deriver not called", false end
-        GC.res = { guids = b.guids, hash = b.hash, deriver = b.deriver, uid = b.uid, remote = o.r, chunk = b.chunk }
-        return GC.res
-    end
-    -- THE getgc CAPTURE METHOD (CaptureHook = "getgc"). Build Core.cap from the
-    -- live sender by reflection -- no FireServer/__namecall hook, no key press.
-    -- Resolution happens once; after that this only rebuilds Core.cap from the
-    -- cache. getgenv().GcHashIdx / GcBall2 override the hash / packet shape.
+
+    -- ---------- getgc: CALL the game's own sender (no upvalues, no key) ----------
+    -- SwordsController.PRY (Tools/Bbs dumps): `local v31 = require(script.PRY)`,
+    -- and the game parries by CALLING v31:
+    --     v31(window, Camera.CFrame, points, aim, flag)   -- normal
+    --     v31(Camera.CFrame, mouseLookCF, flag)           -- UseBall2 servers
+    -- v31 is the sender closure: called, it builds the real token from the real
+    -- per-account key and fires the real remote (plus the game's own random
+    -- decoys) -- a genuine parry, indistinguishable from the player's. We never
+    -- read its upvalues (that getupvalues is what BAC kicked on), derive a key,
+    -- resolve a remote or forge a packet. Its only guards are two honeypots at
+    -- the top -- debug.info globally hooked, or writefile reachable via a
+    -- getfenv(i) stack-walk (i = 1..10) -- so the call must run on a thread whose
+    -- only frames are the sender and ONE clean-env wrapper: no writefile in any
+    -- frame's env, tagged with the sender's own chunk. Acquire with require(PRY)
+    -- (the game's own path; cached, so no module re-run), never getupvalues.
     local gc_fail_at = -math.huge
     function GC.log(msg) if msg ~= GC.last_msg then GC.last_msg = msg; logp(msg) end end
-    local function gc_capture()
-        -- a hard failure is retried at most once a second (callers run per frame);
-        -- "still scanning / identifying" is a cheap flag check, so no wait there
+    local function gc_acquire()
+        if type(GC.dispatcher) == "function" then
+            if not Core.cap then Core.cap = { gc = true } end
+            return true
+        end
         if clock_() - gc_fail_at < 1 then return false end
-        local r, err, hard = forge_resolve()
-        if not r then
-            if hard then gc_fail_at = clock_() end
-            GC.log("getgc: " .. tostring(err)); return false
+        local want = getgenv().GcSender or "require"
+        local fn
+        if want ~= "require" and type(gc_scan.sender) == "function" then fn = gc_scan.sender end
+        if not fn and want ~= "getgc" then
+            local pry = forge_find_pry()
+            if pry then local ok, m = pcall(require, pry); if ok and type(m) == "function" then fn = m end end
         end
-        if not r.key then
-            GC.log("getgc: step 4/4 -- calling the key deriver on a clean thread")
-            local keyStr = forge_derive(r.deriver, r.uid, r.chunk)
-            if type(keyStr) ~= "string" or #keyStr == 0 then
-                GC.res, GC.base, GC.ext = nil, nil, nil; gc_fail_at = clock_(); GC.log("getgc: key derivation returned nothing"); return false
-            end
-            r.key = keyStr
+        if not fn and want ~= "require" then
+            gc_scan_start()
+            if not gc_scan.done then return false end     -- still scanning; quiet
+            fn = gc_scan.sender
         end
-        local keyStr = r.key
-        local hi = tonumber(getgenv().GcHashIdx)
-        local hash = hi and r.guids[math.clamp(hi, 1, #r.guids)] or r.hash
-        local text = tostring(math.floor(Workspace:GetServerTimeNow() * 100))
-        local key = table.create(#text)
-        for i = 1, #text do key[i] = string.byte(keyStr, (i - 1) % #keyStr + 1) end
-        Core.cap = { remote = r.remote, hash = hash, uid = r.uid, key = key, len = #text,
-            ball2 = getgenv().GcBall2 and true or false }
+        if type(fn) ~= "function" then gc_fail_at = clock_(); GC.log("getgc: sender not found (sender=" .. want .. ")"); return false end
+        -- the ONE clean dispatcher, built once. task.spawn(dispatcher) runs it as
+        -- the thread's main function, so inside the sender getfenv(2) is this
+        -- clean wrapper (writefile nil) and getfenv(3+) is empty -- both honeypots
+        -- pass. GcChunk=false skips the single debug.info source read.
+        local chunk
+        if getgenv().GcChunk ~= false then pcall(function() chunk = debug.info(fn, "s") end) end
+        local job = {}
+        local disp = build_body([[
+local job, sender = ...
+return function() sender(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
+        if type(disp) ~= "function" then gc_fail_at = clock_(); GC.log("getgc: could not build a clean dispatcher (no loadstring?)"); return false end
+        GC.sender, GC.job, GC.dispatcher = fn, job, disp
+        Core.cap = { gc = true }
         Core.misses, Core.pending = 0, nil
-        local hn = 0; for i, g in ipairs(r.guids) do if g == hash then hn = i end end
-        GC.log(("getgc: cap set (no hook) -- remote '%s' via Net:RemoteEvent, hash #%d/%d, key %d, ball2 %s"):format(
-            r.remote.Name, hn, #r.guids, #keyStr, tostring(Core.cap.ball2)))
+        GC.log("getgc: sender acquired (" .. want .. ") -- parrying by calling the game's own sender (no upvalues, no key, no forge)")
         return true
+    end
+    -- fire one real parry: set the args, run the sender on a fresh clean thread
+    local function gc_fire(spam)
+        if type(GC.dispatcher) ~= "function" then return "unarmed" end
+        if not is_live() then return "blocked" end
+        if not canParryNow() then return "blocked" end
+        if not spam and not gate_open() then return "blocked" end
+        local cam = Workspace.CurrentCamera
+        if not cam then return "blocked" end
+        local window = parry_window()
+        local points, aim = packet_parts(cam)
+        local name, _, mode = choose_target(cam)
+        if name and mode ~= "Cursor" then local sp = points[name]; if sp then aim = { sp.X, sp.Y } end end
+        local cf = cam.CFrame
+        local look = curve_look_cached(cam)
+        if look then local o = cf.Position; cf = CFrame.lookAt(o, o + look) end
+        if not spam then gate_start() end
+        Core.last_send_at = clock_()
+        local job = GC.job
+        if getgenv().GcBall2 then
+            local ray = cam:ScreenPointToRay(aim[1], aim[2], 0)
+            job[1], job[2], job[3], job[4], job[5] = cf, CFrame.lookAt(ray.Origin, ray.Origin + ray.Direction), false, nil, nil
+            job.n = 3
+        else
+            job[1], job[2], job[3], job[4], job[5] = window, cf, points, aim, false
+            job.n = 5
+        end
+        task.spawn(GC.dispatcher)
+        if not spam then Core.pending = clock_() + window + ping_s() + 0.25 end
+        return "sent"
     end
 
     -- ---------- token + send ----------
@@ -1388,6 +1249,7 @@ end]], chunk_guess, getups, info, v31, out)
         if not is_live() then return "blocked" end
         local cap = Core.cap
         if not cap then return "unarmed" end
+        if cap.gc then return gc_fire(spam) end   -- getgc: call the game's own sender
         if not canParryNow() then return "blocked" end
         if not cap.remote.Parent then Core.cap = nil; return "unarmed" end
         if not spam and not gate_open() then return "blocked" end
@@ -1904,10 +1766,10 @@ end]], chunk_guess, getups, info, v31, out)
         local ok, remote = false, false
         if SP.mode == "Keypress" then ok = pressBlockKey()
         elseif not Core.cap and capture_method() == "getgc" then
-            -- getgc method: resolve the capture by reflection (no hook, no press)
+            -- getgc method: acquire the sender (no hook, no press, no upvalues)
             if clock_() - Capture.last_spam_key < 0.3 then return false end
             Capture.last_spam_key = clock_()
-            if gc_capture() then ok = send(true) == "sent"; remote = ok end
+            if gc_acquire() then ok = send(true) == "sent"; remote = ok end
         elseif not Core.cap then
             -- no capture yet: a native press (it parries by itself) that also
             -- captures, at most one per 0.3s until the packet is in
@@ -1993,13 +1855,14 @@ end]], chunk_guess, getups, info, v31, out)
         -- hook, never a press), and if that can't produce one, skip rather than
         -- fall back to a hook.
         if capture_method() == "getgc" and S.parry_mode ~= "Keypress" then
-            if not Core.cap or Core.misses >= 1 then Core.cap = nil; pcall(gc_capture) end
+            if not Core.cap then pcall(gc_acquire) end
             if not Core.cap then return false end
         end
         -- no capture yet, or the last remote parry went unanswered (the capture
         -- may be stale): this parry is a native press, which parries by itself
-        -- and takes / refreshes the capture on the way
-        local fresh = S.parry_mode ~= "Keypress" and (not Core.cap or Core.misses >= 1)
+        -- and takes / refreshes the capture on the way. getgc never goes "fresh"
+        -- (it has no key/capture to refresh -- it calls the game's own sender).
+        local fresh = S.parry_mode ~= "Keypress" and capture_method() ~= "getgc" and (not Core.cap or Core.misses >= 1)
         if try_ability() then how = "ability"
         elseif S.parry_mode == "Keypress" or fresh then
             if not gate_open() or not canParryNow() then return false end
@@ -2197,7 +2060,7 @@ end]], chunk_guess, getups, info, v31, out)
         if Core.cap or not needs_capture() then return end
         -- getgc capture method: build the capture by reflection instead of a hook
         -- press; no VirtualInputManager, no hook, nothing to scan.
-        if capture_method() == "getgc" then pcall(gc_capture); return end
+        if capture_method() == "getgc" then pcall(gc_acquire); return end
         if not (in_match() or in_lobby_training()) or not canParryNow() then Capture.since = nil; return end
         Capture.since = Capture.since or now
         if now - Capture.since < 1 or now - Capture.last_press < 1.4 then return end
@@ -2857,7 +2720,7 @@ AP:AddDropdown("TargetMode", {
 })
 AP:AddDropdown("CaptureHook", {
     Values = { "getgc", "Namecall", "FireServer", "Both" }, Default = "Both", Text = "Capture hook",
-    Tooltip = "How the parry capture is obtained. Namecall/FireServer/Both briefly hook to catch a real press. 'getgc' uses NO hook and NO press: it reads the game's live sender (getgc) and builds the capture by reflection. The remote and hash come straight from the sender's code; getgenv().GcHashIdx / GcBall2 override.",
+    Tooltip = "How the parry is sent. Namecall/FireServer/Both briefly hook to catch a real press. 'getgc' uses NO hook, NO press, NO getupvalues: it acquires the game's own parry sender and calls it on a clean thread, so the game builds the real token and fires the real remote itself. getgenv().GcSender ('require'/'getgc'), GcBall2, GcChunk override.",
     Callback = function(v) getgenv().CaptureHook = v end,
 })
 AP:AddButton({
