@@ -31,7 +31,7 @@
 
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.46"
+local SCRIPT_VERSION = "rewrite-0.5.47"
 
 -- ---------------------------------------------------------------------------
 -- Single instance.
@@ -1944,18 +1944,23 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         local h = track_homing(st, dir, want, dist, now)
         local lead = math.min(fire_lead(speed), reach + W * 0.85)
         local info = { speed = speed, dist = dist, heading = heading, lead = lead, eta = straight }
-        -- touching, or coming dead at us and already inside our reach time: now or
-        -- never. Only near-straight balls take this shortcut -- one pointing half
-        -- sideways can look "inside reach" while it actually curves past (the
-        -- bench caught exactly that); those go through the estimators below.
-        if rem <= 3 or (straight <= reach and heading >= 0.9) then
+        -- touching / point blank: now or never, whatever direction it reads.
+        -- (Original BladeBall's point_blank = dist <= max(10, speed*0.12).)
+        local point_blank = dist <= math.max(10, speed * 0.12)
+        if rem <= 3 or point_blank then
             return fire(st, now, via == "retarget" and "instant retarget" or "point blank", info, ball)
         end
         if via == "retarget" then
-            -- its velocity may still be the old one at the flip: fire straight off
-            -- the event only if it's clearly coming at us; else the velocity update
-            -- (a moment later) or the next frame point decides.
-            if heading >= 0.5 and straight <= lead then return fire(st, now, "instant retarget", info, ball) end
+            -- ORIGINAL BladeBall's fast retarget, restored: the instant the ball's
+            -- target flips to us -- the first thing the client gets, before its new
+            -- direction replicates -- fire if it would arrive within our lead and
+            -- it is heading in AT ALL (heading >= 0), not just clearly (>= 0.5).
+            -- Its velocity may still be the pre-flip one, so eta is the simple
+            -- distance/speed with a +20% penalty when it still reads as flying
+            -- away. This commits a frame or two earlier than the estimator path.
+            local eta = dist / speed * (heading < 0 and 1.2 or 1)
+            info.eta = eta
+            if eta <= lead and heading >= 0 then return fire(st, now, "instant retarget", info, ball) end
             return
         end
         local mode = S.anticurve
