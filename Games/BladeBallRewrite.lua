@@ -31,7 +31,7 @@
 
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.37"
+local SCRIPT_VERSION = "rewrite-0.5.38"
 
 -- ---------------------------------------------------------------------------
 -- Single instance.
@@ -1198,10 +1198,20 @@ end]], chunk, fn, out, ...)
     end
     -- Read the sender ONCE per session (upvalue index order, deterministic).
     -- Read-only; the remote comes from Net:RemoteEvent(name) once per server.
+    --
+    -- Each step is logged (the log is written to file, so the LAST line before a
+    -- kick names the step that tripped it) and gated by getgenv().GcStep:
+    --   nil/3 = full (sender -> upvalues -> Net -> deriver, the normal path)
+    --       1 = stop after reading the sender's upvalues (no Net, no deriver)
+    --       2 = also call Net, but stop before the deriver
+    -- Set GcStep = 1, rejoin: if it still kicks, the leak is getgc/require/
+    -- getupvalues itself. GcStep = 2 kicks but 1 doesn't -> the Net call.
+    -- Full kicks but 2 doesn't -> the deriver.
     GC.rem = { out = nil, name = nil }
     local function forge_resolve()
         if GC.res and GC.res.remote.Parent then return GC.res end
         GC.res = nil
+        local step = tonumber(getgenv().GcStep) or 3
         local b = GC.base
         if not b then
             local getups = reflect_getups()
@@ -1209,16 +1219,17 @@ end]], chunk, fn, out, ...)
             -- the sender is what the (already loaded) PRY module returned: read
             -- that first -- instant, no heap scan. The getgc scan only runs if
             -- the module can't be read.
-            local v31 = gc_scan.sender
+            local v31, src = gc_scan.sender, "getgc"
             if type(v31) ~= "function" then
                 local pry = forge_find_pry()
-                if pry then local ok, m = pcall(require, pry); if ok and type(m) == "function" then v31 = m end end
+                if pry then local ok, m = pcall(require, pry); if ok and type(m) == "function" then v31, src = m, "require(PRY)" end end
             end
             if type(v31) ~= "function" then
                 v31 = forge_gc_sender(getups)
                 if type(v31) ~= "function" and not gc_scan.done then return nil, "scanning for the PRY sender...", false end
             end
             if type(v31) ~= "function" then return nil, "sender not found (getgc + require(PRY) both failed)", true end
+            GC.log("getgc: step 1/4 -- sender acquired via " .. src .. ", reading upvalues")
             local ok2, ups = pcall(getups, v31)
             if not ok2 or type(ups) ~= "table" then return nil, "getupvalues(sender) failed", true end
             local guids, deriver, uidHolder, net, name, hash = {}, nil, nil, nil, nil, nil
@@ -1249,9 +1260,12 @@ end]], chunk, fn, out, ...)
             local chunk; pcall(function() chunk = debug.info(v31, "s") end)
             b = { guids = guids, hash = hash, name = name, deriver = deriver, uid = uid, net = net, chunk = chunk }
             GC.base = b
+            GC.log(("getgc: step 2/4 -- upvalues read (name ok, %d hashes, uid ok), no game code called yet"):format(#guids))
         end
+        if step < 2 then return nil, "stopped after step 2 (GcStep=1): upvalues only, no Net, no deriver", false end
         -- the remote: Net:RemoteEvent(name), on a clean thread; it may take a
         -- frame (Net can wait for the child), so poll the result
+        GC.log("getgc: step 3/4 -- calling Net:RemoteEvent(name) on a clean thread")
         local o = GC.rem.out
         if not o or (o.done and not (o.ok and typeof(o.r) == "Instance" and o.r.Parent)) then
             local m; pcall(function() m = b.net.RemoteEvent end)
@@ -1269,6 +1283,8 @@ end]], chunk, fn, out, ...)
             GC.rem.out = nil
             return nil, "Net:RemoteEvent(name) failed: " .. tostring(o.r), true
         end
+        GC.log("getgc: step 3/4 ok -- remote '" .. o.r.Name .. "' resolved")
+        if step < 3 then return nil, "stopped after step 3 (GcStep=2): remote ok, deriver not called", false end
         GC.res = { guids = b.guids, hash = b.hash, deriver = b.deriver, uid = b.uid, remote = o.r, chunk = b.chunk }
         return GC.res
     end
@@ -1288,6 +1304,7 @@ end]], chunk, fn, out, ...)
             GC.log("getgc: " .. tostring(err)); return false
         end
         if not r.key then
+            GC.log("getgc: step 4/4 -- calling the key deriver on a clean thread")
             local keyStr = forge_derive(r.deriver, r.uid, r.chunk)
             if type(keyStr) ~= "string" or #keyStr == 0 then
                 GC.res, GC.base = nil, nil; gc_fail_at = clock_(); GC.log("getgc: key derivation returned nothing"); return false
