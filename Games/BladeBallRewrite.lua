@@ -31,7 +31,7 @@
 
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.77"
+local SCRIPT_VERSION = "rewrite-0.5.78"
 
 -- ---------------------------------------------------------------------------
 -- Single instance.
@@ -323,7 +323,8 @@ do
     local me = LocalPlayer.Name
     local Core = { cap = nil, pending = nil, misses = 0, interp = 0.14, last_parry = nil,
         ctx = "match", caps = {}, gen = 0, last_send_at = -math.huge,
-        feed = { n = 0, total = 0, since = 0, ahead = nil, urs = 0 } }
+        feed = { n = 0, total = 0, since = 0, ahead = nil, urs = 0,
+            pos = setmetatable({}, { __mode = "k" }), at = setmetatable({}, { __mode = "k" }) } }
     local G = { until_t = 0, m1 = false, m1_at = 0 }
     local frame_dt = 1 / 60
     local active = false
@@ -2034,21 +2035,34 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         local vel = ball_velocity(ball)
         local speed = vel.Magnitude
         if speed < 1 then return end
+        -- server ball feed (Parry.onBallFeed): when a fresh server position is in,
+        -- use it carried forward to now, and drop its measured lead over the
+        -- physics ball from our reach -- the ball as it really is, ~80-100ms
+        -- sooner, most of all on a turn or a retarget. Stale / none: physics ball.
+        local adj = 0
+        do
+            local F = Core.feed
+            local fp, ft = F.pos[ball], F.at[ball]
+            if fp and ft and F.ahead and now - ft < 0.12 then
+                bpos = fp + vel * (now - ft)
+                adj = math.clamp(F.ahead, 0, Core.interp - 0.02)
+            end
+        end
         local offset = rpos - bpos
         local dist = offset.Magnitude
         if dist < 0.01 then return end
         local dir, want = vel / speed, offset / dist
         local heading = dir:Dot(want)
         local W = parry_window() or 0.5
-        local reach = reach_time()
+        local reach = reach_time() - adj
         local gap = contact_gap(ball)
         local rem = math.max(dist - gap, 0)
         local accel = speed_gain(st, speed, now)
         local h = track_homing(st, dir, want, dist, now)
         local earliest = time_to_contact(dist, gap, speed, accel)
-        local lead = math.min(fire_lead(speed), reach + W * 0.85)
+        local lead = math.min(fire_lead(speed) - adj, reach + W * 0.85)
         local info = { speed = speed, dist = dist, heading = heading, lead = lead, eta = earliest }
-        local tag = via and ("auto parry (" .. via .. ")") or "auto parry"
+        local tag = (via and ("auto parry (" .. via .. ")") or "auto parry") .. (adj > 0 and " [feed]" or "")
         -- touching
         if rem <= 3 then return fire(st, now, tag .. " (contact)", info, ball) end
         -- close: arrival inside the window is certain
@@ -2416,8 +2430,10 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
     -- remote, net "ReplicateBallPosition" (hashed name), that carries
     -- (ball, server position) straight from the server -- no Roblox physics
     -- interpolation buffer in between, which is what Core.interp pays for.
-    -- PROBE ONLY for now: count it and measure how far ahead of the physics
-    -- ball it is, and log that every 5s; timing doesn't use it yet.
+    -- Measured in a live match (0.5.77): ~17 msgs/s with Lag-Ball OFF, 76-97ms
+    -- ahead of the physics ball. decide() parries on it: the latest server
+    -- position carried forward by the ball's velocity since it arrived, with
+    -- that measured lead taken off Core.interp (see feed_view). Logged every 30s.
     function Parry.onBallFeed(ball, p)
         if typeof(ball) ~= "Instance" or not ball:IsA("BasePart") then return end
         if typeof(p) == "CFrame" then p = p.Position end
@@ -2425,13 +2441,14 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         local F, now = Core.feed, clock_()
         if F.since == 0 then F.since = now end
         F.n, F.total = F.n + 1, F.total + 1
+        F.pos[ball], F.at[ball] = p, now
         local v = ball_velocity(ball)
         local sp = v.Magnitude
         if sp > 20 then
             local ahead = (p - ball.Position):Dot(v / sp) / sp
             if math.abs(ahead) < 0.5 then F.ahead = F.ahead and (F.ahead * 0.9 + ahead * 0.1) or ahead end
         end
-        if now - F.since >= 5 then
+        if now - F.since >= 30 then
             logp(("server ball feed: %.0f msgs/s, ahead of the physics ball by %s (Core.interp %.0fms)"):format(
                 F.n / (now - F.since), F.ahead and ("%.0fms"):format(F.ahead * 1000) or "n/a (ball slow)", Core.interp * 1000))
             F.n, F.since = 0, now
