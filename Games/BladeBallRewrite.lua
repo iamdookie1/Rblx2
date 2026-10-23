@@ -31,7 +31,7 @@
 
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.55"
+local SCRIPT_VERSION = "rewrite-0.5.56"
 
 -- ---------------------------------------------------------------------------
 -- Single instance.
@@ -2183,25 +2183,68 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         end
     end
 
-    -- "Your press" capture (default): the hook goes up the moment YOU press block
-    -- (F / click / gamepad R1-X, or a touch on mobile) anywhere you can parry --
-    -- lobby parry zone, training or a round -- so the key is in from your first
-    -- press, no waiting for a ball. A key sends inside this same input dispatch;
-    -- a tap sends on release, so a touch keeps it up a little longer. Nothing
-    -- synthetic; inspect only accepts a genuine parry packet.
+    -- "Your press" capture (default). The hook goes up ONLY for an input the game
+    -- itself turns into a parry -- the same test its own handler uses
+    -- (SwordsController: `if not gameProcessed and UseBind(input, "Block") then
+    -- parry() end`, Bbs dump):
+    --   * keyboard / mouse / controller: one of your Block binds (game defaults
+    --     F, left click, R1; a rebound key is learned from your own real block
+    --     swings) and NOT swallowed by a GUI -- so opening a menu, clicking UI,
+    --     typing or emoting never puts it up;
+    --   * touch: only a press that lands on the game's Block button (tap-to-block
+    --     in the world is ignored). That button parries on release, so the hook
+    --     is already up when the packet goes.
+    -- And you must be able to parry right now (alive / training / lobby zone).
+    -- Nothing synthetic; inspect still only accepts a genuine parry packet.
+    Capture.binds = { F = true, MouseButton1 = true, ButtonR1 = true }
+    Capture.learn = {}
+    function Capture.on_block_button(pos)
+        Capture.gui = Capture.gui or cloneref(game:GetService("GuiService"))
+        local inset = Capture.gui:GetGuiInset()
+        for _, b in ipairs(CollectionService:GetTagged("BlockButton")) do
+            if b:IsA("GuiObject") and b.Visible then
+                local p, sz = b.AbsolutePosition, b.AbsoluteSize
+                for _, dy in ipairs({ 0, inset.Y }) do
+                    local x, y = pos.X, pos.Y + dy
+                    if x >= p.X - 6 and x <= p.X + sz.X + 6 and y >= p.Y - 6 and y <= p.Y + sz.Y + 6 then return true end
+                end
+            end
+        end
+        return false
+    end
     function Parry.onInput(input, processed)
-        if Core.cap or Capture.mode ~= "Your press" or not needs_capture() or not is_live() then return end
+        if not is_live() then return end
         local t, k = input.UserInputType, input.KeyCode
         local touch = t == Enum.UserInputType.Touch
-        local key = not processed and (k == Enum.KeyCode.F or t == Enum.UserInputType.MouseButton1
-            or k == Enum.KeyCode.ButtonR1 or k == Enum.KeyCode.ButtonX)
-        if not (touch or key) or not canParryNow() then return end
+        local name = (k ~= Enum.KeyCode.Unknown) and k.Name or t.Name
+        if not touch and not processed then Capture.last_in, Capture.last_in_at = name, clock_() end
+        if Core.cap or Capture.mode ~= "Your press" or not needs_capture() then return end
+        local block
+        if touch then
+            local ok, hit = pcall(Capture.on_block_button, input.Position)
+            block = ok and hit
+        else
+            block = not processed and Capture.binds[name] == true
+        end
+        if not block or not canParryNow() then return end
         local now = clock_()
         if now - Capture.last_press < 0.15 then return end
         Capture.last_press = now
-        if arm(touch and 0.6 or 0.3) and now - (Capture.notified or 0) > 5 then
+        if arm(touch and 0.8 or 0.3) and now - (Capture.notified or 0) > 5 then
             Capture.notified = now
-            logp("capture: reading your press (" .. capture_method() .. ")")
+            logp("capture: reading your block press (" .. capture_method() .. ")")
+        end
+    end
+    -- A real block swing just played (seen on the animator, no hooks): the
+    -- unprocessed key pressed right before it is a Block bind. Learned after two
+    -- swings on the same key, so a stray key can't sneak in.
+    function Parry.learnBind()
+        local n, at = Capture.last_in, Capture.last_in_at or -math.huge
+        if not n or Capture.binds[n] or clock_() - at > 0.2 then return end
+        Capture.learn[n] = (Capture.learn[n] or 0) + 1
+        if Capture.learn[n] >= 2 then
+            Capture.binds[n] = true
+            logp("capture: learned your block key " .. n)
         end
     end
 
@@ -2489,7 +2532,7 @@ function Engine.start()
             local animator = hum and hum:WaitForChild("Animator", 10)
             if not animator or not Engine.running then return end
             econnect(animator.AnimationPlayed, function(track)
-                if Anim.isGamePress(track) then Parry.gameSwing() end
+                if Anim.isGamePress(track) then Parry.gameSwing(); pcall(Parry.learnBind) end
             end)
         end)
     end
@@ -2871,7 +2914,7 @@ AP:AddDropdown("CaptureHook", {
 })
 AP:AddDropdown("CaptureTrigger", {
     Values = { "Your press", "Incoming ball", "Auto press" }, Default = "Your press", Text = "Capture on",
-    Tooltip = "When the one-time key capture happens. Your press: the first time you press block anywhere you can parry (no waiting for a ball). Incoming ball: when a ball is about to hit you. Auto press: the script presses block itself once (synthetic input).",
+    Tooltip = "When the one-time key capture happens. Your press: the first time you press block anywhere you can parry -- only your real Block key / the Block button, never UI clicks, menus or emotes. Incoming ball: when a ball is about to hit you. Auto press: the script presses block itself once (synthetic input).",
     Callback = function(v) Parry.Capture.mode = v end,
 })
 AP:AddButton({
