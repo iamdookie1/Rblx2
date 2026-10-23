@@ -31,7 +31,7 @@
 
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.60"
+local SCRIPT_VERSION = "rewrite-0.5.61"
 
 -- ---------------------------------------------------------------------------
 -- Single instance.
@@ -101,8 +101,15 @@ end
 -- ---------------------------------------------------------------------------
 local Features = {}
 local feature_log -- the log file writer (set once it exists, below)
+-- Round gate for features that listen to game signals / touch game objects:
+-- like the original (v91, e852d9c), which bisected the LOBBY reason-24 kick to
+-- exactly such listeners attached at load (ability-detection remotes,
+-- Runtime.ChildAdded, ...), they only run while you're in a round / training /
+-- lobby parry and are torn down the moment you leave. Set below once in_play
+-- exists; until then nothing round-only starts.
+local round_check = nil
 local function Feature(name)
-    local f = { name = name, on = false, _conns = {}, _insts = {}, _token = nil }
+    local f = { name = name, on = false, want = false, round_only = false, _conns = {}, _insts = {}, _token = nil }
     function f:connect(signal, fn)
         local c = signal:Connect(function(...)
             if not is_live() then return end
@@ -130,6 +137,8 @@ local function Feature(name)
     end
     function f:setEnabled(v)
         v = v and true or false
+        self.want = v
+        if v and self.round_only and not (round_check and round_check()) then v = false end
         if v == self.on then return end
         self.on = v
         if feature_log then pcall(feature_log, ("%s %s"):format(name, v and "ON" or "OFF")) end
@@ -2555,6 +2564,22 @@ local function in_play()
     end
     return false
 end
+round_check = in_play
+do
+    -- re-apply round-only features when you enter / leave a round
+    local function sync()
+        for _, f in pairs(Features) do
+            if f.round_only and (f.want or f.on) then pcall(function() f:setEnabled(f.want) end) end
+        end
+    end
+    local function on_change() task.defer(sync) end
+    local function watch_char(char) char.AncestryChanged:Connect(on_change) end
+    if LocalPlayer.Character then watch_char(LocalPlayer.Character) end
+    LocalPlayer.CharacterAdded:Connect(function(c) watch_char(c); on_change() end)
+    LocalPlayer:GetAttributeChangedSignal("LobbyTraining"):Connect(on_change)
+    LocalPlayer:GetAttributeChangedSignal("LobbyParry"):Connect(on_change)
+    on_change()
+end
 local function wconnect(signal, fn)
     local c = signal:Connect(function(...)
         if not is_live() then return end
@@ -2955,6 +2980,7 @@ local function is_local(player)
 end
 
 local DetInfinity = Feature("DetInfinity")
+DetInfinity.round_only = true -- game-signal listeners: rounds only (lobby kick)
 function DetInfinity.start()
     local R = get_remotes()
     if R and R:FindFirstChild("InfinityBall") then
@@ -2964,6 +2990,7 @@ end
 function DetInfinity.stop() Det.infinity = false end
 
 local DetDeathSlash = Feature("DetDeathSlash")
+DetDeathSlash.round_only = true -- game-signal listeners: rounds only (lobby kick)
 function DetDeathSlash.start()
     local R = get_remotes()
     if R and R:FindFirstChild("DeathBall") then
@@ -2973,6 +3000,7 @@ end
 function DetDeathSlash.stop() Det.deathslash = false end
 
 local DetTimeHole = Feature("DetTimeHole")
+DetTimeHole.round_only = true -- game-signal listeners: rounds only (lobby kick)
 function DetTimeHole.start()
     local net = get_net()
     if not net then return end
@@ -2984,6 +3012,7 @@ function DetTimeHole.stop() Det.timehole = false end
 -- Slashes of Fury: while it's on you, parry it out (spam path), capped and paced.
 local Slashes = { delay = 0.05, max = 36, count = 0, looping = false }
 local DetSlashes = Feature("DetSlashes")
+DetSlashes.round_only = true -- game-signal listeners: rounds only (lobby kick)
 local function run_slashes()
     if Slashes.looping or not Det.slashes then return end
     Slashes.looping = true
@@ -3015,6 +3044,7 @@ function DetSlashes.stop() Det.slashes, Slashes.count, Slashes.looping = false, 
 -- Anti-Phantom: when Phantom's transmission part gets welded to you, cut the
 -- weld and fire your ability the moment the ball is highlighted on you.
 local DetPhantom = Feature("DetPhantom")
+DetPhantom.round_only = true -- game-signal listeners: rounds only (lobby kick)
 function DetPhantom.start()
     local runtime = Workspace:FindFirstChild("Runtime")
     if not runtime then return end
@@ -3380,107 +3410,124 @@ local EspCfg = { Color = Color3.fromRGB(255, 255, 255), TextSize = 14, Height = 
     OnlyWithAbility = false, MaxDistance = 0, ShowActive = true, ShowCooldown = true }
 local AbilityESP = Feature("AbilityESP")
 do
-    -- One BillboardGui per player, adorned to the head: the ENGINE projects and
-    -- draws it, so it never jitters or flickers (the Drawing text was moved by us
-    -- every frame and came out tiny / glitchy on mobile). Parented straight to
-    -- CoreGui -- a billboard always renders there (not inside gethui, which can
-    -- be a ScreenGui where billboards never draw) and game scripts can't read it.
-    -- Text refreshes 10x a second and is only written when it changes.
-    -- Line 1: name / [equipped ability] / distance. Line 2: READY or cooldown
-    -- left, from the character's CooldownExpiration (server time). The equipped
-    -- ability is the Enabled script under character.Abilities.
-    local entries = {}
-    local function equipped(character)
+    -- Ported from the original Games/BladeBall.lua ability ESP (the one that
+    -- worked): one BillboardGui per player pointed at the head (Adornee), put in
+    -- the executor's hidden container (gethui, else CoreGui) WITHOUT protect_gui --
+    -- the rewrite's protect_gui / CoreGui variants never drew. Built when the
+    -- character spawns (WaitForChild Head); one shared 10 Hz Heartbeat updater
+    -- writes text / style only when they change.
+    -- Ability: the player's EquippedAbility attribute if the game sets it, else
+    -- the Enabled script under character.Abilities (what the game ships now).
+    local HUI = CoreGui
+    pcall(function() local h = gethui and gethui(); if typeof(h) == 'Instance' then HUI = h end end)
+    local entries = {}   -- player -> { billboard, label, character, head, text, color, size, height }
+    local function esc(t) return (tostring(t):gsub('&', '&amp;'):gsub('<', '&lt;'):gsub('>', '&gt;')) end
+    local function equipped(player, character)
+        local a = player:GetAttribute('EquippedAbility') or (character and character:GetAttribute('Ability'))
+        if a and a ~= '' then return tostring(a) end
         local ab = character and character:FindFirstChild('Abilities')
         if not ab then return nil end
-        for _, a in ipairs(ab:GetChildren()) do
-            local ok, en = pcall(function() return a.Enabled end)
-            if ok and en then return a.Name end
+        for _, s in ipairs(ab:GetChildren()) do
+            local ok, en = pcall(function() return s.Enabled end)
+            if ok and en then return s.Name end
         end
         return nil
     end
-    local function esc(t) return (tostring(t):gsub('&', '&amp;'):gsub('<', '&lt;'):gsub('>', '&gt;')) end
+    local function info(player, e)
+        local now = Workspace:GetServerTimeNow()
+        local clock = os.clock()
+        if clock - (e.ab_at or 0) > 1 then e.ab_at, e.ability = clock, equipped(player, e.character) end
+        local name = e.ability
+        if name then
+            local up = player:FindFirstChild('Upgrades')
+            local lv = up and up:FindFirstChild(name)
+            if lv and type(lv.Value) == 'number' and lv.Value > 0 then name = name .. ' V' .. lv.Value end
+        end
+        local status
+        if EspCfg.ShowCooldown then
+            local exp = e.character:GetAttribute('CooldownExpiration') or player:GetAttribute('CooldownExpiration')
+            if type(exp) == 'number' then
+                local left = exp - now
+                status = (left > 0 and left < 600) and ('<font color="#FF6A6A">CD %.1fs</font>'):format(left)
+                    or '<font color="#5CFF7A">READY</font>'
+            end
+        end
+        return name, status
+    end
     local function remove(player)
         local e = entries[player]
-        if e then pcall(function() e.bb:Destroy() end) end
+        if e then pcall(function() e.billboard:Destroy() end) end
         entries[player] = nil
     end
     local function clear_all() for p in pairs(entries) do remove(p) end end
-    local function build(player, head)
-        local bb = Instance.new('BillboardGui')
-        bb.Name = randName()
-        bb.Size = UDim2.fromOffset(240, 46)
-        bb.AlwaysOnTop = true
-        bb.LightInfluence = 0
-        bb.MaxDistance = math.huge
-        bb.ResetOnSpawn = false
-        bb.Adornee = head
-        local label = Instance.new('TextLabel')
-        label.Size = UDim2.fromScale(1, 1)
-        label.BackgroundTransparency = 1
-        label.Font = Enum.Font.GothamBold
-        label.RichText = true
-        label.TextStrokeTransparency = 0.2
-        label.TextYAlignment = Enum.TextYAlignment.Bottom
-        label.Parent = bb
-        pcall(function() if syn and syn.protect_gui then syn.protect_gui(bb) end end)
-        pcall(function() if protect_gui then protect_gui(bb) end end)
-        if not pcall(function() bb.Parent = CoreGui end) then pcall(function() bb.Parent = hui() end) end
-        return { bb = bb, label = label, head = head }
+    local function create(player)
+        task.spawn(function()
+            local character = player.Character
+            while AbilityESP.on and (not character or not character.Parent) do task.wait(0.5); character = player.Character end
+            if not character or not AbilityESP.on then return end
+            local head = character:WaitForChild('Head', 10)
+            if not head or not AbilityESP.on then return end
+            remove(player)
+            local billboard = Instance.new('BillboardGui')
+            billboard.Name = randName(); billboard.Adornee = head
+            billboard.Size = UDim2.new(0, 220, 0, 60)
+            billboard.StudsOffset = Vector3.new(0, EspCfg.Height, 0); billboard.AlwaysOnTop = true
+            billboard.Parent = HUI
+            local label = Instance.new('TextLabel')
+            label.Size = UDim2.new(1, 0, 1, 0); label.BackgroundTransparency = 1
+            label.TextColor3 = EspCfg.Color; label.TextSize = EspCfg.TextSize
+            label.TextStrokeTransparency = 0; label.Font = Enum.Font.Roboto
+            label.RichText = true; label.TextXAlignment = Enum.TextXAlignment.Center
+            label.TextYAlignment = Enum.TextYAlignment.Center; label.Parent = billboard
+            label.Visible = false
+            entries[player] = { billboard = billboard, label = label, character = character, head = head,
+                color = EspCfg.Color, size = EspCfg.TextSize, height = EspCfg.Height }
+        end)
     end
-    local function hex(c) return ("%02X%02X%02X"):format(math.floor(c.R * 255 + 0.5), math.floor(c.G * 255 + 0.5), math.floor(c.B * 255 + 0.5)) end
+    local function add(player)
+        if player == LocalPlayer then return end
+        AbilityESP:connect(player.CharacterAdded, function() create(player) end)
+        if player.Character then create(player) end
+    end
     local function update()
         local my = getRoot()
-        local now = Workspace:GetServerTimeNow()
-        local clock = os.clock()
-        for _, player in ipairs(Players:GetPlayers()) do
-            if player ~= LocalPlayer then
-                local character = player.Character
-                local head = character and (character:FindFirstChild('Head') or character.PrimaryPart)
-                local e = entries[player]
-                if not head or not head.Parent then
-                    if e then e.bb.Enabled = false end
-                else
-                    if e and e.head ~= head then remove(player); e = nil end -- respawned
-                    if not e then e = build(player, head); entries[player] = e end
-                    if e.char ~= character or clock - (e.ab_at or 0) > 1 then
-                        e.char, e.ab_at, e.ability = character, clock, equipped(character)
-                    end
-                    local dist = my and (my.Position - head.Position).Magnitude
-                    local show = not (EspCfg.MaxDistance > 0 and dist and dist > EspCfg.MaxDistance)
-                        and not (EspCfg.OnlyWithAbility and not e.ability)
-                    e.bb.Enabled = show
-                    if show then
-                        local parts = {}
-                        if EspCfg.ShowName then parts[#parts + 1] = esc(player.DisplayName) end
-                        if e.ability then parts[#parts + 1] = '[' .. esc(e.ability) .. ']' end
-                        if EspCfg.ShowDistance and dist then parts[#parts + 1] = ('%.0fm'):format(dist) end
-                        if #parts == 0 then parts[1] = esc(player.DisplayName) end
-                        local text = '<b>' .. table.concat(parts, ' ') .. '</b>'
-                        if EspCfg.ShowCooldown then
-                            local exp = character:GetAttribute('CooldownExpiration')
-                            if type(exp) == 'number' then
-                                local left = exp - now
-                                text = text .. ((left > 0 and left < 600) and ('\n<font color="#FF6A6A">CD %.1fs</font>'):format(left)
-                                    or '\n<font color="#5CFF7A">READY</font>')
-                            end
-                        end
-                        if text ~= e.text then e.text = text; e.label.Text = text end
-                        local key = hex(EspCfg.Color) .. EspCfg.TextSize .. EspCfg.Height
-                        if key ~= e.style then
-                            e.style = key
-                            e.label.TextColor3, e.label.TextSize = EspCfg.Color, EspCfg.TextSize
-                            e.bb.StudsOffset = Vector3.new(0, EspCfg.Height, 0)
-                        end
-                    end
+        for player, e in pairs(entries) do
+            local character, head = e.character, e.head
+            if not (character and character.Parent and head and head.Parent) or player.Parent ~= Players then
+                remove(player)
+            else
+                local dist = my and (my.Position - head.Position).Magnitude
+                local name, status = info(player, e)
+                local visible = not (EspCfg.MaxDistance > 0 and dist and dist > EspCfg.MaxDistance)
+                    and not (EspCfg.OnlyWithAbility and not name)
+                if e.label.Visible ~= visible then e.label.Visible = visible end
+                if visible then
+                    if e.color ~= EspCfg.Color then e.color = EspCfg.Color; e.label.TextColor3 = EspCfg.Color end
+                    if e.size ~= EspCfg.TextSize then e.size = EspCfg.TextSize; e.label.TextSize = EspCfg.TextSize end
+                    if e.height ~= EspCfg.Height then e.height = EspCfg.Height; e.billboard.StudsOffset = Vector3.new(0, EspCfg.Height, 0) end
+                    local parts = {}
+                    if EspCfg.ShowName then parts[#parts + 1] = esc(player.DisplayName) end
+                    if name then parts[#parts + 1] = '[' .. esc(name) .. ']' end
+                    if EspCfg.ShowDistance and dist then parts[#parts + 1] = ('%.0fm'):format(dist) end
+                    if #parts == 0 then parts[1] = esc(player.DisplayName) end
+                    local text = '<b>' .. table.concat(parts, ' ') .. '</b>'
+                    if status then text = text .. '\n' .. status end
+                    if text ~= e.text then e.text = text; e.label.Text = text end
                 end
             end
         end
-        for player in pairs(entries) do if player.Parent ~= Players then remove(player) end end
     end
     function AbilityESP.start()
-        AbilityESP:connect(Players.PlayerRemoving, function(p) remove(p) end)
-        AbilityESP:loop(0.1, update)
+        for _, player in ipairs(Players:GetPlayers()) do add(player) end
+        AbilityESP:connect(Players.PlayerAdded, add)
+        AbilityESP:connect(Players.PlayerRemoving, remove)
+        local acc = 0
+        AbilityESP:connect(RunService.Heartbeat, function(dt)
+            acc = acc + dt
+            if acc < 0.1 then return end
+            acc = 0
+            pcall(update)
+        end)
     end
     function AbilityESP.stop() clear_all() end
 end
@@ -3620,6 +3667,7 @@ Anim.skin = function() return (SkinChanger.on and Skin.name ~= "") and Skin.name
 
 -- No render: turn off the game's ability / parry effects
 local NoRender = Feature("NoRender")
+NoRender.round_only = true -- game-signal listeners: rounds only (lobby kick)
 -- What "No render" removes is picked in the dropdown below. Everything it turns
 -- off is remembered and put back exactly when it's turned off or the pick changes.
 local NR_SEL = { ["Ability effects"] = true, ["Parry effects"] = true }
