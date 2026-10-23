@@ -31,7 +31,7 @@
 
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.64"
+local SCRIPT_VERSION = "rewrite-0.5.65"
 
 -- ---------------------------------------------------------------------------
 -- Single instance.
@@ -1954,20 +1954,14 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         return true
     end
 
-    -- The decision for a ball on us. via: "retarget" (it just turned to us),
-    -- "velocity" (its new direction just replicated), or nil (a frame point).
-    -- The decision for a ball on us. via: "retarget" (it just switched to us),
-    -- "velocity" (its new direction just replicated), or nil (a frame point).
+    -- The decision for a ball on us. via: "velocity" (its new direction just
+    -- replicated) or nil (a frame point: PreSimulation / PostSimulation /
+    -- PreRender).
     -- An EARLY parry is the fatal one: fire before the ball can arrive inside the
     -- window and the parry runs out, the lockout follows and the ball kills you.
     -- So every rule below only fires when arrival inside the window is certain:
     --   * CLOSE (within ~25 studs): it can't curve far -- fire as soon as even its
-    --     straight-in arrival is inside the first half of the window. This holds
-    --     at a retarget too: close range is where retarget fires instantly.
-    --   * RETARGET when not close: its velocity still points at the old target,
-    --     so nothing about its path is known yet -- wait the frame or two for the
-    --     new velocity instead of guessing (the guess fired far curving balls
-    --     way early).
+    --     straight-in arrival is inside the first half of the window.
     --   * otherwise: eta along its homing curve, simulated on the SLOW-turn side
     --     (never faster than the default turn), so the estimate errs late; the
     --     last-moment rule (straight-in arrival about to beat our reach) backs it
@@ -1992,13 +1986,12 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         local earliest = time_to_contact(dist, gap, speed, accel)
         local lead = math.min(fire_lead(speed), reach + W * 0.85)
         local info = { speed = speed, dist = dist, heading = heading, lead = lead, eta = earliest }
-        local tag = via == "retarget" and "retarget" or (via == "velocity" and "auto parry (velocity)" or "auto parry")
+        local tag = via == "velocity" and "auto parry (velocity)" or "auto parry"
         -- touching
         if rem <= 3 then return fire(st, now, tag .. " (contact)", info, ball) end
         -- close: arrival inside the window is certain
         local close = dist <= 25 + speed * 0.03
         if close and earliest <= reach + W * 0.5 then return fire(st, now, tag .. " (close)", info, ball) end
-        if via == "retarget" then return end -- not close: wait for its real velocity
         -- last moment: coming in and about to beat our reach
         local margin = math.max(frame_dt * 2, jitter()) + 0.02
         if heading > 0.3 and earliest <= reach + margin then return fire(st, now, tag .. " (now)", info, ball) end
@@ -2016,7 +2009,8 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
             eta = math.max(sim_prop(bpos, v, rpos, gap, k, accel, reach + W + 0.8) or math.huge, earliest)
         end
         info.eta = eta
-        if eta <= lead then return fire(st, now, tag, info, ball) end
+        -- half a frame ahead: the next check may already be too late
+        if eta <= lead + frame_dt * 0.5 then return fire(st, now, tag, info, ball) end
         -- classic distance net for a ball coming dead straight in
         if heading >= 0.9 and dist <= parry_distance(speed) and earliest <= reach + W * 0.6 then
             return fire(st, now, tag, info, ball)
@@ -2067,10 +2061,11 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         if new == me then
             if SP.auto then clash_check(ball, now) end
             if has_clash(ball, now) then spam_instant() end
-            local root = ap_root()
-            if root then
-                if S.triggerbot then trigger(ball, st, now)
-                elseif S.autoparry then decide(ball, st, root, now, "retarget") end
+            -- (no auto-parry decision here: retarget removed -- the frame points
+            -- and the velocity update decide, with the ball's real path)
+            if S.triggerbot then
+                local root = ap_root()
+                if root then trigger(ball, st, now) end
             end
             if SP.manual then spam_instant() end
         elseif SP.auto then
@@ -2531,8 +2526,11 @@ function Engine.start()
     if LocalPlayer.Character then watch_animator(LocalPlayer.Character) end
     econnect(LocalPlayer.CharacterAdded, function(char) Anim.reset(); watch_animator(char) end)
     econnect(RunService.PreSimulation, function(dt) Parry.frame(dt, 1) end)
+    -- decide at PreSimulation (replicated ball data has just landed),
+    -- PostSimulation (after physics) and PreRender (what's about to be drawn):
+    -- three checks a frame, plus the instant one on each velocity update
+    pcall(function() econnect(RunService.PostSimulation, function() Parry.frame(nil, 2) end) end)
     econnect(RunService.Heartbeat, function()
-        Parry.frame(nil, 2)
         local now = clock_()
         if UiTick and now - Engine.tick_at > 0.1 then Engine.tick_at = now; pcall(UiTick, Parry.spamRate()) end
         if StatusHook and now - Engine.status_at > 0.25 then Engine.status_at = now; pcall(StatusHook, Parry.status()) end
