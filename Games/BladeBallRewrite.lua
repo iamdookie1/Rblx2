@@ -31,7 +31,7 @@
 
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.69"
+local SCRIPT_VERSION = "rewrite-0.5.70"
 
 -- ---------------------------------------------------------------------------
 -- Single instance.
@@ -107,7 +107,32 @@ local feature_log -- the log file writer (set once it exists, below)
 -- Runtime.ChildAdded, ...), they only run while you're in a round / training /
 -- lobby parry and are torn down the moment you leave. Set below once in_play
 -- exists; until then nothing round-only starts.
-local round_check = nil
+-- LOAD STAGGER. The original found (v27, 8d104a4): every build that switched
+-- everything on in the first second after load got a BAC reason-24 kick (X24)
+-- ~27s later, parries or not; a staged run that armed late with gaps between
+-- steps never did. Same pattern here (all on at +0.4s, X24 at +31s). So
+-- anything switched on during the load window (the config autoload) is queued
+-- and started one at a time after the delay. Toggling later is instant.
+-- getgenv().BBStagger = seconds before the first start (0 = off).
+local Stagger = { t0 = os.clock(), delay = tonumber(getgenv().BBStagger) or 30, gap = 6, queue = {}, running = false,
+    round_check = nil } -- round_check: set once in_play exists (round gate, below)
+function Stagger.active() return Stagger.delay > 0 and os.clock() - Stagger.t0 < Stagger.delay end
+function Stagger.push(key, label, fn)
+    for i, e in ipairs(Stagger.queue) do if e.key == key then table.remove(Stagger.queue, i); break end end
+    Stagger.queue[#Stagger.queue + 1] = { key = key, label = label, fn = fn }
+    if Stagger.running then return end
+    Stagger.running = true
+    task.spawn(function()
+        task.wait(math.max(Stagger.delay - (os.clock() - Stagger.t0), 0))
+        while #Stagger.queue > 0 do
+            local e = table.remove(Stagger.queue, 1)
+            if feature_log then pcall(feature_log, "staged start: " .. tostring(e.label)) end
+            pcall(e.fn)
+            if #Stagger.queue > 0 then task.wait(Stagger.gap) end
+        end
+        Stagger.running = false
+    end)
+end
 local function Feature(name)
     local f = { name = name, on = false, want = false, round_only = false, _conns = {}, _insts = {}, _token = nil }
     function f:connect(signal, fn)
@@ -138,7 +163,11 @@ local function Feature(name)
     function f:setEnabled(v)
         v = v and true or false
         self.want = v
-        if v and self.round_only and not (round_check and round_check()) then v = false end
+        if v and not self.on and Stagger.active() then
+            Stagger.push(self, name, function() self:setEnabled(self.want) end)
+            return
+        end
+        if v and self.round_only and not (Stagger.round_check and Stagger.round_check()) then v = false end
         if v == self.on then return end
         self.on = v
         if feature_log then pcall(feature_log, ("%s %s"):format(name, v and "ON" or "OFF")) end
@@ -2570,7 +2599,7 @@ local function in_play()
     end
     return false
 end
-round_check = in_play
+Stagger.round_check = in_play
 do
     -- Re-apply round-only features when you enter / leave a round. POLLED (a
     -- plain loop, no game-signal listener): listeners on game signals attached
@@ -2644,7 +2673,16 @@ function Engine.disarm()
     if StatusHook then pcall(StatusHook, nil, false) end
     Flight.write("all parry/spam features off -- engine off; hook: " .. Parry.hookState())
 end
+Engine.pending = {}
 function Engine.want(name, on)
+    Engine.pending[name] = on and true or false
+    if on and Stagger.active() then
+        Stagger.push("engine:" .. name, name, function() Engine.want_now(name, Engine.pending[name]) end)
+        return
+    end
+    Engine.want_now(name, on)
+end
+function Engine.want_now(name, on)
     if (Engine.users[name] ~= nil) ~= (on and true or false) then Flight.write(("%s %s"):format(name, on and "ON" or "OFF")) end
     Engine.users[name] = on and true or nil
     if next(Engine.users) ~= nil then Engine.arm() else Engine.disarm() end
@@ -2655,6 +2693,9 @@ do
     local exec = "?"
     pcall(function() exec = table.concat({ identifyexecutor() }, " ") end)
     Flight.write(("loaded | executor %s | place %s"):format(exec, tostring(game.PlaceId)))
+    if Stagger.delay > 0 then
+        Flight.write(("load stagger: config features start %ds after load, %ds apart (getgenv().BBStagger = seconds, 0 = off)"):format(Stagger.delay, Stagger.gap))
+    end
     pcall(function()
         local GuiService = cloneref(game:GetService("GuiService"))
         Flight.kick_conn = GuiService.ErrorMessageChanged:Connect(function(msg)
@@ -2865,7 +2906,8 @@ AP:AddToggle("UnlockFPS", {
     Text = "Unlock FPS", Default = true,
     Tooltip = "Raises the frame cap to 240. Auto parry checks the ball 4 times every frame, so more frames = more checks a second (60 FPS: 240/s, 240 FPS: 960/s).",
     Callback = function(v)
-        pcall(function() if type(setfpscap) == "function" then setfpscap(v and 240 or 60) end end)
+        local function apply() pcall(function() if type(setfpscap) == "function" then setfpscap(v and 240 or 60) end end) end
+        if v and Stagger.active() then Stagger.push("fps", "Unlock FPS", apply) else apply() end
     end,
 })
 AP:AddToggle("Triggerbot", {
