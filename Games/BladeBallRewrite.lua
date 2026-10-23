@@ -31,7 +31,7 @@
 
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.75"
+local SCRIPT_VERSION = "rewrite-0.5.76"
 
 -- ---------------------------------------------------------------------------
 -- Single instance.
@@ -2105,12 +2105,8 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
             if now < st.preparry_until then return end
             st.preparried = false
         end
-        -- Built in: a close, fast exchange. When the partner's return would
-        -- reach us before "target = you" can even arrive (ping), waiting for the
-        -- retarget is always too late, so the parry goes ahead of the return --
-        -- one per exchange, timed so its window covers the return -- no spam.
-        -- The Pre-parry toggles add the same for slower balls / their range.
-        local manual = S.preparry or (S.hp_preparry and (Lag.avg or ping_s()) >= 0.08)
+        -- only when the Pre-parry toggles ask for it (never built in)
+        if not (S.preparry or (S.hp_preparry and (Lag.avg or ping_s()) >= 0.08)) then return end
         if not Core.cap or blocked_by_detection() then return end
         local target = st.target
         if type(target) ~= 'string' or target == '' or target == me then return end
@@ -2120,16 +2116,7 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         local speed = vel.Magnitude
         if speed < 1 then return end
         local gap = (their.Position - root.Position).Magnitude
-        if manual then
-            if gap > math.max(S.preparry_range or 20, speed >= 120 and clash_range(speed) or 0) then return end
-        elseif speed < 120 or gap > clash_range(speed) then
-            return
-        else
-            -- only a real exchange: it came to them from us, and they're facing
-            -- us / nobody else is near them to send it to
-            local o = ball_owners(st)[2]
-            if not (o and o.name == me) or not return_comes_to_us(their, root, target, gap) then return end
-        end
+        if gap > (S.preparry_range or 20) then return end
         local to_them = their.Position - ball.Position
         local d_them = to_them.Magnitude
         if d_them > 3 and vel:Dot(to_them / d_them) < speed * 0.3 then return end
@@ -2146,7 +2133,7 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
             st.preparried = true
             st.preparry_until = now + math.max((W or 0.5) + reach + 0.15, (n2 or 1.3) + 0.08)
             Core.last_parry = { t = now, via = "pre-parry", info = { eta = eta, lead = lead } }
-            logp(("pre-parry%s: return in %.2fs, lead %.2fs, gap %.0f, spd %.0f"):format(manual and "" or " (exchange)", eta, lead, gap, speed))
+            logp(("pre-parry: return in %.2fs, lead %.2fs, gap %.0f, spd %.0f"):format(eta, lead, gap, speed))
         end
     end
 
