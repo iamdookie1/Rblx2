@@ -31,7 +31,7 @@
 
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.59"
+local SCRIPT_VERSION = "rewrite-0.5.60"
 
 -- ---------------------------------------------------------------------------
 -- Single instance.
@@ -3380,15 +3380,15 @@ local EspCfg = { Color = Color3.fromRGB(255, 255, 255), TextSize = 14, Height = 
     OnlyWithAbility = false, MaxDistance = 0, ShowActive = true, ShowCooldown = true }
 local AbilityESP = Feature("AbilityESP")
 do
-    -- Remade on the executor's Drawing API: the text is drawn by the executor on
-    -- top of the screen, so it always renders, and there is no GUI instance at
-    -- all for the game to find (BillboardGuis in gethui never drew on some
-    -- executors). Falls back to a BillboardGui in CoreGui only with no Drawing.
-    -- Each frame, per other player: project a point above the head to the screen
-    -- and draw two lines -- name / ability (+ distance), and its state from the
-    -- character's CooldownExpiration (server time): READY or the seconds left.
-    -- The equipped ability is the Enabled script under character.Abilities.
-    local HAS_DRAW = type(Drawing) == "table" and type(Drawing.new) == "function"
+    -- One BillboardGui per player, adorned to the head: the ENGINE projects and
+    -- draws it, so it never jitters or flickers (the Drawing text was moved by us
+    -- every frame and came out tiny / glitchy on mobile). Parented straight to
+    -- CoreGui -- a billboard always renders there (not inside gethui, which can
+    -- be a ScreenGui where billboards never draw) and game scripts can't read it.
+    -- Text refreshes 10x a second and is only written when it changes.
+    -- Line 1: name / [equipped ability] / distance. Line 2: READY or cooldown
+    -- left, from the character's CooldownExpiration (server time). The equipped
+    -- ability is the Enabled script under character.Abilities.
     local entries = {}
     local function equipped(character)
         local ab = character and character:FindFirstChild('Abilities')
@@ -3399,113 +3399,88 @@ do
         end
         return nil
     end
-    local function new_text()
-        if HAS_DRAW then
-            local t = Drawing.new("Text")
-            t.Center, t.Outline, t.Visible = true, true, false
-            pcall(function() t.Font = 2 end)
-            pcall(function() t.OutlineColor = Color3.new(0, 0, 0) end)
-            return t
-        end
-        return nil
-    end
-    local function kill(o) if o then pcall(function() o:Remove() end); pcall(function() o:Destroy() end) end end
+    local function esc(t) return (tostring(t):gsub('&', '&amp;'):gsub('<', '&lt;'):gsub('>', '&gt;')) end
     local function remove(player)
         local e = entries[player]
-        if e then kill(e.top); kill(e.bot); kill(e.bb) end
+        if e then pcall(function() e.bb:Destroy() end) end
         entries[player] = nil
     end
     local function clear_all() for p in pairs(entries) do remove(p) end end
-    local function entry(player)
-        local e = entries[player]
-        if e then return e end
-        e = { top = new_text(), bot = new_text() }
-        if not HAS_DRAW then
-            local bb = Instance.new('BillboardGui')
-            bb.Name = randName(); bb.Size = UDim2.new(0, 220, 0, 44); bb.AlwaysOnTop = true
-            local l = Instance.new('TextLabel')
-            l.Size = UDim2.new(1, 0, 1, 0); l.BackgroundTransparency = 1; l.RichText = true
-            l.TextStrokeTransparency = 0; l.Font = Enum.Font.GothamBold; l.Parent = bb
-            pcall(function() if protect_gui then protect_gui(bb) end end)
-            pcall(function() bb.Parent = CoreGui end)
-            e.bb, e.label = bb, l
-        end
-        entries[player] = e
-        return e
+    local function build(player, head)
+        local bb = Instance.new('BillboardGui')
+        bb.Name = randName()
+        bb.Size = UDim2.fromOffset(240, 46)
+        bb.AlwaysOnTop = true
+        bb.LightInfluence = 0
+        bb.MaxDistance = math.huge
+        bb.ResetOnSpawn = false
+        bb.Adornee = head
+        local label = Instance.new('TextLabel')
+        label.Size = UDim2.fromScale(1, 1)
+        label.BackgroundTransparency = 1
+        label.Font = Enum.Font.GothamBold
+        label.RichText = true
+        label.TextStrokeTransparency = 0.2
+        label.TextYAlignment = Enum.TextYAlignment.Bottom
+        label.Parent = bb
+        pcall(function() if syn and syn.protect_gui then syn.protect_gui(bb) end end)
+        pcall(function() if protect_gui then protect_gui(bb) end end)
+        if not pcall(function() bb.Parent = CoreGui end) then pcall(function() bb.Parent = hui() end) end
+        return { bb = bb, label = label, head = head }
     end
-    local function hide(e)
-        if e.top then e.top.Visible = false end
-        if e.bot then e.bot.Visible = false end
-        if e.bb then e.bb.Enabled = false end
-    end
-    local GREEN, RED, GREY = Color3.fromRGB(92, 255, 122), Color3.fromRGB(255, 106, 106), Color3.fromRGB(180, 180, 180)
-    local function state(character, now)
-        if not EspCfg.ShowCooldown then return nil end
-        local exp = character:GetAttribute('CooldownExpiration')
-        if type(exp) ~= 'number' then return nil end
-        local left = exp - now
-        if left > 0 and left < 600 then return ("CD %.1fs"):format(left), RED end
-        return "READY", GREEN
-    end
-    local function draw()
-        local cam = Workspace.CurrentCamera
-        if not cam then return end
+    local function hex(c) return ("%02X%02X%02X"):format(math.floor(c.R * 255 + 0.5), math.floor(c.G * 255 + 0.5), math.floor(c.B * 255 + 0.5)) end
+    local function update()
         local my = getRoot()
         local now = Workspace:GetServerTimeNow()
         local clock = os.clock()
         for _, player in ipairs(Players:GetPlayers()) do
             if player ~= LocalPlayer then
-                local e = entry(player)
                 local character = player.Character
                 local head = character and (character:FindFirstChild('Head') or character.PrimaryPart)
-                local shown = false
-                if head and head.Parent then
+                local e = entries[player]
+                if not head or not head.Parent then
+                    if e then e.bb.Enabled = false end
+                else
+                    if e and e.head ~= head then remove(player); e = nil end -- respawned
+                    if not e then e = build(player, head); entries[player] = e end
                     if e.char ~= character or clock - (e.ab_at or 0) > 1 then
                         e.char, e.ab_at, e.ability = character, clock, equipped(character)
                     end
                     local dist = my and (my.Position - head.Position).Magnitude
-                    local far = EspCfg.MaxDistance > 0 and dist and dist > EspCfg.MaxDistance
-                    if not far and not (EspCfg.OnlyWithAbility and not e.ability) then
-                        local world = head.Position + Vector3.new(0, EspCfg.Height, 0)
-                        local p, onscreen = cam:WorldToViewportPoint(world)
-                        if onscreen and p.Z > 0 then
-                            local parts = {}
-                            if EspCfg.ShowName then parts[#parts + 1] = player.DisplayName end
-                            if e.ability then parts[#parts + 1] = "[" .. e.ability .. "]" end
-                            if EspCfg.ShowDistance and dist then parts[#parts + 1] = ("%.0fm"):format(dist) end
-                            if #parts == 0 then parts[1] = player.DisplayName end
-                            local line1 = table.concat(parts, " ")
-                            local line2, col = state(character, now)
-                            local size = EspCfg.TextSize
-                            if HAS_DRAW then
-                                e.top.Text, e.top.Size, e.top.Color = line1, size, EspCfg.Color
-                                e.top.Position = Vector2.new(p.X, p.Y - size)
-                                e.top.Visible = true
-                                if line2 then
-                                    e.bot.Text, e.bot.Size, e.bot.Color = line2, size - 1, col or GREY
-                                    e.bot.Position = Vector2.new(p.X, p.Y + 1)
-                                    e.bot.Visible = true
-                                else
-                                    e.bot.Visible = false
-                                end
-                            elseif e.bb then
-                                e.bb.Adornee, e.bb.StudsOffset, e.bb.Enabled = head, Vector3.new(0, EspCfg.Height, 0), true
-                                e.label.TextSize, e.label.TextColor3 = size, EspCfg.Color
-                                local hex = col and ("#%02X%02X%02X"):format(math.floor(col.R * 255 + 0.5), math.floor(col.G * 255 + 0.5), math.floor(col.B * 255 + 0.5))
-                                e.label.Text = line1 .. (line2 and ('\n<font color="' .. hex .. '">' .. line2 .. '</font>') or "")
+                    local show = not (EspCfg.MaxDistance > 0 and dist and dist > EspCfg.MaxDistance)
+                        and not (EspCfg.OnlyWithAbility and not e.ability)
+                    e.bb.Enabled = show
+                    if show then
+                        local parts = {}
+                        if EspCfg.ShowName then parts[#parts + 1] = esc(player.DisplayName) end
+                        if e.ability then parts[#parts + 1] = '[' .. esc(e.ability) .. ']' end
+                        if EspCfg.ShowDistance and dist then parts[#parts + 1] = ('%.0fm'):format(dist) end
+                        if #parts == 0 then parts[1] = esc(player.DisplayName) end
+                        local text = '<b>' .. table.concat(parts, ' ') .. '</b>'
+                        if EspCfg.ShowCooldown then
+                            local exp = character:GetAttribute('CooldownExpiration')
+                            if type(exp) == 'number' then
+                                local left = exp - now
+                                text = text .. ((left > 0 and left < 600) and ('\n<font color="#FF6A6A">CD %.1fs</font>'):format(left)
+                                    or '\n<font color="#5CFF7A">READY</font>')
                             end
-                            shown = true
+                        end
+                        if text ~= e.text then e.text = text; e.label.Text = text end
+                        local key = hex(EspCfg.Color) .. EspCfg.TextSize .. EspCfg.Height
+                        if key ~= e.style then
+                            e.style = key
+                            e.label.TextColor3, e.label.TextSize = EspCfg.Color, EspCfg.TextSize
+                            e.bb.StudsOffset = Vector3.new(0, EspCfg.Height, 0)
                         end
                     end
                 end
-                if not shown then hide(e) end
             end
         end
         for player in pairs(entries) do if player.Parent ~= Players then remove(player) end end
     end
     function AbilityESP.start()
         AbilityESP:connect(Players.PlayerRemoving, function(p) remove(p) end)
-        AbilityESP:connect(RunService.RenderStepped, function() pcall(draw) end)
+        AbilityESP:loop(0.1, update)
     end
     function AbilityESP.stop() clear_all() end
 end
