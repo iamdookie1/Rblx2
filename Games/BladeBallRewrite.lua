@@ -31,7 +31,7 @@
 
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.51"
+local SCRIPT_VERSION = "rewrite-0.5.52"
 
 -- ---------------------------------------------------------------------------
 -- Single instance.
@@ -292,7 +292,7 @@ do
     local S = {
         autoparry = false, triggerbot = false, parry_mode = "Remote",
         preparry = false, preparry_range = 20, hp_preparry = false,
-        anticurve = "Smart", dot_threshold = 0.5, curve_bias = 0.5, close_anticurve = true, close_range = 30,
+        anticurve = "Smart", dot_threshold = 0.5, curve_bias = 0.5, close_anticurve = true, close_range = 30, instant_retarget = true,
         accuracy = 50, accuracy_base = 50, divisor_multiplier = 1.1, timing_mult = 1,
         extra_distance = 0, ping_compensation = false, retry_delay = 1,
         random_accuracy = false, random_accuracy_amount = 10,
@@ -300,7 +300,7 @@ do
         auto_ability = false, cooldown_protection = false,
     }
     local SP = {
-        manual = false, auto = false, mode = "Remote", max_rate = 1000,
+        manual = false, auto = false, mode = "Remote", max_rate = 1000, speed_mode = "Max",
         smart = true, range_bonus = 0, hold = 0.15, sensitivity = 1.3, predictive = true,
     }
     -- detection state (written by the detection features, read here)
@@ -851,7 +851,8 @@ end]]
     -- Kept from the rewrite so nothing outside the hook changes. The v63 hook does
     -- not size its own window or track dry/lat, so capture_window is a fixed hold
     -- and the Capture table just carries the fields prime_capture / spam read.
-    local Capture = { armed_at = 0, dry = 0, last_spam_key = -math.huge, lat = nil, last_press = -math.huge, since = nil }
+    local Capture = { mode = "Your press", armed_at = 0, dry = 0, last_spam_key = -math.huge, lat = nil, last_press = -math.huge, since = nil }
+    Parry.Capture = Capture
     local function capture_window() return 0.2 end
     local function pressBlockKey()
         if not is_live() then return false end
@@ -1785,8 +1786,8 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
             if gc_acquire() then ok = send(true) == "sent"; remote = ok end
         elseif not Core.cap then
             -- no capture yet. Default: wait for the player's own real parry (no
-            -- synthetic press). CaptureInject bootstraps with a native press.
-            if not getgenv().CaptureInject then return false end
+            -- synthetic press). "Auto press" capture bootstraps with a native press.
+            if Capture.mode ~= "Auto press" then return false end
             if clock_() - Capture.last_spam_key < 0.3 then return false end
             Capture.last_spam_key = clock_()
             ok = key_parry(true)
@@ -1809,6 +1810,28 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
     --     keeps its credit instead of being counted as sent (0.5.2 lost ~5% there).
     -- Simulated against real frame timing (3 signal points a frame, jitter,
     -- hitches, blocked moments): 100% of target from 30 to 240 FPS, 300-2000/s.
+    -- Spam speed modes. Fixed modes are exact rates. "Max" is the highest rate the
+    -- connection takes before it desyncs: it climbs toward 2000/s and backs off
+    -- (x0.75) the moment the server-measured ping jumps over its idle baseline --
+    -- the sign the upload queue is backing up -- then climbs again. Never below
+    -- 250/s, so it still out-spams any clash.
+    SP.speeds = { Legit = 30, Normal = 100, Fast = 300, Blatant = 700 }
+    SP.adapt = { rate = 1000, base = nil, at = 0 }
+    function SP.rate_now(now)
+        local fixed = SP.speeds[SP.speed_mode]
+        if fixed then return fixed end
+        local A = SP.adapt
+        if now - A.at >= 0.25 then
+            A.at = now
+            local p = pingMs()
+            if p > 0 then
+                if not A.base or p < A.base then A.base = p else A.base = A.base + (p - A.base) * 0.003 end
+                if p > A.base * 1.35 + 35 then A.rate = math.max(math.floor(A.rate * 0.75), 250)
+                else A.rate = math.min(A.rate + 40, 2000) end
+            end
+        end
+        return A.rate
+    end
     local function spam_tick(now)
         local elapsed = math.min(now - Pump.last, 0.25)
         Pump.last = now
@@ -1821,7 +1844,7 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         if source == "manual" and SP.smart and not focus then Pump.on, Pump.waiting = false, true; return end
         Pump.waiting = false
         -- the rate is EXACTLY the slider value (20-2000/s), no network throttle.
-        local rate = math.clamp(SP.max_rate or 1000, 1, 2000)
+        local rate = math.clamp(SP.rate_now(now), 1, 2000)
         if SP.mode == "Keypress" then rate = math.min(rate, 1 / frame_dt) end
         rate = math.max(rate, 1)
         -- STRICT time bucket: the number allowed so far is rate x (time since the
@@ -1830,7 +1853,8 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         -- fire is blocked (stunned, respawn, no capture), the owed backlog is
         -- forgiven -- the start slides to now -- so it never bursts over the rate
         -- once it can fire again.
-        if not Pump.on or Pump.rate ~= rate then Pump.on, Pump.rate, Pump.t0, Pump.sent = true, rate, now, 0 end
+        if not Pump.on then Pump.on, Pump.rate, Pump.t0, Pump.sent = true, rate, now, 0
+        elseif Pump.rate ~= rate then Pump.rate, Pump.t0 = rate, now - Pump.sent / rate end -- re-rate, no burst
         local allowed = math.floor((now - Pump.t0) * rate) + 1
         local sent = false
         while Pump.sent < allowed do
@@ -1851,8 +1875,9 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         -- counted against the same bucket (at most one ahead of it), so instant
         -- fires on retarget / parry success never push the average over the slider
         local now = clock_()
-        local rate = math.max(math.clamp(SP.max_rate or 1000, 1, 2000), 1)
-        if not Pump.on or Pump.rate ~= rate then Pump.on, Pump.rate, Pump.t0, Pump.sent = true, rate, now, 0 end
+        local rate = math.max(math.clamp(SP.rate_now(now), 1, 2000), 1)
+        if not Pump.on then Pump.on, Pump.rate, Pump.t0, Pump.sent = true, rate, now, 0
+        elseif Pump.rate ~= rate then Pump.rate, Pump.t0 = rate, now - Pump.sent / rate end
         if Pump.sent > math.floor((now - Pump.t0) * rate) + 1 then return end
         if fire_one() then
             Pump.sent = Pump.sent + 1
@@ -1887,14 +1912,14 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         -- Wait-for-your-parry hook capture (the default): never synthesize a press
         -- to capture or refresh -- forge only once the player's own parry has been
         -- read. With no key yet, do nothing and let prime_capture read the next
-        -- real block. getgenv().CaptureInject restores the synthetic bootstrap.
+        -- real block. The "Auto press" capture mode restores the synthetic bootstrap.
         local hookmode = capture_method() ~= "getgc" and S.parry_mode ~= "Keypress"
-        if hookmode and not getgenv().CaptureInject and not Core.cap then return false end
+        if hookmode and Capture.mode ~= "Auto press" and not Core.cap then return false end
         -- no capture yet, or the last remote parry went unanswered (the capture
         -- may be stale): this parry is a native press, which parries by itself
-        -- and takes / refreshes the capture on the way. Only with CaptureInject;
+        -- and takes / refreshes the capture on the way. Only in "Auto press" capture mode;
         -- getgc never goes "fresh" (it calls the game's own sender).
-        local fresh = hookmode and getgenv().CaptureInject and (not Core.cap or Core.misses >= 1)
+        local fresh = hookmode and Capture.mode == "Auto press" and (not Core.cap or Core.misses >= 1)
         if try_ability() then how = "ability"
         elseif S.parry_mode == "Keypress" or fresh then
             if not gate_open() or not canParryNow() then return false end
@@ -1953,25 +1978,22 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         -- (Original BladeBall's point_blank = dist <= max(10, speed*0.12).)
         local point_blank = dist <= math.max(10, speed * 0.12)
         if rem <= 3 or point_blank then
-            return fire(st, now, via == "retarget" and "instant retarget" or "point blank", info, ball)
+            return fire(st, now, "point blank", info, ball)
         end
         if via == "retarget" then
-            -- ORIGINAL BladeBall's fast retarget, restored: the instant the ball's
-            -- target flips to us -- the first thing the client gets, before its new
-            -- direction replicates -- fire if it would arrive within our lead and
-            -- it is heading in AT ALL (heading >= 0), not just clearly (>= 0.5).
-            -- Its velocity may still be the pre-flip one, so eta is the simple
-            -- distance/speed with a +20% penalty when it still reads as flying
-            -- away. This commits a frame or two earlier than the estimator path.
-            -- The ball homes to its target, so it WILL turn to us: fire off the
-            -- event itself, whatever it reads now. Its velocity is still the
-            -- pre-flip one, so pad the path for the turn it has to make (straight
-            -- in: x1.0, side-on: x1.3, full reversal: x1.6) -- over-estimating only
-            -- delays us to the next frame point, under-estimating would fire early.
-            local eta = rem / speed * (1 + 0.3 * (1 - heading))
-            info.eta = eta
-            if eta <= lead then return fire(st, now, "instant retarget", info, ball) end
-            -- not yet: fall through to the close-range check / next frame point
+            -- INSTANT RETARGET, exactly as the fast original (Games/BladeBall.lua
+            -- @48a3978): fire off the target flip itself when the ball, homing in
+            -- at this speed, lands inside the PARRY-DISTANCE lead (range / speed,
+            -- capped so the window can't run out first). Its new direction isn't in
+            -- yet; still flying away means it has to turn first (+20%). Anything
+            -- with more time is left to auto parry's own timing (frame points and
+            -- the velocity update) -- retarget never takes those.
+            if not S.instant_retarget then return end
+            local rlead = math.min(parry_distance(speed) / speed, reach + W * 0.7)
+            local eta = dist / speed * (heading < 0 and 1.2 or 1)
+            info.eta, info.lead = eta, rlead
+            if eta <= rlead then return fire(st, now, "instant retarget", info, ball) end
+            return
         end
         -- CLOSE-RANGE ANTI-CURVE: a ball curved at us from close range reads
         -- side-on (low heading), so the estimators below can call it "away" and
@@ -1984,11 +2006,10 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
                 local eta_c = rem / speed * (1 + 0.4 * (1 - math.max(heading, 0)))
                 if eta_c <= lead then
                     info.eta = eta_c
-                    return fire(st, now, via == "retarget" and "instant retarget" or "close anti-curve", info, ball)
+                    return fire(st, now, "close anti-curve", info, ball)
                 end
             end
         end
-        if via == "retarget" then return end
         local mode = S.anticurve
         local eta = straight
         if mode == "Off" then
@@ -2121,11 +2142,11 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         if capture_method() == "getgc" then pcall(gc_acquire); return end
         if not (in_match() or in_lobby_training()) or not canParryNow() then Capture.since = nil; return end
         Capture.since = Capture.since or now
-        -- Synthetic-press bootstrap (opt in with getgenv().CaptureInject): when no
+        -- Synthetic-press bootstrap ("Auto press" capture mode): when no
         -- ball is near, a VirtualInputManager Block press goes out and the hook
         -- reads its packet. Off by default -- synthetic input can be flagged, and
         -- a press that does not actually parry captures nothing.
-        if getgenv().CaptureInject then
+        if Capture.mode == "Auto press" then
             if now - Capture.since < 1 or now - Capture.last_press < 1.4 then return end
             if Capture.dry >= 3 then
                 if now - Capture.last_press < 20 then return end
@@ -2140,7 +2161,8 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
             end
             return
         end
-        -- Default: capture the player's OWN real parry. Arm the hook ONLY when a
+        if Capture.mode ~= "Incoming ball" then return end
+        -- "Incoming ball": capture the player's OWN real parry. Arm the hook ONLY when a
         -- ball is actually targeting the player and arriving -- i.e. a real parry
         -- is genuinely about to happen -- NOT on any nearby ball or screen tap.
         -- capture_safe() was too loose (any ball within 20 studs, no targeting
@@ -2175,6 +2197,28 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         if arm(math.clamp(tonumber(getgenv().CaptureWindow) or 0.4, 0.12, 1.5)) and now - (Capture.notified or 0) > 5 then
             Capture.notified = now
             logp("capture: block this ball yourself -- the hook reads that one real parry, then auto-forge takes over (" .. capture_method() .. ")")
+        end
+    end
+
+    -- "Your press" capture (default): the hook goes up the moment YOU press block
+    -- (F / click / gamepad R1-X, or a touch on mobile) anywhere you can parry --
+    -- lobby parry zone, training or a round -- so the key is in from your first
+    -- press, no waiting for a ball. A key sends inside this same input dispatch;
+    -- a tap sends on release, so a touch keeps it up a little longer. Nothing
+    -- synthetic; inspect only accepts a genuine parry packet.
+    function Parry.onInput(input, processed)
+        if Core.cap or Capture.mode ~= "Your press" or not needs_capture() or not is_live() then return end
+        local t, k = input.UserInputType, input.KeyCode
+        local touch = t == Enum.UserInputType.Touch
+        local key = not processed and (k == Enum.KeyCode.F or t == Enum.UserInputType.MouseButton1
+            or k == Enum.KeyCode.ButtonR1 or k == Enum.KeyCode.ButtonX)
+        if not (touch or key) or not canParryNow() then return end
+        local now = clock_()
+        if now - Capture.last_press < 0.15 then return end
+        Capture.last_press = now
+        if arm(touch and 0.6 or 0.3) and now - (Capture.notified or 0) > 5 then
+            Capture.notified = now
+            logp("capture: reading your press (" .. capture_method() .. ")")
         end
     end
 
@@ -2328,8 +2372,10 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         else clash = "watching for clashes" end
         local manual = not SP.manual and "off" or (Pump.waiting and "waiting for a threat" or "spamming")
         return {
-            armed = Core.cap and ("armed (" .. capture_method() .. ", " .. Core.ctx .. ")") or "not armed -- capturing at the next safe moment",
+            armed = Core.cap and ("armed (" .. capture_method() .. ", " .. Core.ctx .. ")")
+                or (Capture.mode == "Your press" and "not armed -- press block once" or "not armed -- capturing at the next chance"),
             last = last, clash = clash, manual = manual, rate = SpamMeter.rate, ping = pingMs(),
+            target = SP.rate_now(clock_()), speed_mode = SP.speed_mode,
             curve = S.random_curve and "Random each parry" or (CURVE_NAMES[S.curve_mode] or "?"),
             detect = blocked_by_detection() and "PAUSED (ability detected)" or "clear",
         }
@@ -2450,6 +2496,7 @@ function Engine.start()
     pcall(function() econnect(R.ParrySuccessAll.OnClientEvent, Parry.onParryAll) end)
     pcall(function() econnect(R.NoobParryHappened.OnClientEvent, Parry.onNoobParry) end)
     pcall(function() econnect(R.M1Stop.Event, Parry.onM1Stop) end)
+    econnect(UserInputService.InputBegan, Parry.onInput)
     for _, folder in ipairs(Parry.ballFolders()) do econnect(folder.ChildAdded, Parry.onBallAdded) end
     -- the game's own block swings (your presses, capture presses) start its
     -- lockout; seen on the animator, no hooks
@@ -2796,6 +2843,11 @@ AP:AddSlider("CurveBias", {
     Tooltip = "Smart mode: how much earlier to parry a curving ball (inside the window, early is safe).",
     Callback = function(v) S.curve_bias = v / 100 end,
 })
+AP:AddToggle("InstantRetarget", {
+    Text = "Instant retarget", Default = true,
+    Tooltip = "Parries straight off the ball switching to you when it lands inside the parry distance (the fast original rule). Anything with more time is left to auto parry.",
+    Callback = function(v) S.instant_retarget = v end,
+})
 AP:AddToggle("CloseAntiCurve", {
     Text = "Close-range anti curve", Default = true,
     Tooltip = "Inside close range, a ball curved at you (reads side-on) is treated as incoming and parried on time instead of held until it hits.",
@@ -2831,8 +2883,13 @@ AP:AddDropdown("TargetMode", {
 })
 AP:AddDropdown("CaptureHook", {
     Values = { "Namecall", "FireServer", "Both" }, Default = "Namecall", Text = "Capture hook",
-    Tooltip = "How the key is captured, then every parry is forged (curve, targeting, all options work). Default Namecall uses a __namecall hook (hookmetamethod) that lives in game's locked metatable -- a game script cannot see it, so it is the stealthiest. FireServer/Both also hook the shared FireServer function (identity a game script can compare) -- less stealthy but catch every parry. The hook is up only the instant you block a real incoming ball, then comes down. getgenv().CaptureWindow tunes the up-time; CaptureInject re-enables synthetic presses.",
+    Tooltip = "How the key is captured, then every parry is forged (curve, targeting, all options work). Default Namecall uses a __namecall hook (hookmetamethod) that lives in game's locked metatable -- a game script cannot see it, so it is the stealthiest. FireServer/Both also hook the shared FireServer function (identity a game script can compare) -- less stealthy but catch every parry. The hook is up only around the one press it reads (see 'Capture on'), then stays down for the session.",
     Callback = function(v) getgenv().CaptureHook = v end,
+})
+AP:AddDropdown("CaptureTrigger", {
+    Values = { "Your press", "Incoming ball", "Auto press" }, Default = "Your press", Text = "Capture on",
+    Tooltip = "When the one-time key capture happens. Your press: the first time you press block anywhere you can parry (no waiting for a ball). Incoming ball: when a ball is about to hit you. Auto press: the script presses block itself once (synthetic input).",
+    Callback = function(v) Parry.Capture.mode = v end,
 })
 AP:AddButton({
     Text = "Rehook",
@@ -3046,10 +3103,10 @@ MS:AddDropdown("SpamMode", {
     Values = { "Remote", "Keypress" }, Default = "Remote", Text = "Mode",
     Callback = function(v) SP.mode = v end,
 })
-MS:AddSlider("SpamMaxRate", {
-    Text = "Rate", Default = 1000, Min = 20, Max = 2000, Rounding = 0, Suffix = "/s",
-    Tooltip = "Parries a second for manual and auto spam. The actual rate is held at this value at any FPS.",
-    Callback = function(v) SP.max_rate = v end,
+MS:AddDropdown("SpamSpeed", {
+    Values = { "Legit", "Normal", "Fast", "Blatant", "Max" }, Default = "Max", Text = "Speed",
+    Tooltip = "Legit 30/s, Normal 100/s, Fast 300/s, Blatant 700/s -- held exactly at any FPS. Max: the highest your connection takes before it desyncs (climbs to 2000/s, backs off when ping spikes), never under 250/s.",
+    Callback = function(v) SP.speed_mode = v end,
 })
 local SpamRateLabel = MS:AddLabel("Actual: 0/s", true)
 
@@ -3572,15 +3629,84 @@ Anim.skin = function() return (SkinChanger.on and Skin.name ~= "") and Skin.name
 
 -- No render: turn off the game's ability / parry effects
 local NoRender = Feature("NoRender")
-function NoRender.start()
-    pcall(function() LocalPlayer.PlayerScripts.EffectScripts.ClientFX.Disabled = true end)
-    local runtime = Workspace:FindFirstChild("Runtime")
-    if runtime then NoRender:connect(runtime.ChildAdded, function(v) Debris:AddItem(v, 0) end) end
+-- What "No render" removes is picked in the dropdown below. Everything it turns
+-- off is remembered and put back exactly when it's turned off or the pick changes.
+local NR_SEL = { ["Ability effects"] = true, ["Parry effects"] = true }
+local NR_FX = { ParticleEmitter = true, Trail = true, Beam = true, Smoke = true, Fire = true, Sparkles = true }
+local NR_POST = { BloomEffect = true, BlurEffect = true, ColorCorrectionEffect = true, SunRaysEffect = true, DepthOfFieldEffect = true }
+local nr_saved = {}
+local function nr_set(inst, prop, val)
+    local ok, old = pcall(function() return inst[prop] end)
+    if not ok or old == val then return end
+    nr_saved[inst] = nr_saved[inst] or {}
+    if nr_saved[inst][prop] == nil then nr_saved[inst][prop] = old end
+    pcall(function() inst[prop] = val end)
 end
-function NoRender.stop() pcall(function() LocalPlayer.PlayerScripts.EffectScripts.ClientFX.Disabled = false end) end
+local function nr_fx(inst) if NR_FX[inst.ClassName] then nr_set(inst, "Enabled", false) end end
+-- turn off every effect under root now and as it appears (big trees in slices)
+local function nr_tree(root, token)
+    if not root then return end
+    NoRender:connect(root.DescendantAdded, nr_fx)
+    task.spawn(function()
+        local list = root:GetDescendants()
+        for k = 1, #list do
+            if not NoRender:alive(token) then return end
+            nr_fx(list[k])
+            if k % 2000 == 0 then task.wait() end
+        end
+    end)
+end
+function NoRender.start()
+    local token, sel = NoRender._token, NR_SEL
+    if sel["Parry effects"] then
+        pcall(function() nr_set(LocalPlayer.PlayerScripts.EffectScripts.ClientFX, "Disabled", true) end)
+    end
+    if sel["Ability effects"] then
+        local runtime = Workspace:FindFirstChild("Runtime")
+        if runtime then NoRender:connect(runtime.ChildAdded, function(v) Debris:AddItem(v, 0) end) end
+    end
+    if sel["All particles"] then
+        nr_tree(Workspace, token)
+    else
+        if sel["Ball trails"] then
+            for _, name in ipairs({ "Balls", "TrainingBalls" }) do nr_tree(Workspace:FindFirstChild(name), token) end
+        end
+        if sel["Character effects"] then
+            for _, name in ipairs({ "Alive", "Dead" }) do nr_tree(Workspace:FindFirstChild(name), token) end
+        end
+    end
+    if sel["Post effects"] or sel["Shadows"] then
+        local Lighting = game:GetService("Lighting")
+        if sel["Shadows"] then nr_set(Lighting, "GlobalShadows", false) end
+        if sel["Post effects"] then
+            for _, v in ipairs(Lighting:GetDescendants()) do if NR_POST[v.ClassName] then nr_set(v, "Enabled", false) end end
+            pcall(function()
+                for _, v in ipairs(Workspace.CurrentCamera:GetChildren()) do if NR_POST[v.ClassName] then nr_set(v, "Enabled", false) end end
+            end)
+            NoRender:connect(Lighting.DescendantAdded, function(v) if NR_POST[v.ClassName] then nr_set(v, "Enabled", false) end end)
+        end
+    end
+end
+function NoRender.stop()
+    local saved = nr_saved
+    nr_saved = {}
+    for inst, props in pairs(saved) do
+        for prop, old in pairs(props) do pcall(function() inst[prop] = old end) end
+    end
+end
 local NR = Tabs.Misc:AddRightGroupbox("Performance", "cpu")
-NR:AddToggle("NoRender", { Text = "No render", Default = false, Tooltip = "Turns off ability and parry effects.",
+NR:AddToggle("NoRender", { Text = "No render", Default = false, Tooltip = "Turns off what's picked below.",
     Callback = function(v) NoRender:setEnabled(v) end })
+NR:AddDropdown("NoRenderWhat", {
+    Values = { "Ability effects", "Parry effects", "Ball trails", "Character effects", "All particles", "Post effects", "Shadows" },
+    Default = { "Ability effects", "Parry effects" }, Multi = true, Text = "Removes",
+    Tooltip = "Ability effects: spawned ability visuals. Parry effects: the game's hit/parry FX script. Ball trails / Character effects: particles, trails and beams on balls / players. All particles: every particle, trail and beam in the map. Post effects: bloom, blur, color correction, sun rays, depth of field. Shadows: global shadows.",
+    Callback = function(v)
+        NR_SEL = {}
+        for name, on in pairs(type(v) == "table" and v or {}) do if on then NR_SEL[name] = true end end
+        if NoRender.on then NoRender:setEnabled(false); NoRender:setEnabled(true) end
+    end,
+})
 
 local UA = Tabs.Misc:AddRightGroupbox("Unlock All", "unlock")
 UA:AddButton({ Text = "Load unlock all", Risky = true, DoubleClick = true,
@@ -3649,7 +3775,7 @@ StatusHook = function(s, armed)
     set(L_rate, ("Spam rate: %d/s"):format(math.floor(s.rate + 0.5)))
     set(L_ping, ("Ping: %dms"):format(math.floor(s.ping + 0.5)))
     set(L_curve, "Curve: " .. s.curve)
-    set(SpamRateLabel, ("Actual: %d/s (%s)"):format(math.floor(s.rate + 0.5), s.manual))
+    set(SpamRateLabel, ("Actual: %d/s of %d (%s, %s)"):format(math.floor(s.rate + 0.5), math.floor((s.target or 0) + 0.5), tostring(s.speed_mode), s.manual))
     set(ClashLabel, "Status: " .. s.clash)
 end
 UiTick = function(rate) Orb.tick(rate) end
