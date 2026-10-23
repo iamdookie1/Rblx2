@@ -31,7 +31,7 @@
 
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.71"
+local SCRIPT_VERSION = "rewrite-0.5.72"
 
 -- ---------------------------------------------------------------------------
 -- Single instance.
@@ -53,10 +53,12 @@ local ReplicatedStorage = cloneref(game:GetService('ReplicatedStorage'))
 local Workspace = cloneref(game:GetService('Workspace'))
 local Stats = cloneref(game:GetService('Stats'))
 local CollectionService = cloneref(game:GetService('CollectionService'))
-local VirtualInputManager = cloneref(game:GetService('VirtualInputManager'))
+-- VirtualInputManager and Debris are NOT fetched at load: GetService creates a
+-- service that doesn't exist yet, and a game script can then see it with
+-- game:FindService -- a tell from a script that did nothing else (BBStop=0 kicked).
+-- VirtualInputManager is fetched only when Auto press actually presses.
 local HttpService = cloneref(game:GetService('HttpService'))
 local CoreGui = cloneref(game:GetService('CoreGui'))
-local Debris = cloneref(game:GetService('Debris'))
 local LocalPlayer = Players.LocalPlayer
 -- bisect switch, as the original used: getgenv().BBStop = N stops loading at
 -- stage N -- 0 services only, 1 + parry core / engine / log (no UI), 2 + menu
@@ -901,8 +903,9 @@ end]]
         if not is_live() then return false end
         Core.last_send_at = clock_()
         pcall(function()
-            VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.F, false, game)
-            VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.F, false, game)
+            local vim = cloneref(game:GetService('VirtualInputManager'))
+            vim:SendKeyEvent(true, Enum.KeyCode.F, false, game)
+            vim:SendKeyEvent(false, Enum.KeyCode.F, false, game)
         end)
         return true
     end
@@ -4030,7 +4033,7 @@ function NoRender.start()
     end
     if sel["Ability effects"] then
         local runtime = Workspace:FindFirstChild("Runtime")
-        if runtime then NoRender:connect(runtime.ChildAdded, function(v) Debris:AddItem(v, 0) end) end
+        if runtime then NoRender:connect(runtime.ChildAdded, function(v) task.defer(pcall, v.Destroy, v) end) end
     end
     if sel["All particles"] then
         nr_tree(Workspace, token)
