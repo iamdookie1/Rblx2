@@ -31,7 +31,7 @@
 
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.65"
+local SCRIPT_VERSION = "rewrite-0.5.66"
 
 -- ---------------------------------------------------------------------------
 -- Single instance.
@@ -1955,8 +1955,8 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
     end
 
     -- The decision for a ball on us. via: "velocity" (its new direction just
-    -- replicated) or nil (a frame point: PreSimulation / PostSimulation /
-    -- PreRender).
+    -- replicated) or nil (a frame point: PreAnimation / PreSimulation /
+    -- PostSimulation / PreRender).
     -- An EARLY parry is the fatal one: fire before the ball can arrive inside the
     -- window and the parry runs out, the lockout follows and the ball kills you.
     -- So every rule below only fires when arrival inside the window is certain:
@@ -2526,10 +2526,12 @@ function Engine.start()
     if LocalPlayer.Character then watch_animator(LocalPlayer.Character) end
     econnect(LocalPlayer.CharacterAdded, function(char) Anim.reset(); watch_animator(char) end)
     econnect(RunService.PreSimulation, function(dt) Parry.frame(dt, 1) end)
-    -- decide at PreSimulation (replicated ball data has just landed),
-    -- PostSimulation (after physics) and PreRender (what's about to be drawn):
-    -- three checks a frame, plus the instant one on each velocity update
+    -- decide at every phase of the frame: PreAnimation, PreSimulation
+    -- (replicated ball data has just landed), PostSimulation (after physics) and
+    -- PreRender (what's about to be drawn) -- four checks a frame, plus the
+    -- instant one on each velocity update
     pcall(function() econnect(RunService.PostSimulation, function() Parry.frame(nil, 2) end) end)
+    pcall(function() econnect(RunService.PreAnimation, function() Parry.frame(nil, 4) end) end)
     econnect(RunService.Heartbeat, function()
         local now = clock_()
         if UiTick and now - Engine.tick_at > 0.1 then Engine.tick_at = now; pcall(UiTick, Parry.spamRate()) end
@@ -2858,6 +2860,13 @@ AP:AddToggle("AutoParry", {
     Text = "Auto parry", Default = false,
     Callback = function(v) S.autoparry = v; Engine.want("autoparry", v) end,
 }):AddKeyPicker("AutoParryKey", { Default = "None", Mode = "Toggle", SyncToggleState = true, Text = "Auto parry" })
+AP:AddToggle("UnlockFPS", {
+    Text = "Unlock FPS", Default = true,
+    Tooltip = "Raises the frame cap to 240. Auto parry checks the ball 4 times every frame, so more frames = more checks a second (60 FPS: 240/s, 240 FPS: 960/s).",
+    Callback = function(v)
+        pcall(function() if type(setfpscap) == "function" then setfpscap(v and 240 or 60) end end)
+    end,
+})
 AP:AddToggle("Triggerbot", {
     Text = "Triggerbot", Default = false,
     Tooltip = "Parries the instant the ball is on you, at any distance. Overrides auto parry's timing while on.",
