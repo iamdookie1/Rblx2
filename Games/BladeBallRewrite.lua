@@ -31,7 +31,7 @@
 
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.52"
+local SCRIPT_VERSION = "rewrite-0.5.53"
 
 -- ---------------------------------------------------------------------------
 -- Single instance.
@@ -1810,27 +1810,15 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
     --     keeps its credit instead of being counted as sent (0.5.2 lost ~5% there).
     -- Simulated against real frame timing (3 signal points a frame, jitter,
     -- hitches, blocked moments): 100% of target from 30 to 240 FPS, 300-2000/s.
-    -- Spam speed modes. Fixed modes are exact rates. "Max" is the highest rate the
-    -- connection takes before it desyncs: it climbs toward 2000/s and backs off
-    -- (x0.75) the moment the server-measured ping jumps over its idle baseline --
-    -- the sign the upload queue is backing up -- then climbs again. Never below
-    -- 250/s, so it still out-spams any clash.
-    SP.speeds = { Legit = 30, Normal = 100, Fast = 300, Blatant = 700 }
-    SP.adapt = { rate = 1000, base = nil, at = 0 }
+    -- Spam speed modes. Everything fired in one frame leaves in the same network
+    -- flush and the server steps at 60 Hz, so more than one parry per frame can't
+    -- land any sooner -- it only adds bytes to the send queue (the clog/desync).
+    -- "Max" is therefore exactly one parry per network frame, capped at the 60 Hz
+    -- server step: the fastest rate that still means anything, at ~20 KB/s. The
+    -- clash speed itself comes from the instant fire on retarget / parry success.
+    SP.speeds = { Legit = 20, Normal = 40 }
     function SP.rate_now(now)
-        local fixed = SP.speeds[SP.speed_mode]
-        if fixed then return fixed end
-        local A = SP.adapt
-        if now - A.at >= 0.25 then
-            A.at = now
-            local p = pingMs()
-            if p > 0 then
-                if not A.base or p < A.base then A.base = p else A.base = A.base + (p - A.base) * 0.003 end
-                if p > A.base * 1.35 + 35 then A.rate = math.max(math.floor(A.rate * 0.75), 250)
-                else A.rate = math.min(A.rate + 40, 2000) end
-            end
-        end
-        return A.rate
+        return SP.speeds[SP.speed_mode] or math.min(1 / frame_dt, 60)
     end
     local function spam_tick(now)
         local elapsed = math.min(now - Pump.last, 0.25)
@@ -3104,8 +3092,8 @@ MS:AddDropdown("SpamMode", {
     Callback = function(v) SP.mode = v end,
 })
 MS:AddDropdown("SpamSpeed", {
-    Values = { "Legit", "Normal", "Fast", "Blatant", "Max" }, Default = "Max", Text = "Speed",
-    Tooltip = "Legit 30/s, Normal 100/s, Fast 300/s, Blatant 700/s -- held exactly at any FPS. Max: the highest your connection takes before it desyncs (climbs to 2000/s, backs off when ping spikes), never under 250/s.",
+    Values = { "Legit", "Normal", "Max" }, Default = "Max", Text = "Speed",
+    Tooltip = "Legit 20/s, Normal 40/s. Max: one parry every network frame (up to the server's 60 Hz step) -- the fastest that can land; anything above is batched into the same send and only clogs it. Instant fires on retarget / parry success come on top.",
     Callback = function(v) SP.speed_mode = v end,
 })
 local SpamRateLabel = MS:AddLabel("Actual: 0/s", true)
