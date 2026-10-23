@@ -31,7 +31,7 @@
 
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.63"
+local SCRIPT_VERSION = "rewrite-0.5.64"
 
 -- ---------------------------------------------------------------------------
 -- Single instance.
@@ -1958,16 +1958,20 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
     -- "velocity" (its new direction just replicated), or nil (a frame point).
     -- The decision for a ball on us. via: "retarget" (it just switched to us),
     -- "velocity" (its new direction just replicated), or nil (a frame point).
-    -- One model for all of them (retarget and close range are built in):
-    --   earliest = flying straight in from here (it can't land sooner);
-    --   eta      = its real path: straight in, or its homing turn simulated from
-    --              where it points now (the gain measured on this ball, kept
-    --              across passes, taken at the slow end -- a longer path is the
-    --              safe side). At a retarget its velocity still points at the old
-    --              target, which is exactly the turn the sim plays out.
-    -- Fire when eta is down to the lead (accuracy/cushion inside the window), or
-    -- NOW when even flying straight it lands before the next chance to fire --
-    -- that is close range by TIME, not by distance, whatever direction it reads.
+    -- An EARLY parry is the fatal one: fire before the ball can arrive inside the
+    -- window and the parry runs out, the lockout follows and the ball kills you.
+    -- So every rule below only fires when arrival inside the window is certain:
+    --   * CLOSE (within ~25 studs): it can't curve far -- fire as soon as even its
+    --     straight-in arrival is inside the first half of the window. This holds
+    --     at a retarget too: close range is where retarget fires instantly.
+    --   * RETARGET when not close: its velocity still points at the old target,
+    --     so nothing about its path is known yet -- wait the frame or two for the
+    --     new velocity instead of guessing (the guess fired far curving balls
+    --     way early).
+    --   * otherwise: eta along its homing curve, simulated on the SLOW-turn side
+    --     (never faster than the default turn), so the estimate errs late; the
+    --     last-moment rule (straight-in arrival about to beat our reach) backs it
+    --     up for a ball that really is coming in.
     local function decide(ball, st, root, now, via)
         if pass_busy(st, now) or blocked_by_detection() then return end
         local rpos, bpos = root.Position, ball.Position
@@ -1987,33 +1991,35 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         local h = track_homing(st, dir, want, dist, now)
         local earliest = time_to_contact(dist, gap, speed, accel)
         local lead = math.min(fire_lead(speed), reach + W * 0.85)
+        local info = { speed = speed, dist = dist, heading = heading, lead = lead, eta = earliest }
+        local tag = via == "retarget" and "retarget" or (via == "velocity" and "auto parry (velocity)" or "auto parry")
+        -- touching
+        if rem <= 3 then return fire(st, now, tag .. " (contact)", info, ball) end
+        -- close: arrival inside the window is certain
+        local close = dist <= 25 + speed * 0.03
+        if close and earliest <= reach + W * 0.5 then return fire(st, now, tag .. " (close)", info, ball) end
+        if via == "retarget" then return end -- not close: wait for its real velocity
+        -- last moment: coming in and about to beat our reach
+        local margin = math.max(frame_dt * 2, jitter()) + 0.02
+        if heading > 0.3 and earliest <= reach + margin then return fire(st, now, tag .. " (now)", info, ball) end
+        -- along its curve, slow-turn side (errs late, never early)
         local eta = earliest
         if heading < 0.97 then
-            if h.k then st.k_mem = h.k end
-            local k = math.clamp((h.k or st.k_mem or K_DEFAULT) * 0.85, K_MIN, K_MAX)
+            if h.away then return end -- swinging away from us: wait for it to come round
+            local k = math.clamp(math.min(h.k or K_DEFAULT, K_DEFAULT) * 0.7, K_MIN, K_DEFAULT)
             local v = vel
             if heading < -0.95 then
-                -- dead away: nudge it off the line so the sim can turn it round
                 local side = dir:Cross(Vector3.yAxis)
                 if side.Magnitude < 1e-3 then side = dir:Cross(Vector3.xAxis) end
                 v = (dir + side.Unit * 0.08).Unit * speed
             end
             eta = math.max(sim_prop(bpos, v, rpos, gap, k, accel, reach + W + 0.8) or math.huge, earliest)
-            -- curving: lean a little earlier -- inside the window early is safe, late is fatal
-            lead = math.min(lead + W * 0.25 * (S.curve_bias or 0.5) * (1 - math.max(heading, 0)), reach + W * 0.85)
         end
-        local info = { speed = speed, dist = dist, heading = heading, lead = lead, eta = eta }
-        local name = via == "retarget" and "retarget" or (via == "velocity" and "auto parry (velocity)" or "auto parry")
-        -- now or never
-        local margin = math.max(frame_dt * 2, jitter()) + 0.02
-        if rem <= 3 or (earliest <= reach + margin and (heading > -0.5 or dist <= 14)) then
-            info.eta = earliest
-            return fire(st, now, name .. " (close)", info, ball)
-        end
-        if eta <= lead then return fire(st, now, name, info, ball) end
-        -- classic distance net for a ball coming nearly straight in
-        if heading >= 0.85 and dist <= parry_distance(speed) and earliest <= reach + W * 0.85 then
-            return fire(st, now, name, info, ball)
+        info.eta = eta
+        if eta <= lead then return fire(st, now, tag, info, ball) end
+        -- classic distance net for a ball coming dead straight in
+        if heading >= 0.9 and dist <= parry_distance(speed) and earliest <= reach + W * 0.6 then
+            return fire(st, now, tag, info, ball)
         end
     end
 
