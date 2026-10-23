@@ -31,7 +31,7 @@
 
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.74"
+local SCRIPT_VERSION = "rewrite-0.5.75"
 
 -- ---------------------------------------------------------------------------
 -- Single instance.
@@ -1606,6 +1606,17 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
             swaps[#swaps + 1] = { t = now, from = st.target, to = new }
             if #swaps > 16 then table.remove(swaps, 1) end
             local was_me = st.target == me
+            -- the partner's reaction: how long they held it before it came back
+            -- to us, minus the ball's flight to them (pre-parry timing uses it)
+            if new == me and type(st.target) == 'string' and st.target ~= '' and st.target_at then
+                local their, root = character_root(st.target), getRoot()
+                local spd = ball_velocity(ball).Magnitude
+                if their and root and spd > 1 then
+                    local r = math.clamp(now - st.target_at - (their.Position - root.Position).Magnitude / spd, 0, 0.3)
+                    st.react = st.react and (st.react * 0.5 + r * 0.5) or r
+                end
+            end
+            st.target_at = now
             st.target = new
             if type(new) == 'string' and new ~= '' and new ~= me then
                 st.pass_open, st.parried, st.landed = false, false, false
@@ -2036,7 +2047,7 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         local earliest = time_to_contact(dist, gap, speed, accel)
         local lead = math.min(fire_lead(speed), reach + W * 0.85)
         local info = { speed = speed, dist = dist, heading = heading, lead = lead, eta = earliest }
-        local tag = via == "velocity" and "auto parry (velocity)" or "auto parry"
+        local tag = via and ("auto parry (" .. via .. ")") or "auto parry"
         -- touching
         if rem <= 3 then return fire(st, now, tag .. " (contact)", info, ball) end
         -- close: arrival inside the window is certain
@@ -2094,24 +2105,39 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
             if now < st.preparry_until then return end
             st.preparried = false
         end
-        if not (S.preparry or (S.hp_preparry and (Lag.avg or ping_s()) >= 0.08)) then return end
+        -- Built in: a close, fast exchange. When the partner's return would
+        -- reach us before "target = you" can even arrive (ping), waiting for the
+        -- retarget is always too late, so the parry goes ahead of the return --
+        -- one per exchange, timed so its window covers the return -- no spam.
+        -- The Pre-parry toggles add the same for slower balls / their range.
+        local manual = S.preparry or (S.hp_preparry and (Lag.avg or ping_s()) >= 0.08)
         if not Core.cap or blocked_by_detection() then return end
         local target = st.target
         if type(target) ~= 'string' or target == '' or target == me then return end
         local their = character_root(target)
         if not their then return end
-        local gap = (their.Position - root.Position).Magnitude
-        if gap > (S.preparry_range or 20) then return end
         local vel = ball_velocity(ball)
         local speed = vel.Magnitude
         if speed < 1 then return end
+        local gap = (their.Position - root.Position).Magnitude
+        if manual then
+            if gap > math.max(S.preparry_range or 20, speed >= 120 and clash_range(speed) or 0) then return end
+        elseif speed < 120 or gap > clash_range(speed) then
+            return
+        else
+            -- only a real exchange: it came to them from us, and they're facing
+            -- us / nobody else is near them to send it to
+            local o = ball_owners(st)[2]
+            if not (o and o.name == me) or not return_comes_to_us(their, root, target, gap) then return end
+        end
         local to_them = their.Position - ball.Position
         local d_them = to_them.Magnitude
         if d_them > 3 and vel:Dot(to_them / d_them) < speed * 0.3 then return end
         local back = gap / (speed * 1.1)
         local reach = reach_time()
         if back > reach + frame_dt * 2 then return end
-        local eta = d_them / speed + back
+        -- flight to them + how long they hold it (measured) + flight back
+        local eta = d_them / speed + math.clamp(st.react or 0.05, 0, 0.3) + back
         local lead = fire_lead(speed)
         if eta > lead or has_clash(ball, now) then return end
         if send(false) == "sent" then
@@ -2120,7 +2146,7 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
             st.preparried = true
             st.preparry_until = now + math.max((W or 0.5) + reach + 0.15, (n2 or 1.3) + 0.08)
             Core.last_parry = { t = now, via = "pre-parry", info = { eta = eta, lead = lead } }
-            logp(("pre-parry: return in %.2fs, lead %.2fs, gap %.0f"):format(eta, lead, gap))
+            logp(("pre-parry%s: return in %.2fs, lead %.2fs, gap %.0f, spd %.0f"):format(manual and "" or " (exchange)", eta, lead, gap, speed))
         end
     end
 
@@ -2128,8 +2154,17 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         if new == me then
             if SP.auto then clash_check(ball, now) end
             if has_clash(ball, now) then spam_instant() end
-            -- (no auto-parry decision here: retarget removed -- the frame points
-            -- and the velocity update decide, with the ball's real path)
+            -- instant decision, deferred ONE step: the rest of the same update
+            -- (the ball's new velocity) is applied first, so this sees its real
+            -- new path -- not the stale "flying away from the last hit" one the
+            -- old retarget fired on -- and still runs inside this frame
+            if S.autoparry and not S.triggerbot then
+                task.defer(function()
+                    if not active or not is_live() or st.target ~= me then return end
+                    local root = ap_root()
+                    if root then decide(ball, st, root, clock_(), "retarget") end
+                end)
+            end
             if S.triggerbot then
                 local root = ap_root()
                 if root then trigger(ball, st, now) end
