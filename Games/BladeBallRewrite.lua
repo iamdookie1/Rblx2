@@ -31,7 +31,7 @@
 
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.73"
+local SCRIPT_VERSION = "rewrite-0.5.74"
 
 -- ---------------------------------------------------------------------------
 -- Single instance.
@@ -407,12 +407,17 @@ do
         Lag.avg = Lag.avg + (p - Lag.avg) * 0.3
     end
     local function jitter() return math.clamp(Lag.jit * 2, 0.005, 0.12) end
-    -- seconds from "fire now" until the parry is up, in the timeline of the ball we see
+    -- seconds from "fire now" until the parry is up, in the timeline of the ball we see.
+    -- Worked out once per frame (Core.fid ticks at the frame's first point) and
+    -- reused by every check in it, so no check waits on a Stats read.
     local function reach_time()
+        if Core.rt_fid == Core.fid then return Core.rt end
         sample_lag()
         local ping = math.max(Lag.avg or ping_s(), ping_s())
         local ping_term = S.ping_compensation and ping or ping * 0.5
-        return ping_term + jitter() + Core.interp + frame_dt * 0.5
+        Core.rt = ping_term + jitter() + Core.interp + frame_dt * 0.5
+        Core.rt_fid = Core.fid
+        return Core.rt
     end
 
     -- ---------- the player ----------
@@ -1998,10 +2003,19 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
     -- So every rule below only fires when arrival inside the window is certain:
     --   * CLOSE (within ~25 studs): it can't curve far -- fire as soon as even its
     --     straight-in arrival is inside the first half of the window.
-    --   * otherwise: eta along its homing curve, simulated on the SLOW-turn side
-    --     (never faster than the default turn), so the estimate errs late; the
-    --     last-moment rule (straight-in arrival about to beat our reach) backs it
-    --     up for a ball that really is coming in.
+    --   * otherwise, a curve: no slider -- the ball's own measured turn gain k
+    --     gives two bounds, simulated along its homing path: FAST (turns 1.35x
+    --     harder than measured, the soonest it can land) and SLOW (0.75x, the
+    --     latest), plus the model-free closing-speed estimate. Fire when
+    --       - the middle estimate is due inside our lead (normal timing), or
+    --       - the soonest is due inside our lead AND the parry window still
+    --         covers the latest -- early enough not to die, late enough not to
+    --         run out, or
+    --       - the soonest is about to beat our reach (fire or die).
+    --     No measurement yet: the default gain, same bounds.
+    -- The sims only run when the straight-in arrival (the lower bound on all of
+    -- them) is inside reach + window, and only that far ahead, so the whole
+    -- decision is a few dozen steps and fits inside the frame.
     local function decide(ball, st, root, now, via)
         if pass_busy(st, now) or blocked_by_detection() then return end
         local rpos, bpos = root.Position, ball.Position
@@ -2031,22 +2045,39 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         -- last moment: coming in and about to beat our reach
         local margin = math.max(frame_dt * 2, jitter()) + 0.02
         if heading > 0.3 and earliest <= reach + margin then return fire(st, now, tag .. " (now)", info, ball) end
-        -- along its curve, slow-turn side (errs late, never early)
+        -- nothing can land before the straight-in time: if even that is past
+        -- reach + window, no rule below can fire this frame -- skip the sims
+        local half = frame_dt * 0.5
+        if earliest > reach + W then return end
         local eta = earliest
         if heading < 0.97 then
             if h.away then return end -- swinging away from us: wait for it to come round
-            local k = math.clamp(math.min(h.k or K_DEFAULT, K_DEFAULT) * 0.7, K_MIN, K_DEFAULT)
+            local km = math.clamp(h.k or (st.k_mem or K_DEFAULT), K_MIN, K_MAX)
             local v = vel
             if heading < -0.95 then
                 local side = dir:Cross(Vector3.yAxis)
                 if side.Magnitude < 1e-3 then side = dir:Cross(Vector3.xAxis) end
                 v = (dir + side.Unit * 0.08).Unit * speed
             end
-            eta = math.max(sim_prop(bpos, v, rpos, gap, k, accel, reach + W + 0.8) or math.huge, earliest)
+            local horizon = reach + W + 0.05
+            local fast = math.max(sim_prop(bpos, v, rpos, gap, math.min(km * 1.35, K_MAX), accel, horizon) or math.huge, earliest)
+            if fast > lead + half then
+                -- even the soonest arrival is outside our lead: only the
+                -- straight-in net below could still fire
+                info.eta = fast
+            else
+                local slow = math.max(sim_prop(bpos, v, rpos, gap, math.max(km * 0.75, K_MIN), accel, horizon) or math.huge, earliest)
+                local mid = math.max(median3(fast, slow, radial_eta(h, rem, speed) or (fast + math.min(slow, horizon)) * 0.5), earliest)
+                info.eta, info.fast, info.slow = mid, fast, slow
+                if mid <= lead + half then return fire(st, now, tag .. " (curve)", info, ball) end
+                if slow <= reach + W * 0.9 then return fire(st, now, tag .. " (curve, covered)", info, ball) end
+                if fast <= reach + margin then return fire(st, now, tag .. " (curve, last moment)", info, ball) end
+            end
+        else
+            info.eta = eta
+            -- half a frame ahead: the next check may already be too late
+            if eta <= lead + half then return fire(st, now, tag, info, ball) end
         end
-        info.eta = eta
-        -- half a frame ahead: the next check may already be too late
-        if eta <= lead + frame_dt * 0.5 then return fire(st, now, tag, info, ball) end
         -- classic distance net for a ball coming dead straight in
         if heading >= 0.9 and dist <= parry_distance(speed) and earliest <= reach + W * 0.6 then
             return fire(st, now, tag, info, ball)
@@ -2300,6 +2331,7 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         local now = clock_()
         if point == 1 then
             if dt then frame_dt = math.clamp(dt, 1 / 240, 0.1) end
+            Core.fid = (Core.fid or 0) + 1
             Pump.frame = Pump.frame + 1
             -- captures are per place: entering / leaving lobby training swaps them
             local ctx = in_lobby_training() and "training" or "match"
@@ -2949,11 +2981,6 @@ AP:AddDropdown("ParryMode", {
     Values = { "Remote", "Keypress" }, Default = "Remote", Text = "Parry mode",
     Tooltip = "Remote sends the captured packet (curves, no cooldown tell). Keypress presses block.",
     Callback = function(v) S.parry_mode = v end,
-})
-AP:AddSlider("CurveBias", {
-    Text = "Curve early bias", Default = 50, Min = 0, Max = 100, Rounding = 0, Suffix = "%",
-    Tooltip = "How much earlier to parry a curving ball (inside the window, early is safe).",
-    Callback = function(v) S.curve_bias = v / 100 end,
 })
 AP:AddToggle("PreParry", {
     Text = "Pre-parry", Default = false,
