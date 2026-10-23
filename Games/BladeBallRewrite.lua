@@ -31,7 +31,7 @@
 
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.57"
+local SCRIPT_VERSION = "rewrite-0.5.58"
 
 -- ---------------------------------------------------------------------------
 -- Single instance.
@@ -315,6 +315,7 @@ do
         log_new = math.min(log_new + 1, 60)
         if Parry.onLog then pcall(Parry.onLog, text) end -- the log file (see Flight)
     end
+    Parry.logp = logp
     function Parry.drainLog()
         local out = {}
         for i = #LOG - log_new + 1, #LOG do if LOG[i] then out[#out + 1] = LOG[i] end end
@@ -3499,7 +3500,20 @@ do
         label.Size = UDim2.new(1, 0, 1, 0); label.BackgroundTransparency = 1; label.TextColor3 = EspCfg.Color
         label.TextSize = EspCfg.TextSize; label.TextStrokeTransparency = 0; label.Font = Enum.Font.Roboto
         label.RichText = true; label.Visible = false; label.Parent = bb
-        hideGui(bb)
+        -- A BillboardGui only draws when its container isn't itself a ScreenGui:
+        -- some executors' gethui() IS a ScreenGui, and billboards nested in it
+        -- never render (no labels at all). Use gethui() only when it's a plain
+        -- container, otherwise CoreGui directly (game scripts can't read either).
+        pcall(function() if syn and syn.protect_gui then syn.protect_gui(bb) end end)
+        pcall(function() if protect_gui then protect_gui(bb) end end)
+        local h = hui()
+        local nested = h ~= CoreGui and (h:IsA("LayerCollector") or h:FindFirstAncestorWhichIsA("LayerCollector") ~= nil)
+        local ok = pcall(function() bb.Parent = nested and CoreGui or h end)
+        if not ok then pcall(function() bb.Parent = CoreGui end) end
+        if not EspCfg.logged then
+            EspCfg.logged = true
+            pcall(function() Parry.logp(("ability esp: labels in %s (%s)"):format(bb.Parent and bb.Parent.ClassName or "nil", nested and "gethui is a ScreenGui -> CoreGui" or "gethui")) end)
+        end
         e = { bb = bb, label = label, character = character, head = head }
         entries[player] = e
         return e
