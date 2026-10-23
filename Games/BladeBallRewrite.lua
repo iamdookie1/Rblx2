@@ -31,7 +31,7 @@
 
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.54"
+local SCRIPT_VERSION = "rewrite-0.5.55"
 
 -- ---------------------------------------------------------------------------
 -- Single instance.
@@ -300,7 +300,7 @@ do
         auto_ability = false, cooldown_protection = false,
     }
     local SP = {
-        manual = false, auto = false, mode = "Remote", max_rate = 1000, speed_mode = "Max",
+        manual = false, auto = false, mode = "Remote", max_rate = 1000, speed_mode = "700/s",
         smart = true, range_bonus = 0, hold = 0.15, sensitivity = 1.3, predictive = true,
     }
     -- detection state (written by the detection features, read here)
@@ -1810,11 +1810,10 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
     --     keeps its credit instead of being counted as sent (0.5.2 lost ~5% there).
     -- Simulated against real frame timing (3 signal points a frame, jitter,
     -- hitches, blocked moments): 100% of target from 30 to 240 FPS, 300-2000/s.
-    -- Spam speed modes: fixed rates, each held exactly by the bucket below at any
-    -- FPS. Max is 700/s -- the rate you ran at 733 without desync.
-    SP.speeds = { Legit = 30, Normal = 100, Fast = 300, Blatant = 500, Max = 700 }
+    -- Spam speed: the picked rate ("50/s" .. "1000/s"), held exactly by the
+    -- bucket below at any FPS.
     function SP.rate_now(now)
-        return SP.speeds[SP.speed_mode] or 700
+        return tonumber(tostring(SP.speed_mode):match("%d+")) or 700
     end
     local function spam_tick(now)
         local elapsed = math.min(now - Pump.last, 0.25)
@@ -3087,9 +3086,11 @@ MS:AddDropdown("SpamMode", {
     Values = { "Remote", "Keypress" }, Default = "Remote", Text = "Mode",
     Callback = function(v) SP.mode = v end,
 })
+local SPAM_SPEEDS = {}
+for r = 50, 1000, 50 do SPAM_SPEEDS[#SPAM_SPEEDS + 1] = r .. "/s" end
 MS:AddDropdown("SpamSpeed", {
-    Values = { "Legit", "Normal", "Fast", "Blatant", "Max" }, Default = "Max", Text = "Speed",
-    Tooltip = "Legit 30/s, Normal 100/s, Fast 300/s, Blatant 500/s, Max 700/s -- held exactly at any FPS. If your movement rubber-bands on Max, drop to Blatant.",
+    Values = SPAM_SPEEDS, Default = "700/s", Text = "Speed",
+    Tooltip = "Parries a second for manual and auto spam, held exactly at this rate at any FPS.",
     Callback = function(v) SP.speed_mode = v end,
 })
 local SpamRateLabel = MS:AddLabel("Actual: 0/s", true)
