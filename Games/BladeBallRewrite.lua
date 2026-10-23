@@ -31,7 +31,7 @@
 
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.61"
+local SCRIPT_VERSION = "rewrite-0.5.62"
 
 -- ---------------------------------------------------------------------------
 -- Single instance.
@@ -3407,7 +3407,7 @@ end
 
 -- Ability ESP
 local EspCfg = { Color = Color3.fromRGB(255, 255, 255), TextSize = 14, Height = 3.5, ShowName = true, ShowDistance = false,
-    OnlyWithAbility = false, MaxDistance = 0, ShowActive = true, ShowCooldown = true }
+    OnlyWithAbility = false, MaxDistance = 0, ShowActive = true, ShowCooldown = true, ShowSelf = true }
 local AbilityESP = Feature("AbilityESP")
 do
     -- Ported from the original Games/BladeBall.lua ability ESP (the one that
@@ -3420,6 +3420,10 @@ do
     -- the Enabled script under character.Abilities (what the game ships now).
     local HUI = CoreGui
     pcall(function() local h = gethui and gethui(); if typeof(h) == 'Instance' then HUI = h end end)
+    -- a billboard nested inside a ScreenGui never draws: if gethui is one, use CoreGui
+    pcall(function()
+        if HUI ~= CoreGui and (HUI:IsA("LayerCollector") or HUI:FindFirstAncestorWhichIsA("LayerCollector")) then HUI = CoreGui end
+    end)
     local entries = {}   -- player -> { billboard, label, character, head, text, color, size, height }
     local function esc(t) return (tostring(t):gsub('&', '&amp;'):gsub('<', '&lt;'):gsub('>', '&gt;')) end
     local function equipped(player, character)
@@ -3482,10 +3486,15 @@ do
             label.Visible = false
             entries[player] = { billboard = billboard, label = label, character = character, head = head,
                 color = EspCfg.Color, size = EspCfg.TextSize, height = EspCfg.Height }
+            if not EspCfg.logged then
+                EspCfg.logged = true
+                pcall(function() Parry.logp(("ability esp: first label on %s (container %s %s)"):format(
+                    player.Name, HUI.ClassName, HUI.Name)) end)
+            end
         end)
     end
     local function add(player)
-        if player == LocalPlayer then return end
+        if player == LocalPlayer and not EspCfg.ShowSelf then return end
         AbilityESP:connect(player.CharacterAdded, function() create(player) end)
         if player.Character then create(player) end
     end
@@ -3496,7 +3505,7 @@ do
             if not (character and character.Parent and head and head.Parent) or player.Parent ~= Players then
                 remove(player)
             else
-                local dist = my and (my.Position - head.Position).Magnitude
+                local dist = my and player ~= LocalPlayer and (my.Position - head.Position).Magnitude or nil
                 local name, status = info(player, e)
                 local visible = not (EspCfg.MaxDistance > 0 and dist and dist > EspCfg.MaxDistance)
                     and not (EspCfg.OnlyWithAbility and not name)
@@ -3518,6 +3527,9 @@ do
         end
     end
     function AbilityESP.start()
+        EspCfg.logged = false
+        pcall(function() Parry.logp(("ability esp ON: %d other player(s) in this server%s"):format(
+            #Players:GetPlayers() - 1, EspCfg.ShowSelf and " + you" or "")) end)
         for _, player in ipairs(Players:GetPlayers()) do add(player) end
         AbilityESP:connect(Players.PlayerAdded, add)
         AbilityESP:connect(Players.PlayerRemoving, remove)
@@ -3538,6 +3550,8 @@ VS:AddToggle("ShowPing", { Text = "Ping overlay", Default = false, Callback = fu
 
 local AE = Tabs.Visuals:AddRightGroupbox("Ability ESP", "eye")
 AE:AddToggle("AbilityESP", { Text = "Ability ESP", Default = false, Callback = function(v) AbilityESP:setEnabled(v) end })
+AE:AddToggle("AbilityESPSelf", { Text = "Show on yourself", Default = true,
+    Callback = function(v) EspCfg.ShowSelf = v; if AbilityESP.on then AbilityESP:setEnabled(false); AbilityESP:setEnabled(true) end end })
 AE:AddToggle("AbilityESPName", { Text = "Show name", Default = true, Callback = function(v) EspCfg.ShowName = v end })
 AE:AddToggle("AbilityESPDistance", { Text = "Show distance", Default = false, Callback = function(v) EspCfg.ShowDistance = v end })
 AE:AddToggle("AbilityESPOnlyWith", { Text = "Only players with an ability", Default = false, Callback = function(v) EspCfg.OnlyWithAbility = v end })
