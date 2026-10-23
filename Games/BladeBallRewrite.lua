@@ -31,7 +31,7 @@
 
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.66"
+local SCRIPT_VERSION = "rewrite-0.5.67"
 
 -- ---------------------------------------------------------------------------
 -- Single instance.
@@ -2850,6 +2850,7 @@ local Tabs = {
     Spam = Window:AddTab("Spam", "zap", "Manual and auto spam"),
     Player = Window:AddTab("Player", "user", "Avatar, cosmetics, movement"),
     Visuals = Window:AddTab("Visuals", "eye", "Overlays and ESP"),
+    Orbit = Window:AddTab("Orbit", "orbit", "Circle a point you can walk, or the ball"),
     Misc = Window:AddTab("Misc", "wrench", "Skin changer and extras"),
     Status = Window:AddTab("Status", "gauge", "Live state and parry log"),
 }
@@ -3364,6 +3365,96 @@ MV:AddToggle("AutoJump", {
     Text = "Auto jump", Default = false,
     Callback = function(v) AutoJump:setEnabled(v) end,
 }):AddKeyPicker("AutoJumpKey", { Default = "J", Mode = "Toggle", SyncToggleState = true, Text = "Auto jump" })
+
+-- ----- Orbit tab -----
+-- Circles your character around a centre every frame. "Yourself": the centre
+-- is where you stood when you turned it on, and it is WALKABLE -- your own
+-- movement input (WASD / joystick / gamepad, read from Humanoid.MoveDirection)
+-- moves the centre at your walk speed, so the orbit travels with you. "Ball":
+-- the centre is the live ball. Height 0 keeps your own Y (gravity / jumping
+-- work); anything else holds you that high above the centre. Plain task loop,
+-- no signal listeners. A respawn or a teleport re-centres on where you are.
+local OrbitCfg = { Center = "Yourself", Radius = 8, Speed = 0.5, Clockwise = false, Height = 0, Walk = 1, Face = false }
+local Orbit = Feature("Orbit")
+do
+    local anchor, angle, char_seen = nil, 0, nil
+    local function step(dt)
+        local char = LocalPlayer.Character
+        local hrp = char and char:FindFirstChild("HumanoidRootPart")
+        local hum = char and char:FindFirstChildOfClass("Humanoid")
+        if not hrp or not hum or hum.Health <= 0 then anchor = nil; return end
+        if char ~= char_seen then char_seen, anchor = char, nil end
+        local r = OrbitCfg.Radius
+        local center
+        if OrbitCfg.Center == "Ball" then
+            local b = Parry.mainBall and Parry.mainBall()
+            if not b then return end -- no ball: leave you alone
+            center, anchor = b.Position, nil
+        else
+            if not anchor or (Vector3.new(anchor.X, 0, anchor.Z) - Vector3.new(hrp.Position.X, 0, hrp.Position.Z)).Magnitude > r + 40 then
+                anchor = hrp.Position -- start / respawn / teleport: orbit where you stand
+            end
+            local md = hum.MoveDirection
+            if md.Magnitude > 0.01 then
+                anchor = anchor + Vector3.new(md.X, 0, md.Z).Unit * hum.WalkSpeed * OrbitCfg.Walk * dt
+            end
+            center = anchor
+        end
+        angle = (angle + OrbitCfg.Speed * 2 * math.pi * (OrbitCfg.Clockwise and -1 or 1) * dt) % (2 * math.pi)
+        local hover = OrbitCfg.Height ~= 0
+        local y = hover and (center.Y + OrbitCfg.Height) or hrp.Position.Y
+        local pos = Vector3.new(center.X + math.cos(angle) * r, y, center.Z + math.sin(angle) * r)
+        local rot
+        if OrbitCfg.Face then
+            rot = CFrame.lookAt(pos, Vector3.new(center.X, y, center.Z)).Rotation
+        else
+            rot = hrp.CFrame.Rotation
+        end
+        hrp.CFrame = CFrame.new(pos) * rot
+        local v = hrp.AssemblyLinearVelocity
+        hrp.AssemblyLinearVelocity = Vector3.new(0, hover and 0 or v.Y, 0) -- your own walk velocity would fight the circle
+    end
+    function Orbit.start()
+        anchor, char_seen = nil, nil
+        local tok = Orbit._token
+        task.spawn(function()
+            local last = os.clock()
+            while Orbit:alive(tok) do
+                local now = os.clock()
+                local dt = math.min(now - last, 0.1)
+                last = now
+                pcall(step, dt)
+                task.wait()
+            end
+        end)
+    end
+    function Orbit.stop() anchor = nil end
+end
+local OB = Tabs.Orbit:AddLeftGroupbox("Orbit", "orbit")
+OB:AddToggle("Orbit", {
+    Text = "Orbit", Default = false,
+    Tooltip = "Circle the centre below. Fast orbits move you faster than walking -- keep it modest if you're worried about speed checks.",
+    Callback = function(v) Orbit:setEnabled(v) end,
+}):AddKeyPicker("OrbitKey", { Default = "O", Mode = "Toggle", SyncToggleState = true, Text = "Orbit" })
+OB:AddDropdown("OrbitCenter", {
+    Values = { "Yourself", "Ball" }, Default = "Yourself", Text = "Orbit around",
+    Tooltip = "Yourself: the spot you were standing on -- walking (WASD / joystick) moves that spot, so the orbit walks with you. Ball: the live ball.",
+    Callback = function(v) OrbitCfg.Center = v end,
+})
+OB:AddSlider("OrbitRadius", { Text = "Radius", Default = 8, Min = 2, Max = 60, Rounding = 1, Suffix = " studs",
+    Callback = function(v) OrbitCfg.Radius = v end })
+OB:AddSlider("OrbitSpeed", { Text = "Speed", Default = 0.5, Min = 0.05, Max = 5, Rounding = 2, Suffix = " rev/s",
+    Callback = function(v) OrbitCfg.Speed = v end })
+OB:AddDropdown("OrbitDirection", { Values = { "Counter-clockwise", "Clockwise" }, Default = "Counter-clockwise", Text = "Direction",
+    Callback = function(v) OrbitCfg.Clockwise = v == "Clockwise" end })
+OB:AddSlider("OrbitHeight", { Text = "Height", Default = 0, Min = -10, Max = 40, Rounding = 1, Suffix = " studs",
+    Tooltip = "0 = stay on the ground (gravity and jumping still work). Anything else holds you that high above the centre.",
+    Callback = function(v) OrbitCfg.Height = v end })
+OB:AddSlider("OrbitWalk", { Text = "Walk speed", Default = 1, Min = 0, Max = 3, Rounding = 2, Suffix = "x",
+    Tooltip = "How fast your movement input moves the orbit's centre (x your walk speed). 0 = the centre stays put.",
+    Callback = function(v) OrbitCfg.Walk = v end })
+OB:AddToggle("OrbitFace", { Text = "Face the centre", Default = false,
+    Callback = function(v) OrbitCfg.Face = v end })
 
 -- ----- Visuals tab -----
 local function hexc(c) return ("%02x%02x%02x"):format(math.floor(c.R * 255), math.floor(c.G * 255), math.floor(c.B * 255)) end
