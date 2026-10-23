@@ -31,7 +31,7 @@
 
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.76"
+local SCRIPT_VERSION = "rewrite-0.5.77"
 
 -- ---------------------------------------------------------------------------
 -- Single instance.
@@ -322,7 +322,8 @@ end
 do
     local me = LocalPlayer.Name
     local Core = { cap = nil, pending = nil, misses = 0, interp = 0.14, last_parry = nil,
-        ctx = "match", caps = {}, gen = 0, last_send_at = -math.huge }
+        ctx = "match", caps = {}, gen = 0, last_send_at = -math.huge,
+        feed = { n = 0, total = 0, since = 0, ahead = nil, urs = 0 } }
     local G = { until_t = 0, m1 = false, m1_at = 0 }
     local frame_dt = 1 / 60
     local active = false
@@ -2411,6 +2412,36 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         spam_tick(now)
     end
 
+    -- The game's BallReplicationHandler (Bbs dump) listens on an unreliable
+    -- remote, net "ReplicateBallPosition" (hashed name), that carries
+    -- (ball, server position) straight from the server -- no Roblox physics
+    -- interpolation buffer in between, which is what Core.interp pays for.
+    -- PROBE ONLY for now: count it and measure how far ahead of the physics
+    -- ball it is, and log that every 5s; timing doesn't use it yet.
+    function Parry.onBallFeed(ball, p)
+        if typeof(ball) ~= "Instance" or not ball:IsA("BasePart") then return end
+        if typeof(p) == "CFrame" then p = p.Position end
+        if typeof(p) ~= "Vector3" then return end
+        local F, now = Core.feed, clock_()
+        if F.since == 0 then F.since = now end
+        F.n, F.total = F.n + 1, F.total + 1
+        local v = ball_velocity(ball)
+        local sp = v.Magnitude
+        if sp > 20 then
+            local ahead = (p - ball.Position):Dot(v / sp) / sp
+            if math.abs(ahead) < 0.5 then F.ahead = F.ahead and (F.ahead * 0.9 + ahead * 0.1) or ahead end
+        end
+        if now - F.since >= 5 then
+            logp(("server ball feed: %.0f msgs/s, ahead of the physics ball by %s (Core.interp %.0fms)"):format(
+                F.n / (now - F.since), F.ahead and ("%.0fms"):format(F.ahead * 1000) or "n/a (ball slow)", Core.interp * 1000))
+            F.n, F.since = 0, now
+        end
+    end
+    function Parry.feedUrs(n) Core.feed.urs = n end
+    function Parry.feedCheck()
+        local F = Core.feed
+        if F.total == 0 then logp(("server ball feed: no messages on %d unreliable remote(s) yet -- try the game's Settings > Misc > Lag-Ball on"):format(F.urs)) end
+    end
     function Parry.onBallAdded(ball)
         task.defer(function()
             if not active or not ball.Parent or not ball:GetAttribute('realBall') then return end
@@ -2601,6 +2632,20 @@ function Engine.start()
     pcall(function() econnect(R.M1Stop.Event, Parry.onM1Stop) end)
     econnect(UserInputService.InputBegan, Parry.onInput)
     for _, folder in ipairs(Parry.ballFolders()) do econnect(folder.ChildAdded, Parry.onBallAdded) end
+    -- server ball feed probe (see Parry.onBallFeed): every unreliable remote in
+    -- the game's Net folder; the handler ignores anything that isn't (ball, pos)
+    pcall(function()
+        local idx = ReplicatedStorage:FindFirstChild("Packages") and ReplicatedStorage.Packages:FindFirstChild("_Index")
+        local pkg = idx and idx:FindFirstChild("sleitnick_net@0.1.0")
+        local net = pkg and pkg:FindFirstChild("net")
+        if not net then return end
+        local n = 0
+        for _, r in ipairs(net:GetChildren()) do
+            if r.ClassName == "UnreliableRemoteEvent" then econnect(r.OnClientEvent, Parry.onBallFeed); n = n + 1 end
+        end
+        Parry.feedUrs(n)
+        task.delay(20, function() if Engine.running then pcall(Parry.feedCheck) end end)
+    end)
     -- the game's own block swings (your presses, capture presses) start its
     -- lockout; seen on the animator, no hooks
     local function watch_animator(char)
