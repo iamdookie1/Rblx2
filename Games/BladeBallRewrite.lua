@@ -31,7 +31,7 @@
 
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.58"
+local SCRIPT_VERSION = "rewrite-0.5.59"
 
 -- ---------------------------------------------------------------------------
 -- Single instance.
@@ -1527,6 +1527,7 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
     local on_retarget, on_velocity -- set below
     local function open_pass(st)
         st.pass_open, st.parried, st.landed, st.parry_until = true, false, false, 0
+        if st.hm and st.hm.k then st.k_mem = st.hm.k end -- the ball's turn, kept for the next pass
         st.spd, st.hm = nil, nil
         if st.preparried then
             st.parried, st.parry_until, st.preparried = true, st.preparry_until, false
@@ -1554,8 +1555,16 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
             local swaps = st.swaps
             swaps[#swaps + 1] = { t = now, from = st.target, to = new }
             if #swaps > 16 then table.remove(swaps, 1) end
+            local was_me = st.target == me
             st.target = new
-            if type(new) == 'string' and new ~= '' and new ~= me then st.pass_open, st.parried, st.landed = false, false, false end
+            if type(new) == 'string' and new ~= '' and new ~= me then
+                st.pass_open, st.parried, st.landed = false, false, false
+                -- it left US for someone else: our parry landed (only a parry sends
+                -- it on). Open the lockout now instead of waiting a ping for the
+                -- ParrySuccess message -- in a close exchange the ball is often
+                -- back before that message, and the gate held the parry.
+                if was_me then G.until_t = 0 end
+            end
             if new == me and not st.pass_open then open_pass(st) end
             on_retarget(ball, st, new, now)
         end)
@@ -1938,8 +1947,20 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
 
     -- The decision for a ball on us. via: "retarget" (it just turned to us),
     -- "velocity" (its new direction just replicated), or nil (a frame point).
+    -- The decision for a ball on us. via: "retarget" (it just switched to us),
+    -- "velocity" (its new direction just replicated), or nil (a frame point).
+    -- One model for all of them (retarget and close range are built in):
+    --   earliest = flying straight in from here (it can't land sooner);
+    --   eta      = its real path: straight in, or its homing turn simulated from
+    --              where it points now (the gain measured on this ball, kept
+    --              across passes, taken at the slow end -- a longer path is the
+    --              safe side). At a retarget its velocity still points at the old
+    --              target, which is exactly the turn the sim plays out.
+    -- Fire when eta is down to the lead (accuracy/cushion inside the window), or
+    -- NOW when even flying straight it lands before the next chance to fire --
+    -- that is close range by TIME, not by distance, whatever direction it reads.
     local function decide(ball, st, root, now, via)
-        if pass_busy(st, now) or has_clash(ball, now) or blocked_by_detection() then return end
+        if pass_busy(st, now) or blocked_by_detection() then return end
         local rpos, bpos = root.Position, ball.Position
         local vel = ball_velocity(ball)
         local speed = vel.Magnitude
@@ -1954,81 +1975,36 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         local gap = contact_gap(ball)
         local rem = math.max(dist - gap, 0)
         local accel = speed_gain(st, speed, now)
-        local straight = time_to_contact(dist, gap, speed, accel) -- the earliest it could possibly land
         local h = track_homing(st, dir, want, dist, now)
+        local earliest = time_to_contact(dist, gap, speed, accel)
         local lead = math.min(fire_lead(speed), reach + W * 0.85)
-        local info = { speed = speed, dist = dist, heading = heading, lead = lead, eta = straight }
-        -- touching / point blank: now or never, whatever direction it reads.
-        -- (Original BladeBall's point_blank = dist <= max(10, speed*0.12).)
-        local point_blank = dist <= math.max(10, speed * 0.12)
-        if rem <= 3 or point_blank then
-            return fire(st, now, "point blank", info, ball)
-        end
-        if via == "retarget" then
-            -- INSTANT RETARGET, exactly as the fast original (Games/BladeBall.lua
-            -- @48a3978): fire off the target flip itself when the ball, homing in
-            -- at this speed, lands inside the PARRY-DISTANCE lead (range / speed,
-            -- capped so the window can't run out first). Its new direction isn't in
-            -- yet; still flying away means it has to turn first (+20%). Anything
-            -- with more time is left to auto parry's own timing (frame points and
-            -- the velocity update) -- retarget never takes those.
-            if not S.instant_retarget then return end
-            local rlead = math.min(parry_distance(speed) / speed, reach + W * 0.7)
-            local eta = dist / speed * (heading < 0 and 1.2 or 1)
-            info.eta, info.lead = eta, rlead
-            if eta <= rlead then return fire(st, now, "instant retarget", info, ball) end
-            return
-        end
-        -- CLOSE-RANGE ANTI-CURVE: a ball curved at us from close range reads
-        -- side-on (low heading), so the estimators below can call it "away" and
-        -- hold until it hits. Inside close range, anything not clearly flying away
-        -- is taken as incoming: arrival = remaining distance over speed, padded
-        -- for the arc it still has to bend through (x1 straight .. x1.4 side-on).
-        if S.close_anticurve and heading > -0.5 then
-            local close = math.max(S.close_range or 30, speed * 0.22)
-            if dist <= close then
-                local eta_c = rem / speed * (1 + 0.4 * (1 - math.max(heading, 0)))
-                if eta_c <= lead then
-                    info.eta = eta_c
-                    return fire(st, now, "close anti-curve", info, ball)
-                end
+        local eta = earliest
+        if heading < 0.97 then
+            if h.k then st.k_mem = h.k end
+            local k = math.clamp((h.k or st.k_mem or K_DEFAULT) * 0.85, K_MIN, K_MAX)
+            local v = vel
+            if heading < -0.95 then
+                -- dead away: nudge it off the line so the sim can turn it round
+                local side = dir:Cross(Vector3.yAxis)
+                if side.Magnitude < 1e-3 then side = dir:Cross(Vector3.xAxis) end
+                v = (dir + side.Unit * 0.08).Unit * speed
             end
-        end
-        local mode = S.anticurve
-        local eta = straight
-        if mode == "Off" then
-            if heading <= 0 then return end
-        elseif mode == "Dot" then
-            -- classic: wait until it points at us, then fire on time or distance
-            local thr = math.clamp((S.dot_threshold or 0.5) - pingMs() / 1000, -0.2, 0.95)
-            if heading < thr then return end
-            if dist <= parry_distance(speed) then return fire(st, now, "auto parry (dot)", info, ball) end
-        elseif heading < 0.985 then
-            -- SMART: median of three arrival estimates
-            local horizon = lead + 0.35
-            local k = h.away and K_MIN or math.clamp(h.k or K_DEFAULT, K_MIN, K_MAX)
-            local w = h.away and W_MIN or math.max(h.w or W_DEFAULT, W_MIN)
-            local e1 = sim_prop(bpos, vel, rpos, gap, k, accel, horizon) or math.huge
-            local e2 = sim_const(bpos, vel, rpos, gap, w, accel, horizon) or math.huge
-            local e3 = (not h.away) and radial_eta(h, rem, speed) or nil
-            if e3 then
-                eta = median3(e1, e2, e3)
-            elseif e1 == math.huge or e2 == math.huge then
-                eta = h.away and math.max(e1, e2) or math.min(e1, e2)
-            else
-                eta = (e1 + e2) * 0.5
-            end
-            eta = math.max(eta, straight)
-            info.k = k
+            eta = math.max(sim_prop(bpos, v, rpos, gap, k, accel, reach + W + 0.8) or math.huge, earliest)
             -- curving: lean a little earlier -- inside the window early is safe, late is fatal
             lead = math.min(lead + W * 0.25 * (S.curve_bias or 0.5) * (1 - math.max(heading, 0)), reach + W * 0.85)
-            info.lead = lead
         end
-        info.eta = eta
-        -- safety net: the classic distance trigger for a ball coming in nearly straight
-        local net = heading >= 0.85 and dist <= parry_distance(speed) and straight <= reach + W * 0.85
-        if eta <= lead or net then
-            return fire(st, now, via == "velocity" and "auto parry (velocity)" or "auto parry", info, ball)
+        local info = { speed = speed, dist = dist, heading = heading, lead = lead, eta = eta }
+        local name = via == "retarget" and "retarget" or (via == "velocity" and "auto parry (velocity)" or "auto parry")
+        -- now or never
+        local margin = math.max(frame_dt * 2, jitter()) + 0.02
+        if rem <= 3 or (earliest <= reach + margin and (heading > -0.5 or dist <= 14)) then
+            info.eta = earliest
+            return fire(st, now, name .. " (close)", info, ball)
+        end
+        if eta <= lead then return fire(st, now, name, info, ball) end
+        -- classic distance net for a ball coming nearly straight in
+        if heading >= 0.85 and dist <= parry_distance(speed) and earliest <= reach + W * 0.85 then
+            return fire(st, now, name, info, ball)
         end
     end
 
@@ -2075,7 +2051,7 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
     on_retarget = function(ball, st, new, now)
         if new == me then
             if SP.auto then clash_check(ball, now) end
-            if has_clash(ball, now) then spam_instant(); return end
+            if has_clash(ball, now) then spam_instant() end
             local root = ap_root()
             if root then
                 if S.triggerbot then trigger(ball, st, now)
@@ -2860,35 +2836,10 @@ AP:AddDropdown("ParryMode", {
     Tooltip = "Remote sends the captured packet (curves, no cooldown tell). Keypress presses block.",
     Callback = function(v) S.parry_mode = v end,
 })
-AP:AddDropdown("AntiCurve", {
-    Values = { "Smart", "Dot", "Off" }, Default = "Smart", Text = "Anti curve",
-    Tooltip = "Smart: median of three arrival estimates (homing sims + real closing speed). Dot: wait until the ball points at you. Off: straight-line timing.",
-    Callback = function(v) S.anticurve = v end,
-})
 AP:AddSlider("CurveBias", {
     Text = "Curve early bias", Default = 50, Min = 0, Max = 100, Rounding = 0, Suffix = "%",
-    Tooltip = "Smart mode: how much earlier to parry a curving ball (inside the window, early is safe).",
+    Tooltip = "How much earlier to parry a curving ball (inside the window, early is safe).",
     Callback = function(v) S.curve_bias = v / 100 end,
-})
-AP:AddToggle("InstantRetarget", {
-    Text = "Instant retarget", Default = true,
-    Tooltip = "Parries straight off the ball switching to you when it lands inside the parry distance (the fast original rule). Anything with more time is left to auto parry.",
-    Callback = function(v) S.instant_retarget = v end,
-})
-AP:AddToggle("CloseAntiCurve", {
-    Text = "Close-range anti curve", Default = true,
-    Tooltip = "Inside close range, a ball curved at you (reads side-on) is treated as incoming and parried on time instead of held until it hits.",
-    Callback = function(v) S.close_anticurve = v end,
-})
-AP:AddSlider("CloseRange", {
-    Text = "Close range", Default = 30, Min = 10, Max = 60, Rounding = 0, Suffix = " studs",
-    Tooltip = "Distance inside which close-range anti curve applies (grows with ball speed).",
-    Callback = function(v) S.close_range = v end,
-})
-AP:AddSlider("DotThreshold", {
-    Text = "Dot threshold", Default = 0.5, Min = -0.2, Max = 0.95, Rounding = 2,
-    Tooltip = "Dot mode: how directly the ball must point at you before it can be parried.",
-    Callback = function(v) S.dot_threshold = v end,
 })
 AP:AddToggle("PreParry", {
     Text = "Pre-parry", Default = false,
@@ -3429,12 +3380,16 @@ local EspCfg = { Color = Color3.fromRGB(255, 255, 255), TextSize = 14, Height = 
     OnlyWithAbility = false, MaxDistance = 0, ShowActive = true, ShowCooldown = true }
 local AbilityESP = Feature("AbilityESP")
 do
+    -- Remade on the executor's Drawing API: the text is drawn by the executor on
+    -- top of the screen, so it always renders, and there is no GUI instance at
+    -- all for the game to find (BillboardGuis in gethui never drew on some
+    -- executors). Falls back to a BillboardGui in CoreGui only with no Drawing.
+    -- Each frame, per other player: project a point above the head to the screen
+    -- and draw two lines -- name / ability (+ distance), and its state from the
+    -- character's CooldownExpiration (server time): READY or the seconds left.
+    -- The equipped ability is the Enabled script under character.Abilities.
+    local HAS_DRAW = type(Drawing) == "table" and type(Drawing.new) == "function"
     local entries = {}
-    local function esc(s) return (tostring(s):gsub('&', '&amp;'):gsub('<', '&lt;'):gsub('>', '&gt;')) end
-    -- The equipped ability is the one script under the character's Abilities
-    -- folder that is Enabled (the game ships every ability there and enables only
-    -- the equipped one -- the same thing auto ability reads). There is no
-    -- EquippedAbility attribute any more. Re-read about once a second per player.
     local function equipped(character)
         local ab = character and character:FindFirstChild('Abilities')
         if not ab then return nil end
@@ -3444,113 +3399,113 @@ do
         end
         return nil
     end
-    local function info(player, character, e)
-        local ability = player:GetAttribute('EquippedAbility') or (character and character:GetAttribute('Ability'))
-        if (not ability or ability == '') and e then
-            local now0 = os.clock()
-            if e.ab_char ~= character or now0 - (e.ab_at or 0) > 1 then
-                e.ab_char, e.ab_at, e.ability = character, now0, equipped(character)
-            end
-            ability = e.ability
+    local function new_text()
+        if HAS_DRAW then
+            local t = Drawing.new("Text")
+            t.Center, t.Outline, t.Visible = true, true, false
+            pcall(function() t.Font = 2 end)
+            pcall(function() t.OutlineColor = Color3.new(0, 0, 0) end)
+            return t
         end
-        if not ability or ability == '' then return nil end
-        local name = tostring(ability)
-        local up = player:FindFirstChild('Upgrades')
-        local lv = up and up:FindFirstChild(name)
-        if lv and type(lv.Value) == 'number' and lv.Value > 0 then name = name .. ' V' .. lv.Value end
-        local now = Workspace:GetServerTimeNow()
-        local status
-        if EspCfg.ShowActive then
-            local start, dur = player:GetAttribute('AbilityDurationStart') or 0, player:GetAttribute('AbilityDuration') or 0
-            local left = (start > 0 and dur > 0) and (start + dur - now) or 0
-            if left > 0 then status = ('<font color="#5CFF7A">ACTIVE %.1fs</font>'):format(left)
-            elseif character and character:GetAttribute('AbilityActive') then status = '<font color="#5CFF7A">ACTIVE</font>' end
-        end
-        if not status and EspCfg.ShowCooldown then
-            local exp = (character and character:GetAttribute('CooldownExpiration')) or player:GetAttribute('CooldownExpiration')
-            if type(exp) == 'number' then
-                local left = exp - now
-                status = (left > 0 and left < 600) and ('<font color="#FF6A6A">CD %.1fs</font>'):format(left) or '<font color="#B4B4B4">READY</font>'
-            end
-        end
-        return name, status
+        return nil
     end
+    local function kill(o) if o then pcall(function() o:Remove() end); pcall(function() o:Destroy() end) end end
     local function remove(player)
         local e = entries[player]
-        if e then pcall(function() e.bb:Destroy() end) end
+        if e then kill(e.top); kill(e.bot); kill(e.bb) end
         entries[player] = nil
     end
     local function clear_all() for p in pairs(entries) do remove(p) end end
-    -- Build (or rebuild against a fresh head) the billboard for one player. Nil
-    -- when the player has no character / head yet; the next tick retries.
-    local function ensure_entry(player)
+    local function entry(player)
         local e = entries[player]
-        local character = player.Character
-        local head = character and character:FindFirstChild('Head')
-        if not character or not head or not head.Parent then
-            if e then remove(player) end
-            return nil
+        if e then return e end
+        e = { top = new_text(), bot = new_text() }
+        if not HAS_DRAW then
+            local bb = Instance.new('BillboardGui')
+            bb.Name = randName(); bb.Size = UDim2.new(0, 220, 0, 44); bb.AlwaysOnTop = true
+            local l = Instance.new('TextLabel')
+            l.Size = UDim2.new(1, 0, 1, 0); l.BackgroundTransparency = 1; l.RichText = true
+            l.TextStrokeTransparency = 0; l.Font = Enum.Font.GothamBold; l.Parent = bb
+            pcall(function() if protect_gui then protect_gui(bb) end end)
+            pcall(function() bb.Parent = CoreGui end)
+            e.bb, e.label = bb, l
         end
-        if e and e.head == head then return e end
-        if e then remove(player) end -- respawned: rebuild on the new head
-        local bb = Instance.new('BillboardGui')
-        bb.Name = randName(); bb.Adornee = head; bb.Size = UDim2.new(0, 220, 0, 60)
-        bb.StudsOffset = Vector3.new(0, EspCfg.Height, 0); bb.AlwaysOnTop = true
-        local label = Instance.new('TextLabel')
-        label.Size = UDim2.new(1, 0, 1, 0); label.BackgroundTransparency = 1; label.TextColor3 = EspCfg.Color
-        label.TextSize = EspCfg.TextSize; label.TextStrokeTransparency = 0; label.Font = Enum.Font.Roboto
-        label.RichText = true; label.Visible = false; label.Parent = bb
-        -- A BillboardGui only draws when its container isn't itself a ScreenGui:
-        -- some executors' gethui() IS a ScreenGui, and billboards nested in it
-        -- never render (no labels at all). Use gethui() only when it's a plain
-        -- container, otherwise CoreGui directly (game scripts can't read either).
-        pcall(function() if syn and syn.protect_gui then syn.protect_gui(bb) end end)
-        pcall(function() if protect_gui then protect_gui(bb) end end)
-        local h = hui()
-        local nested = h ~= CoreGui and (h:IsA("LayerCollector") or h:FindFirstAncestorWhichIsA("LayerCollector") ~= nil)
-        local ok = pcall(function() bb.Parent = nested and CoreGui or h end)
-        if not ok then pcall(function() bb.Parent = CoreGui end) end
-        if not EspCfg.logged then
-            EspCfg.logged = true
-            pcall(function() Parry.logp(("ability esp: labels in %s (%s)"):format(bb.Parent and bb.Parent.ClassName or "nil", nested and "gethui is a ScreenGui -> CoreGui" or "gethui")) end)
-        end
-        e = { bb = bb, label = label, character = character, head = head }
         entries[player] = e
         return e
     end
-    -- One driver, loop-paced: every tick, (re)build a billboard per other player
-    -- and refresh its text. Runs everywhere (lobby and rounds); the billboards are
-    -- parked via hideGui (protected + hidden container), so they are not a scan
-    -- surface. (ESP was ruled out as the idle-kick cause in 0.5.20, so it is no
-    -- longer gated to in_play.)
-    local function update()
+    local function hide(e)
+        if e.top then e.top.Visible = false end
+        if e.bot then e.bot.Visible = false end
+        if e.bb then e.bb.Enabled = false end
+    end
+    local GREEN, RED, GREY = Color3.fromRGB(92, 255, 122), Color3.fromRGB(255, 106, 106), Color3.fromRGB(180, 180, 180)
+    local function state(character, now)
+        if not EspCfg.ShowCooldown then return nil end
+        local exp = character:GetAttribute('CooldownExpiration')
+        if type(exp) ~= 'number' then return nil end
+        local left = exp - now
+        if left > 0 and left < 600 then return ("CD %.1fs"):format(left), RED end
+        return "READY", GREEN
+    end
+    local function draw()
+        local cam = Workspace.CurrentCamera
+        if not cam then return end
         local my = getRoot()
+        local now = Workspace:GetServerTimeNow()
+        local clock = os.clock()
         for _, player in ipairs(Players:GetPlayers()) do
-            local e = player ~= LocalPlayer and ensure_entry(player) or nil
-            if e then
-                local dist = my and (my.Position - e.head.Position).Magnitude
-                local name, status = info(player, e.character, e)
-                local vis = not (EspCfg.MaxDistance > 0 and dist and dist > EspCfg.MaxDistance) and not (EspCfg.OnlyWithAbility and not name)
-                e.label.Visible = vis
-                if vis then
-                    e.label.TextColor3, e.label.TextSize = EspCfg.Color, EspCfg.TextSize
-                    e.bb.StudsOffset = Vector3.new(0, EspCfg.Height, 0)
-                    local parts = {}
-                    if EspCfg.ShowName then parts[#parts + 1] = esc(player.DisplayName) end
-                    if name then parts[#parts + 1] = '[' .. esc(name) .. ']' end
-                    if EspCfg.ShowDistance and dist then parts[#parts + 1] = ('%.0fm'):format(dist) end
-                    if #parts == 0 then parts[1] = esc(player.DisplayName) end
-                    local text = '<b>' .. table.concat(parts, ' ') .. '</b>' .. (status and ('\n' .. status) or '')
-                    if text ~= e.text then e.text = text; e.label.Text = text end
+            if player ~= LocalPlayer then
+                local e = entry(player)
+                local character = player.Character
+                local head = character and (character:FindFirstChild('Head') or character.PrimaryPart)
+                local shown = false
+                if head and head.Parent then
+                    if e.char ~= character or clock - (e.ab_at or 0) > 1 then
+                        e.char, e.ab_at, e.ability = character, clock, equipped(character)
+                    end
+                    local dist = my and (my.Position - head.Position).Magnitude
+                    local far = EspCfg.MaxDistance > 0 and dist and dist > EspCfg.MaxDistance
+                    if not far and not (EspCfg.OnlyWithAbility and not e.ability) then
+                        local world = head.Position + Vector3.new(0, EspCfg.Height, 0)
+                        local p, onscreen = cam:WorldToViewportPoint(world)
+                        if onscreen and p.Z > 0 then
+                            local parts = {}
+                            if EspCfg.ShowName then parts[#parts + 1] = player.DisplayName end
+                            if e.ability then parts[#parts + 1] = "[" .. e.ability .. "]" end
+                            if EspCfg.ShowDistance and dist then parts[#parts + 1] = ("%.0fm"):format(dist) end
+                            if #parts == 0 then parts[1] = player.DisplayName end
+                            local line1 = table.concat(parts, " ")
+                            local line2, col = state(character, now)
+                            local size = EspCfg.TextSize
+                            if HAS_DRAW then
+                                e.top.Text, e.top.Size, e.top.Color = line1, size, EspCfg.Color
+                                e.top.Position = Vector2.new(p.X, p.Y - size)
+                                e.top.Visible = true
+                                if line2 then
+                                    e.bot.Text, e.bot.Size, e.bot.Color = line2, size - 1, col or GREY
+                                    e.bot.Position = Vector2.new(p.X, p.Y + 1)
+                                    e.bot.Visible = true
+                                else
+                                    e.bot.Visible = false
+                                end
+                            elseif e.bb then
+                                e.bb.Adornee, e.bb.StudsOffset, e.bb.Enabled = head, Vector3.new(0, EspCfg.Height, 0), true
+                                e.label.TextSize, e.label.TextColor3 = size, EspCfg.Color
+                                local hex = col and ("#%02X%02X%02X"):format(math.floor(col.R * 255 + 0.5), math.floor(col.G * 255 + 0.5), math.floor(col.B * 255 + 0.5))
+                                e.label.Text = line1 .. (line2 and ('\n<font color="' .. hex .. '">' .. line2 .. '</font>') or "")
+                            end
+                            shown = true
+                        end
+                    end
                 end
+                if not shown then hide(e) end
             end
         end
-        -- players who left the server
         for player in pairs(entries) do if player.Parent ~= Players then remove(player) end end
     end
     function AbilityESP.start()
         AbilityESP:connect(Players.PlayerRemoving, function(p) remove(p) end)
-        AbilityESP:loop(0.1, update)
+        AbilityESP:connect(RunService.RenderStepped, function() pcall(draw) end)
     end
     function AbilityESP.stop() clear_all() end
 end
@@ -3564,8 +3519,7 @@ AE:AddToggle("AbilityESP", { Text = "Ability ESP", Default = false, Callback = f
 AE:AddToggle("AbilityESPName", { Text = "Show name", Default = true, Callback = function(v) EspCfg.ShowName = v end })
 AE:AddToggle("AbilityESPDistance", { Text = "Show distance", Default = false, Callback = function(v) EspCfg.ShowDistance = v end })
 AE:AddToggle("AbilityESPOnlyWith", { Text = "Only players with an ability", Default = false, Callback = function(v) EspCfg.OnlyWithAbility = v end })
-AE:AddToggle("AbilityESPActive", { Text = "Show active time", Default = true, Callback = function(v) EspCfg.ShowActive = v end })
-AE:AddToggle("AbilityESPCooldown", { Text = "Show cooldown", Default = true, Callback = function(v) EspCfg.ShowCooldown = v end })
+AE:AddToggle("AbilityESPCooldown", { Text = "Show ready / cooldown", Default = true, Callback = function(v) EspCfg.ShowCooldown = v end })
 AE:AddSlider("AbilityESPTextSize", { Text = "Text size", Default = 14, Min = 8, Max = 30, Rounding = 0, Callback = function(v) EspCfg.TextSize = v end })
 AE:AddSlider("AbilityESPHeight", { Text = "Height offset", Default = 3.5, Min = 0, Max = 15, Rounding = 1, Suffix = " studs", Callback = function(v) EspCfg.Height = v end })
 AE:AddSlider("AbilityESPMaxDistance", { Text = "Max distance", Default = 0, Min = 0, Max = 2000, Rounding = 0, Suffix = " studs",
