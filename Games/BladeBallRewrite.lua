@@ -31,7 +31,7 @@
 
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.70"
+local SCRIPT_VERSION = "rewrite-0.5.71"
 
 -- ---------------------------------------------------------------------------
 -- Single instance.
@@ -58,6 +58,10 @@ local HttpService = cloneref(game:GetService('HttpService'))
 local CoreGui = cloneref(game:GetService('CoreGui'))
 local Debris = cloneref(game:GetService('Debris'))
 local LocalPlayer = Players.LocalPlayer
+-- bisect switch, as the original used: getgenv().BBStop = N stops loading at
+-- stage N -- 0 services only, 1 + parry core / engine / log (no UI), 2 + menu
+-- library, 3 + whole menu and config. Idle and see which stage first kicks.
+if getgenv().BBStop == 0 then return end
 local clock_ = os.clock
 local LOAD_T = clock_()
 local isMobile = UserInputService.TouchEnabled and not UserInputService.MouseEnabled
@@ -2711,6 +2715,8 @@ do
     end)
 end
 
+if getgenv().BBStop == 1 then Flight.write("BBStop 1: stopped after the core (no UI)"); return end
+
 -- ===========================================================================
 -- MOBILE MANUAL-SPAM SWITCH (touch devices only; no on-screen UI on PC).
 -- A capsule switch: tap to turn spam on/off, drag to move it. The thumb slides
@@ -2870,7 +2876,23 @@ end
 -- ===========================================================================
 -- UI
 -- ===========================================================================
-Library = loadstring(game:HttpGet("https://raw.githubusercontent.com/iamdookie1/Ui3/main/Ui.lua"))()
+do
+    -- The game's own scripts can read the output console (LogService). Ui3
+    -- warn()s "[Ui3] Failed to load '<setting>' ..." when a saved config value
+    -- can't be applied (an old value for a setting that has since changed) and
+    -- "[Ui3] Callback error ..." when a callback errors -- a script-loaded tell
+    -- sitting in the console from the first second, with nothing switched on.
+    -- Run Ui3 with its print / warn going to our log file instead.
+    local fn = loadstring(game:HttpGet("https://raw.githubusercontent.com/iamdookie1/Ui3/main/Ui.lua"))
+    local function quiet(...)
+        local t = {}
+        for i = 1, select("#", ...) do t[i] = tostring((select(i, ...))) end
+        pcall(Flight.write, "ui (kept off the console): " .. table.concat(t, " "))
+    end
+    pcall(function() setfenv(fn, setmetatable({ warn = quiet, print = quiet }, { __index = getfenv(fn) })) end)
+    Library = fn()
+end
+if getgenv().BBStop == 2 then Flight.write("BBStop 2: stopped after loading the menu library (no window)"); return end
 local Options, Toggles = Library.Options, Library.Toggles
 local S, SP, Det = Parry.S, Parry.SP, Parry.Det
 local function Notify(title, text, time) pcall(function() Library:Notify({ Title = title, Description = text, Time = time or 3 }) end) end
@@ -4149,6 +4171,7 @@ genv.__BladeBallShutdown = function()
     if genv.__BladeBallInstance == INSTANCE then genv.__BladeBallInstance = nil end
 end
 
+if getgenv().BBStop == 3 then Flight.write("BBStop 3: whole menu + config loaded, stopping before the loaded notice") end
 Notify("Blade Ball", "Rewrite " .. SCRIPT_VERSION .. " loaded. " .. (touchUI and "Tap the menu button to open." or "LeftControl toggles the menu."), 5)
 
 end)
