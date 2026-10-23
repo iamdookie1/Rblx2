@@ -31,7 +31,7 @@
 
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.62"
+local SCRIPT_VERSION = "rewrite-0.5.63"
 
 -- ---------------------------------------------------------------------------
 -- Single instance.
@@ -2566,19 +2566,23 @@ local function in_play()
 end
 round_check = in_play
 do
-    -- re-apply round-only features when you enter / leave a round
-    local function sync()
-        for _, f in pairs(Features) do
-            if f.round_only and (f.want or f.on) then pcall(function() f:setEnabled(f.want) end) end
+    -- Re-apply round-only features when you enter / leave a round. POLLED (a
+    -- plain loop, no game-signal listener): listeners on game signals attached
+    -- in the lobby are what BAC kicks on (reason 24) -- the original's fix was
+    -- to drive this from a poll too.
+    task.spawn(function()
+        local last = nil
+        while is_live() do
+            local inr = in_play()
+            if inr ~= last then
+                last = inr
+                for _, f in pairs(Features) do
+                    if f.round_only and (f.want or f.on) then pcall(function() f:setEnabled(f.want) end) end
+                end
+            end
+            task.wait(0.4)
         end
-    end
-    local function on_change() task.defer(sync) end
-    local function watch_char(char) char.AncestryChanged:Connect(on_change) end
-    if LocalPlayer.Character then watch_char(LocalPlayer.Character) end
-    LocalPlayer.CharacterAdded:Connect(function(c) watch_char(c); on_change() end)
-    LocalPlayer:GetAttributeChangedSignal("LobbyTraining"):Connect(on_change)
-    LocalPlayer:GetAttributeChangedSignal("LobbyParry"):Connect(on_change)
-    on_change()
+    end)
 end
 local function wconnect(signal, fn)
     local c = signal:Connect(function(...)
@@ -2611,19 +2615,23 @@ end
 function Engine.arm()
     if Engine.armed then return end
     Engine.armed = true
-    local function on_change() task.defer(reevaluate) end
-    local function watch_char(char) wconnect(char.AncestryChanged, on_change) end
-    if LocalPlayer.Character then watch_char(LocalPlayer.Character) end
-    wconnect(LocalPlayer.CharacterAdded, function(c) watch_char(c); on_change() end)
-    wconnect(LocalPlayer:GetAttributeChangedSignal("LobbyTraining"), on_change)
-    wconnect(LocalPlayer:GetAttributeChangedSignal("LobbyParry"), on_change)
+    -- wake / sleep is POLLED (no CharacterAdded / AncestryChanged / attribute
+    -- listeners in the lobby -- those are what BAC kicks on, reason 24)
+    local tok = {}
+    Engine.poll_tok = tok
+    task.spawn(function()
+        while Engine.armed and Engine.poll_tok == tok and is_live() do
+            pcall(reevaluate)
+            task.wait(0.4)
+        end
+    end)
     Flight.write("parry/spam feature on -- engine " .. (in_play() and "waking" or "asleep until a round"))
     reevaluate()
     if not Engine.running and StatusHook then pcall(StatusHook, nil, true) end
 end
 function Engine.disarm()
     if not Engine.armed then return end
-    Engine.armed, Engine.sleep_tok = false, nil
+    Engine.armed, Engine.sleep_tok, Engine.poll_tok = false, nil, nil
     for _, c in ipairs(Engine.watch) do pcall(function() c:Disconnect() end) end
     Engine.watch = {}
     if Engine.running then Engine.stop() end
@@ -3410,135 +3418,137 @@ local EspCfg = { Color = Color3.fromRGB(255, 255, 255), TextSize = 14, Height = 
     OnlyWithAbility = false, MaxDistance = 0, ShowActive = true, ShowCooldown = true, ShowSelf = true }
 local AbilityESP = Feature("AbilityESP")
 do
-    -- Ported from the original Games/BladeBall.lua ability ESP (the one that
-    -- worked): one BillboardGui per player pointed at the head (Adornee), put in
-    -- the executor's hidden container (gethui, else CoreGui) WITHOUT protect_gui --
-    -- the rewrite's protect_gui / CoreGui variants never drew. Built when the
-    -- character spawns (WaitForChild Head); one shared 10 Hz Heartbeat updater
-    -- writes text / style only when they change.
-    -- Ability: the player's EquippedAbility attribute if the game sets it, else
-    -- the Enabled script under character.Abilities (what the game ships now).
-    local HUI = CoreGui
-    pcall(function() local h = gethui and gethui(); if typeof(h) == 'Instance' then HUI = h end end)
-    -- a billboard nested inside a ScreenGui never draws: if gethui is one, use CoreGui
-    pcall(function()
-        if HUI ~= CoreGui and (HUI:IsA("LayerCollector") or HUI:FindFirstAncestorWhichIsA("LayerCollector")) then HUI = CoreGui end
-    end)
-    local entries = {}   -- player -> { billboard, label, character, head, text, color, size, height }
+    -- A 2D overlay: ONE ScreenGui in gethui -- the same kind of GUI in the same
+    -- place as the menu, which renders on Delta and has never kicked -- with a
+    -- label per player placed over their head every frame from the camera
+    -- projection. (BillboardGuis in Delta's gethui folder never draw -- the
+    -- self-label test showed it -- and Drawing text came out tiny / glitchy on
+    -- mobile.) No game-signal listeners at all: players are scanned by a 0.1s
+    -- loop and labels placed by a per-frame task.wait() loop, because listeners
+    -- attached in the lobby are what BAC kicks on (reason 24).
+    -- Line 1: name / [ability] / distance; line 2: READY or cooldown left
+    -- (character CooldownExpiration). Ability: EquippedAbility attribute, else
+    -- the Enabled script under character.Abilities.
+    local gui, entries = nil, {}
     local function esc(t) return (tostring(t):gsub('&', '&amp;'):gsub('<', '&lt;'):gsub('>', '&gt;')) end
     local function equipped(player, character)
         local a = player:GetAttribute('EquippedAbility') or (character and character:GetAttribute('Ability'))
         if a and a ~= '' then return tostring(a) end
         local ab = character and character:FindFirstChild('Abilities')
         if not ab then return nil end
-        for _, s in ipairs(ab:GetChildren()) do
-            local ok, en = pcall(function() return s.Enabled end)
-            if ok and en then return s.Name end
+        for _, sc in ipairs(ab:GetChildren()) do
+            local ok, en = pcall(function() return sc.Enabled end)
+            if ok and en then return sc.Name end
         end
         return nil
     end
-    local function info(player, e)
-        local now = Workspace:GetServerTimeNow()
-        local clock = os.clock()
-        if clock - (e.ab_at or 0) > 1 then e.ab_at, e.ability = clock, equipped(player, e.character) end
-        local name = e.ability
-        if name then
-            local up = player:FindFirstChild('Upgrades')
-            local lv = up and up:FindFirstChild(name)
-            if lv and type(lv.Value) == 'number' and lv.Value > 0 then name = name .. ' V' .. lv.Value end
-        end
-        local status
-        if EspCfg.ShowCooldown then
-            local exp = e.character:GetAttribute('CooldownExpiration') or player:GetAttribute('CooldownExpiration')
-            if type(exp) == 'number' then
-                local left = exp - now
-                status = (left > 0 and left < 600) and ('<font color="#FF6A6A">CD %.1fs</font>'):format(left)
-                    or '<font color="#5CFF7A">READY</font>'
-            end
-        end
-        return name, status
+    local function make_gui()
+        local g = Instance.new("ScreenGui")
+        g.Name = randName(); g.IgnoreGuiInset = true; g.ResetOnSpawn = false; g.DisplayOrder = 2
+        pcall(function() if protectgui then protectgui(g) elseif syn and syn.protect_gui then syn.protect_gui(g) end end)
+        if not pcall(function() g.Parent = hui() end) or not g.Parent then pcall(function() g.Parent = CoreGui end) end
+        return g
     end
     local function remove(player)
         local e = entries[player]
-        if e then pcall(function() e.billboard:Destroy() end) end
+        if e then pcall(function() e.label:Destroy() end) end
         entries[player] = nil
     end
-    local function clear_all() for p in pairs(entries) do remove(p) end end
-    local function create(player)
-        task.spawn(function()
-            local character = player.Character
-            while AbilityESP.on and (not character or not character.Parent) do task.wait(0.5); character = player.Character end
-            if not character or not AbilityESP.on then return end
-            local head = character:WaitForChild('Head', 10)
-            if not head or not AbilityESP.on then return end
-            remove(player)
-            local billboard = Instance.new('BillboardGui')
-            billboard.Name = randName(); billboard.Adornee = head
-            billboard.Size = UDim2.new(0, 220, 0, 60)
-            billboard.StudsOffset = Vector3.new(0, EspCfg.Height, 0); billboard.AlwaysOnTop = true
-            billboard.Parent = HUI
-            local label = Instance.new('TextLabel')
-            label.Size = UDim2.new(1, 0, 1, 0); label.BackgroundTransparency = 1
-            label.TextColor3 = EspCfg.Color; label.TextSize = EspCfg.TextSize
-            label.TextStrokeTransparency = 0; label.Font = Enum.Font.Roboto
-            label.RichText = true; label.TextXAlignment = Enum.TextXAlignment.Center
-            label.TextYAlignment = Enum.TextYAlignment.Center; label.Parent = billboard
-            label.Visible = false
-            entries[player] = { billboard = billboard, label = label, character = character, head = head,
-                color = EspCfg.Color, size = EspCfg.TextSize, height = EspCfg.Height }
-            if not EspCfg.logged then
-                EspCfg.logged = true
-                pcall(function() Parry.logp(("ability esp: first label on %s (container %s %s)"):format(
-                    player.Name, HUI.ClassName, HUI.Name)) end)
-            end
-        end)
+    local function clear_all()
+        for p in pairs(entries) do remove(p) end
+        if gui then pcall(function() gui:Destroy() end); gui = nil end
     end
-    local function add(player)
-        if player == LocalPlayer and not EspCfg.ShowSelf then return end
-        AbilityESP:connect(player.CharacterAdded, function() create(player) end)
-        if player.Character then create(player) end
+    local function new_label()
+        local l = Instance.new("TextLabel")
+        l.AnchorPoint = Vector2.new(0.5, 1)
+        l.Size = UDim2.fromOffset(320, 44)
+        l.BackgroundTransparency = 1
+        l.Font = Enum.Font.GothamBold
+        l.RichText = true
+        l.TextStrokeTransparency = 0.15
+        l.TextYAlignment = Enum.TextYAlignment.Bottom
+        l.Visible = false
+        l.Parent = gui
+        return l
     end
-    local function update()
+    -- 10x a second: who to show, and what each label says
+    local function refresh()
         local my = getRoot()
-        for player, e in pairs(entries) do
-            local character, head = e.character, e.head
-            if not (character and character.Parent and head and head.Parent) or player.Parent ~= Players then
-                remove(player)
-            else
-                local dist = my and player ~= LocalPlayer and (my.Position - head.Position).Magnitude or nil
-                local name, status = info(player, e)
-                local visible = not (EspCfg.MaxDistance > 0 and dist and dist > EspCfg.MaxDistance)
-                    and not (EspCfg.OnlyWithAbility and not name)
-                if e.label.Visible ~= visible then e.label.Visible = visible end
-                if visible then
-                    if e.color ~= EspCfg.Color then e.color = EspCfg.Color; e.label.TextColor3 = EspCfg.Color end
-                    if e.size ~= EspCfg.TextSize then e.size = EspCfg.TextSize; e.label.TextSize = EspCfg.TextSize end
-                    if e.height ~= EspCfg.Height then e.height = EspCfg.Height; e.billboard.StudsOffset = Vector3.new(0, EspCfg.Height, 0) end
-                    local parts = {}
-                    if EspCfg.ShowName then parts[#parts + 1] = esc(player.DisplayName) end
-                    if name then parts[#parts + 1] = '[' .. esc(name) .. ']' end
-                    if EspCfg.ShowDistance and dist then parts[#parts + 1] = ('%.0fm'):format(dist) end
-                    if #parts == 0 then parts[1] = esc(player.DisplayName) end
-                    local text = '<b>' .. table.concat(parts, ' ') .. '</b>'
-                    if status then text = text .. '\n' .. status end
-                    if text ~= e.text then e.text = text; e.label.Text = text end
+        local now = Workspace:GetServerTimeNow()
+        local clock = os.clock()
+        local seen = {}
+        for _, player in ipairs(Players:GetPlayers()) do
+            if player ~= LocalPlayer or EspCfg.ShowSelf then
+                local character = player.Character
+                local head = character and character.Parent and (character:FindFirstChild('Head') or character.PrimaryPart)
+                if head then
+                    seen[player] = true
+                    local e = entries[player]
+                    if not e then e = { label = new_label() }; entries[player] = e end
+                    if e.char ~= character then e.char, e.ab_at = character, 0 end
+                    e.head = head
+                    if clock - e.ab_at > 1 then e.ab_at, e.ability = clock, equipped(player, character) end
+                    local dist = my and player ~= LocalPlayer and (my.Position - head.Position).Magnitude or nil
+                    e.show = not (EspCfg.MaxDistance > 0 and dist and dist > EspCfg.MaxDistance)
+                        and not (EspCfg.OnlyWithAbility and not e.ability)
+                    if e.show then
+                        local name = e.ability
+                        if name then
+                            local up = player:FindFirstChild('Upgrades')
+                            local lv = up and up:FindFirstChild(name)
+                            if lv and type(lv.Value) == 'number' and lv.Value > 0 then name = name .. ' V' .. lv.Value end
+                        end
+                        local parts = {}
+                        if EspCfg.ShowName then parts[#parts + 1] = esc(player.DisplayName) end
+                        if name then parts[#parts + 1] = '[' .. esc(name) .. ']' end
+                        if EspCfg.ShowDistance and dist then parts[#parts + 1] = ('%.0fm'):format(dist) end
+                        if #parts == 0 then parts[1] = esc(player.DisplayName) end
+                        local text = '<b>' .. table.concat(parts, ' ') .. '</b>'
+                        if EspCfg.ShowCooldown then
+                            local exp = character:GetAttribute('CooldownExpiration') or player:GetAttribute('CooldownExpiration')
+                            if type(exp) == 'number' then
+                                local left = exp - now
+                                text = text .. ((left > 0 and left < 600) and ('\n<font color="#FF6A6A">CD %.1fs</font>'):format(left)
+                                    or '\n<font color="#5CFF7A">READY</font>')
+                            end
+                        end
+                        if text ~= e.text then e.text = text; e.label.Text = text end
+                        if e.size ~= EspCfg.TextSize then e.size = EspCfg.TextSize; e.label.TextSize = EspCfg.TextSize end
+                        if e.color ~= EspCfg.Color then e.color = EspCfg.Color; e.label.TextColor3 = EspCfg.Color end
+                    end
                 end
             end
         end
+        for player in pairs(entries) do if not seen[player] then remove(player) end end
+    end
+    -- every frame: put each label over its head
+    local function place()
+        local cam = Workspace.CurrentCamera
+        if not cam then return end
+        local up = Vector3.new(0, EspCfg.Height, 0)
+        for _, e in pairs(entries) do
+            local head = e.head
+            local vis = false
+            if e.show and head and head.Parent then
+                local p, on = cam:WorldToViewportPoint(head.Position + up)
+                if on and p.Z > 0 then
+                    e.label.Position = UDim2.fromOffset(math.floor(p.X + 0.5), math.floor(p.Y + 0.5))
+                    vis = true
+                end
+            end
+            if e.label.Visible ~= vis then e.label.Visible = vis end
+        end
     end
     function AbilityESP.start()
-        EspCfg.logged = false
-        pcall(function() Parry.logp(("ability esp ON: %d other player(s) in this server%s"):format(
-            #Players:GetPlayers() - 1, EspCfg.ShowSelf and " + you" or "")) end)
-        for _, player in ipairs(Players:GetPlayers()) do add(player) end
-        AbilityESP:connect(Players.PlayerAdded, add)
-        AbilityESP:connect(Players.PlayerRemoving, remove)
-        local acc = 0
-        AbilityESP:connect(RunService.Heartbeat, function(dt)
-            acc = acc + dt
-            if acc < 0.1 then return end
-            acc = 0
-            pcall(update)
+        local tok = AbilityESP._token
+        gui = make_gui()
+        pcall(function() Parry.logp(("ability esp ON: %d other player(s)%s, overlay in %s"):format(
+            #Players:GetPlayers() - 1, EspCfg.ShowSelf and " + you" or "", tostring(gui.Parent and gui.Parent.ClassName))) end)
+        task.spawn(function()
+            while AbilityESP:alive(tok) do pcall(refresh); task.wait(0.1) end
+        end)
+        task.spawn(function()
+            while AbilityESP:alive(tok) do pcall(place); task.wait() end
         end)
     end
     function AbilityESP.stop() clear_all() end
