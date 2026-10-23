@@ -31,7 +31,7 @@
 
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.67"
+local SCRIPT_VERSION = "rewrite-0.5.68"
 
 -- ---------------------------------------------------------------------------
 -- Single instance.
@@ -3367,31 +3367,108 @@ MV:AddToggle("AutoJump", {
 }):AddKeyPicker("AutoJumpKey", { Default = "J", Mode = "Toggle", SyncToggleState = true, Text = "Auto jump" })
 
 -- ----- Orbit tab -----
--- Circles your character around a centre every frame. "Yourself": the centre
--- is where you stood when you turned it on, and it is WALKABLE -- your own
--- movement input (WASD / joystick / gamepad, read from Humanoid.MoveDirection)
--- moves the centre at your walk speed, so the orbit travels with you. "Ball":
--- the centre is the live ball. Height 0 keeps your own Y (gravity / jumping
--- work); anything else holds you that high above the centre. Plain task loop,
--- no signal listeners. A respawn or a teleport re-centres on where you are.
-local OrbitCfg = { Center = "Yourself", Radius = 8, Speed = 0.5, Clockwise = false, Height = 0, Walk = 1, Face = false }
+-- Circles (or traces a shape around) a centre every frame.
+--   Yourself: the centre is where you stood when you turned it on, and it is
+--     WALKABLE -- your movement input (WASD / joystick / gamepad, read from
+--     Humanoid.MoveDirection) moves it at your walk speed. The CAMERA stays on
+--     that centre (Humanoid.CameraOffset pins the focus there), so it behaves as
+--     if you were standing on it instead of swinging with the orbit, and
+--     AutoRotate is off while orbiting so Roblox stops turning you / the camera.
+--   Ball: the centre is the ball -- in a match only the real match ball
+--     (Workspace.Balls), in lobby training only your training ball
+--     (Workspace.TrainingBalls), never mixed up.
+--   In the plain lobby it does nothing at all.
+-- Semi immortal: flips you up by N studs and back every frame, so you're off
+-- the ball's line half the time (the camera ignores the flip). Works with or
+-- without orbit. Plain task loops, no signal listeners.
+local OrbitCfg = { Center = "Yourself", Shape = "Circle", Radius = 8, Speed = 0.5, Clockwise = false, Height = 0,
+    Walk = 1, Face = false, Bob = false, BobAmp = 25 }
+local function orbit_ctx()
+    local char = LocalPlayer.Character
+    if not char or not char.Parent then return nil end
+    local alive = Workspace:FindFirstChild("Alive")
+    if alive and char.Parent == alive then return "match" end
+    if LocalPlayer:GetAttribute("LobbyTraining") then
+        local dead = Workspace:FindFirstChild("Dead")
+        if dead and char.Parent == dead then return "training" end
+    end
+    return nil -- lobby: nothing
+end
+local function orbit_ball(ctx)
+    local folder = Workspace:FindFirstChild(ctx == "training" and "TrainingBalls" or "Balls")
+    if not folder then return nil end
+    local first
+    for _, b in ipairs(folder:GetChildren()) do
+        if b:IsA("BasePart") and (ctx == "training" or b:GetAttribute("realBall")) then
+            if b:GetAttribute("target") == LocalPlayer.Name then return b end
+            first = first or b
+        end
+    end
+    return first
+end
+-- unit offset (x, z) of a shape at parameter t (radians, one lap = 2pi)
+local function shape_point(shape, t)
+    if shape == "Ellipse" then return math.cos(t), math.sin(t) * 0.5 end
+    if shape == "Figure 8" then return math.sin(t), math.sin(t) * math.cos(t) end
+    if shape == "Flower" then local r = math.cos(3 * t); return r * math.cos(t), r * math.sin(t) end
+    local n, inner
+    if shape == "Triangle" then n = 3 elseif shape == "Square" then n = 4 elseif shape == "Hexagon" then n = 6
+    elseif shape == "Star" then n, inner = 10, 0.45 else return math.cos(t), math.sin(t) end
+    local u = (t / (2 * math.pi)) * n
+    local i0 = math.floor(u)
+    local f = u - i0
+    local function vert(k)
+        local a = 2 * math.pi * (k % n) / n - math.pi / 2
+        local r = (inner and k % 2 == 1) and inner or 1
+        return math.cos(a) * r, math.sin(a) * r
+    end
+    local x1, z1 = vert(i0)
+    local x2, z2 = vert(i0 + 1)
+    return x1 + (x2 - x1) * f, z1 + (z2 - z1) * f
+end
+local Bob = { flip = false, base = nil }
+-- vertical flip for this frame (0 or the amplitude), alternating every call
+local function bob_dy()
+    if not OrbitCfg.Bob then Bob.flip = false; return 0 end
+    Bob.flip = not Bob.flip
+    return Bob.flip and OrbitCfg.BobAmp or 0
+end
 local Orbit = Feature("Orbit")
+local SemiImmortal = Feature("SemiImmortal")
+local orbit_saved = { hum = nil, autorotate = nil }
+local function cam_reset()
+    local h = orbit_saved.hum
+    if h then
+        pcall(function() h.CameraOffset = Vector3.zero end)
+        if orbit_saved.autorotate ~= nil then pcall(function() h.AutoRotate = orbit_saved.autorotate end) end
+    end
+    orbit_saved.hum, orbit_saved.autorotate = nil, nil
+end
+local function cam_hold(hum)
+    if orbit_saved.hum ~= hum then
+        cam_reset()
+        orbit_saved.hum, orbit_saved.autorotate = hum, hum.AutoRotate
+        hum.AutoRotate = false
+    end
+end
 do
     local anchor, angle, char_seen = nil, 0, nil
     local function step(dt)
+        local ctx = orbit_ctx()
         local char = LocalPlayer.Character
         local hrp = char and char:FindFirstChild("HumanoidRootPart")
         local hum = char and char:FindFirstChildOfClass("Humanoid")
-        if not hrp or not hum or hum.Health <= 0 then anchor = nil; return end
-        if char ~= char_seen then char_seen, anchor = char, nil end
+        if not ctx or not hrp or not hum or hum.Health <= 0 then anchor, Bob.base = nil, nil; cam_reset(); return end
+        if char ~= char_seen then char_seen, anchor, Bob.base = char, nil, nil end
         local r = OrbitCfg.Radius
-        local center
+        local center, self_mode
         if OrbitCfg.Center == "Ball" then
-            local b = Parry.mainBall and Parry.mainBall()
-            if not b then return end -- no ball: leave you alone
+            local b = orbit_ball(ctx)
+            if not b then anchor = nil; cam_reset(); return end -- no ball: leave you alone
             center, anchor = b.Position, nil
         else
-            if not anchor or (Vector3.new(anchor.X, 0, anchor.Z) - Vector3.new(hrp.Position.X, 0, hrp.Position.Z)).Magnitude > r + 40 then
+            self_mode = true
+            if not anchor or (Vector3.new(anchor.X, 0, anchor.Z) - Vector3.new(hrp.Position.X, 0, hrp.Position.Z)).Magnitude > r * 2 + 40 then
                 anchor = hrp.Position -- start / respawn / teleport: orbit where you stand
             end
             local md = hum.MoveDirection
@@ -3401,21 +3478,31 @@ do
             center = anchor
         end
         angle = (angle + OrbitCfg.Speed * 2 * math.pi * (OrbitCfg.Clockwise and -1 or 1) * dt) % (2 * math.pi)
+        local ox, oz = shape_point(OrbitCfg.Shape, angle)
         local hover = OrbitCfg.Height ~= 0
-        local y = hover and (center.Y + OrbitCfg.Height) or hrp.Position.Y
-        local pos = Vector3.new(center.X + math.cos(angle) * r, y, center.Z + math.sin(angle) * r)
-        local rot
-        if OrbitCfg.Face then
-            rot = CFrame.lookAt(pos, Vector3.new(center.X, y, center.Z)).Rotation
+        local base_y
+        if hover then
+            base_y = center.Y + OrbitCfg.Height
+        elseif OrbitCfg.Bob then
+            Bob.base = Bob.base or hrp.Position.Y
+            base_y = Bob.base
         else
-            rot = hrp.CFrame.Rotation
+            Bob.base = nil
+            base_y = hrp.Position.Y
         end
+        local dy = bob_dy()
+        local pos = Vector3.new(center.X + ox * r, base_y + dy, center.Z + oz * r)
+        local rot = OrbitCfg.Face and CFrame.lookAt(pos, Vector3.new(center.X, pos.Y, center.Z)).Rotation or hrp.CFrame.Rotation
+        cam_hold(hum)
         hrp.CFrame = CFrame.new(pos) * rot
         local v = hrp.AssemblyLinearVelocity
-        hrp.AssemblyLinearVelocity = Vector3.new(0, hover and 0 or v.Y, 0) -- your own walk velocity would fight the circle
+        hrp.AssemblyLinearVelocity = Vector3.new(0, (hover or OrbitCfg.Bob) and 0 or v.Y, 0)
+        -- camera: as if you stood on the centre (self) / ignoring the bob (ball)
+        local focus = self_mode and Vector3.new(center.X, base_y, center.Z) or Vector3.new(pos.X, base_y, pos.Z)
+        hum.CameraOffset = hrp.CFrame:VectorToObjectSpace(focus - hrp.Position)
     end
     function Orbit.start()
-        anchor, char_seen = nil, nil
+        anchor, char_seen, Bob.base = nil, nil, nil
         local tok = Orbit._token
         task.spawn(function()
             local last = os.clock()
@@ -3428,22 +3515,53 @@ do
             end
         end)
     end
-    function Orbit.stop() anchor = nil end
+    function Orbit.stop() anchor, Bob.base = nil, nil; cam_reset() end
 end
+-- semi immortal on its own (orbit off): flip up and back every frame in place
+function SemiImmortal.start()
+    local tok = SemiImmortal._token
+    Bob.base = nil
+    task.spawn(function()
+        while SemiImmortal:alive(tok) do
+            pcall(function()
+                if Orbit.on then return end -- orbit applies the flip itself
+                local char = LocalPlayer.Character
+                local hrp = char and char:FindFirstChild("HumanoidRootPart")
+                local hum = char and char:FindFirstChildOfClass("Humanoid")
+                if not orbit_ctx() or not hrp or not hum or hum.Health <= 0 then Bob.base = nil; cam_reset(); return end
+                Bob.base = Bob.base or hrp.Position.Y
+                local p = hrp.Position
+                local dy = bob_dy()
+                cam_hold(hum)
+                hrp.CFrame = CFrame.new(p.X, Bob.base + dy, p.Z) * hrp.CFrame.Rotation
+                local v = hrp.AssemblyLinearVelocity
+                hrp.AssemblyLinearVelocity = Vector3.new(v.X, 0, v.Z)
+                hum.CameraOffset = hrp.CFrame:VectorToObjectSpace(Vector3.new(0, Bob.base - hrp.Position.Y, 0))
+            end)
+            task.wait()
+        end
+    end)
+end
+function SemiImmortal.stop() Bob.base = nil; if not Orbit.on then cam_reset() end end
+
 local OB = Tabs.Orbit:AddLeftGroupbox("Orbit", "orbit")
 OB:AddToggle("Orbit", {
     Text = "Orbit", Default = false,
-    Tooltip = "Circle the centre below. Fast orbits move you faster than walking -- keep it modest if you're worried about speed checks.",
+    Tooltip = "Works in a match and in lobby training; does nothing in the lobby. Fast orbits move you faster than walking.",
     Callback = function(v) Orbit:setEnabled(v) end,
 }):AddKeyPicker("OrbitKey", { Default = "O", Mode = "Toggle", SyncToggleState = true, Text = "Orbit" })
 OB:AddDropdown("OrbitCenter", {
     Values = { "Yourself", "Ball" }, Default = "Yourself", Text = "Orbit around",
-    Tooltip = "Yourself: the spot you were standing on -- walking (WASD / joystick) moves that spot, so the orbit walks with you. Ball: the live ball.",
+    Tooltip = "Yourself: the spot you were standing on -- walking moves that spot and the camera stays on it. Ball: the match ball in a match, your training ball in training.",
     Callback = function(v) OrbitCfg.Center = v end,
 })
-OB:AddSlider("OrbitRadius", { Text = "Radius", Default = 8, Min = 2, Max = 60, Rounding = 1, Suffix = " studs",
+OB:AddDropdown("OrbitShape", {
+    Values = { "Circle", "Ellipse", "Triangle", "Square", "Hexagon", "Star", "Figure 8", "Flower" }, Default = "Circle", Text = "Shape",
+    Callback = function(v) OrbitCfg.Shape = v end,
+})
+OB:AddSlider("OrbitRadius", { Text = "Radius", Default = 8, Min = 2, Max = 80, Rounding = 1, Suffix = " studs",
     Callback = function(v) OrbitCfg.Radius = v end })
-OB:AddSlider("OrbitSpeed", { Text = "Speed", Default = 0.5, Min = 0.05, Max = 5, Rounding = 2, Suffix = " rev/s",
+OB:AddSlider("OrbitSpeed", { Text = "Speed", Default = 0.5, Min = 0.05, Max = 20, Rounding = 2, Suffix = " laps/s",
     Callback = function(v) OrbitCfg.Speed = v end })
 OB:AddDropdown("OrbitDirection", { Values = { "Counter-clockwise", "Clockwise" }, Default = "Counter-clockwise", Text = "Direction",
     Callback = function(v) OrbitCfg.Clockwise = v == "Clockwise" end })
@@ -3451,10 +3569,16 @@ OB:AddSlider("OrbitHeight", { Text = "Height", Default = 0, Min = -10, Max = 40,
     Tooltip = "0 = stay on the ground (gravity and jumping still work). Anything else holds you that high above the centre.",
     Callback = function(v) OrbitCfg.Height = v end })
 OB:AddSlider("OrbitWalk", { Text = "Walk speed", Default = 1, Min = 0, Max = 3, Rounding = 2, Suffix = "x",
-    Tooltip = "How fast your movement input moves the orbit's centre (x your walk speed). 0 = the centre stays put.",
+    Tooltip = "How fast your movement input moves the centre (x your walk speed). 0 = the centre stays put.",
     Callback = function(v) OrbitCfg.Walk = v end })
 OB:AddToggle("OrbitFace", { Text = "Face the centre", Default = false,
     Callback = function(v) OrbitCfg.Face = v end })
+local SI = Tabs.Orbit:AddRightGroupbox("Semi immortal", "shield")
+SI:AddToggle("SemiImmortal", { Text = "Semi immortal", Default = false,
+    Tooltip = "Flips you up and back down every frame, so half the time you're off the ball's line. Works with or without orbit; the camera ignores the flip. In a match / training only.",
+    Callback = function(v) OrbitCfg.Bob = v; SemiImmortal:setEnabled(v) end })
+SI:AddSlider("SemiImmortalAmp", { Text = "Flip height", Default = 25, Min = 5, Max = 120, Rounding = 0, Suffix = " studs",
+    Callback = function(v) OrbitCfg.BobAmp = v end })
 
 -- ----- Visuals tab -----
 local function hexc(c) return ("%02x%02x%02x"):format(math.floor(c.R * 255), math.floor(c.G * 255), math.floor(c.B * 255)) end
