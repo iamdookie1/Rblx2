@@ -31,7 +31,7 @@
 
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.56"
+local SCRIPT_VERSION = "rewrite-0.5.57"
 
 -- ---------------------------------------------------------------------------
 -- Single instance.
@@ -3430,8 +3430,28 @@ local AbilityESP = Feature("AbilityESP")
 do
     local entries = {}
     local function esc(s) return (tostring(s):gsub('&', '&amp;'):gsub('<', '&lt;'):gsub('>', '&gt;')) end
-    local function info(player, character)
+    -- The equipped ability is the one script under the character's Abilities
+    -- folder that is Enabled (the game ships every ability there and enables only
+    -- the equipped one -- the same thing auto ability reads). There is no
+    -- EquippedAbility attribute any more. Re-read about once a second per player.
+    local function equipped(character)
+        local ab = character and character:FindFirstChild('Abilities')
+        if not ab then return nil end
+        for _, a in ipairs(ab:GetChildren()) do
+            local ok, en = pcall(function() return a.Enabled end)
+            if ok and en then return a.Name end
+        end
+        return nil
+    end
+    local function info(player, character, e)
         local ability = player:GetAttribute('EquippedAbility') or (character and character:GetAttribute('Ability'))
+        if (not ability or ability == '') and e then
+            local now0 = os.clock()
+            if e.ab_char ~= character or now0 - (e.ab_at or 0) > 1 then
+                e.ab_char, e.ab_at, e.ability = character, now0, equipped(character)
+            end
+            ability = e.ability
+        end
         if not ability or ability == '' then return nil end
         local name = tostring(ability)
         local up = player:FindFirstChild('Upgrades')
@@ -3495,7 +3515,7 @@ do
             local e = player ~= LocalPlayer and ensure_entry(player) or nil
             if e then
                 local dist = my and (my.Position - e.head.Position).Magnitude
-                local name, status = info(player, e.character)
+                local name, status = info(player, e.character, e)
                 local vis = not (EspCfg.MaxDistance > 0 and dist and dist > EspCfg.MaxDistance) and not (EspCfg.OnlyWithAbility and not name)
                 e.label.Visible = vis
                 if vis then
