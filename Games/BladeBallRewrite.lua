@@ -31,7 +31,7 @@
 
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.68"
+local SCRIPT_VERSION = "rewrite-0.5.69"
 
 -- ---------------------------------------------------------------------------
 -- Single instance.
@@ -3173,6 +3173,7 @@ local ClashLabel = AS:AddLabel("Status: off", true)
 -- Avatar changer
 local Avatar = { target = "", original = nil }
 local AvatarChanger = Feature("AvatarChanger")
+AvatarChanger.round_only = true -- touches your character / game state: rounds only (lobby detection)
 do
     local function strip(char)
         for _, obj in ipairs(char:GetChildren()) do
@@ -3300,27 +3301,33 @@ AVC:AddInput("AvatarTarget", { Text = "Target", Placeholder = "Username or user 
 AVC:AddToggle("AvatarChanger", { Text = "Avatar changer", Default = false, Callback = function(v) AvatarChanger:setEnabled(v) end })
 
 -- Headless / Korblox
+-- originals kept in a local weak table: an "OriginalScale" attribute on the
+-- head mesh was a foreign attribute any game script could see
+local headless_orig = setmetatable({}, { __mode = "k" })
 local function apply_headless(char, on)
     local head = char and char:FindFirstChild("Head"); if not head then return end
     head.Transparency = on and 1 or 0
     for _, child in head:GetChildren() do
         if child:IsA("Decal") or child.Name == "face" then child.Transparency = on and 1 or 0
         elseif child:IsA("SpecialMesh") or child:IsA("DataModelMesh") then
-            if on and not child:GetAttribute("OriginalScale") then
-                child:SetAttribute("OriginalScale", child.Scale); child.Scale = Vector3.new(0, 0, 0)
-            elseif not on then
-                local orig = child:GetAttribute("OriginalScale")
-                if orig then child.Scale = orig; child:SetAttribute("OriginalScale", nil) end
+            if on and headless_orig[child] == nil then
+                headless_orig[child] = child.Scale; child.Scale = Vector3.new(0, 0, 0)
+            elseif not on and headless_orig[child] ~= nil then
+                child.Scale = headless_orig[child]; headless_orig[child] = nil
             end
         end
     end
 end
+-- our mesh is tracked locally; it carries the default "Mesh" name, not a
+-- "KorbloxMesh" tell any game script could look for
+local korblox_mesh = setmetatable({}, { __mode = "k" })
 local function apply_korblox(char, on)
     local leg = char and char:FindFirstChild("Right Leg"); if not leg then return end
     if on then
-        if leg:FindFirstChild("KorbloxMesh") then return end
+        local mine = korblox_mesh[leg]
+        if mine and mine.Parent == leg then return end
         for _, v in leg:GetChildren() do if v:IsA("SpecialMesh") then v:Destroy() end end
-        local m = Instance.new("SpecialMesh"); m.Name = "KorbloxMesh"
+        local m = Instance.new("SpecialMesh"); m.Name = "Mesh"; korblox_mesh[leg] = m
         m.MeshId = "rbxassetid://902942096"; m.TextureId = "rbxassetid://902843398"
         m.Offset = Vector3.new(0, 0.7, 0); m.Parent = leg
     else
@@ -3328,12 +3335,14 @@ local function apply_korblox(char, on)
     end
 end
 local Headless = Feature("Headless")
+Headless.round_only = true -- touches your character / game state: rounds only (lobby detection)
 function Headless.start()
     pcall(apply_headless, LocalPlayer.Character, true)
     Headless:connect(LocalPlayer.CharacterAdded, function(c) task.wait(0.5); if Headless.on then pcall(apply_headless, c, true) end end)
 end
 function Headless.stop() pcall(apply_headless, LocalPlayer.Character, false) end
 local Korblox = Feature("Korblox")
+Korblox.round_only = true -- touches your character / game state: rounds only (lobby detection)
 function Korblox.start()
     pcall(apply_korblox, LocalPlayer.Character, true)
     Korblox:connect(LocalPlayer.CharacterAdded, function(c) task.wait(0.5); if Korblox.on then pcall(apply_korblox, c, true) end end)
@@ -3346,6 +3355,7 @@ HK:AddToggle("Korblox", { Text = "Korblox", Default = false, Callback = function
 
 -- Auto jump
 local AutoJump = Feature("AutoJump")
+AutoJump.round_only = true -- touches your character / game state: rounds only (lobby detection)
 do
     local lastGrounded = false
     function AutoJump.start()
@@ -3611,13 +3621,14 @@ local function panel(name, size, pos, title_text)
 end
 
 local BallVelocity = Feature("BallVelocity")
+BallVelocity.round_only = true -- touches your character / game state: rounds only (lobby detection)
 function BallVelocity.start()
     local gui, line = panel("BB_BallVelocity", UDim2.new(0, 200, 0, 70), UDim2.new(0, 10, 0.78, 0), "Ball Status")
     BallVelocity:own(gui)
     local cur, peakl = line(24), line(44)
     local peak, last_ball = 0, nil
+    pcall(Parry.resolve)
     BallVelocity:connect(RunService.RenderStepped, function()
-        pcall(Parry.resolve)
         local ball = Parry.mainBall()
         if not ball then cur.Text = "Current: 0"; return end
         if ball ~= last_ball then peak, last_ball = 0, ball end
@@ -3818,6 +3829,7 @@ local function save_skin()
     end)
 end
 local SkinChanger = Feature("SkinChanger")
+SkinChanger.round_only = true -- touches your character / game state: rounds only (lobby detection)
 do
     local swords, controller, realGetSword
     local function our_sword(name)
