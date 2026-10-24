@@ -31,7 +31,7 @@
 
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.78"
+local SCRIPT_VERSION = "rewrite-0.5.79"
 
 -- ---------------------------------------------------------------------------
 -- Single instance.
@@ -322,7 +322,7 @@ end
 do
     local me = LocalPlayer.Name
     local Core = { cap = nil, pending = nil, misses = 0, interp = 0.14, last_parry = nil,
-        ctx = "match", caps = {}, gen = 0, last_send_at = -math.huge,
+        ctx = "match", caps = {}, gen = 0, last_send_at = -math.huge, tune = 0, verdict = nil,
         feed = { n = 0, total = 0, since = 0, ahead = nil, urs = 0,
             pos = setmetatable({}, { __mode = "k" }), at = setmetatable({}, { __mode = "k" }) } }
     local G = { until_t = 0, m1 = false, m1_at = 0 }
@@ -337,7 +337,7 @@ do
 
     local S = {
         autoparry = false, triggerbot = false, parry_mode = "Remote",
-        preparry = false, preparry_range = 20, hp_preparry = false,
+        preparry = false, preparry_range = 20, hp_preparry = false, hard_curve = false, self_tune = false,
         anticurve = "Smart", dot_threshold = 0.5, curve_bias = 0.5, close_anticurve = true, close_range = 30, instant_retarget = true,
         accuracy = 50, accuracy_base = 50, divisor_multiplier = 1.1, timing_mult = 1,
         extra_distance = 0, ping_compensation = false, retry_delay = 1,
@@ -379,6 +379,7 @@ do
         update_divisor()
     end
     Parry.roll = roll_accuracy
+    function Parry.resetTune() Core.tune = 0 end
     update_divisor()
     local function index_of(list, name)
         for i, n in ipairs(list) do if n == name then return i end end
@@ -881,6 +882,9 @@ end]]
                 if pcall_(inspect, l[i]) and Core.cap then break end
             end
             if Core.cap then finish(); return true end
+            -- nothing in it was a parry: empty it, or a hook that stays up would
+            -- fill its 4 slots with other sends and never catch the parry
+            if #l > 0 then box.list = {} end
             return false
         end
         task.spawn(function()
@@ -2060,16 +2064,23 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         local accel = speed_gain(st, speed, now)
         local h = track_homing(st, dir, want, dist, now)
         local earliest = time_to_contact(dist, gap, speed, accel)
-        local lead = math.min(fire_lead(speed) - adj, reach + W * 0.85)
+        local tune = S.self_tune and Core.tune or 0
+        local lead = math.min(fire_lead(speed) - adj + tune, reach + W * 0.85)
+        -- how early the "certain" rules below may go: Accuracy decides it, like
+        -- the main timing (100 = only just ahead of the ball). Until 0.5.79 these
+        -- used a fixed slice of the window -- with the 1.5s first window that
+        -- was up to 0.75-0.9s early, so 100% accuracy still parried far out.
+        local acc = (math.clamp(S.accuracy or 50, 1, 100) - 1) / 99
+        local Wc = math.min(W, 0.6)
         local info = { speed = speed, dist = dist, heading = heading, lead = lead, eta = earliest }
-        local tag = (via and ("auto parry (" .. via .. ")") or "auto parry") .. (adj > 0 and " [feed]" or "")
+        local tag = (via and ("auto parry (" .. via .. ")") or "auto parry") .. ((adj > 0 and via ~= "feed") and " [feed]" or "")
         -- touching
         if rem <= 3 then return fire(st, now, tag .. " (contact)", info, ball) end
         -- close: arrival inside the window is certain
+        local margin = math.max(frame_dt * 2, jitter()) + 0.02 + math.max(tune, 0)
         local close = dist <= 25 + speed * 0.03
-        if close and earliest <= reach + W * 0.5 then return fire(st, now, tag .. " (close)", info, ball) end
+        if close and earliest <= reach + math.max(margin, Wc * 0.5 * (1 - acc)) then return fire(st, now, tag .. " (close)", info, ball) end
         -- last moment: coming in and about to beat our reach
-        local margin = math.max(frame_dt * 2, jitter()) + 0.02
         if heading > 0.3 and earliest <= reach + margin then return fire(st, now, tag .. " (now)", info, ball) end
         -- nothing can land before the straight-in time: if even that is past
         -- reach + window, no rule below can fire this frame -- skip the sims
@@ -2099,13 +2110,23 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
                 if slow <= reach + W * 0.9 then return fire(st, now, tag .. " (curve, covered)", info, ball) end
                 if fast <= reach + margin then return fire(st, now, tag .. " (curve, last moment)", info, ball) end
             end
+            -- Hard curve guard (toggle): the WORST case -- the hardest turn the
+            -- model allows -- would land before our reach is up: fire now. Saves
+            -- you from a sudden whip-in; can parry a curve-bait ball early.
+            if S.hard_curve and fast > reach + margin then
+                local worst = sim_prop(bpos, v, rpos, gap, K_MAX, accel, reach + margin + 0.02)
+                if worst and worst <= reach + margin then
+                    info.eta = worst
+                    return fire(st, now, tag .. " (hard curve guard)", info, ball)
+                end
+            end
         else
             info.eta = eta
             -- half a frame ahead: the next check may already be too late
             if eta <= lead + half then return fire(st, now, tag, info, ball) end
         end
         -- classic distance net for a ball coming dead straight in
-        if heading >= 0.9 and dist <= parry_distance(speed) and earliest <= reach + W * 0.6 then
+        if heading >= 0.9 and dist <= parry_distance(speed) and earliest <= reach + math.max(margin, Wc * 0.6 * (1 - acc)) then
             return fire(st, now, tag, info, ball)
         end
     end
@@ -2216,6 +2237,16 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         if capture_method() == "getgc" then pcall(gc_acquire); return end
         if not (in_match() or in_lobby_training()) or not canParryNow() then Capture.since = nil; return end
         Capture.since = Capture.since or now
+        -- Namecall method: the hook stays UP the whole time there's no capture
+        -- (re-armed every frame), so the first real parry you make is caught,
+        -- whatever started it -- it comes down the moment the capture is in, or
+        -- 0.5s after you leave the round. Namecall only (__namecall is
+        -- exploit-side; the FireServer methods are the detectable ones).
+        if capture_method() == "Namecall" and Capture.mode ~= "Auto press" then
+            local was_up = H.nc ~= nil
+            if arm(0.5) and not was_up then logp("capture: namecall hook up until your first real parry") end
+            return
+        end
         -- Synthetic-press bootstrap ("Auto press" capture mode): when no
         -- ball is near, a VirtualInputManager Block press goes out and the hook
         -- reads its packet. Off by default -- synthetic input can be flagged, and
@@ -2354,8 +2385,8 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
             w.min_d, dt, open, close, w.ping * 1000, w.lead and (", lead %.2f"):format(w.lead) or "")
         local verdict
         if w.min_d > 15 then verdict = " -> ball never reached you (curved off / went elsewhere): not a timing miss"
-        elseif dt > close then verdict = (" -> EARLY by %.2fs"):format(dt - close)
-        elseif dt < open then verdict = (" -> LATE by %.2fs"):format(open - dt)
+        elseif dt > close then verdict = (" -> EARLY by %.2fs"):format(dt - close); Core.verdict = -(dt - close)
+        elseif dt < open then verdict = (" -> LATE by %.2fs"):format(open - dt); Core.verdict = open - dt
         else verdict = " -> ON TIME by what we see: the server didn't count it" end
         local c = w.cap
         local capinfo = c and ("\n    capture #%d (taken %.0fms after its press): %d of %d remote parries landed"):format(
@@ -2391,7 +2422,16 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
             end
             if Core.pending and now > Core.pending then
                 Core.pending, Core.misses = nil, Core.misses + 1
+                Core.verdict = nil
                 logp(miss_verdict(Core.watch))
+                -- Self-tune (toggle): an EARLY / LATE miss moves the fire time a
+                -- little the other way -- half the miss, at most 15ms a step,
+                -- capped at +/-40ms; landed parries ease it back toward 0. Two-way
+                -- and bounded, unlike the 0.5.8 drift (one-way, uncapped).
+                if S.self_tune and Core.verdict then
+                    Core.tune = math.clamp(Core.tune + math.clamp(Core.verdict * 0.5, -0.015, 0.015), -0.04, 0.04)
+                    logp(("  self-tune: now firing %+.0fms"):format(Core.tune * 1000))
+                end
                 Core.watch = nil
                 if S.parry_mode == "Keypress" then
                     Core.misses = 0
@@ -2448,6 +2488,14 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
             local ahead = (p - ball.Position):Dot(v / sp) / sp
             if math.abs(ahead) < 0.5 then F.ahead = F.ahead and (F.ahead * 0.9 + ahead * 0.1) or ahead end
         end
+        -- new server data on a ball coming at us: decide now, not at the next frame point
+        if active and S.autoparry and not S.triggerbot then
+            local st = tracked[ball]
+            if st and st.target == me then
+                local root = ap_root()
+                if root then decide(ball, st, root, now, "feed") end
+            end
+        end
         if now - F.since >= 30 then
             logp(("server ball feed: %.0f msgs/s, ahead of the physics ball by %s (Core.interp %.0fms)"):format(
                 F.n / (now - F.since), F.ahead and ("%.0fms"):format(F.ahead * 1000) or "n/a (ball slow)", Core.interp * 1000))
@@ -2493,6 +2541,7 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         -- was fast, it went ~75 studs early: "animation, no parry after a few
         -- hits", on every mode.
         Core.pending, Core.misses = nil, 0
+        Core.tune = Core.tune * 0.9
         for _, st in pairs(tracked) do if st.target == me and st.pass_open then st.landed = true end end
         spam_instant()
     end
@@ -3124,6 +3173,16 @@ APS:AddSlider("ExtraDistance", {
 APS:AddSlider("RetryDelay", {
     Text = "Retry delay", Default = 1, Min = 0.2, Max = 1.5, Rounding = 2, Suffix = "s",
     Callback = function(v) S.retry_delay = v end,
+})
+APS:AddToggle("SelfTune", {
+    Text = "Self-tune timing", Default = false,
+    Tooltip = "Each EARLY / LATE miss nudges the fire time the other way (max 15ms a step, +/-40ms total); landed parries ease it back. Downside: a few odd misses can pull it off for a while.",
+    Callback = function(v) S.self_tune = v; if not v then Parry.resetTune() end end,
+})
+APS:AddToggle("HardCurveGuard", {
+    Text = "Hard curve guard", Default = false,
+    Tooltip = "Fires if the hardest possible turn would land the ball before your parry is up. Saves sudden whip-in curves; downside: can parry curve-bait balls early.",
+    Callback = function(v) S.hard_curve = v end,
 })
 APS:AddToggle("PingCompensation", {
     Text = "Ping compensation", Default = false,
