@@ -31,7 +31,7 @@
 
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.79"
+local SCRIPT_VERSION = "rewrite-0.5.80"
 
 -- ---------------------------------------------------------------------------
 -- Single instance.
@@ -119,8 +119,10 @@ local feature_log -- the log file writer (set once it exists, below)
 -- steps never did. Same pattern here (all on at +0.4s, X24 at +31s). So
 -- anything switched on during the load window (the config autoload) is queued
 -- and started one at a time after the delay. Toggling later is instant.
--- getgenv().BBStagger = seconds before the first start (0 = off).
-local Stagger = { t0 = os.clock(), delay = tonumber(getgenv().BBStagger) or 30, gap = 6, queue = {}, running = false,
+-- OFF by default since 0.5.80: the lobby X24 turned out to be the
+-- VirtualInputManager GetService at load (0.5.72), not the timing, so config
+-- features start straight away. getgenv().BBStagger = seconds brings it back.
+local Stagger = { t0 = os.clock(), delay = tonumber(getgenv().BBStagger) or 0, gap = 6, queue = {}, running = false,
     round_check = nil } -- round_check: set once in_play exists (round gate, below)
 function Stagger.active() return Stagger.delay > 0 and os.clock() - Stagger.t0 < Stagger.delay end
 function Stagger.push(key, label, fn)
