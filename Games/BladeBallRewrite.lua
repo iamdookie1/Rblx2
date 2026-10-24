@@ -31,7 +31,7 @@
 
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.81"
+local SCRIPT_VERSION = "rewrite-0.5.82"
 
 -- ---------------------------------------------------------------------------
 -- Single instance.
@@ -1665,6 +1665,17 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
     local AutoSpam = { active_until = 0, ball = nil, partner = nil, reason = nil, was_active = false,
         peak = 0, cool_ball = nil, cool_until = 0 }
     local parry_all = {}
+    -- the ball where the server has it (feed position carried to now) and the
+    -- feed's lead over the physics ball, or the physics ball and 0 -- the same
+    -- view auto parry uses, so spam's "too fast to react" sees the real gap
+    function Core.ball_now(ball)
+        local F, now = Core.feed, clock_()
+        local fp, ft = F.pos[ball], F.at[ball]
+        if fp and ft and F.ahead and now - ft < 0.12 then
+            return fp + ball_velocity(ball) * (now - ft), math.clamp(F.ahead, 0, Core.interp - 0.02)
+        end
+        return ball.Position, 0
+    end
     local function clash_range(speed) return math.clamp(18 + speed * 0.08, 18, 50) + (SP.range_bonus or 0) end
     local function ball_owners(st)
         local owners = {}
@@ -1726,7 +1737,8 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         local speed = math.max(velocity.Magnitude, 1)
         local gap = (their.Position - root.Position).Magnitude
         if gap > clash_range(speed) * (held and 1.3 or 1) then return nil end
-        local react = reach_time()
+        local bnow, adj = Core.ball_now(ball)
+        local react = reach_time() - adj
         local sens = math.clamp(SP.sensitivity or 1.3, 0.6, 2.5)
         local back = gap / (speed * 1.08)
         local too_fast = back <= react * sens + 0.08
@@ -1735,14 +1747,14 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         local trading = trading_fast(now, partner)
         if target == me then
             if handoffs >= 1 then return partner, "quick hand-off", true end
-            local eta = (ball.Position - root.Position).Magnitude / speed
+            local eta = (bnow - root.Position).Magnitude / speed
             if eta <= react * (sens - 0.1) + 0.08 then return partner, ("lands in %.2fs, too fast to react"):format(eta), true end
             if trading and speed >= 30 then return partner, "trading parries", false end
             if held then return partner, "exchange on", false end
             return nil
         end
         if held and owners[1] and now - owners[1].t <= tempo then return partner, "exchange on", false end
-        local to_them = their.Position - ball.Position
+        local to_them = their.Position - bnow
         local d_them = to_them.Magnitude
         if not (d_them < 6 or velocity:Dot(to_them / d_them) > speed * 0.3) then return nil end
         if handoffs >= 2 then return partner, ("%d quick hand-offs"):format(handoffs), true end
@@ -1768,7 +1780,7 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         local range = clash_range(speed)
         local gap = (their.Position - root.Position).Magnitude
         if gap > range * 1.4 then return "partner out of range" end
-        local bpos = ball.Position
+        local bpos = Core.ball_now(ball)
         if math.min((bpos - root.Position).Magnitude, (bpos - their.Position).Magnitude) > range * 1.5 + 10 then
             return "ball left the exchange"
         end
@@ -2110,18 +2122,24 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         -- close: arrival inside the window is certain
         local margin = math.max(frame_dt * 2, jitter()) + 0.02 + math.max(tune, 0)
         local half = frame_dt * 0.5
-        -- close: it can't curve far from here, so its straight-in arrival counts
-        -- whatever way it's pointing
+        -- Straight-line rules only for a ball that is actually pointed at us.
+        -- Until 0.5.82 "close" counted the straight-in time whatever way the ball
+        -- pointed and "now" took anything over 0.3 heading, so a ball curving
+        -- past (or a mini curve) inside ~30 studs fired on a distance it was
+        -- never going to fly -- the "hits curves way too far out". Anything
+        -- not pointed at us goes to the curve sims below instead.
         local close = dist <= 25 + speed * 0.03
-        if close and earliest <= math.max(lead, reach + margin) + half then return fire(st, now, tag .. " (close)", info, ball) end
+        if close and heading >= 0.85 and earliest <= math.max(lead, reach + margin) + half then return fire(st, now, tag .. " (close)", info, ball) end
         -- last moment: coming in and about to beat our reach
-        if heading > 0.3 and earliest <= reach + margin then return fire(st, now, tag .. " (now)", info, ball) end
+        if heading >= 0.85 and earliest <= reach + margin then return fire(st, now, tag .. " (now)", info, ball) end
         -- nothing can land before the straight-in time: if even that is past
         -- reach + window, no rule below can fire this frame -- skip the sims
         if earliest > math.max(lead, reach + Wc) + half then return end
         local eta = earliest
         if heading < 0.97 then
-            if h.away then return end -- swinging away from us: wait for it to come round
+            -- swinging away from us: wait for it to come round -- unless it's
+            -- touching distance, where the contact rule above already fired
+            if h.away then return end
             local km = math.clamp(h.k or (st.k_mem or K_DEFAULT), K_MIN, K_MAX)
             local v = vel
             if heading < -0.95 then
@@ -2139,9 +2157,12 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
                 local slow = math.max(sim_prop(bpos, v, rpos, gap, math.max(km * 0.75, K_MIN), accel, horizon) or math.huge, earliest)
                 local mid = math.max(median3(fast, slow, radial_eta(h, rem, speed) or (fast + math.min(slow, horizon)) * 0.5), earliest)
                 info.eta, info.fast, info.slow = mid, fast, slow
+                -- fire on the curve's own arrival (the middle estimate), at the
+                -- Accuracy lead -- not on the soonest-possible one (0.5.74-0.5.81
+                -- "covered" did, which is what parried curves far out)
                 if mid <= lead + half then return fire(st, now, tag .. " (curve)", info, ball) end
-                -- the soonest is due and the window still holds for the latest
-                if slow <= reach + Wc - (jitter() + frame_dt + 0.03) then return fire(st, now, tag .. " (curve, covered)", info, ball) end
+                -- safety: even the soonest-possible arrival is about to beat our
+                -- reach -- waiting any longer could be too late
                 if fast <= reach + margin then return fire(st, now, tag .. " (curve, last moment)", info, ball) end
             end
             -- Hard curve guard (toggle): the WORST case -- the hardest turn the
