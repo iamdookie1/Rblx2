@@ -31,7 +31,7 @@
 
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.82"
+local SCRIPT_VERSION = "rewrite-0.5.83"
 
 -- ---------------------------------------------------------------------------
 -- Single instance.
@@ -348,7 +348,7 @@ do
         auto_ability = false, cooldown_protection = false,
     }
     local SP = {
-        manual = false, auto = false, mode = "Remote", max_rate = 1000, speed_mode = "700/s",
+        manual = false, auto = false, mode = "Remote", max_rate = 1000, speed_mode = "700/s", method = "Fixed rate",
         smart = true, range_bonus = 0, hold = 0.15, sensitivity = 1.3, predictive = true,
     }
     -- detection state (written by the detection features, read here)
@@ -1746,10 +1746,17 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         local handoffs = quick_handoffs(owners, partner, tempo)
         local trading = trading_fast(now, partner)
         if target == me then
-            if handoffs >= 1 then return partner, "quick hand-off", true end
+            -- START on what can't be parried by reaction: the ball lands inside
+            -- our reach (+ sensitivity), seen on the server-feed position. A
+            -- hand-off / trading streak only counts if THEIR return is also too
+            -- fast -- before 0.5.83 one hand-off inside a slow 0.5-0.9s tempo, or
+            -- two parries in 0.7s at any speed over 30, started it ("too early"),
+            -- and the lands-in test used sens - 0.1 on the lagging physics ball
+            -- ("too late").
             local eta = (bnow - root.Position).Magnitude / speed
-            if eta <= react * (sens - 0.1) + 0.08 then return partner, ("lands in %.2fs, too fast to react"):format(eta), true end
-            if trading and speed >= 30 then return partner, "trading parries", false end
+            if eta <= react * sens + 0.08 + frame_dt then return partner, ("lands in %.2fs, too fast to react"):format(eta), true end
+            if handoffs >= 1 and too_fast then return partner, "quick hand-off", true end
+            if trading and too_fast then return partner, "trading parries", false end
             if held then return partner, "exchange on", false end
             return nil
         end
@@ -1914,7 +1921,34 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
     function SP.rate_now(now)
         return tonumber(tostring(SP.speed_mode):match("%d+")) or 700
     end
-    local function spam_tick(now)
+    -- Spam methods (Spam tab > Method):
+    --   Fixed rate    the picked Speed, held exactly by the bucket (the original)
+    --   Per frame     one parry per frame -- your FPS is the rate (60-240/s); a
+    --                 send never queues behind another sent the same frame
+    --   Ping adaptive the picked Speed, capped at 12 parries per round trip
+    --                 (min 60/s): high ping gets fewer sends in flight -- the
+    --                 thing that clogs and desyncs -- low ping gets the full Speed
+    --   On ball       the picked Speed, but only while a ball is on you or about
+    --                 to be (none sent while it's on them), plus one the instant
+    --                 it turns to you and on each server ball update after that
+    function SP.on_ball_now()
+        local root = getRoot()
+        if not root then return false end
+        for _, ball in ipairs(get_live_balls()) do
+            local st = get_ball_state(ball)
+            if st.target == me then return true end
+            local bp = Core.ball_now(ball)
+            if (bp - root.Position).Magnitude <= 12 then return true end
+        end
+        return false
+    end
+    function SP.method_rate(rate)
+        if SP.method == "Ping adaptive" then
+            return math.min(rate, math.max(60, 12 / math.max(ping_s(), 0.02)))
+        end
+        return rate
+    end
+    local function spam_tick(now, point)
         local elapsed = math.min(now - Pump.last, 0.25)
         Pump.last = now
         local span = now - SpamMeter.since
@@ -1925,8 +1959,18 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         -- Smart stop: manual spam holds fire while nothing is a threat
         if source == "manual" and SP.smart and not focus then Pump.on, Pump.waiting = false, true; return end
         Pump.waiting = false
+        if SP.method == "On ball" and not SP.on_ball_now() then Pump.on = false; return end
+        if SP.method == "Per frame" then
+            -- once a frame, at its first point; no bucket
+            if point == 1 then
+                Pump.on = true
+                if fire_one() and Pump.remote_sent then Anim.spamBlock() end
+                Pump.remote_sent = false
+            end
+            return
+        end
         -- the rate is EXACTLY the slider value (20-2000/s), no network throttle.
-        local rate = math.clamp(SP.rate_now(now), 1, 2000)
+        local rate = SP.method_rate(math.clamp(SP.rate_now(now), 1, 2000))
         if SP.mode == "Keypress" then rate = math.min(rate, 1 / frame_dt) end
         rate = math.max(rate, 1)
         -- STRICT time bucket: the number allowed so far is rate x (time since the
@@ -1954,10 +1998,17 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         local source = current_source(clock_())
         if not source or not LocalPlayer.Character then return end
         if source == "manual" and SP.smart and not spam_focus() then return end
+        if SP.method == "Per frame" then
+            -- at most the one parry this frame
+            if Pump.fired_frame ~= Pump.frame and fire_one() and Pump.remote_sent then Anim.spamBlock() end
+            Pump.remote_sent = false
+            return
+        end
+        if SP.method == "On ball" and not SP.on_ball_now() then return end
         -- counted against the same bucket (at most one ahead of it), so instant
         -- fires on retarget / parry success never push the average over the slider
         local now = clock_()
-        local rate = math.max(math.clamp(SP.rate_now(now), 1, 2000), 1)
+        local rate = math.max(SP.method_rate(math.clamp(SP.rate_now(now), 1, 2000)), 1)
         if not Pump.on then Pump.on, Pump.rate, Pump.t0, Pump.sent = true, rate, now, 0
         elseif Pump.rate ~= rate then Pump.rate, Pump.t0 = rate, now - Pump.sent / rate end
         if Pump.sent > math.floor((now - Pump.t0) * rate) + 1 then return end
@@ -2518,7 +2569,7 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         elseif SP.auto or SP.manual then
             for _, ball in ipairs(get_live_balls()) do get_ball_state(ball) end
         end
-        spam_tick(now)
+        spam_tick(now, point)
     end
 
     -- The game's BallReplicationHandler (Bbs dump) listens on an unreliable
@@ -2544,6 +2595,10 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
             if math.abs(ahead) < 0.5 then F.ahead = F.ahead and (F.ahead * 0.9 + ahead * 0.1) or ahead end
         end
         -- new server data on a ball coming at us: decide now, not at the next frame point
+        if active and SP.method == "On ball" then
+            local st = tracked[ball]
+            if st and st.target == me then spam_instant() end
+        end
         if active and S.autoparry and not S.triggerbot then
             local st = tracked[ball]
             if st and st.target == me then
@@ -3424,6 +3479,11 @@ MS:AddToggle("SmartStop", {
 MS:AddDropdown("SpamMode", {
     Values = { "Remote", "Keypress" }, Default = "Remote", Text = "Mode",
     Callback = function(v) SP.mode = v end,
+})
+MS:AddDropdown("SpamMethod", {
+    Values = { "Fixed rate", "Per frame", "Ping adaptive", "On ball" }, Default = "Fixed rate", Text = "Method",
+    Tooltip = "Fixed rate: exactly the Speed. Per frame: one a frame (your FPS). Ping adaptive: the Speed, capped at 12 per round trip so high ping doesn't clog. On ball: the Speed only while a ball is on you, plus one instantly on each server update of it.",
+    Callback = function(v) SP.method = v end,
 })
 local SPAM_SPEEDS = {}
 for r = 50, 1000, 50 do SPAM_SPEEDS[#SPAM_SPEEDS + 1] = r .. "/s" end
