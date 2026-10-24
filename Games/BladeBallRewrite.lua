@@ -31,7 +31,7 @@
 
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.80"
+local SCRIPT_VERSION = "rewrite-0.5.81"
 
 -- ---------------------------------------------------------------------------
 -- Single instance.
@@ -352,7 +352,8 @@ do
         smart = true, range_bonus = 0, hold = 0.15, sensitivity = 1.3, predictive = true,
     }
     -- detection state (written by the detection features, read here)
-    local Det = { infinity = false, deathslash = false, timehole = false, slashes = false, phantom_until = 0 }
+    local Det = { infinity = false, deathslash = false, timehole = false, slashes = false, phantom_until = 0,
+        tor = setmetatable({}, { __mode = "k" }), tor_fid = -1, tor_list = {} }
     Parry.S, Parry.SP, Parry.Det, Parry.targetNames, Parry.curveNames = S, SP, Det, TARGET_NAMES, CURVE_NAMES
 
     -- parry log: a ring buffer the Status tab drains
@@ -488,14 +489,21 @@ do
     end
 
     -- ---------- timing ----------
+    -- How far ahead of the ball's arrival (beyond our reach) the parry goes.
+    -- Accuracy maps straight onto the SAFE range, both ends of which still parry:
+    --   100 -> safe: just ahead of the ball -- jitter + a frame + 10ms, so a late
+    --          check or a ping wobble can't leave it behind the ball;
+    --   1   -> early: as early as still lands inside the parry window -- the
+    --          window (capped at 0.6s: the 1.5s first window is the game's limit,
+    --          not how long the block really holds) minus jitter + a frame + 30ms.
+    -- Linear in between. Timing then bends it toward either end.
     local function cushion_for(speed, W)
         local a = (math.clamp(S.accuracy or 50, 1, 100) - 1) / 99
-        local latest = 0.01
-        local earliest = math.max(math.min(W - jitter() - 0.03, W * (0.45 + 0.4 * math.clamp((speed - 40) / 120, 0, 1))), latest)
-        local tight, loose = jitter(), W * 0.6
-        local c = math.clamp(loose + (tight - loose) * a, latest, earliest)
+        local safe = jitter() + frame_dt + 0.01
+        local early = math.max(math.min(W, 0.6) - (jitter() + frame_dt + 0.03), safe)
+        local c = early + (safe - early) * a
         local m = math.clamp(S.timing_mult or 1, 0, 2)
-        if m <= 1 then c = latest + (c - latest) * m else c = c + (earliest - c) * (m - 1) end
+        if m <= 1 then c = safe + (c - safe) * m else c = c + (early - c) * (m - 1) end
         return c
     end
     local function fire_lead(speed)
@@ -2035,8 +2043,32 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
     -- The sims only run when the straight-in arrival (the lower bound on all of
     -- them) is inside reach + window, and only that far ahead, so the whole
     -- decision is a few dozen steps and fits inside the frame.
+    -- Aerodynamic Slash (Bbs dump, observeTag "AerodynamicSlashTornado"): the
+    -- ability tags a tornado whose "Ball" attribute names the ball and whose
+    -- "TornadoTime" is how long the ball spins in it before it's sent. While it
+    -- spins it is near / over you and "targeting" you but can't hit -- the old
+    -- auto parry fired on it, far too early. Held until the spin is over.
+    function Det.tornado(ball, now)
+        if Det.tor_fid ~= Core.fid then
+            Det.tor_fid = Core.fid
+            local list = {}
+            for _, t in ipairs(CollectionService:GetTagged("AerodynamicSlashTornado")) do
+                local first = Det.tor[t]
+                if not first then
+                    first = now; Det.tor[t] = first
+                    logp(("aerodynamic slash on %s: holding the parry %.1fs while it spins"):format(
+                        tostring(t:GetAttribute("Ball")), tonumber(t:GetAttribute("TornadoTime")) or 1))
+                end
+                local name = t:GetAttribute("Ball")
+                if name and now - first < (tonumber(t:GetAttribute("TornadoTime")) or 1) + 0.05 then list[name] = true end
+            end
+            Det.tor_list = list
+        end
+        return Det.tor_list[ball.Name] == true
+    end
     local function decide(ball, st, root, now, via)
         if pass_busy(st, now) or blocked_by_detection() then return end
+        if Det.tornado(ball, now) then return end
         local rpos, bpos = root.Position, ball.Position
         local vel = ball_velocity(ball)
         local speed = vel.Magnitude
@@ -2067,12 +2099,9 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         local h = track_homing(st, dir, want, dist, now)
         local earliest = time_to_contact(dist, gap, speed, accel)
         local tune = S.self_tune and Core.tune or 0
-        local lead = math.min(fire_lead(speed) - adj + tune, reach + W * 0.85)
-        -- how early the "certain" rules below may go: Accuracy decides it, like
-        -- the main timing (100 = only just ahead of the ball). Until 0.5.79 these
-        -- used a fixed slice of the window -- with the 1.5s first window that
-        -- was up to 0.75-0.9s early, so 100% accuracy still parried far out.
-        local acc = (math.clamp(S.accuracy or 50, 1, 100) - 1) / 99
+        -- lead = reach + the Accuracy cushion (cushion_for): EVERY rule below fires
+        -- on it, so Accuracy is the one dial for how early, at every range.
+        local lead = fire_lead(speed) - adj + tune
         local Wc = math.min(W, 0.6)
         local info = { speed = speed, dist = dist, heading = heading, lead = lead, eta = earliest }
         local tag = (via and ("auto parry (" .. via .. ")") or "auto parry") .. ((adj > 0 and via ~= "feed") and " [feed]" or "")
@@ -2080,14 +2109,16 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         if rem <= 3 then return fire(st, now, tag .. " (contact)", info, ball) end
         -- close: arrival inside the window is certain
         local margin = math.max(frame_dt * 2, jitter()) + 0.02 + math.max(tune, 0)
+        local half = frame_dt * 0.5
+        -- close: it can't curve far from here, so its straight-in arrival counts
+        -- whatever way it's pointing
         local close = dist <= 25 + speed * 0.03
-        if close and earliest <= reach + math.max(margin, Wc * 0.5 * (1 - acc)) then return fire(st, now, tag .. " (close)", info, ball) end
+        if close and earliest <= math.max(lead, reach + margin) + half then return fire(st, now, tag .. " (close)", info, ball) end
         -- last moment: coming in and about to beat our reach
         if heading > 0.3 and earliest <= reach + margin then return fire(st, now, tag .. " (now)", info, ball) end
         -- nothing can land before the straight-in time: if even that is past
         -- reach + window, no rule below can fire this frame -- skip the sims
-        local half = frame_dt * 0.5
-        if earliest > reach + W then return end
+        if earliest > math.max(lead, reach + Wc) + half then return end
         local eta = earliest
         if heading < 0.97 then
             if h.away then return end -- swinging away from us: wait for it to come round
@@ -2098,7 +2129,7 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
                 if side.Magnitude < 1e-3 then side = dir:Cross(Vector3.xAxis) end
                 v = (dir + side.Unit * 0.08).Unit * speed
             end
-            local horizon = reach + W + 0.05
+            local horizon = math.max(lead, reach + Wc) + 0.05
             local fast = math.max(sim_prop(bpos, v, rpos, gap, math.min(km * 1.35, K_MAX), accel, horizon) or math.huge, earliest)
             if fast > lead + half then
                 -- even the soonest arrival is outside our lead: only the
@@ -2109,7 +2140,8 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
                 local mid = math.max(median3(fast, slow, radial_eta(h, rem, speed) or (fast + math.min(slow, horizon)) * 0.5), earliest)
                 info.eta, info.fast, info.slow = mid, fast, slow
                 if mid <= lead + half then return fire(st, now, tag .. " (curve)", info, ball) end
-                if slow <= reach + W * 0.9 then return fire(st, now, tag .. " (curve, covered)", info, ball) end
+                -- the soonest is due and the window still holds for the latest
+                if slow <= reach + Wc - (jitter() + frame_dt + 0.03) then return fire(st, now, tag .. " (curve, covered)", info, ball) end
                 if fast <= reach + margin then return fire(st, now, tag .. " (curve, last moment)", info, ball) end
             end
             -- Hard curve guard (toggle): the WORST case -- the hardest turn the
@@ -2128,7 +2160,7 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
             if eta <= lead + half then return fire(st, now, tag, info, ball) end
         end
         -- classic distance net for a ball coming dead straight in
-        if heading >= 0.9 and dist <= parry_distance(speed) and earliest <= reach + math.max(margin, Wc * 0.6 * (1 - acc)) then
+        if heading >= 0.9 and dist <= parry_distance(speed) and earliest <= math.max(lead, reach + margin) + half then
             return fire(st, now, tag, info, ball)
         end
     end
@@ -3160,7 +3192,7 @@ AP:AddButton({
 local APS = Tabs.Parry:AddRightGroupbox("Timing", "sliders-horizontal")
 APS:AddSlider("Accuracy", {
     Text = "Accuracy", Default = 50, Min = 1, Max = 100, Rounding = 0,
-    Tooltip = "Higher = contact lands later in the parry (tighter); lower = earlier with more cushion.",
+    Tooltip = "100 = parry just ahead of the ball (the latest that still parries); 1 = as early as still lands in the parry window. Every rule follows it, at every range.",
     Callback = function(v) S.accuracy_base = v; Parry.roll() end,
 })
 APS:AddSlider("TimingMult", {
