@@ -31,7 +31,7 @@
 
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.84"
+local SCRIPT_VERSION = "rewrite-0.5.85"
 
 -- ---------------------------------------------------------------------------
 -- Single instance.
@@ -53,10 +53,10 @@ local ReplicatedStorage = cloneref(game:GetService('ReplicatedStorage'))
 local Workspace = cloneref(game:GetService('Workspace'))
 local Stats = cloneref(game:GetService('Stats'))
 local CollectionService = cloneref(game:GetService('CollectionService'))
--- VirtualInputManager and Debris are NOT fetched at all: GetService creates a
+-- VirtualInputManager and Debris are NOT fetched at load: GetService creates a
 -- service that doesn't exist yet, and a game script can then see it with
 -- game:FindService -- a tell from a script that did nothing else (BBStop=0 kicked).
--- Key presses use the executor's keypress / keyrelease instead.
+-- VirtualInputManager is fetched only when Keypress / Auto press actually presses.
 local HttpService = cloneref(game:GetService('HttpService'))
 local CoreGui = cloneref(game:GetService('CoreGui'))
 local LocalPlayer = Players.LocalPlayer
@@ -419,9 +419,11 @@ do
     local function reach_time()
         if Core.rt_fid == Core.fid then return Core.rt end
         sample_lag()
-        local ping = math.max(Lag.avg or ping_s(), ping_s())
-        local ping_term = S.ping_compensation and ping or ping * 0.5
-        Core.rt = ping_term + jitter() + Core.interp + frame_dt * 0.5
+        -- half the round trip, from the SMOOTHED ping. Full ping ("Ping
+        -- compensation", removed in 0.5.85) and max(avg, now) both made high
+        -- ping parry earlier and earlier -- worse than no compensation at all.
+        -- The ball we read is the server-feed one, so its own lag is already gone.
+        Core.rt = (Lag.avg or ping_s()) * 0.5 + jitter() + Core.interp + frame_dt * 0.5
         Core.rt_fid = Core.fid
         return Core.rt
     end
@@ -489,36 +491,23 @@ do
     end
 
     -- ---------- timing ----------
-    -- How far ahead of the ball's arrival (beyond our reach) the parry goes.
-    -- Accuracy maps straight onto the SAFE range, both ends of which still parry:
-    --   100 -> safe: just ahead of the ball -- jitter + a frame + 10ms, so a late
-    --          check or a ping wobble can't leave it behind the ball;
-    --   1   -> early: as early as still lands inside the parry window -- the
-    --          window (capped at 0.6s: the 1.5s first window is the game's limit,
-    --          not how long the block really holds) minus jitter + a frame + 30ms.
-    -- Linear in between. Timing then bends it toward either end.
-    local function cushion_for(speed, W)
+    -- The cushion: how far ahead of the ball's arrival (beyond our reach) the
+    -- parry goes. Accuracy maps straight onto the range that still parries:
+    --   100 -> just ahead of the ball: jitter + a frame + 10ms, so a late check
+    --          or a ping wobble can't leave the parry behind the ball;
+    --   1   -> as early as still lands in the parry window: the window (capped
+    --          at 0.6s -- the 1.5s first window is the game's limit, not how
+    --          long the block holds) minus jitter + a frame + 30ms.
+    -- Linear in between. One dial; every rule in decide() uses it.
+    local function safe_margin() return jitter() + frame_dt + 0.01 end
+    local function cushion_for(_, W)
         local a = (math.clamp(S.accuracy or 50, 1, 100) - 1) / 99
-        local safe = jitter() + frame_dt + 0.01
-        local early = math.max(math.min(W, 0.6) - (jitter() + frame_dt + 0.03), safe)
-        local c = early + (safe - early) * a
-        local m = math.clamp(S.timing_mult or 1, 0, 2)
-        if m <= 1 then c = safe + (c - safe) * m else c = c + (early - c) * (m - 1) end
-        return c
+        local safe = safe_margin()
+        local early = math.max(math.min(W or 0.5, 0.6) - (jitter() + frame_dt + 0.03), safe)
+        return early + (safe - early) * a
     end
     local function fire_lead(speed)
-        local W = parry_window() or 0.5
-        local extra = math.clamp((S.extra_distance or 0) / math.max(speed, 1), -0.15, 0.15)
-        return reach_time() + cushion_for(speed, W) + extra
-    end
-    local function parry_distance(speed)
-        local ping_ms = pingMs()
-        local capped = math.min(math.max(speed - 9.5, 0), 650)
-        local divisor = (2.4 + capped * 0.002) * (S.divisor_multiplier or 1.1)
-        local distance = math.clamp(ping_ms / 100, 5, 17) + math.max(speed / divisor, 9.5)
-        if S.ping_compensation then distance = distance + speed * (ping_ms / 1000) * 0.5 end
-        distance = distance * (0.5 + 0.5 * math.clamp(S.timing_mult or 1, 0, 2))
-        return distance + (S.extra_distance or 0)
+        return reach_time() + cushion_for(speed, parry_window() or 0.5)
     end
 
     -- ---------- screen points / aim / target ----------
@@ -923,12 +912,12 @@ end]]
     local function pressBlockKey()
         if not is_live() then return false end
         Core.last_send_at = clock_()
-        -- the executor's keypress / keyrelease (0x46 = F), for Keypress mode and
-        -- Auto press capture alike -- no VirtualInputManager anywhere
-        if type(keypress) ~= "function" or type(keyrelease) ~= "function" then return false end
+        -- VirtualInputManager, fetched only here (never at load -- see the top).
+        -- keypress / keyrelease / keytap / keyclick(0x46) crash Delta (0.5.84).
         local ok = pcall(function()
-            keypress(0x46)
-            keyrelease(0x46)
+            local vim = cloneref(game:GetService('VirtualInputManager'))
+            vim:SendKeyEvent(true, Enum.KeyCode.F, false, game)
+            vim:SendKeyEvent(false, Enum.KeyCode.F, false, game)
         end)
         return ok
     end
@@ -2025,7 +2014,7 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
     -- ===================== AUTO PARRY / TRIGGERBOT / PRE-PARRY =====================
     local function mark_parried(st, now)
         local _, n2 = parry_window()
-        st.parried, st.parry_until = true, now + math.max(math.clamp(S.retry_delay or 1, 0.2, 1.5), (n2 or 1.3) + 0.08)
+        st.parried, st.parry_until = true, now + (n2 or 1.3) + 0.08
     end
     local function pass_busy(st, now)
         if st.landed then return true end
@@ -2087,27 +2076,6 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         return true
     end
 
-    -- The decision for a ball on us. via: "velocity" (its new direction just
-    -- replicated) or nil (a frame point: PreAnimation / PreSimulation /
-    -- PostSimulation / PreRender).
-    -- An EARLY parry is the fatal one: fire before the ball can arrive inside the
-    -- window and the parry runs out, the lockout follows and the ball kills you.
-    -- So every rule below only fires when arrival inside the window is certain:
-    --   * CLOSE (within ~25 studs): it can't curve far -- fire as soon as even its
-    --     straight-in arrival is inside the first half of the window.
-    --   * otherwise, a curve: no slider -- the ball's own measured turn gain k
-    --     gives two bounds, simulated along its homing path: FAST (turns 1.35x
-    --     harder than measured, the soonest it can land) and SLOW (0.75x, the
-    --     latest), plus the model-free closing-speed estimate. Fire when
-    --       - the middle estimate is due inside our lead (normal timing), or
-    --       - the soonest is due inside our lead AND the parry window still
-    --         covers the latest -- early enough not to die, late enough not to
-    --         run out, or
-    --       - the soonest is about to beat our reach (fire or die).
-    --     No measurement yet: the default gain, same bounds.
-    -- The sims only run when the straight-in arrival (the lower bound on all of
-    -- them) is inside reach + window, and only that far ahead, so the whole
-    -- decision is a few dozen steps and fits inside the frame.
     -- Aerodynamic Slash (Bbs dump, observeTag "AerodynamicSlashTornado"): the
     -- ability tags a tornado whose "Ball" attribute names the ball and whose
     -- "TornadoTime" is how long the ball spins in it before it's sent. While it
@@ -2131,26 +2099,37 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         end
         return Det.tor_list[ball.Name] == true
     end
+    -- ===================== THE DECISION (rewritten 0.5.85) =====================
+    -- For a ball on us, seen where the SERVER has it (feed position carried to
+    -- now; physics ball if the feed is stale). Three numbers:
+    --   reach  seconds until a parry fired now is up (half ping + jitter + the
+    --          physics lag the feed doesn't cover + half a frame)
+    --   lead   reach + the Accuracy cushion: fire when the ball is due by then
+    --   t_min  the soonest it can possibly land: straight in at full speed
+    --          (plus its speed-up). Nothing arrives sooner -- so while t_min is
+    --          past lead there is nothing to do and nothing is simulated.
+    -- Then:
+    --   touching                 -> fire
+    --   pointed at us (>= 0.97)  -> fire when t_min is due
+    --   anything else = a curve  -> simulate its homing path with the gain it
+    --     has been measured turning at (kept across passes):
+    --       MUST  even the fastest-turning version (1.5x, or the model's max with
+    --             Hard curve guard) lands before our reach -> fire now, at any
+    --             heading, even swinging away (this is what saves a close ball
+    --             knocked back at you at an odd angle)
+    --       DUE   the curve's own arrival (median of the fast / slow turn and the
+    --             measured closing speed) is inside lead -> fire
+    --     a ball swinging away is otherwise left until it comes round.
+    -- No straight-line distance rules: they fired on distances a curving ball
+    -- was never going to fly.
     local function decide(ball, st, root, now, via)
         if pass_busy(st, now) or blocked_by_detection() then return end
         if Det.tornado(ball, now) then return end
-        local rpos, bpos = root.Position, ball.Position
         local vel = ball_velocity(ball)
         local speed = vel.Magnitude
         if speed < 1 then return end
-        -- server ball feed (Parry.onBallFeed): when a fresh server position is in,
-        -- use it carried forward to now, and drop its measured lead over the
-        -- physics ball from our reach -- the ball as it really is, ~80-100ms
-        -- sooner, most of all on a turn or a retarget. Stale / none: physics ball.
-        local adj = 0
-        do
-            local F = Core.feed
-            local fp, ft = F.pos[ball], F.at[ball]
-            if fp and ft and F.ahead and now - ft < 0.12 then
-                bpos = fp + vel * (now - ft)
-                adj = math.clamp(F.ahead, 0, Core.interp - 0.02)
-            end
-        end
+        local bpos, adj = Core.ball_now(ball)
+        local rpos = root.Position
         local offset = rpos - bpos
         local dist = offset.Magnitude
         if dist < 0.01 then return end
@@ -2162,81 +2141,37 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         local rem = math.max(dist - gap, 0)
         local accel = speed_gain(st, speed, now)
         local h = track_homing(st, dir, want, dist, now)
-        local earliest = time_to_contact(dist, gap, speed, accel)
         local tune = S.self_tune and Core.tune or 0
-        -- lead = reach + the Accuracy cushion (cushion_for): EVERY rule below fires
-        -- on it, so Accuracy is the one dial for how early, at every range.
-        local lead = fire_lead(speed) - adj + tune
-        local Wc = math.min(W, 0.6)
-        local info = { speed = speed, dist = dist, heading = heading, lead = lead, eta = earliest }
-        local tag = (via and ("auto parry (" .. via .. ")") or "auto parry") .. ((adj > 0 and via ~= "feed") and " [feed]" or "")
-        -- touching
-        if rem <= 3 then return fire(st, now, tag .. " (contact)", info, ball) end
-        -- close: arrival inside the window is certain
-        local margin = math.max(frame_dt * 2, jitter()) + 0.02 + math.max(tune, 0)
+        local must_by = reach + safe_margin() + math.max(tune, 0)
+        local lead = math.max(reach + cushion_for(speed, W) + tune, must_by)
         local half = frame_dt * 0.5
-        -- Straight-line rules only for a ball that is actually pointed at us.
-        -- Until 0.5.82 "close" counted the straight-in time whatever way the ball
-        -- pointed and "now" took anything over 0.3 heading, so a ball curving
-        -- past (or a mini curve) inside ~30 studs fired on a distance it was
-        -- never going to fly -- the "hits curves way too far out". Anything
-        -- not pointed at us goes to the curve sims below instead.
-        local close = dist <= 25 + speed * 0.03
-        if close and heading >= 0.85 and earliest <= math.max(lead, reach + margin) + half then return fire(st, now, tag .. " (close)", info, ball) end
-        -- last moment: coming in and about to beat our reach
-        if heading >= 0.85 and earliest <= reach + margin then return fire(st, now, tag .. " (now)", info, ball) end
-        -- nothing can land before the straight-in time: if even that is past
-        -- reach + window, no rule below can fire this frame -- skip the sims
-        if earliest > math.max(lead, reach + Wc) + half then return end
-        local eta = earliest
-        if heading < 0.97 then
-            -- swinging away from us: wait for it to come round -- unless it's
-            -- touching distance, where the contact rule above already fired
-            if h.away then return end
-            local km = math.clamp(h.k or (st.k_mem or K_DEFAULT), K_MIN, K_MAX)
-            local v = vel
-            if heading < -0.95 then
-                local side = dir:Cross(Vector3.yAxis)
-                if side.Magnitude < 1e-3 then side = dir:Cross(Vector3.xAxis) end
-                v = (dir + side.Unit * 0.08).Unit * speed
-            end
-            local horizon = math.max(lead, reach + Wc) + 0.05
-            local fast = math.max(sim_prop(bpos, v, rpos, gap, math.min(km * 1.35, K_MAX), accel, horizon) or math.huge, earliest)
-            if fast > lead + half then
-                -- even the soonest arrival is outside our lead: only the
-                -- straight-in net below could still fire
-                info.eta = fast
-            else
-                local slow = math.max(sim_prop(bpos, v, rpos, gap, math.max(km * 0.75, K_MIN), accel, horizon) or math.huge, earliest)
-                local mid = math.max(median3(fast, slow, radial_eta(h, rem, speed) or (fast + math.min(slow, horizon)) * 0.5), earliest)
-                info.eta, info.fast, info.slow = mid, fast, slow
-                -- fire on the curve's own arrival (the middle estimate), at the
-                -- Accuracy lead -- not on the soonest-possible one (0.5.74-0.5.81
-                -- "covered" did, which is what parried curves far out)
-                if mid <= lead + half then return fire(st, now, tag .. " (curve)", info, ball) end
-                -- safety: even the soonest-possible arrival is about to beat our
-                -- reach -- waiting any longer could be too late
-                if fast <= reach + margin then return fire(st, now, tag .. " (curve, last moment)", info, ball) end
-            end
-            -- Hard curve guard (toggle): the WORST case -- the hardest turn the
-            -- model allows -- would land before our reach is up: fire now. Saves
-            -- you from a sudden whip-in; can parry a curve-bait ball early.
-            if S.hard_curve and fast > reach + margin then
-                local worst = sim_prop(bpos, v, rpos, gap, K_MAX, accel, reach + margin + 0.02)
-                if worst and worst <= reach + margin then
-                    info.eta = worst
-                    return fire(st, now, tag .. " (hard curve guard)", info, ball)
-                end
-            end
-        else
-            info.eta = eta
-            -- half a frame ahead: the next check may already be too late
-            if eta <= lead + half then return fire(st, now, tag, info, ball) end
+        local t_min = time_to_contact(dist, gap, speed, accel)
+        local info = { speed = speed, dist = dist, heading = heading, lead = lead, eta = t_min }
+        local tag = (via and ("auto parry (" .. via .. ")") or "auto parry") .. ((adj > 0 and via ~= "feed") and " [feed]" or "")
+        if rem <= 3 then return fire(st, now, tag .. " (contact)", info, ball) end
+        if t_min > lead + half then return end
+        if heading >= 0.97 then return fire(st, now, tag, info, ball) end
+        -- a curve
+        local km = math.clamp(h.k or st.k_mem or K_DEFAULT, K_MIN, K_MAX)
+        local v = vel
+        if heading < -0.95 then -- dead away: nudge it off the line so the sim can turn it
+            local side = dir:Cross(Vector3.yAxis)
+            if side.Magnitude < 1e-3 then side = dir:Cross(Vector3.xAxis) end
+            v = (dir + side.Unit * 0.08).Unit * speed
         end
-        -- classic distance net for a ball coming dead straight in
-        if heading >= 0.9 and dist <= parry_distance(speed) and earliest <= math.max(lead, reach + margin) + half then
-            return fire(st, now, tag, info, ball)
+        local horizon = lead + 0.05
+        local k_fast = S.hard_curve and K_MAX or math.min(math.max(km * 1.5, K_DEFAULT), K_MAX)
+        local fast = math.max(sim_prop(bpos, v, rpos, gap, k_fast, accel, horizon) or math.huge, t_min)
+        info.fast = fast
+        if fast <= must_by + half then
+            info.eta = fast
+            return fire(st, now, tag .. " (curve, must)", info, ball)
         end
+        if h.away or fast > lead + half then return end
+        local slow = math.max(sim_prop(bpos, v, rpos, gap, math.max(km * 0.7, K_MIN), accel, horizon + W) or math.huge, t_min)
+        local mid = math.max(median3(fast, slow, radial_eta(h, rem, speed) or (fast + math.min(slow, horizon + W)) * 0.5), t_min)
+        info.eta, info.slow = mid, slow
+        if mid <= lead + half then return fire(st, now, tag .. " (curve)", info, ball) end
     end
 
     local function trigger(ball, st, now)
@@ -2356,7 +2291,7 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
             return
         end
         -- Synthetic-press bootstrap ("Auto press" capture mode): when no
-        -- ball is near, a keypress(0x46) Block press goes out and the hook
+        -- ball is near, a VirtualInputManager Block press goes out and the hook
         -- reads its packet. Off by default -- synthetic input can be flagged, and
         -- a press that does not actually parry captures nothing.
         if Capture.mode == "Auto press" then
@@ -2654,7 +2589,11 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         -- hits", on every mode.
         Core.pending, Core.misses = nil, 0
         Core.tune = Core.tune * 0.9
-        for _, st in pairs(tracked) do if st.target == me and st.pass_open then st.landed = true end end
+        -- only a pass WE fired on is landed. Until 0.5.85 this marked any pass on
+        -- us -- and in a fast exchange the ball is already back on us when our
+        -- ParrySuccess arrives, so the NEW incoming pass was marked landed and
+        -- auto parry never fired on it: "ball hit back to me from close, no parry".
+        for _, st in pairs(tracked) do if st.target == me and st.pass_open and st.parried then st.landed = true end end
         spam_instant()
     end
     function Parry.onParryAll(...)
@@ -3198,133 +3137,124 @@ local Tabs = {
     Status = Window:AddTab("Status", "gauge", "Live state and parry log"),
 }
 
--- ----- Auto Parry tab -----
+-- ----- Auto Parry tab (rewritten 0.5.85) -----
+-- Same option ids as before, so saved configs carry over. Removed: Timing,
+-- Extra distance, Retry delay (the game's own lockout is used) and Ping
+-- compensation (full-ping lead made high ping worse).
 local AP = Tabs.Parry:AddLeftGroupbox("Auto Parry", "swords")
 AP:AddToggle("AutoParry", {
     Text = "Auto parry", Default = false,
+    Tooltip = "Parries every ball sent at you, curves included, at the Accuracy you set.",
     Callback = function(v) S.autoparry = v; Engine.want("autoparry", v) end,
 }):AddKeyPicker("AutoParryKey", { Default = "None", Mode = "Toggle", SyncToggleState = true, Text = "Auto parry" })
+AP:AddToggle("Triggerbot", {
+    Text = "Triggerbot", Default = false,
+    Tooltip = "Parries the instant the ball turns to you, at any distance. Overrides auto parry's timing while on.",
+    Callback = function(v) S.triggerbot = v; Engine.want("triggerbot", v) end,
+}):AddKeyPicker("TriggerbotKey", { Default = "None", Mode = "Toggle", SyncToggleState = true, Text = "Triggerbot" })
+AP:AddDropdown("ParryMode", {
+    Values = { "Remote", "Keypress" }, Default = "Remote", Text = "Parry mode",
+    Tooltip = "Remote: the captured parry, forged (curve and target options work). Keypress: presses block.",
+    Callback = function(v) S.parry_mode = v end,
+})
+AP:AddToggle("ParryAnimation", {
+    Text = "Parry animation", Default = true,
+    Tooltip = "Plays your sword's block swing on remote parries.",
+    Callback = function(v) Anim.enabled = v end,
+})
 AP:AddToggle("UnlockFPS", {
     Text = "Unlock FPS", Default = true,
-    Tooltip = "Raises the frame cap to 240. Auto parry checks the ball 4 times every frame, so more frames = more checks a second (60 FPS: 240/s, 240 FPS: 960/s).",
+    Tooltip = "Frame cap 240: auto parry checks the ball 4 times a frame, so more frames = more checks.",
     Callback = function(v)
         local function apply() pcall(function() if type(setfpscap) == "function" then setfpscap(v and 240 or 60) end end) end
         if v and Stagger.active() then Stagger.push("fps", "Unlock FPS", apply) else apply() end
-    end,
-})
-AP:AddToggle("Triggerbot", {
-    Text = "Triggerbot", Default = false,
-    Tooltip = "Parries the instant the ball is on you, at any distance. Overrides auto parry's timing while on.",
-    Callback = function(v) S.triggerbot = v; Engine.want("triggerbot", v) end,
-}):AddKeyPicker("TriggerbotKey", { Default = "None", Mode = "Toggle", SyncToggleState = true, Text = "Triggerbot" })
-AP:AddToggle("ParryAnimation", {
-    Text = "Parry animation", Default = true,
-    Tooltip = "Plays your sword's block swing on remote parries (Keypress mode and abilities animate themselves). Off = no animations from the script at all.",
-    Callback = function(v) Anim.enabled = v end,
-})
-AP:AddDropdown("ParryMode", {
-    Values = { "Remote", "Keypress" }, Default = "Remote", Text = "Parry mode",
-    Tooltip = "Remote sends the captured packet (curves, no cooldown tell). Keypress presses block.",
-    Callback = function(v) S.parry_mode = v end,
-})
-AP:AddToggle("PreParry", {
-    Text = "Pre-parry", Default = false,
-    Tooltip = "Ball on a player right next to you whose return would beat your reaction: parry ahead of it.",
-    Callback = function(v) S.preparry = v end,
-})
-AP:AddSlider("PreParryRange", {
-    Text = "Pre-parry range", Default = 20, Min = 8, Max = 45, Rounding = 0, Suffix = " studs",
-    Callback = function(v) S.preparry_range = v end,
-})
-AP:AddToggle("HighPingPreParry", {
-    Text = "Auto pre-parry at high ping", Default = false,
-    Tooltip = "Pre-parry turns itself on while your ping is 80ms or more.",
-    Callback = function(v) S.hp_preparry = v end,
-})
-AP:AddDropdown("TargetMode", {
-    Values = Parry.targetNames, Default = "Cursor", Text = "Target mode",
-    Callback = function(v) Parry.setTargetMode(v) end,
-})
-AP:AddDropdown("CaptureHook", {
-    Values = { "Namecall", "FireServer", "Both" }, Default = "Namecall", Text = "Capture hook",
-    Tooltip = "How the key is captured, then every parry is forged (curve, targeting, all options work). Default Namecall uses a __namecall hook (hookmetamethod) that lives in game's locked metatable -- a game script cannot see it, so it is the stealthiest. FireServer/Both also hook the shared FireServer function (identity a game script can compare) -- less stealthy but catch every parry. The hook is up only around the one press it reads (see 'Capture on'), then stays down for the session.",
-    Callback = function(v) getgenv().CaptureHook = v end,
-})
-AP:AddDropdown("CaptureTrigger", {
-    Values = { "Your press", "Incoming ball", "Auto press" }, Default = "Your press", Text = "Capture on",
-    Tooltip = "When the one-time key capture happens. Your press: the first time you press block anywhere you can parry -- only your real Block key / the Block button, never UI clicks, menus or emotes. Incoming ball: when a ball is about to hit you. Auto press: the script presses block itself once (synthetic input).",
-    Callback = function(v) Parry.Capture.mode = v end,
-})
-AP:AddButton({
-    Text = "Rehook",
-    Tooltip = "Drop the current capture and take a fresh one as soon as no ball is near you (uses the Capture hook above). Use it if parries stop landing.",
-    Func = function()
-        if Parry.rehook() then
-            Notify("Rehook", "Capture dropped -- taking a fresh one as soon as no ball is near you.", 3)
-        else
-            Notify("Rehook", "Capture dropped. Turn on Auto parry or spam to take a fresh one.", 4)
-        end
     end,
 })
 
 local APS = Tabs.Parry:AddRightGroupbox("Timing", "sliders-horizontal")
 APS:AddSlider("Accuracy", {
     Text = "Accuracy", Default = 50, Min = 1, Max = 100, Rounding = 0,
-    Tooltip = "100 = parry just ahead of the ball (the latest that still parries); 1 = as early as still lands in the parry window. Every rule follows it, at every range.",
+    Tooltip = "100 = parry just ahead of the ball, the latest that still parries. 1 = as early as still lands in the parry window. Both ends parry.",
     Callback = function(v) S.accuracy_base = v; Parry.roll() end,
-})
-APS:AddSlider("TimingMult", {
-    Text = "Timing", Default = 1, Min = 0, Max = 2, Rounding = 2,
-    Tooltip = "Toward 2 = parry earlier, toward 0 = later.",
-    Callback = function(v) S.timing_mult = v end,
-})
-APS:AddSlider("ExtraDistance", {
-    Text = "Extra distance", Default = 0, Min = -20, Max = 40, Rounding = 0, Suffix = " studs",
-    Callback = function(v) S.extra_distance = v end,
-})
-APS:AddSlider("RetryDelay", {
-    Text = "Retry delay", Default = 1, Min = 0.2, Max = 1.5, Rounding = 2, Suffix = "s",
-    Callback = function(v) S.retry_delay = v end,
-})
-APS:AddToggle("SelfTune", {
-    Text = "Self-tune timing", Default = false,
-    Tooltip = "Each EARLY / LATE miss nudges the fire time the other way (max 15ms a step, +/-40ms total); landed parries ease it back. Downside: a few odd misses can pull it off for a while.",
-    Callback = function(v) S.self_tune = v; if not v then Parry.resetTune() end end,
-})
-APS:AddToggle("HardCurveGuard", {
-    Text = "Hard curve guard", Default = false,
-    Tooltip = "Fires if the hardest possible turn would land the ball before your parry is up. Saves sudden whip-in curves; downside: can parry curve-bait balls early.",
-    Callback = function(v) S.hard_curve = v end,
-})
-APS:AddToggle("PingCompensation", {
-    Text = "Ping compensation", Default = false,
-    Tooltip = "Leads further ahead on high ping. Turn on if parries land late.",
-    Callback = function(v) S.ping_compensation = v end,
 })
 APS:AddToggle("RandomAccuracy", { Text = "Randomize accuracy", Default = false, Callback = function(v) S.random_accuracy = v end })
 APS:AddSlider("RandomAccuracyAmount", {
     Text = "Randomize amount", Default = 10, Min = 0, Max = 50, Rounding = 0, Suffix = " +/-",
     Callback = function(v) S.random_accuracy_amount = v end,
 })
+APS:AddToggle("HardCurveGuard", {
+    Text = "Hard curve guard", Default = false,
+    Tooltip = "Treats every curve as the hardest turn possible for the must-fire check. Saves sudden whip-ins; downside: can parry curve-bait balls early.",
+    Callback = function(v) S.hard_curve = v end,
+})
+APS:AddToggle("SelfTune", {
+    Text = "Self-tune timing", Default = false,
+    Tooltip = "Each EARLY / LATE miss nudges the fire time the other way (max 15ms a step, +/-40ms total); landed parries ease it back. Downside: a few odd misses can pull it off for a while.",
+    Callback = function(v) S.self_tune = v; if not v then Parry.resetTune() end end,
+})
 
-local CV = Tabs.Parry:AddRightGroupbox("Curve", "spline")
-CV:AddDropdown("CurveMode", {
+local AIM = Tabs.Parry:AddRightGroupbox("Aim & Curve", "spline")
+AIM:AddDropdown("TargetMode", {
+    Values = Parry.targetNames, Default = "Cursor", Text = "Target mode",
+    Callback = function(v) Parry.setTargetMode(v) end,
+})
+AIM:AddDropdown("CurveMode", {
     Values = Parry.curveNames, Default = "Camera", Text = "Curve mode", Searchable = true,
     Tooltip = "The direction sent with every parry (auto parry, triggerbot and spam).",
     Callback = function(v) Parry.setCurveMode(v) end,
 })
-CV:AddToggle("RandomCurve", { Text = "Random curve each parry", Default = false, Callback = function(v) S.random_curve = v end })
+AIM:AddToggle("RandomCurve", { Text = "Random curve each parry", Default = false, Callback = function(v) S.random_curve = v end })
 local function cycle_curve(dir)
     local names = Parry.curveNames
     local idx = (S.curve_mode - 1 + dir) % #names + 1
     pcall(function() Options.CurveMode:SetValue(names[idx]) end)
     Notify("Curve", names[idx], 1)
 end
-CV:AddLabel("Next curve"):AddKeyPicker("NextCurveKey", {
+AIM:AddLabel("Next curve"):AddKeyPicker("NextCurveKey", {
     Default = "None", Mode = "Toggle", Text = "Next curve", Callback = function() cycle_curve(1) end,
 })
-CV:AddLabel("Previous curve"):AddKeyPicker("PrevCurveKey", {
+AIM:AddLabel("Previous curve"):AddKeyPicker("PrevCurveKey", {
     Default = "None", Mode = "Toggle", Text = "Previous curve", Callback = function() cycle_curve(-1) end,
+})
+
+
+local CAP = Tabs.Parry:AddLeftGroupbox("Capture", "key-round")
+CAP:AddDropdown("CaptureHook", {
+    Values = { "Namecall", "FireServer", "Both" }, Default = "Namecall", Text = "Capture hook",
+    Tooltip = "Namecall (stealthiest): a __namecall hook that stays up until your first real parry is caught, then comes down. FireServer / Both also hook the shared FireServer function, which a game script can compare.",
+    Callback = function(v) getgenv().CaptureHook = v end,
+})
+CAP:AddDropdown("CaptureTrigger", {
+    Values = { "Your press", "Incoming ball", "Auto press" }, Default = "Your press", Text = "Capture on",
+    Tooltip = "FireServer / Both hooks: when the hook goes up. Your press: your real Block key / button only. Incoming ball: a ball about to hit you. Auto press: the script presses block once itself.",
+    Callback = function(v) Parry.Capture.mode = v end,
+})
+CAP:AddButton({
+    Text = "Rehook",
+    Tooltip = "Drop the capture and take a fresh one. Use it if parries stop landing.",
+    Func = function()
+        if Parry.rehook() then
+            Notify("Rehook", "Capture dropped -- taking a fresh one.", 3)
+        else
+            Notify("Rehook", "Capture dropped. Turn on Auto parry or spam to take a fresh one.", 4)
+        end
+    end,
+})
+
+local PP = Tabs.Parry:AddLeftGroupbox("Pre-parry", "fast-forward")
+PP:AddToggle("PreParry", {
+    Text = "Pre-parry", Default = false,
+    Tooltip = "Ball on a player right next to you whose return would beat your reaction: parry ahead of it.",
+    Callback = function(v) S.preparry = v end,
+})
+PP:AddSlider("PreParryRange", {
+    Text = "Pre-parry range", Default = 20, Min = 8, Max = 45, Rounding = 0, Suffix = " studs",
+    Callback = function(v) S.preparry_range = v end,
+})
+PP:AddToggle("HighPingPreParry", {
+    Text = "Auto pre-parry at high ping", Default = false,
+    Tooltip = "Pre-parry turns itself on while your ping is 80ms or more.",
+    Callback = function(v) S.hp_preparry = v end,
 })
 
 local AB = Tabs.Parry:AddLeftGroupbox("Abilities", "sparkles")
