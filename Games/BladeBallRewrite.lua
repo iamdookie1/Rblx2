@@ -31,7 +31,7 @@
 
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.83"
+local SCRIPT_VERSION = "rewrite-0.5.84"
 
 -- ---------------------------------------------------------------------------
 -- Single instance.
@@ -53,10 +53,10 @@ local ReplicatedStorage = cloneref(game:GetService('ReplicatedStorage'))
 local Workspace = cloneref(game:GetService('Workspace'))
 local Stats = cloneref(game:GetService('Stats'))
 local CollectionService = cloneref(game:GetService('CollectionService'))
--- VirtualInputManager and Debris are NOT fetched at load: GetService creates a
+-- VirtualInputManager and Debris are NOT fetched at all: GetService creates a
 -- service that doesn't exist yet, and a game script can then see it with
 -- game:FindService -- a tell from a script that did nothing else (BBStop=0 kicked).
--- VirtualInputManager is fetched only when Auto press actually presses.
+-- Key presses use the executor's keypress / keyrelease instead.
 local HttpService = cloneref(game:GetService('HttpService'))
 local CoreGui = cloneref(game:GetService('CoreGui'))
 local LocalPlayer = Players.LocalPlayer
@@ -923,12 +923,14 @@ end]]
     local function pressBlockKey()
         if not is_live() then return false end
         Core.last_send_at = clock_()
-        pcall(function()
-            local vim = cloneref(game:GetService('VirtualInputManager'))
-            vim:SendKeyEvent(true, Enum.KeyCode.F, false, game)
-            vim:SendKeyEvent(false, Enum.KeyCode.F, false, game)
+        -- the executor's keypress / keyrelease (0x46 = F), for Keypress mode and
+        -- Auto press capture alike -- no VirtualInputManager anywhere
+        if type(keypress) ~= "function" or type(keyrelease) ~= "function" then return false end
+        local ok = pcall(function()
+            keypress(0x46)
+            keyrelease(0x46)
         end)
-        return true
+        return ok
     end
     -- a native block press (the game sends the parry and animates it); with
     -- capture = true the hook is up for it so its packet becomes the capture.
@@ -2354,7 +2356,7 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
             return
         end
         -- Synthetic-press bootstrap ("Auto press" capture mode): when no
-        -- ball is near, a VirtualInputManager Block press goes out and the hook
+        -- ball is near, a keypress(0x46) Block press goes out and the hook
         -- reads its packet. Off by default -- synthetic input can be flagged, and
         -- a press that does not actually parry captures nothing.
         if Capture.mode == "Auto press" then
