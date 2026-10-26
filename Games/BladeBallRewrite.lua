@@ -31,7 +31,7 @@
 
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.85"
+local SCRIPT_VERSION = "rewrite-0.5.86"
 
 -- ---------------------------------------------------------------------------
 -- Single instance.
@@ -708,6 +708,18 @@ do
     -- the remote's FireServer, resolved in Parry.resolve() (never at load)
     local FIRE_FN
     local JOB_ID = game.JobId
+    -- The sender module (SwordsController.PRY, Bbs dump) opens with
+    --   _G.BAC_HASH   = "<real hash>"
+    --   _G.BAC_FAKE_1 / _G.BAC_FAKE_2 = "<decoy hashes>"
+    -- and every parry also fires decoy packets carrying the fake ones, same
+    -- shape as the real packet. Read from the game's own _G (a read the game
+    -- can't see); re-read each time, in case it rotates.
+    function Core.bac()
+        local ok, g = pcall(function() return getrenv and getrenv()._G end)
+        if not ok or type(g) ~= "table" then return nil end
+        local real, f1, f2 = rawget(g, "BAC_HASH"), rawget(g, "BAC_FAKE_1"), rawget(g, "BAC_FAKE_2")
+        return type(real) == "string" and #real == 36 and real or nil, f1, f2
+    end
 
     local H = { fire = nil, nc = nil, want = false, until_t = 0 }
 
@@ -721,11 +733,10 @@ do
     -- replace the shared FireServer function, whose identity a game script CAN
     -- cache and compare, so they are the detectable ones. getgc (reflection) is
     -- always migrated away.
-    local function capture_method()
-        local m = getgenv().CaptureHook
-        if m == nil or m == "getgc" then m = "Namecall" end
-        return m
-    end
+    -- Namecall only since 0.5.86: the FireServer / Both hooks changed the
+    -- FireServer function itself, which a game script can probe; the parry
+    -- sender's :FireServer calls all go through __namecall anyway.
+    local function capture_method() return "Namecall" end
     Core.capture_method = capture_method
 
     -- __namecall goes back exactly: the original function object written straight
@@ -749,9 +760,11 @@ do
         local key = {}
         for i = 1, #text do key[i] = bxor_(byte_(token, i), (byte_(text, i) + i) % 256) end
         local prev = Core.cap
-        Core.cap = { remote = remote, hash = hash, uid = uid, key = key, len = #text, ball2 = typeof_(a4) == "CFrame" }
+        Core.cap = { remote = remote, hash = hash, uid = uid, key = key, len = #text, ball2 = typeof_(a4) == "CFrame",
+            verified = Core.bac() == hash }
         Core.misses, Core.pending = 0, nil
         Core.new_capture = { prev = prev }
+        if Parry.onCapture then task.defer(pcall, Parry.onCapture, Core.cap) end
     end
 
     -- A real parry: (hash, id, token, window, cameraCF, points, aim, flag), or on
@@ -760,6 +773,12 @@ do
     local function inspect(entry)
         local self, a = entry[1], entry[3]
         local a1, a2, a3, a4, a5 = a[1], a[2], a[3], a[4], a[5]
+        -- the decoys: until 0.5.86 any 36-char hash was taken, so a capture
+        -- could be a FAKE packet -- then every forged parry carried the fake
+        -- hash: animation, no parry, in some captures and not others
+        local real, f1, f2 = Core.bac()
+        if a1 == f1 or a1 == f2 then return false end
+        if real and a1 ~= real then return false end
         if typeof_(self) == 'Instance' and self.ClassName == 'RemoteEvent'
             and type_(a1) == 'string' and #a1 == 36 and a1 ~= JOB_ID and type_(a2) == 'string' and type_(a3) == 'string'
             and ((type_(a4) == 'number' and typeof_(a5) == 'CFrame') or (typeof_(a4) == 'CFrame' and typeof_(a5) == 'CFrame')) then
@@ -1334,6 +1353,14 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         if cap.gc then return gc_fire(spam) end   -- getgc: call the game's own sender
         if not canParryNow() then return "blocked" end
         if not cap.remote.Parent then Core.cap = nil; return "unarmed" end
+        -- a capture whose hash isn't the game's real one (the hash rotated, or
+        -- an old decoy capture): drop it and take a fresh one
+        local real = Core.bac()
+        if real and cap.hash ~= real then
+            Core.cap = nil
+            logp("capture: its hash is not the game's real one -- dropped, taking a fresh one")
+            return "unarmed"
+        end
         if not spam and not gate_open() then return "blocked" end
         local window = parry_window()
         local tok = make_token(cap)
@@ -1494,12 +1521,16 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         return rem / c2
     end
     -- proportional homing: each step the direction lerps toward us by k*dt
-    local function sim_prop(pos, vel, target, gap, k, accel, horizon)
+    -- tvel: how the target (us) is moving -- the ball homes on where we ARE, so
+    -- a running player's curve lands somewhere else than a standing one's
+    local function sim_prop(pos, vel, target, gap, k, accel, horizon, tvel)
         local speed = vel.Magnitude
         if speed < 1 then return nil end
         local dir, t = vel / speed, 0
         local a = math.clamp(k * SIM_DT, 0, 1)
+        local tstep = tvel and tvel * SIM_DT or nil
         while t < horizon do
+            if tstep then target = target + tstep end
             local to = target - pos
             local dist = to.Magnitude
             if dist <= gap then return t end
@@ -2160,18 +2191,30 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
             v = (dir + side.Unit * 0.08).Unit * speed
         end
         local horizon = lead + 0.05
+        local rv = root.AssemblyLinearVelocity
+        local tvel = Vector3.new(rv.X, 0, rv.Z)
+        if tvel.Magnitude < 1 then tvel = nil end
         local k_fast = S.hard_curve and K_MAX or math.min(math.max(km * 1.5, K_DEFAULT), K_MAX)
-        local fast = math.max(sim_prop(bpos, v, rpos, gap, k_fast, accel, horizon) or math.huge, t_min)
+        local fast = math.max(sim_prop(bpos, v, rpos, gap, k_fast, accel, horizon, tvel) or math.huge, t_min)
         info.fast = fast
         if fast <= must_by + half then
             info.eta = fast
             return fire(st, now, tag .. " (curve, must)", info, ball)
         end
         if h.away or fast > lead + half then return end
-        local slow = math.max(sim_prop(bpos, v, rpos, gap, math.max(km * 0.7, K_MIN), accel, horizon + W) or math.huge, t_min)
+        local slow = math.max(sim_prop(bpos, v, rpos, gap, math.max(km * 0.7, K_MIN), accel, horizon + W, tvel) or math.huge, t_min)
         local mid = math.max(median3(fast, slow, radial_eta(h, rem, speed) or (fast + math.min(slow, horizon + W)) * 0.5), t_min)
         info.eta, info.slow = mid, slow
-        if mid <= lead + half then return fire(st, now, tag .. " (curve)", info, ball) end
+        if mid <= lead + half then
+            -- certainty: a parry fired now holds until reach + window. If the
+            -- slowest version of this curve lands after that AND the soonest is
+            -- still two frames clear of the must line, wait a check -- the
+            -- curve's next readings narrow it; the MUST rule still guards the
+            -- soonest. This is what stops a curve being parried out of range.
+            local holds = reach + math.min(W, 0.6) - safe_margin()
+            if slow > holds and fast > must_by + frame_dt * 2 then return end
+            return fire(st, now, tag .. " (curve)", info, ball)
+        end
     end
 
     local function trigger(ball, st, now)
@@ -3219,16 +3262,16 @@ AIM:AddLabel("Previous curve"):AddKeyPicker("PrevCurveKey", {
 
 
 local CAP = Tabs.Parry:AddLeftGroupbox("Capture", "key-round")
-CAP:AddDropdown("CaptureHook", {
-    Values = { "Namecall", "FireServer", "Both" }, Default = "Namecall", Text = "Capture hook",
-    Tooltip = "Namecall (stealthiest): a __namecall hook that stays up until your first real parry is caught, then comes down. FireServer / Both also hook the shared FireServer function, which a game script can compare.",
-    Callback = function(v) getgenv().CaptureHook = v end,
+CAP:AddLabel("Parry once yourself: the hook reads that real parry (the real hash only, never the game's decoys) and auto parry takes over. A notification says when it has it.", true)
+CAP:AddToggle("AutoPressCapture", {
+    Text = "Auto press capture", Default = false,
+    Tooltip = "The script presses block once itself to take the capture (synthetic input) instead of waiting for your own parry.",
+    Callback = function(v) Parry.Capture.mode = v and "Auto press" or "Your press" end,
 })
-CAP:AddDropdown("CaptureTrigger", {
-    Values = { "Your press", "Incoming ball", "Auto press" }, Default = "Your press", Text = "Capture on",
-    Tooltip = "FireServer / Both hooks: when the hook goes up. Your press: your real Block key / button only. Incoming ball: a ball about to hit you. Auto press: the script presses block once itself.",
-    Callback = function(v) Parry.Capture.mode = v end,
-})
+Parry.onCapture = function(cap)
+    Notify("Parry remote captured", cap.verified and "Real parry hash confirmed -- auto parry is armed."
+        or "Captured (couldn't read the game's real hash to confirm it).", 4)
+end
 CAP:AddButton({
     Text = "Rehook",
     Tooltip = "Drop the capture and take a fresh one. Use it if parries stop landing.",
