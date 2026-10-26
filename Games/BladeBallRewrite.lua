@@ -31,7 +31,7 @@
 
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.87"
+local SCRIPT_VERSION = "rewrite-0.5.88"
 
 -- ---------------------------------------------------------------------------
 -- Single instance.
@@ -492,19 +492,23 @@ do
 
     -- ---------- timing ----------
     -- The cushion: how far ahead of the ball's arrival (beyond our reach) the
-    -- parry goes. Accuracy maps straight onto the range that still parries:
-    --   100 -> just ahead of the ball: jitter + a frame + 10ms, so a late check
-    --          or a ping wobble can't leave the parry behind the ball;
-    --   1   -> as early as still lands in the parry window: the window (capped
-    --          at 0.6s -- the 1.5s first window is the game's limit, not how
-    --          long the block holds) minus jitter + a frame + 30ms.
-    -- Linear in between. One dial; every rule in decide() uses it.
+    -- parry goes. Since 0.5.88 it is set in BALL TRAVEL, not plain time -- a
+    -- time cushion is a different distance at every speed (0.34s at 39 was
+    -- ~100 studs on a 300 ball, yet 100's 30ms was nothing on a slow one):
+    --   100 -> SAFE:  5 studs of travel ahead (never less than jitter + a frame
+    --          + 10ms) -- close, but a slow ball isn't let onto you;
+    --   1   -> EARLY: 35 studs ahead, and never past what the parry window
+    --          (capped 0.6s) still covers -- so even 1 can't run out.
+    -- Squared toward SAFE: (1 - a)^2, so the middle of the slider is already
+    -- fairly close (50 = ~1/4 of the way out, 39 = ~2/5).
     local function safe_margin() return jitter() + frame_dt + 0.01 end
-    local function cushion_for(_, W)
+    local function cushion_for(speed, W)
         local a = (math.clamp(S.accuracy or 50, 1, 100) - 1) / 99
-        local safe = safe_margin()
-        local early = math.max(math.min(W or 0.5, 0.6) - (jitter() + frame_dt + 0.03), safe)
-        return early + (safe - early) * a
+        local sp = math.max(speed or 1, 1)
+        local safe = math.max(safe_margin(), 5 / sp)
+        local early = math.max(math.min(math.min(W or 0.5, 0.6) - (jitter() + frame_dt + 0.03), 35 / sp), safe)
+        local f = (1 - a) * (1 - a)
+        return safe + (early - safe) * f
     end
     local function fire_lead(speed)
         return reach_time() + cushion_for(speed, parry_window() or 0.5)
@@ -2142,15 +2146,9 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
     -- Then:
     --   touching                 -> fire
     --   pointed at us (>= 0.97)  -> fire when t_min is due
-    --   anything else = a curve  -> simulate its homing path with the gain it
-    --     has been measured turning at (kept across passes):
-    --       MUST  even the fastest-turning version (1.5x, or the model's max with
-    --             Hard curve guard) lands before our reach -> fire now, at any
-    --             heading, even swinging away (this is what saves a close ball
-    --             knocked back at you at an odd angle)
-    --       DUE   the curve's own arrival (median of the fast / slow turn and the
-    --             measured closing speed) is inside lead -> fire
-    --     a ball swinging away is otherwise left until it comes round.
+    --   anything else = a curve  -> see "anti curve" below: fire on its
+    --     LATEST arrival at the Accuracy lead, and at once if its SOONEST
+    --     arrival would beat a parry fired now.
     -- No straight-line distance rules: they fired on distances a curving ball
     -- was never going to fly.
     local function decide(ball, st, root, now, via)
@@ -2182,7 +2180,18 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         if rem <= 3 then return fire(st, now, tag .. " (contact)", info, ball) end
         if t_min > lead + half then return end
         if heading >= 0.97 then return fire(st, now, tag, info, ball) end
-        -- a curve
+        -- ===== a curve (anti curve, rewritten 0.5.88) =====
+        -- Two runs of its homing path, with the turn gain it has actually been
+        -- measured turning at (kept across passes; default until measured):
+        --   SLOW  turning 0.75x as hard -- the LATEST it can arrive. The normal
+        --         fire is on this, at the Accuracy lead: a curve is never
+        --         parried before even its slowest version is due, so no early
+        --         hits on wide or bait curves.
+        --   FAST  turning 1.4x as hard (the model's max with Hard curve guard)
+        --         -- the SOONEST. If it would land before a parry fired now is
+        --         up (reach + safety), fire at once whatever else: you can't
+        --         be curved past.
+        -- A ball swinging away waits to come round (FAST still guards it).
         local km = math.clamp(h.k or st.k_mem or K_DEFAULT, K_MIN, K_MAX)
         local v = vel
         if heading < -0.95 then -- dead away: nudge it off the line so the sim can turn it
@@ -2190,31 +2199,20 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
             if side.Magnitude < 1e-3 then side = dir:Cross(Vector3.xAxis) end
             v = (dir + side.Unit * 0.08).Unit * speed
         end
-        local horizon = lead + 0.05
         local rv = root.AssemblyLinearVelocity
         local tvel = Vector3.new(rv.X, 0, rv.Z)
         if tvel.Magnitude < 1 then tvel = nil end
-        local k_fast = S.hard_curve and K_MAX or math.min(math.max(km * 1.5, K_DEFAULT), K_MAX)
-        local fast = math.max(sim_prop(bpos, v, rpos, gap, k_fast, accel, horizon, tvel) or math.huge, t_min)
+        local k_fast = S.hard_curve and K_MAX or math.min(km * 1.4, K_MAX)
+        local fast = math.max(sim_prop(bpos, v, rpos, gap, k_fast, accel, must_by + 0.05, tvel) or math.huge, t_min)
         info.fast = fast
         if fast <= must_by + half then
             info.eta = fast
             return fire(st, now, tag .. " (curve, must)", info, ball)
         end
-        if h.away or fast > lead + half then return end
-        local slow = math.max(sim_prop(bpos, v, rpos, gap, math.max(km * 0.7, K_MIN), accel, horizon + W, tvel) or math.huge, t_min)
-        local mid = math.max(median3(fast, slow, radial_eta(h, rem, speed) or (fast + math.min(slow, horizon + W)) * 0.5), t_min)
-        info.eta, info.slow = mid, slow
-        if mid <= lead + half then
-            -- certainty: a parry fired now holds until reach + window. If the
-            -- slowest version of this curve lands after that AND the soonest is
-            -- still two frames clear of the must line, wait a check -- the
-            -- curve's next readings narrow it; the MUST rule still guards the
-            -- soonest. This is what stops a curve being parried out of range.
-            local holds = reach + math.min(W, 0.6) - safe_margin()
-            if slow > holds and fast > must_by + frame_dt * 2 then return end
-            return fire(st, now, tag .. " (curve)", info, ball)
-        end
+        if h.away then return end
+        local slow = math.max(sim_prop(bpos, v, rpos, gap, math.max(km * 0.75, K_MIN), accel, lead + 0.05, tvel) or math.huge, t_min)
+        info.eta, info.slow = slow, slow
+        if slow <= lead + half then return fire(st, now, tag .. " (curve)", info, ball) end
     end
 
     local function trigger(ball, st, now)
@@ -3275,7 +3273,7 @@ AP:AddToggle("UnlockFPS", {
 local APS = Tabs.Parry:AddRightGroupbox("Timing", "sliders-horizontal")
 APS:AddSlider("Accuracy", {
     Text = "Accuracy", Default = 50, Min = 1, Max = 100, Rounding = 0,
-    Tooltip = "100 = parry just ahead of the ball, the latest that still parries. 1 = as early as still lands in the parry window. Both ends parry.",
+    Tooltip = "How close the ball gets before the parry, in ball travel at any speed: 100 = ~5 studs ahead, 1 = ~35 studs ahead (never past the parry window). The middle is already fairly close (50 = ~1/4 of the way out). Curves follow it too.",
     Callback = function(v) S.accuracy_base = v; Parry.roll() end,
 })
 APS:AddToggle("RandomAccuracy", { Text = "Randomize accuracy", Default = false, Callback = function(v) S.random_accuracy = v end })
