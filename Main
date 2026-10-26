@@ -73,6 +73,8 @@ local Games = {
     -- Velstorm's Survive Overnight (game 7058980030), from its dump's own
     -- place id.
     [121418861436763] = { Name = 'Survive Overnight', Script = 'Games/SurviveOvernight.lua' },
+    -- RoChess! by 1 Elo Chess (game 10768845402), from its dump's own place id.
+    [139717576471404] = { Name = 'RoChess', Script = 'Games/RoChess.lua' },
     -- [🎃] Dodge or Die (game 9845585365): every mode's place, from the game's
     -- own ServerModeConfig. AutoLoad runs it as soon as it is detected.
     [131794278839305] = { Name = 'Dodge or Die', Script = 'Games/DodgeOrDie.lua', AutoLoad = true },
@@ -98,6 +100,7 @@ local GameIds = {
     [10764755131] = { Name = 'Crunch Leaves', Script = 'Games/CrunchLeaves.lua' },
     [3620011279] = { Name = 'raise a floppa 2', Script = 'Games/RaiseAFloppa2.lua' },
     [7058980030] = { Name = 'Survive Overnight', Script = 'Games/SurviveOvernight.lua' },
+    [10768845402] = { Name = 'RoChess', Script = 'Games/RoChess.lua' },
 }
 
 -- Games whose other modes (ranked, duels, events...) each have their own place
