@@ -31,7 +31,7 @@
 
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.86"
+local SCRIPT_VERSION = "rewrite-0.5.87"
 
 -- ---------------------------------------------------------------------------
 -- Single instance.
@@ -2288,9 +2288,15 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         end
     end
     on_velocity = function(ball, st)
-        if not S.autoparry or S.triggerbot then return end
+        if not (S.autoparry or S.triggerbot) then return end
         local root = ap_root()
-        if root then decide(ball, st, root, clock_(), "velocity") end
+        if not root then return end
+        if st.reopen_until and clock_() < st.reopen_until and (st.parried or st.landed)
+            and ball_velocity(ball):Dot(root.Position - Core.ball_now(ball)) > 0 then
+            st.reopen_until = nil
+            open_pass(st); G.until_t = 0
+        end
+        if S.triggerbot then trigger(ball, st, clock_()) else decide(ball, st, root, clock_(), "velocity") end
     end
 
     -- ===================== per-frame (3 points a frame) =====================
@@ -2579,11 +2585,13 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
             local st = tracked[ball]
             if st and st.target == me then spam_instant() end
         end
-        if active and S.autoparry and not S.triggerbot then
+        if active and (S.autoparry or S.triggerbot) then
             local st = tracked[ball]
             if st and st.target == me then
                 local root = ap_root()
-                if root then decide(ball, st, root, now, "feed") end
+                if root then
+                    if S.triggerbot then trigger(ball, st, now) else decide(ball, st, root, now, "feed") end
+                end
             end
         end
         if now - F.since >= 30 then
@@ -2639,15 +2647,65 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         for _, st in pairs(tracked) do if st.target == me and st.pass_open and st.parried then st.landed = true end end
         spam_instant()
     end
-    function Parry.onParryAll(...)
-        local who
-        for i = 1, select('#', ...) do
+    -- ParrySuccessAll(fxName, fxParent, sword, player, ...) (Bbs dump,
+    -- parrySuccessAll). Until 0.5.87 "who" was the first Instance -- fxParent,
+    -- a part -- so it was never the player. Now: the Player argument, else the
+    -- player whose character holds an Instance argument.
+    local function parry_all_who(...)
+        local n = select('#', ...)
+        for i = 1, n do
             local a = select(i, ...)
-            if typeof(a) == 'Instance' then who = a.Name; break end
-            if type(a) == 'string' and Players:FindFirstChild(a) then who = a; break end
+            if typeof(a) == 'Instance' and a:IsA('Player') then return a.Name end
         end
-        parry_all[#parry_all + 1] = { t = clock_(), who = who }
+        for i = 1, n do
+            local a = select(i, ...)
+            if typeof(a) == 'Instance' then
+                local m = a:IsA('Model') and a or a:FindFirstAncestorOfClass('Model')
+                if m and Players:FindFirstChild(m.Name) then return m.Name end
+            elseif type(a) == 'string' and Players:FindFirstChild(a) then
+                return a
+            end
+        end
+        return nil
+    end
+    function Parry.onParryAll(...)
+        local who = parry_all_who(...)
+        local now = clock_()
+        parry_all[#parry_all + 1] = { t = now, who = who }
         if #parry_all > 16 then table.remove(parry_all, 1) end
+        -- SOMEONE ELSE parried. In a fast exchange the server sends the ball to
+        -- them and back to us inside one replication step, so the target
+        -- attribute we see never leaves us -- our pass stayed "parried / landed"
+        -- and auto parry + triggerbot sat out the game's 1.3s lockout on the
+        -- return. Their parry is proof the last pass ended: open a new one and
+        -- decide on it right now.
+        if who and who ~= me and active then
+            local reopened = false
+            local r = getRoot()
+            for ball, st in pairs(tracked) do
+                -- only a ball coming back at us (multi-ball: one we just sent
+                -- away, still flying off, stays as it is)
+                if r and st.target == me and (st.parried or st.landed) and ball.Parent then
+                    if ball_velocity(ball):Dot(r.Position - Core.ball_now(ball)) > 0 then
+                        open_pass(st); reopened = true
+                    else
+                        -- its new velocity isn't in yet: reopen on the update
+                        st.reopen_until = now + 0.5
+                    end
+                end
+            end
+            if reopened then G.until_t = 0 end
+            if S.autoparry or S.triggerbot then
+                local root = ap_root()
+                if root then
+                    for ball, st in pairs(tracked) do
+                        if st.target == me and ball.Parent then
+                            if S.triggerbot then trigger(ball, st, now) else decide(ball, st, root, now, "their parry") end
+                        end
+                    end
+                end
+            end
+        end
         if AutoSpam.ball or SP.manual then spam_instant() end
     end
     function Parry.onNoobParry() task.wait(0.11); G.until_t = 0 end
