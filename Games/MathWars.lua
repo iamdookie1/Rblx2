@@ -468,7 +468,7 @@ make("TextLabel", {
 
 local Panel = make("Frame", {
     Name = "Panel", BackgroundColor3 = THEME.Bg, BorderSizePixel = 0,
-    Size = UDim2.fromOffset(276, 262), Position = UDim2.fromOffset(24, 120), ZIndex = 10, Active = true,
+    Size = UDim2.fromOffset(276, 296), Position = UDim2.fromOffset(24, 120), ZIndex = 10, Active = true,
 }, Gui)
 make("UICorner", { CornerRadius = UDim.new(0, 10) }, Panel)
 make("UIStroke", { Color = Color3.fromRGB(70, 80, 105), Thickness = 1 }, Panel)
@@ -505,18 +505,24 @@ local CopyBtn = button("Copy", 0, 34)
 local ClearBtn = button("Clear", 134, 34)
 local PreviewBtn = button("Preview typed: on", 0, 68)
 local EndBtn = button("Stop at drag end: on", 134, 68)
+local GuideBtn = button("Key guide: off", 0, 102)
+local GuideInfo = make("TextLabel", {
+    Text = "highlights the next key", Font = Enum.Font.Gotham, TextSize = 11, TextColor3 = THEME.Dim,
+    BackgroundTransparency = 1, TextWrapped = true, TextXAlignment = Enum.TextXAlignment.Left,
+    Size = UDim2.fromOffset(126, 28), Position = UDim2.fromOffset(134, 102), ZIndex = 11,
+}, Body)
 
 local Status = make("TextLabel", {
     Text = "Press Create path, then drag on the board.", Font = Enum.Font.Gotham, TextSize = 12, TextColor3 = THEME.Dim,
     BackgroundTransparency = 1, TextWrapped = true, TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top,
-    Size = UDim2.new(1, 0, 0, 44), Position = UDim2.fromOffset(0, 102), ZIndex = 11,
+    Size = UDim2.new(1, 0, 0, 44), Position = UDim2.fromOffset(0, 136), ZIndex = 11,
 }, Body)
 
 local Output = make("TextBox", {
     Text = "", PlaceholderText = "your equation shows up here", Font = Enum.Font.Code, TextSize = 13, TextColor3 = THEME.Text,
     PlaceholderColor3 = THEME.Dim, BackgroundColor3 = Color3.fromRGB(14, 16, 22), BorderSizePixel = 0, TextWrapped = true,
     ClearTextOnFocus = false, TextEditable = false, MultiLine = true, TextXAlignment = Enum.TextXAlignment.Left,
-    TextYAlignment = Enum.TextYAlignment.Top, Size = UDim2.new(1, 0, 0, 70), Position = UDim2.fromOffset(0, 150), ZIndex = 11,
+    TextYAlignment = Enum.TextYAlignment.Top, Size = UDim2.new(1, 0, 0, 70), Position = UDim2.fromOffset(0, 184), ZIndex = 11,
 }, Body)
 make("UICorner", { CornerRadius = UDim.new(0, 6) }, Output)
 make("UIPadding", { PaddingLeft = UDim.new(0, 6), PaddingRight = UDim.new(0, 6), PaddingTop = UDim.new(0, 4) }, Output)
@@ -563,7 +569,7 @@ track(Collapse.Activated:Connect(function()
     collapsed = not collapsed
     Body.Visible = not collapsed
     Collapse.Text = collapsed and "+" or "–"
-    Panel.Size = collapsed and UDim2.fromOffset(276, 30) or UDim2.fromOffset(276, 262)
+    Panel.Size = collapsed and UDim2.fromOffset(276, 30) or UDim2.fromOffset(276, 296)
     clampPanel()
 end))
 
@@ -779,6 +785,301 @@ task.spawn(function()
     end
 end)
 
+--// key guide -------------------------------------------------------------------------
+-- The game's touch keypad (MathKeypad) is a Numbers pad that's always up
+-- (digits, x, ., UNDO, left, right) and a Functions pad with three pages
+-- (TRIG, POWERS, SYMBOLS) that its SwitchPage button steps through. Every key
+-- is a button with a "Key" attribute, the display keeps the caret in its
+-- "Cursor" attribute, and function keys type "name()" with the caret inside.
+-- On a phone the keypad only shows once the equation is opened (OpenEquation).
+-- The guide works out every press that types the equation, using the
+-- keypad's own edit rules, then reads what's in the box and where the caret
+-- is to know how far along you are, and outlines the next thing to tap: the
+-- open button, the page switch, or the key.
+
+local PAGES = { "TRIG", "POWERS", "SYMBOLS" }
+local KEY_FUNCS = {
+    sin = true, cos = true, tan = true, arcsin = true, arccos = true, arctan = true,
+    tanh = true, abs = true, sqrt = true, log = true, ln = true, exp = true,
+}
+local KEY_NAMES = {
+    left = "←", right = "→", undo = "UNDO", clear = "CLR", sqrt = "√", ["-"] = "−", ["*"] = "×", ["/"] = "÷",
+}
+
+-- the keypad's own edit(text, cursor, key), found in memory
+local KeypadEdit
+local function findKeypadEdit()
+    if KeypadEdit or typeof(getgc) ~= "function" then return KeypadEdit end
+    local ok, list = pcall(getgc, true)
+    if ok and type(list) == "table" then
+        for _, v in ipairs(list) do
+            if type(v) == "table" and type(rawget(v, "edit")) == "function" and type(rawget(v, "mount")) == "function" then
+                KeypadEdit = v.edit
+                break
+            end
+        end
+    end
+    return KeypadEdit
+end
+
+-- the same rules, for the keys the guide uses, if it can't be found
+local function copyEdit(text, cursor, key)
+    local len = utf8.len(text) or #text
+    cursor = math.clamp(cursor, 0, len)
+    if key == "left" then return text, math.max(0, cursor - 1) end
+    if key == "right" then return text, math.min(len, cursor + 1) end
+    if key == "clear" then return "", 0 end
+    local split = utf8.offset(text, cursor + 1) or #text + 1
+    local before, after = text:sub(1, split - 1), text:sub(split)
+    if key == ")" and after:sub(1, 1) == ")" then return text, cursor + 1 end
+    if key == "x" and before:sub(-1) == "x" and after:sub(1, 1) == ")" then
+        before, after, cursor = before .. ")", after:sub(2), cursor + 1
+    end
+    local insert, step = key, #key
+    if key == "(" then
+        insert, step = "()", 1
+    elseif key:match("^[a-z]+$") and key ~= "x" and key ~= "pi" and key ~= "e" then
+        insert, step = key .. "()", #key + 1
+    end
+    return before .. insert .. after, cursor + step
+end
+
+local function keypadEdit(text, cursor, key)
+    local e = findKeypadEdit()
+    if e then
+        local ok, t, c = pcall(e, text, cursor, key)
+        if ok and type(t) == "string" and type(c) == "number" then return t, c end
+    end
+    return copyEdit(text, cursor, key)
+end
+
+-- every press that types target from an empty box, and the box after each
+local function planFor(target)
+    local keys, states = {}, { { "", 0 } }
+    local text, cursor = "", 0
+    for _ = 1, 4000 do
+        if cursor >= #target and text == target then break end
+        local rest = target:sub(cursor + 1)
+        local name = rest:match("^(%a+)%(")
+        local key
+        if name and KEY_FUNCS[name] then
+            key = name
+        elseif rest:sub(1, 1) == ")" then
+            key = "right" -- the bracket's already there, step past it
+        else
+            local ch = rest:sub(1, 1)
+            if not ch:match("[%d%.x%+%-%*/%^%(]") then return nil, "the keypad can't type '" .. ch .. "'" end
+            key = ch
+        end
+        text, cursor = keypadEdit(text, cursor, key)
+        keys[#keys + 1] = key
+        states[#states + 1] = { text, cursor }
+        if text:sub(1, cursor) ~= target:sub(1, cursor) then return nil, "couldn't plan the presses" end
+    end
+    if text ~= target then return nil, "couldn't plan the presses" end
+    return { Keys = keys, States = states, Target = target }
+end
+
+local Guide = { On = false, Plan = nil, StuckText = nil, StuckSince = 0 }
+
+local Mark = make("Frame", {
+    Name = "GuideMark", BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1), ZIndex = 60, Active = false,
+}, nil)
+make("UICorner", { CornerRadius = UDim.new(0, 8) }, Mark)
+local MarkStroke = make("UIStroke", {
+    Color = Color3.fromRGB(255, 226, 70), Thickness = 3, ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+}, Mark)
+local MarkFill = make("Frame", {
+    BackgroundColor3 = Color3.fromRGB(255, 226, 70), BackgroundTransparency = 0.7, Size = UDim2.fromScale(1, 1),
+    ZIndex = 59, Active = false, BorderSizePixel = 0,
+}, Mark)
+make("UICorner", { CornerRadius = UDim.new(0, 8) }, MarkFill)
+
+local function markOn(btn)
+    if Mark.Parent ~= btn then Mark.Parent = btn end
+end
+local function markOff() Mark.Parent = nil end
+
+track(RunService.RenderStepped:Connect(function()
+    if not Mark.Parent then return end
+    local pulse = (math.sin(os.clock() * 7) + 1) / 2
+    MarkStroke.Transparency = 0.1 + pulse * 0.35
+    MarkFill.BackgroundTransparency = 0.55 + pulse * 0.35
+end))
+
+local Keypad
+local function keypadFrame()
+    if Keypad and Keypad.Parent then return Keypad end
+    local gui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    for _, d in ipairs(gui and gui:GetDescendants() or {}) do
+        if d.Name == "MathKeypad" and d:IsA("Frame") and d:FindFirstChild("Numbers") and d:FindFirstChild("Functions") then
+            Keypad = d
+            return d
+        end
+    end
+    return nil
+end
+
+local function findNamed(name, class)
+    local gui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    for _, d in ipairs(gui and gui:GetDescendants() or {}) do
+        if d.Name == name and d:IsA(class) then return d end
+    end
+    return nil
+end
+
+local function shown(gui)
+    while gui and gui:IsA("GuiObject") do
+        if not gui.Visible then return false end
+        gui = gui.Parent
+    end
+    return true
+end
+
+-- the button to tap for a key: the key if it's up, else the page switch
+-- (toward whichever page has it in the fewest taps)
+local function buttonFor(kp, key)
+    local functions = kp:FindFirstChild("Functions")
+    local current = table.find(PAGES, functions and functions:GetAttribute("Page") or "") or 3
+    local bestPage, bestTaps
+    for _, b in ipairs(kp:GetDescendants()) do
+        if b:IsA("GuiButton") and b:GetAttribute("Key") == key then
+            if shown(b) then return b, nil end
+            local index = tonumber(b.Name:match("^Key(%d+)$"))
+            if index and index > 15 then
+                local page = (index - 16) // 12 + 1
+                local taps = (page - current) % #PAGES
+                if not bestTaps or taps < bestTaps then bestPage, bestTaps = page, taps end
+            end
+        end
+    end
+    if bestPage then
+        local switch = functions and functions:FindFirstChild("SwitchPage")
+        return switch, PAGES[bestPage]
+    end
+    return nil, nil
+end
+
+local function commonPrefix(a, b)
+    local n = 0
+    while n < #a and n < #b and a:sub(n + 1, n + 1) == b:sub(n + 1, n + 1) do n += 1 end
+    return n
+end
+
+-- what to press next, as a key value (or "done"), plus why
+local function nextKey(text, cursor)
+    local plan = Guide.Plan
+    local keys, states = plan.Keys, plan.States
+    for k = #states, 1, -1 do
+        local st = states[k]
+        if st[1] == text and (cursor == nil or st[2] == cursor) then
+            if k - 1 >= #keys then return "done" end
+            return keys[k]
+        end
+    end
+    -- right text, caret somewhere else: walk it back into place
+    for k = #states, 1, -1 do
+        local st = states[k]
+        if st[1] == text and cursor ~= nil then
+            return cursor < st[2] and "right" or "left", "move the caret back"
+        end
+    end
+    -- something else is in the box. UNDO walks back to where it went wrong;
+    -- if it's nothing like the equation, or UNDO has run out, clear it.
+    if Guide.StuckText ~= text then Guide.StuckText, Guide.StuckSince = text, os.clock() end
+    if #text > 0 and (commonPrefix(text, plan.Target) == 0 or os.clock() - Guide.StuckSince > 4) then
+        return "clear", "the box has something else in it"
+    end
+    return "undo", "that isn't what the equation needs"
+end
+
+local function setInfo(text, color)
+    GuideInfo.Text = text
+    GuideInfo.TextColor3 = color or THEME.Dim
+end
+
+local function guideStep()
+    local target = Made.Text
+    if not target then markOff() setInfo("make a path first") return end
+    if not Guide.Plan or Guide.Plan.Target ~= target then
+        local plan, err = planFor(target)
+        if not plan then markOff() setInfo(err, Color3.fromRGB(255, 110, 110)) return end
+        Guide.Plan = plan
+    end
+
+    local box = equationBox()
+    local text = box and box.Text or typedText()
+    local kp = keypadFrame()
+
+    -- no keypad on screen: on a phone the equation has to be opened first;
+    -- on a keyboard there's nothing to tap, so say what to type
+    if not kp or not shown(kp) then
+        if UserInputService.TouchEnabled then
+            local open = findNamed("OpenEquation", "GuiButton")
+            if open and shown(open) then
+                markOn(open)
+                setInfo("tap to open the equation", THEME.Text)
+                return
+            end
+            markOff()
+            setInfo("the keypad shows up on your turn")
+            return
+        end
+        markOff()
+        local done = commonPrefix(text, target)
+        if text == target then setInfo("all typed, fire!", Color3.fromRGB(120, 230, 140)) return end
+        setInfo(done == #text and ("type: " .. target:sub(done + 1)) or "box doesn't match, fix it", THEME.Text)
+        return
+    end
+    if LocalPlayer:GetAttribute("AdvancedMode") == true then
+        markOff()
+        setInfo("turn advanced mode off to use the guide", Color3.fromRGB(255, 170, 90))
+        return
+    end
+
+    local display = findNamed("MathDisplay", "GuiButton")
+    local cursor = display and display:GetAttribute("Cursor")
+    local key, why = nextKey(text, type(cursor) == "number" and cursor or nil)
+    if key == "done" then
+        markOff()
+        setInfo("all typed, fire!", Color3.fromRGB(120, 230, 140))
+        return
+    end
+    local btn, page = buttonFor(kp, key)
+    if not btn then markOff() setInfo("can't find the " .. (KEY_NAMES[key] or key) .. " key") return end
+    markOn(btn)
+    local label = KEY_NAMES[key] or key
+    if page then
+        setInfo(("switch page to %s (for %s)"):format(page, label), THEME.Text)
+    elseif why then
+        setInfo(("%s: tap %s"):format(why, label), Color3.fromRGB(255, 170, 90))
+    else
+        local plan = Guide.Plan
+        local doneCount = 0
+        for k = #plan.States, 1, -1 do
+            if plan.States[k][1] == text then doneCount = k - 1 break end
+        end
+        setInfo(("tap %s  (%d/%d)"):format(label, doneCount + 1, #plan.Keys), THEME.Text)
+    end
+end
+
+track(GuideBtn.Activated:Connect(function()
+    Guide.On = not Guide.On
+    GuideBtn.Text = "Key guide: " .. (Guide.On and "on" or "off")
+    GuideBtn.BackgroundColor3 = Guide.On and THEME.On or THEME.Btn
+    if not Guide.On then
+        markOff()
+        setInfo("highlights the next key")
+    end
+end))
+
+task.spawn(function()
+    while not Unloaded do
+        if Guide.On then pcall(guideStep) end
+        task.wait(0.1)
+    end
+end)
+
 --// teardown -------------------------------------------------------------------------
 
 Genv.__MathWarsStop = function()
@@ -789,4 +1090,5 @@ Genv.__MathWarsStop = function()
     table.clear(Connections)
     pcall(function() Gui:Destroy() end)
     pcall(function() Folder:Destroy() end)
+    pcall(function() Mark:Destroy() end)
 end
