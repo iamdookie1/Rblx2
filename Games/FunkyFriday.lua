@@ -1348,8 +1348,8 @@ end
 local LINK_RELAY = "https://funkyff.serveousercontent.com"  -- your relay (Server/funky_friday_relay.py)
 local LINK_SEED = "1ac2a72473ddca69"          -- the same seed phrase the relay runs with (FF_SEED)
 -- advanced: an exact key/secret instead of deriving them from the seed above
-local LINK_RELAY_KEY = ""
-local LINK_RELAY_SECRET = ""
+local LINK_RELAY_KEY = "4510b0b9d1028da6"
+local LINK_RELAY_SECRET = "e612f27b3aa6a1c51a1f9db4cd833d70af4a296d9670c712630957599fdbdf9a"
 local LINK_BETA, LINK_DEV = 1, 2
 local LINK_FLAG_AUTO, LINK_FLAG_PLAYING = 1, 2
 local LINK_POLL_EVERY = 6   -- seconds, when there's no WebSocket
