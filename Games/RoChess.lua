@@ -253,7 +253,7 @@ local Brain = (function()
     end
 
     local nodes, deadline, sliceStart, stopped, canStop = 0, 0, 0, false, false
-    local yieldFn, SLICE = nil, 0.012
+    local yieldFn, SLICE = nil, 0.006
     local rootBest, rootScore = 0, 0
 
     local function addPiece(sq, p)
@@ -774,7 +774,7 @@ local Brain = (function()
 
     local function qsearch(alpha, beta, ply)
         nodes += 1
-        if band(nodes, 1023) == 0 then poll() end
+        if band(nodes, 255) == 0 then poll() end
         if stopped then return 0 end
         local stand = evaluate()
         if ply >= MAXPLY then return stand end
@@ -834,7 +834,7 @@ local Brain = (function()
         if inCheck then depth += 1 end
         if depth <= 0 or ply >= MAXPLY - 4 then return qsearch(alpha, beta, ply) end
         nodes += 1
-        if band(nodes, 1023) == 0 then poll() end
+        if band(nodes, 255) == 0 then poll() end
         if stopped then return 0 end
         local pv = beta - alpha > 1
         local idx = band(h1, TMASK) + 1
@@ -1240,6 +1240,7 @@ local Config = safeRequire(ChessFolder and ChessFolder:FindFirstChild("Config"))
 local Levels = safeRequire(ChessFolder and ChessFolder:FindFirstChild("Levels"))
 
 local App
+local NextScan = 0
 local function isApp(t)
     return type(t) == "table" and type(rawget(t, "onBoardMove")) == "function"
         and type(rawget(t, "startBotGame")) == "function"
@@ -1248,7 +1249,8 @@ end
 
 local function findApp()
     if isApp(App) then return App end
-    if typeof(getgc) == "function" then
+    if typeof(getgc) == "function" and os.clock() >= NextScan then
+        NextScan = os.clock() + 5
         local ok, list = pcall(getgc, true)
         if ok and type(list) == "table" then
             for _, v in ipairs(list) do
@@ -1277,9 +1279,8 @@ local function engineYield()
     task.wait()
 end
 
-local function yielderFor(seconds)
-    if seconds and seconds > 0.25 then return engineYield end
-    return nil
+local function yielderFor()
+    return engineYield
 end
 
 local function bestFor(s, seconds)
