@@ -703,6 +703,9 @@ local function makeLink(role, onCommand)
     local seen = {}
     local outbox = {}
     local lastHi = 0
+    -- what the link has actually done, shown in the menus to find where it breaks
+    local diag = { Sent = 0, SendFails = 0, LastSend = "-", Polls = 0, LastPoll = "-", Got = 0, Pings = {} }
+    link.Diag = diag
     local usedNonce = {}      -- beta: nonce -> expiry, so a command can't be replayed
     local verifying = 0       -- beta: signature checks in flight, capped against floods
 
@@ -750,6 +753,11 @@ local function makeLink(role, onCommand)
         end
         local ok, data = pcall(HttpService.JSONDecode, HttpService, event.message)
         if not ok or type(data) ~= "table" or data.v ~= 2 then return end
+        diag.Got = diag.Got + 1
+        if data.k == "ping" then
+            if data.i == instance and type(data.n) == "string" then diag.Pings[data.n] = os.clock() end
+            return
+        end
         local from = tonumber(data.f)
         if not from or data.i == instance then return end
         local player = Players:GetPlayerByUserId(from)
@@ -792,6 +800,19 @@ local function makeLink(role, onCommand)
                     Headers = { ["Content-Type"] = "text/plain" },
                     Body = outbox[1],
                 })
+                if ok and type(response) == "table" then
+                    diag.LastSend = tostring(response.StatusCode or "?")
+                    local body = type(response.Body) == "string" and response.Body or ""
+                    if body:match("^%s*<") then diag.LastSend = diag.LastSend .. " (got a web page, not the relay)" end
+                    if (tonumber(response.StatusCode) or 200) >= 400 or body:match("^%s*<") then
+                        diag.SendFails = diag.SendFails + 1
+                    else
+                        diag.Sent = diag.Sent + 1
+                    end
+                else
+                    diag.LastSend = "failed: " .. tostring(response)
+                    diag.SendFails = diag.SendFails + 1
+                end
                 if ok and type(response) == "table" and response.StatusCode == 429 and not link.Stopped then
                     task.wait(5)
                 else
@@ -810,9 +831,20 @@ local function makeLink(role, onCommand)
             Url = ("%s/%s/json?poll=1&since=%s"):format(relay, topic, since()),
             Method = "GET",
         })
-        if not ok or type(response) ~= "table" or type(response.Body) ~= "string" then return false end
+        diag.Polls = diag.Polls + 1
+        if not ok or type(response) ~= "table" or type(response.Body) ~= "string" then
+            diag.LastPoll = "failed: " .. tostring(response)
+            return "relay unreachable"
+        end
+        local status = tonumber(response.StatusCode) or 200
+        diag.LastPoll = tostring(status)
+        if response.Body:match("^%s*<") then
+            -- a tunnel's warning/landing page instead of relay data
+            diag.LastPoll = status .. " (got a web page, not the relay)"
+            return "relay answered with a web page"
+        end
         for line in response.Body:gmatch("[^\n]+") do handleText(line) end
-        return (response.StatusCode or 200) < 400
+        return status < 400 and "polling" or ("relay error " .. status)
     end
 
     -- a WebSocket while one stays up, polling otherwise
@@ -822,7 +854,9 @@ local function makeLink(role, onCommand)
             return
         end
         hello(true)
-        local socketWorks, hadSocket = socketConnect ~= nil, false
+        -- only ntfy.sh speaks WebSocket; on your own relay a connect attempt can
+        -- hang instead of failing, so go straight to polling there
+        local socketWorks, hadSocket = socketConnect ~= nil and relay:find("ntfy%.sh") ~= nil, false
         while not link.Stopped do
             local socket
             if socketWorks then
@@ -848,7 +882,7 @@ local function makeLink(role, onCommand)
                     task.wait(2)
                 end
             else
-                link.Mode = poll() and "polling" or "relay unreachable"
+                link.Mode = poll()
                 task.wait(LINK_POLL_EVERY)
             end
         end
@@ -911,6 +945,18 @@ local function makeLink(role, onCommand)
         end
         table.sort(list, function(a, b) return a.Player.Name:lower() < b.Player.Name:lower() end)
         return list
+    end
+
+    -- posts a ping and reports whether it comes back through the relay
+    function link.Ping()
+        local nonce = HttpService:GenerateGUID(false)
+        post({ k = "ping", n = nonce })
+        return nonce
+    end
+
+    function link.DiagText()
+        return ("relay: %s\nsent %d, failed %d (last: %s)\npolls %d (last: %s), messages in %d")
+            :format(relay, diag.Sent, diag.SendFails, diag.LastSend, diag.Polls, diag.LastPoll, diag.Got)
     end
 
     function link.Status()
@@ -1404,6 +1450,20 @@ task.spawn(function()
             pcall(function() statusText:SetDesc(text) end)
         end
         task.wait(0.5)
+    end
+end)
+
+-- what the link to the dev script is doing, to tell where it breaks
+local linkText = Tab:Paragraph({ Title = "Link", Desc = "-" })
+task.spawn(function()
+    while not Unloaded do
+        if Link then
+            local devs = #Link.List(LINK_DEV)
+            pcall(function()
+                linkText:SetDesc(("%s\ndev scripts seen: %d\n%s"):format(Link.Status(), devs, Link.DiagText()))
+            end)
+        end
+        task.wait(1)
     end
 end)
 
