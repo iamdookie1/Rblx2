@@ -1684,7 +1684,7 @@ do
     local Tab = Window:AddTab('Assist', 'lightbulb', 'Best-move arrow')
 
     local box = Tab:AddLeftGroupbox('Best move', 'arrow-up-right')
-    box:AddLabel('Draws the engine\'s best move on the board in bot games, puzzles and the analysis board. Off in live online games.', true)
+    box:AddLabel('Draws the engine\'s best move on the board in bot games, puzzles and the analysis board. Off in live online games we will be adding online next update :)', true)
     toggle(box, 'rc_arrow', 'Best-move arrow', 'Arrow', nil, function(v) if not v then clearArrow() end end)
     box:AddSlider('rc_arrowthink', { Text = 'Think time', Min = 0.05, Max = 10, Default = S.ArrowThink, Rounding = 2, Suffix = 's', Callback = function(v) S.ArrowThink = v end })
     local eval = box:AddLabel('-', true)
