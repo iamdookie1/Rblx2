@@ -39,9 +39,17 @@ Either way, print what the script needs with
   python funky_friday_relay.py --show      (add --seed "..." to show a seed's)
 See Server/README.md.
 
+It also opens the tunnel for you: on start it runs the Serveo SSH tunnel
+(the same `ssh -R funkyff:80:localhost:8080 serveo.net` you'd type by hand),
+points it at its own port, prints your https URL and reconnects if Serveo drops.
+That needs `ssh` (pkg install openssh); without it the relay still serves
+locally and tells you. Change the name with FF_SUBDOMAIN=yourname, or skip the
+tunnel with --no-tunnel to expose the port some other way.
+
 Run:
-  python funky_friday_relay.py              # listens on 0.0.0.0:8080
-  PORT=9000 python funky_friday_relay.py    # a different port
+  FF_SEED="a phrase" python funky_friday_relay.py   # relay + tunnel, one command
+  PORT=9000 python funky_friday_relay.py            # a different local port
+  python funky_friday_relay.py --no-tunnel          # relay only, no tunnel
 """
 
 import hashlib
@@ -49,6 +57,8 @@ import hmac
 import json
 import os
 import secrets
+import shutil
+import subprocess
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -59,6 +69,7 @@ AUTH_FILE = os.path.join(HERE, "relay_auth.json")
 SEED_FILE = os.path.join(HERE, "seed.txt")
 
 PORT = int(os.environ.get("PORT", "8080"))
+SUBDOMAIN = os.environ.get("FF_SUBDOMAIN", "funkyff")  # the serveo.net subdomain
 AUTH_WINDOW = 60          # seconds a request's timestamp may be off by
 MESSAGE_TTL = 120         # seconds a message is kept and handed to late pollers
 MAX_PER_TOPIC = 400       # most messages kept per topic
@@ -255,6 +266,67 @@ class Handler(BaseHTTPRequestHandler):
         return self._send(200, json.dumps({"id": msg["id"]}))
 
 
+STOP = threading.Event()        # set on shutdown so the tunnel thread can quit
+TUNNEL = {"proc": None}         # the running ssh process, so we can stop it
+
+
+def start_serveo(subdomain, port):
+    """Open the Serveo SSH tunnel (the same `ssh -R ... serveo.net` by hand),
+    pointed at our own port, in a thread that reconnects if Serveo drops. Serveo
+    gives HTTPS, so your relay URL is https://<subdomain>.serveo.net."""
+    if not shutil.which("ssh"):
+        print("  tunnel: ssh not found -- run `pkg install openssh`, then this")
+        print("          will bring the tunnel up itself. serving locally for now.")
+        return None
+    cmd = [
+        "ssh",
+        "-o", "StrictHostKeyChecking=accept-new",  # don't hang on the host-key prompt
+        "-o", "ServerAliveInterval=60",
+        "-o", "ServerAliveCountMax=3",
+        "-o", "ExitOnForwardFailure=yes",
+        "-R", "%s:80:localhost:%d" % (subdomain, port),
+        "serveo.net",
+    ]
+
+    def run():
+        backoff = 2
+        while not STOP.is_set():
+            print("  tunnel: connecting to serveo.net ...")
+            try:
+                proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                        stderr=subprocess.STDOUT, text=True, bufsize=1)
+            except OSError as exc:
+                print("  tunnel: couldn't start ssh (%s)" % exc)
+                return
+            TUNNEL["proc"] = proc
+            for line in proc.stdout:
+                line = line.rstrip()
+                if line:
+                    print("  tunnel: " + line)  # Serveo prints your https URL here
+            proc.wait()
+            TUNNEL["proc"] = None
+            if STOP.is_set():
+                return
+            print("  tunnel: dropped, reconnecting in %ds" % backoff)
+            STOP.wait(backoff)
+            backoff = min(backoff * 2, 30)
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    return thread
+
+
+def stop_serveo():
+    STOP.set()
+    proc = TUNNEL.get("proc")
+    if proc and proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
 def main():
     if "--show" in sys.argv:
         if FROM_SEED:
@@ -277,12 +349,23 @@ def main():
         print("  key:    %s" % KEY)
         print("  secret: %s  (keep this one off-screen)" % SECRET)
     print("  health: http://127.0.0.1:%d/health" % PORT)
-    print("Expose this port with a tunnel (see Server/README.md), then set the")
-    print("public URL and seed (or key/secret) in the scripts. Ctrl+C to stop.")
+
+    tunnel = None
+    if "--no-tunnel" in sys.argv:
+        print("Tunnel off (--no-tunnel). Expose port %d yourself; see README." % PORT)
+    else:
+        print("Opening the Serveo tunnel -- your relay URL will be:")
+        print("  https://%s.serveo.net   (put this in the script's LINK_RELAY)" % SUBDOMAIN)
+        print("  change the name with FF_SUBDOMAIN=yourname, or --no-tunnel to skip")
+        tunnel = start_serveo(SUBDOMAIN, PORT)
+    print("Ctrl+C to stop.")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        print("\nstopped")
+        print("\nstopping")
+    finally:
+        if tunnel is not None:
+            stop_serveo()
 
 
 if __name__ == "__main__":

@@ -36,7 +36,8 @@ it, so there's only one value to keep in sync.
 FF_SEED="whatever phrase you like" python funky_friday_relay.py
 ```
 
-It listens on port `8080`. Run it with `--show` to print what the script needs:
+It listens on port `8080` **and opens the tunnel for you** — see step 2. Run it
+with `--show` to print what the script needs:
 
 ```sh
 python funky_friday_relay.py --seed "whatever phrase you like" --show
@@ -55,7 +56,7 @@ with `PORT=9000 ...`.
 and secret once, saved in `relay_auth.json` and the same every run; `--show`
 prints them and you paste them into `LINK_RELAY_KEY` / `LINK_RELAY_SECRET`.)
 
-## 2. Give it a public link that stays the same
+## 2. The public link (the relay opens it for you)
 
 The phone is behind your carrier/router, so you need a tunnel. The clients
 connect to the tunnel provider, not to your phone, so your phone/home IP is
@@ -63,32 +64,38 @@ never in the public URL the Roblox clients use. (The provider itself does carry
 your traffic — you can't hide from the provider, only from the clients.)
 
 On Android, tunnels that run their own binary (cloudflared, ngrok) sometimes
-fail to start in Termux with an `unexpected e_type: 2` loader error. So the most
-reliable options on a phone are the **SSH-based** ones, which use Termux's own
-`ssh` and have no binary to trip over.
+fail to start in Termux with an `unexpected e_type: 2` loader error. So the
+relay uses the **SSH-based** Serveo tunnel, which runs through Termux's own
+`ssh` (the `openssh` you installed) and has no binary to trip over.
 
-### Option A — SSH tunnel, no binary to install (most reliable on Termux)
+**You don't run the tunnel separately — the relay does it.** On start it runs
 
-These use the `openssh` you already installed and give HTTPS automatically.
+```sh
+ssh -R funkyff:80:localhost:8080 serveo.net
+```
 
-- **Serveo** — free, and lets you ask for a **stable custom subdomain**, so the
-  URL is the same each time:
-  ```sh
-  ssh -R funkyyourname:80:localhost:8080 serveo.net
-  ```
-  Your URL is `https://funkyyourname.serveo.net`. (Serveo occasionally goes
-  down; if it won't connect, try again later or use Pinggy.)
-- **Pinggy** — free, very reliable; the free URL rotates every 60 minutes, a
-  cheap plan keeps it fixed:
-  ```sh
-  ssh -p 443 -R0:localhost:8080 qr@a.pinggy.io
-  ```
-  It prints your `https://...pinggy.link` URL.
+for you, pointed at its own port, prints the URL, and reconnects if Serveo
+drops. Your relay URL is therefore:
 
-Keep the `ssh` command running in its own Termux session (open a new one with a
-swipe from the left, or use `tmux`).
+```
+https://funkyff.serveo.net
+```
 
-### Option B — Cloudflare Tunnel (robust, but needs the binary to run + a domain for a stable URL)
+Change the subdomain with `FF_SUBDOMAIN=yourname python funky_friday_relay.py`
+(→ `https://yourname.serveo.net`). Serveo occasionally goes down; if the tunnel
+log keeps retrying, try again later or use one of the alternatives below with
+`--no-tunnel`.
+
+Check it's reachable: open `https://funkyff.serveo.net/health` in a browser — it
+should say `ok`.
+
+### Alternatives (run the relay with `--no-tunnel` and bring your own)
+
+- **Pinggy** — SSH-based like Serveo, very reliable; free URL rotates every 60
+  minutes, a cheap plan keeps it fixed:
+  `ssh -p 443 -R0:localhost:8080 qr@a.pinggy.io` (prints a `...pinggy.link` URL).
+
+#### Cloudflare Tunnel (robust, but needs the binary to run + a domain for a stable URL)
 
 ```sh
 pkg install tur-repo && pkg install cloudflared
@@ -103,16 +110,13 @@ cloudflared --version        # if this errors with "unexpected e_type", use Opti
   (e.g. `relay.yourdomain.com`) to `http://localhost:8080`. Cloudflare's
   "locally-managed tunnel" guide covers it.
 
-### Option C — ngrok (free static domain, but also a binary)
+#### ngrok (free static domain, but also a binary)
 
 Make a free ngrok account, install the Android/arm64 build, add your authtoken,
 and create the one free static domain the account includes
 (`funky-yourname.ngrok-free.app`), then
 `ngrok http --url=funky-yourname.ngrok-free.app 8080`. Same `e_type` caveat as
 cloudflared on some phones.
-
-Check it's reachable either way: open `https://your-url/health` in a browser —
-it should say `ok`.
 
 ## 3. Point the scripts at your relay
 
@@ -121,8 +125,8 @@ link block — no `getgenv` lines before `loadstring`, and the seed stays hidden
 in the obfuscated output:
 
 ```lua
-local LINK_RELAY = "https://your-url"   -- your tunnel URL, no trailing slash
-local LINK_SEED  = "whatever phrase you like"   -- the same seed as the server
+local LINK_RELAY = "https://funkyff.serveo.net"   -- your relay URL, no trailing slash
+local LINK_SEED  = "whatever phrase you like"      -- the same seed as the server
 ```
 
 The script derives the key and secret from the seed, then stamps, adds a
