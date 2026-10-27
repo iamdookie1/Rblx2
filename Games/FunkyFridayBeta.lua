@@ -405,6 +405,12 @@ local LINK_COMMANDS = {
     Shake = 7, Blur = 8, Rainbow = 9, FakeKick = 10,
     Jump = 11, Sit = 12, Message = 13,
     Unload = 14, Kick = 15,
+    Bless = 16, CoinFlip = 17, OkOnly = 18,
+    UpsideDown = 19, SpinCam = 20, Wobble = 21, Zoom = 22,
+    BlackWhite = 23, DeepFry = 24, LightsOut = 25, Flash = 26,
+    PopupSpam = 27, Confetti = 28,
+    Mute = 29, Chipmunk = 30, DeepVoice = 31,
+    Dance = 32,
 }
 
 -- role: LINK_BETA or LINK_DEV. onCommand(cmd, arg, fromPlayer) runs on beta
@@ -569,177 +575,386 @@ local function makeLink(role, onCommand)
     return link
 end
 
---// what the dev script can do to you ------------------------------------------
--- All of it is on this client only, and all of it wears off.
+--// pranks --------------------------------------------------------------------
+-- What a command does when it lands: on beta copies when the dev script sends
+-- it, or on the dev copy itself when it targets "Me", to see it first. All of
+-- it is on this client only, and all of it wears off. Keep this block the same
+-- in Games/FunkyFriday.lua and Games/FunkyFridayBeta.lua.
+--
+-- hooks: SetAuto(state), Freeze(seconds), Chances(map, seconds), Unload()
 
-local RunService = game:GetService("RunService")
-local Lighting = game:GetService("Lighting")
+local function makePranks(hooks)
+    local RunService = game:GetService("RunService")
+    local Lighting = game:GetService("Lighting")
+    local pranks = { Stopped = false }
+    local junk = {} -- guis, effects, connections and render binds, cleaned up on Stop
+    local rng = Random.new()
+
+    local function keep(thing)
+        junk[#junk + 1] = thing
+        return thing
+    end
+
+    -- for a while, then back
+    local function lasting(seconds, onEnd)
+        task.delay(seconds, function()
+            if not pranks.Stopped then pcall(onEnd) end
+        end)
+    end
+
+    local function screen()
+        local gui = Instance.new("ScreenGui")
+        gui.Name = "FFP_" .. HttpService:GenerateGUID(false):sub(1, 6)
+        gui.IgnoreGuiInset = true
+        gui.ResetOnSpawn = false
+        gui.DisplayOrder = 1000
+        gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+        local ok, holder = pcall(function() return gethui and gethui() or game:GetService("CoreGui") end)
+        gui.Parent = ok and holder or LocalPlayer:WaitForChild("PlayerGui")
+        return keep(gui)
+    end
+
+    local function bigText(parent, text, position, size)
+        local label = Instance.new("TextLabel")
+        label.AnchorPoint = Vector2.new(0.5, 0.5)
+        label.Position = position or UDim2.fromScale(0.5, 0.3)
+        label.Size = size or UDim2.fromScale(0.8, 0.12)
+        label.BackgroundTransparency = 1
+        label.Font = Enum.Font.GothamBlack
+        label.TextScaled = true
+        label.TextColor3 = Color3.new(1, 1, 1)
+        label.TextStrokeTransparency = 0
+        label.Text = text
+        label.Parent = parent
+        return label
+    end
+
+    local function popup(text, seconds)
+        local gui = screen()
+        bigText(gui, text)
+        lasting(seconds, function() gui:Destroy() end)
+    end
+
+    -- a full screen colour over everything
+    local function cover(color, transparency)
+        local gui = screen()
+        local frame = Instance.new("Frame")
+        frame.Size = UDim2.fromScale(1, 1)
+        frame.BackgroundColor3 = color
+        frame.BackgroundTransparency = transparency
+        frame.BorderSizePixel = 0
+        frame.Parent = gui
+        return gui, frame
+    end
+
+    -- runs after the game's camera every frame, for a while
+    local function cameraEffect(seconds, step)
+        local name = "FFP_Cam_" .. HttpService:GenerateGUID(false):sub(1, 6)
+        local started = os.clock()
+        RunService:BindToRenderStep(name, Enum.RenderPriority.Camera.Value + 1, function()
+            local camera = workspace.CurrentCamera
+            if camera then pcall(step, camera, os.clock() - started) end
+        end)
+        keep(name)
+        lasting(seconds, function() RunService:UnbindFromRenderStep(name) end)
+    end
+
+    local function colorEffect(seconds, props, step)
+        local color = Instance.new("ColorCorrectionEffect")
+        for key, value in pairs(props) do color[key] = value end
+        color.Parent = Lighting
+        keep(color)
+        local connection = step and keep(RunService.RenderStepped:Connect(function() step(color) end))
+        lasting(seconds, function()
+            if connection then connection:Disconnect() end
+            color:Destroy()
+        end)
+    end
+
+    local function playingSounds()
+        local list = {}
+        for _, root in ipairs({ workspace, game:GetService("SoundService"), LocalPlayer:FindFirstChildOfClass("PlayerGui") }) do
+            for _, sound in ipairs(root and root:GetDescendants() or {}) do
+                if sound:IsA("Sound") and sound.Playing then list[#list + 1] = sound end
+            end
+        end
+        return list
+    end
+
+    local function pitch(seconds, octave)
+        for _, sound in ipairs(playingSounds()) do
+            local shift = Instance.new("PitchShiftSoundEffect")
+            shift.Octave = octave
+            shift.Parent = sound
+            keep(shift)
+            lasting(seconds, function() shift:Destroy() end)
+        end
+    end
+
+    local function humanoid()
+        local character = LocalPlayer.Character
+        return character and character:FindFirstChildOfClass("Humanoid")
+    end
+
+    local function fakeKick(seconds)
+        local gui, dim = cover(Color3.new(0, 0, 0), 0.35)
+        dim.Active = true
+        local box = Instance.new("Frame")
+        box.AnchorPoint = Vector2.new(0.5, 0.5)
+        box.Position = UDim2.fromScale(0.5, 0.5)
+        box.Size = UDim2.fromOffset(400, 200)
+        box.BackgroundColor3 = Color3.fromRGB(57, 59, 61)
+        box.BorderSizePixel = 0
+        box.Parent = dim
+        Instance.new("UICorner", box).CornerRadius = UDim.new(0, 8)
+        local function text(content, y, height, size, bold)
+            local label = Instance.new("TextLabel")
+            label.BackgroundTransparency = 1
+            label.Position = UDim2.new(0, 20, 0, y)
+            label.Size = UDim2.new(1, -40, 0, height)
+            label.Font = bold and Enum.Font.GothamBold or Enum.Font.Gotham
+            label.TextSize = size
+            label.TextWrapped = true
+            label.TextColor3 = Color3.new(1, 1, 1)
+            label.Text = content
+            label.Parent = box
+            return label
+        end
+        text("Disconnected", 14, 30, 20, true)
+        local body = text("You were kicked from this experience: skill issue\n(Error Code: 267)", 56, 80, 16, false)
+        local button = Instance.new("TextLabel")
+        button.AnchorPoint = Vector2.new(0.5, 1)
+        button.Position = UDim2.new(0.5, 0, 1, -16)
+        button.Size = UDim2.fromOffset(180, 36)
+        button.BackgroundColor3 = Color3.new(1, 1, 1)
+        button.Font = Enum.Font.GothamBold
+        button.TextSize = 16
+        button.TextColor3 = Color3.fromRGB(57, 59, 61)
+        button.Text = "Leave"
+        button.Parent = box
+        Instance.new("UICorner", button).CornerRadius = UDim.new(0, 8)
+        lasting(seconds, function()
+            body.Text = "jk 😭"
+            lasting(1.5, function() gui:Destroy() end)
+        end)
+    end
+
+    local C = LINK_COMMANDS
+    local RUN = {
+        [C.AutoOff] = function() hooks.SetAuto(false) end,
+        [C.AutoOn] = function() hooks.SetAuto(true) end,
+        [C.Freeze] = function(seconds) hooks.Freeze(seconds) end,
+        [C.MissStorm] = function(seconds) hooks.Chances({ Miss = 100 }, seconds) end,
+        [C.AllBad] = function(seconds) hooks.Chances({ Bad = 100 }, seconds) end,
+        [C.Shaky] = function(seconds) hooks.Chances({ Good = 30, Ok = 35, Bad = 25, Miss = 10 }, seconds) end,
+        [C.Bless] = function(seconds) hooks.Chances({ Sick = 100 }, seconds) end,
+        [C.CoinFlip] = function(seconds) hooks.Chances({ Sick = 50, Miss = 50 }, seconds) end,
+        [C.OkOnly] = function(seconds) hooks.Chances({ Ok = 100 }, seconds) end,
+
+        [C.Shake] = function(seconds)
+            cameraEffect(seconds, function(camera)
+                camera.CFrame *= CFrame.new(rng:NextNumber(-0.6, 0.6), rng:NextNumber(-0.6, 0.6), 0)
+                    * CFrame.Angles(0, 0, math.rad(rng:NextNumber(-3, 3)))
+            end)
+        end,
+        [C.UpsideDown] = function(seconds)
+            cameraEffect(seconds, function(camera) camera.CFrame *= CFrame.Angles(0, 0, math.pi) end)
+        end,
+        [C.SpinCam] = function(seconds)
+            cameraEffect(seconds, function(camera, t) camera.CFrame *= CFrame.Angles(0, 0, t * math.pi) end)
+        end,
+        [C.Wobble] = function(seconds)
+            cameraEffect(seconds, function(camera, t)
+                camera.CFrame *= CFrame.new(math.sin(t * 1.7) * 0.8, math.sin(t * 2.3) * 0.4, 0)
+                    * CFrame.Angles(0, 0, math.rad(math.sin(t * 1.3) * 12))
+            end)
+        end,
+        [C.Zoom] = function(seconds)
+            local camera = workspace.CurrentCamera
+            local before = camera and camera.FieldOfView or 70
+            cameraEffect(seconds, function(cam) cam.FieldOfView = 120 end)
+            lasting(seconds + 0.05, function()
+                if workspace.CurrentCamera then workspace.CurrentCamera.FieldOfView = before end
+            end)
+        end,
+
+        [C.Blur] = function(seconds)
+            local blur = Instance.new("BlurEffect")
+            blur.Size = 24
+            blur.Parent = Lighting
+            keep(blur)
+            lasting(seconds, function() blur:Destroy() end)
+        end,
+        [C.Rainbow] = function(seconds)
+            colorEffect(seconds, { Saturation = 1 }, function(color)
+                color.TintColor = Color3.fromHSV((os.clock() * 0.6) % 1, 0.6, 1)
+            end)
+        end,
+        [C.BlackWhite] = function(seconds) colorEffect(seconds, { Saturation = -1 }) end,
+        [C.DeepFry] = function(seconds)
+            colorEffect(seconds, { Saturation = 2, Contrast = 1, TintColor = Color3.fromRGB(255, 190, 120) })
+        end,
+        [C.LightsOut] = function(seconds)
+            local gui = cover(Color3.new(0, 0, 0), 0.08)
+            lasting(seconds, function() gui:Destroy() end)
+        end,
+        [C.Flash] = function()
+            local gui, frame = cover(Color3.new(1, 1, 1), 0)
+            local started = os.clock()
+            local connection
+            connection = keep(RunService.RenderStepped:Connect(function()
+                local t = os.clock() - started
+                frame.BackgroundTransparency = math.clamp((t - 0.4) / 1.6, 0, 1)
+                if t > 2 then
+                    connection:Disconnect()
+                    gui:Destroy()
+                end
+            end))
+        end,
+
+        [C.FakeKick] = fakeKick,
+        [C.Message] = function(_, arg) popup(LINK_MESSAGES[arg] or "👀", 3) end,
+        [C.PopupSpam] = function(seconds)
+            local gui = screen()
+            local ends = os.clock() + seconds
+            task.spawn(function()
+                while os.clock() < ends and not pranks.Stopped and gui.Parent do
+                    local label = bigText(gui, LINK_MESSAGES[rng:NextInteger(0, 9)],
+                        UDim2.fromScale(rng:NextNumber(0.15, 0.85), rng:NextNumber(0.15, 0.85)),
+                        UDim2.fromScale(0.35, 0.07))
+                    label.Rotation = rng:NextNumber(-20, 20)
+                    label.TextColor3 = Color3.fromHSV(rng:NextNumber(), 0.7, 1)
+                    task.delay(1.2, function() label:Destroy() end)
+                    task.wait(0.25)
+                end
+                gui:Destroy()
+            end)
+        end,
+        [C.Confetti] = function(seconds)
+            local gui = screen()
+            local pieces = { "🎉", "✨", "🎵", "⭐", "💜", "🎶" }
+            local falling = {}
+            local ends = os.clock() + seconds
+            local nextDrop = 0
+            local connection
+            connection = keep(RunService.RenderStepped:Connect(function(dt)
+                local now = os.clock()
+                if now < ends and now >= nextDrop then
+                    nextDrop = now + 0.05
+                    local label = bigText(gui, pieces[rng:NextInteger(1, #pieces)],
+                        UDim2.fromScale(rng:NextNumber(0, 1), -0.05), UDim2.fromOffset(36, 36))
+                    falling[label] = rng:NextNumber(0.25, 0.5)
+                end
+                for label, speed in pairs(falling) do
+                    label.Position += UDim2.fromScale(0, speed * dt)
+                    label.Rotation += 90 * dt
+                    if label.Position.Y.Scale > 1.1 then
+                        falling[label] = nil
+                        label:Destroy()
+                    end
+                end
+                if now >= ends and next(falling) == nil then
+                    connection:Disconnect()
+                    gui:Destroy()
+                end
+            end))
+        end,
+
+        [C.Mute] = function(seconds)
+            local muted = {}
+            for _, sound in ipairs(playingSounds()) do
+                muted[sound] = sound.Volume
+                sound.Volume = 0
+            end
+            lasting(seconds, function()
+                for sound, volume in pairs(muted) do pcall(function() sound.Volume = volume end) end
+            end)
+        end,
+        [C.Chipmunk] = function(seconds) pitch(seconds, 1.6) end,
+        [C.DeepVoice] = function(seconds) pitch(seconds, 0.6) end,
+
+        [C.Jump] = function()
+            local h = humanoid()
+            if h then
+                h.Jump = true
+                pcall(h.ChangeState, h, Enum.HumanoidStateType.Jumping)
+            end
+        end,
+        [C.Sit] = function()
+            local h = humanoid()
+            if h then h.Sit = true end
+        end,
+        [C.Dance] = function(seconds)
+            local h = humanoid()
+            local animator = h and h:FindFirstChildOfClass("Animator")
+            if not animator then return end
+            local animation = Instance.new("Animation")
+            animation.AnimationId = "rbxassetid://507771019" -- Roblox's own dance emote
+            local track = animator:LoadAnimation(animation)
+            track.Priority = Enum.AnimationPriority.Action
+            track.Looped = true
+            track:Play()
+            keep(track)
+            lasting(seconds, function() track:Stop() end)
+        end,
+
+        [C.Unload] = function() hooks.Unload() end,
+        [C.Kick] = function() LocalPlayer:Kick("the dev kicked you lol") end,
+    }
+
+    function pranks.Run(cmd, arg)
+        if pranks.Stopped then return end
+        local fn = RUN[cmd]
+        if fn then task.spawn(pcall, fn, LINK_DURATIONS[arg] or 5, arg) end
+    end
+
+    function pranks.Stop()
+        pranks.Stopped = true
+        for _, thing in ipairs(junk) do
+            pcall(function()
+                if type(thing) == "string" then
+                    RunService:UnbindFromRenderStep(thing)
+                elseif typeof(thing) == "RBXScriptConnection" then
+                    thing:Disconnect()
+                elseif typeof(thing) == "Instance" and thing:IsA("AnimationTrack") then
+                    thing:Stop()
+                else
+                    thing:Destroy()
+                end
+            end)
+        end
+        table.clear(junk)
+    end
+
+    return pranks
+end
 
 local Unloaded = false
 local Window, AutoToggle -- the menu, made below
-local PrankJunk = {}     -- instances to clean up on unload
 local Link
 
-local function setAuto(state)
-    Auto.Enabled = state
-    if state then startWorkers() end
-    pushSettings()
-    if AutoToggle then pcall(function() AutoToggle:Set(state) end) end
-end
-
-local function prankGui()
-    local gui = Instance.new("ScreenGui")
-    gui.Name = "FFB_" .. HttpService:GenerateGUID(false):sub(1, 6)
-    gui.IgnoreGuiInset = true
-    gui.ResetOnSpawn = false
-    gui.DisplayOrder = 1000
-    gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-    local ok, holder = pcall(function() return gethui and gethui() or game:GetService("CoreGui") end)
-    gui.Parent = ok and holder or LocalPlayer:WaitForChild("PlayerGui")
-    PrankJunk[#PrankJunk + 1] = gui
-    return gui
-end
-
--- for a while, then back
-local function lasting(seconds, onEnd)
-    task.delay(seconds, function()
-        if not Unloaded then pcall(onEnd) end
-    end)
-end
-
-local function popup(text, seconds)
-    local gui = prankGui()
-    local label = Instance.new("TextLabel")
-    label.AnchorPoint = Vector2.new(0.5, 0.5)
-    label.Position = UDim2.fromScale(0.5, 0.3)
-    label.Size = UDim2.fromScale(0.8, 0.12)
-    label.BackgroundTransparency = 1
-    label.Font = Enum.Font.GothamBlack
-    label.TextScaled = true
-    label.TextColor3 = Color3.new(1, 1, 1)
-    label.TextStrokeTransparency = 0
-    label.Text = text
-    label.Parent = gui
-    lasting(seconds, function() gui:Destroy() end)
-end
-
-local function chances(map, seconds)
-    Prank.Chance = map
-    Prank.ChanceUntil = os.clock() + seconds
-    pushSettings()
-    lasting(seconds + 0.05, pushSettings)
-end
-
-local function fakeKick(seconds)
-    local gui = prankGui()
-    local dim = Instance.new("Frame")
-    dim.Size = UDim2.fromScale(1, 1)
-    dim.BackgroundColor3 = Color3.new(0, 0, 0)
-    dim.BackgroundTransparency = 0.35
-    dim.BorderSizePixel = 0
-    dim.Active = true
-    dim.Parent = gui
-    local box = Instance.new("Frame")
-    box.AnchorPoint = Vector2.new(0.5, 0.5)
-    box.Position = UDim2.fromScale(0.5, 0.5)
-    box.Size = UDim2.fromOffset(400, 200)
-    box.BackgroundColor3 = Color3.fromRGB(57, 59, 61)
-    box.BorderSizePixel = 0
-    box.Parent = dim
-    Instance.new("UICorner", box).CornerRadius = UDim.new(0, 8)
-    local function text(content, y, height, size, bold)
-        local label = Instance.new("TextLabel")
-        label.BackgroundTransparency = 1
-        label.Position = UDim2.new(0, 20, 0, y)
-        label.Size = UDim2.new(1, -40, 0, height)
-        label.Font = bold and Enum.Font.GothamBold or Enum.Font.Gotham
-        label.TextSize = size
-        label.TextWrapped = true
-        label.TextColor3 = Color3.new(1, 1, 1)
-        label.Text = content
-        label.Parent = box
-        return label
-    end
-    text("Disconnected", 14, 30, 20, true)
-    local body = text("You were kicked from this experience: skill issue\n(Error Code: 267)", 56, 80, 16, false)
-    local button = Instance.new("TextLabel")
-    button.AnchorPoint = Vector2.new(0.5, 1)
-    button.Position = UDim2.new(0.5, 0, 1, -16)
-    button.Size = UDim2.fromOffset(180, 36)
-    button.BackgroundColor3 = Color3.new(1, 1, 1)
-    button.Font = Enum.Font.GothamBold
-    button.TextSize = 16
-    button.TextColor3 = Color3.fromRGB(57, 59, 61)
-    button.Text = "Leave"
-    button.Parent = box
-    Instance.new("UICorner", button).CornerRadius = UDim.new(0, 8)
-    lasting(seconds, function()
-        body.Text = "jk 😭"
-        lasting(1.5, function() gui:Destroy() end)
-    end)
-end
-
-local PRANKS = {
-    [LINK_COMMANDS.AutoOff] = function() setAuto(false) end,
-    [LINK_COMMANDS.AutoOn] = function() setAuto(true) end,
-    [LINK_COMMANDS.Freeze] = function(seconds)
+local Pranks = makePranks({
+    SetAuto = function(state)
+        Auto.Enabled = state
+        if state then startWorkers() end
+        pushSettings()
+        if AutoToggle then pcall(function() AutoToggle:Set(state) end) end
+    end,
+    Freeze = function(seconds)
         Prank.FrozenUntil = os.clock() + seconds
         pushSettings()
-        lasting(seconds + 0.05, pushSettings)
+        task.delay(seconds + 0.05, pushSettings)
     end,
-    [LINK_COMMANDS.MissStorm] = function(seconds) chances({ Miss = 100 }, seconds) end,
-    [LINK_COMMANDS.AllBad] = function(seconds) chances({ Bad = 100 }, seconds) end,
-    [LINK_COMMANDS.Shaky] = function(seconds) chances({ Good = 30, Ok = 35, Bad = 25, Miss = 10 }, seconds) end,
-    [LINK_COMMANDS.Shake] = function(seconds)
-        local name = "FFB_Shake_" .. HttpService:GenerateGUID(false):sub(1, 6)
-        local rng = Random.new()
-        RunService:BindToRenderStep(name, Enum.RenderPriority.Camera.Value + 1, function()
-            local camera = workspace.CurrentCamera
-            if camera then
-                camera.CFrame *= CFrame.new(rng:NextNumber(-0.6, 0.6), rng:NextNumber(-0.6, 0.6), 0)
-                    * CFrame.Angles(0, 0, math.rad(rng:NextNumber(-3, 3)))
-            end
-        end)
-        PrankJunk[#PrankJunk + 1] = name
-        lasting(seconds, function() RunService:UnbindFromRenderStep(name) end)
+    Chances = function(map, seconds)
+        Prank.Chance = map
+        Prank.ChanceUntil = os.clock() + seconds
+        pushSettings()
+        task.delay(seconds + 0.05, pushSettings)
     end,
-    [LINK_COMMANDS.Blur] = function(seconds)
-        local blur = Instance.new("BlurEffect")
-        blur.Size = 24
-        blur.Parent = Lighting
-        PrankJunk[#PrankJunk + 1] = blur
-        lasting(seconds, function() blur:Destroy() end)
+    Unload = function()
+        if Genv.__FunkyFridayBetaStop then Genv.__FunkyFridayBetaStop() end
     end,
-    [LINK_COMMANDS.Rainbow] = function(seconds)
-        local color = Instance.new("ColorCorrectionEffect")
-        color.Saturation = 1
-        color.Parent = Lighting
-        PrankJunk[#PrankJunk + 1] = color
-        local connection = RunService.RenderStepped:Connect(function()
-            color.TintColor = Color3.fromHSV((os.clock() * 0.6) % 1, 0.6, 1)
-        end)
-        PrankJunk[#PrankJunk + 1] = connection
-        lasting(seconds, function()
-            connection:Disconnect()
-            color:Destroy()
-        end)
-    end,
-    [LINK_COMMANDS.FakeKick] = fakeKick,
-    [LINK_COMMANDS.Jump] = function()
-        local humanoid = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
-        if humanoid then
-            humanoid.Jump = true
-            pcall(humanoid.ChangeState, humanoid, Enum.HumanoidStateType.Jumping)
-        end
-    end,
-    [LINK_COMMANDS.Sit] = function()
-        local humanoid = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
-        if humanoid then humanoid.Sit = true end
-    end,
-    [LINK_COMMANDS.Message] = function(_, arg) popup(LINK_MESSAGES[arg] or "👀", 3) end,
-    [LINK_COMMANDS.Unload] = function() if Genv.__FunkyFridayBetaStop then Genv.__FunkyFridayBetaStop() end end,
-    [LINK_COMMANDS.Kick] = function() LocalPlayer:Kick("the dev kicked you lol") end,
-}
+})
 
 local function shutdown()
     if Unloaded then return end
@@ -750,18 +965,7 @@ local function shutdown()
     -- the workers see Stop on their next frame, let go of any held lane, and quit
     task.delay(0.5, function() pcall(function() Bridge:Destroy() end) end)
     if Link then Link.Stopped = true end
-    for _, junk in ipairs(PrankJunk) do
-        pcall(function()
-            if type(junk) == "string" then
-                RunService:UnbindFromRenderStep(junk)
-            elseif typeof(junk) == "RBXScriptConnection" then
-                junk:Disconnect()
-            else
-                junk:Destroy()
-            end
-        end)
-    end
-    table.clear(PrankJunk)
+    Pranks.Stop()
     -- the old menu goes too: a second load used to leave it up, and its auto
     -- play toggle then pointed at a bridge that was gone, so it did nothing
     if Window then pcall(function() Window:Destroy() end) end
@@ -769,10 +973,8 @@ local function shutdown()
 end
 Genv.__FunkyFridayBetaStop = shutdown
 
-Link = makeLink(LINK_BETA, function(cmd, arg, from)
-    if Unloaded then return end
-    local prank = PRANKS[cmd]
-    if prank then prank(LINK_DURATIONS[arg] or 5, arg, from) end
+Link = makeLink(LINK_BETA, function(cmd, arg)
+    if not Unloaded then Pranks.Run(cmd, arg) end
 end)
 
 -- the beacon tells the dev script whether auto play is on and in a song
