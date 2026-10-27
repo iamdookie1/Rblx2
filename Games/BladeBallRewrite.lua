@@ -31,7 +31,7 @@
 
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.88"
+local SCRIPT_VERSION = "rewrite-0.5.89"
 
 -- ---------------------------------------------------------------------------
 -- Single instance.
@@ -365,6 +365,20 @@ do
         if Parry.onLog then pcall(Parry.onLog, text) end -- the log file (see Flight)
     end
     Parry.logp = logp
+    -- ---------- debug feed (Debug tab) ----------
+    -- Collects only while the debug overlay is on: an event list (retargets,
+    -- fires, captures, their parries...), the last decision's numbers, why the
+    -- last check held, and update rates. Read by Parry.debugLines / the overlay.
+    local DBG = { on = false, list = {}, eval = {}, block = nil, block_at = 0,
+        counts = { vel = 0, feed = 0, since = clock_() }, rates = { vel = 0, feed = 0 } }
+    Parry.DBG = DBG
+    function DBG.ev(text)
+        if not DBG.on then return end
+        local l = DBG.list
+        l[#l + 1] = { t = clock_(), text = text }
+        if #l > 40 then table.remove(l, 1) end
+    end
+    function DBG.held(why, now) if DBG.on then DBG.block, DBG.block_at = why, now end end
     function Parry.drainLog()
         local out = {}
         for i = #LOG - log_new + 1, #LOG do if LOG[i] then out[#out + 1] = LOG[i] end end
@@ -769,6 +783,7 @@ do
         Core.misses, Core.pending = 0, nil
         Core.new_capture = { prev = prev }
         if Parry.onCapture then task.defer(pcall, Parry.onCapture, Core.cap) end
+        DBG.ev(Core.cap.verified and "CAPTURE: real parry hash confirmed" or "CAPTURE: taken (real hash not readable)")
     end
 
     -- A real parry: (hash, id, token, window, cameraCF, points, aim, flag), or on
@@ -1648,6 +1663,12 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
             swaps[#swaps + 1] = { t = now, from = st.target, to = new }
             if #swaps > 16 then table.remove(swaps, 1) end
             local was_me = st.target == me
+            if DBG.on then
+                local r = getRoot()
+                local d = r and (ball.Position - r.Position).Magnitude or 0
+                DBG.ev(("retarget %s -> %s  (%.0f studs, spd %.0f)%s"):format(tostring(st.target), tostring(new), d,
+                    ball_velocity(ball).Magnitude, new == me and "  << ON YOU" or (was_me and "  (left you)" or "")))
+            end
             -- the partner's reaction: how long they held it before it came back
             -- to us, minus the ball's flight to them (pre-parry timing uses it)
             if new == me and type(st.target) == 'string' and st.target ~= '' and st.target_at then
@@ -2092,6 +2113,10 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
             if capture_method() ~= "getgc" then Anim.block() end
         end
         Core.last_parry = { t = now, via = via, info = info }
+        if DBG.on then
+            DBG.ev(info and ("FIRE %s [%s] d %.0f spd %.0f eta %.2f lead %.2f"):format(via, how, info.dist or 0,
+                info.speed or 0, math.min(info.eta or 0, 9.99), info.lead or 0) or ("FIRE %s [%s]"):format(via, how))
+        end
         -- a key press is answered (or not) like a remote parry: same miss check
         if how ~= "remote" and how ~= "ability" then Core.pending = clock_() + (parry_window() or 0.5) + ping_s() + 0.3 end
         -- watch this ball until the parry is answered: when it actually got
@@ -2124,6 +2149,8 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
                 local first = Det.tor[t]
                 if not first then
                     first = now; Det.tor[t] = first
+                    DBG.ev(("aerodynamic slash tornado on %s: holding %.1fs"):format(tostring(t:GetAttribute("Ball")),
+                        tonumber(t:GetAttribute("TornadoTime")) or 1))
                     logp(("aerodynamic slash on %s: holding the parry %.1fs while it spins"):format(
                         tostring(t:GetAttribute("Ball")), tonumber(t:GetAttribute("TornadoTime")) or 1))
                 end
@@ -2152,8 +2179,9 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
     -- No straight-line distance rules: they fired on distances a curving ball
     -- was never going to fly.
     local function decide(ball, st, root, now, via)
-        if pass_busy(st, now) or blocked_by_detection() then return end
-        if Det.tornado(ball, now) then return end
+        if pass_busy(st, now) then DBG.held(st.landed and "this pass landed" or "already fired on this pass", now); return end
+        if blocked_by_detection() then DBG.held("ability detection", now); return end
+        if Det.tornado(ball, now) then DBG.held("aerodynamic slash tornado", now); return end
         local vel = ball_velocity(ball)
         local speed = vel.Magnitude
         if speed < 1 then return end
@@ -2176,6 +2204,13 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         local half = frame_dt * 0.5
         local t_min = time_to_contact(dist, gap, speed, accel)
         local info = { speed = speed, dist = dist, heading = heading, lead = lead, eta = t_min }
+        if DBG.on then
+            local e = DBG.eval
+            e.t, e.via, e.speed, e.dist, e.heading, e.reach, e.lead, e.t_min, e.k, e.feed = now, via or "frame",
+                speed, dist, heading, reach, lead, t_min, h.k, adj > 0
+            e.fast, e.slow = nil, nil
+            info.dbg = e
+        end
         local tag = (via and ("auto parry (" .. via .. ")") or "auto parry") .. ((adj > 0 and via ~= "feed") and " [feed]" or "")
         if rem <= 3 then return fire(st, now, tag .. " (contact)", info, ball) end
         if t_min > lead + half then return end
@@ -2205,6 +2240,7 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         local k_fast = S.hard_curve and K_MAX or math.min(km * 1.4, K_MAX)
         local fast = math.max(sim_prop(bpos, v, rpos, gap, k_fast, accel, must_by + 0.05, tvel) or math.huge, t_min)
         info.fast = fast
+        if info.dbg then info.dbg.fast = fast end
         if fast <= must_by + half then
             info.eta = fast
             return fire(st, now, tag .. " (curve, must)", info, ball)
@@ -2212,6 +2248,7 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         if h.away then return end
         local slow = math.max(sim_prop(bpos, v, rpos, gap, math.max(km * 0.75, K_MIN), accel, lead + 0.05, tvel) or math.huge, t_min)
         info.eta, info.slow = slow, slow
+        if info.dbg then info.dbg.slow = slow end
         if slow <= lead + half then return fire(st, now, tag .. " (curve)", info, ball) end
     end
 
@@ -2286,6 +2323,7 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         end
     end
     on_velocity = function(ball, st)
+        DBG.counts.vel = DBG.counts.vel + 1
         if not (S.autoparry or S.triggerbot) then return end
         local root = ap_root()
         if not root then return end
@@ -2514,6 +2552,7 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
                 Core.pending, Core.misses = nil, Core.misses + 1
                 Core.verdict = nil
                 logp(miss_verdict(Core.watch))
+                if DBG.on then DBG.ev("MISS: " .. miss_verdict(Core.watch):gsub("\n.*", "")) end
                 -- Self-tune (toggle): an EARLY / LATE miss moves the fire time a
                 -- little the other way -- half the miss, at most 15ms a step,
                 -- capped at +/-40ms; landed parries ease it back toward 0. Two-way
@@ -2571,6 +2610,7 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         local F, now = Core.feed, clock_()
         if F.since == 0 then F.since = now end
         F.n, F.total = F.n + 1, F.total + 1
+        DBG.counts.feed = DBG.counts.feed + 1
         F.pos[ball], F.at[ball] = p, now
         local v = ball_velocity(ball)
         local sp = v.Magnitude
@@ -2619,6 +2659,7 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         return list
     end
     function Parry.onParrySuccess()
+        DBG.ev("our parry LANDED")
         Anim.onSuccess()
         local char = LocalPlayer.Character
         if not (char and char:IsDescendantOf(Workspace)) then return end
@@ -2693,6 +2734,7 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
                 end
             end
             if reopened then G.until_t = 0 end
+            DBG.ev(("parry by %s%s"):format(who, reopened and "  -> ball coming back: new pass opened" or ""))
             if S.autoparry or S.triggerbot then
                 local root = ap_root()
                 if root then
@@ -2709,6 +2751,39 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
     function Parry.onNoobParry() task.wait(0.11); G.until_t = 0 end
     function Parry.onM1Stop(v) G.m1, G.m1_at = v and true or false, clock_() end
 
+    function Parry.debugLines()
+        local now = clock_()
+        local c, R = DBG.counts, DBG.rates
+        local span = now - c.since
+        if span >= 1 then R.vel, R.feed = c.vel / span, c.feed / span; c.vel, c.feed, c.since = 0, 0, now end
+        local L = {}
+        L[#L + 1] = ("ping %.0fms (avg %.0f)  jitter %.0fms  reach %.0fms"):format(pingMs(), (Lag.avg or 0) * 1000,
+            jitter() * 1000, reach_time() * 1000)
+        local F = Core.feed
+        L[#L + 1] = ("server feed %.0f/s (ahead %s)  velocity updates %.0f/s"):format(R.feed,
+            F.ahead and ("%.0fms"):format(F.ahead * 1000) or "-", R.vel)
+        local cap = Core.cap
+        L[#L + 1] = cap and ("capture: yes, %s"):format(cap.verified and "real hash confirmed" or "hash not confirmed")
+            or ("capture: none (hook %s)"):format(Parry.hookState())
+        L[#L + 1] = gate_open() and "parry gate: open" or ("parry gate: locked %.2fs"):format(math.max(G.until_t - now, 0))
+        local on_me
+        for _, b in ipairs(get_live_balls()) do
+            local st = tracked[b]
+            if st and st.target == me then on_me = st; break end
+        end
+        L[#L + 1] = on_me and ("ball ON YOU, pass: %s"):format(on_me.landed and "landed" or (on_me.parried and "fired" or "open"))
+            or "no ball on you"
+        local e = DBG.eval
+        if e.t and now - e.t < 1.5 then
+            L[#L + 1] = ("check (%s%s): spd %.0f  d %.0f  heading %.2f"):format(e.via, e.feed and ", feed" or "", e.speed, e.dist, e.heading)
+            L[#L + 1] = ("  soonest %.2fs  lead %.2fs  reach %.2fs%s%s%s"):format(math.min(e.t_min, 9.99), e.lead, e.reach,
+                e.fast and ("  curve fast %.2f"):format(math.min(e.fast, 9.99)) or "",
+                e.slow and (" slow %.2f"):format(math.min(e.slow, 9.99)) or "",
+                e.k and ("  k %.1f"):format(e.k) or "")
+        end
+        if DBG.block and now - DBG.block_at < 2 then L[#L + 1] = ("held: %s (%.1fs ago)"):format(DBG.block, now - DBG.block_at) end
+        return L
+    end
     function Parry.status()
         local lp = Core.last_parry
         local last = "none"
@@ -3234,6 +3309,7 @@ local Tabs = {
     Orbit = Window:AddTab("Orbit", "orbit", "Circle a point you can walk, or the ball"),
     Misc = Window:AddTab("Misc", "wrench", "Skin changer and extras"),
     Status = Window:AddTab("Status", "gauge", "Live state and parry log"),
+    Debug = Window:AddTab("Debug", "bug", "On-screen debug overlay"),
 }
 
 -- ----- Auto Parry tab (rewritten 0.5.85) -----
@@ -4552,6 +4628,113 @@ StatusHook = function(s, armed)
     set(ClashLabel, "Status: " .. s.clash)
 end
 UiTick = function(rate) Orb.tick(rate) end
+
+-- ----- Debug tab -----
+-- One on-screen panel: live numbers on top (ping / reach, server feed, capture,
+-- parry gate, the ball on you, the last decision's numbers and why it held),
+-- the newest events under it (retargets, fires, landed / missed, their
+-- parries, captures, tornado holds). Drag it by any part; it is clamped to the
+-- screen every update -- and shrunk if the Size would make it bigger than the
+-- screen -- so it can never end up off screen. Collection runs only while on.
+local DebugCfg = { Size = 1 }
+local DebugUI = Feature("DebugUI")
+function DebugUI.start()
+    Parry.DBG.on = true
+    local W0, H0 = 360, 330
+    local gui = Instance.new("ScreenGui"); gui.Name = randName(); gui.ResetOnSpawn = false
+    gui.IgnoreGuiInset = true; gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling; gui.DisplayOrder = 1000
+    local frame = Instance.new("Frame"); frame.Size = UDim2.fromOffset(W0, H0); frame.Position = UDim2.fromOffset(16, 90)
+    frame.BackgroundColor3 = Color3.fromRGB(12, 12, 16); frame.BackgroundTransparency = 0.15
+    frame.BorderSizePixel = 0; frame.Active = true; frame.Parent = gui
+    Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 8)
+    local stroke = Instance.new("UIStroke", frame); stroke.Color = Color3.fromRGB(70, 70, 85)
+    local scale = Instance.new("UIScale", frame)
+    local function label(y, h, size, font)
+        local l = Instance.new("TextLabel", frame)
+        l.Position, l.Size = UDim2.fromOffset(8, y), UDim2.new(1, -16, 0, h)
+        l.BackgroundTransparency = 1; l.TextColor3 = Color3.fromRGB(235, 235, 240)
+        l.Font = font or Enum.Font.Code; l.TextSize = size or 12
+        l.TextXAlignment = Enum.TextXAlignment.Left; l.TextYAlignment = Enum.TextYAlignment.Top
+        l.TextWrapped = true; l.RichText = false; l.Text = ""
+        return l
+    end
+    local title = label(5, 16, 13, Enum.Font.GothamBold); title.Text = "Debug  (drag to move)"
+    local live = label(24, 128)
+    local sep = Instance.new("Frame", frame); sep.Position, sep.Size = UDim2.fromOffset(8, 155), UDim2.new(1, -16, 0, 1)
+    sep.BackgroundColor3 = Color3.fromRGB(70, 70, 85); sep.BorderSizePixel = 0
+    local events = label(160, H0 - 166)
+    events.ClipsDescendants = true
+    hideGui(gui)
+    DebugUI:own(gui)
+
+    -- keep it on screen: shrink to fit, then clamp the corner
+    local function fit()
+        local cam = Workspace.CurrentCamera
+        local vp = cam and cam.ViewportSize or Vector2.new(800, 600)
+        local s = math.min(DebugCfg.Size, (vp.X * 0.96) / W0, (vp.Y * 0.92) / H0)
+        scale.Scale = math.max(s, 0.3)
+    end
+    local function place(x, y)
+        local cam = Workspace.CurrentCamera
+        local vp = cam and cam.ViewportSize or Vector2.new(800, 600)
+        local sz = frame.AbsoluteSize
+        x = math.clamp(x, 0, math.max(vp.X - sz.X, 0))
+        y = math.clamp(y, 0, math.max(vp.Y - sz.Y, 0))
+        frame.Position = UDim2.fromOffset(x, y)
+    end
+    local drag
+    local function grab(i)
+        local t = i.UserInputType
+        if t == Enum.UserInputType.MouseButton1 or t == Enum.UserInputType.Touch then
+            drag = { at = i.Position, from = frame.AbsolutePosition, input = t }
+        end
+    end
+    -- grab from the background or any text on it
+    DebugUI:connect(frame.InputBegan, grab)
+    for _, c in ipairs(frame:GetChildren()) do
+        if c:IsA("GuiObject") then DebugUI:connect(c.InputBegan, grab) end
+    end
+    DebugUI:connect(UserInputService.InputChanged, function(i)
+        if not drag then return end
+        local t = i.UserInputType
+        if t == Enum.UserInputType.MouseMovement or t == Enum.UserInputType.Touch then
+            local d = i.Position - drag.at
+            place(drag.from.X + d.X, drag.from.Y + d.Y)
+        end
+    end)
+    DebugUI:connect(UserInputService.InputEnded, function(i)
+        local t = i.UserInputType
+        if t == Enum.UserInputType.MouseButton1 or t == Enum.UserInputType.Touch then drag = nil end
+    end)
+
+    DebugUI:loop(0.1, function()
+        fit()
+        if not drag then place(frame.AbsolutePosition.X, frame.AbsolutePosition.Y) end
+        local ok, lines = pcall(Parry.debugLines)
+        live.Text = ok and table.concat(lines, "\n") or ("debug error: " .. tostring(lines))
+        local now, out, list = os.clock(), {}, Parry.DBG.list
+        for i = #list, math.max(#list - 13, 1), -1 do
+            local e = list[i]
+            out[#out + 1] = ("%5.1fs  %s"):format(now - e.t, e.text)
+        end
+        events.Text = #out > 0 and table.concat(out, "\n") or "(no events yet -- they show here as they happen)"
+    end)
+end
+function DebugUI.stop() Parry.DBG.on = false end
+
+local DBGB = Tabs.Debug:AddLeftGroupbox("Debug overlay", "bug")
+DBGB:AddToggle("DebugUI", {
+    Text = "Debug overlay", Default = false,
+    Tooltip = "On-screen panel: live ping / reach / feed / capture / gate / the ball on you and the last decision, plus the newest events (retargets, fires, landed / missed, their parries, captures).",
+    Callback = function(v) DebugUI:setEnabled(v) end,
+})
+DBGB:AddSlider("DebugUISize", {
+    Text = "Size", Default = 100, Min = 50, Max = 200, Rounding = 0, Suffix = "%",
+    Tooltip = "It never gets bigger than the screen, whatever this says.",
+    Callback = function(v) DebugCfg.Size = v / 100 end,
+})
+DBGB:AddButton({ Text = "Clear events", Func = function() table.clear(Parry.DBG.list) end })
+DBGB:AddLabel("Times in the event list are seconds ago. 'soonest' = the earliest the ball can land, 'lead' = when auto parry fires, 'reach' = your ping delay.", true)
 
 -- ---------------------------------------------------------------------------
 -- Unload.
