@@ -31,7 +31,7 @@
 
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.89"
+local SCRIPT_VERSION = "rewrite-0.5.90"
 
 -- ---------------------------------------------------------------------------
 -- Single instance.
@@ -1634,6 +1634,7 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
     local on_retarget, on_velocity -- set below
     local function open_pass(st)
         st.pass_open, st.parried, st.landed, st.parry_until = true, false, false, 0
+        st.dbg_seen = nil
         if st.hm and st.hm.k then st.k_mem = st.hm.k end -- the ball's turn, kept for the next pass
         st.spd, st.hm = nil, nil
         if st.preparried then
@@ -2210,6 +2211,15 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
                 speed, dist, heading, reach, lead, t_min, h.k, adj > 0
             e.fast, e.slow = nil, nil
             info.dbg = e
+            -- the first look at this pass already had it landing inside our reach:
+            -- it was late before we could do anything (retarget / data arrived late)
+            if not st.dbg_seen then
+                st.dbg_seen = true
+                if t_min < reach then
+                    DBG.ev(("LATE: first seen %.2fs from landing, reach %.2fs (%s) -- already too close when the data arrived"):format(
+                        t_min, reach, via or "frame"))
+                end
+            end
         end
         local tag = (via and ("auto parry (" .. via .. ")") or "auto parry") .. ((adj > 0 and via ~= "feed") and " [feed]" or "")
         if rem <= 3 then return fire(st, now, tag .. " (contact)", info, ball) end
