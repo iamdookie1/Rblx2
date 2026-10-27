@@ -414,7 +414,7 @@ local canPlay = typeof(getgc) == "function" or typeof(run_on_actor) == "function
 -- Keep this block the same in both files.
 
 local LINK_RELAY = "https://funkyff.serveousercontent.com"  -- your relay (Server/funky_friday_relay.py)
-local LINK_SEED = "1ac2a72473ddca69"          -- the same seed phrase the relay runs with (FF_SEED)
+local LINK_SEED = ""          -- the same seed phrase the relay runs with (FF_SEED)
 -- advanced: an exact key/secret instead of deriving them from the seed above
 local LINK_RELAY_KEY = "4510b0b9d1028da6"
 local LINK_RELAY_SECRET = "e612f27b3aa6a1c51a1f9db4cd833d70af4a296d9670c712630957599fdbdf9a"
