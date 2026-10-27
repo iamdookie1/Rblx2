@@ -31,7 +31,7 @@
 
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.92"
+local SCRIPT_VERSION = "rewrite-0.5.93"
 
 -- ---------------------------------------------------------------------------
 -- Single instance.
@@ -4814,7 +4814,7 @@ DBGB:AddButton({ Text = "Clear events", Func = function() table.clear(Parry.DBG.
 -- frame (it binds at RenderPriority.Input), this re-issues the same direction
 -- at full magnitude, optionally snapped to the nearest of 8 camera-relative
 -- directions -- the same Humanoid:Move call the control script itself makes.
-local PcMoveCfg = { Snap = true, bind = nil }
+local PcMoveCfg = { Snap = true, bind = nil, cur = nil }
 local PcMove = Feature("PcMove")
 function PcMove.start()
     local name = randName()
@@ -4827,18 +4827,38 @@ function PcMove.start()
             if not hum or hum.Health <= 0 then return end
             local md = hum.MoveDirection
             local flat = Vector3.new(md.X, 0, md.Z)
-            if flat.Magnitude < 0.05 then return end
+            if flat.Magnitude < 0.05 then PcMoveCfg.cur = nil; return end
             local dir = flat.Unit
             if PcMoveCfg.Snap then
+                -- Sticky 8-way. Plain rounding (0.5.92) flipped between two
+                -- neighbours whenever the thumb sat near a 22.5 deg boundary --
+                -- the "weird" zig-zag. Now the direction you're on is kept until
+                -- the stick is clearly in the next one (15 deg past the line),
+                -- and the 4 main ones (W/A/S/D) are a little wider than the
+                -- diagonals, like a keyboard where one key is easier than two.
                 local cam = Workspace.CurrentCamera
                 if cam then
                     local f = Vector3.new(cam.CFrame.LookVector.X, 0, cam.CFrame.LookVector.Z)
                     local r = Vector3.new(cam.CFrame.RightVector.X, 0, cam.CFrame.RightVector.Z)
                     if f.Magnitude > 0.01 and r.Magnitude > 0.01 then
                         f, r = f.Unit, r.Unit
-                        local a = math.atan2(dir:Dot(r), dir:Dot(f))
-                        a = math.floor(a / (math.pi / 4) + 0.5) * (math.pi / 4)
-                        dir = f * math.cos(a) + r * math.sin(a)
+                        local a = math.atan2(dir:Dot(r), dir:Dot(f)) -- 0 = forward, + = right
+                        local step = math.pi / 4
+                        local function off(idx) -- angle from raw to direction idx, -pi..pi
+                            local d = (a - idx * step + math.pi) % (2 * math.pi) - math.pi
+                            return math.abs(d)
+                        end
+                        -- nearest, with the main 4 weighted wider (+8 deg)
+                        local best, best_d
+                        for idx = 0, 7 do
+                            local d = off(idx) - (idx % 2 == 0 and math.rad(8) or 0)
+                            if not best_d or d < best_d then best, best_d = idx, d end
+                        end
+                        local cur = PcMoveCfg.cur
+                        if cur and cur ~= best and off(cur) < step / 2 + math.rad(15) then best = cur end
+                        PcMoveCfg.cur = best
+                        local sa = best * step
+                        dir = f * math.cos(sa) + r * math.sin(sa)
                     end
                 end
             end
