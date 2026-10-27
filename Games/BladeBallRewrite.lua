@@ -31,7 +31,7 @@
 
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.91"
+local SCRIPT_VERSION = "rewrite-0.5.92"
 
 -- ---------------------------------------------------------------------------
 -- Single instance.
@@ -2786,6 +2786,28 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
             end
             if reopened then G.until_t = 0 end
             DBG.ev(("parry by %s%s"):format(who, reopened and "  -> ball coming back: new pass opened" or ""))
+            -- Fast retarget, 1v1: with only us and them alive, THEIR parry means
+            -- the ball is coming to us -- known now, not when the target
+            -- attribute lands. Treated as the retarget (same fire-only-if-it-
+            -- should rules); the attribute arriving later finds the pass open.
+            if S.fast_retarget and S.autoparry and not S.triggerbot and in_match() then
+                local alive = 0
+                for _, m in ipairs(Alive:GetChildren()) do
+                    if m:FindFirstChildOfClass("Humanoid") then alive = alive + 1 end
+                end
+                if alive == 2 then
+                    local root = ap_root()
+                    if root then
+                        for ball, st in pairs(tracked) do
+                            if st.target == who and ball.Parent then
+                                if not st.pass_open then open_pass(st) end
+                                DBG.ev(("1v1: %s parried -- taken as the retarget to you"):format(who))
+                                Core.fast_retarget(ball, st, root, now)
+                            end
+                        end
+                    end
+                end
+            end
             if S.autoparry or S.triggerbot then
                 local root = ap_root()
                 if root then
@@ -4786,10 +4808,65 @@ DBGB:AddSlider("DebugUISize", {
 })
 DBGB:AddButton({ Text = "Clear events", Func = function() table.clear(Parry.DBG.list) end })
 
+-- PC-style movement (for touch): the thumbstick is analog -- a part tilt walks
+-- slower, and it goes any angle. On PC, WASD is always full walk speed in one
+-- of 8 directions. Right after the game's control script sets the move each
+-- frame (it binds at RenderPriority.Input), this re-issues the same direction
+-- at full magnitude, optionally snapped to the nearest of 8 camera-relative
+-- directions -- the same Humanoid:Move call the control script itself makes.
+local PcMoveCfg = { Snap = true, bind = nil }
+local PcMove = Feature("PcMove")
+function PcMove.start()
+    local name = randName()
+    PcMoveCfg.bind = name
+    pcall(function()
+        RunService:BindToRenderStep(name, Enum.RenderPriority.Input.Value + 1, function()
+            if not is_live() then return end
+            local char = LocalPlayer.Character
+            local hum = char and char:FindFirstChildOfClass("Humanoid")
+            if not hum or hum.Health <= 0 then return end
+            local md = hum.MoveDirection
+            local flat = Vector3.new(md.X, 0, md.Z)
+            if flat.Magnitude < 0.05 then return end
+            local dir = flat.Unit
+            if PcMoveCfg.Snap then
+                local cam = Workspace.CurrentCamera
+                if cam then
+                    local f = Vector3.new(cam.CFrame.LookVector.X, 0, cam.CFrame.LookVector.Z)
+                    local r = Vector3.new(cam.CFrame.RightVector.X, 0, cam.CFrame.RightVector.Z)
+                    if f.Magnitude > 0.01 and r.Magnitude > 0.01 then
+                        f, r = f.Unit, r.Unit
+                        local a = math.atan2(dir:Dot(r), dir:Dot(f))
+                        a = math.floor(a / (math.pi / 4) + 0.5) * (math.pi / 4)
+                        dir = f * math.cos(a) + r * math.sin(a)
+                    end
+                end
+            end
+            hum:Move(dir, false)
+        end)
+    end)
+end
+function PcMove.stop()
+    if PcMoveCfg.bind then pcall(function() RunService:UnbindFromRenderStep(PcMoveCfg.bind) end) end
+    PcMoveCfg.bind = nil
+end
+
+local DBGM = Tabs.Debug:AddLeftGroupbox("Movement", "gamepad-2")
+DBGM:AddToggle("PcMovement", {
+    Text = "PC-style movement", Default = false,
+    Tooltip = "Mobile thumbstick moves like WASD: any tilt is full walk speed (no slow part-tilt walking).",
+    Callback = function(v) PcMove:setEnabled(v) end,
+})
+DBGM:AddToggle("PcMovementSnap", {
+    Text = "Snap to 8 directions", Default = true,
+    Tooltip = "Like W, A, S, D and the diagonals: the stick's direction rounds to the nearest of 8, relative to the camera.",
+    Callback = function(v) PcMoveCfg.Snap = v end,
+})
+
 local DBGT = Tabs.Debug:AddRightGroupbox("Experimental", "flask-conical")
 DBGT:AddToggle("FastRetarget", {
     Text = "Fast retarget", Default = false,
-    Tooltip = "Auto parry decides the instant the ball turns to you, before its new direction arrives -- but only fires when it should: it's due at your Accuracy, and even a curve twice as long would still land inside the parry (or it's fire-or-die close). Otherwise the normal checks take it a moment later.",
+    Tooltip = "Auto parry decides the instant the ball turns to you, before its new direction arrives -- but only fires when it should: it's due at your Accuracy, and even a curve twice as long would still land inside the parry (or it's fire-or-die close). Otherwise the normal checks take it a moment later. In a 1v1 the other player's parry counts as the retarget (it can only be coming to you).",
     Callback = function(v) Parry.S.fast_retarget = v end,
 })
 DBGB:AddLabel("Times in the event list are seconds ago. 'soonest' = the earliest the ball can land, 'lead' = when auto parry fires, 'reach' = your ping delay.", true)
