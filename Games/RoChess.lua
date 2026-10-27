@@ -1203,15 +1203,15 @@ local S = {
     Color = "random",
     Engine = "Custom",
     MaxDepth = 64,
-    ThinkTime = 1.5,
-    MoveDelay = 0.3,
+    ThinkTime = 0.1,
+    MoveDelay = 0,
     Requeue = true,
     SolvePuzzles = false,
     NextPuzzle = true,
     SolveRush = false,
-    PuzzleThink = 1.5,
+    PuzzleThink = 0.1,
     Arrow = false,
-    ArrowThink = 1.5,
+    ArrowThink = 0.1,
     ClaimTasks = false,
     AutoCrate = false,
     Crate = "pieces",
@@ -1272,10 +1272,15 @@ local function engineYield()
     task.wait()
 end
 
+local function yielderFor(seconds)
+    if seconds and seconds > 0.25 then return engineYield end
+    return nil
+end
+
 local function bestFor(s, seconds)
     if not s or not s.ucis then return nil end
     if S.Engine == "Custom" then
-        local res = Brain.analyse(s.startFen, table.clone(s.ucis), seconds, S.MaxDepth, engineYield)
+        local res = Brain.analyse(s.startFen, table.clone(s.ucis), seconds, S.MaxDepth, yielderFor(seconds))
         if type(res) == "table" and res.best then return res.best, res end
     end
     if not (Bot and Bot.analyse) then return nil end
@@ -1348,7 +1353,7 @@ task.spawn(function()
                     Stats.Status = "thinking"
                     local best = bestFor(s, S.ThinkTime)
                     if best and session() == s and myMoveReady(s) then
-                        task.wait(S.MoveDelay)
+                        if S.MoveDelay > 0 then task.wait(S.MoveDelay) end
                         if session() == s and myMoveReady(s) then
                             playUci(best)
                             Stats.Status = "played " .. best
@@ -1365,7 +1370,7 @@ task.spawn(function()
                 Stats.Status = "online game open: farm paused"
             end
         end
-        task.wait(0.15)
+        task.wait(0.05)
     end
 end)
 
@@ -1421,7 +1426,7 @@ task.spawn(function()
         elseif kind ~= "puzzle" then
             solvedAt = nil
         end
-        task.wait(0.2)
+        task.wait(0.05)
     end
 end)
 
@@ -1457,7 +1462,7 @@ task.spawn(function()
             if ArrowShown then clearArrow() end
             if s and s.kind == "online" then Stats.Eval = "off in online games" end
         end
-        task.wait(0.25)
+        task.wait(0.05)
     end
 end)
 
@@ -1643,8 +1648,8 @@ do
         Callback = function(v) S.Engine = v end,
     })
     engine:AddSlider('rc_depth', { Text = 'Max depth (custom)', Min = 1, Max = 64, Default = S.MaxDepth, Rounding = 0, Callback = function(v) S.MaxDepth = v end })
-    engine:AddSlider('rc_think', { Text = 'Think time', Tooltip = 'longer is stronger; weak bots need very little', Min = 0.1, Max = 10, Default = S.ThinkTime, Rounding = 1, Suffix = 's', Callback = function(v) S.ThinkTime = v end })
-    engine:AddSlider('rc_delay', { Text = 'Extra delay per move', Min = 0, Max = 3, Default = S.MoveDelay, Rounding = 1, Suffix = 's', Callback = function(v) S.MoveDelay = v end })
+    engine:AddSlider('rc_think', { Text = 'Think time', Tooltip = 'longer is stronger; weak bots need very little', Min = 0.05, Max = 10, Default = S.ThinkTime, Rounding = 2, Suffix = 's', Callback = function(v) S.ThinkTime = v end })
+    engine:AddSlider('rc_delay', { Text = 'Extra delay per move', Min = 0, Max = 3, Default = S.MoveDelay, Rounding = 2, Suffix = 's', Callback = function(v) S.MoveDelay = v end })
     engine:AddButton({ Text = 'Start bot game now', Func = function() task.spawn(startBotGame) end })
     engine:AddButton({
         Text = 'Play best move once',
@@ -1667,7 +1672,7 @@ do
     toggle(pz, 'rc_puzzles', 'Auto solve puzzles', 'SolvePuzzles', 'plays the puzzle\'s solution, or the engine\'s move where the server hasn\'t sent it yet')
     toggle(pz, 'rc_nextpz', 'Load the next puzzle', 'NextPuzzle')
     pz:AddButton({ Text = 'Open puzzles', Func = function() local app = findApp() if app then pcall(app.openPuzzles) end end })
-    pz:AddSlider('rc_pzthink', { Text = 'Engine time (rated puzzles)', Min = 0.3, Max = 10, Default = S.PuzzleThink, Rounding = 1, Suffix = 's', Callback = function(v) S.PuzzleThink = v end })
+    pz:AddSlider('rc_pzthink', { Text = 'Engine time (rated puzzles)', Min = 0.05, Max = 10, Default = S.PuzzleThink, Rounding = 2, Suffix = 's', Callback = function(v) S.PuzzleThink = v end })
 
     local rush = Tab:AddRightGroupbox('Puzzle sprint', 'zap')
     rush:AddLabel('Open the sprint page and press Start; this solves each puzzle as it appears.', true)
@@ -1681,7 +1686,7 @@ do
     local box = Tab:AddLeftGroupbox('Best move', 'arrow-up-right')
     box:AddLabel('Draws the engine\'s best move on the board in bot games, puzzles and the analysis board. Off in live online games.', true)
     toggle(box, 'rc_arrow', 'Best-move arrow', 'Arrow', nil, function(v) if not v then clearArrow() end end)
-    box:AddSlider('rc_arrowthink', { Text = 'Think time', Min = 0.2, Max = 10, Default = S.ArrowThink, Rounding = 1, Suffix = 's', Callback = function(v) S.ArrowThink = v end })
+    box:AddSlider('rc_arrowthink', { Text = 'Think time', Min = 0.05, Max = 10, Default = S.ArrowThink, Rounding = 2, Suffix = 's', Callback = function(v) S.ArrowThink = v end })
     local eval = box:AddLabel('-', true)
     every(0.5, function() eval:SetText('best: ' .. Stats.Eval) end)
 end
