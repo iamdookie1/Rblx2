@@ -392,6 +392,9 @@ local canPlay = typeof(getgc) == "function" or typeof(run_on_actor) == "function
 --  ack   a beta copy ran command s
 --  bye   the script was closed
 -- Every copy says hi with q when it starts, so the ones already here answer.
+-- Each copy has its own id (i) and only skips its own messages, so the dev and
+-- beta scripts running on the same client find each other through the relay
+-- too, which is how you test it alone: you show up on your own beta list.
 -- A peer only counts while that player is in this server, commands are only
 -- taken from a dev copy in this server, and the dev copy asks again every two
 -- minutes to drop anyone whose script died without a bye. Without a WebSocket
@@ -456,6 +459,7 @@ local function makeLink(role, onCommand)
     local jobId = (tostring(game.JobId):gsub("[^%w]", ""):lower())
     local topic = "madness-ff-" .. (jobId ~= "" and jobId or ("solo" .. LocalPlayer.UserId))
     local me = LocalPlayer.UserId
+    local instance = HttpService:GenerateGUID(false)
     -- where to pick up from: the last message we saw, or the relay's last few
     -- seconds (by its own clock) for the first look
     local lastId = nil
@@ -464,7 +468,7 @@ local function makeLink(role, onCommand)
     local lastHi = 0
 
     local function post(message)
-        message.v, message.f = 1, me
+        message.v, message.f, message.i = 1, me, instance
         outbox[#outbox + 1] = HttpService:JSONEncode(message)
     end
 
@@ -483,7 +487,7 @@ local function makeLink(role, onCommand)
         local ok, data = pcall(HttpService.JSONDecode, HttpService, event.message)
         if not ok or type(data) ~= "table" or data.v ~= 1 then return end
         local from = tonumber(data.f)
-        if not from or from == me then return end
+        if not from or data.i == instance then return end
         local player = Players:GetPlayerByUserId(from)
         if not player then return end
 

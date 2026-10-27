@@ -1324,6 +1324,9 @@ end
 --  ack   a beta copy ran command s
 --  bye   the script was closed
 -- Every copy says hi with q when it starts, so the ones already here answer.
+-- Each copy has its own id (i) and only skips its own messages, so the dev and
+-- beta scripts running on the same client find each other through the relay
+-- too, which is how you test it alone: you show up on your own beta list.
 -- A peer only counts while that player is in this server, commands are only
 -- taken from a dev copy in this server, and the dev copy asks again every two
 -- minutes to drop anyone whose script died without a bye. Without a WebSocket
@@ -1388,6 +1391,7 @@ local function makeLink(role, onCommand)
     local jobId = (tostring(game.JobId):gsub("[^%w]", ""):lower())
     local topic = "madness-ff-" .. (jobId ~= "" and jobId or ("solo" .. LocalPlayer.UserId))
     local me = LocalPlayer.UserId
+    local instance = HttpService:GenerateGUID(false)
     -- where to pick up from: the last message we saw, or the relay's last few
     -- seconds (by its own clock) for the first look
     local lastId = nil
@@ -1396,7 +1400,7 @@ local function makeLink(role, onCommand)
     local lastHi = 0
 
     local function post(message)
-        message.v, message.f = 1, me
+        message.v, message.f, message.i = 1, me, instance
         outbox[#outbox + 1] = HttpService:JSONEncode(message)
     end
 
@@ -1415,7 +1419,7 @@ local function makeLink(role, onCommand)
         local ok, data = pcall(HttpService.JSONDecode, HttpService, event.message)
         if not ok or type(data) ~= "table" or data.v ~= 1 then return end
         local from = tonumber(data.f)
-        if not from or from == me then return end
+        if not from or data.i == instance then return end
         local player = Players:GetPlayerByUserId(from)
         if not player then return end
 
@@ -2369,7 +2373,8 @@ do
         for _, peer in ipairs(Link.List(LINK_BETA)) do
             local auto = bit32.band(peer.Flags or 0, LINK_FLAG_AUTO) ~= 0
             local playing = bit32.band(peer.Flags or 0, LINK_FLAG_PLAYING) ~= 0
-            lines[#lines + 1] = ("• %s   auto: %s%s"):format(peerName(peer.Player), auto and "on" or "off", playing and ", in a song" or "")
+            local you = peer.Player == LocalPlayer and " (you, found through the relay)" or ""
+            lines[#lines + 1] = ("• %s%s   auto: %s%s"):format(peerName(peer.Player), you, auto and "on" or "off", playing and ", in a song" or "")
         end
         betaLabel:SetText(#lines > 0 and table.concat(lines, "\n") or "nobody on beta in this lobby right now")
     end)
@@ -2393,7 +2398,10 @@ end
 do
     local Tab = Window:AddTab('Cmds', 'terminal', 'Mess with whoever is on beta')
 
-    -- "Me" runs the command on this client, to see what it does first
+    -- "Me (no relay)" runs the command on this client straight away, to see what
+    -- it does. to test the relay itself, run the beta script on this client too
+    -- and pick your own name: that goes out to the relay and back
+    local ME = "Me (no relay)"
     local targetName = "Everyone"
     local durationArg = 4 -- 8s
     local messageArg = 1
@@ -2401,18 +2409,18 @@ do
     local Sent = nil -- { Seq, Target, Name, At, Self }
 
     local function targetPlayer()
-        if targetName == "Everyone" or targetName == "Me" then return nil end
+        if targetName == "Everyone" or targetName == ME then return nil end
         return Players:FindFirstChild(targetName)
     end
 
     local function send(name, cmd, seconds, text)
-        if targetName == "Me" then
+        if targetName == ME then
             Pranks.Run(cmd, seconds, text)
             Sent = { Name = name, At = os.clock(), Self = true }
             return
         end
         if #Link.List(LINK_BETA) == 0 then
-            Library:Notify({ Title = 'Nobody on beta here', Description = 'There\'s no one running the beta script in this lobby. Pick "Me" to try it on yourself.', Time = 3 })
+            Library:Notify({ Title = 'Nobody on beta here', Description = 'There\'s no one running the beta script in this lobby. Pick "Me (no relay)" to try it on yourself, or run the beta script here too to test the relay.', Time = 3 })
             return
         end
         local target = targetPlayer()
@@ -2428,8 +2436,8 @@ do
     local targetBox = Tab:AddLeftGroupbox('Target', 'crosshair')
     local targetDropdown = targetBox:AddDropdown('ff_cmd_target', {
         Text = 'Send to',
-        Tooltip = 'Everyone on beta, one of them, or Me to try it on yourself',
-        Values = { 'Everyone', 'Me' },
+        Tooltip = 'Everyone on beta, one of them (your own name if you run beta here too), or Me (no relay) to try it locally',
+        Values = { 'Everyone', ME },
         Default = 'Everyone',
         Callback = function(value) targetName = value or "Everyone" end,
     })
@@ -2449,7 +2457,7 @@ do
 
     local lastList = ""
     every(1, function()
-        local names = { 'Everyone', 'Me' }
+        local names = { 'Everyone', ME }
         for _, peer in ipairs(Link.List(LINK_BETA)) do names[#names + 1] = peer.Player.Name end
         local key = table.concat(names, ",")
         if key ~= lastList then
@@ -2571,7 +2579,7 @@ do
     button(charBox, 'Make them dance', LINK_COMMANDS.Dance, true, 'plays Roblox\'s dance emote on them for a while')
 
     local otherBox = Tab:AddRightGroupbox('Other', 'skull')
-    button(otherBox, 'Unload their beta', LINK_COMMANDS.Unload, false, 'closes their beta script (on Me: closes this one)')
+    button(otherBox, 'Unload their beta', LINK_COMMANDS.Unload, false, 'closes their beta script (on Me (no relay): closes this one)')
     otherBox:AddButton({
         Text = 'Kick them (for real)',
         Tooltip = 'actually kicks them from the server, double click. they can just rejoin',
