@@ -69,7 +69,9 @@ AUTH_FILE = os.path.join(HERE, "relay_auth.json")
 SEED_FILE = os.path.join(HERE, "seed.txt")
 
 PORT = int(os.environ.get("PORT", "8080"))
-SUBDOMAIN = os.environ.get("FF_SUBDOMAIN", "funkyff")  # the serveo.net subdomain
+SUBDOMAIN = os.environ.get("FF_SUBDOMAIN", "funkyff")  # the name you reserved on Serveo
+# where Serveo serves reserved names: https://<subdomain>.<this>
+TUNNEL_DOMAIN = os.environ.get("FF_TUNNEL_DOMAIN", "serveousercontent.com")
 AUTH_WINDOW = 60          # seconds a request's timestamp may be off by
 MESSAGE_TTL = 120         # seconds a message is kept and handed to late pollers
 MAX_PER_TOPIC = 400       # most messages kept per topic
@@ -273,13 +275,13 @@ TUNNEL = {"proc": None}         # the running ssh process, so we can stop it
 def start_serveo(subdomain, port):
     """Open the Serveo SSH tunnel (the same `ssh -R ... serveo.net` by hand),
     pointed at our own port, in a thread that reconnects if Serveo drops. Serveo
-    gives HTTPS, so your relay URL is https://<subdomain>.serveo.net."""
+    gives HTTPS, so your relay URL is https://<subdomain>.serveousercontent.com."""
     if not shutil.which("ssh"):
         print("  tunnel: ssh not found -- run `pkg install openssh`, then this")
         print("          will bring the tunnel up itself. serving locally for now.")
         return None
     key = ensure_key()
-    expected = "https://%s.serveo.net" % subdomain
+    expected = "https://%s.%s" % (subdomain, TUNNEL_DOMAIN)
     cmd = [
         "ssh",
         "-o", "StrictHostKeyChecking=accept-new",  # don't hang on the host-key prompt
@@ -404,7 +406,7 @@ def main():
         print("Tunnel off (--no-tunnel). Expose port %d yourself; see README." % PORT)
     else:
         print("Opening the Serveo tunnel -- your relay URL will be:")
-        print("  https://%s.serveo.net   (put this in the script's LINK_RELAY)" % SUBDOMAIN)
+        print("  https://%s.%s   (put this in the script's LINK_RELAY)" % (SUBDOMAIN, TUNNEL_DOMAIN))
         print("  change the name with FF_SUBDOMAIN=yourname, or --no-tunnel to skip")
         tunnel = start_serveo(SUBDOMAIN, PORT)
     print("Ctrl+C to stop.")

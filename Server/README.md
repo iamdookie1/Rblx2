@@ -78,7 +78,7 @@ for you, pointed at its own port, prints the URL, and reconnects if Serveo
 drops. Your relay URL is therefore:
 
 ```
-https://funkyff.serveo.net
+https://funkyff.serveousercontent.com
 ```
 
 **One-time setup: register your SSH key with Serveo.** Serveo only gives you
@@ -87,16 +87,16 @@ it hands out a random `...serveousercontent.com` URL, which **has your IP
 address written into it** — don't use or share that one. The relay makes the key
 for you on first run (`~/.ssh/id_ed25519`) and uses it every run after. On that
 first run Serveo prints a link to register the key: open it, log in, then
-restart the relay. From then on you get `https://funkyff.serveo.net` every time,
+restart the relay. From then on you get `https://funkyff.serveousercontent.com` every time,
 and the relay prints `tunnel: OK -- ... matches the scripts' LINK_RELAY`. If it
 ever gets a different URL, it prints a `!!` warning saying so.
 
 Change the subdomain with `FF_SUBDOMAIN=yourname python funky_friday_relay.py`
-(→ `https://yourname.serveo.net`). Serveo occasionally goes down; if the tunnel
+(→ `https://yourname.serveousercontent.com`). Serveo occasionally goes down; if the tunnel
 log keeps retrying, try again later or use one of the alternatives below with
 `--no-tunnel`.
 
-Check it's reachable: open `https://funkyff.serveo.net/health` in a browser — it
+Check it's reachable: open `https://funkyff.serveousercontent.com/health` in a browser — it
 should say `ok`.
 
 ### Alternatives (run the relay with `--no-tunnel` and bring your own)
@@ -135,7 +135,7 @@ link block — no `getgenv` lines before `loadstring`, and the seed stays hidden
 in the obfuscated output:
 
 ```lua
-local LINK_RELAY = "https://funkyff.serveo.net"   -- your relay URL, no trailing slash
+local LINK_RELAY = "https://funkyff.serveousercontent.com"   -- your relay URL, no trailing slash
 local LINK_SEED  = "whatever phrase you like"      -- the same seed as the server
 ```
 
