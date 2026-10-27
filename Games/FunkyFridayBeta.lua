@@ -787,6 +787,36 @@ local function makeLink(role, onCommand)
         if ok then handle(event) end
     end
 
+    local function sslFailed(ok, response)
+        local text = ""
+        if not ok then
+            text = tostring(response)
+        elseif type(response) == "table" and (response.Success == false or (tonumber(response.StatusCode) or 0) == 0) then
+            text = tostring(response.StatusMessage or "") .. " " .. tostring(response.Body or "")
+        end
+        return text:lower():find("ssl") ~= nil
+    end
+
+    -- one request to the relay. when https can't even finish its handshake
+    -- (SslConnectFail: some executors won't take some tunnels' https), switch
+    -- to plain http for good. commands are RSA-signed, so http can't be used
+    -- to forge one; it only means the presence traffic isn't encrypted.
+    local function relayCall(method, path, body)
+        local opts = { Url = relay .. path, Method = method }
+        if body then
+            opts.Body = body
+            opts.Headers = { ["Content-Type"] = "text/plain" }
+        end
+        local ok, response = pcall(httpRequest, opts)
+        if relay:find("^https://") and sslFailed(ok, response) then
+            diag.Fallback = "https failed (" .. (ok and tostring(response.StatusMessage) or tostring(response)) .. "), switched to http"
+            relay = (relay:gsub("^https://", "http://"))
+            opts.Url = relay .. path
+            ok, response = pcall(httpRequest, opts)
+        end
+        return ok, response
+    end
+
     -- posts go out one at a time, in order. a busy relay (429) gets them again
     task.spawn(function()
         while httpRequest do
@@ -794,12 +824,7 @@ local function makeLink(role, onCommand)
                 if link.Stopped then break end
                 task.wait(0.05)
             else
-                local ok, response = pcall(httpRequest, {
-                    Url = relay .. "/" .. topic,
-                    Method = "POST",
-                    Headers = { ["Content-Type"] = "text/plain" },
-                    Body = outbox[1],
-                })
+                local ok, response = relayCall("POST", "/" .. topic, outbox[1])
                 if ok and type(response) == "table" then
                     diag.LastSend = tostring(response.StatusCode or "?")
                     local body = type(response.Body) == "string" and response.Body or ""
@@ -827,10 +852,7 @@ local function makeLink(role, onCommand)
     end
 
     local function poll()
-        local ok, response = pcall(httpRequest, {
-            Url = ("%s/%s/json?poll=1&since=%s"):format(relay, topic, since()),
-            Method = "GET",
-        })
+        local ok, response = relayCall("GET", ("/%s/json?poll=1&since=%s"):format(topic, since()))
         diag.Polls = diag.Polls + 1
         if not ok or type(response) ~= "table" or type(response.Body) ~= "string" then
             diag.LastPoll = "failed: " .. tostring(response)
@@ -955,8 +977,10 @@ local function makeLink(role, onCommand)
     end
 
     function link.DiagText()
-        return ("relay: %s\nsent %d, failed %d (last: %s)\npolls %d (last: %s), messages in %d")
+        local text = ("relay: %s\nsent %d, failed %d (last: %s)\npolls %d (last: %s), messages in %d")
             :format(relay, diag.Sent, diag.SendFails, diag.LastSend, diag.Polls, diag.LastPoll, diag.Got)
+        if diag.Fallback then text = text .. "\n" .. diag.Fallback end
+        return text
     end
 
     function link.Status()
