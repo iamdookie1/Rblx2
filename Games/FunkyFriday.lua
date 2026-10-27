@@ -1346,7 +1346,7 @@ end
 -- Keep this block the same in both files.
 
 local LINK_RELAY = "https://funkyff.serveousercontent.com"  -- your relay (Server/funky_friday_relay.py)
-local LINK_SEED = "I want dick :("          -- the same seed phrase the relay runs with (FF_SEED)
+local LINK_SEED = "1ac2a72473ddca69"          -- the same seed phrase the relay runs with (FF_SEED)
 -- advanced: an exact key/secret instead of deriving them from the seed above
 local LINK_RELAY_KEY = ""
 local LINK_RELAY_SECRET = ""
