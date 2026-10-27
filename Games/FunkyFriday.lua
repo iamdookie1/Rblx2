@@ -28,6 +28,10 @@
 --  Keypress      presses your lane keys with VirtualInputManager.
 -- The last two read the notes off the screen and predict when each one lands
 -- on its receptor from how fast it is moving, so they press within a frame.
+--
+-- This is the dev version of the beta script (Games/FunkyFridayBeta.lua). The
+-- two link up across clients: the Dev tab lists who in the lobby is on beta,
+-- and the Cmds tab sends them commands (see "link" below).
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -1292,6 +1296,200 @@ local function checkModes()
     return lines
 end
 
+--// link ----------------------------------------------------------------------
+-- Funky Friday (the dev script, Games/FunkyFriday.lua) and Funky Friday beta
+-- (Games/FunkyFridayBeta.lua) find each other across clients through
+-- animations: a track played on your own character replicates to everyone in
+-- the server, speed included. Each copy plays a "beacon" track at almost no
+-- weight (so it doesn't show), with a speed that says which script it is,
+-- its flags and the last command it ran. The dev copy also plays a short
+-- "command" track whose speed carries a command for the beta copies. Both
+-- animations are Roblox's own emotes, so they load in any game.
+-- Keep this block the same in both files.
+
+local LINK_BEACON_ID = "507770677"  -- the R15 cheer emote
+local LINK_COMMAND_ID = "507770453" -- the R15 point emote
+local LINK_BETA, LINK_DEV = 1, 2
+local LINK_FLAG_AUTO, LINK_FLAG_PLAYING = 1, 2
+
+-- arg -> seconds, for the commands that last a while
+local LINK_DURATIONS = { [0] = 1, 2, 3, 5, 8, 10, 15, 20, 30, 60 }
+local LINK_MESSAGES = {
+    [0] = "👀", "skill issue", "the dev is watching you", "you're not him", "nice miss lol",
+    "bro is NOT locked in", "turn around", "L + ratio", "do better", "gg ez",
+}
+local LINK_COMMANDS = {
+    AutoOff = 1, AutoOn = 2, Freeze = 3,
+    MissStorm = 4, AllBad = 5, Shaky = 6,
+    Shake = 7, Blur = 8, Rainbow = 9, FakeKick = 10,
+    Jump = 11, Sit = 12, Message = 13,
+    Unload = 14, Kick = 15,
+}
+
+-- role: LINK_BETA or LINK_DEV. onCommand(cmd, arg, fromPlayer) runs on beta
+-- copies for every command aimed at them.
+local function makeLink(role, onCommand)
+    local link = { Role = role, Flags = 0, Ack = 0, Seq = 0, Peers = {}, Stopped = false }
+    local own = { Animator = nil, Tracks = {} }
+    local queue = {}
+    local lastCommand = {} -- player -> last command value seen from them
+    local commandSince, commandUntil = 0, 0
+
+    local function animatorOf(player)
+        local character = player.Character
+        local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+        return humanoid and humanoid:FindFirstChildOfClass("Animator")
+    end
+
+    local function idOf(track)
+        local animation = track.Animation
+        return animation and tostring(animation.AnimationId):match("(%d+)%D*$")
+    end
+
+    local function ownTrack(key, id)
+        local animator = animatorOf(LocalPlayer)
+        if animator ~= own.Animator then
+            for _, track in pairs(own.Tracks) do pcall(function() track:Stop(0) end) end
+            table.clear(own.Tracks)
+            own.Animator = animator
+        end
+        if not animator then return nil end
+        local track = own.Tracks[key]
+        if not track then
+            local animation = Instance.new("Animation")
+            animation.AnimationId = "rbxassetid://" .. id
+            local ok, loaded = pcall(animator.LoadAnimation, animator, animation)
+            if not ok or not loaded then return nil end
+            loaded.Priority = Enum.AnimationPriority.Core
+            loaded.Looped = true
+            own.Tracks[key] = loaded
+            track = loaded
+        end
+        return track
+    end
+
+    -- plays (or re-plays, if the game stopped it) one of our tracks at a speed
+    local function play(key, id, speed)
+        local track = ownTrack(key, id)
+        if not track then return end
+        if not track.IsPlaying then
+            track:Play(0, 0.001, speed)
+            track:AdjustSpeed(speed)
+        elseif math.abs(track.Speed - speed) > 0.25 then
+            track:AdjustSpeed(speed)
+        end
+    end
+
+    local function stop(key)
+        local track = own.Tracks[key]
+        if track and track.IsPlaying then track:Stop(0) end
+    end
+
+    function link.TargetCode(player)
+        return player.UserId % 99 + 1
+    end
+
+    local function scan()
+        local now = os.clock()
+        for _, player in ipairs(Players:GetPlayers()) do
+            if player ~= LocalPlayer then
+                local animator = animatorOf(player)
+                local beacon, command
+                if animator then
+                    local ok, tracks = pcall(animator.GetPlayingAnimationTracks, animator)
+                    for _, track in ipairs(ok and tracks or {}) do
+                        local id = idOf(track)
+                        local value = math.floor(track.Speed + 0.5)
+                        if id == LINK_BEACON_ID and value >= 1000000 and value < 2000000 then
+                            beacon = value - 1000000
+                        elseif id == LINK_COMMAND_ID and value >= 100000 and value < 10000000 then
+                            command = value
+                        end
+                    end
+                end
+                if beacon then
+                    local peer = link.Peers[player]
+                    if not peer then
+                        peer = { Player = player }
+                        link.Peers[player] = peer
+                    end
+                    peer.Role = math.floor(beacon / 100000)
+                    peer.Flags = math.floor(beacon / 1000) % 100
+                    peer.Ack = beacon % 1000
+                    peer.Seen = now
+                end
+                if command and command ~= lastCommand[player] then
+                    lastCommand[player] = command
+                    local cmd = math.floor(command / 100000)
+                    local arg = math.floor(command / 10000) % 10
+                    local target = math.floor(command / 100) % 100
+                    local seq = command % 100
+                    if role == LINK_BETA and onCommand and (target == 0 or target == link.TargetCode(LocalPlayer)) then
+                        link.Ack = seq
+                        task.spawn(pcall, onCommand, cmd, arg, player)
+                    end
+                end
+            end
+        end
+        -- gone, or no beacon for a while (the game can stop everyone's tracks
+        -- for a moment, and they come back within half a second)
+        for player, peer in pairs(link.Peers) do
+            if not player.Parent or now - peer.Seen > 4 then link.Peers[player] = nil end
+        end
+        for player in pairs(lastCommand) do
+            if not player.Parent then lastCommand[player] = nil end
+        end
+    end
+
+    -- sends a command to one beta player, or to every one with no target.
+    -- returns its sequence number, which the target's beacon echoes once run
+    function link.Send(cmd, arg, target)
+        link.Seq = link.Seq % 99 + 1
+        local code = target and link.TargetCode(target) or 0
+        queue[#queue + 1] = cmd * 100000 + (arg or 0) * 10000 + code * 100 + link.Seq
+        return link.Seq
+    end
+
+    -- peers of a role, sorted by name
+    function link.List(wanted)
+        local list = {}
+        for _, peer in pairs(link.Peers) do
+            if not wanted or peer.Role == wanted then list[#list + 1] = peer end
+        end
+        table.sort(list, function(a, b) return a.Player.Name:lower() < b.Player.Name:lower() end)
+        return list
+    end
+
+    function link.Beaconing()
+        local track = own.Tracks.Beacon
+        return track ~= nil and track.IsPlaying
+    end
+
+    task.spawn(function()
+        while not link.Stopped do
+            local now = os.clock()
+            pcall(scan)
+            pcall(play, "Beacon", LINK_BEACON_ID, 1000000 + role * 100000 + link.Flags * 1000 + link.Ack)
+            -- commands go out one at a time, each held long enough to be seen,
+            -- and the track stops a few seconds after the last one
+            if #queue > 0 and now - commandSince >= 0.4 then
+                local value = table.remove(queue, 1)
+                commandSince, commandUntil = now, now + 3
+                pcall(play, "Command", LINK_COMMAND_ID, value)
+            elseif commandUntil > 0 and now >= commandUntil then
+                commandUntil = 0
+                pcall(stop, "Command")
+            end
+            task.wait(0.1)
+        end
+        for _, track in pairs(own.Tracks) do pcall(function() track:Stop(0) end) end
+    end)
+
+    return link
+end
+
+local Link = makeLink(LINK_DEV)
+
 --// teardown ----------------------------------------------------------------
 
 local function unload()
@@ -1299,6 +1497,7 @@ local function unload()
     Unloaded = true
     Auto.Enabled = false
     pcall(releaseScreen)
+    Link.Stopped = true
     Bridge:SetAttribute("Stop", true)
     for _, connection in ipairs(Connections) do
         pcall(function() connection:Disconnect() end)
@@ -1666,4 +1865,187 @@ do
         status:SetText(themesOn() and ("themes: " .. (hooked or "looking for the game...")) or "themes: off")
     end)
     look:AddLabel('Changes show straight away, on notes already on screen too. Needs getgc or run_on_actor, like game mode.', true)
+end
+
+--// dev ---------------------------------------------------------------------
+-- Everyone in the lobby running the beta script (Games/FunkyFridayBeta.lua),
+-- found through the link above, and commands to mess with them. They only
+-- ever touch the beta player's own client, and they all wear off.
+
+local function peerName(player)
+    if player.DisplayName ~= player.Name then return player.DisplayName .. " (@" .. player.Name .. ")" end
+    return "@" .. player.Name
+end
+
+do
+    local Tab = Window:AddTab('Dev', 'shield', 'Who is on beta in this lobby')
+
+    local betaBox = Tab:AddBigGroupbox('Beta users in this lobby', 'users')
+    local betaLabel = betaBox:AddLabel('looking...', true)
+    every(0.5, function()
+        local lines = {}
+        for _, peer in ipairs(Link.List(LINK_BETA)) do
+            local auto = bit32.band(peer.Flags or 0, LINK_FLAG_AUTO) ~= 0
+            local playing = bit32.band(peer.Flags or 0, LINK_FLAG_PLAYING) ~= 0
+            lines[#lines + 1] = ("• %s   auto: %s%s"):format(peerName(peer.Player), auto and "on" or "off", playing and ", in a song" or "")
+        end
+        betaLabel:SetText(#lines > 0 and table.concat(lines, "\n") or "nobody on beta in this lobby right now")
+    end)
+
+    local devBox = Tab:AddLeftGroupbox('Other dev users', 'shield')
+    local devLabel = devBox:AddLabel('-', true)
+    every(1, function()
+        local names = {}
+        for _, peer in ipairs(Link.List(LINK_DEV)) do names[#names + 1] = peerName(peer.Player) end
+        devLabel:SetText(#names > 0 and table.concat(names, "\n") or "just you")
+    end)
+
+    local linkBox = Tab:AddRightGroupbox('Link', 'radio')
+    local linkLabel = linkBox:AddLabel('-', true)
+    every(1, function()
+        linkLabel:SetText(Link.Beaconing() and "link: on, beta users can see you're here"
+            or "link: waiting for your character")
+    end)
+    linkBox:AddLabel('The scripts find each other through an emote track played on your character at no weight, so nobody sees it. A beta user shows up here a second or two after they load it, once you both have a character.', true)
+end
+
+do
+    local Tab = Window:AddTab('Cmds', 'terminal', 'Mess with whoever is on beta')
+
+    local targetName = "Everyone"
+    local durationArg = 4 -- 8s
+    local messageArg = 1
+    local Sent = nil -- { Seq, Target, Name, At }
+
+    local function targetPlayer()
+        if targetName == "Everyone" then return nil end
+        return Players:FindFirstChild(targetName)
+    end
+
+    local function send(name, cmd, arg)
+        if #Link.List(LINK_BETA) == 0 then
+            Library:Notify({ Title = 'Nobody on beta here', Description = 'There\'s no one running the beta script in this lobby.', Time = 3 })
+            return
+        end
+        local target = targetPlayer()
+        if targetName ~= "Everyone" and (not target or not Link.Peers[target]) then
+            Library:Notify({ Title = 'Not here', Description = targetName .. ' isn\'t on beta in this lobby anymore.', Time = 3 })
+            return
+        end
+        local seq = Link.Send(cmd, arg, target)
+        Sent = { Seq = seq, Target = target, Name = name, At = os.clock() }
+        log("Info", ("sent %s to %s"):format(name, target and peerName(target) or "every beta user"))
+    end
+
+    local targetBox = Tab:AddLeftGroupbox('Target', 'crosshair')
+    local targetDropdown = targetBox:AddDropdown('ff_cmd_target', {
+        Text = 'Send to',
+        Values = { 'Everyone' },
+        Default = 'Everyone',
+        Callback = function(value) targetName = value or "Everyone" end,
+    })
+    local durationValues = {}
+    for arg = 0, 9 do durationValues[#durationValues + 1] = LINK_DURATIONS[arg] .. 's' end
+    targetBox:AddDropdown('ff_cmd_duration', {
+        Text = 'How long',
+        Tooltip = 'for the commands that last a while: freeze, miss storm, shake, blur...',
+        Values = durationValues,
+        Default = durationValues[durationArg + 1],
+        Callback = function(value)
+            local index = table.find(durationValues, value)
+            if index then durationArg = index - 1 end
+        end,
+    })
+    local sentLabel = targetBox:AddLabel('last: -', true)
+
+    local lastList = ""
+    every(1, function()
+        local names = { 'Everyone' }
+        for _, peer in ipairs(Link.List(LINK_BETA)) do names[#names + 1] = peer.Player.Name end
+        local key = table.concat(names, ",")
+        if key ~= lastList then
+            lastList = key
+            targetDropdown:SetValues(names)
+        end
+        if not table.find(names, targetName) then
+            targetName = "Everyone"
+            targetDropdown:SetValue("Everyone")
+        end
+    end)
+
+    every(0.25, function()
+        if not Sent then return end
+        local done, total = 0, 0
+        for _, peer in ipairs(Link.List(LINK_BETA)) do
+            if not Sent.Target or peer.Player == Sent.Target then
+                total += 1
+                if peer.Ack == Sent.Seq then done += 1 end
+            end
+        end
+        local state
+        if total > 0 and done == total then
+            state = "done"
+        elseif os.clock() - Sent.At > 5 then
+            state = done > 0 and ("reached %d of %d"):format(done, total) or "didn't go through"
+        else
+            state = "sending..."
+        end
+        sentLabel:SetText(("last: %s -> %s: %s"):format(Sent.Name,
+            Sent.Target and Sent.Target.Name or "everyone", state))
+    end)
+
+    local function button(box, text, cmd, timed, tooltip)
+        box:AddButton({
+            Text = text,
+            Tooltip = tooltip,
+            Func = function() send(text, cmd, timed and durationArg or 0) end,
+        })
+    end
+
+    local autoBox = Tab:AddLeftGroupbox('Their auto play', 'music')
+    button(autoBox, 'Turn auto off', LINK_COMMANDS.AutoOff, false, 'flips their auto play toggle off')
+    button(autoBox, 'Turn auto on', LINK_COMMANDS.AutoOn, false, 'flips their auto play toggle on')
+    button(autoBox, 'Freeze auto', LINK_COMMANDS.Freeze, true, 'auto play stops hitting for a while, then carries on. their toggle stays on')
+
+    local judgeBox = Tab:AddRightGroupbox('Their judgements', 'dices')
+    button(judgeBox, 'Miss storm', LINK_COMMANDS.MissStorm, true, 'every note gets missed for a while')
+    button(judgeBox, 'All Bads', LINK_COMMANDS.AllBad, true, 'every hit is a Bad for a while')
+    button(judgeBox, 'Shaky hands', LINK_COMMANDS.Shaky, true, 'a mess of Goods, Oks, Bads and some misses for a while')
+
+    local screenBox = Tab:AddRightGroupbox('Their screen', 'monitor')
+    button(screenBox, 'Camera shake', LINK_COMMANDS.Shake, true)
+    button(screenBox, 'Blur', LINK_COMMANDS.Blur, true)
+    button(screenBox, 'Rainbow', LINK_COMMANDS.Rainbow, true)
+    button(screenBox, 'Fake kick', LINK_COMMANDS.FakeKick, true, 'a fake "Disconnected" box over their screen, then "jk"')
+
+    local messageBox = Tab:AddLeftGroupbox('Messages', 'message-circle')
+    local messageValues = {}
+    for arg = 0, 9 do messageValues[#messageValues + 1] = LINK_MESSAGES[arg] end
+    messageBox:AddDropdown('ff_cmd_message', {
+        Text = 'Message',
+        Values = messageValues,
+        Default = messageValues[messageArg + 1],
+        Callback = function(value)
+            local index = table.find(messageValues, value)
+            if index then messageArg = index - 1 end
+        end,
+    })
+    messageBox:AddButton({
+        Text = 'Pop it on their screen',
+        Func = function() send('Message', LINK_COMMANDS.Message, messageArg) end,
+    })
+
+    local charBox = Tab:AddLeftGroupbox('Their character', 'person-standing')
+    button(charBox, 'Make them jump', LINK_COMMANDS.Jump, false)
+    button(charBox, 'Make them sit', LINK_COMMANDS.Sit, false)
+
+    local otherBox = Tab:AddRightGroupbox('Other', 'skull')
+    button(otherBox, 'Unload their beta', LINK_COMMANDS.Unload, false, 'closes their beta script')
+    otherBox:AddButton({
+        Text = 'Kick them (for real)',
+        Tooltip = 'actually kicks them from the server, double click. they can just rejoin',
+        Risky = true,
+        DoubleClick = true,
+        Func = function() send('Kick', LINK_COMMANDS.Kick, 0) end,
+    })
 end
