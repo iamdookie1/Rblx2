@@ -77,6 +77,8 @@ local Games = {
     [139717576471404] = { Name = 'RoChess', Script = 'Games/RoChess.lua' },
     -- Ninja Legends by Muscle Legends Studio (game 1335695570), from its dump.
     [3956818381] = { Name = 'Ninja Legends', Script = 'Games/NinjaLegends.lua' },
+    -- Math Wars by Math Wars Club (game 10769958564), from its dump.
+    [107994348663960] = { Name = 'Math Wars', Script = 'Games/MathWars.lua' },
     -- [🎃] Dodge or Die (game 9845585365): every mode's place, from the game's
     -- own ServerModeConfig. AutoLoad runs it as soon as it is detected.
     [131794278839305] = { Name = 'Dodge or Die', Script = 'Games/DodgeOrDie.lua', AutoLoad = true },
@@ -104,6 +106,7 @@ local GameIds = {
     [7058980030] = { Name = 'Survive Overnight', Script = 'Games/SurviveOvernight.lua' },
     [10768845402] = { Name = 'RoChess', Script = 'Games/RoChess.lua' },
     [1335695570] = { Name = 'Ninja Legends', Script = 'Games/NinjaLegends.lua' },
+    [10769958564] = { Name = 'Math Wars', Script = 'Games/MathWars.lua' },
 }
 
 -- Games whose other modes (ranked, duels, events...) each have their own place
