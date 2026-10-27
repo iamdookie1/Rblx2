@@ -1,0 +1,2 @@
+# the key/secret the relay generates on first run -- never commit it
+relay_auth.json
