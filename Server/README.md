@@ -3,166 +3,109 @@
 A tiny message relay for the Funky Friday scripts
 ([`Games/FunkyFriday.lua`](../Games/FunkyFriday.lua) and
 [`Games/FunkyFridayBeta.lua`](../Games/FunkyFridayBeta.lua)), small enough to
-run on an Android phone in Termux. By default the scripts use the free public
-`ntfy.sh`; this lets you run your own instead, on a link that stays the same
-every session, with signed requests so nobody can read your room or send fake
-commands.
+run on an Android phone in Termux. Nothing but Python's standard library — **no
+`pip install`.**
 
-`funky_friday_relay.py` uses **only Python's standard library — there is nothing
-to `pip install`.** You just need Python itself and a tunnel to give the phone a
-public link.
+## How the security works
 
-## What you download
+The relay is **dumb and untrusted** — it just carries messages and needs no
+password. The security is in the messages:
 
-In Termux:
+- The **dev script holds an RSA private key** and signs every command.
+- The **beta script carries only the matching public key** — it can *check* a
+  signature but can never *make* one.
+
+So a beta copy, even fully deobfuscated, cannot forge a command, and neither can
+the relay or anyone watching it: only your dev client can issue commands. Each
+command also carries a timestamp and a one-time nonce, so a captured command
+can't be replayed. Because the proof is in the signature, **there is nothing to
+copy between this server and the scripts.**
+
+## 1. Make your key pair (once)
 
 ```sh
 pkg update && pkg install python git openssh
 git clone https://github.com/iamdookie1/Rblx2
 cd Rblx2/Server
+python make_key.py
 ```
 
-`python` runs the relay, `openssh` is for the SSH-based tunnels below (which
-need no extra binary), and `git` just pulls this repo. For a Cloudflare/ngrok
-tunnel you'd install that one tool too — see the options further down.
+It prints two long hex numbers:
 
-## 1. Pick a seed and run the relay
+- **PUBLIC n** → put it in **both** scripts as `LINK_PUB_N`. Safe to ship/commit.
+- **PRIVATE d** → only your **dev** client gets it. Set it on that client with
+  `getgenv().FunkyFridayDevKey = "<d>"` before the dev `loadstring`, or paste it
+  into `LINK_DEV_PRIVATE` in your own dev copy. **Never share or commit it** —
+  whoever holds it can command every beta user.
 
-The easy path is one **seed phrase** that you give to both the relay and the
-script. Each side works out the key, the secret and the request signatures from
-it, so there's only one value to keep in sync.
+Generating the key on your own phone means the private key never leaves it.
+(The exponent is always 65537, which the scripts already use, so you only copy
+`n` and `d`.) Run `make_key.py` again any time to roll a fresh pair — then update
+`LINK_PUB_N` everywhere.
+
+## 2. Run the relay
 
 ```sh
-FF_SEED="whatever phrase you like" python funky_friday_relay.py
+python funky_friday_relay.py
 ```
 
-It listens on port `8080` **and opens the tunnel for you** — see step 2. Run it
-with `--show` to print what the script needs:
+It listens on port `8080` **and opens the tunnel for you** (step 3). `--no-tunnel`
+serves locally only; `PORT=9000 ...` changes the local port.
 
-```sh
-python funky_friday_relay.py --seed "whatever phrase you like" --show
-```
+## 3. The public link (the relay opens it for you)
 
-Other ways to give it the seed: `--seed "phrase"` on the command line, or put
-the phrase in a file named `seed.txt` next to the script. Use a different port
-with `PORT=9000 ...`.
+The phone is behind your carrier/router, so you need a tunnel. Clients connect to
+the tunnel provider, not to your phone, so your phone/home IP is never in the
+public URL. (The provider does carry your traffic — you can't hide from the
+provider, only from the clients.)
 
-> Keep the seed private. Anyone who has it can send your scripts commands. Since
-> you obfuscate the public beta, baking the seed into it (see step 3) keeps it
-> out of sight. `seed.txt` and the generated `relay_auth.json` are gitignored so
-> they're never committed.
-
-(If you'd rather not use a seed, run it with no seed and it makes a random key
-and secret once, saved in `relay_auth.json` and the same every run; `--show`
-prints them and you paste them into `LINK_RELAY_KEY` / `LINK_RELAY_SECRET`.)
-
-## 2. The public link (the relay opens it for you)
-
-The phone is behind your carrier/router, so you need a tunnel. The clients
-connect to the tunnel provider, not to your phone, so your phone/home IP is
-never in the public URL the Roblox clients use. (The provider itself does carry
-your traffic — you can't hide from the provider, only from the clients.)
-
-On Android, tunnels that run their own binary (cloudflared, ngrok) sometimes
-fail to start in Termux with an `unexpected e_type: 2` loader error. So the
-relay uses the **SSH-based** Serveo tunnel, which runs through Termux's own
-`ssh` (the `openssh` you installed) and has no binary to trip over.
-
-**You don't run the tunnel separately — the relay does it.** On start it runs
+On Android, tunnels that run their own binary (cloudflared, ngrok) sometimes fail
+to start in Termux with an `unexpected e_type: 2` loader error, so the relay uses
+the SSH-based **Serveo** tunnel through Termux's own `ssh`. On start it runs
 
 ```sh
 ssh -R funkyff:80:localhost:8080 serveo.net
 ```
 
-for you, pointed at its own port, prints the URL, and reconnects if Serveo
-drops. Your relay URL is therefore:
+for you, pointed at its own port, and reconnects if Serveo drops. Your relay URL
+is `https://funkyff.serveousercontent.com` (change the name with
+`FF_SUBDOMAIN=yourname`).
 
-```
-https://funkyff.serveousercontent.com
-```
+**One-time: register your SSH key with Serveo.** Serveo only gives you a reserved
+name once your SSH key is registered; until then it hands out a random
+`...serveousercontent.com` URL that **has your IP address written into it** —
+don't use or share that one. The relay makes the key on first run
+(`~/.ssh/id_ed25519`); Serveo then prints a link to register it — open it, log
+in, and restart the relay. After that you get `https://funkyff.serveousercontent.com`
+every time and the relay prints `tunnel: OK -- ... matches the scripts' LINK_RELAY`.
 
-**One-time setup: register your SSH key with Serveo.** Serveo only gives you
-the name you asked for (`funkyff`) once your SSH key is registered; until then
-it hands out a random `...serveousercontent.com` URL, which **has your IP
-address written into it** — don't use or share that one. The relay makes the key
-for you on first run (`~/.ssh/id_ed25519`) and uses it every run after. On that
-first run Serveo prints a link to register the key: open it, log in, then
-restart the relay. From then on you get `https://funkyff.serveousercontent.com` every time,
-and the relay prints `tunnel: OK -- ... matches the scripts' LINK_RELAY`. If it
-ever gets a different URL, it prints a `!!` warning saying so.
+Check it: open `https://funkyff.serveousercontent.com/health` — it should say `ok`.
 
-Change the subdomain with `FF_SUBDOMAIN=yourname python funky_friday_relay.py`
-(→ `https://yourname.serveousercontent.com`). Serveo occasionally goes down; if the tunnel
-log keeps retrying, try again later or use one of the alternatives below with
-`--no-tunnel`.
+### Alternatives (run with `--no-tunnel` and bring your own)
 
-Check it's reachable: open `https://funkyff.serveousercontent.com/health` in a browser — it
-should say `ok`.
+- **Pinggy** (SSH-based, reliable; free URL rotates hourly):
+  `ssh -p 443 -R0:localhost:8080 qr@a.pinggy.io`
+- **Cloudflare Tunnel** (`pkg install tur-repo && pkg install cloudflared`; a
+  stable hostname needs your own domain; may hit the `e_type` error).
+- **ngrok** (free static domain; same binary caveat).
 
-### Alternatives (run the relay with `--no-tunnel` and bring your own)
+## 4. Point the scripts at the relay
 
-- **Pinggy** — SSH-based like Serveo, very reliable; free URL rotates every 60
-  minutes, a cheap plan keeps it fixed:
-  `ssh -p 443 -R0:localhost:8080 qr@a.pinggy.io` (prints a `...pinggy.link` URL).
-
-#### Cloudflare Tunnel (robust, but needs the binary to run + a domain for a stable URL)
-
-```sh
-pkg install tur-repo && pkg install cloudflared
-cloudflared --version        # if this errors with "unexpected e_type", use Option A
-```
-
-- A quick tunnel is free and needs no account but the URL changes each run:
-  `cloudflared tunnel --url http://localhost:8080` → a random
-  `*.trycloudflare.com`. Fine for a one-off test.
-- A **stable** hostname needs a domain on Cloudflare: log in with
-  `cloudflared tunnel login`, create a named tunnel, and route a hostname
-  (e.g. `relay.yourdomain.com`) to `http://localhost:8080`. Cloudflare's
-  "locally-managed tunnel" guide covers it.
-
-#### ngrok (free static domain, but also a binary)
-
-Make a free ngrok account, install the Android/arm64 build, add your authtoken,
-and create the one free static domain the account includes
-(`funky-yourname.ngrok-free.app`), then
-`ngrok http --url=funky-yourname.ngrok-free.app 8080`. Same `e_type` caveat as
-cloudflared on some phones.
-
-## 3. Point the scripts at your relay
-
-You obfuscate the public beta, so just set the two constants near the top of the
-link block — no `getgenv` lines before `loadstring`, and the seed stays hidden
-in the obfuscated output:
+In **both** scripts, near the top of the link block:
 
 ```lua
-local LINK_RELAY = "https://funkyff.serveousercontent.com"   -- your relay URL, no trailing slash
-local LINK_SEED  = "whatever phrase you like"      -- the same seed as the server
+local LINK_RELAY = "https://funkyff.serveousercontent.com"   -- your relay URL
+local LINK_PUB_N = "<the PUBLIC n from make_key.py>"
 ```
 
-The script derives the key and secret from the seed, then stamps, adds a
-one-time nonce to, and signs (HMAC-SHA256) every request, and polls the relay
-(this relay has no WebSocket). The dev script's Link box will read
-`on, checking every 6s (your relay, signed)`.
-
-If you ever do want to set it at load time instead of baking it in, these still
-work and override the constants:
+On your **dev** client only, supply the private key (either line):
 
 ```lua
-getgenv().FunkyFridayRelay = "https://your-url"
-getgenv().FunkyFridayRelaySeed = "whatever phrase you like"
--- or an exact pair: getgenv().FunkyFridayRelayKey / .FunkyFridayRelaySecret
+getgenv().FunkyFridayDevKey = "<the PRIVATE d from make_key.py>"  -- before loadstring
+-- or paste d into LINK_DEV_PRIVATE in your own dev copy
 ```
 
-To test it all on one device, run **both** the dev and beta scripts in the same
-game with the same relay and seed — they find each other through your relay and
-you appear on your own beta list.
-
-## The four auth checks
-
-A request is only accepted when all four pass (see the top of the `.py`): the
-**key** matches, the **timestamp** is within a minute of the server's clock, the
-**nonce** hasn't been used before, and the **signature** (HMAC-SHA256 over
-key + topic + time + nonce + body, using the secret) is correct. The topic is
-one of the signed fields, so a request signed for your room can't be replayed
-into another. Anyone without the seed (hence without the secret) can't produce a
-valid signature, so forged commands are dropped.
+The dev script's Link box shows `(signing on)` when it has the key, or
+`(no dev key set -- can't send commands)` when it doesn't. Beta needs only the
+public key. Signing a command takes a second or two on the dev client (it's done
+off the main thread, so the game doesn't freeze); the beta check is instant.

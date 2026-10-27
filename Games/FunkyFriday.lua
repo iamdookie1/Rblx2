@@ -1313,48 +1313,45 @@ end
 --// link ----------------------------------------------------------------------
 -- Funky Friday (the dev script, Games/FunkyFriday.lua) and Funky Friday beta
 -- (Games/FunkyFridayBeta.lua) find each other through a relay on the web, not
--- through the game. Every copy in a server joins the same ntfy topic (named
--- from the server's JobId), listens to it over a WebSocket, and posts small
--- JSON messages to it with the executor's request function. Nothing is played
--- on your character, so it works without one, commands land in a fraction of
--- a second, a command reaches exactly the UserId it is for, and messages can
--- carry real values (any duration, your own text).
+-- through the game. Every copy in a server joins the same topic (named from the
+-- server's JobId) and posts small JSON messages to it with the executor's
+-- request function. Nothing is played on your character, so it works without
+-- one, commands land quickly, and a command reaches exactly the UserId it's for.
 --  hi    who you are: role and flags. q = true asks everyone to answer with theirs
 --  cmd   a command for one beta user (t = their UserId) or all of them (t = 0)
 --  ack   a beta copy ran command s
 --  bye   the script was closed
--- Every copy says hi with q when it starts, so the ones already here answer.
--- Each copy has its own id (i) and only skips its own messages, so the dev and
--- beta scripts running on the same client find each other through the relay
--- too, which is how you test it alone: you show up on your own beta list.
--- A peer only counts while that player is in this server, commands are only
--- taken from a dev copy in this server, and the dev copy asks again every two
--- minutes to drop anyone whose script died without a bye. Without a WebSocket
--- it polls the topic every few seconds instead.
 --
--- To use your own relay (Server/funky_friday_relay.py, run on your phone in
--- Termux) instead of the public ntfy.sh, fill in LINK_RELAY and LINK_SEED just
--- below with your tunnel URL and one shared seed phrase. The script works out
--- the key, the secret and every request's signature from the seed on its own,
--- so there is nothing to pass in before loadstring -- handy when you obfuscate
--- the script, which keeps the seed out of sight. Set the same seed on the
--- server (FF_SEED). With a seed set, every request is stamped, given a one-time
--- nonce and signed (HMAC-SHA256) so the relay tells your scripts from anyone
--- else and drops forged commands; it then polls (that relay has no WebSocket).
--- (getgenv().FunkyFridayRelay / .FunkyFridayRelaySeed / .FunkyFridayRelayKey /
--- .FunkyFridayRelaySecret still override the constants at load time if you want.)
--- Keep this block the same in both files.
+-- Commands are signed with RSA. The dev script holds a private key and signs
+-- every command; the beta script carries only the matching PUBLIC key and
+-- checks the signature, so a beta copy (even fully deobfuscated) can verify a
+-- command but can never make one -- only the dev's own client can. Each command
+-- also carries a timestamp and a one-time nonce, so a captured command can't be
+-- replayed. The relay itself needs no secret and is never trusted: it just
+-- carries bytes, and a message it (or anyone) forges fails the signature check.
+--
+-- The public key below is safe to ship in both scripts. The dev's PRIVATE key
+-- is not set here -- put it on the dev's own client with
+--   getgenv().FunkyFridayDevKey = "<hex>"   (before loadstring)
+-- or paste it into LINK_DEV_PRIVATE in the dev's own copy. Never share or commit
+-- it: whoever holds it can command every beta user. Without it the dev script
+-- still lists beta users but can't send commands.
+--
+-- Set getgenv().FunkyFridayRelay before loading to use a different relay URL.
+-- Keep this whole block the same in both files.
 
 local LINK_RELAY = "https://funkyff.serveousercontent.com"  -- your relay (Server/funky_friday_relay.py)
-local LINK_SEED = ""          -- the same seed phrase the relay runs with (FF_SEED)
--- advanced: an exact key/secret instead of deriving them from the seed above
-local LINK_RELAY_KEY = "4510b0b9d1028da6"
-local LINK_RELAY_SECRET = "e612f27b3aa6a1c51a1f9db4cd833d70af4a296d9670c712630957599fdbdf9a"
+-- RSA-2048 public key (modulus n as hex; exponent e = 65537). Public: fine to ship.
+local LINK_PUB_N = "e6220846e7680c937891dbff9be774cdfb847c9cc8e3e49c4abd33e02a422b684f218e2c340895cfd1ef48c5d2132bbe13c823957480d37fa64898dff254c80858ea2954d7a24538fe2b44ec1a6b5d0f828a00492e979d4dc1559ef9d2c974ed455b9de0a18f5c8344bc6e46162ec828a80558d2413b9d37c516d008e55db2f51f15b4fec6f6742e877682f996099f644353006e023125297539e7b75072a77df9c0d62b1da79df9516945d39ad3014f862ad5c681d167c7c28f8ab46d0816e99b2538f69a4366a1515e41cbf58d45daff22ae44047edb26dbbf6e2bbea133a87560fb222fa5ff1173f68b621b952e88d48a08e51f9a42a3c1c00ec33f0d0487"
+local LINK_PUB_E = "10001"
+local LINK_DEV_PRIVATE = ""  -- dev private exponent d (hex); leave "" and use getgenv().FunkyFridayDevKey
+
 local LINK_BETA, LINK_DEV = 1, 2
 local LINK_FLAG_AUTO, LINK_FLAG_PLAYING = 1, 2
-local LINK_POLL_EVERY = 6   -- seconds, when there's no WebSocket
-local LINK_ASK_EVERY = 120  -- seconds, the dev copy's roll call
+local LINK_POLL_EVERY = 6    -- seconds, when there's no WebSocket
+local LINK_ASK_EVERY = 120   -- seconds, the dev copy's roll call
 local LINK_TEXT_MAX = 120
+local LINK_SIG_WINDOW = 90   -- seconds a signed command stays valid (clock skew + travel)
 
 -- index -> seconds, for the duration picker
 local LINK_DURATIONS = { [0] = 1, 2, 3, 5, 8, 10, 15, 20, 30, 60 }
@@ -1396,9 +1393,7 @@ local function linkSocketFunction()
     return nil
 end
 
--- SHA-256 + HMAC in pure Lua (bit32 is in Roblox), for signing relay requests.
--- Only used when you run your own relay with a secret; the public ntfy.sh
--- default sends nothing signed.
+-- SHA-256 in pure Lua (bit32 is in Roblox), used to hash a command before signing.
 local LINK_SHA_K = {
     0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
     0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
@@ -1449,25 +1444,181 @@ local function linkSha256(msg)
     return ("%08x%08x%08x%08x%08x%08x%08x%08x"):format(h0,h1,h2,h3,h4,h5,h6,h7)
 end
 
-local function linkHexBytes(s)
-    return (s:gsub("%x%x", function(h) return string.char(tonumber(h, 16)) end))
+-- Montgomery big-number math (base 2^24) for RSA. modexp(base, exp, mod) only;
+-- verify (exponent 65537) is quick, signing (full private exponent) is heavier
+-- and yields through onStep so it never freezes the game.
+local LINK_BIG = (function()
+    local B = 16777216
+    local BIG = {}
+
+    local function limbs(hex, s)
+        hex = hex:gsub("%s", "")
+        if #hex % 6 ~= 0 then hex = ("0"):rep(6 - #hex % 6) .. hex end
+        local t = {}
+        for i = 1, s do t[i] = 0 end
+        local idx, pos = 1, #hex
+        while pos > 0 and idx <= s do
+            t[idx] = tonumber(hex:sub(math.max(1, pos - 5), pos), 16)
+            pos = pos - 6
+            idx = idx + 1
+        end
+        return t
+    end
+
+    local function cmp(a, b, s)
+        for i = s, 1, -1 do
+            if a[i] > b[i] then return 1 elseif a[i] < b[i] then return -1 end
+        end
+        return 0
+    end
+
+    local function subInto(a, b, s)
+        local borrow = 0
+        for i = 1, s do
+            local v = a[i] - b[i] - borrow
+            if v < 0 then v = v + B; borrow = 1 else borrow = 0 end
+            a[i] = v
+        end
+    end
+
+    local function dbl(x, m, s)
+        local carry = 0
+        for i = 1, s do
+            local v = x[i] * 2 + carry
+            x[i] = v % B
+            carry = (v >= B) and 1 or 0
+        end
+        if carry == 1 or cmp(x, m, s) >= 0 then subInto(x, m, s) end
+    end
+
+    local function powerOfTwoModM(exp2, m, s)
+        local x = {}
+        for i = 1, s do x[i] = 0 end
+        x[1] = 1
+        for _ = 1, exp2 do dbl(x, m, s) end
+        return x
+    end
+
+    local function invMod2_24(a)
+        local inv = 1
+        for _ = 1, 5 do
+            inv = (inv * (2 - a * inv % B)) % B
+            if inv < 0 then inv = inv + B end
+        end
+        return inv % B
+    end
+
+    local function montmul(a, b, m, n0inv, s)
+        local t = {}
+        for i = 1, s + 2 do t[i] = 0 end
+        for i = 1, s do
+            local ai, c = a[i], 0
+            for j = 1, s do
+                local v = t[j] + ai * b[j] + c
+                t[j] = v % B
+                c = math.floor(v / B)
+            end
+            local v = t[s + 1] + c
+            t[s + 1] = v % B
+            t[s + 2] = t[s + 2] + math.floor(v / B)
+            local u = (t[1] * n0inv) % B
+            c = math.floor((t[1] + u * m[1]) / B)
+            for j = 2, s do
+                local w = t[j] + u * m[j] + c
+                t[j - 1] = w % B
+                c = math.floor(w / B)
+            end
+            v = t[s + 1] + c
+            t[s] = v % B
+            c = math.floor(v / B)
+            t[s + 1] = t[s + 2] + c
+            t[s + 2] = 0
+        end
+        local r = {}
+        for i = 1, s do r[i] = t[i] end
+        if t[s + 1] ~= 0 or cmp(r, m, s) >= 0 then subInto(r, m, s) end
+        return r
+    end
+
+    local function bitsMSB(exp, s)
+        local top = s
+        while top > 1 and exp[top] == 0 do top = top - 1 end
+        local bits = {}
+        for i = top, 1, -1 do
+            local limb = exp[i]
+            local hi = (i == top)
+            for bit = 23, 0, -1 do
+                local b = math.floor(limb / 2 ^ bit) % 2
+                if not (hi and #bits == 0 and b == 0) then bits[#bits + 1] = b end
+            end
+        end
+        if #bits == 0 then bits[1] = 0 end
+        return bits
+    end
+
+    -- base, exp, mod are hex strings; returns the result as a hex string
+    function BIG.modexp(baseHex, expHex, modHex, s, onStep)
+        local m = limbs(modHex, s)
+        local base = limbs(baseHex, s)
+        local exp = limbs(expHex, s)
+        local n0inv = (B - invMod2_24(m[1])) % B
+        local R2 = powerOfTwoModM(48 * s, m, s)
+        local one = {}
+        for i = 1, s do one[i] = 0 end
+        one[1] = 1
+        local baseM = montmul(base, R2, m, n0inv, s)
+        local resM = montmul(one, R2, m, n0inv, s)
+        local bits = bitsMSB(exp, s)
+        for k = 1, #bits do
+            resM = montmul(resM, resM, m, n0inv, s)
+            if bits[k] == 1 then resM = montmul(resM, baseM, m, n0inv, s) end
+            if onStep and k % 24 == 0 then onStep() end
+        end
+        local r = montmul(resM, one, m, n0inv, s)
+        local parts = {}
+        for i = s, 1, -1 do parts[#parts + 1] = ("%06x"):format(r[i]) end
+        local hex = table.concat(parts):gsub("^0+", "")
+        return hex == "" and "0" or hex
+    end
+
+    return BIG
+end)()
+
+-- RSA: the modulus length in base-2^24 limbs, plus a spare
+local LINK_S = math.floor(#LINK_PUB_N * 4 / 24) + 2
+
+-- EM = 0x00 01 FF..FF 00 || SHA256(msg), filled to the modulus byte length.
+-- A fixed deterministic padding (PKCS#1 v1.5 style); both sides use the same.
+local function linkPadded(msg)
+    local k = math.floor(#LINK_PUB_N / 2)          -- modulus length in bytes
+    return "0001" .. ("ff"):rep(k - 3 - 32) .. "00" .. linkSha256(msg)
 end
 
-local function linkHmac(key, message)
-    if #key > 64 then key = linkHexBytes(linkSha256(key)) end
-    key = key .. string.rep("\0", 64 - #key)
-    local ipad, opad = {}, {}
-    for i = 1, 64 do
-        local b = key:byte(i)
-        ipad[i] = string.char(bit32.bxor(b, 0x36))
-        opad[i] = string.char(bit32.bxor(b, 0x5c))
-    end
-    local inner = linkHexBytes(linkSha256(table.concat(ipad) .. message))
-    return linkSha256(table.concat(opad) .. inner)
+local function linkStripHex(h)
+    local r = h:gsub("^0+", "")
+    return r == "" and "0" or r
+end
+
+-- the exact bytes that get signed for a command
+local function linkCanon(cmd, seconds, target, ts, nonce, text)
+    return ("FFv2\n%d\n%d\n%d\n%d\n%s\n%s"):format(cmd, seconds, target, ts, nonce, text)
+end
+
+-- dev side: sign a command (heavy; yields through onStep)
+local function linkSign(private, msg)
+    return LINK_BIG.modexp(linkPadded(msg), private, LINK_PUB_N, LINK_S, function()
+        task.wait()
+    end)
+end
+
+-- beta side: true when sig is the dev's signature over msg (quick)
+local function linkVerify(msg, sig)
+    local ok, got = pcall(LINK_BIG.modexp, sig, LINK_PUB_E, LINK_PUB_N, LINK_S)
+    return ok and got == linkStripHex(linkPadded(msg))
 end
 
 -- role: LINK_BETA or LINK_DEV. onCommand(cmd, seconds, text, fromPlayer) runs
--- on beta copies for every command aimed at them.
+-- on beta copies for every command aimed at them that carries a valid signature.
 local function makeLink(role, onCommand)
     local link = { Role = role, Flags = 0, Seq = 0, Peers = {}, Stopped = false, Mode = "starting" }
     local httpRequest = linkRequestFunction()
@@ -1477,46 +1628,49 @@ local function makeLink(role, onCommand)
     local topic = "madness-ff-" .. (jobId ~= "" and jobId or ("solo" .. LocalPlayer.UserId))
     local me = LocalPlayer.UserId
     local instance = HttpService:GenerateGUID(false)
-    local seed = tostring(Genv.FunkyFridayRelaySeed or LINK_SEED)
-    local relayKey = tostring(Genv.FunkyFridayRelayKey or LINK_RELAY_KEY)
-    local relaySecret = tostring(Genv.FunkyFridayRelaySecret or LINK_RELAY_SECRET)
-    -- a seed makes the key and secret on its own, so only the seed is set
-    if seed ~= "" and relaySecret == "" then
-        relayKey = linkSha256("FFKEY:" .. seed):sub(1, 16)
-        relaySecret = linkSha256("FFSECRET:" .. seed)
-    end
-    local signed = relaySecret ~= ""
-    -- where to pick up from: the last message we saw, or the relay's last few
-    -- seconds (by its own clock) for the first look
+    local devPrivate = tostring(Genv.FunkyFridayDevKey or LINK_DEV_PRIVATE)
+    local canSign = role == LINK_DEV and devPrivate ~= ""
+    link.CanSign = canSign
     local lastId = nil
     local seen = {}
     local outbox = {}
     local lastHi = 0
-
-    -- the headers for a request: just the content type on public ntfy.sh, plus
-    -- a timestamp, a one-time nonce and an HMAC signature on your own relay
-    local function authHeaders(body)
-        local headers = { ["Content-Type"] = "text/plain" }
-        if signed then
-            local stamp = tostring(os.time())
-            local nonce = HttpService:GenerateGUID(false)
-            headers["X-FF-Key"] = relayKey
-            headers["X-FF-Time"] = stamp
-            headers["X-FF-Nonce"] = nonce
-            headers["X-FF-Sign"] = linkHmac(relaySecret,
-                table.concat({ relayKey, topic, stamp, nonce, body or "" }, "\n"))
-        end
-        return headers
-    end
+    local usedNonce = {}      -- beta: nonce -> expiry, so a command can't be replayed
+    local verifying = 0       -- beta: signature checks in flight, capped against floods
 
     local function post(message)
-        message.v, message.f, message.i = 1, me, instance
+        message.v, message.f, message.i = 2, me, instance
         outbox[#outbox + 1] = HttpService:JSONEncode(message)
     end
 
     local function hello(ask)
         lastHi = os.clock()
         post({ k = "hi", r = role, fl = link.Flags, q = ask or nil })
+    end
+
+    local function onCmd(data, player, peer)
+        if not peer or peer.Role ~= LINK_DEV then return end
+        local target = tonumber(data.t) or 0
+        if target ~= 0 and target ~= me then return end
+        local ts, nonce = tonumber(data.ts), data.n
+        if not ts or math.abs(os.time() - ts) > LINK_SIG_WINDOW then return end
+        if type(nonce) ~= "string" or usedNonce[nonce] then return end
+        if type(data.sig) ~= "string" then return end
+        if verifying > 3 then return end          -- someone's flooding; don't burn CPU
+        local cmd = tonumber(data.c)
+        local seconds = tonumber(data.d) or 0
+        local text = type(data.x) == "string" and data.x:sub(1, LINK_TEXT_MAX) or ""
+        usedNonce[nonce] = os.time() + LINK_SIG_WINDOW * 2   -- reserve now so it's checked once
+        local msg = linkCanon(cmd, seconds, target, ts, nonce, text)
+        verifying = verifying + 1
+        task.spawn(function()
+            local good = linkVerify(msg, data.sig)
+            verifying = verifying - 1
+            if good then
+                post({ k = "ack", s = tonumber(data.s) or 0 })
+                pcall(onCommand, cmd, seconds, text, player)
+            end
+        end)
     end
 
     local function handle(event)
@@ -1527,7 +1681,7 @@ local function makeLink(role, onCommand)
             lastId = event.id
         end
         local ok, data = pcall(HttpService.JSONDecode, HttpService, event.message)
-        if not ok or type(data) ~= "table" or data.v ~= 1 then return end
+        if not ok or type(data) ~= "table" or data.v ~= 2 then return end
         local from = tonumber(data.f)
         if not from or data.i == instance then return end
         local player = Players:GetPlayerByUserId(from)
@@ -1548,12 +1702,7 @@ local function makeLink(role, onCommand)
         elseif data.k == "ack" then
             if peer then peer.Ack = tonumber(data.s) or peer.Ack end
         elseif data.k == "cmd" and role == LINK_BETA and onCommand then
-            if not peer or peer.Role ~= LINK_DEV then return end
-            local target = tonumber(data.t) or 0
-            if target ~= 0 and target ~= me then return end
-            post({ k = "ack", s = tonumber(data.s) or 0 })
-            local text = type(data.x) == "string" and data.x:sub(1, LINK_TEXT_MAX) or ""
-            task.spawn(pcall, onCommand, tonumber(data.c), tonumber(data.d), text, player)
+            onCmd(data, player, peer)
         end
     end
 
@@ -1572,7 +1721,7 @@ local function makeLink(role, onCommand)
                 local ok, response = pcall(httpRequest, {
                     Url = relay .. "/" .. topic,
                     Method = "POST",
-                    Headers = authHeaders(outbox[1]),
+                    Headers = { ["Content-Type"] = "text/plain" },
                     Body = outbox[1],
                 })
                 if ok and type(response) == "table" and response.StatusCode == 429 and not link.Stopped then
@@ -1592,7 +1741,6 @@ local function makeLink(role, onCommand)
         local ok, response = pcall(httpRequest, {
             Url = ("%s/%s/json?poll=1&since=%s"):format(relay, topic, since()),
             Method = "GET",
-            Headers = authHeaders(""),
         })
         if not ok or type(response) ~= "table" or type(response.Body) ~= "string" then return false end
         for line in response.Body:gmatch("[^\n]+") do handleText(line) end
@@ -1606,7 +1754,7 @@ local function makeLink(role, onCommand)
             return
         end
         hello(true)
-        local socketWorks, hadSocket = socketConnect ~= nil and not signed, false
+        local socketWorks, hadSocket = socketConnect ~= nil, false
         while not link.Stopped do
             local socket
             if socketWorks then
@@ -1638,7 +1786,7 @@ local function makeLink(role, onCommand)
         end
     end)
 
-    -- flag changes, the dev copy's roll call, and players who left
+    -- flag changes, the dev copy's roll call, players who left, and old nonces
     task.spawn(function()
         local sentFlags = link.Flags
         local nextAsk = os.clock() + LINK_ASK_EVERY
@@ -1659,20 +1807,32 @@ local function makeLink(role, onCommand)
                 if not player.Parent or silent then link.Peers[player] = nil end
             end
             if askedAt and now - askedAt > 10 then askedAt = nil end
+            local t = os.time()
+            for nonce, expiry in pairs(usedNonce) do
+                if expiry < t then usedNonce[nonce] = nil end
+            end
             task.wait(0.5)
         end
     end)
 
-    -- sends a command to one beta player, or to every one with no target.
-    -- returns its sequence number, which the target acks once it has run it
+    -- sends a signed command to one beta player, or to every one with no target.
+    -- returns its sequence number and whether it could sign (needs the dev key).
+    -- signing runs in the background (a second or two) and the post follows it.
     function link.Send(cmd, seconds, text, target)
         link.Seq = link.Seq % 9999 + 1
-        post({
-            k = "cmd", c = cmd, d = seconds, s = link.Seq,
-            x = text and tostring(text):sub(1, LINK_TEXT_MAX) or nil,
-            t = target and target.UserId or 0,
-        })
-        return link.Seq
+        local seq = link.Seq
+        if not canSign then return seq, false end
+        seconds = tonumber(seconds) or 0
+        text = text and tostring(text):sub(1, LINK_TEXT_MAX) or ""
+        local tgt = target and target.UserId or 0
+        local ts = os.time()
+        local nonce = HttpService:GenerateGUID(false)
+        task.spawn(function()
+            local sig = linkSign(devPrivate, linkCanon(cmd, seconds, tgt, ts, nonce, text))
+            post({ k = "cmd", c = cmd, d = seconds, s = seq, t = tgt, ts = ts, n = nonce,
+                   x = (text ~= "" and text or nil), sig = sig })
+        end)
+        return seq, true
     end
 
     -- peers of a role, sorted by name
@@ -1686,11 +1846,15 @@ local function makeLink(role, onCommand)
     end
 
     function link.Status()
-        local tag = signed and " (your relay, signed)" or ""
         if link.Mode == "off" then return "off: this executor has no request function" end
-        if link.Mode == "live" then return "live over a WebSocket" .. tag end
-        if link.Mode == "polling" then return ("on, checking every %ds"):format(LINK_POLL_EVERY) .. tag end
-        return link.Mode .. "..." .. tag
+        local base
+        if link.Mode == "live" then base = "live over a WebSocket"
+        elseif link.Mode == "polling" then base = ("on, checking every %ds"):format(LINK_POLL_EVERY)
+        else base = link.Mode .. "..." end
+        if role == LINK_DEV then
+            base = base .. (canSign and " (signing on)" or " (no dev key set -- can't send commands)")
+        end
+        return base
     end
 
     -- says bye so the others drop us straight away, then stops
@@ -2529,6 +2693,10 @@ do
         if targetName == ME then
             Pranks.Run(cmd, seconds, text)
             Sent = { Name = name, At = os.clock(), Self = true }
+            return
+        end
+        if not Link.CanSign then
+            Library:Notify({ Title = 'No dev key set', Description = 'Commands are signed, and this client has no dev key, so it can\'t send them. Set getgenv().FunkyFridayDevKey = "..." before loading, or use "Me (no relay)" to try pranks on yourself.', Time = 6 })
             return
         end
         if #Link.List(LINK_BETA) == 0 then
