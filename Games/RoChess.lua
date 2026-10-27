@@ -253,7 +253,7 @@ local Brain = (function()
     end
 
     local nodes, deadline, sliceStart, stopped, canStop = 0, 0, 0, false, false
-    local yieldFn, SLICE = nil, 0.012
+    local yieldFn, SLICE = nil, 0.006
     local rootBest, rootScore = 0, 0
 
     local function addPiece(sq, p)
@@ -774,7 +774,7 @@ local Brain = (function()
 
     local function qsearch(alpha, beta, ply)
         nodes += 1
-        if band(nodes, 1023) == 0 then poll() end
+        if band(nodes, 255) == 0 then poll() end
         if stopped then return 0 end
         local stand = evaluate()
         if ply >= MAXPLY then return stand end
@@ -834,7 +834,7 @@ local Brain = (function()
         if inCheck then depth += 1 end
         if depth <= 0 or ply >= MAXPLY - 4 then return qsearch(alpha, beta, ply) end
         nodes += 1
-        if band(nodes, 1023) == 0 then poll() end
+        if band(nodes, 255) == 0 then poll() end
         if stopped then return 0 end
         local pv = beta - alpha > 1
         local idx = band(h1, TMASK) + 1
@@ -1216,6 +1216,11 @@ local S = {
     AutoCrate = false,
     Crate = "pieces",
     AntiAfk = true,
+    OnlinePlay = false,
+    OnlineThink = 0.5,
+    OnlineDelayMin = 0.4,
+    OnlineDelayMax = 1.5,
+    OnlineQueue = false,
 }
 
 local Stats = { Games = 0, Wins = 0, Draws = 0, Losses = 0, Puzzles = 0, Status = "idle", Eval = "-" }
@@ -1235,6 +1240,7 @@ local Config = safeRequire(ChessFolder and ChessFolder:FindFirstChild("Config"))
 local Levels = safeRequire(ChessFolder and ChessFolder:FindFirstChild("Levels"))
 
 local App
+local NextScan = 0
 local function isApp(t)
     return type(t) == "table" and type(rawget(t, "onBoardMove")) == "function"
         and type(rawget(t, "startBotGame")) == "function"
@@ -1243,7 +1249,8 @@ end
 
 local function findApp()
     if isApp(App) then return App end
-    if typeof(getgc) == "function" then
+    if typeof(getgc) == "function" and os.clock() >= NextScan then
+        NextScan = os.clock() + 5
         local ok, list = pcall(getgc, true)
         if ok and type(list) == "table" then
             for _, v in ipairs(list) do
@@ -1272,9 +1279,8 @@ local function engineYield()
     task.wait()
 end
 
-local function yielderFor(seconds)
-    if seconds and seconds > 0.25 then return engineYield end
-    return nil
+local function yielderFor()
+    return engineYield
 end
 
 local function bestFor(s, seconds)
@@ -1430,7 +1436,81 @@ task.spawn(function()
     end
 end)
 
-local ARROW_KINDS = { bot = true, puzzle = true, rush = true, analysis = true }
+local QUEUE_NAMES = { "findMatch", "startOnlineGame", "playOnline", "joinQueue", "queueOnline", "startSearch", "startMatchmaking", "quickPlay", "search" }
+local QUEUE_SKIP = { "leave", "cancel", "stop", "end", "exit", "quit" }
+
+local function findQueueFn()
+    local app = findApp()
+    if not app then return nil end
+    for _, name in ipairs(QUEUE_NAMES) do
+        if type(rawget(app, name)) == "function" then return app[name], name end
+    end
+    for k, v in pairs(app) do
+        if type(k) == "string" and type(v) == "function" then
+            local low = k:lower()
+            if low:find("queue") or low:find("online") or low:find("match") or low:find("search") then
+                local skip = false
+                for _, w in ipairs(QUEUE_SKIP) do
+                    if low:find(w) then skip = true break end
+                end
+                if not skip then return v, k end
+            end
+        end
+    end
+    return nil
+end
+
+local function queueOnline()
+    local app = findApp()
+    if not app or app.searching or onlineLive(app.session) then return false end
+    local fn = findQueueFn()
+    if not fn then return false end
+    return (pcall(fn))
+end
+
+task.spawn(function()
+    local lastEnd
+    while not Unloaded do
+        local s = session()
+        if S.OnlinePlay and s and s.kind == "online" then
+            if s.over then
+                countResult(s)
+                lastEnd = lastEnd or os.clock()
+                if S.OnlineQueue and not S.BotFarm and os.clock() - lastEnd > 3 then
+                    lastEnd = nil
+                    Stats.Status = "queueing online"
+                    queueOnline()
+                end
+            elseif myMoveReady(s) then
+                lastEnd = nil
+                Stats.Status = "thinking (online)"
+                local started = os.clock()
+                local best = bestFor(s, S.OnlineThink)
+                if best and session() == s and myMoveReady(s) then
+                    local lo, hi = S.OnlineDelayMin, math.max(S.OnlineDelayMin, S.OnlineDelayMax)
+                    local pause = lo + math.random() * (hi - lo) - (os.clock() - started)
+                    if pause > 0 then task.wait(pause) end
+                    if session() == s and myMoveReady(s) then
+                        playUci(best)
+                        Stats.Status = "played " .. best .. " (online)"
+                    end
+                end
+            else
+                Stats.Status = "opponent is thinking"
+            end
+        elseif S.OnlinePlay and S.OnlineQueue and not S.BotFarm and not (s and s.kind ~= "online" and not s.over) then
+            local app = findApp()
+            if app and not app.searching then
+                Stats.Status = "queueing online"
+                queueOnline()
+                task.wait(3)
+            end
+        end
+        task.wait(0.05)
+    end
+end)
+
+local ARROW_KINDS = { bot = true, puzzle = true, rush = true, analysis = true, online = true }
 local ArrowShown = false
 
 local function clearArrow()
@@ -1460,7 +1540,6 @@ task.spawn(function()
         else
             lastKey = nil
             if ArrowShown then clearArrow() end
-            if s and s.kind == "online" then Stats.Eval = "off in online games" end
         end
         task.wait(0.05)
     end
@@ -1553,7 +1632,7 @@ Library = lib
 
 local Window = Library:CreateWindow({
     Title = 'RoChess',
-    Footer = 'custom engine vs bots',
+    Footer = 'custom engine vs bots and online',
     Icon = 'crown',
     ToggleKeybind = Enum.KeyCode.RightShift,
     Theme = 'Ember',
@@ -1656,13 +1735,34 @@ do
         Func = function()
             task.spawn(function()
                 local s = session()
-                if s and s.kind ~= "online" and myMoveReady(s) then
+                if s and myMoveReady(s) then
                     local best = bestFor(s, S.ThinkTime)
                     if best then playUci(best) end
                 end
             end)
         end,
     })
+end
+
+do
+    local Tab = Window:AddTab('Online', 'globe', 'Engine plays your online games')
+
+    local play = Tab:AddLeftGroupbox('Online play', 'swords')
+    play:AddLabel('Plays your moves in live online games with the engine. A random delay between the min and max makes the timing look human.', true)
+    toggle(play, 'rc_online', 'Auto play online', 'OnlinePlay', 'plays the engine\'s move whenever it is your turn in an online game')
+        :AddKeyPicker('rc_online_key', { Default = 'None', Mode = 'Toggle', SyncToggleState = true, Text = 'Online play' })
+    toggle(play, 'rc_onlinequeue', 'Queue the next online game', 'OnlineQueue', 'searches for a new online match when the last one ends (pauses while the bot farm is on)')
+    local queueInfo = play:AddLabel('-', true)
+    every(1, function()
+        local _, name = findQueueFn()
+        queueInfo:SetText('queue function: ' .. (name or 'not found yet'))
+    end)
+    play:AddButton({ Text = 'Queue online now', Func = function() task.spawn(queueOnline) end })
+
+    local tune = Tab:AddRightGroupbox('Timing', 'timer')
+    tune:AddSlider('rc_onthink', { Text = 'Think time', Min = 0.05, Max = 10, Default = S.OnlineThink, Rounding = 2, Suffix = 's', Callback = function(v) S.OnlineThink = v end })
+    tune:AddSlider('rc_ondmin', { Text = 'Min move delay', Min = 0, Max = 10, Default = S.OnlineDelayMin, Rounding = 2, Suffix = 's', Callback = function(v) S.OnlineDelayMin = v end })
+    tune:AddSlider('rc_ondmax', { Text = 'Max move delay', Min = 0, Max = 15, Default = S.OnlineDelayMax, Rounding = 2, Suffix = 's', Callback = function(v) S.OnlineDelayMax = v end })
 end
 
 do
@@ -1684,7 +1784,7 @@ do
     local Tab = Window:AddTab('Assist', 'lightbulb', 'Best-move arrow')
 
     local box = Tab:AddLeftGroupbox('Best move', 'arrow-up-right')
-    box:AddLabel('Draws the engine\'s best move on the board in bot games, puzzles and the analysis board. Off in live online games we will be adding online next update :)', true)
+    box:AddLabel('Draws the engine\'s best move on the board in bot games, online games, puzzles and the analysis board.', true)
     toggle(box, 'rc_arrow', 'Best-move arrow', 'Arrow', nil, function(v) if not v then clearArrow() end end)
     box:AddSlider('rc_arrowthink', { Text = 'Think time', Min = 0.05, Max = 10, Default = S.ArrowThink, Rounding = 2, Suffix = 's', Callback = function(v) S.ArrowThink = v end })
     local eval = box:AddLabel('-', true)
