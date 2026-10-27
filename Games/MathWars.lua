@@ -238,6 +238,9 @@ local Made = {
     Level = 0,        -- how far Simplify has gone
     Text = nil,
     EndCut = true,
+    LockAim = true,   -- pin the launch angle and the end point
+    Candidates = nil, -- fitted options for this drag
+    Angle0 = 0,       -- the drawn launch angle, degrees
 }
 
 -- Ramer-Douglas-Peucker on a polyline, tolerance in board units
@@ -343,13 +346,13 @@ local function lineYAt(poly, u)
 end
 
 -- the real error: trace the equation and compare it to what was drawn
-local function measure(text, polyAbs, x0, y0, f)
+local function measure(text, rawLine, x0, y0, f)
     local path, err = trace(text, x0, y0, f)
     if not path then return nil, err end
     local worst, last = 0, 0
     for i = 1, path.n do
         local u = (path.xs[i] - x0) * f
-        local want = lineYAt(polyAbs, u)
+        local want = lineYAt(rawLine, u)
         if want then
             worst = math.max(worst, math.abs((path.ys[i] - y0) - want))
             last = math.max(last, u)
@@ -358,75 +361,314 @@ local function measure(text, polyAbs, x0, y0, f)
     return path, nil, worst, last
 end
 
-local function buildEquation()
-    local raw = Made.Raw
-    if not raw or #raw < 2 then return nil, "draw a longer path" end
-    -- each Simplify doubles how far a corner can be from the line before
-    -- it's dropped
-    local tol = 0.35 * 2 ^ Made.Level
-    local poly = simplifyLine(raw, tol)
-    -- relative u is distance in the facing direction; the equation's x is
-    -- the signed offset, so flip back for a left-facing shot
-    local signed = {}
-    for i, p in ipairs(poly) do signed[i] = { p[1] * Made.Facing, p[2] } end
-    if Made.Facing < 0 then
-        -- abs terms need knots in x order; a left shot's x runs negative
-        local rev = {}
-        for i = #signed, 1, -1 do rev[#rev + 1] = signed[i] end
-        signed = rev
-    end
+--// fitting ---------------------------------------------------------------------------
+-- Simplify used to just drop drawn points and join the rest, so it followed
+-- every wobble of your finger and lost the launch angle. Now each option is
+-- fitted: bent lines get their corners placed by least squares, smooth drags
+-- also get short polynomial forms, and with "Lock aim" the launch angle (taken
+-- from the first stretch of the drag) and the end point are pinned exactly.
+-- Every option is scored with the game's own compiled function, and each
+-- Simplify picks the shortest one inside the next error budget.
 
-    -- round as hard as the shot allows: the fewest decimals whose traced
-    -- error stays within this level's tolerance (rounding every coefficient
-    -- adds up over many corners, so it's measured, not guessed)
-    local x0, y0 = origin()
-    local allowed = math.max(0.75, tol * 1.5)
-    local base, dec
-    for tryDec = 0, 3 do
-        local text = polylineToText(signed, tryDec)
-        if compiles(text) then
-            base, dec = text, tryDec
-            if not x0 then break end
-            local _, _, worst = measure(text, poly, x0, y0, Made.Facing)
-            if worst and worst <= allowed then break end
-        end
-    end
-    if not base then
-        local _, err = compiles(polylineToText(signed, 3))
-        return nil, "the game rejected it: " .. tostring(err)
-    end
-
-    if not x0 then return { Text = base, Segments = #poly - 1 } end
-    local text = base
-    local endsAtDrag = false
-    if Made.EndCut then
-        local e = poly[#poly][1] * Made.Facing
-        for _, cut in ipairs(endCuts(e, Made.Facing, dec)) do
-            local candidate = base .. cut
-            if compiles(candidate) then
-                local path = trace(candidate, x0, y0, Made.Facing)
-                if path and path.termination == "undefined" then
-                    local reach = math.abs(path.xs[path.n] - x0)
-                    if math.abs(reach - poly[#poly][1]) <= 1.5 then
-                        text, endsAtDrag = candidate, true
-                        break
-                    end
-                end
+-- least squares: the c minimising |rows * c - rhs|^2
+local function solveLS(rows, rhs, n)
+    if n == 0 then return {} end
+    local M, v = {}, {}
+    for i = 1, n do M[i] = table.create(n, 0) v[i] = 0 end
+    for r, row in ipairs(rows) do
+        local b = rhs[r]
+        for i = 1, n do
+            local ri = row[i]
+            if ri ~= 0 then
+                v[i] += ri * b
+                local Mi = M[i]
+                for j = 1, n do Mi[j] += ri * row[j] end
             end
         end
     end
-    local path, terr, worst, covered = measure(text, poly, x0, y0, Made.Facing)
-    return {
-        Text = text,
-        Path = path,
-        TraceError = terr,
-        Worst = worst,
-        Covered = covered,
-        Length = poly[#poly][1],
-        Segments = #poly - 1,
-        EndsAtDrag = endsAtDrag,
-        Decimals = dec,
+    for i = 1, n do M[i][i] += 1e-9 end
+    for col = 1, n do
+        local piv, best = col, math.abs(M[col][col])
+        for r = col + 1, n do
+            if math.abs(M[r][col]) > best then piv, best = r, math.abs(M[r][col]) end
+        end
+        if best < 1e-14 then return nil end
+        M[col], M[piv] = M[piv], M[col]
+        v[col], v[piv] = v[piv], v[col]
+        for r = col + 1, n do
+            local k = M[r][col] / M[col][col]
+            if k ~= 0 then
+                for c = col, n do M[r][c] -= k * M[col][c] end
+                v[r] -= k * v[col]
+            end
+        end
+    end
+    local x = table.create(n, 0)
+    for i = n, 1, -1 do
+        local sum = v[i]
+        for j = i + 1, n do sum -= M[i][j] * x[j] end
+        x[i] = sum / M[i][i]
+    end
+    return x
+end
+
+-- the launch slope (rise per unit forward) over the first stretch of the
+-- drag, up to the first corner you drew if that comes sooner
+local function launchSlope(raw)
+    local total = raw[#raw][1]
+    local reach = math.max(2, math.min(12, total * 0.12))
+    local fine = simplifyLine(raw, 0.3)
+    if #fine > 2 and fine[2][1] <= reach + 1 then reach = math.max(1, fine[2][1]) end
+    local suv, suu = 0, 0
+    for _, p in ipairs(raw) do
+        if p[1] > 0 and p[1] <= reach then
+            suv += p[1] * p[2]
+            suu += p[1] * p[1]
+        end
+    end
+    if suu == 0 then
+        local p = raw[2]
+        return p[2] / p[1], math.min(reach, p[1])
+    end
+    return suv / suu, reach
+end
+
+-- heights at fixed corner positions (u) that fit the drag best; fixed[j]
+-- pins a corner's height
+local function fitBroken(raw, knots, fixed)
+    local m = #knots
+    local index, n = {}, 0
+    for j = 1, m do
+        if fixed[j] == nil then n += 1 index[j] = n end
+    end
+    local rows, rhs = {}, {}
+    local seg = 1
+    for _, p in ipairs(raw) do
+        local u = p[1]
+        while seg < m - 1 and u > knots[seg + 1] do seg += 1 end
+        local a, b = knots[seg], knots[seg + 1]
+        local w = b > a and math.clamp((u - a) / (b - a), 0, 1) or 0
+        local row = table.create(n, 0)
+        local target = p[2]
+        if index[seg] then row[index[seg]] += 1 - w else target -= (1 - w) * fixed[seg] end
+        if index[seg + 1] then row[index[seg + 1]] += w else target -= w * fixed[seg + 1] end
+        rows[#rows + 1], rhs[#rhs + 1] = row, target
+    end
+    local sol = solveLS(rows, rhs, n)
+    if not sol then return nil end
+    local ys = {}
+    for j = 1, m do ys[j] = fixed[j] or sol[index[j]] end
+    return ys
+end
+
+-- f(x) = sum c_k (x/S)^k, k = 1..deg. Locked: c_1 is the launch slope and
+-- the end point gets a heavy row so the curve lands where the drag ended.
+local function fitPoly(rawSigned, deg, S, slopeX, lock, endX, endY)
+    local free = {}
+    for k = (lock and 2 or 1), deg do free[#free + 1] = k end
+    local n = #free
+    local c1 = lock and slopeX * S or nil
+    local rows, rhs = {}, {}
+    local function addRow(x, y, weight)
+        local t = x / S
+        local row = table.create(n, 0)
+        for i, k in ipairs(free) do row[i] = weight * t ^ k end
+        local target = y
+        if c1 then target -= c1 * t end
+        rows[#rows + 1], rhs[#rhs + 1] = row, weight * target
+    end
+    for _, p in ipairs(rawSigned) do addRow(p[1], p[2], 1) end
+    if lock then addRow(endX, endY, 40) end
+    local sol = solveLS(rows, rhs, n)
+    if not sol then return nil end
+    local c = {}
+    if c1 then c[1] = c1 end
+    for i, k in ipairs(free) do c[k] = sol[i] end
+    for k = 1, deg do c[k] = c[k] or 0 end
+    return c
+end
+
+local function joinTerms(terms)
+    if #terms == 0 then return "0" end
+    local out = {}
+    for i, t in ipairs(terms) do
+        if i == 1 then out[1] = (t[1] == "-" and "-" or "") .. t[2] else out[#out + 1] = t[1] .. t[2] end
+    end
+    return table.concat(out)
+end
+
+local function polyToText(c, S, dec)
+    local terms = {}
+    for k = 1, #c do
+        local coef, body = c[k], nil
+        if k == 1 then coef, body = coef / S, "x" else body = "(x/" .. S .. ")^" .. k end
+        local str, r = fmt(coef, dec)
+        if r ~= 0 then
+            if str == "1" then str = "" end
+            terms[#terms + 1] = { coef < 0 and "-" or "+", str .. body }
+        end
+    end
+    return joinTerms(terms)
+end
+
+-- how far an equation is from the drag (the game's own compiled function,
+-- shifted the way the tracer shifts it), and its launch angle
+local function score(text, sample, F, endX, endY)
+    if not MathExpression or not MathExpression.compile then return nil end
+    pcall(function() if MathExpression.beginTrace then MathExpression.beginTrace() end end)
+    local okc, c = pcall(MathExpression.compile, text, true)
+    if not okc or type(c) ~= "table" or not c.ok or type(c.fn) ~= "function" then return nil end
+    local f0 = tonumber(c.f0) or 0
+    local worst = 0
+    for _, p in ipairs(sample) do
+        local ok, y = pcall(c.fn, p[1])
+        if not ok or type(y) ~= "number" or y ~= y or math.abs(y) == math.huge then return nil end
+        worst = math.max(worst, math.abs((y - f0) - p[2]))
+    end
+    local probe = 0.25
+    local ok1, y1 = pcall(c.fn, F * probe)
+    local angle = (ok1 and type(y1) == "number") and math.deg(math.atan((y1 - f0) / probe)) or nil
+    local okE, yE = pcall(c.fn, endX)
+    local endErr = (okE and type(yE) == "number") and math.abs((yE - f0) - endY) or math.huge
+    return worst, angle, endErr
+end
+
+local function buildCandidates()
+    local raw, F, lock = Made.Raw, Made.Facing, Made.LockAim
+    local total = raw[#raw][1]
+    local endV = raw[#raw][2]
+    local s0, reach = launchSlope(raw)
+
+    local sample = {}
+    local step = math.max(1, math.floor(#raw / 300))
+    for i = 1, #raw, step do sample[#sample + 1] = { raw[i][1] * F, raw[i][2] } end
+    sample[#sample + 1] = { total * F, endV }
+
+    local list, seen = {}, {}
+    local function consider(text, kind, pieces)
+        if seen[text] or #text > 1000 then return end
+        seen[text] = true
+        local worst, angle, endErr = score(text, sample, F, total * F, endV)
+        if worst then list[#list + 1] = { Text = text, Err = worst, Angle = angle, EndErr = endErr, Kind = kind, Pieces = pieces } end
+    end
+
+    -- bent lines: corners from the drawing, heights fitted
+    local lastKey
+    for _, tol in ipairs({ 0.15, 0.3, 0.6, 1.2, 2.5, 5, 10, 20, 40, 1e9 }) do
+        local knots = {}
+        for _, p in ipairs(simplifyLine(raw, tol)) do knots[#knots + 1] = p[1] end
+        local fixed = { [1] = 0 }
+        if lock then
+            -- a straight launch piece at the drawn angle, no corner inside it
+            local k2 = { 0 }
+            if reach < total - 0.5 then k2[2] = reach end
+            for _, u in ipairs(knots) do
+                -- a corner right at the launch piece's end is that end
+                if u > k2[#k2] + 0.5 and u < total - 1e-6 then k2[#k2 + 1] = u end
+            end
+            k2[#k2 + 1] = total
+            knots = k2
+            if #knots > 2 then fixed[2] = s0 * knots[2] end
+            fixed[#knots] = endV
+        end
+        local key = table.concat(knots, ",")
+        if key ~= lastKey then
+            lastKey = key
+            local ys = fitBroken(raw, knots, fixed)
+            if ys then
+                local poly = {}
+                for j, u in ipairs(knots) do poly[j] = { u * F, ys[j] } end
+                if F < 0 then
+                    local rev = {}
+                    for i = #poly, 1, -1 do rev[#rev + 1] = poly[i] end
+                    poly = rev
+                end
+                for dec = 0, 3 do consider(polylineToText(poly, dec), "line", #knots - 1) end
+            end
+        end
+    end
+
+    -- smooth curves
+    local S = 10 * math.max(1, math.floor(total / 10 + 0.5))
+    local rawSigned = {}
+    for i = 1, #raw, step do rawSigned[#rawSigned + 1] = { raw[i][1] * F, raw[i][2] } end
+    for deg = 1, 6 do
+        local c = fitPoly(rawSigned, deg, S, s0 * F, lock, total * F, endV)
+        if c then
+            for dec = 0, 3 do consider(polyToText(c, S, dec), "curve", deg) end
+        end
+    end
+
+    Made.Candidates = list
+    Made.Angle0 = math.deg(math.atan(s0))
+    return list
+end
+
+local BUDGETS = { 0.5, 1, 2, 4, 8, 16, 32, 64 }
+
+-- the shortest option within this Simplify level's error budget (keeping the
+-- launch angle when aim is locked)
+local function pickCandidate(level)
+    local list = Made.Candidates or buildCandidates()
+    local budget = BUDGETS[math.clamp(level + 1, 1, #BUDGETS)]
+    -- locked: it has to leave at the drawn angle and land where you let go
+    local function aimOk(c)
+        return not Made.LockAim or (c.Angle and math.abs(c.Angle - Made.Angle0) <= 0.75 and c.EndErr <= 1.5)
+    end
+    local best
+    for _, c in ipairs(list) do
+        if aimOk(c) and c.Err <= budget then
+            if not best or #c.Text < #best.Text or (#c.Text == #best.Text and c.Err < best.Err) then best = c end
+        end
+    end
+    -- nothing inside the budget: the closest one, keeping the aim if any can
+    if not best then
+        for _, c in ipairs(list) do
+            if aimOk(c) and (not best or c.Err < best.Err) then best = c end
+        end
+    end
+    if not best then
+        for _, c in ipairs(list) do
+            if not best or c.Err < best.Err then best = c end
+        end
+    end
+    return best
+end
+
+local function buildEquation()
+    local raw = Made.Raw
+    if not raw or #raw < 2 then return nil, "draw a longer path" end
+    local pick = pickCandidate(Made.Level)
+    if not pick then return nil, "couldn't fit an equation the game accepts" end
+    local base = pick.Text
+    local F = Made.Facing
+    local total = raw[#raw][1]
+
+    local x0, y0 = origin()
+    local result = {
+        Text = base, Kind = pick.Kind, Pieces = pick.Pieces, Worst = pick.Err,
+        Angle = pick.Angle, Angle0 = Made.Angle0, Length = total,
     }
+    if not x0 then return result end
+    local text, endsAtDrag = base, false
+    if Made.EndCut then
+        for dec = 0, 2 do
+            for _, cut in ipairs(endCuts(total * F, F, dec)) do
+                local candidate = base .. cut
+                if not endsAtDrag and compiles(candidate) then
+                    local path = trace(candidate, x0, y0, F)
+                    if path and path.termination == "undefined" and math.abs(math.abs(path.xs[path.n] - x0) - total) <= 1.5 then
+                        text, endsAtDrag = candidate, true
+                    end
+                end
+            end
+            if endsAtDrag then break end
+        end
+    end
+    local path, terr, worst = measure(text, raw, x0, y0, F)
+    result.Text, result.Path, result.TraceError, result.EndsAtDrag = text, path, terr, endsAtDrag
+    if worst then result.Worst = worst end
+    return result
 end
 
 --// mini ui --------------------------------------------------------------------
@@ -468,7 +710,7 @@ make("TextLabel", {
 
 local Panel = make("Frame", {
     Name = "Panel", BackgroundColor3 = THEME.Bg, BorderSizePixel = 0,
-    Size = UDim2.fromOffset(276, 296), Position = UDim2.fromOffset(24, 120), ZIndex = 10, Active = true,
+    Size = UDim2.fromOffset(276, 316), Position = UDim2.fromOffset(24, 120), ZIndex = 10, Active = true,
 }, Gui)
 make("UICorner", { CornerRadius = UDim.new(0, 10) }, Panel)
 make("UIStroke", { Color = Color3.fromRGB(70, 80, 105), Thickness = 1 }, Panel)
@@ -505,24 +747,25 @@ local CopyBtn = button("Copy", 0, 34)
 local ClearBtn = button("Clear", 134, 34)
 local PreviewBtn = button("Preview typed: on", 0, 68)
 local EndBtn = button("Stop at drag end: on", 134, 68)
-local GuideBtn = button("Key guide: off", 0, 102)
+local LockBtn = button("Lock aim: on", 0, 102)
+local GuideBtn = button("Key guide: off", 134, 102)
 local GuideInfo = make("TextLabel", {
-    Text = "highlights the next key", Font = Enum.Font.Gotham, TextSize = 11, TextColor3 = THEME.Dim,
+    Text = "key guide: yellow = tap now, purple = tap after", Font = Enum.Font.Gotham, TextSize = 11, TextColor3 = THEME.Dim,
     BackgroundTransparency = 1, TextWrapped = true, TextXAlignment = Enum.TextXAlignment.Left,
-    Size = UDim2.fromOffset(126, 28), Position = UDim2.fromOffset(134, 102), ZIndex = 11,
+    Size = UDim2.new(1, 0, 0, 20), Position = UDim2.fromOffset(0, 134), ZIndex = 11,
 }, Body)
 
 local Status = make("TextLabel", {
     Text = "Press Create path, then drag on the board.", Font = Enum.Font.Gotham, TextSize = 12, TextColor3 = THEME.Dim,
     BackgroundTransparency = 1, TextWrapped = true, TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top,
-    Size = UDim2.new(1, 0, 0, 44), Position = UDim2.fromOffset(0, 136), ZIndex = 11,
+    Size = UDim2.new(1, 0, 0, 42), Position = UDim2.fromOffset(0, 156), ZIndex = 11,
 }, Body)
 
 local Output = make("TextBox", {
     Text = "", PlaceholderText = "your equation shows up here", Font = Enum.Font.Code, TextSize = 13, TextColor3 = THEME.Text,
     PlaceholderColor3 = THEME.Dim, BackgroundColor3 = Color3.fromRGB(14, 16, 22), BorderSizePixel = 0, TextWrapped = true,
     ClearTextOnFocus = false, TextEditable = false, MultiLine = true, TextXAlignment = Enum.TextXAlignment.Left,
-    TextYAlignment = Enum.TextYAlignment.Top, Size = UDim2.new(1, 0, 0, 70), Position = UDim2.fromOffset(0, 184), ZIndex = 11,
+    TextYAlignment = Enum.TextYAlignment.Top, Size = UDim2.new(1, 0, 0, 70), Position = UDim2.fromOffset(0, 202), ZIndex = 11,
 }, Body)
 make("UICorner", { CornerRadius = UDim.new(0, 6) }, Output)
 make("UIPadding", { PaddingLeft = UDim.new(0, 6), PaddingRight = UDim.new(0, 6), PaddingTop = UDim.new(0, 4) }, Output)
@@ -569,7 +812,7 @@ track(Collapse.Activated:Connect(function()
     collapsed = not collapsed
     Body.Visible = not collapsed
     Collapse.Text = collapsed and "+" or "–"
-    Panel.Size = collapsed and UDim2.fromOffset(276, 30) or UDim2.fromOffset(276, 296)
+    Panel.Size = collapsed and UDim2.fromOffset(276, 30) or UDim2.fromOffset(276, 316)
     clampPanel()
 end))
 
@@ -592,10 +835,19 @@ local function showResult()
     Made.Text = r.Text
     Output.Text = r.Text
     if r.Path then drawPoints(Pools.Made, pathPoints(r.Path)) end
+    local shape
+    if r.Kind == "curve" then
+        shape = r.Pieces == 1 and "straight line" or ("smooth curve (power %d)"):format(r.Pieces)
+    else
+        shape = ("%d-piece line"):format(r.Pieces or 1)
+    end
     local parts = {
         ("face %s%s"):format(faceName(Made.Facing), facing() ~= Made.Facing and " (flip your facing!)" or ""),
-        ("%d piece%s, %d chars"):format(r.Segments, r.Segments == 1 and "" or "s", #r.Text),
+        ("%s, %d chars"):format(shape, #r.Text),
     }
+    if r.Angle then
+        parts[#parts + 1] = ("launch %+.1f° (drew %+.1f°)%s"):format(r.Angle, r.Angle0 or 0, Made.LockAim and " locked" or "")
+    end
     if r.Worst then parts[#parts + 1] = ("off by at most %.2f"):format(r.Worst) end
     if r.EndsAtDrag then parts[#parts + 1] = "stops at your drag's end" elseif Made.EndCut then parts[#parts + 1] = "keeps going past the end" end
     if r.TraceError then parts[#parts + 1] = "trace: " .. tostring(r.TraceError) end
@@ -678,7 +930,7 @@ local function finishDrag()
         setStatus("That drag was too short (or went backwards). Press Create path and try again.", Color3.fromRGB(255, 170, 90))
         return
     end
-    Made.Raw, Made.Facing, Made.Level = raw, f, 0
+    Made.Raw, Made.Facing, Made.Level, Made.Candidates = raw, f, 0, nil
     setStatus("Working it out...", THEME.Dim)
     task.spawn(showResult)
 end
@@ -724,8 +976,21 @@ end))
 
 track(SimplifyBtn.Activated:Connect(function()
     if not Made.Raw then setStatus("Make a path first.", THEME.Dim) return end
-    Made.Level += 1
-    task.spawn(showResult)
+    task.spawn(function()
+        -- step up until the pick actually gets shorter
+        local current = pickCandidate(Made.Level)
+        local level = Made.Level
+        while level < #BUDGETS - 1 do
+            level += 1
+            local nextPick = pickCandidate(level)
+            if nextPick and current and #nextPick.Text < #current.Text then
+                Made.Level = level
+                showResult()
+                return
+            end
+        end
+        setStatus("That's as simple as it gets for this drag.", Color3.fromRGB(255, 170, 90))
+    end)
 end))
 
 track(CopyBtn.Activated:Connect(function()
@@ -740,7 +1005,7 @@ track(CopyBtn.Activated:Connect(function()
 end))
 
 track(ClearBtn.Activated:Connect(function()
-    Made.Raw, Made.Text, Made.Level = nil, nil, 0
+    Made.Raw, Made.Text, Made.Level, Made.Candidates = nil, nil, 0, nil
     Output.Text = ""
     clearPool(Pools.Made)
     clearPool(Pools.Drag)
@@ -753,6 +1018,17 @@ track(PreviewBtn.Activated:Connect(function()
     PreviewBtn.Text = "Preview typed: " .. (PreviewOn and "on" or "off")
     PreviewBtn.BackgroundColor3 = PreviewOn and THEME.Btn or Color3.fromRGB(60, 40, 44)
     if not PreviewOn then clearPool(Pools.Typed) end
+end))
+
+track(LockBtn.Activated:Connect(function()
+    Made.LockAim = not Made.LockAim
+    LockBtn.Text = "Lock aim: " .. (Made.LockAim and "on" or "off")
+    LockBtn.BackgroundColor3 = Made.LockAim and THEME.Btn or Color3.fromRGB(60, 40, 44)
+    Made.Candidates = nil
+    if Made.Raw then
+        Made.Level = 0
+        task.spawn(showResult)
+    end
 end))
 
 track(EndBtn.Activated:Connect(function()
@@ -895,16 +1171,36 @@ local MarkFill = make("Frame", {
 }, Mark)
 make("UICorner", { CornerRadius = UDim.new(0, 8) }, MarkFill)
 
+-- the tap after that: a purple ring just outside the button, so it still
+-- shows when it's the same button as the yellow one (a key twice in a row,
+-- or the page switch twice)
+local MarkNext = make("Frame", {
+    Name = "GuideMarkNext", BackgroundTransparency = 1, Size = UDim2.new(1, 10, 1, 10),
+    Position = UDim2.fromOffset(-5, -5), ZIndex = 61, Active = false,
+}, nil)
+make("UICorner", { CornerRadius = UDim.new(0, 11) }, MarkNext)
+local MarkNextStroke = make("UIStroke", {
+    Color = Color3.fromRGB(176, 92, 255), Thickness = 3, ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+}, MarkNext)
+
 local function markOn(btn)
     if Mark.Parent ~= btn then Mark.Parent = btn end
 end
-local function markOff() Mark.Parent = nil end
+local function markNextOn(btn)
+    if MarkNext.Parent ~= btn then MarkNext.Parent = btn end
+end
+local function markNextOff() MarkNext.Parent = nil end
+local function markOff()
+    Mark.Parent = nil
+    markNextOff()
+end
 
 track(RunService.RenderStepped:Connect(function()
     if not Mark.Parent then return end
     local pulse = (math.sin(os.clock() * 7) + 1) / 2
     MarkStroke.Transparency = 0.1 + pulse * 0.35
     MarkFill.BackgroundTransparency = 0.55 + pulse * 0.35
+    MarkNextStroke.Transparency = 0.15 + (1 - pulse) * 0.3
 end))
 
 local Keypad
@@ -944,7 +1240,7 @@ local function buttonFor(kp, key)
     local bestPage, bestTaps
     for _, b in ipairs(kp:GetDescendants()) do
         if b:IsA("GuiButton") and b:GetAttribute("Key") == key then
-            if shown(b) then return b, nil end
+            if shown(b) then return b, nil, 0 end
             local index = tonumber(b.Name:match("^Key(%d+)$"))
             if index and index > 15 then
                 local page = (index - 16) // 12 + 1
@@ -955,9 +1251,9 @@ local function buttonFor(kp, key)
     end
     if bestPage then
         local switch = functions and functions:FindFirstChild("SwitchPage")
-        return switch, PAGES[bestPage]
+        return switch, PAGES[bestPage], bestTaps
     end
-    return nil, nil
+    return nil, nil, 0
 end
 
 local function commonPrefix(a, b)
@@ -974,7 +1270,7 @@ local function nextKey(text, cursor)
         local st = states[k]
         if st[1] == text and (cursor == nil or st[2] == cursor) then
             if k - 1 >= #keys then return "done" end
-            return keys[k]
+            return keys[k], nil, k - 1
         end
     end
     -- right text, caret somewhere else: walk it back into place
@@ -1039,27 +1335,32 @@ local function guideStep()
 
     local display = findNamed("MathDisplay", "GuiButton")
     local cursor = display and display:GetAttribute("Cursor")
-    local key, why = nextKey(text, type(cursor) == "number" and cursor or nil)
+    local key, why, doneCount = nextKey(text, type(cursor) == "number" and cursor or nil)
     if key == "done" then
         markOff()
         setInfo("all typed, fire!", Color3.fromRGB(120, 230, 140))
         return
     end
-    local btn, page = buttonFor(kp, key)
+    local btn, page, taps = buttonFor(kp, key)
     if not btn then markOff() setInfo("can't find the " .. (KEY_NAMES[key] or key) .. " key") return end
     markOn(btn)
     local label = KEY_NAMES[key] or key
     if page then
-        setInfo(("switch page to %s (for %s)"):format(page, label), THEME.Text)
+        -- still on the wrong page: purple says tap the switch again, if it
+        -- takes more than one
+        if taps >= 2 then markNextOn(btn) else markNextOff() end
+        setInfo(("switch page to %s (for %s)%s"):format(page, label, taps >= 2 and ", twice" or ""), THEME.Text)
     elseif why then
+        markNextOff()
         setInfo(("%s: tap %s"):format(why, label), Color3.fromRGB(255, 170, 90))
     else
         local plan = Guide.Plan
-        local doneCount = 0
-        for k = #plan.States, 1, -1 do
-            if plan.States[k][1] == text then doneCount = k - 1 break end
-        end
-        setInfo(("tap %s  (%d/%d)"):format(label, doneCount + 1, #plan.Keys), THEME.Text)
+        -- the key after this one (or the page switch it'll need)
+        local after = doneCount and plan.Keys[doneCount + 2]
+        local afterBtn = after and buttonFor(kp, after)
+        if afterBtn then markNextOn(afterBtn) else markNextOff() end
+        local afterLabel = after and (KEY_NAMES[after] or after)
+        setInfo(("tap %s%s  (%d/%d)"):format(label, afterLabel and (", then " .. afterLabel) or "", (doneCount or 0) + 1, #plan.Keys), THEME.Text)
     end
 end
 
@@ -1091,4 +1392,5 @@ Genv.__MathWarsStop = function()
     pcall(function() Gui:Destroy() end)
     pcall(function() Folder:Destroy() end)
     pcall(function() Mark:Destroy() end)
+    pcall(function() MarkNext:Destroy() end)
 end
