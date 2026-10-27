@@ -237,7 +237,12 @@ local Made = {
     Facing = 1,
     Level = 0,        -- how far Simplify has gone
     Text = nil,
-    EndCut = true,
+    Snap = true,      -- aim at the player your drag ends on
+    Mode = "follow",  -- "aim" when there's a target, else follow the drawing
+    Aim = nil :: any,         -- aim options for the target (aimOptions)
+    Route = nil :: any,       -- the route on show
+    NoAimFor = nil :: any,    -- the player no short shot reached
+    FollowCache = nil :: any, -- tracer-checked picks per Simplify level
     LockAim = true,   -- pin the launch angle and the end point
     Candidates = nil, -- fitted options for this drag
     Angle0 = 0,       -- the drawn launch angle, degrees
@@ -317,21 +322,6 @@ local function polylineToText(poly, dec)
         if i == 1 then out[1] = (t[1] == "-" and "-" or "") .. t[2] else out[#out + 1] = t[1] .. t[2] end
     end
     return table.concat(out)
-end
-
--- extra bits that make the shot stop where the drag ended: f is undefined
--- past the end, and the tracer stops at "undefined". Constants don't move the
--- shot, so the +1 these add changes nothing else.
-local function endCuts(e, f, dec)
-    local es = fmt(e, dec)
-    local inside = f > 0 and (es .. "-x") or ("x+" .. es)
-    if f > 0 and e < 0 then inside = "-" .. es .. "-x" end
-    if f < 0 and e > 0 then inside = "x-" .. es end
-    return {
-        "+0sqrt(" .. inside .. ")",
-        "+sqrt(" .. inside .. ")^0",
-        "+sqrt(" .. inside .. ")/sqrt(" .. inside .. ")",
-    }
 end
 
 local function lineYAt(poly, u)
@@ -606,68 +596,406 @@ end
 
 local BUDGETS = { 0.5, 1, 2, 4, 8, 16, 32, 64 }
 
--- the shortest option within this Simplify level's error budget (keeping the
--- launch angle when aim is locked)
-local function pickCandidate(level)
+-- every option in the order Simplify takes them at this level: inside the
+-- budget shortest first (aim kept when locked), then the rest, closest first
+local function rankedCandidates(level)
     local list = Made.Candidates or buildCandidates()
     local budget = BUDGETS[math.clamp(level + 1, 1, #BUDGETS)]
-    -- locked: it has to leave at the drawn angle and land where you let go
     local function aimOk(c)
         return not Made.LockAim or (c.Angle and math.abs(c.Angle - Made.Angle0) <= 0.75 and c.EndErr <= 1.5)
     end
-    local best
+    local inside, rest = {}, {}
     for _, c in ipairs(list) do
-        if aimOk(c) and c.Err <= budget then
-            if not best or #c.Text < #best.Text or (#c.Text == #best.Text and c.Err < best.Err) then best = c end
+        if aimOk(c) and c.Err <= budget then inside[#inside + 1] = c else rest[#rest + 1] = c end
+    end
+    table.sort(inside, function(a, b)
+        if #a.Text ~= #b.Text then return #a.Text < #b.Text end
+        return a.Err < b.Err
+    end)
+    table.sort(rest, function(a, b)
+        local aa, ba = aimOk(a), aimOk(b)
+        if aa ~= ba then return aa end
+        return a.Err < b.Err
+    end)
+    for _, c in ipairs(rest) do inside[#inside + 1] = c end
+    return inside
+end
+
+--// the board: blocks and players ----------------------------------------------------
+-- Blocks are parts under workspace.Arena with a "Cell" or "ObstacleId"
+-- attribute (what the game's own teleport check looks for); a shot stops at
+-- the first one. Players are workspace models with a "CombatantId" and HP
+-- left, hit within Config.HITBOX_RADIUS of their PrimaryPart, and a shot can
+-- go through several of them.
+
+local HITBOX = Config.HITBOX_RADIUS or 2.8
+local HASH = 4
+
+local function buildBlocks()
+    local grid = {}
+    local arena = Workspace:FindFirstChild("Arena")
+    if not arena then return grid end
+    local ox, oy = boardOffset()
+    for _, d in ipairs(arena:GetDescendants()) do
+        if d:IsA("BasePart") and (d:GetAttribute("Cell") ~= nil or d:GetAttribute("ObstacleId") ~= nil) then
+            local cf, size = d.CFrame, d.Size
+            local function half(axis)
+                return (math.abs(cf.RightVector[axis]) * size.X + math.abs(cf.UpVector[axis]) * size.Y
+                    + math.abs(cf.LookVector[axis]) * size.Z) / 2
+            end
+            local hx, hy, hz = half("X"), half("Y"), half("Z")
+            local pos = cf.Position
+            if pos.Y - hy <= PLANE_Y and pos.Y + hy >= PLANE_Y then
+                local rect = { pos.X - hx - ox, pos.X + hx - ox, -(pos.Z + hz) - oy, -(pos.Z - hz) - oy }
+                for gx = math.floor((rect[1] - 0.5) / HASH), math.floor((rect[2] + 0.5) / HASH) do
+                    for gy = math.floor((rect[3] - 0.5) / HASH), math.floor((rect[4] + 0.5) / HASH) do
+                        local key = gx * 1000 + gy
+                        local cell = grid[key]
+                        if not cell then cell = {} grid[key] = cell end
+                        cell[#cell + 1] = rect
+                    end
+                end
+            end
         end
     end
-    -- nothing inside the budget: the closest one, keeping the aim if any can
-    if not best then
-        for _, c in ipairs(list) do
-            if aimOk(c) and (not best or c.Err < best.Err) then best = c end
+    return grid
+end
+
+local function blockAt(grid, x, y, margin)
+    local cell = grid[math.floor(x / HASH) * 1000 + math.floor(y / HASH)]
+    if not cell then return false end
+    for _, r in ipairs(cell) do
+        if x >= r[1] - margin and x <= r[2] + margin and y >= r[3] - margin and y <= r[4] + margin then return true end
+    end
+    return false
+end
+
+local function combatants()
+    local mine = LocalPlayer:GetAttribute("CombatantId")
+    local ox, oy = boardOffset()
+    local out = {}
+    for _, m in ipairs(Workspace:GetChildren()) do
+        local id = m:GetAttribute("CombatantId")
+        if id ~= nil and id ~= mine and m:IsA("Model") and (m:GetAttribute("HP") or 1) > 0 and m.PrimaryPart then
+            local x, y = toMath(m.PrimaryPart.Position)
+            out[#out + 1] = { Model = m, Name = m.Name, X = x - ox, Y = y - oy + (Config.HITBOX_Y_OFFSET or 0) }
         end
     end
-    if not best then
-        for _, c in ipairs(list) do
-            if not best or c.Err < best.Err then best = c end
+    return out
+end
+
+-- the player your drag ends on, or failing that the first one it runs through
+local function targetOfDrag(raw, F)
+    local x0, y0 = origin()
+    if not x0 then return nil end
+    local people = combatants()
+    local ex, ey = x0 + raw[#raw][1] * F, y0 + raw[#raw][2]
+    local best, bestD
+    for _, c in ipairs(people) do
+        local d = math.sqrt((c.X - ex) ^ 2 + (c.Y - ey) ^ 2)
+        if d <= HITBOX + 8 and (not bestD or d < bestD) then best, bestD = c, d end
+    end
+    if best then return best end
+    for _, q in ipairs(raw) do
+        local px, py = x0 + q[1] * F, y0 + q[2]
+        for _, c in ipairs(people) do
+            if (px - c.X) ^ 2 + (py - c.Y) ^ 2 <= (HITBOX + 1) ^ 2 then return c end
         end
     end
-    return best
+    return nil
+end
+
+-- fly a traced path: who it goes through, and the first block that stops it
+local function walkPath(path, grid, people)
+    local hits = {}
+    for i = 2, path.n do
+        local ax, ay, bx, by = path.xs[i - 1], path.ys[i - 1], path.xs[i], path.ys[i]
+        local steps = math.max(1, math.ceil(math.sqrt((bx - ax) ^ 2 + (by - ay) ^ 2) / 0.4))
+        for st = 1, steps do
+            local t = st / steps
+            local px, py = ax + (bx - ax) * t, ay + (by - ay) * t
+            for _, c in ipairs(people) do
+                if not hits[c] and (px - c.X) ^ 2 + (py - c.Y) ^ 2 <= HITBOX ^ 2 then hits[c] = i end
+            end
+            if blockAt(grid, px, py, 0.2) then return hits, i, px, py end
+        end
+    end
+    return hits
+end
+
+-- the game's tracer on an equation, cut where it would hit a block
+local function flight(text, x0, y0, F, grid, people)
+    local path, err = trace(text, x0, y0, F)
+    if not path or path.n < 2 then return nil, err or "no path" end
+    local hits, stopAt, sx, sy = walkPath(path, grid, people)
+    return { Path = path, Hits = hits, StopAt = stopAt, StopX = sx, StopY = sy }
+end
+
+local function flightPoints(f)
+    local pts = pathPoints(f.Path)
+    if f.StopAt then
+        for i = #pts, f.StopAt, -1 do pts[i] = nil end
+        pts[#pts + 1] = { f.StopX, f.StopY }
+    end
+    return pts
+end
+
+--// short equations that hit a target ----------------------------------------------
+
+-- a bent line in signed x as text, plus a function made from the very same
+-- rounded numbers (so a check on it is a check on what you'll type)
+local function brokenForm(poly, dec)
+    local m = #poly - 1
+    local slopes = {}
+    for i = 1, m do slopes[i] = (poly[i + 1][2] - poly[i][2]) / (poly[i + 1][1] - poly[i][1]) end
+    local terms, A, parts = {}, 0, {}
+    local function value(n)
+        local str, r = fmt(n, dec)
+        return str, (n < 0 and -r or r)
+    end
+    local function add(coef, body, knot)
+        local str, v = value(coef)
+        if v == 0 then return end
+        terms[#terms + 1] = { coef < 0 and "-" or "+", (str == "1" and "" or str) .. body }
+        if knot then parts[#parts + 1] = { v, knot } else A = v end
+    end
+    if m >= 1 then add((slopes[1] + slopes[m]) / 2, "x") end
+    for i = 2, m do
+        local k = poly[i][1]
+        local ks, kv = value(k)
+        local inner = kv == 0 and "x" or ("x" .. (k < 0 and "+" or "-") .. ks)
+        add((slopes[i] - slopes[i - 1]) / 2, "abs(" .. inner .. ")", kv)
+    end
+    local text = joinTerms(terms)
+    return text, function(x)
+        local y = A * x
+        for _, t in ipairs(parts) do y += t[1] * math.abs(x - t[2]) end
+        return y
+    end
+end
+
+-- f(x) = a x + B (x/10)^2
+local function arcForm(a, b, dec)
+    local B = b * 100
+    local as, av = fmt(a, dec)
+    local bs, bv = fmt(B, dec)
+    av = a < 0 and -av or av
+    bv = B < 0 and -bv or bv
+    local terms = {}
+    if av ~= 0 then terms[#terms + 1] = { a < 0 and "-" or "+", (as == "1" and "" or as) .. "x" } end
+    if bv ~= 0 then terms[#terms + 1] = { B < 0 and "-" or "+", (bs == "1" and "" or bs) .. "(x/10)^2" } end
+    return joinTerms(terms), function(x) return av * x + bv * (x / 10) ^ 2 end
+end
+
+-- a quick flight of fn from you: does it reach the target before a block or
+-- the edge of the board? (steep stretches are stepped through finely)
+local function quickShot(fn, F, x0, y0, grid, target, maxU)
+    local f0 = fn(0)
+    local reach = (HITBOX - 0.6) ^ 2
+    local px, py, u = x0, y0, 0
+    while u < maxU do
+        u = math.min(maxU, u + 0.5)
+        local y = y0 + fn(F * u) - f0
+        if y ~= y or y < ARENA.YMIN or y > ARENA.YMAX then return false end
+        local x = x0 + F * u
+        local steps = math.max(1, math.ceil(math.abs(y - py) / 0.5))
+        for st = 1, steps do
+            local t = st / steps
+            local sx, sy = px + (x - px) * t, py + (y - py) * t
+            if (sx - target.X) ^ 2 + (sy - target.Y) ^ 2 <= reach then return true end
+            if blockAt(grid, sx, sy, 0.35) then return false end
+        end
+        px, py = x, y
+    end
+    return false
+end
+
+local function signedPoly(uPts, F)
+    local poly = {}
+    for i, q in ipairs(uPts) do poly[i] = { q[1] * F, q[2] } end
+    if F < 0 then
+        local rev = {}
+        for i = #poly, 1, -1 do rev[#rev + 1] = poly[i] end
+        poly = rev
+    end
+    return poly
+end
+
+-- every short shape that gets to the target, shortest first
+local function aimOptions(target)
+    local x0, y0 = origin()
+    if not x0 then return nil, "no character" end
+    local dx, dy = target.X - x0, target.Y - y0
+    local F = dx >= 0 and 1 or -1
+    if math.abs(dx) < 0.5 then F = Made.Facing end
+    local du = math.max(0.5, math.abs(dx))
+    local grid = buildBlocks()
+    local edge = F > 0 and (ARENA.XMAX - x0) or (x0 - ARENA.XMIN)
+    local maxU = math.min(du + HITBOX + 3, maxRange(x0, F) or math.huge, edge)
+    local ylo, yhi = ARENA.YMIN - y0 + 2, ARENA.YMAX - y0 - 2
+    local raw = Made.Raw
+
+    local shapes = {}
+    local function bent(uPts, label) shapes[#shapes + 1] = { Poly = signedPoly(uPts, F), Label = label } end
+    bent({ { 0, 0 }, { du, dy } }, "straight")
+    for _, fk in ipairs({ 0.15, 0.3, 0.45, 0.6, 0.75, 0.9 }) do
+        for h = ylo, yhi, 4 do bent({ { 0, 0 }, { du * fk, h }, { du, dy } }, "one bend") end
+    end
+    -- arcs through you and the target, leaving at every angle
+    local tx = F * du
+    for deg = -80, 80, 4 do
+        local a = F * math.tan(math.rad(deg))
+        shapes[#shapes + 1] = { Arc = { a, (dy - a * tx) / (tx * tx) }, Label = "arc" }
+    end
+    -- routes with your drawing's bends, ending on the target
+    if raw then
+        local corners = {}
+        for _, q in ipairs(simplifyLine(raw, 4)) do
+            if q[1] > 1 and q[1] < du - 1 then corners[#corners + 1] = q end
+        end
+        while #corners > 2 do table.remove(corners, #corners) end
+        if #corners > 0 then
+            for _, shift in ipairs({ 0, 6, -6, 12, -12 }) do
+                local pts = { { 0, 0 } }
+                for _, q in ipairs(corners) do pts[#pts + 1] = { q[1], q[2] + shift } end
+                pts[#pts + 1] = { du, dy }
+                bent(pts, #corners == 1 and "one bend" or "two bends")
+            end
+        end
+    end
+
+    local function drawnGap(fn)
+        if not raw then return 0 end
+        local f0, sum, n = fn(0), 0, 0
+        for _, q in ipairs(raw) do
+            if q[1] <= du then
+                sum += math.abs((fn(F * q[1]) - f0) - q[2])
+                n += 1
+            end
+        end
+        return n > 0 and sum / n or 0
+    end
+
+    local found = {}
+    for i, sh in ipairs(shapes) do
+        if i % 40 == 0 then task.wait() end
+        local makeForm
+        if sh.Poly then
+            makeForm = function(dec) return brokenForm(sh.Poly, dec) end
+        else
+            makeForm = function(dec) return arcForm(sh.Arc[1], sh.Arc[2], dec) end
+        end
+        local _, exact = makeForm(6)
+        if quickShot(exact, F, x0, y0, grid, target, maxU) then
+            for dec = 0, 3 do
+                local text, fn = makeForm(dec)
+                if quickShot(fn, F, x0, y0, grid, target, maxU) then
+                    found[#found + 1] = { Text = text, Label = sh.Label, Gap = drawnGap(fn) }
+                    break
+                end
+            end
+        end
+    end
+    -- shortest first; between ones about as short, the one nearer your drawing
+    local function rank(c) return #c.Text + math.min(c.Gap, 40) * 0.08 end
+    table.sort(found, function(a, b)
+        local ra, rb = rank(a), rank(b)
+        if ra ~= rb then return ra < rb end
+        return a.Gap < b.Gap
+    end)
+    return { List = found, F = F, X0 = x0, Y0 = y0, Grid = grid, Target = target, Next = 1 }
+end
+
+-- the next option the game's own tracer agrees hits the target
+local function nextAimRoute(aim)
+    local seen = aim.Seen or {}
+    aim.Seen = seen
+    while aim.Next <= #aim.List do
+        local c = aim.List[aim.Next]
+        aim.Next += 1
+        if not seen[c.Text] then
+            seen[c.Text] = true
+            if compiles(c.Text) then
+                local f = flight(c.Text, aim.X0, aim.Y0, aim.F, aim.Grid, { aim.Target })
+                if f and f.Hits[aim.Target] then
+                    c.Flight = f
+                    return c
+                end
+            end
+        end
+        if aim.Next % 6 == 0 then task.wait() end
+    end
+    return nil
+end
+
+--// following the drawing -------------------------------------------------------------
+
+-- the first option at this Simplify level that the game's tracer flies all
+-- the way (no early stop), and that misses every block your drawing missed
+local function followPick(level)
+    Made.FollowCache = Made.FollowCache or {}
+    if Made.FollowCache[level] then return Made.FollowCache[level] end
+    local raw, F = Made.Raw, Made.Facing
+    local total = raw[#raw][1]
+    local x0, y0 = origin()
+    local grid = x0 and buildBlocks() or {}
+    local drawnClear = true
+    if x0 then
+        for i = 2, #raw do
+            if blockAt(grid, x0 + raw[i][1] * F, y0 + raw[i][2], 0.2) then drawnClear = false break end
+        end
+    end
+    local first
+    for i, c in ipairs(rankedCandidates(level)) do
+        if i > 25 then break end
+        first = first or c
+        if not x0 then Made.FollowCache[level] = { C = c } return Made.FollowCache[level] end
+        local f = flight(c.Text, x0, y0, F, grid, {})
+        if f then
+            local far = math.abs(f.Path.xs[f.Path.n] - x0)
+            local diesEarly = f.Path.termination == "undefined" and far < total - 1
+            local blocked = drawnClear and f.StopAt and math.abs(f.StopX - x0) < total - 1
+            if not diesEarly and not blocked then
+                Made.FollowCache[level] = { C = c, Flight = f }
+                return Made.FollowCache[level]
+            end
+        end
+        if i % 5 == 0 then task.wait() end
+    end
+    Made.FollowCache[level] = first and { C = first } or nil
+    return Made.FollowCache[level]
 end
 
 local function buildEquation()
     local raw = Made.Raw
     if not raw or #raw < 2 then return nil, "draw a longer path" end
-    local pick = pickCandidate(Made.Level)
-    if not pick then return nil, "couldn't fit an equation the game accepts" end
-    local base = pick.Text
-    local F = Made.Facing
-    local total = raw[#raw][1]
-
-    local x0, y0 = origin()
-    local result = {
-        Text = base, Kind = pick.Kind, Pieces = pick.Pieces, Worst = pick.Err,
-        Angle = pick.Angle, Angle0 = Made.Angle0, Length = total,
-    }
-    if not x0 then return result end
-    local text, endsAtDrag = base, false
-    if Made.EndCut then
-        for dec = 0, 2 do
-            for _, cut in ipairs(endCuts(total * F, F, dec)) do
-                local candidate = base .. cut
-                if not endsAtDrag and compiles(candidate) then
-                    local path = trace(candidate, x0, y0, F)
-                    if path and path.termination == "undefined" and math.abs(math.abs(path.xs[path.n] - x0) - total) <= 1.5 then
-                        text, endsAtDrag = candidate, true
-                    end
-                end
-            end
-            if endsAtDrag then break end
+    if Made.Mode == "aim" and Made.Aim then
+        local route = Made.Route or nextAimRoute(Made.Aim)
+        Made.Route = route
+        if route then
+            return {
+                Mode = "aim", Text = route.Text, Label = route.Label, Path = route.Flight.Path,
+                Points = flightPoints(route.Flight), Target = Made.Aim.Target, Facing = Made.Aim.F,
+            }
         end
+        Made.Mode = "follow"
+        Made.NoAimFor = Made.Aim.Target.Name
     end
-    local path, terr, worst = measure(text, raw, x0, y0, F)
-    result.Text, result.Path, result.TraceError, result.EndsAtDrag = text, path, terr, endsAtDrag
-    if worst then result.Worst = worst end
+    local pick = followPick(Made.Level)
+    if not pick then return nil, "couldn't fit an equation the game accepts" end
+    local c = pick.C
+    local result = {
+        Mode = "follow", Text = c.Text, Kind = c.Kind, Pieces = c.Pieces, Worst = c.Err,
+        Angle = c.Angle, Angle0 = Made.Angle0, Facing = Made.Facing,
+    }
+    local x0, y0 = origin()
+    if pick.Flight then
+        result.Path = pick.Flight.Path
+        result.Points = flightPoints(pick.Flight)
+        result.Blocked = pick.Flight.StopAt ~= nil
+        local _, _, worst = measure(c.Text, raw, x0, y0, Made.Facing)
+        if worst then result.Worst = worst end
+    end
     return result
 end
 
@@ -746,7 +1074,7 @@ local SimplifyBtn = button("Simplify", 134, 0)
 local CopyBtn = button("Copy", 0, 34)
 local ClearBtn = button("Clear", 134, 34)
 local PreviewBtn = button("Preview typed: on", 0, 68)
-local EndBtn = button("Stop at drag end: on", 134, 68)
+local SnapBtn = button("Snap to enemy: on", 134, 68)
 local LockBtn = button("Lock aim: on", 0, 102)
 local GuideBtn = button("Key guide: off", 134, 102)
 local GuideInfo = make("TextLabel", {
@@ -823,6 +1151,8 @@ end
 
 local function faceName(f) return f > 0 and "right" or "left" end
 
+local solveDrag
+
 local function showResult()
     local r, err = buildEquation()
     if not r then
@@ -834,24 +1164,52 @@ local function showResult()
     end
     Made.Text = r.Text
     Output.Text = r.Text
-    if r.Path then drawPoints(Pools.Made, pathPoints(r.Path)) end
+    if r.Points then
+        drawPoints(Pools.Made, r.Points)
+    elseif r.Path then
+        drawPoints(Pools.Made, pathPoints(r.Path))
+    else
+        clearPool(Pools.Made)
+    end
+    SimplifyBtn.Text = r.Mode == "aim" and "Other route" or "Simplify"
+    local face = ("face %s%s"):format(faceName(r.Facing), facing() ~= r.Facing and " (flip your facing!)" or "")
+    if r.Mode == "aim" then
+        setStatus(("hits %s · %s · %d chars · %s"):format(r.Target.Name, r.Label, #r.Text, face), Color3.fromRGB(120, 230, 140))
+        return
+    end
     local shape
     if r.Kind == "curve" then
         shape = r.Pieces == 1 and "straight line" or ("smooth curve (power %d)"):format(r.Pieces)
     else
         shape = ("%d-piece line"):format(r.Pieces or 1)
     end
-    local parts = {
-        ("face %s%s"):format(faceName(Made.Facing), facing() ~= Made.Facing and " (flip your facing!)" or ""),
-        ("%s, %d chars"):format(shape, #r.Text),
-    }
+    local parts = { face, ("%s, %d chars"):format(shape, #r.Text) }
+    if Made.NoAimFor then table.insert(parts, 1, "no clear short shot at " .. Made.NoAimFor .. ", following your drawing") end
     if r.Angle then
         parts[#parts + 1] = ("launch %+.1f° (drew %+.1f°)%s"):format(r.Angle, r.Angle0 or 0, Made.LockAim and " locked" or "")
     end
     if r.Worst then parts[#parts + 1] = ("off by at most %.2f"):format(r.Worst) end
-    if r.EndsAtDrag then parts[#parts + 1] = "stops at your drag's end" elseif Made.EndCut then parts[#parts + 1] = "keeps going past the end" end
+    if r.Blocked then parts[#parts + 1] = "hits a block on the way" end
     if r.TraceError then parts[#parts + 1] = "trace: " .. tostring(r.TraceError) end
     setStatus(table.concat(parts, " · "), THEME.Text)
+end
+
+-- work the last drag out again: aim at the player it ends on if there is
+-- one (and snapping is on), else follow the drawing
+solveDrag = function()
+    if not Made.Raw then return end
+    Made.Level, Made.Candidates, Made.FollowCache = 0, nil, nil
+    Made.Aim, Made.Route, Made.NoAimFor, Made.Mode = nil, nil, nil, "follow"
+    setStatus("Working it out...", THEME.Dim)
+    task.spawn(function()
+        local target = Made.Snap and targetOfDrag(Made.Raw, Made.Facing)
+        if target then
+            setStatus("Aiming at " .. target.Name .. "...", THEME.Dim)
+            local aim = aimOptions(target)
+            if aim then Made.Aim, Made.Mode = aim, "aim" end
+        end
+        showResult()
+    end)
 end
 
 --// capturing the drag ------------------------------------------------------------
@@ -930,9 +1288,8 @@ local function finishDrag()
         setStatus("That drag was too short (or went backwards). Press Create path and try again.", Color3.fromRGB(255, 170, 90))
         return
     end
-    Made.Raw, Made.Facing, Made.Level, Made.Candidates = raw, f, 0, nil
-    setStatus("Working it out...", THEME.Dim)
-    task.spawn(showResult)
+    Made.Raw, Made.Facing = raw, f
+    solveDrag()
 end
 
 track(Capture.InputBegan:Connect(function(input)
@@ -977,13 +1334,29 @@ end))
 track(SimplifyBtn.Activated:Connect(function()
     if not Made.Raw then setStatus("Make a path first.", THEME.Dim) return end
     task.spawn(function()
-        -- step up until the pick actually gets shorter
-        local current = pickCandidate(Made.Level)
+        -- aiming: the next route the game's tracer agrees hits (round again
+        -- from the shortest once they run out)
+        if Made.Mode == "aim" and Made.Aim then
+            local route = nextAimRoute(Made.Aim)
+            if not route then
+                Made.Aim.Next, Made.Aim.Seen = 1, nil
+                route = nextAimRoute(Made.Aim)
+            end
+            if route then
+                Made.Route = route
+                showResult()
+            else
+                setStatus("No other route hits " .. Made.Aim.Target.Name .. ".", Color3.fromRGB(255, 170, 90))
+            end
+            return
+        end
+        -- following: step up until the pick actually gets shorter
+        local current = followPick(Made.Level)
         local level = Made.Level
         while level < #BUDGETS - 1 do
             level += 1
-            local nextPick = pickCandidate(level)
-            if nextPick and current and #nextPick.Text < #current.Text then
+            local nextPick = followPick(level)
+            if nextPick and current and #nextPick.C.Text < #current.C.Text then
                 Made.Level = level
                 showResult()
                 return
@@ -1005,7 +1378,9 @@ track(CopyBtn.Activated:Connect(function()
 end))
 
 track(ClearBtn.Activated:Connect(function()
-    Made.Raw, Made.Text, Made.Level, Made.Candidates = nil, nil, 0, nil
+    Made.Raw, Made.Text, Made.Level, Made.Candidates, Made.FollowCache = nil, nil, 0, nil, nil
+    Made.Aim, Made.Route, Made.NoAimFor, Made.Mode = nil, nil, nil, "follow"
+    SimplifyBtn.Text = "Simplify"
     Output.Text = ""
     clearPool(Pools.Made)
     clearPool(Pools.Drag)
@@ -1024,17 +1399,14 @@ track(LockBtn.Activated:Connect(function()
     Made.LockAim = not Made.LockAim
     LockBtn.Text = "Lock aim: " .. (Made.LockAim and "on" or "off")
     LockBtn.BackgroundColor3 = Made.LockAim and THEME.Btn or Color3.fromRGB(60, 40, 44)
-    Made.Candidates = nil
-    if Made.Raw then
-        Made.Level = 0
-        task.spawn(showResult)
-    end
+    if Made.Raw then solveDrag() end
 end))
 
-track(EndBtn.Activated:Connect(function()
-    Made.EndCut = not Made.EndCut
-    EndBtn.Text = "Stop at drag end: " .. (Made.EndCut and "on" or "off")
-    if Made.Raw then task.spawn(showResult) end
+track(SnapBtn.Activated:Connect(function()
+    Made.Snap = not Made.Snap
+    SnapBtn.Text = "Snap to enemy: " .. (Made.Snap and "on" or "off")
+    SnapBtn.BackgroundColor3 = Made.Snap and THEME.Btn or Color3.fromRGB(60, 40, 44)
+    if Made.Raw then solveDrag() end
 end))
 
 --// live preview of what's typed ------------------------------------------------------
