@@ -278,6 +278,8 @@ def start_serveo(subdomain, port):
         print("  tunnel: ssh not found -- run `pkg install openssh`, then this")
         print("          will bring the tunnel up itself. serving locally for now.")
         return None
+    key = ensure_key()
+    expected = "https://%s.serveo.net" % subdomain
     cmd = [
         "ssh",
         "-o", "StrictHostKeyChecking=accept-new",  # don't hang on the host-key prompt
@@ -287,6 +289,8 @@ def start_serveo(subdomain, port):
         "-R", "%s:80:localhost:%d" % (subdomain, port),
         "serveo.net",
     ]
+    if key:
+        cmd[1:1] = ["-i", key, "-o", "IdentitiesOnly=yes"]
 
     def run():
         backoff = 2
@@ -303,6 +307,7 @@ def start_serveo(subdomain, port):
                 line = line.rstrip()
                 if line:
                     print("  tunnel: " + line)  # Serveo prints your https URL here
+                    check_forward(line, expected)
             proc.wait()
             TUNNEL["proc"] = None
             if STOP.is_set():
@@ -314,6 +319,50 @@ def start_serveo(subdomain, port):
     thread = threading.Thread(target=run, daemon=True)
     thread.start()
     return thread
+
+
+KEY_FILE = os.path.expanduser("~/.ssh/id_ed25519")
+
+
+def ensure_key():
+    """Serveo only gives out a name you ask for (funkyff) to an SSH key you've
+    registered with it, so make one the first time and use it every run after.
+    Returns its path, or None if ssh-keygen isn't there."""
+    if os.path.exists(KEY_FILE):
+        return KEY_FILE
+    if not shutil.which("ssh-keygen"):
+        print("  tunnel: ssh-keygen not found (pkg install openssh) -- no key, so")
+        print("          Serveo will hand out a random URL instead of your name")
+        return None
+    os.makedirs(os.path.dirname(KEY_FILE), mode=0o700, exist_ok=True)
+    result = subprocess.run(
+        ["ssh-keygen", "-t", "ed25519", "-N", "", "-q", "-C", "funkyff-relay", "-f", KEY_FILE],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        print("  tunnel: couldn't make an ssh key: %s" % (result.stderr.strip() or result.returncode))
+        return None
+    print("  tunnel: made an ssh key at %s (used every run from now on)" % KEY_FILE)
+    print("          Serveo will print a link below to register it -- open it once")
+    print("          and log in, then restart this and you get your name for good.")
+    return KEY_FILE
+
+
+def check_forward(line, expected):
+    """Shout when Serveo gave a different URL than the one the scripts use."""
+    marker = "Forwarding HTTP traffic from "
+    if marker not in line:
+        return
+    url = line.split(marker, 1)[1].strip().rstrip("/")
+    if url == expected:
+        print("  tunnel: OK -- %s matches the scripts' LINK_RELAY" % url)
+        return
+    print("  tunnel: !! Serveo gave %s, NOT %s" % (url, expected))
+    print("          the scripts point at %s, so they won't reach this." % expected)
+    print("          This happens until your ssh key is registered with Serveo:")
+    print("          open the register link Serveo printed above, log in, and")
+    print("          restart. Don't use or share the random URL -- it has your")
+    print("          IP address written into it.")
 
 
 def stop_serveo():

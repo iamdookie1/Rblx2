@@ -81,6 +81,16 @@ drops. Your relay URL is therefore:
 https://funkyff.serveo.net
 ```
 
+**One-time setup: register your SSH key with Serveo.** Serveo only gives you
+the name you asked for (`funkyff`) once your SSH key is registered; until then
+it hands out a random `...serveousercontent.com` URL, which **has your IP
+address written into it** — don't use or share that one. The relay makes the key
+for you on first run (`~/.ssh/id_ed25519`) and uses it every run after. On that
+first run Serveo prints a link to register the key: open it, log in, then
+restart the relay. From then on you get `https://funkyff.serveo.net` every time,
+and the relay prints `tunnel: OK -- ... matches the scripts' LINK_RELAY`. If it
+ever gets a different URL, it prints a `!!` warning saying so.
+
 Change the subdomain with `FF_SUBDOMAIN=yourname python funky_friday_relay.py`
 (→ `https://yourname.serveo.net`). Serveo occasionally goes down; if the tunnel
 log keeps retrying, try again later or use one of the alternatives below with
