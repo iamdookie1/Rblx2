@@ -31,7 +31,7 @@
 
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.90"
+local SCRIPT_VERSION = "rewrite-0.5.91"
 
 -- ---------------------------------------------------------------------------
 -- Single instance.
@@ -339,7 +339,7 @@ do
 
     local S = {
         autoparry = false, triggerbot = false, parry_mode = "Remote",
-        preparry = false, preparry_range = 20, hp_preparry = false, hard_curve = false, self_tune = false,
+        preparry = false, preparry_range = 20, hp_preparry = false, hard_curve = false, self_tune = false, fast_retarget = false,
         anticurve = "Smart", dot_threshold = 0.5, curve_bias = 0.5, close_anticurve = true, close_range = 30, instant_retarget = true,
         accuracy = 50, accuracy_base = 50, divisor_multiplier = 1.1, timing_mult = 1,
         extra_distance = 0, ping_compensation = false, retry_delay = 1,
@@ -2304,8 +2304,49 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         end
     end
 
+    -- FAST RETARGET (Debug toggle). The old script's instant retarget fired
+    -- straight from the target change on distance alone -- the ball's new
+    -- velocity isn't in yet then -- and every loose version of it parried
+    -- balls that hadn't turned yet, so the parry ran out. Remade to fire only
+    -- when it should, from that same instant (no defer, no waiting for the
+    -- velocity), on the ball's server-feed position and its speed:
+    --   soonest = (distance - contact gap) / speed, homing straight in -- it
+    --   can't land sooner (a speed-up only makes the next check sooner too)
+    --   * soonest inside reach + safety: fire now, fire or die;
+    --   * not yet due at the Accuracy lead: hold (the normal checks take it);
+    --   * a curve could make it fly up to TWICE that path (the old v36 rule):
+    --     fire only if even that still lands before the parry runs out.
+    function Core.fast_retarget(ball, st, root, now)
+        if pass_busy(st, now) or blocked_by_detection() or Det.tornado(ball, now) then return false end
+        local speed = ball_velocity(ball).Magnitude
+        if speed < 1 then return false end
+        local bpos, adj = Core.ball_now(ball)
+        local dist = (root.Position - bpos).Magnitude
+        local gap = contact_gap(ball)
+        local soonest = math.max(dist - gap, 0) / speed
+        local W = math.min(parry_window() or 0.5, 0.6)
+        local reach = reach_time() - adj
+        local must_by = reach + safe_margin()
+        local lead = math.max(reach + cushion_for(speed, W), must_by)
+        local holds = reach + W - (jitter() + frame_dt + 0.03)
+        local info = { speed = speed, dist = dist, heading = 0, lead = lead, eta = soonest }
+        if soonest <= must_by then return fire(st, now, "fast retarget (must)", info, ball) end
+        if soonest > lead then
+            DBG.held(("fast retarget: not due (%.2fs > lead %.2fs)"):format(soonest, lead), now)
+            return false
+        end
+        if soonest * 2 > holds then
+            DBG.held(("fast retarget: a curve could outlast the parry (%.2fs x2 > %.2fs)"):format(soonest, holds), now)
+            return false
+        end
+        return fire(st, now, "fast retarget", info, ball)
+    end
     on_retarget = function(ball, st, new, now)
         if new == me then
+            if S.fast_retarget and S.autoparry and not S.triggerbot then
+                local root = ap_root()
+                if root then Core.fast_retarget(ball, st, root, now) end
+            end
             if SP.auto then clash_check(ball, now) end
             if has_clash(ball, now) then spam_instant() end
             -- instant decision, deferred ONE step: the rest of the same update
@@ -4744,6 +4785,13 @@ DBGB:AddSlider("DebugUISize", {
     Callback = function(v) DebugCfg.Size = v / 100 end,
 })
 DBGB:AddButton({ Text = "Clear events", Func = function() table.clear(Parry.DBG.list) end })
+
+local DBGT = Tabs.Debug:AddRightGroupbox("Experimental", "flask-conical")
+DBGT:AddToggle("FastRetarget", {
+    Text = "Fast retarget", Default = false,
+    Tooltip = "Auto parry decides the instant the ball turns to you, before its new direction arrives -- but only fires when it should: it's due at your Accuracy, and even a curve twice as long would still land inside the parry (or it's fire-or-die close). Otherwise the normal checks take it a moment later.",
+    Callback = function(v) Parry.S.fast_retarget = v end,
+})
 DBGB:AddLabel("Times in the event list are seconds ago. 'soonest' = the earliest the ball can land, 'lead' = when auto parry fires, 'reach' = your ping delay.", true)
 
 -- ---------------------------------------------------------------------------
