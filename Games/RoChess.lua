@@ -252,8 +252,9 @@ local Brain = (function()
         K1[p], K2[p] = 0, 0
     end
 
-    local nodes, deadline, sliceStart, stopped, canStop = 0, 0, 0, false, false
-    local yieldFn, SLICE = nil, 0.006
+    local nodes, deadline, hardDeadline, sliceStart, stopped, canStop = 0, 0, 0, 0, false, false
+    local yieldFn, SLICE = nil, 0.01
+    local MIN_DEPTH = 6
     local rootBest, rootScore = 0, 0
 
     local function addPiece(sq, p)
@@ -748,7 +749,7 @@ local Brain = (function()
 
     local function poll()
         local now = clock()
-        if canStop and now >= deadline then
+        if (canStop and now >= deadline) or now >= hardDeadline then
             stopped = true
             return
         end
@@ -776,8 +777,31 @@ local Brain = (function()
         nodes += 1
         if band(nodes, 255) == 0 then poll() end
         if stopped then return 0 end
+        if ply >= MAXPLY then return evaluate() end
+        if attacked(kingSq[side], 1 - side) then
+            local list, scores = ML[ply], MS[ply]
+            local n = gen(list, scores, false, ply)
+            local legal = 0
+            for i = 1, n do
+                local m = pick(list, scores, i, n)
+                makeMove(m)
+                if attacked(kingSq[1 - side], side) then
+                    unmakeMove()
+                else
+                    legal += 1
+                    local sc = -qsearch(-beta, -alpha, ply + 1)
+                    unmakeMove()
+                    if stopped then return 0 end
+                    if sc > alpha then
+                        if sc >= beta then return sc end
+                        alpha = sc
+                    end
+                end
+            end
+            if legal == 0 then return -MATE + ply end
+            return alpha
+        end
         local stand = evaluate()
-        if ply >= MAXPLY then return stand end
         if stand >= beta then return stand end
         if stand > alpha then alpha = stand end
         local list, scores = ML[ply], MS[ply]
@@ -1105,6 +1129,7 @@ local Brain = (function()
     local function think(seconds, maxDepth, yielder)
         local start = clock()
         deadline = start + (seconds or 1)
+        hardDeadline = start + max((seconds or 1) * 4, 1.5)
         sliceStart = start
         yieldFn = yielder
         stopped, canStop, nodes = false, false, 0
@@ -1153,9 +1178,9 @@ local Brain = (function()
             end
             if rootBest ~= 0 then bestMove = rootBest end
             bestScore, doneDepth, prev = sc, d, sc
-            canStop = true
+            if d >= MIN_DEPTH then canStop = true end
             if abs(sc) > MATE_BOUND and d >= (MATE - abs(sc)) + 1 then break end
-            if clock() - start > (seconds or 1) * 0.5 then break end
+            if canStop and clock() - start > (seconds or 1) * 0.6 then break end
         end
         yieldFn = nil
         local res = { best = toUci(bestMove), score = bestScore, depth = doneDepth, nodes = nodes }
@@ -1203,21 +1228,21 @@ local S = {
     Color = "random",
     Engine = "Custom",
     MaxDepth = 64,
-    ThinkTime = 0.1,
+    ThinkTime = 0.5,
     MoveDelay = 0,
     Requeue = true,
     SolvePuzzles = false,
     NextPuzzle = true,
     SolveRush = false,
-    PuzzleThink = 0.1,
+    PuzzleThink = 0.5,
     Arrow = false,
-    ArrowThink = 0.1,
+    ArrowThink = 0.5,
     ClaimTasks = false,
     AutoCrate = false,
     Crate = "pieces",
     AntiAfk = true,
     OnlinePlay = false,
-    OnlineThink = 0.5,
+    OnlineThink = 2,
     OnlineDelayMin = 0.4,
     OnlineDelayMax = 1.5,
     OnlineQueue = false,
