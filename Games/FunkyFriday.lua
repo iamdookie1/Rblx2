@@ -1345,7 +1345,7 @@ end
 -- .FunkyFridayRelaySecret still override the constants at load time if you want.)
 -- Keep this block the same in both files.
 
-local LINK_RELAY = "https://ntfy.sh"  -- your tunnel URL to use your own relay
+local LINK_RELAY = "https://funkyff.serveo.net"  -- your relay (Server/funky_friday_relay.py)
 local LINK_SEED = ""          -- one shared seed phrase; "" keeps the public ntfy.sh
 -- advanced: an exact key/secret instead of deriving them from the seed above
 local LINK_RELAY_KEY = ""
