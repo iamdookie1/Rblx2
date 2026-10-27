@@ -23,10 +23,21 @@ The topic (room) is one of the signed fields, so a request signed for your room
 can't be replayed into anyone else's, and rooms are made on demand (a game
 server's topic just starts working the first time a signed request names it).
 
-The key and secret are made once, on first run, and saved next to this file in
-relay_auth.json, so they stay the same every session. Print them with
-  python funky_friday_relay.py --show
-and put them in the scripts (see Server/README.md).
+The simplest way to set it up: pick one seed phrase and give it to both sides.
+Run the server with that seed and put the same seed in the script's LINK_SEED;
+each side works out the key and secret from it on its own, so there's only one
+value to keep in sync.
+  FF_SEED="some phrase" python funky_friday_relay.py
+  python funky_friday_relay.py --seed "some phrase"
+  echo "some phrase" > seed.txt && python funky_friday_relay.py   # picked up too
+
+With no seed, the server instead makes a random key and secret on first run and
+saves them next to this file in relay_auth.json, so they stay the same every
+session; copy those into the script's LINK_RELAY_KEY / LINK_RELAY_SECRET.
+
+Either way, print what the script needs with
+  python funky_friday_relay.py --show      (add --seed "..." to show a seed's)
+See Server/README.md.
 
 Run:
   python funky_friday_relay.py              # listens on 0.0.0.0:8080
@@ -45,6 +56,7 @@ from urllib.parse import urlparse, parse_qs
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 AUTH_FILE = os.path.join(HERE, "relay_auth.json")
+SEED_FILE = os.path.join(HERE, "seed.txt")
 
 PORT = int(os.environ.get("PORT", "8080"))
 AUTH_WINDOW = 60          # seconds a request's timestamp may be off by
@@ -53,13 +65,41 @@ MAX_PER_TOPIC = 400       # most messages kept per topic
 MAX_BODY = 8 * 1024       # biggest message body accepted
 
 
-def load_auth():
-    """The key/secret pair, made once and reused every run after."""
+def derive(seed):
+    """key and secret from one seed phrase -- the script does the same, so both
+    sides land on the same pair from the same seed."""
+    key = hashlib.sha256(("FFKEY:" + seed).encode()).hexdigest()[:16]
+    secret = hashlib.sha256(("FFSECRET:" + seed).encode()).hexdigest()
+    return key, secret
+
+
+def find_seed(argv):
+    """A seed from --seed, then FF_SEED, then seed.txt; None if none is set."""
+    if "--seed" in argv:
+        i = argv.index("--seed")
+        if i + 1 < len(argv):
+            return argv[i + 1].strip() or None
+    env = os.environ.get("FF_SEED")
+    if env and env.strip():
+        return env.strip()
+    try:
+        with open(SEED_FILE) as f:
+            return f.read().strip() or None
+    except OSError:
+        return None
+
+
+def load_auth(seed):
+    """From a seed when there is one, otherwise a random pair saved once and
+    reused every run after. Returns (key, secret, from_seed)."""
+    if seed:
+        key, secret = derive(seed)
+        return key, secret, True
     try:
         with open(AUTH_FILE) as f:
             data = json.load(f)
             if data.get("key") and data.get("secret"):
-                return data["key"], data["secret"]
+                return data["key"], data["secret"], False
     except (OSError, ValueError):
         pass
     auth = {"key": secrets.token_hex(8), "secret": secrets.token_hex(32)}
@@ -69,10 +109,12 @@ def load_auth():
         os.chmod(AUTH_FILE, 0o600)
     except OSError:
         pass
-    return auth["key"], auth["secret"]
+    return auth["key"], auth["secret"], False
 
 
-KEY, SECRET = load_auth()
+import sys
+SEED = find_seed(sys.argv)
+KEY, SECRET, FROM_SEED = load_auth(SEED)
 
 
 class Store:
@@ -214,19 +256,29 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    import sys
     if "--show" in sys.argv:
-        print("relay key:    %s" % KEY)
-        print("relay secret: %s" % SECRET)
-        print("\nkept in %s -- same every run" % AUTH_FILE)
+        if FROM_SEED:
+            print("seed:         %s" % SEED)
+            print("relay key:    %s   (made from the seed)" % KEY)
+            print("relay secret: %s   (made from the seed)" % SECRET)
+            print("\nPut the same seed in the script's LINK_SEED -- it works the")
+            print("key and secret out itself, so these two are just for reference.")
+        else:
+            print("relay key:    %s" % KEY)
+            print("relay secret: %s" % SECRET)
+            print("\nkept in %s -- same every run" % AUTH_FILE)
+            print("put these in the script's LINK_RELAY_KEY / LINK_RELAY_SECRET")
         return
     server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     print("Funky Friday relay on port %d" % PORT)
-    print("  key:    %s" % KEY)
-    print("  secret: %s  (keep this one off-screen)" % SECRET)
+    if FROM_SEED:
+        print("  seed set -> key %s (put the SAME seed in the script's LINK_SEED)" % KEY)
+    else:
+        print("  key:    %s" % KEY)
+        print("  secret: %s  (keep this one off-screen)" % SECRET)
     print("  health: http://127.0.0.1:%d/health" % PORT)
-    print("Expose this port with a tunnel (see Server/README.md), then put the")
-    print("public URL, key and secret in the scripts. Ctrl+C to stop.")
+    print("Expose this port with a tunnel (see Server/README.md), then set the")
+    print("public URL and seed (or key/secret) in the scripts. Ctrl+C to stop.")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

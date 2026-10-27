@@ -1,2 +1,4 @@
 # the key/secret the relay generates on first run -- never commit it
 relay_auth.json
+# your seed phrase, if you keep it in a file -- never commit it
+seed.txt

@@ -401,18 +401,23 @@ local canPlay = typeof(getgc) == "function" or typeof(run_on_actor) == "function
 -- it polls the topic every few seconds instead.
 --
 -- To use your own relay (Server/funky_friday_relay.py, run on your phone in
--- Termux) instead of the public ntfy.sh, set these before loading:
---   getgenv().FunkyFridayRelay = "https://your-tunnel-url"
---   getgenv().FunkyFridayRelayKey = "<the key the server printed>"
---   getgenv().FunkyFridayRelaySecret = "<the secret the server printed>"
--- With a secret set, every request is stamped, given a one-time nonce and
--- signed (HMAC-SHA256) so the relay can tell your scripts from anyone else and
--- drop forged commands; it then polls (that relay has no WebSocket).
+-- Termux) instead of the public ntfy.sh, fill in LINK_RELAY and LINK_SEED just
+-- below with your tunnel URL and one shared seed phrase. The script works out
+-- the key, the secret and every request's signature from the seed on its own,
+-- so there is nothing to pass in before loadstring -- handy when you obfuscate
+-- the script, which keeps the seed out of sight. Set the same seed on the
+-- server (FF_SEED). With a seed set, every request is stamped, given a one-time
+-- nonce and signed (HMAC-SHA256) so the relay tells your scripts from anyone
+-- else and drops forged commands; it then polls (that relay has no WebSocket).
+-- (getgenv().FunkyFridayRelay / .FunkyFridayRelaySeed / .FunkyFridayRelayKey /
+-- .FunkyFridayRelaySecret still override the constants at load time if you want.)
 -- Keep this block the same in both files.
 
-local LINK_RELAY = "https://ntfy.sh"
-local LINK_RELAY_KEY = ""     -- set here, or getgenv().FunkyFridayRelayKey
-local LINK_RELAY_SECRET = ""  -- set here, or getgenv().FunkyFridayRelaySecret
+local LINK_RELAY = "https://ntfy.sh"  -- your tunnel URL to use your own relay
+local LINK_SEED = ""          -- one shared seed phrase; "" keeps the public ntfy.sh
+-- advanced: an exact key/secret instead of deriving them from the seed above
+local LINK_RELAY_KEY = ""
+local LINK_RELAY_SECRET = ""
 local LINK_BETA, LINK_DEV = 1, 2
 local LINK_FLAG_AUTO, LINK_FLAG_PLAYING = 1, 2
 local LINK_POLL_EVERY = 6   -- seconds, when there's no WebSocket
@@ -540,8 +545,14 @@ local function makeLink(role, onCommand)
     local topic = "madness-ff-" .. (jobId ~= "" and jobId or ("solo" .. LocalPlayer.UserId))
     local me = LocalPlayer.UserId
     local instance = HttpService:GenerateGUID(false)
+    local seed = tostring(Genv.FunkyFridayRelaySeed or LINK_SEED)
     local relayKey = tostring(Genv.FunkyFridayRelayKey or LINK_RELAY_KEY)
     local relaySecret = tostring(Genv.FunkyFridayRelaySecret or LINK_RELAY_SECRET)
+    -- a seed makes the key and secret on its own, so only the seed is set
+    if seed ~= "" and relaySecret == "" then
+        relayKey = linkSha256("FFKEY:" .. seed):sub(1, 16)
+        relaySecret = linkSha256("FFSECRET:" .. seed)
+    end
     local signed = relaySecret ~= ""
     -- where to pick up from: the last message we saw, or the relay's last few
     -- seconds (by its own clock) for the first look
