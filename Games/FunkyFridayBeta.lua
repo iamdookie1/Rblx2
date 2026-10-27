@@ -18,8 +18,9 @@
 -- PlayerScripts.ClientActor, so the worker runs there through run_on_actor, or
 -- here when getgc can see them.
 --
--- It links up with the full script (the dev version) across clients: anyone
--- in the lobby running Games/FunkyFriday.lua sees you're on beta, and can send
+-- It links up with the full script (the dev version) across clients through a
+-- web relay (an ntfy topic for your server, which sees your UserId): anyone in
+-- the lobby running Games/FunkyFriday.lua sees you're on beta, and can send
 -- you commands from its Cmds tab (see "link" below).
 
 local Players = game:GetService("Players")
@@ -379,21 +380,33 @@ local canPlay = typeof(getgc) == "function" or typeof(run_on_actor) == "function
 
 --// link ----------------------------------------------------------------------
 -- Funky Friday (the dev script, Games/FunkyFriday.lua) and Funky Friday beta
--- (Games/FunkyFridayBeta.lua) find each other across clients through
--- animations: a track played on your own character replicates to everyone in
--- the server, speed included. Each copy plays a "beacon" track at almost no
--- weight (so it doesn't show), with a speed that says which script it is,
--- its flags and the last command it ran. The dev copy also plays a short
--- "command" track whose speed carries a command for the beta copies. Both
--- animations are Roblox's own emotes, so they load in any game.
+-- (Games/FunkyFridayBeta.lua) find each other through a relay on the web, not
+-- through the game. Every copy in a server joins the same ntfy topic (named
+-- from the server's JobId), listens to it over a WebSocket, and posts small
+-- JSON messages to it with the executor's request function. Nothing is played
+-- on your character, so it works without one, commands land in a fraction of
+-- a second, a command reaches exactly the UserId it is for, and messages can
+-- carry real values (any duration, your own text).
+--  hi    who you are: role and flags. q = true asks everyone to answer with theirs
+--  cmd   a command for one beta user (t = their UserId) or all of them (t = 0)
+--  ack   a beta copy ran command s
+--  bye   the script was closed
+-- Every copy says hi with q when it starts, so the ones already here answer.
+-- A peer only counts while that player is in this server, commands are only
+-- taken from a dev copy in this server, and the dev copy asks again every two
+-- minutes to drop anyone whose script died without a bye. Without a WebSocket
+-- it polls the topic every few seconds instead. To use your own ntfy server,
+-- set getgenv().FunkyFridayRelay = "https://your.server" before loading.
 -- Keep this block the same in both files.
 
-local LINK_BEACON_ID = "507770677"  -- the R15 cheer emote
-local LINK_COMMAND_ID = "507770453" -- the R15 point emote
+local LINK_RELAY = "https://ntfy.sh"
 local LINK_BETA, LINK_DEV = 1, 2
 local LINK_FLAG_AUTO, LINK_FLAG_PLAYING = 1, 2
+local LINK_POLL_EVERY = 6   -- seconds, when there's no WebSocket
+local LINK_ASK_EVERY = 120  -- seconds, the dev copy's roll call
+local LINK_TEXT_MAX = 120
 
--- arg -> seconds, for the commands that last a while
+-- index -> seconds, for the duration picker
 local LINK_DURATIONS = { [0] = 1, 2, 3, 5, 8, 10, 15, 20, 30, 60 }
 local LINK_MESSAGES = {
     [0] = "👀", "skill issue", "the dev is watching you", "you're not him", "nice miss lol",
@@ -413,127 +426,205 @@ local LINK_COMMANDS = {
     Dance = 32,
 }
 
--- role: LINK_BETA or LINK_DEV. onCommand(cmd, arg, fromPlayer) runs on beta
--- copies for every command aimed at them.
+local function linkRequestFunction()
+    if typeof(request) == "function" then return request end
+    if typeof(http_request) == "function" then return http_request end
+    if typeof(syn) == "table" and typeof(syn.request) == "function" then return syn.request end
+    if typeof(http) == "table" and typeof(http.request) == "function" then return http.request end
+    if typeof(fluxus) == "table" and typeof(fluxus.request) == "function" then return fluxus.request end
+    return nil
+end
+
+local function linkSocketFunction()
+    if typeof(WebSocket) == "table" then
+        local connect = WebSocket.connect or WebSocket.Connect
+        if typeof(connect) == "function" then return connect end
+    end
+    if typeof(syn) == "table" and typeof(syn.websocket) == "table" and typeof(syn.websocket.connect) == "function" then
+        return syn.websocket.connect
+    end
+    return nil
+end
+
+-- role: LINK_BETA or LINK_DEV. onCommand(cmd, seconds, text, fromPlayer) runs
+-- on beta copies for every command aimed at them.
 local function makeLink(role, onCommand)
-    local link = { Role = role, Flags = 0, Ack = 0, Seq = 0, Peers = {}, Stopped = false }
-    local own = { Animator = nil, Tracks = {} }
-    local queue = {}
-    local lastCommand = {} -- player -> last command value seen from them
-    local commandSince, commandUntil = 0, 0
+    local link = { Role = role, Flags = 0, Seq = 0, Peers = {}, Stopped = false, Mode = "starting" }
+    local httpRequest = linkRequestFunction()
+    local socketConnect = linkSocketFunction()
+    local relay = (tostring(Genv.FunkyFridayRelay or LINK_RELAY):gsub("/+$", ""))
+    local jobId = (tostring(game.JobId):gsub("[^%w]", ""):lower())
+    local topic = "madness-ff-" .. (jobId ~= "" and jobId or ("solo" .. LocalPlayer.UserId))
+    local me = LocalPlayer.UserId
+    -- where to pick up from: the last message we saw, or the relay's last few
+    -- seconds (by its own clock) for the first look
+    local lastId = nil
+    local seen = {}
+    local outbox = {}
+    local lastHi = 0
 
-    local function animatorOf(player)
-        local character = player.Character
-        local humanoid = character and character:FindFirstChildOfClass("Humanoid")
-        return humanoid and humanoid:FindFirstChildOfClass("Animator")
+    local function post(message)
+        message.v, message.f = 1, me
+        outbox[#outbox + 1] = HttpService:JSONEncode(message)
     end
 
-    local function idOf(track)
-        local animation = track.Animation
-        return animation and tostring(animation.AnimationId):match("(%d+)%D*$")
+    local function hello(ask)
+        lastHi = os.clock()
+        post({ k = "hi", r = role, fl = link.Flags, q = ask or nil })
     end
 
-    local function ownTrack(key, id)
-        local animator = animatorOf(LocalPlayer)
-        if animator ~= own.Animator then
-            for _, track in pairs(own.Tracks) do pcall(function() track:Stop(0) end) end
-            table.clear(own.Tracks)
-            own.Animator = animator
+    local function handle(event)
+        if type(event) ~= "table" or event.event ~= "message" or type(event.message) ~= "string" then return end
+        if event.id then
+            if seen[event.id] then return end
+            seen[event.id] = true
+            lastId = event.id
         end
-        if not animator then return nil end
-        local track = own.Tracks[key]
-        if not track then
-            local animation = Instance.new("Animation")
-            animation.AnimationId = "rbxassetid://" .. id
-            local ok, loaded = pcall(animator.LoadAnimation, animator, animation)
-            if not ok or not loaded then return nil end
-            loaded.Priority = Enum.AnimationPriority.Core
-            loaded.Looped = true
-            own.Tracks[key] = loaded
-            track = loaded
+        local ok, data = pcall(HttpService.JSONDecode, HttpService, event.message)
+        if not ok or type(data) ~= "table" or data.v ~= 1 then return end
+        local from = tonumber(data.f)
+        if not from or from == me then return end
+        local player = Players:GetPlayerByUserId(from)
+        if not player then return end
+
+        local peer = link.Peers[player]
+        if data.k == "hi" then
+            if not peer then
+                peer = { Player = player, Ack = 0 }
+                link.Peers[player] = peer
+            end
+            peer.Role = tonumber(data.r)
+            peer.Flags = tonumber(data.fl) or 0
+            peer.Seen = os.clock()
+            if data.q then hello(false) end
+        elseif data.k == "bye" then
+            link.Peers[player] = nil
+        elseif data.k == "ack" then
+            if peer then peer.Ack = tonumber(data.s) or peer.Ack end
+        elseif data.k == "cmd" and role == LINK_BETA and onCommand then
+            if not peer or peer.Role ~= LINK_DEV then return end
+            local target = tonumber(data.t) or 0
+            if target ~= 0 and target ~= me then return end
+            post({ k = "ack", s = tonumber(data.s) or 0 })
+            local text = type(data.x) == "string" and data.x:sub(1, LINK_TEXT_MAX) or ""
+            task.spawn(pcall, onCommand, tonumber(data.c), tonumber(data.d), text, player)
         end
-        return track
     end
 
-    -- plays (or re-plays, if the game stopped it) one of our tracks at a speed
-    local function play(key, id, speed)
-        local track = ownTrack(key, id)
-        if not track then return end
-        if not track.IsPlaying then
-            track:Play(0, 0.001, speed)
-            track:AdjustSpeed(speed)
-        elseif math.abs(track.Speed - speed) > 0.25 then
-            track:AdjustSpeed(speed)
-        end
+    local function handleText(text)
+        local ok, event = pcall(HttpService.JSONDecode, HttpService, text)
+        if ok then handle(event) end
     end
 
-    local function stop(key)
-        local track = own.Tracks[key]
-        if track and track.IsPlaying then track:Stop(0) end
-    end
-
-    function link.TargetCode(player)
-        return player.UserId % 99 + 1
-    end
-
-    local function scan()
-        local now = os.clock()
-        for _, player in ipairs(Players:GetPlayers()) do
-            if player ~= LocalPlayer then
-                local animator = animatorOf(player)
-                local beacon, command
-                if animator then
-                    local ok, tracks = pcall(animator.GetPlayingAnimationTracks, animator)
-                    for _, track in ipairs(ok and tracks or {}) do
-                        local id = idOf(track)
-                        local value = math.floor(track.Speed + 0.5)
-                        if id == LINK_BEACON_ID and value >= 1000000 and value < 2000000 then
-                            beacon = value - 1000000
-                        elseif id == LINK_COMMAND_ID and value >= 100000 and value < 10000000 then
-                            command = value
-                        end
-                    end
-                end
-                if beacon then
-                    local peer = link.Peers[player]
-                    if not peer then
-                        peer = { Player = player }
-                        link.Peers[player] = peer
-                    end
-                    peer.Role = math.floor(beacon / 100000)
-                    peer.Flags = math.floor(beacon / 1000) % 100
-                    peer.Ack = beacon % 1000
-                    peer.Seen = now
-                end
-                if command and command ~= lastCommand[player] then
-                    lastCommand[player] = command
-                    local cmd = math.floor(command / 100000)
-                    local arg = math.floor(command / 10000) % 10
-                    local target = math.floor(command / 100) % 100
-                    local seq = command % 100
-                    if role == LINK_BETA and onCommand and (target == 0 or target == link.TargetCode(LocalPlayer)) then
-                        link.Ack = seq
-                        task.spawn(pcall, onCommand, cmd, arg, player)
-                    end
+    -- posts go out one at a time, in order. a busy relay (429) gets them again
+    task.spawn(function()
+        while httpRequest do
+            if #outbox == 0 then
+                if link.Stopped then break end
+                task.wait(0.05)
+            else
+                local ok, response = pcall(httpRequest, {
+                    Url = relay .. "/" .. topic,
+                    Method = "POST",
+                    Headers = { ["Content-Type"] = "text/plain" },
+                    Body = outbox[1],
+                })
+                if ok and type(response) == "table" and response.StatusCode == 429 and not link.Stopped then
+                    task.wait(5)
+                else
+                    table.remove(outbox, 1)
                 end
             end
         end
-        -- gone, or no beacon for a while (the game can stop everyone's tracks
-        -- for a moment, and they come back within half a second)
-        for player, peer in pairs(link.Peers) do
-            if not player.Parent or now - peer.Seen > 4 then link.Peers[player] = nil end
-        end
-        for player in pairs(lastCommand) do
-            if not player.Parent then lastCommand[player] = nil end
-        end
+    end)
+
+    local function since()
+        return lastId or "10s"
     end
 
+    local function poll()
+        local ok, response = pcall(httpRequest, {
+            Url = ("%s/%s/json?poll=1&since=%s"):format(relay, topic, since()),
+            Method = "GET",
+        })
+        if not ok or type(response) ~= "table" or type(response.Body) ~= "string" then return false end
+        for line in response.Body:gmatch("[^\n]+") do handleText(line) end
+        return (response.StatusCode or 200) < 400
+    end
+
+    -- a WebSocket while one stays up, polling otherwise
+    task.spawn(function()
+        if not httpRequest then
+            link.Mode = "off"
+            return
+        end
+        hello(true)
+        local socketWorks, hadSocket = socketConnect ~= nil, false
+        while not link.Stopped do
+            local socket
+            if socketWorks then
+                local url = ("%s/%s/ws?since=%s"):format(relay:gsub("^http", "ws"), topic, since())
+                local ok, result = pcall(socketConnect, url)
+                if ok and result then
+                    socket, hadSocket = result, true
+                elseif not hadSocket then
+                    socketWorks = false -- never got one up, so don't keep trying
+                end
+            end
+            if socket then
+                link.Mode = "live"
+                local closed = false
+                local onMessage = socket.OnMessage:Connect(handleText)
+                local onClose = socket.OnClose:Connect(function() closed = true end)
+                while not closed and not link.Stopped do task.wait(0.25) end
+                pcall(function() onMessage:Disconnect() end)
+                pcall(function() onClose:Disconnect() end)
+                pcall(function() socket:Close() end)
+                if not link.Stopped then
+                    link.Mode = "reconnecting"
+                    task.wait(2)
+                end
+            else
+                link.Mode = poll() and "polling" or "relay unreachable"
+                task.wait(LINK_POLL_EVERY)
+            end
+        end
+    end)
+
+    -- flag changes, the dev copy's roll call, and players who left
+    task.spawn(function()
+        local sentFlags = link.Flags
+        local nextAsk = os.clock() + LINK_ASK_EVERY
+        local askedAt = nil
+        while not link.Stopped do
+            local now = os.clock()
+            if link.Flags ~= sentFlags and now - lastHi >= 3 then
+                sentFlags = link.Flags
+                hello(false)
+            end
+            if role == LINK_DEV and now >= nextAsk then
+                nextAsk = now + LINK_ASK_EVERY
+                askedAt = now
+                hello(true)
+            end
+            for player, peer in pairs(link.Peers) do
+                local silent = askedAt and now - askedAt > 10 and peer.Seen < askedAt
+                if not player.Parent or silent then link.Peers[player] = nil end
+            end
+            if askedAt and now - askedAt > 10 then askedAt = nil end
+            task.wait(0.5)
+        end
+    end)
+
     -- sends a command to one beta player, or to every one with no target.
-    -- returns its sequence number, which the target's beacon echoes once run
-    function link.Send(cmd, arg, target)
-        link.Seq = link.Seq % 99 + 1
-        local code = target and link.TargetCode(target) or 0
-        queue[#queue + 1] = cmd * 100000 + (arg or 0) * 10000 + code * 100 + link.Seq
+    -- returns its sequence number, which the target acks once it has run it
+    function link.Send(cmd, seconds, text, target)
+        link.Seq = link.Seq % 9999 + 1
+        post({
+            k = "cmd", c = cmd, d = seconds, s = link.Seq,
+            x = text and tostring(text):sub(1, LINK_TEXT_MAX) or nil,
+            t = target and target.UserId or 0,
+        })
         return link.Seq
     end
 
@@ -547,30 +638,19 @@ local function makeLink(role, onCommand)
         return list
     end
 
-    function link.Beaconing()
-        local track = own.Tracks.Beacon
-        return track ~= nil and track.IsPlaying
+    function link.Status()
+        if link.Mode == "off" then return "off: this executor has no request function" end
+        if link.Mode == "live" then return "live over a WebSocket" end
+        if link.Mode == "polling" then return ("on, checking every %ds (no WebSocket)"):format(LINK_POLL_EVERY) end
+        return link.Mode .. "..."
     end
 
-    task.spawn(function()
-        while not link.Stopped do
-            local now = os.clock()
-            pcall(scan)
-            pcall(play, "Beacon", LINK_BEACON_ID, 1000000 + role * 100000 + link.Flags * 1000 + link.Ack)
-            -- commands go out one at a time, each held long enough to be seen,
-            -- and the track stops a few seconds after the last one
-            if #queue > 0 and now - commandSince >= 0.4 then
-                local value = table.remove(queue, 1)
-                commandSince, commandUntil = now, now + 3
-                pcall(play, "Command", LINK_COMMAND_ID, value)
-            elseif commandUntil > 0 and now >= commandUntil then
-                commandUntil = 0
-                pcall(stop, "Command")
-            end
-            task.wait(0.1)
-        end
-        for _, track in pairs(own.Tracks) do pcall(function() track:Stop(0) end) end
-    end)
+    -- says bye so the others drop us straight away, then stops
+    function link.Stop()
+        if link.Stopped then return end
+        post({ k = "bye" })
+        link.Stopped = true
+    end
 
     return link
 end
@@ -813,7 +893,7 @@ local function makePranks(hooks)
         end,
 
         [C.FakeKick] = fakeKick,
-        [C.Message] = function(_, arg) popup(LINK_MESSAGES[arg] or "👀", 3) end,
+        [C.Message] = function(_, text) popup(text ~= "" and text or "👀", 3) end,
         [C.PopupSpam] = function(seconds)
             local gui = screen()
             local ends = os.clock() + seconds
@@ -902,10 +982,11 @@ local function makePranks(hooks)
         [C.Kick] = function() LocalPlayer:Kick("the dev kicked you lol") end,
     }
 
-    function pranks.Run(cmd, arg)
+    -- seconds for the commands that last a while, text for Message
+    function pranks.Run(cmd, seconds, text)
         if pranks.Stopped then return end
         local fn = RUN[cmd]
-        if fn then task.spawn(pcall, fn, LINK_DURATIONS[arg] or 5, arg) end
+        if fn then task.spawn(pcall, fn, math.clamp(tonumber(seconds) or 5, 0.5, 120), tostring(text or "")) end
     end
 
     function pranks.Stop()
@@ -964,7 +1045,7 @@ local function shutdown()
     pcall(function() Bridge:SetAttribute("Stop", true) end)
     -- the workers see Stop on their next frame, let go of any held lane, and quit
     task.delay(0.5, function() pcall(function() Bridge:Destroy() end) end)
-    if Link then Link.Stopped = true end
+    if Link then Link.Stop() end
     Pranks.Stop()
     -- the old menu goes too: a second load used to leave it up, and its auto
     -- play toggle then pointed at a bridge that was gone, so it did nothing
@@ -973,11 +1054,11 @@ local function shutdown()
 end
 Genv.__FunkyFridayBetaStop = shutdown
 
-Link = makeLink(LINK_BETA, function(cmd, arg)
-    if not Unloaded then Pranks.Run(cmd, arg) end
+Link = makeLink(LINK_BETA, function(cmd, seconds, text)
+    if not Unloaded then Pranks.Run(cmd, seconds, text) end
 end)
 
--- the beacon tells the dev script whether auto play is on and in a song
+-- the link tells the dev script whether auto play is on and in a song
 task.spawn(function()
     while not Unloaded do
         local flags = 0
