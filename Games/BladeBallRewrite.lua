@@ -31,7 +31,7 @@
 
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.96"
+local SCRIPT_VERSION = "rewrite-0.5.97"
 
 -- ---------------------------------------------------------------------------
 -- Single instance.
@@ -1268,6 +1268,135 @@ end]]
         end
         return p
     end
+    -- ---------- HOOKLESS CAPTURE (Debug button) ----------
+    -- Takes the capture with NO parry and NO hook, the way the original's
+    -- 924f4dd/a833314 read it -- minus getgc. PRY's send function holds, as
+    -- upvalues: the Net package, the remote's name right after it, the first
+    -- argument, a uid holder (holder[2][holder[1]] is the current uid) and the
+    -- token function (its first function upvalue: key = token(uid, "TIME")).
+    --   1. sender = require(PRY): already loaded, so this only returns its cached
+    --      value -- nothing runs.
+    --   2. walk function upvalues from there (getupvalues, read-only) to the send
+    --      function; tables read with rawget only (no metamethod can fire) and
+    --      only tables with no metatable are looked into.
+    --   3. hash from _G.BAC_HASH; uid read from the holder (re-read every parry).
+    --   4. the two calls into game code -- token(uid, "TIME") and
+    --      Net:RemoteEvent(name) -- run on a fresh thread whose globals and only
+    --      Lua frame are the GAME's env (e090d3d), so PRY's getfenv(1..10)
+    --      writefile check never sees ours.
+    function Core.game_call(nowait, fn, ...)
+        local args = table.pack(...)
+        local env
+        pcall(function() env = getrenv and getrenv() end)
+        local setenv = setfenv
+        local box = { done = false }
+        local caller = function()
+            if env and setenv then pcall(setenv, 0, env) end
+            box.res = table.pack(pcall(fn, table.unpack(args, 1, args.n)))
+            box.done = true
+        end
+        if env and setenv then pcall(setenv, caller, env) end
+        task.spawn(caller)
+        if not box.done and not nowait then
+            local t0 = clock_()
+            while not box.done and clock_() - t0 < 3 do task.wait() end
+        end
+        if not box.done or not box.res[1] then return nil end
+        return table.unpack(box.res, 2, box.res.n)
+    end
+    function Core.holder_value(h)
+        if type(h) ~= "table" then return nil end
+        local k, inner = rawget(h, 1), rawget(h, 2)
+        if k == nil or k ~= k or type(inner) ~= "table" then return nil end
+        return rawget(inner, k)
+    end
+    -- key bytes for a uid: token(uid, "TIME"), repeated to the time-text length
+    function Core.key_for(token, uid, nowait)
+        local k = Core.game_call(nowait, token, uid, "TIME")
+        if type(k) ~= "string" or #k == 0 then return nil end
+        local len = #tostring(math.floor(Workspace:GetServerTimeNow() * 100))
+        local key = {}
+        for i = 1, len do key[i] = string.byte(k, (i - 1) % #k + 1) end
+        return key, len
+    end
+    function Parry.hooklessCapture()
+        local function say(t) logp("hookless capture: " .. t); DBG.ev("hookless: " .. t) end
+        local getups = reflect_getups()
+        if type(getups) ~= "function" then say("getupvalues not available"); return false, "no getupvalues" end
+        local pry = forge_find_pry()
+        if not pry then say("SwordsController.PRY not found"); return false, "PRY not found" end
+        local ok, entry = pcall(require, pry)
+        if not ok or type(entry) ~= "function" then say("require(PRY) gave " .. typeof(entry)); return false, "PRY isn't a function" end
+        local function is_net(v) return type(v) == "table" and type(rawget(v, "RemoteEvent")) == "function" end
+        local function is_holder(v)
+            if is_net(v) then return false end
+            local val = Core.holder_value(v)
+            return val ~= nil and type(val) ~= "function"
+        end
+        local grm = getrawmetatable
+        local seen, queue, found, nodes = {}, { { entry, 0 } }, nil, 0
+        while #queue > 0 and not found and nodes < 400 do
+            local item = table.remove(queue, 1)
+            local fn, depth = item[1], item[2]
+            if type(fn) == "function" and not seen[fn] then
+                seen[fn] = true
+                nodes = nodes + 1
+                local okU, ups = pcall(getups, fn)
+                if okU and type(ups) == "table" then
+                    local has_remote, token, net_i, holder = false, nil, nil, nil
+                    local n = 0
+                    for i, v in pairs(ups) do if type(i) == "number" and i > n then n = i end end
+                    for i = 1, n do
+                        local v = ups[i]
+                        local t = typeof(v)
+                        if t == "Instance" then
+                            local okR, r = pcall(function() return v.ClassName == "RemoteEvent" end)
+                            if okR and r then has_remote = true end
+                        elseif t == "function" then
+                            if not token then token = v end
+                            if depth < 4 then queue[#queue + 1] = { v, depth + 1 } end
+                        elseif t == "table" then
+                            if not net_i and is_net(v) then net_i = i
+                            elseif not holder and is_holder(v) then holder = v
+                            elseif depth < 4 and not (grm and grm(v)) then
+                                -- look one table deep for more functions (raw only)
+                                for j = 1, 32 do
+                                    local f = rawget(v, j)
+                                    if type(f) == "function" then queue[#queue + 1] = { f, depth + 1 } end
+                                end
+                            end
+                        end
+                    end
+                    if has_remote and token and net_i and holder and type(ups[net_i + 1]) == "string" then
+                        found = { token = token, net = ups[net_i], name = ups[net_i + 1], first = ups[net_i + 2], holder = holder }
+                    end
+                end
+            end
+        end
+        if not found then
+            say(("send function not found (%d functions read) -- the layout changed"):format(nodes))
+            return false, "layout not found"
+        end
+        say(("send function found after reading %d function(s)"):format(nodes))
+        local uid = Core.holder_value(found.holder)
+        if type(uid) ~= "string" then say("uid holder is empty"); return false, "no uid" end
+        local real = Core.bac()
+        local hash = real or (type(found.first) == "string" and #found.first == 36 and found.first) or nil
+        if not hash then say("no hash (no _G.BAC_HASH and no 36-char first argument)"); return false, "no hash" end
+        local key, len = Core.key_for(found.token, uid, false)
+        if not key then say("the token function gave no key"); return false, "no key" end
+        local remote = Core.game_call(false, function(net, name) return net:RemoteEvent(name) end, found.net, found.name)
+        if typeof(remote) ~= "Instance" or not remote:IsA("RemoteEvent") then say("Net:RemoteEvent(name) found no remote"); return false, "no remote" end
+        local cap = { remote = remote, hash = hash, uid = uid, key = key, len = len, ball2 = false,
+            verified = real ~= nil and hash == real, hookless = true, holder = found.holder, token = found.token, key_uid = uid }
+        if H.fire or H.nc then pcall(Core.unhook) end
+        Core.cap, Core.misses, Core.pending = cap, 0, nil
+        Core.caps.match, Core.caps.training = cap, cap
+        say(("ARMED with no parry: remote %s, hash %s, uid %d chars, key %d bytes"):format(remote.Name,
+            cap.verified and "real (BAC_HASH)" or "from the sender", #uid, #key))
+        return true
+    end
+
     local GC = { last_msg = nil }
     function GC.clean(s) return (tostring(s):gsub("[^%w]", "")) end
     function GC.is_lua(f)
@@ -1450,6 +1579,17 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
             return "unarmed"
         end
         if not spam and not gate_open() then return "blocked" end
+        -- hookless capture: the uid is re-read from the game's holder every
+        -- parry (the server may expect it to roll forward); a new uid gets its
+        -- own key from the token function (game-env thread, no wait)
+        if cap.holder then
+            local uid = Core.holder_value(cap.holder)
+            if type(uid) == "string" and uid ~= cap.key_uid then
+                local key, len = Core.key_for(cap.token, uid, true)
+                if not key then return "blocked" end
+                cap.uid, cap.key, cap.len, cap.key_uid = uid, key, len, uid
+            end
+        end
         local window = parry_window()
         local tok = make_token(cap)
         if not tok then Core.cap = nil; return "unarmed" end
@@ -5102,6 +5242,20 @@ DBGM:AddToggle("PcMovementSnap", {
 })
 
 local DBGT = Tabs.Debug:AddRightGroupbox("Experimental", "flask-conical")
+DBGT:AddButton({
+    Text = "Capture without parrying (this server)",
+    Tooltip = "Arms auto parry with NO parry and NO hook: reads the game's parry sender (require + upvalue reads, raw only) and asks its own token function for the key on a game-env thread. For this server only. Experimental -- if it ever kicks, drop it.",
+    Func = function()
+        task.spawn(function()
+            local ok, ok2, why = pcall(Parry.hooklessCapture)
+            if ok and ok2 then
+                Notify("Hookless capture", "Armed with no parry -- auto parry is ready for this server.", 5)
+            else
+                Notify("Hookless capture", "Didn't work: " .. tostring(ok and why or ok2) .. " (details in the debug overlay / log)", 6)
+            end
+        end)
+    end,
+})
 DBGT:AddToggle("FastRetarget", {
     Text = "Fast retarget", Default = false,
     Tooltip = "Auto parry decides the instant the ball turns to you, before its new direction arrives -- but only fires when it should: it's due at your Accuracy, and even a curve twice as long would still land inside the parry (or it's fire-or-die close). Otherwise the normal checks take it a moment later. In a 1v1 the other player's parry counts as the retarget (it can only be coming to you).",
