@@ -181,8 +181,9 @@ local Settings = {
     AutoClearWeather = false, AutoNightSkip = false, AutoDryWood = false,
     -- farm
     AutoCook = false, AutoCrockpot = false,
-    PerfectFishing = false, AutoRecast = false,
-    PerfectFlute = false, AutoFeedTaming = false, AutoHealPets = false,
+    PerfectFishing = false, InstantCatch = false, InstantCatchDelay = 0.4, AutoRecast = false,
+    PerfectFlute = false, InstaTame = false, AutoStartTaming = false, AutoFeedTaming = false, AutoHealPets = false,
+    AutoUpgradeTools = false, AutoArmour = false, EspFishSpots = false,
     AutoPlant = false, PlantRadius = 60, AutoBenchUpgrade = false, CraftPick = nil,
     AutoUpgradeDefense = false,
     -- events
@@ -3052,7 +3053,36 @@ end
 
 -- Fishing --------------------------------------------------------------------------
 -- The rod object is ReplicatedStorage.Tools["Fishing Rod"] made with .new: it
--- has Model, RealModel, State, CatchCount and the Pull/Cast methods.
+-- has Model, RealModel, State, CatchCount and the Pull/Cast/Reel methods. The
+-- game makes a fresh one every time the rod is equipped (OnEquip sets its
+-- Equipped field), so the one in hand is the one with Equipped == true.
+local heldCache, heldAt = nil, -1
+local function heldToolNow()
+    local handler = gameModule("InventoryHandler")
+    local ok, tool = pcall(function()
+        return handler.GetCurrentlyEquipped()
+    end)
+    if ok and typeof(tool) == "Instance" then
+        return tool
+    end
+    local name = equippedName()
+    local inv = inventory()
+    return name and inv and inv:FindFirstChild(name) or nil
+end
+-- Asked every frame by the fishing and flute helpers, so read a few times a second.
+local function heldTool()
+    if os.clock() - heldAt > 0.2 then
+        heldCache, heldAt = heldToolNow(), os.clock()
+    end
+    return heldCache
+end
+Feat.heldTool = heldTool
+
+local function holding(toolName)
+    local tool = heldTool()
+    return tool ~= nil and (tool:GetAttribute("ToolName") == toolName or tostring(tool.Name):find(toolName == "Fishing Rod" and "Rod" or "Flute") ~= nil)
+end
+
 local Rod, lastRodScan = nil, 0
 local function isRod(t)
     if rawget(t, "CatchCount") == nil or rawget(t, "RealModel") == nil then
@@ -3062,36 +3092,99 @@ local function isRod(t)
     return type(mt) == "table" and type(rawget(mt, "Pull")) == "function"
 end
 
-local function holdingRod()
-    local name = equippedName()
-    return name and tostring(name):find("Rod") ~= nil
+-- The rod object for the tool in hand (when the hand can be read).
+local function liveRod()
+    local held = heldTool()
+    local function good(t)
+        return isRod(t) and rawget(t, "Equipped") == true and (held == nil or t.RealModel == held)
+    end
+    if Rod and good(Rod) and Rod.RealModel.Parent then
+        return Rod
+    end
+    if os.clock() - lastRodScan < 1.5 then
+        return nil
+    end
+    lastRodScan = os.clock()
+    Rod = findGameObject(good)
+    return Rod
 end
 
+local hookedRod, hookedItem, hookedAt = nil, nil, 0
 function Feat.fishingStep()
-    if not (Settings.PerfectFishing or Settings.AutoRecast) or not holdingRod() then
+    if not (Settings.PerfectFishing or Settings.InstantCatch or Settings.AutoRecast) then
         return
     end
-    if not Rod or not Rod.RealModel or not Rod.RealModel.Parent or Rod.RealModel.Name ~= equippedName() then
-        if os.clock() - lastRodScan < 3 then
-            return
-        end
-        lastRodScan = os.clock()
-        Rod = findGameObject(function(t)
-            return isRod(t) and t.Equipped
-        end)
-        if not Rod then
-            return
+    local frame = interface("FishingCatchFrame")
+    local catching = frame and frame.Visible
+    -- Only look for the rod while it matters: a fish on the line, or a rod in hand to recast.
+    if not catching and not (Settings.AutoRecast and holding("Fishing Rod")) then
+        return
+    end
+    local rod = liveRod()
+    if not rod then
+        return
+    end
+    if rod ~= hookedRod or rod.HookedItem ~= hookedItem then
+        hookedRod, hookedItem, hookedAt = rod, rod.HookedItem, os.clock()
+    end
+    if rod.State == "Fishing" and rod.HookedItem and not rod.ItemCaught then
+        if Settings.InstantCatch and os.clock() - hookedAt >= Settings.InstantCatchDelay then
+            -- What a full catch bar does: mark it caught, tell the server, reel in.
+            rod.ItemCaught = true
+            fire("ConfirmCatchItem")
+            pcall(rod.Reel, rod)
+        elseif Settings.PerfectFishing and catching and not rod.AlreadyClickedThisPass and barOverlap(frame) then
+            pcall(rod.Pull, rod)
         end
     end
-    if Settings.PerfectFishing and Rod.State == "Fishing" and Rod.HookedItem and not Rod.AlreadyClickedThisPass then
-        local frame = interface("FishingCatchFrame")
-        if frame and frame.Visible and barOverlap(frame) then
-            pcall(Rod.Pull, Rod)
+    if Settings.AutoRecast and rod.State == "Idle" and time() >= (rod.LastCast or 0) + (rod.Cooldown or 0.5) + 1.2 then
+        pcall(rod.Activate, rod)
+    end
+end
+
+-- Fish hotspots (tag FishHotspot) are the bubbling patches; Active ones bite.
+function Feat.fishingSpots()
+    local list, order = {}, {}
+    local found = {}
+    for _, spot in tagged("FishHotspot") do
+        if spot:IsA("BasePart") and spot:IsDescendantOf(Workspace) then
+            local owner = spot:FindFirstAncestorWhichIsA("Model")
+            local base = owner and (owner:GetAttribute("FullLandmarkName") or cleanName(owner.Name)) or "Fishing spot"
+            table.insert(found, { spot = spot, base = base, active = spot:GetAttribute("Active") == true, d = distanceTo(spot.Position) })
         end
     end
-    if Settings.AutoRecast and Rod.Equipped and Rod.State == "Idle" and time() >= (Rod.LastCast or 0) + (Rod.Cooldown or 0.5) + 1.2 then
-        pcall(Rod.Activate, Rod)
+    table.sort(found, function(a, b)
+        if a.active ~= b.active then
+            return a.active
+        end
+        return a.d < b.d
+    end)
+    local counts = {}
+    for _, entry in found do
+        counts[entry.base] = (counts[entry.base] or 0) + 1
+        local label = string.format("%s %d%s · %dm", entry.base, counts[entry.base], entry.active and " (active)" or "", math.floor(entry.d))
+        list[label] = entry.spot
+        table.insert(order, label)
     end
+    return list, order
+end
+
+-- Somewhere dry to stand next to the water at `pos`.
+local ShoreParams = RaycastParams.new()
+ShoreParams.FilterType = Enum.RaycastFilterType.Exclude
+function Feat.shoreNear(pos)
+    ShoreParams.FilterDescendantsInstances = { character(), charactersFolder(), itemsFolder() }
+    for _, gap in { 10, 16, 22, 30, 40 } do
+        for i = 0, 7 do
+            local angle = i * math.pi / 4
+            local probe = pos + Vector3.new(math.cos(angle) * gap, 60, math.sin(angle) * gap)
+            local hit = Workspace:Raycast(probe, Vector3.new(0, -140, 0), ShoreParams)
+            if hit and hit.Material ~= Enum.Material.Water and not hit.Instance:HasTag("Water") and hit.Instance.Name ~= "Water" then
+                return hit.Position + Vector3.new(0, 3.5, 0)
+            end
+        end
+    end
+    return pos + Vector3.new(0, 6, 0)
 end
 
 -- Taming ---------------------------------------------------------------------------
@@ -3100,38 +3193,65 @@ local function isFlute(t)
     return rawget(t, "RealModel") ~= nil and rawget(t, "TamingMinigameActive") ~= nil
 end
 
+local function liveFlute(activeOnly)
+    local held = heldTool()
+    local function good(t)
+        return isFlute(t) and rawget(t, "Equipped") ~= false and (held == nil or t.RealModel == held)
+            and (not activeOnly or t.TamingMinigameActive == true)
+    end
+    if Flute and good(Flute) and Flute.RealModel.Parent then
+        return Flute
+    end
+    if os.clock() - lastFluteScan < 1 then
+        return nil
+    end
+    lastFluteScan = os.clock()
+    Flute = findGameObject(good)
+    return Flute
+end
+
 function Feat.fluteStep()
-    if not Settings.PerfectFlute then
+    if not (Settings.PerfectFlute or Settings.InstaTame or Settings.AutoStartTaming) then
         return
     end
     local frame = interface("TamingFluteFrame")
-    if not frame or not frame.Visible then
+    local playing = frame and frame.Visible
+    if not playing and not (Settings.AutoStartTaming and holding("Taming Flute")) then
         return
     end
-    if not Flute or not Flute.TamingMinigameActive then
-        if os.clock() - lastFluteScan < 1 then
-            return
-        end
-        lastFluteScan = os.clock()
-        Flute = findGameObject(function(t)
-            return isFlute(t) and t.TamingMinigameActive == true
-        end)
-        if not Flute then
-            return
-        end
-    end
-    -- Keep the note on the middle of the green zone. Bar height on screen is
-    -- (1 - NotePosition) of the track, so a pixel gap maps straight back.
-    local track = frame.TimingBar
-    local zone, bar = track.SuccessArea, track.Bar
-    local height = track.AbsoluteSize.Y
-    if height <= 0 then
+    local flute = liveFlute(playing)
+    if not flute then
         return
     end
-    local zoneMid = zone.AbsolutePosition.Y + zone.AbsoluteSize.Y / 2
-    local barMid = bar.AbsolutePosition.Y + bar.AbsoluteSize.Y / 2
-    Flute.NotePosition = math.clamp((Flute.NotePosition or 0) + (barMid - zoneMid) / height, 0, 1)
-    Flute.NoteVelocity = 0
+    if playing and flute.TamingMinigameActive then
+        if Settings.InstaTame then
+            -- The game's own test shortcut: a full bar finishes the song.
+            flute.TamingTime = 1000
+            return
+        end
+        if Settings.PerfectFlute then
+            -- Keep the note on the middle of the green zone. Bar height on
+            -- screen is (1 - NotePosition) of the track, so a pixel gap maps
+            -- straight back.
+            local track = frame.TimingBar
+            local zone, bar = track.SuccessArea, track.Bar
+            local height = track.AbsoluteSize.Y
+            if height > 0 then
+                local zoneMid = zone.AbsolutePosition.Y + zone.AbsoluteSize.Y / 2
+                local barMid = bar.AbsolutePosition.Y + bar.AbsoluteSize.Y / 2
+                flute.NotePosition = math.clamp((flute.NotePosition or 0) + (barMid - zoneMid) / height, 0, 1)
+                flute.NoteVelocity = 0
+            end
+        end
+    elseif Settings.AutoStartTaming and not flute.TamingMinigameActive then
+        -- Start the song on the nearest animal the flute can reach, unless it
+        -- already wants food from you.
+        local animal = flute.ClosestAnimal
+        if animal and animal.Parent and animal:GetAttribute("PlayerFeeding") ~= UID
+            and time() - (flute.LastTaming or 0) > 1.5 and time() >= (flute.LastSwing or 0) + (flute.Cooldown or 0.5) then
+            pcall(flute.Activate, flute)
+        end
+    end
 end
 
 local function foodNamesFor(animal)
@@ -3771,6 +3891,186 @@ function Feat.caveTravel(point)
     return false
 end
 
+-- Shops, traders and benches ------------------------------------------------------
+-- The map is built fresh each game, so these are looked up by what they do
+-- (their Interaction) and by landmark name rather than fixed spots.
+local PLACE_WORDS = { "trader", "smith", "shop", "workshop", "upgrade", "beekeeper", "merchant", "anvil" }
+local function placeLabel(name)
+    local lower = string.lower(name)
+    for _, word in PLACE_WORDS do
+        if lower:find(word, 1, true) then
+            return true
+        end
+    end
+    return false
+end
+
+function Feat.places()
+    local list, order, seen = {}, {}, {}
+    local function add(label, model)
+        local pos = pivotPos(model)
+        if pos and not seen[model] then
+            seen[model] = true
+            local text = string.format("%s · %dm", spaced(label), math.floor(distanceTo(pos)))
+            list[text] = model
+            table.insert(order, text)
+        end
+    end
+    for _, root in { Workspace:FindFirstChild("Map"), structuresFolder(), charactersFolder() } do
+        for _, inst in root and root:GetDescendants() or {} do
+            if inst:IsA("Model") then
+                local interaction = inst:GetAttribute("Interaction")
+                if interaction and placeLabel(interaction) then
+                    add(interaction == "OpenToolTrader" and "Tool Smith" or interaction, inst)
+                elseif placeLabel(inst.Name) and (inst.Parent and inst.Parent.Name == "Landmarks" or inst.Parent == structuresFolder()) then
+                    add(inst:GetAttribute("FullLandmarkName") or cleanName(inst.Name), inst)
+                end
+            end
+        end
+    end
+    table.sort(order, function(a, b)
+        return (pivotPos(list[a]) and distanceTo(pivotPos(list[a])) or 0) < (pivotPos(list[b]) and distanceTo(pivotPos(list[b])) or 0)
+    end)
+    return list, order
+end
+
+function Feat.findToolSmith()
+    local list, order = Feat.places()
+    for _, label in order do
+        local lower = label:lower()
+        if lower:find("tool smith") or lower:find("toolsmith") or lower:find("tool trader") then
+            return list[label]
+        end
+    end
+    return nil
+end
+
+-- Rod and flute upgrades: hold the tool at an upgrade bench once it has its
+-- XP. Rods go Old -> Good -> Strong; flutes likewise.
+local UPGRADES = {
+    { tool = "Fishing Rod", benches = { ToolUpgradeBench = true, FishingRodUpgrade = true }, module = "FishingUpgradeClient",
+        call = "RequestUpgradeRod", remote = "RequestUpgradeRod", maxed = function(item)
+            return item.Name ~= "Old Rod" and item.Name ~= "Good Rod"
+        end },
+    { tool = "Taming Flute", benches = { ToolUpgradeBench = true, TamingFluteUpgrade = true }, module = "FluteUpgradeClient",
+        call = "RequestUpgradeFlute", remote = "RequestUpgradeFlute", maxed = function(item)
+            return (item:GetAttribute("ToolTier") or 1) >= 3
+        end },
+}
+
+local function readyToUpgrade(item, kind)
+    return item:GetAttribute("ToolName") == kind.tool and not kind.maxed(item)
+        and (item:GetAttribute("XP") or 0) >= (item:GetAttribute("LevelUpXP") or math.huge)
+end
+
+local function upgradeBench(kind)
+    local best, bestD
+    for _, root in { structuresFolder(), Workspace:FindFirstChild("Map") } do
+        for _, inst in root and root:GetDescendants() or {} do
+            if inst:IsA("Model") and kind.benches[inst:GetAttribute("Interaction") or ""] then
+                local d = distanceTo(pivotPos(inst))
+                if not bestD or d < bestD then
+                    best, bestD = inst, d
+                end
+            end
+        end
+    end
+    return best
+end
+
+function Feat.upgradesReady()
+    local ready = {}
+    for _, item in inventoryItems() do
+        for _, kind in UPGRADES do
+            if readyToUpgrade(item, kind) then
+                table.insert(ready, { item = item, kind = kind })
+            end
+        end
+    end
+    return ready
+end
+
+function Feat.upgradeTools(still)
+    local start = rootPart() and rootPart().Position
+    local done = 0
+    for _, entry in Feat.upgradesReady() do
+        if not still() then
+            return
+        end
+        local bench = upgradeBench(entry.kind)
+        if not bench then
+            setStatus("No upgrade bench for your " .. entry.kind.tool:lower() .. " on this map")
+        else
+            setStatus("Upgrading " .. entry.item.Name)
+            if moveTo(safeSpotNear(pivotPos(bench), 5), runOpts()) and still() then
+                fire("EquipItemHandle", "FireAllClients", entry.item)
+                waitFor(2, function()
+                    local held = heldToolNow()
+                    return held == entry.item
+                end, still)
+                local module = gameModule(entry.kind.module)
+                local fn = module and module[entry.kind.call]
+                if not (fn and pcall(fn, bench)) then
+                    invoke(entry.kind.remote, entry.item, bench)
+                end
+                task.wait(2)
+                done += 1
+            end
+        end
+    end
+    setStatus(done > 0 and string.format("Upgraded %d tool%s", done, done == 1 and "" or "s") or "Nothing ready to upgrade")
+    if start and still() then
+        moveTo(start, runOpts())
+    end
+end
+
+local lastUpgradeCheck = 0
+function Feat.upgradeTick()
+    if not Settings.AutoUpgradeTools or Job.name or os.clock() - lastUpgradeCheck < 15 then
+        return
+    end
+    lastUpgradeCheck = os.clock()
+    if #Feat.upgradesReady() > 0 then
+        startJob("Upgrade tools", Feat.upgradeTools)
+    end
+end
+
+-- Armour: wear the best piece lying around for each slot.
+local armourBusy = false
+function Feat.armourTick()
+    if not Settings.AutoArmour or armourBusy then
+        return
+    end
+    local worn = {}
+    local folder = LocalPlayer:FindFirstChild("Armour")
+    for _, piece in folder and folder:GetChildren() or {} do
+        local slot = piece:GetAttribute("ArmourSlot") or "?"
+        worn[slot] = math.max(worn[slot] or 0, piece:GetAttribute("Armour") or 0)
+    end
+    local hrp = rootPart()
+    if not hrp then
+        return
+    end
+    local best, bestGain
+    for model in Index.byKind.Gear or {} do
+        if model.Parent and model:GetAttribute("Interaction") == "Armour" and mineOrFree(model) then
+            local gain = (model:GetAttribute("Armour") or 0) - (worn[model:GetAttribute("ArmourSlot") or "?"] or 0)
+            if gain > 0 and (not bestGain or gain > bestGain) and tryOnce(model, 10) then
+                best, bestGain = model, gain
+            end
+        end
+    end
+    if best then
+        armourBusy = true
+        task.spawn(function()
+            if carryTo(best, hrp.Position + hrp.CFrame.LookVector * 3) then
+                invoke("RequestEquipArmour", best)
+            end
+            armourBusy = false
+        end)
+    end
+end
+
 -- Shops ----------------------------------------------------------------------------
 function Feat.beekeeperSlots()
     local shops = ReplicatedStorage:FindFirstChild("Shops")
@@ -3896,7 +4196,7 @@ end
 -- each runs guarded, so one failing never stops the others.
 local TICKS = {
     "cookTick", "crockpotTick", "tamingTick", "plantTick", "benchTick", "defenseTick", "candyTick", "pumpkinTick",
-    "hollowTick", "templeTick", "keysTick", "mergeTick", "reviveTick", "machineTick", "dryTick",
+    "hollowTick", "templeTick", "keysTick", "mergeTick", "reviveTick", "machineTick", "dryTick", "upgradeTick", "armourTick",
 }
 local tickErrors = {}
 loop(0.5, function()
@@ -3910,8 +4210,13 @@ loop(0.5, function()
 end)
 bind(RunService.RenderStepped, function()
     if alive() then
-        Feat.fishingStep()
-        Feat.fluteStep()
+        for _, name in { "fishingStep", "fluteStep" } do
+            local ok, err = pcall(Feat[name])
+            if not ok and not tickErrors[name] then
+                tickErrors[name] = true
+                warn("[99 Nights] " .. name .. ": " .. tostring(err))
+            end
+        end
     end
 end)
 return Feat, fire
@@ -4009,6 +4314,13 @@ local function updateEsp()
             for _, player in Players:GetPlayers() do
                 if player ~= LocalPlayer and player.Character then
                     consider(player.Character, Settings.PlayerColor, player.DisplayName)
+                end
+            end
+        end
+        if Settings.EspFishSpots then
+            for _, spot in tagged("FishHotspot") do
+                if spot:IsA("BasePart") and spot:GetAttribute("Active") then
+                    consider(spot, Color3.fromRGB(90, 200, 255), "Fishing spot")
                 end
             end
         end
@@ -4572,6 +4884,8 @@ do
     slider(SafeBox, "EscapeBelow", "Escape below health", "EscapeBelow", 5, 80, "%")
 
     local ReviveBox = SurvivalTab:AddLeftGroupbox("Revive", "cross")
+    toggle(EatBox, "AutoArmour", "Wear better armour", "AutoArmour",
+        "Brings over and puts on any armour on the map that beats what you wear in that slot")
     toggle(ReviveBox, "AutoReviveOthers", "Revive teammates near me", "AutoReviveOthers",
         "Revives downed players within 20 studs. Needs a bandage or medkit in your inventory, like reviving by hand")
     toggle(ReviveBox, "AutoSelfRevive", "Self revive when offered", "AutoSelfRevive",
@@ -4597,12 +4911,40 @@ do
     local FishBox = FarmTab:AddRightGroupbox("Fishing", "fish")
     toggle(FishBox, "PerfectFishing", "Perfect catch", "PerfectFishing",
         "While a fish is hooked, reels exactly when the bar is in the green zone")
+    toggle(FishBox, "InstantCatch", "Instant catch", "InstantCatch",
+        "Lands a fish as soon as it bites, the way a full catch bar does")
+    slider(FishBox, "InstantCatchDelay", "Wait after the bite", "InstantCatchDelay", 0, 3, " s",
+        "A short wait looks like a real catch. Raise it if catches get refused")
     toggle(FishBox, "AutoRecast", "Recast after each catch", "AutoRecast",
         "Casts again where you're aiming. Keep the camera on the water")
+    local spots = {}
+    local spotPicker = FishBox:AddDropdown("FishSpot", { Text = "Fishing spot", Values = {}, AllowNull = true, Searchable = true,
+        Tooltip = "Bubbling hotspots, active ones first. You land on the shore next to it" })
+    local function refreshSpots()
+        local list, order = Feat.fishingSpots()
+        spots = list
+        spotPicker:SetValues(order)
+    end
+    FishBox:AddButton({
+        Text = "Teleport",
+        Func = function()
+            local spot = spots[spotPicker.Value]
+            if not spot or not spot.Parent then
+                notify("Fishing", "Pick a spot first (or refresh)", 2)
+                return
+            end
+            teleportTo(Feat.shoreNear(spot.Position), { exact = true })
+        end,
+    }):AddButton({ Text = "Refresh", Func = refreshSpots })
+    task.defer(refreshSpots)
 
     local TameBox = FarmTab:AddLeftGroupbox("Taming and pets", "paw-print")
     toggle(TameBox, "PerfectFlute", "Perfect flute", "PerfectFlute",
         "Keeps the note in the green zone while you play the taming flute")
+    toggle(TameBox, "InstaTame", "Instant flute", "InstaTame",
+        "Finishes the flute song the moment it starts (the game's own test shortcut). Pair with Feed the animal")
+    toggle(TameBox, "AutoStartTaming", "Start taming the nearest animal", "AutoStartTaming",
+        "While you hold the flute, plays it at the nearest tameable animal in reach")
     toggle(TameBox, "AutoFeedTaming", "Feed the animal I'm taming", "AutoFeedTaming",
         "Brings the food the animal asks for (raw or cooked) and feeds it")
     toggle(TameBox, "AutoHealPets", "Heal hurt pets", "AutoHealPets", "Feeds a hurt pet one of its favourite foods")
@@ -4648,6 +4990,24 @@ do
         "Crafts the next Crafting Bench tier as soon as the camp has the wood and scrap")
     toggle(CraftBox, "AutoUpgradeDefense", "Upgrade defences (Base Defender)", "AutoUpgradeDefense",
         "Base Defender class only: upgrades every defence structure that isn't upgraded yet")
+
+    local UpBox = FarmTab:AddRightGroupbox("Tool upgrades", "arrow-big-up")
+    toggle(UpBox, "AutoUpgradeTools", "Auto upgrade rod and flute", "AutoUpgradeTools",
+        "When your rod or flute has the XP for its next level, goes to an upgrade bench, upgrades it and comes back")
+    UpBox:AddButton("Upgrade now", function()
+        startJob("Upgrade tools", Feat.upgradeTools)
+    end)
+    local upLabel = UpBox:AddLabel("", true)
+    loop(3, function()
+        local parts = {}
+        for _, item in inventoryItems() do
+            local need = item:GetAttribute("LevelUpXP")
+            if need and (item:GetAttribute("ToolName") == "Fishing Rod" or item:GetAttribute("ToolName") == "Taming Flute") then
+                table.insert(parts, string.format("%s %d/%d XP", item.Name, item:GetAttribute("XP") or 0, need))
+            end
+        end
+        setText(upLabel, #parts > 0 and table.concat(parts, " · ") or "No rod or flute in your inventory")
+    end)
 end
 
 -- Events --------------------------------------------------------------------------
@@ -4792,7 +5152,7 @@ do
 end
 
 -- Movement ------------------------------------------------------------------------
-local refreshPlaces, refreshLandmarks, refreshChests, refreshKids, refreshItems
+local refreshPlaces, refreshLandmarks, refreshChests, refreshKids, refreshItems, refreshShops
 do
     local MoveTab = UI.Window:AddTab("Movement", "footprints", "Speed, jump, fly and teleports")
 
@@ -4867,6 +5227,20 @@ do
     local PlaceBox = MoveTab:AddRightGroupbox("Places", "map-pin")
     refreshPlaces = teleportPicker(PlaceBox, "TpPlace", "Camp and caves", placeTargets, function(getPos)
         return getPos()
+    end)
+
+    local ShopTpBox = MoveTab:AddRightGroupbox("Shops and benches", "store")
+    refreshShops = teleportPicker(ShopTpBox, "TpShop", "Trader, smith or bench", Feat.places, function(model)
+        local pos = pivotPos(model)
+        return pos and safeSpotNear(pos, 6)
+    end)
+    ShopTpBox:AddButton("Tool Smith", function()
+        local smith = Feat.findToolSmith()
+        if smith then
+            teleportTo(safeSpotNear(pivotPos(smith), 6))
+        else
+            notify("Tool Smith", "No Tool Smith on this map yet (the map changes every game, and far parts may not be loaded)", 4)
+        end
     end)
 
     local CaveBox = MoveTab:AddRightGroupbox("Cave travel", "mountain")
@@ -5000,6 +5374,7 @@ do
             Settings.ItemColor = c
         end,
     })
+    toggle(EspBox, "EspFishSpots", "Active fishing spots", "EspFishSpots")
     multi(EspBox, "EspItemKinds", "Item types", "EspItemKinds",
         { "Fuel", "Food", "Heals", "Scrap", "Gems", "Ammo", "Gear", "Seeds", "Currency", "Other" },
         { "Fuel", "Food", "Heals", "Scrap", "Gems", "Ammo", "Gear", "Seeds", "Currency" },
@@ -5054,7 +5429,7 @@ local lastLists = 0
 loop(1, function()
     if os.clock() - lastLists > 15 then
         lastLists = os.clock()
-        for _, refresh in { refreshPlaces, refreshLandmarks, refreshChests, refreshKids, refreshItems } do
+        for _, refresh in { refreshPlaces, refreshLandmarks, refreshChests, refreshKids, refreshItems, refreshShops } do
             pcall(refresh)
         end
     end
