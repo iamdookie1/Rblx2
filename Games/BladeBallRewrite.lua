@@ -31,7 +31,7 @@
 
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.95"
+local SCRIPT_VERSION = "rewrite-0.5.96"
 
 -- ---------------------------------------------------------------------------
 -- Single instance.
@@ -783,7 +783,76 @@ do
         Core.misses, Core.pending = 0, nil
         Core.new_capture = { prev = prev }
         if Parry.onCapture then task.defer(pcall, Parry.onCapture, Core.cap) end
+        task.defer(pcall, Core.analyze_capture, Core.cap)
         DBG.ev(Core.cap.verified and "CAPTURE: real parry hash confirmed" or "CAPTURE: taken (real hash not readable)")
+    end
+
+    -- CAPTURE ANALYSIS (read-only research for parry-free captures). After a
+    -- capture: is the key derived from something readable (uid / hash /
+    -- UserId / JobId, byte for byte or with a constant offset)? what is the uid?
+    -- and against the capture saved from the LAST server (executor file, the
+    -- game can't see it): same key? same uid? same remote? If the key and uid
+    -- stay the same across servers, one capture ever could serve every later
+    -- server with no parry and no hook. Sends nothing, hooks nothing.
+    function Core.analyze_capture(cap)
+        if not cap or not cap.key then return end
+        local path = "BladeBall/capture_memory.json"
+        local key = cap.key
+        local hexk = {}
+        for i = 1, #key do hexk[i] = ("%02x"):format(key[i]) end
+        local entry = { key = table.concat(hexk), uid = tostring(cap.uid), len = cap.len,
+            remote = (cap.remote and cap.remote.Name) or "?", hash = cap.hash, job = game.JobId, t = os.time() }
+        local prev
+        pcall(function()
+            if isfile and isfile(path) then prev = HttpService:JSONDecode(readfile(path)) end
+        end)
+        local uid, uidsrc = tostring(cap.uid), nil
+        if uid == tostring(LocalPlayer.UserId) then uidsrc = "your UserId"
+        elseif uid == LocalPlayer.Name then uidsrc = "your name"
+        else
+            pcall(function()
+                for k, v in pairs(LocalPlayer:GetAttributes()) do
+                    if tostring(v) == uid then uidsrc = "your player attribute " .. k; break end
+                end
+            end)
+        end
+        local keysrc
+        local function test(name, str)
+            if keysrc or type(str) ~= "string" or #str < #key then return end
+            local off
+            for i = 1, #key do
+                local d = (key[i] - str:byte(i)) % 256
+                if off == nil then off = d elseif d ~= off then return end
+            end
+            keysrc = name .. (off ~= 0 and (" +%d"):format(off) or "")
+        end
+        test("uid", uid); test("hash", cap.hash); test("UserId", tostring(LocalPlayer.UserId)); test("JobId", game.JobId)
+        local lines = {
+            ("capture analysis: uid is %s (%d chars), key %s (%d bytes)"):format(uidsrc or "from an unknown source", #uid,
+                keysrc and ("= " .. keysrc) or "not derived from uid/hash/UserId/JobId", #key),
+        }
+        if prev and prev.key then
+            if prev.job == entry.job then
+                lines[#lines + 1] = "capture analysis: last saved capture is from THIS server -- rejoin another server and capture again to compare"
+            else
+                lines[#lines + 1] = ("capture analysis vs last server: key %s, uid %s, remote name %s"):format(
+                    prev.key == entry.key and "SAME" or "different", prev.uid == entry.uid and "SAME" or "different",
+                    prev.remote == entry.remote and "same" or "different")
+                if prev.key == entry.key and prev.uid == entry.uid then
+                    lines[#lines + 1] = "capture analysis: key + uid carry across servers -- a parry-free capture is possible"
+                end
+            end
+        else
+            lines[#lines + 1] = "capture analysis: first capture saved -- capture once in another server to compare"
+        end
+        if not (prev and prev.job == entry.job) then
+            pcall(function()
+                if makefolder and isfolder and not isfolder("BladeBall") then makefolder("BladeBall") end
+                if writefile then writefile(path, HttpService:JSONEncode(entry)) end
+            end)
+        end
+        for _, l in ipairs(lines) do logp(l); DBG.ev(l) end
+        if Parry.onCaptureAnalysis then pcall(Parry.onCaptureAnalysis, lines[#lines]) end
     end
 
     -- A real parry: (hash, id, token, window, cameraCF, points, aim, flag), or on
@@ -3481,6 +3550,7 @@ CAP:AddToggle("AutoPressCapture", {
     Tooltip = "The script presses block once itself to take the capture (synthetic input) instead of waiting for your own parry.",
     Callback = function(v) Parry.Capture.mode = v and "Auto press" or "Your press" end,
 })
+Parry.onCaptureAnalysis = function(text) Notify("Capture analysis", text, 8) end
 Parry.onCapture = function(cap)
     Notify("Parry remote captured", cap.verified and "Real parry hash confirmed -- auto parry is armed."
         or "Captured (couldn't read the game's real hash to confirm it).", 4)
