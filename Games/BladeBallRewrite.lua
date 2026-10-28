@@ -1385,7 +1385,9 @@ end]]
         if not hash then say("no hash (no _G.BAC_HASH and no 36-char first argument)"); return false, "no hash" end
         local key, len = Core.key_for(found.token, uid, false)
         if not key then say("the token function gave no key"); return false, "no key" end
-        local remote = Core.game_call(false, function(net, name) return net:RemoteEvent(name) end, found.net, found.name)
+        -- the game's own Net.RemoteEvent, called as net:RemoteEvent(name) -- no
+        -- closure of ours between it and the game-env caller frame
+        local remote = Core.game_call(false, rawget(found.net, "RemoteEvent"), found.net, found.name)
         if typeof(remote) ~= "Instance" or not remote:IsA("RemoteEvent") then say("Net:RemoteEvent(name) found no remote"); return false, "no remote" end
         local cap = { remote = remote, hash = hash, uid = uid, key = key, len = len, ball2 = false,
             verified = real ~= nil and hash == real, hookless = true, holder = found.holder, token = found.token, key_uid = uid }
