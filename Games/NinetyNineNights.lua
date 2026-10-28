@@ -149,7 +149,7 @@ local Settings = {
     ChopTypes = { Tree = true }, ChopPerSwing = 3,
     KillAura = false, AuraRange = 30, ShowAuraRange = false, AuraColor = Color3.fromRGB(255, 90, 90),
     AuraKinds = { Hostile = true, ["Can attack"] = true }, AuraPerSwing = 3, AuraPriority = "Chasing me first",
-    AutoEquip = true, HitFrom = "Your position", ExtraDelay = 0, OneTool = true,
+    AutoEquip = true, HitFrom = "Your position", ExtraDelay = 0, OneTool = true, SwingMode = "Fast",
     -- tree farm
     FarmTrees = false, FarmRadius = 250, FarmAround = "Camp fire", FarmNight = "Wait at camp",
     -- movement
@@ -193,7 +193,7 @@ local Settings = {
     -- explore
     AutoChests = false, AutoBagKids = false, AutoDropKids = false,
     AutoCoins = false, CoinRange = 20, InstantPrompts = false,
-    ReturnAfterRun = true,
+    ReturnAfterRun = true, RunSpeed = 300, RunHigh = 35, SkipGuarded = true, GuardRadius = 14,
 }
 
 local MobColors = {
@@ -416,7 +416,10 @@ local function isMelee(tool)
 end
 
 -- Best melee weapon in the inventory by WeaponDamage. Ties go to the one in hand.
-local function bestWeapon()
+-- Cached for a moment: the swing loop asks every tick and the inventory
+-- rarely changes.
+local weaponCache, weaponCacheAt = nil, -1
+local function bestWeaponNow()
     local held = equippedName()
     local best, bestDamage
     for _, item in inventoryItems() do
@@ -428,6 +431,12 @@ local function bestWeapon()
         end
     end
     return best
+end
+local function bestWeapon()
+    if os.clock() - weaponCacheAt > 1 or (weaponCache and weaponCache.Parent == nil) then
+        weaponCache, weaponCacheAt = bestWeaponNow(), os.clock()
+    end
+    return weaponCache
 end
 
 -- The axe that can break the most of `trees`, then the one that hits them hardest.
@@ -456,22 +465,23 @@ local function bestAxe(trees)
     return best, bestList or {}
 end
 
-local lastEquip = 0
--- True when `tool` is already in hand. Otherwise asks the server to equip it
--- (when auto equip is on) and the swing waits for the next tick.
+local lastEquip, lastEquipped = 0, nil
+-- True when the swing can go ahead with `tool`. Not in hand: asks the server
+-- to equip it (when auto equip is on). Fast swings straight away, since the
+-- server handles the equip before the hits sent after it; Normal waits a
+-- tick for the game to show the tool in hand.
 local function readyTool(tool)
-    if equippedName() == tool.Name then
+    if equippedName() == tool.Name or not Settings.AutoEquip then
         return true
     end
-    if not Settings.AutoEquip then
-        return true
-    end
-    if os.clock() - lastEquip > 0.75 then
-        lastEquip = os.clock()
+    local fast = Settings.SwingMode == "Fast"
+    if lastEquipped ~= tool or os.clock() - lastEquip > (fast and 0.3 or 0.75) then
+        lastEquip, lastEquipped = os.clock(), tool
         local r = remote("EquipItemHandle")
         if r then
             r:FireServer("FireAllClients", tool)
         end
+        return fast
     end
     return false
 end
@@ -1181,6 +1191,10 @@ end
 -- Moves you to `pos` and returns once you're there (true) or the move was
 -- replaced, cancelled or timed out (false). `opts.unknownHeight`: the point is a
 -- map marker with no real height.
+-- opts: unknownHeight (a map marker with no real height), exact (go to `pos`
+-- itself instead of the ground under it), speed (studs/s, overrides the tween
+-- speed), high (studs: rise this far above the route, cross, then drop, so
+-- mobs on the ground can't reach you on the way).
 function moveTo(pos, opts)
     opts = opts or {}
     local hrp = rootPart()
@@ -1193,7 +1207,7 @@ function moveTo(pos, opts)
     if far then
         streamAround(pos)
     end
-    local target = landingSpot(pos, opts.unknownHeight)
+    local target = opts.exact and pos or landingSpot(pos, opts.unknownHeight)
     local look = hrp.CFrame.Rotation
 
     if Settings.TpMethod == "Instant" then
@@ -1207,27 +1221,46 @@ function moveTo(pos, opts)
         end
     else
         -- Tween: moved by CFrame with no velocity, so the anti-fling never sees it.
+        local points = { target }
+        local high = opts.high and opts.high > 0 and (target - hrp.Position).Magnitude > 30
+        if high then
+            local top = math.max(hrp.Position.Y, target.Y) + opts.high
+            points = {
+                Vector3.new(hrp.Position.X, top, hrp.Position.Z),
+                Vector3.new(target.X, top, target.Z),
+                target,
+            }
+        end
+        local speed = opts.speed or Settings.TpSpeed
         Travelling, TravelOwner = true, token
-        local t0 = os.clock()
-        local limit = (target - hrp.Position).Magnitude / math.max(Settings.TpSpeed, 1) + 10
-        local arrived = false
-        while alive() and token == tpToken and os.clock() - t0 < limit do
-            local dt = RunService.Heartbeat:Wait()
-            local r = rootPart()
-            if not r then
-                break
-            end
-            local delta = target - r.Position
-            local d = delta.Magnitude
-            if d < 2 then
-                r.CFrame = CFrame.new(target) * look
+        local arrived = true
+        for _, point in points do
+            local r0 = rootPart()
+            local t0 = os.clock()
+            local limit = r0 and (point - r0.Position).Magnitude / math.max(speed, 1) + 10 or 0
+            local reached = false
+            while alive() and token == tpToken and os.clock() - t0 < limit do
+                local dt = RunService.Heartbeat:Wait()
+                local r = rootPart()
+                if not r then
+                    break
+                end
+                local delta = point - r.Position
+                local d = delta.Magnitude
+                if d < 2 then
+                    r.CFrame = CFrame.new(point) * look
+                    r.AssemblyLinearVelocity = Vector3.zero
+                    reached = true
+                    break
+                end
+                local step = math.min(d, speed * dt)
+                r.CFrame = CFrame.new(r.Position + delta.Unit * step) * look
                 r.AssemblyLinearVelocity = Vector3.zero
-                arrived = true
+            end
+            if not reached then
+                arrived = false
                 break
             end
-            local step = math.min(d, Settings.TpSpeed * dt)
-            r.CFrame = CFrame.new(r.Position + delta.Unit * step) * look
-            r.AssemblyLinearVelocity = Vector3.zero
         end
         if TravelOwner == token then
             Travelling, TravelOwner = false, nil
@@ -1262,6 +1295,24 @@ local function teleportTo(pos, opts)
     task.spawn(moveTo, pos, opts)
 end
 
+-- Keeps you at `cf` for `seconds` (hovering, no falling), or until `done()`.
+local function holdAt(cf, seconds, done)
+    local t0 = os.clock()
+    while alive() and os.clock() - t0 < seconds do
+        local r = rootPart()
+        if not r then
+            return false
+        end
+        r.CFrame = cf
+        r.AssemblyLinearVelocity = Vector3.zero
+        if done and done() then
+            return true
+        end
+        RunService.Heartbeat:Wait()
+    end
+    return done == nil or done()
+end
+
 -- A spot `gap` studs from `pos`, on your side of it.
 local function besideOf(pos, gap)
     local hrp = rootPart()
@@ -1269,6 +1320,54 @@ local function besideOf(pos, gap)
     away = Vector3.new(away.X, 0, away.Z)
     away = away.Magnitude > 0.1 and away.Unit or Vector3.new(0, 0, 1)
     return pos + away * gap
+end
+
+-- Mobs that can hurt you within `radius` of `pos`.
+local function foesNear(pos, radius)
+    local list = {}
+    for model in Index.mobs do
+        if model.Parent then
+            local kind = mobKind(model)
+            if kind == "Hostile" or kind == "Can attack" then
+                local p = mobPos(model)
+                if p and (p - pos).Magnitude <= radius then
+                    table.insert(list, p)
+                end
+            end
+        end
+    end
+    return list
+end
+
+-- A spot `gap` studs from `pos` on the side furthest from any mob nearby.
+local function safeSpotNear(pos, gap)
+    local foes = foesNear(pos, 40)
+    if #foes == 0 then
+        return besideOf(pos, gap)
+    end
+    local best, bestScore
+    for i = 0, 7 do
+        local angle = i * math.pi / 4
+        local spot = pos + Vector3.new(math.cos(angle) * gap, 0, math.sin(angle) * gap)
+        local score = math.huge
+        for _, foe in foes do
+            score = math.min(score, (foe - spot).Magnitude)
+        end
+        if not bestScore or score > bestScore then
+            best, bestScore = spot, score
+        end
+    end
+    return best
+end
+
+-- How the runs (chest run, kid rescue) travel: faster than a plain teleport
+-- tween, over the top of mobs.
+local function runOpts(extra)
+    local opts = { speed = Settings.RunSpeed, high = Settings.RunHigh }
+    for k, v in extra or {} do
+        opts[k] = v
+    end
+    return opts
 end
 
 --// Jobs \\--
@@ -1533,6 +1632,8 @@ end
 -- pickers can list a category's items without walking the whole folder.
 local kindNames = {}
 local onItemAdded -- chest loot watcher, set further down
+local watchChest -- set further down
+do
 
 local function setAdd(map, key, model)
     local set = map[key]
@@ -1560,8 +1661,6 @@ local function countName(kind, name, delta)
         names[name] = n
     end
 end
-
-local watchChest -- set further down
 
 local function indexItem(model)
     if Index.items[model] or Index.chests[model] or model.Parent ~= itemsFolder() then
@@ -1654,6 +1753,7 @@ task.spawn(function()
         end
     end
 end)
+end
 
 -- Items of `kind` ("All" or nil for every kind), with how many of each lie around.
 local function namesIn(kind)
@@ -1791,9 +1891,10 @@ local BRING_SORTS = {
 --   filter  fn(model) -> bool
 --   list    exact models (chest loot)
 --   order   a BRING_SORTS key
+--   at      a CFrame to bring to instead of the destination's own spot
 local function bringList(what, dest, limit)
     local hrp = rootPart()
-    local target = bringTarget(dest)
+    local target = what.at or bringTarget(dest)
     if not hrp or not target then
         return {}
     end
@@ -1909,11 +2010,16 @@ end
 
 -- The pickers on the Bring tab: one category, and the items in it (none
 -- picked = the whole category).
+local ALL_ITEMS = "★ All of them"
 local function currentBringWhat()
     local category = Settings.BringCategory or "All"
+    local picks = Settings.BringPicks[category]
+    if picks and picks[ALL_ITEMS] then
+        picks = nil
+    end
     return {
         kinds = category ~= "All" and { [category] = true } or nil,
-        names = Settings.BringPicks[category],
+        names = picks,
         exclude = Settings.BringExclude,
     }
 end
@@ -1931,7 +2037,7 @@ local function runBring(what, dest, limit)
     end
     Bring.running = true
     task.spawn(function()
-        local base = bringTarget(dest)
+        local base = what.at or bringTarget(dest)
         if not base then
             Bring.running = false
             return
@@ -2019,6 +2125,9 @@ end
 -- the chosen place.
 local RecentChests = setmetatable({}, { __mode = "k" })
 local LootQueue = {}
+-- During a chest run, loot sent to "You" goes to where the run started, not
+-- to wherever the run has flown to by then.
+local LootAnchor = { cf = nil, untilT = 0 }
 
 local function noteChestOpened(chest)
     local pos = pivotPos(chest)
@@ -2078,7 +2187,8 @@ local function pumpLoot()
         end
     end
     if #list > 0 then
-        runBring({ list = list }, Settings.ChestLootDest, #list)
+        local at = Settings.ChestLootDest == "You" and LootAnchor.cf and os.clock() < LootAnchor.untilT and LootAnchor.cf or nil
+        runBring({ list = list, at = at }, Settings.ChestLootDest, #list)
     end
 end
 
@@ -2222,6 +2332,8 @@ local function dropKidsAtCamp(force)
     end
 end
 
+local survivalTick
+do
 local function collectCurrency()
     local hrp = rootPart()
     if not hrp then
@@ -2288,7 +2400,7 @@ end
 local FOOD_KINDS, HEAL_KINDS = { "Food" }, { "Heals", "Food" }
 
 local lastEat, lastHeal, lastFeed, lastScrap = 0, 0, 0, 0
-local function survivalTick()
+function survivalTick()
     if Settings.AutoChests then
         openChestsInRange()
     end
@@ -2333,6 +2445,7 @@ local function survivalTick()
         lastScrap = now
         runBring({ kinds = { Scrap = true }, exclude = Settings.BringExclude }, "Crafting bench", 20)
     end
+end
 end
 local INTERESTING_LANDMARK = { Landmark = true, Trap = true }
 local function landmarkTargets(everything)
@@ -2485,8 +2598,12 @@ end
 
 --// Automations \\--
 local logEvent -- set once the dashboard exists
+local goToCamp, treeFarm, rescueKids, chestRun, safetyTick
+-- In their own function, like the feature module, so their helpers don't
+-- crowd the main chunk's 200 locals.
+;(function()
 
-local function goToCamp(still)
+function goToCamp(still)
     local pos = campPos()
     if not pos then
         setStatus("No camp fire found")
@@ -2525,7 +2642,7 @@ local function nextFarmTree(center)
     return best
 end
 
-local function treeFarm(still)
+function treeFarm(still)
     local hrp = rootPart()
     local origin = hrp and hrp.Position
     if not origin then
@@ -2573,76 +2690,98 @@ local function treeFarm(still)
     setStatus("Tree farm off")
 end
 
--- Kid rescue: go to each missing kid, bag it, bring it back to camp.
-local function rescueKids(still)
+-- Kid rescue: fill the sack with as many kids as it holds (nearest next each
+-- time), then one trip to camp drops them all. Dropping doesn't wait for the
+-- server to mark them rescued; those kids are just never visited again.
+function rescueKids(still)
     local start = rootPart() and rootPart().Position
-    local rescued, failed = 0, {}
+    local rescued, failed, done = 0, {}, {}
+    local function inBag()
+        local ids = {}
+        for _, item in bagContents() do
+            local id = item:GetAttribute("KidId")
+            if id then
+                ids[id] = true
+            end
+        end
+        return ids
+    end
+    local function dropAll()
+        if not goToCamp(still) then
+            return false
+        end
+        local carried = inBag()
+        setStatus("Dropping kids at camp")
+        dropKidsAtCamp(true)
+        waitFor(1.5, function()
+            return kidsInBag() == 0
+        end, still)
+        for id in carried do
+            done[id] = true
+            rescued += 1
+            if logEvent then
+                logEvent("Rescued " .. spaced(id), Color3.fromRGB(255, 220, 80))
+            end
+        end
+        return true
+    end
     while still() do
         if not itemBag() then
             setStatus("You need a sack in your inventory to carry kids")
+            notify("Kid rescue", "You need a sack in your inventory", 4)
             return
         end
-        if sackSpace() <= 0 and kidsInBag() == 0 then
-            setStatus("Your sack is full: empty it first")
-            notify("Kid rescue", "Your sack is full: empty it first", 5)
-            return
-        end
+        local carrying = inBag()
         local hrp = rootPart()
-        local kids = kidPositions()
-        local pick, pickD
-        for kidId, info in kids do
-            if not failed[kidId] then
+        local pick, pickD, pickInfo
+        for kidId, info in kidPositions() do
+            if not failed[kidId] and not done[kidId] and not carrying[kidId] then
                 local d = hrp and (info.pos - hrp.Position).Magnitude or 0
                 if not pickD or d < pickD then
-                    pick, pickD = kidId, d
+                    pick, pickD, pickInfo = kidId, d, info
                 end
             end
         end
-        if not pick then
+        local full = sackSpace() <= 0
+        if (not pick or full) and next(carrying) then
+            if not dropAll() then
+                return
+            end
+        elseif not pick then
             break
-        end
-        local info = kids[pick]
-        local name = info.name or spaced(pick)
-        setStatus("Going to " .. name)
-        local unknown = not info.live and info.pos.Y == 0
-        if not moveTo(info.pos, { unknownHeight = unknown }) or not still() then
+        elseif full then
+            setStatus("Your sack is full: empty it first")
+            notify("Kid rescue", "Your sack is full: empty it first", 5)
             return
-        end
-        -- Wait for the kid to stream in, then step right next to it.
-        setStatus("Looking for " .. name)
-        local model
-        waitFor(5, function()
-            model = liveKid(pick)
-            return model ~= nil
-        end, still)
-        if not model then
-            failed[pick] = "not found at its map point"
-        elseif not canBag(model) then
-            failed[pick] = "can't be picked up yet"
         else
-            local before = kidsInBag()
-            moveTo(besideOf(mobPos(model), 3))
-            setStatus("Picking up " .. name)
-            local got = waitFor(6, function()
-                if tryOnce(model, 1.5) then
-                    bagKid(model)
-                end
-                return kidsInBag() > before or model.Parent == nil
+            local name = pickInfo.name or spaced(pick)
+            setStatus("Going to " .. name)
+            local unknown = not pickInfo.live and pickInfo.pos.Y == 0
+            if not moveTo(pickInfo.pos, runOpts({ unknownHeight = unknown })) or not still() then
+                return
+            end
+            setStatus("Looking for " .. name)
+            local model
+            waitFor(3, function()
+                model = liveKid(pick)
+                return model ~= nil
             end, still)
-            if not got then
-                failed[pick] = "the sack wouldn't take it (full?)"
+            if not model then
+                failed[pick] = "not found at its map point"
+            elseif not canBag(model) then
+                failed[pick] = "can't be picked up yet"
             else
-                if not goToCamp(still) then
-                    return
-                end
-                setStatus("Dropping " .. name .. " at camp")
-                waitFor(6, function()
-                    dropKidsAtCamp(true)
-                    return kidsInBag() == 0
+                local before = kidsInBag()
+                moveTo(safeSpotNear(mobPos(model), 3), runOpts())
+                setStatus("Picking up " .. name)
+                local got = waitFor(4, function()
+                    if tryOnce(model, 0.75) then
+                        bagKid(model)
+                    end
+                    return kidsInBag() > before or model.Parent == nil
                 end, still)
-                rescued += 1
-                if logEvent then
-                    logEvent("Rescued " .. name, Color3.fromRGB(255, 220, 80))
+                if not got then
+                    failed[pick] = "the sack wouldn't take it"
                 end
             end
         end
@@ -2655,55 +2794,70 @@ local function rescueKids(still)
     if #skipped > 0 then
         text ..= " · skipped " .. table.concat(skipped, ", ")
     end
-    -- Kids that couldn't be picked up can leave you out in the woods: end at
-    -- camp when anyone was rescued, otherwise back where you started.
-    if still() then
-        if rescued > 0 then
-            goToCamp(still)
-        elseif start then
-            moveTo(start)
-        end
+    if still() and rescued == 0 and start then
+        moveTo(start, runOpts())
     end
     setStatus(text)
     notify("Kid rescue", text, 6)
 end
 
--- Chest run: visit every chest that can still be opened, nearest first.
-local function chestRun(still)
-    local start = rootPart() and rootPart().Position
-    local opened, skipped = 0, setmetatable({}, { __mode = "k" })
+-- Chest run: hover just above each chest that can still be opened (nearest
+-- next), open it and move straight on: the loot is brought separately (see
+-- Chest loot), so nothing waits for it. Travel goes over the top of mobs and
+-- chests with mobs right next to them can be skipped.
+function chestRun(still)
+    local hrp = rootPart()
+    local start = hrp and hrp.CFrame
+    if start then
+        LootAnchor.cf = start * CFrame.new(0, 1, -7)
+        LootAnchor.untilT = os.clock() + 900
+    end
+    local opened, skipped, guarded = 0, setmetatable({}, { __mode = "k" }), 0
     while still() do
         local best = nearestOpenableChest(skipped)
         if not best then
             break
         end
-        local name = best:GetAttribute("ChestName") or cleanName(best.Name)
-        setStatus(string.format("Chest run: %s (%d opened)", name, opened))
+        skipped[best] = true
         local pos = pivotPos(best)
-        if pos and moveTo(besideOf(pos, 4)) and still() then
-            local done = waitFor(3, function()
-                if tryOnce(best, 1) then
-                    openChest(best)
+        local name = best:GetAttribute("ChestName") or cleanName(best.Name)
+        if pos and Settings.SkipGuarded and #foesNear(pos, Settings.GuardRadius) > 0 and not Settings.KillAura then
+            guarded += 1
+        elseif pos then
+            setStatus(string.format("Chest run: %s (%d opened)", name, opened))
+            local spot = safeSpotNear(pos, 2.5) + Vector3.new(0, 5, 0)
+            if moveTo(spot, runOpts({ exact = true })) and still() then
+                local here = CFrame.new(spot)
+                -- Every chest in reach, not just the one we came for.
+                for chest in Index.chests do
+                    local p = openableChest(chest) and pivotPos(chest)
+                    if p and (p - spot).Magnitude <= 12 then
+                        openChest(chest)
+                        skipped[chest] = true
+                        opened += 1
+                    end
                 end
-                return not openableChest(best)
-            end, still)
-            if done then
-                opened += 1
+                holdAt(here, 0.15)
             end
         end
-        skipped[best] = true
     end
-    setStatus(string.format("Chest run done: %d opened", opened))
-    notify("Chest run", string.format("%d chest%s opened", opened, opened == 1 and "" or "s"))
+    local text = string.format("Chest run done: %d opened", opened)
+    if guarded > 0 then
+        text ..= string.format(" · %d skipped (mobs next to them)", guarded)
+    end
+    setStatus(text)
+    notify("Chest run", text)
     if Settings.ReturnAfterRun and start and still() then
-        moveTo(start)
+        moveTo(start.Position, runOpts())
     end
+    -- Loot from the last chests is still landing: keep sending it to the start.
+    LootAnchor.untilT = os.clock() + 10
 end
 
 -- Night safety and low health escape, checked from the survival loop.
 local lastEscape = 0
 local wasNight = nil
-local function safetyTick()
+function safetyTick()
     local night = isNight()
     if Settings.NightCamp and night and wasNight == false and Job.name ~= "Tree farm" then
         startJob("Night safety", function(still)
@@ -2732,6 +2886,7 @@ local function safetyTick()
         end)
     end
 end
+end)()
 
 --// Farm, events and helpers from version 720 \\--
 -- Each helper is one small tick, run from a shared loop below, and every one
@@ -3642,6 +3797,83 @@ function Feat.buyBeekeeper(slot)
     return true
 end
 
+-- Badges -------------------------------------------------------------------------
+-- The dump holds no badge list (it's in the game's website data), so the list
+-- comes from Roblox's public badge API for this game, and which ones you own
+-- from the same API (or BadgeService when the web call is blocked).
+local function httpGet(url)
+    local ok, body = pcall(function()
+        return game:HttpGet(url)
+    end)
+    if ok and type(body) == "string" and #body > 0 then
+        return body
+    end
+    local req = (typeof(syn) == "table" and syn.request) or (typeof(http_request) == "function" and http_request)
+        or (typeof(request) == "function" and request)
+    if req then
+        local good, res = pcall(req, { Url = url, Method = "GET" })
+        if good and type(res) == "table" and type(res.Body) == "string" then
+            return res.Body
+        end
+    end
+    return nil
+end
+
+local function decode(body)
+    local ok, data = pcall(function()
+        return game:GetService("HttpService"):JSONDecode(body)
+    end)
+    return ok and type(data) == "table" and data or nil
+end
+
+-- Returns the badges you don't have ({ name, description }) and how many the game has.
+function Feat.missingBadges()
+    local all, cursor = {}, nil
+    repeat
+        local url = ("https://badges.roblox.com/v1/universes/%d/badges?limit=100&sortOrder=Asc"):format(game.GameId)
+        if cursor then
+            url ..= "&cursor=" .. cursor
+        end
+        local data = decode(httpGet(url) or "")
+        if not data then
+            return nil, "couldn't load the game's badge list (your executor may block web requests)"
+        end
+        for _, badge in data.data or {} do
+            table.insert(all, badge)
+        end
+        cursor = data.nextPageCursor
+    until not cursor or cursor == "" or #all >= 1000
+    local owned = {}
+    for i = 1, #all, 50 do
+        local ids = {}
+        for j = i, math.min(i + 49, #all) do
+            table.insert(ids, tostring(all[j].id))
+        end
+        local data = decode(httpGet(("https://badges.roblox.com/v1/users/%d/badges/awarded-dates?badgeIds=%s"):format(UID, table.concat(ids, ","))) or "")
+        if data and data.data then
+            for _, row in data.data do
+                owned[row.badgeId] = true
+            end
+        else
+            local service = game:GetService("BadgeService")
+            for j = i, math.min(i + 49, #all) do
+                local ok, has = pcall(service.UserHasBadgeAsync, service, UID, all[j].id)
+                if ok and has then
+                    owned[all[j].id] = true
+                end
+            end
+        end
+    end
+    local missing = {}
+    for _, badge in all do
+        if badge.enabled ~= false and not owned[badge.id] then
+            table.insert(missing, { name = tostring(badge.displayName or badge.name or badge.id),
+                description = tostring(badge.displayDescription or badge.description or "") })
+        end
+    end
+    return missing, #all
+end
+
 -- Daily quests, for the dashboard.
 function Feat.dailyQuests()
     local folder = LocalPlayer:FindFirstChild("DailyQuests")
@@ -4044,6 +4276,31 @@ UI.GameCards = UI.GameBox:AddStatCards("GameCards", {
 })
 UI.FireBar = UI.GameBox:AddProgressBar("FireBar", { Text = "Camp fire fuel", Default = 0, Max = 100, Percent = false })
 UI.QuestLabel = UI.GameBox:AddLabel("Daily quests: -", true)
+
+UI.BadgeBox = UI.DashTab:AddBigGroupbox("Badges you don't have", "award")
+UI.BadgeLabel = UI.BadgeBox:AddLabel("Press Check to look them up", true)
+UI.BadgeLog = UI.BadgeBox:AddLog("BadgeLog", { Text = "Missing badges", Height = 160, MaxLines = 300 })
+local function checkBadges()
+    setText(UI.BadgeLabel, "Looking up this game's badges...")
+    task.spawn(function()
+        local missing, total = Feat.missingBadges()
+        pcall(UI.BadgeLog.Clear, UI.BadgeLog)
+        if not missing then
+            setText(UI.BadgeLabel, "Couldn't check: " .. tostring(total))
+            return
+        end
+        setText(UI.BadgeLabel, string.format("You have %d of %d badges · %d missing", total - #missing, total, #missing))
+        for _, badge in missing do
+            pcall(UI.BadgeLog.Log, UI.BadgeLog, badge.name .. (badge.description ~= "" and (" — " .. badge.description) or ""))
+        end
+    end)
+end
+UI.BadgeBox:AddButton("Check badges", checkBadges)
+task.delay(6, function()
+    if alive() then
+        checkBadges()
+    end
+end)
 UI.EventLog = UI.GameBox:AddLog("EventLog", { Text = "Events", Height = 140, MaxLines = 150 })
 
 logEvent = function(text, color)
@@ -4064,7 +4321,7 @@ toggle(UI.ChopBox, "ShowChopRange", "Show chop range", "ShowChopRange"):AddColor
         Settings.ChopColor = c
     end,
 })
-slider(UI.ChopBox, "ChopPerSwing", "Trees per swing", "ChopPerSwing", 1, 10)
+slider(UI.ChopBox, "ChopPerSwing", "Trees per swing", "ChopPerSwing", 1, 25)
 multi(UI.ChopBox, "ChopTypes", "What to chop", "ChopTypes", { "Tree" }, { "Tree" },
     "Filled from what the map holds, so new resource types show up here on their own")
 
@@ -4079,7 +4336,7 @@ toggle(UI.AuraBox, "ShowAuraRange", "Show aura range", "ShowAuraRange"):AddColor
         Settings.AuraColor = c
     end,
 })
-slider(UI.AuraBox, "AuraPerSwing", "Mobs per swing", "AuraPerSwing", 1, 10)
+slider(UI.AuraBox, "AuraPerSwing", "Mobs per swing", "AuraPerSwing", 1, 25)
 multi(UI.AuraBox, "AuraKinds", "Targets", "AuraKinds", { "Hostile", "Can attack", "Passive" }, { "Hostile", "Can attack" },
     "Hostile: chasing or aggressive. Can attack: fights back. Passive: neither")
 choice(UI.AuraBox, "AuraPriority", "Hit first", "AuraPriority", { "Chasing me first", "Nearest", "Lowest health" },
@@ -4088,6 +4345,8 @@ UI.AuraNearLabel = UI.AuraBox:AddLabel("Nearby: -", true)
 
 UI.SwingBox = UI.CombatTab:AddLeftGroupbox("Swing settings", "settings-2")
 toggle(UI.SwingBox, "AutoEquip", "Auto equip the right tool", "AutoEquip")
+choice(UI.SwingBox, "SwingMode", "Swing mode", "SwingMode", { "Fast", "Normal" },
+    "Fast equips and hits in the same moment, on the tool's own cooldown. Normal waits a beat for the tool to show in hand")
 choice(UI.SwingBox, "HitFrom", "Send hits from", "HitFrom", { "Your position", "Near target" },
     "Near target reports the swing next to what you hit. Try it if far hits don't land")
 slider(UI.SwingBox, "ExtraDelay", "Extra delay per swing", "ExtraDelay", 0, 1000, " ms")
@@ -4133,7 +4392,11 @@ do
         end
         lastVersion, lastCategory = Index.namesVersion, category
         local names, counts = namesIn(category)
-        UI.BringItems:SetValues(names)
+        local values = { ALL_ITEMS }
+        for _, name in names do
+            table.insert(values, name)
+        end
+        UI.BringItems:SetValues(values)
         local picks = Settings.BringPicks[category] or {}
         UI.BringItems:SetValue(picks)
         if UI.BringExclude then
@@ -4171,13 +4434,17 @@ do
         Values = {},
         Multi = true,
         Searchable = true,
-        Tooltip = "Changes with the category. Pick none to bring the whole category",
+        Tooltip = "Changes with the category. ★ All of them (or nothing picked) brings the whole category",
         Callback = function(v)
             local picks = {}
             for name, on in v or {} do
                 if on then
                     picks[name] = true
                 end
+            end
+            -- "All of them" wins over single picks.
+            if picks[ALL_ITEMS] then
+                picks = { [ALL_ITEMS] = true }
             end
             Settings.BringPicks[Settings.BringCategory or "All"] = picks
         end,
@@ -4235,7 +4502,8 @@ do
     slider(HowBox, "BringPerFrame", "Items per frame (fast)", "BringPerFrame", 1, 50)
     slider(HowBox, "BringHold", "Hold before letting go", "BringHold", 0, 500, " ms", "Raise this if items snap back to where they were")
     slider(HowBox, "BringMax", "Max items per bring", "BringMax", 1, 500)
-    slider(HowBox, "BringRange", "Search distance", "BringRange", 25, 5000, " studs")
+    slider(HowBox, "BringRange", "Only items within", "BringRange", 25, 5000, " studs",
+        "Bring only takes items your game has loaded (the map around you, plus anything the game keeps loaded everywhere); this caps how far from you they can be")
     toggle(HowBox, "BringSkipNear", "Skip items already there", "BringSkipNear")
 
     local LootBox = BringTab:AddRightGroupbox("Chest loot", "package-open")
@@ -4467,6 +4735,13 @@ do
         stopJob("Stopped")
     end)
     toggle(RunBox, "ReturnAfterRun", "Go back to where I was after a chest run", "ReturnAfterRun")
+    slider(RunBox, "RunSpeed", "Run speed", "RunSpeed", 100, 600, " studs/s",
+        "How fast chest runs and kid rescue travel. Moves by position, so the game's speed check doesn't see it")
+    slider(RunBox, "RunHigh", "Fly over mobs by", "RunHigh", 0, 80, " studs",
+        "Runs rise this high before crossing the map and drop at the end, out of reach of mobs on the ground. 0 = straight line")
+    toggle(RunBox, "SkipGuarded", "Skip chests with mobs next to them", "SkipGuarded",
+        "Chest run leaves a chest alone when a hostile mob is this close to it, unless kill aura is on")
+    slider(RunBox, "GuardRadius", "Mob distance", "GuardRadius", 5, 40, " studs")
     RunBox:AddLabel("Kid rescue needs a sack. It goes to each kid, picks it up and brings it to the camp fire. Turn on kill aura first", true)
 
     local KidsBox = ExploreTab:AddRightGroupbox("Lost kids", "baby")
