@@ -51,6 +51,10 @@
 --   Passive    neither
 --   Kids, pets, the dead and anything marked NotAttackable are never hit.
 --
+-- The automations (tree farm, kid rescue, chest run, night safety) only chain
+-- the calls above: move, then do what you'd do standing there. One runs at a
+-- time; starting one stops the other.
+--
 -- Everything here is LOCAL PLAYER ONLY.
 
 local Players = game:GetService("Players")
@@ -59,8 +63,6 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local UserInputService = game:GetService("UserInputService")
 local Lighting = game:GetService("Lighting")
 local VirtualUser = game:GetService("VirtualUser")
-local HttpService = game:GetService("HttpService")
-local CoreGui = game:GetService("CoreGui")
 local Workspace = workspace
 
 local LocalPlayer = Players.LocalPlayer
@@ -79,9 +81,11 @@ local function alive()
 end
 
 --// Ui3, from the latest commit so a cached main branch never wins \\--
+local Library
+do
 local ref = "main"
 local resolved, shaOrError = pcall(function()
-    local commit = HttpService:JSONDecode(game:HttpGet("https://api.github.com/repos/iamdookie1/Ui3/commits/main"))
+    local commit = game:GetService("HttpService"):JSONDecode(game:HttpGet("https://api.github.com/repos/iamdookie1/Ui3/commits/main"))
     return commit.sha
 end)
 if resolved and shaOrError then
@@ -89,21 +93,27 @@ if resolved and shaOrError then
 else
     warn("[Ui3] could not resolve the latest commit, falling back to main: " .. tostring(shaOrError))
 end
-local Library = loadstring(game:HttpGet(("https://raw.githubusercontent.com/iamdookie1/Ui3/%s/Ui.lua"):format(ref)))()
+Library = loadstring(game:HttpGet(("https://raw.githubusercontent.com/iamdookie1/Ui3/%s/Ui.lua"):format(ref)))()
+end
 local Options = Library.Options
+if not alive() then
+    return
+end
 
 local Settings = {
-    -- main
+    -- combat
     AutoChop = false, ChopRange = 40, ShowChopRange = false, ChopColor = Color3.fromRGB(120, 220, 120),
     ChopTypes = { Tree = true }, ChopPerSwing = 3,
     KillAura = false, AuraRange = 30, ShowAuraRange = false, AuraColor = Color3.fromRGB(255, 90, 90),
-    AuraKinds = { Hostile = true, ["Can attack"] = true }, AuraPerSwing = 3,
-    AutoEquip = true, HitFrom = "Your position", ExtraDelay = 0,
+    AuraKinds = { Hostile = true, ["Can attack"] = true }, AuraPerSwing = 3, AuraPriority = "Chasing me first",
+    AutoEquip = true, HitFrom = "Your position", ExtraDelay = 0, OneTool = true,
+    -- tree farm
+    FarmTrees = false, FarmRadius = 250, FarmAround = "Camp fire", FarmNight = "Wait at camp",
     -- movement
     Speed = false, SpeedValue = 32, SpeedMethod = "WalkSpeed",
     Jump = false, JumpValue = 75, InfJump = false,
     Fly = false, FlySpeed = 60, Noclip = false, AntiAfk = true,
-    TpMethod = "Instant", TpSpeed = 150,
+    TpMethod = "Tween", TpSpeed = 150, TpGround = true,
     -- visuals
     KidDots = false, KidLabels = true, KidColor = Color3.fromRGB(255, 220, 80),
     EspMobs = false, EspKids = false, EspPlayers = false, EspChests = false, EspItems = false,
@@ -112,19 +122,20 @@ local Settings = {
     PlayerColor = Color3.fromRGB(120, 180, 255), ChestColor = Color3.fromRGB(255, 200, 90),
     ItemColor = Color3.fromRGB(200, 200, 200),
     Fullbright = false, NoFog = false, AlwaysDay = false, FovOn = false, Fov = 80,
-    -- main (both jobs at once)
-    OneTool = true,
     -- bring
-    BringKinds = { Fuel = true }, BringNames = {}, BringByName = false,
+    BringKinds = { Fuel = true }, BringNames = {}, BringByName = false, BringExclude = {},
     BringDest = "You", BringMode = "Fast", BringPerFrame = 10, BringHold = 100,
     BringMax = 100, BringRange = 2000, BringSkipNear = true, SavedSpot = nil,
     AutoBring = false, AutoBringEvery = 10,
-    -- extra
+    -- survival
+    AutoEat = false, EatBelow = 120, EatBring = true,
+    AutoHeal = false, HealBelow = 50, HealBring = true, ConsumeRange = 15,
+    KeepFireFed = false, FireBelow = 40, KeepScrapping = false,
+    NightCamp = false, Escape = false, EscapeBelow = 25,
+    -- explore
     AutoChests = false, AutoBagKids = false, AutoDropKids = false,
-    AutoCoins = false, CoinRange = 20,
-    AutoEat = false, EatBelow = 120, AutoHeal = false, HealBelow = 50, ConsumeRange = 15,
-    KeepFireFed = false, FireBelow = 40,
-    InstantPrompts = false,
+    AutoCoins = false, CoinRange = 20, InstantPrompts = false,
+    ReturnAfterRun = true,
 }
 
 local MobColors = {
@@ -147,7 +158,7 @@ local function getHui()
     local ok, hui = pcall(function()
         return gethui and gethui()
     end)
-    return (ok and hui) or CoreGui
+    return (ok and hui) or game:GetService("CoreGui")
 end
 
 local VisualGui = Instance.new("ScreenGui")
@@ -176,6 +187,13 @@ end
 local function humanoid()
     local c = character()
     return c and c:FindFirstChildOfClass("Humanoid")
+end
+local function healthPercent()
+    local hum = humanoid()
+    if not hum then
+        return 100
+    end
+    return hum.Health / math.max(hum.MaxHealth, 1) * 100
 end
 local function pivotPos(model)
     if not model or not model.Parent then
@@ -213,6 +231,12 @@ local function clock(seconds)
     seconds = math.max(0, math.floor(tonumber(seconds) or 0))
     return string.format("%d:%02d", seconds // 60, seconds % 60)
 end
+local function byDistance(a, b)
+    return a.d < b.d
+end
+local function notify(title, text, time)
+    pcall(Library.Notify, Library, { Title = title, Description = text, Time = time or 3 })
+end
 
 local Remotes = ReplicatedStorage:WaitForChild("RemoteEvents", 15)
 local function remote(name)
@@ -223,10 +247,45 @@ local function mapFolder(name)
     local map = Workspace:FindFirstChild("Map")
     return map and map:FindFirstChild(name)
 end
+local function charactersFolder()
+    return Workspace:FindFirstChild("Characters")
+end
+local function itemsFolder()
+    return Workspace:FindFirstChild("Items")
+end
+local function campPart(name)
+    local camp = mapFolder("Campground")
+    return camp and camp:FindFirstChild(name)
+end
+local function campPos()
+    return pivotPos(campPart("MainFire"))
+end
+local function isNight()
+    return Workspace:GetAttribute("State") == "Night"
+end
+
+-- Things that shouldn't wait on each other run on their own thread, guarded so
+-- one error never kills the loop.
+local function loop(every, fn)
+    task.spawn(function()
+        while alive() do
+            local ok, err = pcall(fn)
+            if not ok then
+                warn("[99 Nights] " .. tostring(err))
+            end
+            task.wait(every)
+        end
+    end)
+end
 
 --// Tools \\--
 local function inventory()
     return LocalPlayer:FindFirstChild("Inventory")
+end
+
+local function inventoryItems()
+    local inv = inventory()
+    return inv and inv:GetChildren() or {}
 end
 
 local function equippedName()
@@ -246,14 +305,18 @@ local function canChopWith(tool, target)
     return not need or (tool:GetAttribute("ToolTier") or 1) >= need
 end
 
+local function canChopAtAll(target)
+    for _, item in inventoryItems() do
+        if canChopWith(item, target) then
+            return true
+        end
+    end
+    return false
+end
+
 local RANGED = { Firearm = true, ThrownWeapon = true }
 local function isMelee(tool)
     return tool:GetAttribute("WeaponDamage") ~= nil and not RANGED[tool:GetAttribute("ToolName") or ""]
-end
-
-local function inventoryItems()
-    local inv = inventory()
-    return inv and inv:GetChildren() or {}
 end
 
 -- Best melee weapon in the inventory by WeaponDamage. Ties go to the one in hand.
@@ -346,9 +409,40 @@ local function sendHit(target, tool, killing)
 end
 
 --// Resources (anything choppable) \\--
-local Resources = {}
+-- Trees don't move, so each one's position is read once and filed in a grid of
+-- 64-stud cells. A range lookup then only looks at the cells it overlaps
+-- instead of every tree on the map.
+local CELL = 64
+local Resources = {} -- model -> position
+local ResourceGrid = {} -- cell key -> { [model] = true }
 local ResourceTypes = {}
 local pendingTypes = false
+
+local function cellKey(cx, cz)
+    return cx * 100003 + cz
+end
+
+local function fileResource(model, pos)
+    Resources[model] = pos
+    local key = cellKey(pos.X // CELL, pos.Z // CELL)
+    local cell = ResourceGrid[key]
+    if not cell then
+        cell = {}
+        ResourceGrid[key] = cell
+    end
+    cell[model] = true
+end
+
+local function dropResource(model)
+    local pos = Resources[model]
+    if pos then
+        Resources[model] = nil
+        local cell = ResourceGrid[cellKey(pos.X // CELL, pos.Z // CELL)]
+        if cell then
+            cell[model] = nil
+        end
+    end
+end
 
 local function considerResource(inst)
     if not inst:IsA("Model") then
@@ -358,7 +452,11 @@ local function considerResource(inst)
     if kind == nil or inst:GetAttribute("Health") == nil then
         return
     end
-    Resources[inst] = true
+    local pos = pivotPos(inst)
+    if not pos then
+        return
+    end
+    fileResource(inst, pos)
     if not ResourceTypes[kind] then
         ResourceTypes[kind] = true
         pendingTypes = true
@@ -370,23 +468,47 @@ task.spawn(function()
     if not map or not alive() then
         return
     end
+    bind(map.DescendantAdded, function(inst)
+        -- Attributes can land a frame after the model.
+        task.defer(considerResource, inst)
+    end)
+    bind(map.DescendantRemoving, dropResource)
     for i, inst in map:GetDescendants() do
         considerResource(inst)
         if i % 4000 == 0 then
             task.wait()
         end
     end
-    bind(map.DescendantAdded, considerResource)
-    bind(map.DescendantRemoving, function(inst)
-        Resources[inst] = nil
-    end)
 end)
 
---// Mobs \\--
-local function charactersFolder()
-    return Workspace:FindFirstChild("Characters")
+-- Choppable things of the chosen types within `radius` of `center`, nearest first.
+local function resourcesNear(center, radius)
+    local list = {}
+    local r2 = radius * radius
+    for cx = (center.X - radius) // CELL, (center.X + radius) // CELL do
+        for cz = (center.Z - radius) // CELL, (center.Z + radius) // CELL do
+            local cell = ResourceGrid[cellKey(cx, cz)]
+            if cell then
+                for model in cell do
+                    local pos = Resources[model]
+                    if model.Parent == nil then
+                        dropResource(model)
+                    elseif Settings.ChopTypes[model:GetAttribute("Resource")] and (model:GetAttribute("Health") or 0) > 0 then
+                        local delta = pos - center
+                        local d2 = delta.X * delta.X + delta.Z * delta.Z
+                        if d2 <= r2 then
+                            table.insert(list, { model = model, d = math.sqrt(d2 + delta.Y * delta.Y) })
+                        end
+                    end
+                end
+            end
+        end
+    end
+    table.sort(list, byDistance)
+    return list
 end
 
+--// Mobs \\--
 -- What a mob is, from what it does (see the header).
 local function mobKind(model)
     local npc = model:FindFirstChild("NPC")
@@ -426,36 +548,64 @@ local function mobPos(model)
     return hrp and hrp.Position or pivotPos(model)
 end
 
+local function mobHealth(model)
+    local npc = model:FindFirstChild("NPC")
+    return npc and npc:IsA("Humanoid") and npc.Health or math.huge
+end
+
+local function chasingMe(model)
+    return model:GetAttribute("ChasingPlayer") == LocalPlayer.UserId
+end
+
 --// Auto chop + kill aura, side by side \\--
 -- Both share one swing clock (the server sees one tool swing at a time). Each
 -- swing hits mobs and trees together when one tool can do both; otherwise the
 -- two jobs take turns.
+local SwingInfo = { axe = "-", weapon = "-", blocked = 0, blockedTier = nil }
+local FarmTarget = nil -- the tree the farm walked to; chopped even past the chop distance
+local swingTick
+do
 local nextSwing = 0
 local nextJob = "aura"
-local SwingInfo = { axe = "-", weapon = "-", blocked = 0, blockedTier = nil }
 
 local function chopCandidates()
     local hrp = rootPart()
     if not hrp then
         return {}
     end
-    local list = {}
-    for model in Resources do
-        if model.Parent == nil then
-            Resources[model] = nil
-        elseif Settings.ChopTypes[model:GetAttribute("Resource")] and (model:GetAttribute("Health") or 0) > 0 then
-            local pos = pivotPos(model)
-            local d = pos and (pos - hrp.Position).Magnitude
-            if d and d <= Settings.ChopRange then
-                table.insert(list, { model = model, d = d })
+    local list = resourcesNear(hrp.Position, Settings.ChopRange)
+    if FarmTarget and FarmTarget.Parent and Resources[FarmTarget] then
+        local seen = false
+        for _, entry in list do
+            if entry.model == FarmTarget then
+                seen = true
+                break
             end
         end
+        if not seen then
+            table.insert(list, 1, { model = FarmTarget, d = (Resources[FarmTarget] - hrp.Position).Magnitude })
+        end
     end
-    table.sort(list, function(a, b)
-        return a.d < b.d
-    end)
     return list
 end
+
+local AURA_SORTS = {
+    Nearest = function(a, b)
+        return a.d < b.d
+    end,
+    ["Chasing me first"] = function(a, b)
+        if a.mine ~= b.mine then
+            return a.mine
+        end
+        return a.d < b.d
+    end,
+    ["Lowest health"] = function(a, b)
+        if a.hp ~= b.hp then
+            return a.hp < b.hp
+        end
+        return a.d < b.d
+    end,
+}
 
 local function auraTargets()
     local hrp = rootPart()
@@ -471,14 +621,12 @@ local function auraTargets()
                 local pos = mobPos(model)
                 local d = pos and (pos - hrp.Position).Magnitude
                 if d and d <= Settings.AuraRange then
-                    table.insert(list, { model = model, d = d })
+                    table.insert(list, { model = model, d = d, mine = chasingMe(model), hp = mobHealth(model) })
                 end
             end
         end
     end
-    table.sort(list, function(a, b)
-        return a.d < b.d
-    end)
+    table.sort(list, AURA_SORTS[Settings.AuraPriority] or AURA_SORTS.Nearest)
     return list
 end
 
@@ -496,8 +644,9 @@ local function hitTrees(list, tool)
     end
 end
 
-local function swingTick()
-    if not (Settings.AutoChop or Settings.KillAura) then
+function swingTick()
+    local chopping = Settings.AutoChop or FarmTarget ~= nil
+    if not (chopping or Settings.KillAura) then
         return
     end
     local now = os.clock()
@@ -517,7 +666,7 @@ local function swingTick()
         or (Settings.KillAura and (#mobs > 0 and "no melee weapon" or "nothing in range") or "-")
 
     local trees, axe, breakable = {}, nil, {}
-    if Settings.AutoChop then
+    if chopping then
         trees = chopCandidates()
         if #trees > 0 then
             axe, breakable = bestAxe(trees)
@@ -573,10 +722,11 @@ local function swingTick()
         return
     end
 
-    -- Different tools: take turns, so neither job starves.
+    -- Different tools: take turns, so neither job starves. A mob chasing you
+    -- always gets the swing first.
     local job
     if wantAura and wantChop then
-        job = nextJob
+        job = mobs[1].mine and "aura" or nextJob
     else
         job = wantAura and "aura" or "chop"
     end
@@ -591,8 +741,11 @@ local function swingTick()
         nextJob = job == "aura" and "chop" or "aura"
     end
 end
+end
 
 --// Range rings \\--
+local ChopRing, AuraRing
+do
 local function makeRing()
     local ring = Instance.new("CylinderHandleAdornment")
     ring.Adornee = Workspace.Terrain
@@ -604,8 +757,8 @@ local function makeRing()
     ring.Parent = VisualGui
     return ring
 end
-local ChopRing = makeRing()
-local AuraRing = makeRing()
+ChopRing, AuraRing = makeRing(), makeRing()
+end
 
 local function placeRing(ring, show, radius, color, lift)
     local hrp = rootPart()
@@ -719,6 +872,7 @@ end
 
 -- On-screen up/down buttons for flying on a phone.
 local FlyButtons = Instance.new("Frame")
+do
 FlyButtons.Name = "FlyButtons"
 FlyButtons.BackgroundTransparency = 1
 FlyButtons.AnchorPoint = Vector2.new(1, 1)
@@ -760,9 +914,11 @@ end)
 flyButton("▼", 72, function(v)
     FlyDownHeld = v
 end)
+end
 
 local Saved = {}
 local NoclipParts = {}
+local Travelling = false -- a tween is moving you; it passes through walls on the way
 
 local function movementStep(dt)
     local hum = humanoid()
@@ -815,7 +971,7 @@ local function restoreNoclip()
 end
 
 bind(RunService.Stepped, function()
-    if not alive() or not Settings.Noclip then
+    if not alive() or not (Settings.Noclip or Travelling) then
         return
     end
     local c = character()
@@ -850,44 +1006,209 @@ bind(LocalPlayer.Idled, function()
     end)
 end)
 
---// Teleports \\--
+--// Travel \\--
+-- Far places may not be streamed in yet, so the area is asked for first, then
+-- the landing spot is found by casting down onto the ground (through tree tops,
+-- mobs and loose items) so you never land in a canopy or under the map.
 local tpToken = 0
-local function teleportTo(pos)
+local TravelOwner = nil
+local moveTo
+do
+local GroundParams = RaycastParams.new()
+GroundParams.FilterType = Enum.RaycastFilterType.Exclude
+
+local function streamAround(pos)
+    pcall(LocalPlayer.RequestStreamAroundAsync, LocalPlayer, pos, 2)
+end
+
+local function groundAt(pos, fromHeight)
+    local skip = { character(), charactersFolder(), itemsFolder(), VisualGui }
+    local list = {}
+    for _, inst in skip do
+        if inst then
+            table.insert(list, inst)
+        end
+    end
+    local origin = Vector3.new(pos.X, (fromHeight or pos.Y) + 8, pos.Z)
+    for _ = 1, 10 do
+        GroundParams.FilterDescendantsInstances = list
+        local hit = Workspace:Raycast(origin, Vector3.new(0, -600, 0), GroundParams)
+        if not hit then
+            return nil
+        end
+        local inst = hit.Instance
+        local model = inst:FindFirstAncestorWhichIsA("Model")
+        -- Tree tops, leaves and anything you can walk through aren't ground.
+        if (model and model:GetAttribute("Resource")) or not inst.CanCollide or inst.Transparency >= 1 then
+            table.insert(list, inst)
+            origin = hit.Position
+        else
+            return hit.Position
+        end
+    end
+    return nil
+end
+
+-- Where to stand for `pos`: on the ground under it when it can be found.
+local function landingSpot(pos, unknownHeight)
+    if not Settings.TpGround and not unknownHeight then
+        return pos + Vector3.new(0, 4, 0)
+    end
+    local ground = groundAt(pos, unknownHeight and 400 or nil)
+    if ground then
+        return ground + Vector3.new(0, 3.5, 0)
+    end
+    return unknownHeight and Vector3.new(pos.X, 80, pos.Z) or pos + Vector3.new(0, 4, 0)
+end
+
+-- Moves you to `pos` and returns once you're there (true) or the move was
+-- replaced, cancelled or timed out (false). `opts.unknownHeight`: the point is a
+-- map marker with no real height.
+function moveTo(pos, opts)
+    opts = opts or {}
     local hrp = rootPart()
     if not hrp or not pos then
-        Library:Notify({ Title = "Teleport", Description = "Nowhere to go (not loaded?)", Time = 3 })
-        return
+        return false
     end
-    local target = CFrame.new(pos + Vector3.new(0, 4, 0))
     tpToken += 1
     local token = tpToken
-    if Settings.TpMethod == "Instant" then
-        hrp.CFrame = target
-        hrp.AssemblyLinearVelocity = Vector3.zero
-        return
+    local far = (pos - hrp.Position).Magnitude > 200 or opts.unknownHeight
+    if far then
+        streamAround(pos)
     end
-    -- Tween: moved by CFrame with no velocity, so the anti-fling never sees it.
-    task.spawn(function()
-        while alive() and token == tpToken do
+    local target = landingSpot(pos, opts.unknownHeight)
+    local look = hrp.CFrame.Rotation
+
+    if Settings.TpMethod == "Instant" then
+        hrp.CFrame = CFrame.new(target) * look
+        hrp.AssemblyLinearVelocity = Vector3.zero
+        if Travelling then
+            Travelling, TravelOwner = false, nil
+            if not Settings.Noclip then
+                restoreNoclip()
+            end
+        end
+    else
+        -- Tween: moved by CFrame with no velocity, so the anti-fling never sees it.
+        Travelling, TravelOwner = true, token
+        local t0 = os.clock()
+        local limit = (target - hrp.Position).Magnitude / math.max(Settings.TpSpeed, 1) + 10
+        local arrived = false
+        while alive() and token == tpToken and os.clock() - t0 < limit do
             local dt = RunService.Heartbeat:Wait()
             local r = rootPart()
             if not r then
                 break
             end
-            local delta = target.Position - r.Position
+            local delta = target - r.Position
             local d = delta.Magnitude
             if d < 2 then
-                r.CFrame = target
+                r.CFrame = CFrame.new(target) * look
                 r.AssemblyLinearVelocity = Vector3.zero
+                arrived = true
                 break
             end
             local step = math.min(d, Settings.TpSpeed * dt)
-            r.CFrame = CFrame.new(r.Position + delta.Unit * step) * r.CFrame.Rotation
+            r.CFrame = CFrame.new(r.Position + delta.Unit * step) * look
             r.AssemblyLinearVelocity = Vector3.zero
+        end
+        if TravelOwner == token then
+            Travelling, TravelOwner = false, nil
+            if not Settings.Noclip then
+                restoreNoclip()
+            end
+        end
+        if not arrived then
+            return false
+        end
+    end
+
+    -- A map marker's real ground streams in after you get there: settle onto it.
+    if opts.unknownHeight then
+        task.wait(0.5)
+        local r = rootPart()
+        local ground = r and groundAt(r.Position, 400)
+        if r and ground and token == tpToken then
+            r.CFrame = CFrame.new(ground + Vector3.new(0, 3.5, 0)) * look
+            r.AssemblyLinearVelocity = Vector3.zero
+        end
+    end
+    return token == tpToken
+end
+end
+
+local function teleportTo(pos, opts)
+    if not rootPart() or not pos then
+        notify("Teleport", "Nowhere to go (not loaded?)")
+        return
+    end
+    task.spawn(moveTo, pos, opts)
+end
+
+-- A spot `gap` studs from `pos`, on your side of it.
+local function besideOf(pos, gap)
+    local hrp = rootPart()
+    local away = hrp and (hrp.Position - pos) or Vector3.new(0, 0, 1)
+    away = Vector3.new(away.X, 0, away.Z)
+    away = away.Magnitude > 0.1 and away.Unit or Vector3.new(0, 0, 1)
+    return pos + away * gap
+end
+
+--// Jobs \\--
+-- One automation at a time (tree farm, kid rescue, chest run, going to camp).
+-- Starting one stops the one before; each checks `still()` between steps.
+local Job = { name = nil, token = 0, status = "Idle" }
+
+local function setStatus(text)
+    Job.status = text
+end
+
+local function stopJob(reason)
+    Job.token += 1
+    tpToken += 1
+    Job.name = nil
+    FarmTarget = nil
+    setStatus(reason or "Idle")
+end
+
+local function startJob(name, fn)
+    stopJob()
+    local token = Job.token
+    Job.name = name
+    local function still()
+        return alive() and Job.token == token
+    end
+    task.spawn(function()
+        local ok, err = pcall(fn, still)
+        if not ok then
+            warn("[99 Nights] " .. name .. ": " .. tostring(err))
+        end
+        if Job.token == token then
+            Job.name = nil
+            FarmTarget = nil
+            if not ok then
+                setStatus(name .. " stopped: " .. tostring(err))
+            end
         end
     end)
 end
 
+-- Waits up to `seconds`, returning early (true) once `done()` holds.
+local function waitFor(seconds, done, still)
+    local t0 = os.clock()
+    while os.clock() - t0 < seconds do
+        if still and not still() then
+            return false
+        end
+        if done() then
+            return true
+        end
+        task.wait(0.15)
+    end
+    return done()
+end
+
+--// Places \\--
 -- Fixed places: camp pieces and every cave point the server publishes.
 local function placeTargets()
     local list, order = {}, {}
@@ -908,7 +1229,8 @@ local function placeTargets()
             local model = camp:FindFirstChild(entry[2])
             if model then
                 add(entry[1], function()
-                    return pivotPos(model) and pivotPos(model) + Vector3.new(0, 0, 8)
+                    local pos = pivotPos(model)
+                    return pos and besideOf(pos, 8)
                 end)
             end
         end
@@ -935,17 +1257,25 @@ local function placeTargets()
     return list, order
 end
 
+local function isChest(model)
+    return model:GetAttribute("Interaction") == "ItemChest"
+end
+
+local function chestOpened(chest)
+    return chest:GetAttribute("LocalOpened") or chest:GetAttribute(math.abs(LocalPlayer.UserId) .. "Opened")
+end
+
 -- Every chest, numbered once so a label keeps pointing at the same chest.
 local ChestIds, nextChestId = setmetatable({}, { __mode = "k" }), 0
 local function chestTargets()
-    local items = Workspace:FindFirstChild("Items")
+    local items = itemsFolder()
     local list, order = {}, {}
     if not items then
         return list, order
     end
     local found = {}
     for _, model in items:GetChildren() do
-        if model:GetAttribute("Interaction") == "ItemChest" then
+        if isChest(model) then
             if not ChestIds[model] then
                 nextChestId += 1
                 ChestIds[model] = nextChestId
@@ -953,13 +1283,13 @@ local function chestTargets()
             local label = (model:GetAttribute("ChestName") or cleanName(model.Name)) .. " #" .. ChestIds[model]
             if model:GetAttribute("Locked") then
                 label ..= " (locked)"
+            elseif chestOpened(model) then
+                label ..= " (opened)"
             end
             table.insert(found, { label = label, model = model, d = distanceTo(pivotPos(model)) })
         end
     end
-    table.sort(found, function(a, b)
-        return a.d < b.d
-    end)
+    table.sort(found, byDistance)
     for _, entry in found do
         list[entry.label] = entry.model
         table.insert(order, entry.label)
@@ -1005,6 +1335,20 @@ local function landmarkTargets(everything)
     return list, order
 end
 
+--// Kids \\--
+local function liveKid(kidId)
+    local folder = charactersFolder()
+    if not folder then
+        return nil
+    end
+    for _, model in folder:GetChildren() do
+        if model:GetAttribute("KidId") == kidId and model:GetAttribute("Lost") ~= false then
+            return model
+        end
+    end
+    return nil
+end
+
 -- Kids: the live model when it's streamed in, the server's map point otherwise.
 local function kidPositions()
     local kids = {}
@@ -1023,7 +1367,7 @@ local function kidPositions()
             if kidId and model:GetAttribute("Lost") ~= false and (kids[kidId] or not missing) then
                 local pos = mobPos(model)
                 if pos then
-                    kids[kidId] = { pos = pos, live = true, name = model:GetAttribute("PingName") }
+                    kids[kidId] = { pos = pos, live = true, name = model:GetAttribute("PingName"), model = model }
                 end
             end
         end
@@ -1031,44 +1375,22 @@ local function kidPositions()
     return kids
 end
 
-local function itemNameTargets()
-    local items = Workspace:FindFirstChild("Items")
-    local names, order = {}, {}
-    if not items then
-        return order
-    end
-    for _, model in items:GetChildren() do
-        local interaction = model:GetAttribute("Interaction")
-        if interaction and interaction ~= "ItemChest" then
-            local name = cleanName(model.Name)
-            if not names[name] then
-                names[name] = true
-                table.insert(order, name)
+local function missingCount()
+    local n = 0
+    local folder = mapFolder("MissingKids")
+    if folder then
+        for _, value in folder:GetAttributes() do
+            if typeof(value) == "Vector3" then
+                n += 1
             end
         end
     end
-    table.sort(order)
-    return order
-end
-
-local function nearestItemNamed(name)
-    local items = Workspace:FindFirstChild("Items")
-    local best, bestD
-    if not items then
-        return nil
-    end
-    for _, model in items:GetChildren() do
-        if cleanName(model.Name) == name and model:GetAttribute("Interaction") ~= "ItemChest" then
-            local d = distanceTo(pivotPos(model))
-            if not bestD or d < bestD then
-                best, bestD = model, d
-            end
-        end
-    end
-    return best
+    return n
 end
 
 --// Kid dots (screen markers, work on anything the camera can project) \\--
+local updateKidDots
+do
 local KidMarkers = {}
 local function kidMarker(kidId)
     local m = KidMarkers[kidId]
@@ -1100,7 +1422,7 @@ local function kidMarker(kidId)
     return m
 end
 
-local function updateKidDots()
+function updateKidDots()
     local hrp = rootPart()
     local kids = (Settings.KidDots and hrp) and kidPositions() or {}
     for kidId, m in KidMarkers do
@@ -1141,14 +1463,11 @@ local function updateKidDots()
         m.dot.Visible = true
     end
 end
+end
 
 --// Items: types by what they do, so new items sort themselves \\--
 local ITEM_KINDS = { "Fuel", "Food", "Heals", "Scrap", "Gems", "Ammo", "Gear", "Seeds", "Other" }
 local HEAL_NAMES = { Bandage = true, MedKit = true }
-
-local function itemsFolder()
-    return Workspace:FindFirstChild("Items")
-end
 
 local function mineOrFree(model)
     local owner = model:GetAttribute("Owner")
@@ -1185,9 +1504,51 @@ local function itemKind(model)
     return "Other"
 end
 
-local function campPart(name)
-    local camp = mapFolder("Campground")
-    return camp and camp:FindFirstChild(name)
+local function isFood(model)
+    local bunny = LocalPlayer:GetAttribute("Class") == "Bunny"
+    return model:GetAttribute("RestoreHunger") ~= nil and not (bunny and model:GetAttribute("HasMeat"))
+end
+
+local function isHeal(model)
+    return model:GetAttribute("RestoreHealth") ~= nil or HEAL_NAMES[cleanName(model.Name)] == true
+end
+
+-- Names of the loose items on the map, for the pickers.
+local function itemNames()
+    local items = itemsFolder()
+    local seen, order = {}, {}
+    if not items then
+        return order
+    end
+    for _, model in items:GetChildren() do
+        local kind = itemKind(model)
+        if kind and kind ~= "Currency" then
+            local name = cleanName(model.Name)
+            if not seen[name] then
+                seen[name] = true
+                table.insert(order, name)
+            end
+        end
+    end
+    table.sort(order)
+    return order
+end
+
+local function nearestItemNamed(name)
+    local items = itemsFolder()
+    local best, bestD
+    if not items then
+        return nil
+    end
+    for _, model in items:GetChildren() do
+        if cleanName(model.Name) == name and not isChest(model) then
+            local d = distanceTo(pivotPos(model))
+            if not bestD or d < bestD then
+                best, bestD = model, d
+            end
+        end
+    end
+    return best
 end
 
 --// Bring \\--
@@ -1226,21 +1587,26 @@ local function slotOffset(i, dest)
     return Vector3.new((r % 6 - 2.5) * spacing, layer * spacing, (r // 6 - 2.5) * spacing)
 end
 
-local function bringList(kinds, names, byName, dest, limit)
+-- What to bring: { kinds = {}, names = {}, byName = bool, filter = fn, exclude = {} }
+local function bringList(what, dest, limit)
     local items = itemsFolder()
     local hrp = rootPart()
     local target = bringTarget(dest)
     if not items or not hrp or not target then
         return {}
     end
+    local exclude = what.exclude or {}
     local list = {}
     for _, model in items:GetChildren() do
         local kind = itemKind(model)
+        local name = cleanName(model.Name)
         local wanted
-        if byName then
-            wanted = names[cleanName(model.Name)] == true
+        if what.filter then
+            wanted = kind ~= nil and what.filter(model)
+        elseif what.byName then
+            wanted = what.names[name] == true
         else
-            wanted = kind ~= nil and kind ~= "Currency" and kinds[kind] == true
+            wanted = kind ~= nil and kind ~= "Currency" and what.kinds[kind] == true and not exclude[name]
         end
         if wanted and mineOrFree(model) and anyPart(model) then
             local pos = pivotPos(model)
@@ -1251,9 +1617,7 @@ local function bringList(kinds, names, byName, dest, limit)
             end
         end
     end
-    table.sort(list, function(a, b)
-        return a.d < b.d
-    end)
+    table.sort(list, byDistance)
     local out = {}
     for i = 1, math.min(limit, #list) do
         out[i] = list[i].model
@@ -1298,13 +1662,24 @@ local function isOwner(part)
     return ok and result or false
 end
 
-local function runBring(kinds, names, byName, dest, limit)
+local function currentBringWhat()
+    return {
+        kinds = Settings.BringKinds,
+        names = Settings.BringNames,
+        byName = Settings.BringByName,
+        exclude = Settings.BringExclude,
+    }
+end
+
+-- Starts a bring and returns how many items it's moving.
+local function runBring(what, dest, limit)
     Bring.token += 1
     local token = Bring.token
-    local list = bringList(kinds, names, byName, dest, limit or Settings.BringMax)
+    local list = bringList(what, dest, limit or Settings.BringMax)
     local start, stop = remote("RequestStartDraggingItem"), remote("StopDraggingItem")
     Bring.total, Bring.done = #list, 0
     if #list == 0 or not start or not stop then
+        Bring.running = false
         return 0
     end
     Bring.running = true
@@ -1375,27 +1750,7 @@ local function runBring(kinds, names, byName, dest, limit)
     return #list
 end
 
-local function itemNames()
-    local items = itemsFolder()
-    local seen, order = {}, {}
-    if not items then
-        return order
-    end
-    for _, model in items:GetChildren() do
-        local kind = itemKind(model)
-        if kind and kind ~= "Currency" then
-            local name = cleanName(model.Name)
-            if not seen[name] then
-                seen[name] = true
-                table.insert(order, name)
-            end
-        end
-    end
-    table.sort(order)
-    return order
-end
-
---// Extra: chests, kids, coins, eating, healing, fire \\--
+--// Loot, kids, coins, eating, healing \\--
 local Tried = setmetatable({}, { __mode = "k" })
 local function tryOnce(model, every)
     local last = Tried[model]
@@ -1415,8 +1770,31 @@ local function chestPrompt(chest)
     return nil
 end
 
-local function chestOpened(chest)
-    return chest:GetAttribute("LocalOpened") or chest:GetAttribute(math.abs(LocalPlayer.UserId) .. "Opened")
+local function openChest(chest)
+    local prompt = chestPrompt(chest)
+    if prompt and prompt.Enabled and typeof(fireproximityprompt) == "function" then
+        -- Some executors honour the hold time, so drop it for the call.
+        local hold = prompt.HoldDuration
+        prompt.HoldDuration = 0
+        pcall(fireproximityprompt, prompt)
+        task.delay(0.25, function()
+            if prompt.Parent and not Settings.InstantPrompts then
+                prompt.HoldDuration = hold
+            end
+        end)
+        return true
+    end
+    local r = remote("RequestOpenItemChest")
+    if r then
+        r:FireServer(chest)
+        chest:SetAttribute("LocalOpened", true)
+        return true
+    end
+    return false
+end
+
+local function openableChest(chest)
+    return isChest(chest) and chest.Parent ~= nil and not chest:GetAttribute("Locked") and not chestOpened(chest)
 end
 
 local function openChestsInRange()
@@ -1426,29 +1804,13 @@ local function openChestsInRange()
         return
     end
     for _, chest in items:GetChildren() do
-        if chest:GetAttribute("Interaction") == "ItemChest" and not chest:GetAttribute("Locked") and not chestOpened(chest) then
+        if openableChest(chest) then
             local prompt = chestPrompt(chest)
             local pos = pivotPos(chest)
             -- Opens exactly where the chest's own prompt would let you.
             local range = prompt and prompt.MaxActivationDistance or 10
-            if prompt and prompt.Enabled and pos and (pos - hrp.Position).Magnitude <= range and tryOnce(chest, 5) then
-                if typeof(fireproximityprompt) == "function" then
-                    -- Some executors honour the hold time, so drop it for the call.
-                    local hold = prompt.HoldDuration
-                    prompt.HoldDuration = 0
-                    pcall(fireproximityprompt, prompt)
-                    task.delay(0.25, function()
-                        if prompt.Parent and not Settings.InstantPrompts then
-                            prompt.HoldDuration = hold
-                        end
-                    end)
-                else
-                    local r = remote("RequestOpenItemChest")
-                    if r then
-                        r:FireServer(chest)
-                        chest:SetAttribute("LocalOpened", true)
-                    end
-                end
+            if pos and (pos - hrp.Position).Magnitude <= range and tryOnce(chest, 5) then
+                openChest(chest)
             end
         end
     end
@@ -1463,37 +1825,59 @@ local function itemBag()
     return nil
 end
 
+local function kidsInBag()
+    local bagFolder = LocalPlayer:FindFirstChild("ItemBag")
+    local n = 0
+    if bagFolder then
+        for _, item in bagFolder:GetChildren() do
+            if item:GetAttribute("KidId") then
+                n += 1
+            end
+        end
+    end
+    return n
+end
+
+local function canBag(model)
+    return model:GetAttribute("CanBeBagged") and model:GetAttribute("Interaction") == "CanBeBagged"
+end
+
+local function bagKid(model)
+    local bag, r = itemBag(), remote("RequestBagStoreItem")
+    if bag and r then
+        task.spawn(pcall, r.InvokeServer, r, bag, model)
+        return true
+    end
+    return false
+end
+
 -- Kids go in the sack from the game's interaction range (15 studs).
 local function bagKidsInRange()
     local folder = charactersFolder()
     local hrp = rootPart()
-    local bag = itemBag()
-    local r = remote("RequestBagStoreItem")
-    if not folder or not hrp or not bag or not r then
+    if not folder or not hrp or not itemBag() then
         return
     end
     for _, model in folder:GetChildren() do
-        if model:GetAttribute("CanBeBagged") and model:GetAttribute("Interaction") == "CanBeBagged" then
+        if canBag(model) then
             local pos = mobPos(model)
             if pos and (pos - hrp.Position).Magnitude <= 15 and tryOnce(model, 3) then
-                task.spawn(pcall, r.InvokeServer, r, bag, model)
+                bagKid(model)
             end
         end
     end
 end
 
 -- Kids in the sack come out at camp.
-local function dropKidsAtCamp()
+local function dropKidsAtCamp(force)
     local bagFolder = LocalPlayer:FindFirstChild("ItemBag")
     local bag = itemBag()
     local r = remote("RequestBagDropItem")
-    local fire = campPart("MainFire")
-    if not bagFolder or not bag or not r or not fire or distanceTo(pivotPos(fire)) > 30 then
+    if not bagFolder or not bag or not r or distanceTo(campPos()) > 30 then
         return
     end
-    local children = bagFolder:GetChildren()
-    for _, item in children do
-        if item:GetAttribute("KidId") and tryOnce(item, 3) then
+    for _, item in bagFolder:GetChildren() do
+        if item:GetAttribute("KidId") and (force or tryOnce(item, 3)) then
             r:FireServer(bag, item, #bagFolder:GetChildren() <= 1)
         end
     end
@@ -1545,8 +1929,21 @@ local function consumeNearest(filter)
     return false
 end
 
-local lastEat, lastHeal, lastFeed = 0, 0, 0
-local function extraTick()
+-- Nothing in reach: pull the nearest one over and use it on the next pass.
+local lastFetch = 0
+local function consumeOrFetch(filter, fetch)
+    if consumeNearest(filter) then
+        return true
+    end
+    if fetch and not Bring.running and os.clock() - lastFetch > 3 then
+        lastFetch = os.clock()
+        runBring({ filter = filter }, "You", 1)
+    end
+    return false
+end
+
+local lastEat, lastHeal, lastFeed, lastScrap = 0, 0, 0, 0
+local function survivalTick()
     if Settings.AutoChests then
         openChestsInRange()
     end
@@ -1554,25 +1951,20 @@ local function extraTick()
         bagKidsInRange()
     end
     if Settings.AutoDropKids then
-        dropKidsAtCamp()
+        dropKidsAtCamp(false)
     end
     if Settings.AutoCoins then
         collectCurrency()
     end
     local now = os.clock()
     if Settings.AutoEat and now - lastEat > 1.5 and (LocalPlayer:GetAttribute("Hunger") or 200) < Settings.EatBelow then
-        local bunny = LocalPlayer:GetAttribute("Class") == "Bunny"
-        if consumeNearest(function(m)
-            return m:GetAttribute("RestoreHunger") ~= nil and not (bunny and m:GetAttribute("HasMeat"))
-        end) then
+        if consumeOrFetch(isFood, Settings.EatBring) then
             lastEat = now
         end
     end
     local hum = humanoid()
-    if Settings.AutoHeal and hum and now - lastHeal > 1.5 and hum.Health / math.max(hum.MaxHealth, 1) * 100 < Settings.HealBelow then
-        if consumeNearest(function(m)
-            return m:GetAttribute("RestoreHealth") ~= nil or HEAL_NAMES[cleanName(m.Name)] == true
-        end) then
+    if Settings.AutoHeal and hum and hum.Health > 0 and now - lastHeal > 1.5 and healthPercent() < Settings.HealBelow then
+        if consumeOrFetch(isHeal, Settings.HealBring) then
             lastHeal = now
         end
     end
@@ -1581,12 +1973,18 @@ local function extraTick()
         local fuel = fire and fire:GetAttribute("FuelRemaining")
         if fuel and fuel < Settings.FireBelow then
             lastFeed = now
-            runBring({ Fuel = true }, {}, false, "Camp fire", 6)
+            runBring({ kinds = { Fuel = true }, exclude = Settings.BringExclude }, "Camp fire", 6)
         end
+    end
+    if Settings.KeepScrapping and now - lastScrap > 20 and not Bring.running then
+        lastScrap = now
+        runBring({ kinds = { Scrap = true }, exclude = Settings.BringExclude }, "Crafting bench", 20)
     end
 end
 
 -- Instant prompts: every hold-to-interact prompt fires on press.
+local setInstantPrompts
+do
 local PromptHolds = setmetatable({}, { __mode = "k" })
 local function instantPrompt(prompt)
     if prompt:IsA("ProximityPrompt") and prompt.HoldDuration > 0 then
@@ -1596,7 +1994,7 @@ local function instantPrompt(prompt)
         prompt.HoldDuration = 0
     end
 end
-local function setInstantPrompts(on)
+function setInstantPrompts(on)
     if on then
         for _, inst in Workspace:GetDescendants() do
             instantPrompt(inst)
@@ -1615,8 +2013,266 @@ bind(Workspace.DescendantAdded, function(inst)
         task.defer(instantPrompt, inst)
     end
 end)
+end
+
+--// Automations \\--
+local logEvent -- set once the dashboard exists
+
+local function goToCamp(still)
+    local pos = campPos()
+    if not pos then
+        setStatus("No camp fire found")
+        return false
+    end
+    setStatus("Going to camp")
+    return moveTo(besideOf(pos, 10)) and (not still or still())
+end
+
+-- Tree farm: walk to the nearest tree an axe you own can break, stay until
+-- it falls (the swing loop chops it), then the next one.
+local function farmCenter(origin)
+    if Settings.FarmAround == "Camp fire" then
+        return campPos() or origin
+    end
+    return origin
+end
+
+-- A tree that took no damage last time is skipped for a while.
+local FarmSkip = setmetatable({}, { __mode = "k" })
+
+-- The tree nearest to you among those within the farm radius of `center`.
+local function nextFarmTree(center)
+    local hrp = rootPart()
+    local best, bestD
+    for _, entry in resourcesNear(center, Settings.FarmRadius) do
+        local model = entry.model
+        local skipUntil = FarmSkip[model]
+        if not (skipUntil and os.clock() < skipUntil) and canChopAtAll(model) then
+            local d = hrp and (Resources[model] - hrp.Position).Magnitude or entry.d
+            if not bestD or d < bestD then
+                best, bestD = model, d
+            end
+        end
+    end
+    return best
+end
+
+local function treeFarm(still)
+    local hrp = rootPart()
+    local origin = hrp and hrp.Position
+    if not origin then
+        return
+    end
+    while still() and Settings.FarmTrees do
+        if isNight() and Settings.FarmNight ~= "Keep farming" then
+            FarmTarget = nil
+            if Settings.FarmNight == "Wait at camp" and distanceTo(campPos()) > 40 then
+                goToCamp(still)
+            end
+            setStatus("Night: waiting for morning")
+            waitFor(600, function()
+                return not isNight() or not Settings.FarmTrees
+            end, still)
+        else
+            local tree = nextFarmTree(farmCenter(origin))
+            if not tree then
+                FarmTarget = nil
+                setStatus("No trees left within " .. Settings.FarmRadius .. " studs")
+                task.wait(3)
+            else
+                FarmTarget = tree
+                local name = cleanName(tree.Name)
+                setStatus("Walking to " .. name)
+                local pos = Resources[tree] or pivotPos(tree)
+                if pos and moveTo(besideOf(pos, 4)) and still() then
+                    local startHealth = tree:GetAttribute("Health") or 0
+                    setStatus("Chopping " .. name)
+                    local fell = waitFor(25, function()
+                        return not tree.Parent or (tree:GetAttribute("Health") or 0) <= 0 or not Settings.FarmTrees
+                            or (isNight() and Settings.FarmNight ~= "Keep farming")
+                    end, still)
+                    if not fell and (tree:GetAttribute("Health") or 0) >= startHealth then
+                        -- No damage at all in 25 s: something blocks it, try others first.
+                        FarmSkip[tree] = os.clock() + 120
+                    end
+                else
+                    FarmSkip[tree] = os.clock() + 30
+                end
+                FarmTarget = nil
+            end
+        end
+    end
+    setStatus("Tree farm off")
+end
+
+-- Kid rescue: go to each missing kid, bag it, bring it back to camp.
+local function rescueKids(still)
+    local start = rootPart() and rootPart().Position
+    local rescued, failed = 0, {}
+    while still() do
+        if not itemBag() then
+            setStatus("You need a sack in your inventory to carry kids")
+            return
+        end
+        local hrp = rootPart()
+        local kids = kidPositions()
+        local pick, pickD
+        for kidId, info in kids do
+            if not failed[kidId] then
+                local d = hrp and (info.pos - hrp.Position).Magnitude or 0
+                if not pickD or d < pickD then
+                    pick, pickD = kidId, d
+                end
+            end
+        end
+        if not pick then
+            break
+        end
+        local info = kids[pick]
+        local name = info.name or spaced(pick)
+        setStatus("Going to " .. name)
+        local unknown = not info.live and info.pos.Y == 0
+        if not moveTo(info.pos, { unknownHeight = unknown }) or not still() then
+            return
+        end
+        -- Wait for the kid to stream in, then step right next to it.
+        setStatus("Looking for " .. name)
+        local model
+        waitFor(5, function()
+            model = liveKid(pick)
+            return model ~= nil
+        end, still)
+        if not model then
+            failed[pick] = "not found at its map point"
+        elseif not canBag(model) then
+            failed[pick] = "can't be picked up yet"
+        else
+            local before = kidsInBag()
+            moveTo(besideOf(mobPos(model), 3))
+            setStatus("Picking up " .. name)
+            local got = waitFor(6, function()
+                if tryOnce(model, 1.5) then
+                    bagKid(model)
+                end
+                return kidsInBag() > before or model.Parent == nil
+            end, still)
+            if not got then
+                failed[pick] = "the sack wouldn't take it (full?)"
+            else
+                if not goToCamp(still) then
+                    return
+                end
+                setStatus("Dropping " .. name .. " at camp")
+                waitFor(6, function()
+                    dropKidsAtCamp(true)
+                    return kidsInBag() == 0
+                end, still)
+                rescued += 1
+                if logEvent then
+                    logEvent("Rescued " .. name, Color3.fromRGB(255, 220, 80))
+                end
+            end
+        end
+    end
+    local text = string.format("Kid rescue done: %d rescued", rescued)
+    local skipped = {}
+    for kidId, why in failed do
+        table.insert(skipped, spaced(kidId) .. " (" .. why .. ")")
+    end
+    if #skipped > 0 then
+        text ..= " · skipped " .. table.concat(skipped, ", ")
+    end
+    -- Kids that couldn't be picked up can leave you out in the woods: end at
+    -- camp when anyone was rescued, otherwise back where you started.
+    if still() then
+        if rescued > 0 then
+            goToCamp(still)
+        elseif start then
+            moveTo(start)
+        end
+    end
+    setStatus(text)
+    notify("Kid rescue", text, 6)
+end
+
+-- Chest run: visit every chest that can still be opened, nearest first.
+local function chestRun(still)
+    local start = rootPart() and rootPart().Position
+    local opened, skipped = 0, setmetatable({}, { __mode = "k" })
+    while still() do
+        local items = itemsFolder()
+        local best, bestD
+        for _, chest in items and items:GetChildren() or {} do
+            if openableChest(chest) and not skipped[chest] then
+                local d = distanceTo(pivotPos(chest))
+                if not bestD or d < bestD then
+                    best, bestD = chest, d
+                end
+            end
+        end
+        if not best then
+            break
+        end
+        local name = best:GetAttribute("ChestName") or cleanName(best.Name)
+        setStatus(string.format("Chest run: %s (%d opened)", name, opened))
+        local pos = pivotPos(best)
+        if pos and moveTo(besideOf(pos, 4)) and still() then
+            local done = waitFor(3, function()
+                if tryOnce(best, 1) then
+                    openChest(best)
+                end
+                return not openableChest(best)
+            end, still)
+            if done then
+                opened += 1
+            end
+        end
+        skipped[best] = true
+    end
+    setStatus(string.format("Chest run done: %d opened", opened))
+    notify("Chest run", string.format("%d chest%s opened", opened, opened == 1 and "" or "s"))
+    if Settings.ReturnAfterRun and start and still() then
+        moveTo(start)
+    end
+end
+
+-- Night safety and low health escape, checked from the survival loop.
+local lastEscape = 0
+local wasNight = nil
+local function safetyTick()
+    local night = isNight()
+    if Settings.NightCamp and night and wasNight == false and Job.name ~= "Tree farm" then
+        startJob("Night safety", function(still)
+            goToCamp(still)
+            setStatus("Night: at camp")
+        end)
+    end
+    wasNight = night
+    if Settings.Escape and humanoid() and humanoid().Health > 0 and healthPercent() < Settings.EscapeBelow
+        and os.clock() - lastEscape > 10 and distanceTo(campPos()) > 40 then
+        lastEscape = os.clock()
+        local wasFarming = Job.name == "Tree farm"
+        startJob("Escape", function(still)
+            goToCamp(still)
+            if wasFarming then
+                -- The farm stays off until you turn it back on.
+                Settings.FarmTrees = false
+                if Options.FarmTrees then
+                    Options.FarmTrees:SetValue(false)
+                end
+            end
+            setStatus(string.format("Escaped to camp at %d%% health", math.floor(healthPercent())))
+            if logEvent then
+                logEvent("Low health: escaped to camp", Color3.fromRGB(255, 120, 90))
+            end
+        end)
+    end
+end
 
 --// ESP \\--
+-- Roblox draws at most 31 highlights at once, so they go to the nearest 30
+-- things; names show on everything in range.
+local MAX_HIGHLIGHTS = 30
 local Esp = {}
 local function espEntry(model)
     local e = Esp[model]
@@ -1648,25 +2304,32 @@ local function espEntry(model)
     return e
 end
 
+local function dropHighlight(e)
+    if e.hl then
+        e.hl:Destroy()
+        e.hl = nil
+    end
+end
+
 local function dropEsp(model)
     local e = Esp[model]
     if e then
         e.bb:Destroy()
-        if e.hl then
-            e.hl:Destroy()
-        end
+        dropHighlight(e)
         Esp[model] = nil
     end
 end
 
 local function updateEsp()
     local hrp = rootPart()
-    local want = {}
+    local want, order = {}, {}
     local function consider(model, color, text)
         local pos = pivotPos(model)
         local d = hrp and pos and (pos - hrp.Position).Magnitude
         if d and d <= Settings.EspDistance then
-            want[model] = { color = color, text = text .. string.format(" · %dm", math.floor(d)) }
+            local entry = { model = model, d = d, color = color, text = text .. string.format(" · %dm", math.floor(d)) }
+            want[model] = entry
+            table.insert(order, entry)
         end
     end
 
@@ -1685,6 +2348,9 @@ local function updateEsp()
                     if Settings.EspShowHealth and npc and npc:IsA("Humanoid") then
                         label ..= string.format(" %d/%d", math.floor(npc.Health), math.floor(npc.MaxHealth))
                     end
+                    if chasingMe(model) then
+                        label ..= " ⚠"
+                    end
                     consider(model, MobColors[kind] or Color3.new(1, 1, 1), label)
                 end
             end
@@ -1696,15 +2362,15 @@ local function updateEsp()
                 end
             end
         end
-        local items = Workspace:FindFirstChild("Items")
+        local items = itemsFolder()
         if items and (Settings.EspChests or Settings.EspItems) then
             for _, model in items:GetChildren() do
-                local interaction = model:GetAttribute("Interaction")
-                if interaction == "ItemChest" then
-                    if Settings.EspChests then
-                        consider(model, Settings.ChestColor, model:GetAttribute("ChestName") or cleanName(model.Name))
+                if isChest(model) then
+                    if Settings.EspChests and not chestOpened(model) then
+                        local name = model:GetAttribute("ChestName") or cleanName(model.Name)
+                        consider(model, Settings.ChestColor, model:GetAttribute("Locked") and (name .. " (locked)") or name)
                     end
-                elseif interaction and Settings.EspItems and Settings.EspItemKinds[itemKind(model)] then
+                elseif Settings.EspItems and model:GetAttribute("Interaction") and Settings.EspItemKinds[itemKind(model)] then
                     consider(model, Settings.ItemColor, cleanName(model.Name))
                 end
             end
@@ -1716,31 +2382,33 @@ local function updateEsp()
             dropEsp(model)
         end
     end
-    for model, info in want do
-        local e = espEntry(model)
+    table.sort(order, byDistance)
+    for i, info in order do
+        local e = espEntry(info.model)
         if e then
             e.text.Text = info.text
             e.text.TextColor3 = info.color
-            if Settings.EspHighlight then
+            if Settings.EspHighlight and i <= MAX_HIGHLIGHTS then
                 if not e.hl then
                     e.hl = Instance.new("Highlight")
                     e.hl.FillTransparency = 0.75
                     e.hl.OutlineTransparency = 0.1
                     e.hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
-                    e.hl.Adornee = model
+                    e.hl.Adornee = info.model
                     e.hl.Parent = VisualGui
                 end
                 e.hl.FillColor = info.color
                 e.hl.OutlineColor = info.color
-            elseif e.hl then
-                e.hl:Destroy()
-                e.hl = nil
+            else
+                dropHighlight(e)
             end
         end
     end
 end
 
 --// Lighting \\--
+local restoreLighting, lightingStep
+do
 local LightingSaved = nil
 local EffectsSaved = {}
 local function saveLighting()
@@ -1758,7 +2426,7 @@ local function saveLighting()
         ExposureCompensation = Lighting.ExposureCompensation,
     }
 end
-local function restoreLighting()
+function restoreLighting()
     if Settings.Fullbright or Settings.NoFog or Settings.AlwaysDay then
         return
     end
@@ -1789,7 +2457,7 @@ local function saveEffect(effect, prop)
 end
 
 -- The game rewrites lighting every frame for day/night, so this runs every frame too.
-local function lightingStep()
+function lightingStep()
     if not (Settings.Fullbright or Settings.NoFog or Settings.AlwaysDay) then
         return
     end
@@ -1820,9 +2488,11 @@ local function lightingStep()
         end
     end
 end
+end
 
+local UI = {}
 --// UI \\--
-local Window = Library:CreateWindow({
+UI.Window = Library:CreateWindow({
     Title = "Survive 99 Nights",
     Footer = "dookie hub · Ui3",
     Icon = "trees",
@@ -1830,11 +2500,65 @@ local Window = Library:CreateWindow({
     ConfigFolder = "Ui3/Survive99Nights",
 })
 
--- Dashboard ---------------------------------------------------------------------
-local DashTab = Window:AddTab("Dashboard", "layout-dashboard", "Night and game info")
+local function toggle(box, idx, text, key, tooltip, after)
+    return box:AddToggle(idx, {
+        Text = text,
+        Default = Settings[key],
+        Tooltip = tooltip,
+        Callback = function(v)
+            Settings[key] = v
+            if after then
+                after(v)
+            end
+        end,
+    })
+end
 
-local NightBox = DashTab:AddBigGroupbox("Night", "moon")
-local NightCards = NightBox:AddStatCards("NightCards", {
+local function slider(box, idx, text, key, min, max, suffix, tooltip)
+    return box:AddSlider(idx, {
+        Text = text,
+        Default = Settings[key],
+        Min = min,
+        Max = max,
+        Suffix = suffix,
+        Tooltip = tooltip,
+        Callback = function(v)
+            Settings[key] = v
+        end,
+    })
+end
+
+local function choice(box, idx, text, key, values, tooltip)
+    return box:AddDropdown(idx, {
+        Text = text,
+        Values = values,
+        Default = Settings[key],
+        Tooltip = tooltip,
+        Callback = function(v)
+            Settings[key] = v or values[1]
+        end,
+    })
+end
+
+local function multi(box, idx, text, key, values, defaults, tooltip)
+    return box:AddDropdown(idx, {
+        Text = text,
+        Values = values,
+        Default = defaults,
+        Multi = true,
+        Searchable = #values > 8,
+        Tooltip = tooltip,
+        Callback = function(v)
+            Settings[key] = v
+        end,
+    })
+end
+
+-- Dashboard ---------------------------------------------------------------------
+UI.DashTab = UI.Window:AddTab("Dashboard", "layout-dashboard", "Night and game info")
+
+UI.NightBox = UI.DashTab:AddBigGroupbox("Night", "moon")
+UI.NightCards = UI.NightBox:AddStatCards("NightCards", {
     Cards = {
         { Title = "Day", Value = "-", Icon = "calendar" },
         { Title = "Phase", Value = "-", Icon = "sun-moon" },
@@ -1842,8 +2566,8 @@ local NightCards = NightBox:AddStatCards("NightCards", {
         { Title = "Weather", Value = "-", Icon = "cloud" },
     },
 })
-local PhaseBar = NightBox:AddProgressBar("PhaseBar", { Text = "Until night", Default = 0, Max = 1, Percent = true })
-local NightCards2 = NightBox:AddStatCards("NightCards2", {
+UI.PhaseBar = UI.NightBox:AddProgressBar("PhaseBar", { Text = "Until night", Default = 0, Max = 1, Percent = true })
+UI.NightCards2 = UI.NightBox:AddStatCards("NightCards2", {
     Cards = {
         { Title = "Cultist attack", Value = "-", Icon = "skull" },
         { Title = "Biome", Value = "-", Icon = "map" },
@@ -1852,8 +2576,8 @@ local NightCards2 = NightBox:AddStatCards("NightCards2", {
     },
 })
 
-local YouBox = DashTab:AddBigGroupbox("You", "user")
-local YouCards = YouBox:AddStatCards("YouCards", {
+UI.YouBox = UI.DashTab:AddBigGroupbox("You", "user")
+UI.YouCards = UI.YouBox:AddStatCards("YouCards", {
     Cards = {
         { Title = "Health", Value = "-", Icon = "heart" },
         { Title = "Hunger", Value = "-", Icon = "drumstick" },
@@ -1861,851 +2585,469 @@ local YouCards = YouBox:AddStatCards("YouCards", {
         { Title = "Class", Value = "-", Icon = "shield" },
     },
 })
-local HungerBar = YouBox:AddProgressBar("HungerBar", { Text = "Hunger", Default = 0, Max = 200, Percent = false })
-local HealthBar = YouBox:AddProgressBar("HealthBar", { Text = "Health", Default = 0, Max = 100, Percent = false })
+UI.HungerBar = UI.YouBox:AddProgressBar("HungerBar", { Text = "Hunger", Default = 0, Max = 200, Percent = false })
+UI.HealthBar = UI.YouBox:AddProgressBar("HealthBar", { Text = "Health", Default = 0, Max = 100, Percent = false })
 
-local GameBox = DashTab:AddBigGroupbox("Game", "gamepad-2")
-local GameCards = GameBox:AddStatCards("GameCards", {
+UI.GameBox = UI.DashTab:AddBigGroupbox("Game", "gamepad-2")
+UI.GameCards = UI.GameBox:AddStatCards("GameCards", {
     Cards = {
         { Title = "Camp fire fuel", Value = "-", Icon = "flame" },
         { Title = "Diamonds", Value = "-", Icon = "gem" },
         { Title = "Players", Value = "-", Icon = "users" },
-        { Title = "Server age", Value = "-", Icon = "timer" },
+        { Title = "Automation", Value = "-", Icon = "bot" },
     },
 })
-local FireBar = GameBox:AddProgressBar("FireBar", { Text = "Camp fire fuel", Default = 0, Max = 100, Percent = false })
-local EventLog = GameBox:AddLog("EventLog", { Text = "Events", Height = 140, MaxLines = 150 })
+UI.FireBar = UI.GameBox:AddProgressBar("FireBar", { Text = "Camp fire fuel", Default = 0, Max = 100, Percent = false })
+UI.EventLog = UI.GameBox:AddLog("EventLog", { Text = "Events", Height = 140, MaxLines = 150 })
 
--- Main ---------------------------------------------------------------------------
-local MainTab = Window:AddTab("Main", "axe", "Auto chop and kill aura")
+logEvent = function(text, color)
+    pcall(UI.EventLog.Log, UI.EventLog, text, color)
+end
 
-local ChopBox = MainTab:AddLeftGroupbox("Auto chop", "trees")
-ChopBox:AddToggle("AutoChop", {
-    Text = "Auto chop",
-    Default = false,
-    Tooltip = "Hits the nearest trees in range with your best axe, on the axe's own cooldown",
-    Callback = function(v)
-        Settings.AutoChop = v
-    end,
-})
-ChopBox:AddSlider("ChopRange", {
-    Text = "Chop distance",
-    Default = Settings.ChopRange,
-    Min = 0,
-    Max = 200,
-    Suffix = " studs",
-    Callback = function(v)
-        Settings.ChopRange = v
-    end,
-})
-ChopBox:AddToggle("ShowChopRange", {
-    Text = "Show chop range",
-    Default = false,
-    Callback = function(v)
-        Settings.ShowChopRange = v
-    end,
-}):AddColorPicker("ChopColor", {
+-- Combat --------------------------------------------------------------------------
+UI.CombatTab = UI.Window:AddTab("Combat", "axe", "Auto chop, kill aura and tree farm")
+
+UI.ChopBox = UI.CombatTab:AddLeftGroupbox("Auto chop", "trees")
+toggle(UI.ChopBox, "AutoChop", "Auto chop", "AutoChop", "Hits the nearest trees in range with your best axe, on the axe's own cooldown")
+    :AddKeyPicker("AutoChopKey", { Default = "None", Mode = "Toggle", SyncToggleState = true, Text = "Auto chop" })
+slider(UI.ChopBox, "ChopRange", "Chop distance", "ChopRange", 0, 200, " studs")
+toggle(UI.ChopBox, "ShowChopRange", "Show chop range", "ShowChopRange"):AddColorPicker("ChopColor", {
     Default = Settings.ChopColor,
     Title = "Chop range color",
     Callback = function(c)
         Settings.ChopColor = c
     end,
 })
-ChopBox:AddSlider("ChopPerSwing", {
-    Text = "Trees per swing",
-    Default = Settings.ChopPerSwing,
-    Min = 1,
-    Max = 10,
-    Callback = function(v)
-        Settings.ChopPerSwing = v
-    end,
-})
-ChopBox:AddDropdown("ChopTypes", {
-    Text = "What to chop",
-    Values = { "Tree" },
-    Default = { "Tree" },
-    Multi = true,
-    Tooltip = "Filled from what the map holds, so new resource types show up here on their own",
-    Callback = function(v)
-        Settings.ChopTypes = v
-    end,
-})
+slider(UI.ChopBox, "ChopPerSwing", "Trees per swing", "ChopPerSwing", 1, 10)
+multi(UI.ChopBox, "ChopTypes", "What to chop", "ChopTypes", { "Tree" }, { "Tree" },
+    "Filled from what the map holds, so new resource types show up here on their own")
 
-local AuraBox = MainTab:AddRightGroupbox("Kill aura", "swords")
-AuraBox:AddToggle("KillAura", {
-    Text = "Kill aura",
-    Default = false,
-    Tooltip = "Hits mobs in range with your best melee weapon. Kids and pets are never hit",
-    Callback = function(v)
-        Settings.KillAura = v
-    end,
-})
-AuraBox:AddSlider("AuraRange", {
-    Text = "Aura distance",
-    Default = Settings.AuraRange,
-    Min = 0,
-    Max = 200,
-    Suffix = " studs",
-    Callback = function(v)
-        Settings.AuraRange = v
-    end,
-})
-AuraBox:AddToggle("ShowAuraRange", {
-    Text = "Show aura range",
-    Default = false,
-    Callback = function(v)
-        Settings.ShowAuraRange = v
-    end,
-}):AddColorPicker("AuraColor", {
+UI.AuraBox = UI.CombatTab:AddRightGroupbox("Kill aura", "swords")
+toggle(UI.AuraBox, "KillAura", "Kill aura", "KillAura", "Hits mobs in range with your best melee weapon. Kids and pets are never hit")
+    :AddKeyPicker("KillAuraKey", { Default = "None", Mode = "Toggle", SyncToggleState = true, Text = "Kill aura" })
+slider(UI.AuraBox, "AuraRange", "Aura distance", "AuraRange", 0, 200, " studs")
+toggle(UI.AuraBox, "ShowAuraRange", "Show aura range", "ShowAuraRange"):AddColorPicker("AuraColor", {
     Default = Settings.AuraColor,
     Title = "Aura range color",
     Callback = function(c)
         Settings.AuraColor = c
     end,
 })
-AuraBox:AddSlider("AuraPerSwing", {
-    Text = "Mobs per swing",
-    Default = Settings.AuraPerSwing,
-    Min = 1,
-    Max = 10,
-    Callback = function(v)
-        Settings.AuraPerSwing = v
-    end,
-})
-AuraBox:AddDropdown("AuraKinds", {
-    Text = "Targets",
-    Values = { "Hostile", "Can attack", "Passive" },
-    Default = { "Hostile", "Can attack" },
-    Multi = true,
-    Tooltip = "Hostile: chasing or aggressive. Can attack: fights back. Passive: neither",
-    Callback = function(v)
-        Settings.AuraKinds = v
-    end,
-})
-local AuraNearLabel = AuraBox:AddLabel("Nearby: -", true)
+slider(UI.AuraBox, "AuraPerSwing", "Mobs per swing", "AuraPerSwing", 1, 10)
+multi(UI.AuraBox, "AuraKinds", "Targets", "AuraKinds", { "Hostile", "Can attack", "Passive" }, { "Hostile", "Can attack" },
+    "Hostile: chasing or aggressive. Can attack: fights back. Passive: neither")
+choice(UI.AuraBox, "AuraPriority", "Hit first", "AuraPriority", { "Chasing me first", "Nearest", "Lowest health" },
+    "Which mobs get the swing when more are in range than mobs per swing")
+UI.AuraNearLabel = UI.AuraBox:AddLabel("Nearby: -", true)
 
-local SwingBox = MainTab:AddLeftGroupbox("Swing settings", "settings-2")
-SwingBox:AddToggle("AutoEquip", {
-    Text = "Auto equip the right tool",
-    Default = Settings.AutoEquip,
-    Callback = function(v)
-        Settings.AutoEquip = v
-    end,
-})
-SwingBox:AddDropdown("HitFrom", {
-    Text = "Send hits from",
-    Values = { "Your position", "Near target" },
-    Default = Settings.HitFrom,
-    Tooltip = "Near target reports the swing next to what you hit. Try it if far hits don't land",
-    Callback = function(v)
-        Settings.HitFrom = v or "Your position"
-    end,
-})
-SwingBox:AddSlider("ExtraDelay", {
-    Text = "Extra delay per swing",
-    Default = 0,
-    Min = 0,
-    Max = 1000,
-    Suffix = " ms",
-    Callback = function(v)
-        Settings.ExtraDelay = v
-    end,
-})
-SwingBox:AddToggle("OneTool", {
-    Text = "One tool for chop and aura",
-    Default = Settings.OneTool,
-    Tooltip = "With both on, swing your axe at mobs too instead of swapping to a weapon every other swing",
-    Callback = function(v)
-        Settings.OneTool = v
-    end,
-})
-local AxeLabel = SwingBox:AddLabel("Axe: -", true)
-local WeaponLabel = SwingBox:AddLabel("Weapon: -", true)
-local BlockedLabel = SwingBox:AddLabel("", true)
+UI.SwingBox = UI.CombatTab:AddLeftGroupbox("Swing settings", "settings-2")
+toggle(UI.SwingBox, "AutoEquip", "Auto equip the right tool", "AutoEquip")
+choice(UI.SwingBox, "HitFrom", "Send hits from", "HitFrom", { "Your position", "Near target" },
+    "Near target reports the swing next to what you hit. Try it if far hits don't land")
+slider(UI.SwingBox, "ExtraDelay", "Extra delay per swing", "ExtraDelay", 0, 1000, " ms")
+toggle(UI.SwingBox, "OneTool", "One tool for chop and aura", "OneTool",
+    "With both on, swing your axe at mobs too instead of swapping to a weapon every other swing")
+UI.AxeLabel = UI.SwingBox:AddLabel("Axe: -", true)
+UI.WeaponLabel = UI.SwingBox:AddLabel("Weapon: -", true)
+UI.BlockedLabel = UI.SwingBox:AddLabel("", true)
 
-local BringStatus, BringNames
-do
--- Bring ---------------------------------------------------------------------------
-local BringTab = Window:AddTab("Bring", "magnet", "Pull items to you, the fire or the bench")
-
-local WhatBox = BringTab:AddLeftGroupbox("What", "package-search")
-WhatBox:AddDropdown("BringKinds", {
-    Text = "Item types",
-    Values = ITEM_KINDS,
-    Default = { "Fuel" },
-    Multi = true,
-    Tooltip = "Sorted by what an item does (burns, feeds, heals, scraps...), so new items fall in on their own",
-    Callback = function(v)
-        Settings.BringKinds = v
-    end,
-})
-WhatBox:AddToggle("BringByName", {
-    Text = "Pick by name instead",
-    Default = false,
-    Callback = function(v)
-        Settings.BringByName = v
-    end,
-})
-BringNames = WhatBox:AddDropdown("BringNames", {
-    Text = "Item names",
-    Values = {},
-    Multi = true,
-    Searchable = true,
-    Callback = function(v)
-        Settings.BringNames = v
-    end,
-})
-WhatBox:AddButton("Refresh names", function()
-    BringNames:SetValues(itemNames())
-end)
-
-local WhereBox = BringTab:AddRightGroupbox("Where", "map-pin")
-WhereBox:AddDropdown("BringDest", {
-    Text = "Bring to",
-    Values = BRING_DESTS,
-    Default = Settings.BringDest,
-    Tooltip = "Camp fire burns fuel as it lands. Crafting bench scraps scrap as it lands",
-    Callback = function(v)
-        Settings.BringDest = v or "You"
-    end,
-})
-local SpotLabel = WhereBox:AddLabel("Saved spot: none", true)
-WhereBox:AddButton("Save current spot", function()
-    local hrp = rootPart()
-    if hrp then
-        Settings.SavedSpot = CFrame.new(hrp.Position + hrp.CFrame.LookVector * 6)
-        local p = Settings.SavedSpot.Position
-        SpotLabel:SetText(string.format("Saved spot: %d, %d, %d", p.X, p.Y, p.Z))
-    end
-end)
-
-local HowBox = BringTab:AddLeftGroupbox("How", "gauge")
-HowBox:AddDropdown("BringMode", {
-    Text = "Method",
-    Values = { "Fast", "Safe" },
-    Default = Settings.BringMode,
-    Tooltip = "Fast moves many items per frame (100+ a second). Safe moves one at a time and waits until the server hands it over",
-    Callback = function(v)
-        Settings.BringMode = v or "Fast"
-    end,
-})
-HowBox:AddSlider("BringPerFrame", {
-    Text = "Items per frame (fast)",
-    Default = Settings.BringPerFrame,
-    Min = 1,
-    Max = 50,
-    Callback = function(v)
-        Settings.BringPerFrame = v
-    end,
-})
-HowBox:AddSlider("BringHold", {
-    Text = "Hold before letting go",
-    Default = Settings.BringHold,
-    Min = 0,
-    Max = 500,
-    Suffix = " ms",
-    Tooltip = "Raise this if items snap back to where they were",
-    Callback = function(v)
-        Settings.BringHold = v
-    end,
-})
-HowBox:AddSlider("BringMax", {
-    Text = "Max items per bring",
-    Default = Settings.BringMax,
-    Min = 1,
-    Max = 500,
-    Callback = function(v)
-        Settings.BringMax = v
-    end,
-})
-HowBox:AddSlider("BringRange", {
-    Text = "Search distance",
-    Default = Settings.BringRange,
-    Min = 25,
-    Max = 5000,
-    Suffix = " studs",
-    Callback = function(v)
-        Settings.BringRange = v
-    end,
-})
-HowBox:AddToggle("BringSkipNear", {
-    Text = "Skip items already there",
-    Default = Settings.BringSkipNear,
-    Callback = function(v)
-        Settings.BringSkipNear = v
-    end,
-})
-
-local GoBox = BringTab:AddRightGroupbox("Bring", "send")
-BringStatus = GoBox:AddLabel("Idle", true)
-GoBox:AddButton({
-    Text = "Bring now",
-    Func = function()
-        local n = runBring(Settings.BringKinds, Settings.BringNames, Settings.BringByName, Settings.BringDest)
-        if n == 0 then
-            BringStatus:SetText("Nothing to bring")
-        end
-    end,
-}):AddButton({
-    Text = "Stop",
-    Func = function()
-        Bring.token += 1
-        Bring.running = false
-    end,
-})
-GoBox:AddToggle("AutoBring", {
-    Text = "Auto bring",
-    Default = false,
-    Callback = function(v)
-        Settings.AutoBring = v
-    end,
-})
-GoBox:AddSlider("AutoBringEvery", {
-    Text = "Every",
-    Default = Settings.AutoBringEvery,
-    Min = 2,
-    Max = 60,
-    Suffix = " s",
-    Callback = function(v)
-        Settings.AutoBringEvery = v
-    end,
-})
-
-local QuickBox = BringTab:AddRightGroupbox("Quick", "zap")
-for _, quick in {
-    { "Fuel to camp fire", { Fuel = true }, "Camp fire" },
-    { "Scrap to crafting bench", { Scrap = true }, "Crafting bench" },
-    { "Food to me", { Food = true }, "You" },
-    { "Heals to me", { Heals = true }, "You" },
-    { "Gear and ammo to me", { Gear = true, Ammo = true }, "You" },
-    { "Gems to me", { Gems = true }, "You" },
-} do
-    QuickBox:AddButton(quick[1], function()
-        local n = runBring(quick[2], {}, false, quick[3])
-        if n == 0 then
-            BringStatus:SetText("Nothing to bring")
+UI.FarmBox = UI.CombatTab:AddRightGroupbox("Tree farm", "tree-pine")
+toggle(UI.FarmBox, "FarmTrees", "Tree farm", "FarmTrees",
+    "Goes from tree to tree and chops each one down. Only picks trees an axe you own can break",
+    function(v)
+        if v then
+            startJob("Tree farm", treeFarm)
+        elseif Job.name == "Tree farm" then
+            stopJob("Tree farm off")
         end
     end)
-end
+slider(UI.FarmBox, "FarmRadius", "Farm radius", "FarmRadius", 50, 2000, " studs")
+choice(UI.FarmBox, "FarmAround", "Around", "FarmAround", { "Camp fire", "Where I started" },
+    "Camp fire keeps the logs close for bringing to the fire")
+choice(UI.FarmBox, "FarmNight", "At night", "FarmNight", { "Wait at camp", "Wait where I am", "Keep farming" })
+UI.FarmBox:AddLabel("Pair it with Bring → Auto bring (Fuel to Camp fire) to keep the fire burning", true)
+
+-- Bring ---------------------------------------------------------------------------
+do
+    local BringTab = UI.Window:AddTab("Bring", "magnet", "Pull items to you, the fire or the bench")
+
+    local WhatBox = BringTab:AddLeftGroupbox("What", "package-search")
+    multi(WhatBox, "BringKinds", "Item types", "BringKinds", ITEM_KINDS, { "Fuel" },
+        "Sorted by what an item does (burns, feeds, heals, scraps...), so new items fall in on their own")
+    UI.BringExclude = WhatBox:AddDropdown("BringExclude", {
+        Text = "Never bring",
+        Values = {},
+        Multi = true,
+        Searchable = true,
+        Tooltip = "Items to leave where they are, even when their type is picked",
+        Callback = function(v)
+            Settings.BringExclude = v
+        end,
+    })
+    WhatBox:AddDivider()
+    toggle(WhatBox, "BringByName", "Pick by name instead", "BringByName")
+    UI.BringNames = WhatBox:AddDropdown("BringNames", {
+        Text = "Item names",
+        Values = {},
+        Multi = true,
+        Searchable = true,
+        Callback = function(v)
+            Settings.BringNames = v
+        end,
+    })
+    WhatBox:AddButton("Refresh names", function()
+        local names = itemNames()
+        UI.BringNames:SetValues(names)
+        UI.BringExclude:SetValues(names)
+    end)
+
+    local WhereBox = BringTab:AddRightGroupbox("Where", "map-pin")
+    choice(WhereBox, "BringDest", "Bring to", "BringDest", BRING_DESTS,
+        "Camp fire burns fuel as it lands. Crafting bench scraps scrap as it lands")
+    local SpotLabel = WhereBox:AddLabel("Saved spot: none", true)
+    WhereBox:AddButton("Save current spot", function()
+        local hrp = rootPart()
+        if hrp then
+            Settings.SavedSpot = CFrame.new(hrp.Position + hrp.CFrame.LookVector * 6)
+            local p = Settings.SavedSpot.Position
+            SpotLabel:SetText(string.format("Saved spot: %d, %d, %d", p.X, p.Y, p.Z))
+        end
+    end)
+
+    local HowBox = BringTab:AddLeftGroupbox("How", "gauge")
+    choice(HowBox, "BringMode", "Method", "BringMode", { "Fast", "Safe" },
+        "Fast moves many items per frame (100+ a second). Safe moves one at a time and waits until the server hands it over")
+    slider(HowBox, "BringPerFrame", "Items per frame (fast)", "BringPerFrame", 1, 50)
+    slider(HowBox, "BringHold", "Hold before letting go", "BringHold", 0, 500, " ms", "Raise this if items snap back to where they were")
+    slider(HowBox, "BringMax", "Max items per bring", "BringMax", 1, 500)
+    slider(HowBox, "BringRange", "Search distance", "BringRange", 25, 5000, " studs")
+    toggle(HowBox, "BringSkipNear", "Skip items already there", "BringSkipNear")
+
+    local GoBox = BringTab:AddRightGroupbox("Bring", "send")
+    UI.BringStatus = GoBox:AddLabel("Idle", true)
+    GoBox:AddButton({
+        Text = "Bring now",
+        Func = function()
+            if runBring(currentBringWhat(), Settings.BringDest) == 0 then
+                UI.BringStatus:SetText("Nothing to bring")
+            end
+        end,
+    }):AddButton({
+        Text = "Stop",
+        Func = function()
+            Bring.token += 1
+            Bring.running = false
+        end,
+    })
+    toggle(GoBox, "AutoBring", "Auto bring", "AutoBring")
+    slider(GoBox, "AutoBringEvery", "Every", "AutoBringEvery", 2, 60, " s")
+
+    local QuickBox = BringTab:AddRightGroupbox("Quick", "zap")
+    for _, quick in {
+        { "Fuel to camp fire", { Fuel = true }, "Camp fire" },
+        { "Scrap to crafting bench", { Scrap = true }, "Crafting bench" },
+        { "Food to me", { Food = true }, "You" },
+        { "Heals to me", { Heals = true }, "You" },
+        { "Gear and ammo to me", { Gear = true, Ammo = true }, "You" },
+        { "Gems to me", { Gems = true }, "You" },
+    } do
+        QuickBox:AddButton(quick[1], function()
+            if runBring({ kinds = quick[2], exclude = Settings.BringExclude }, quick[3]) == 0 then
+                UI.BringStatus:SetText("Nothing to bring")
+            end
+        end)
+    end
 end
 
+-- Survival ------------------------------------------------------------------------
+do
+    local SurvivalTab = UI.Window:AddTab("Survival", "heart-pulse", "Eating, healing, the fire and staying alive")
+
+    local EatBox = SurvivalTab:AddLeftGroupbox("Eat and heal", "drumstick")
+    toggle(EatBox, "AutoEat", "Auto eat", "AutoEat", "Eats the nearest food in reach when hunger drops below the line")
+    slider(EatBox, "EatBelow", "Eat below hunger", "EatBelow", 10, 200)
+    toggle(EatBox, "EatBring", "Bring food over if none is in reach", "EatBring")
+    EatBox:AddDivider()
+    toggle(EatBox, "AutoHeal", "Auto heal", "AutoHeal", "Uses the nearest bandage or medkit in reach when health drops below the line")
+    slider(EatBox, "HealBelow", "Heal below health", "HealBelow", 5, 95, "%")
+    toggle(EatBox, "HealBring", "Bring a heal over if none is in reach", "HealBring")
+    EatBox:AddDivider()
+    slider(EatBox, "ConsumeRange", "Eat / heal reach", "ConsumeRange", 5, 80, " studs",
+        "The game lets you use things within 15 studs; more may or may not be accepted")
+
+    local CampBox = SurvivalTab:AddRightGroupbox("Camp", "flame")
+    toggle(CampBox, "KeepFireFed", "Keep the fire fed", "KeepFireFed",
+        "Brings fuel to the camp fire (and burns it) whenever its fuel drops below the line")
+    slider(CampBox, "FireBelow", "Feed below fuel", "FireBelow", 1, 500)
+    toggle(CampBox, "KeepScrapping", "Keep scrapping", "KeepScrapping",
+        "Every 20 s, brings scrap to the crafting bench and scraps it")
+
+    local SafeBox = SurvivalTab:AddRightGroupbox("Safety", "shield")
+    toggle(SafeBox, "NightCamp", "Go to camp when night falls", "NightCamp",
+        "Stops whatever automation is running (except the tree farm, which has its own night setting)")
+    toggle(SafeBox, "Escape", "Escape to camp on low health", "Escape",
+        "Drops what you're doing and goes to the camp fire. Turns the tree farm off")
+    slider(SafeBox, "EscapeBelow", "Escape below health", "EscapeBelow", 5, 80, "%")
+end
+
+-- Explore -------------------------------------------------------------------------
+do
+    local ExploreTab = UI.Window:AddTab("Explore", "compass", "Kids, chests and loot")
+
+    local RunBox = ExploreTab:AddLeftGroupbox("Automation", "bot")
+    UI.JobLabel = RunBox:AddLabel("Idle", true)
+    RunBox:AddButton({
+        Text = "Rescue all kids",
+        Func = function()
+            startJob("Kid rescue", rescueKids)
+        end,
+    }):AddButton({
+        Text = "Chest run",
+        Func = function()
+            startJob("Chest run", chestRun)
+        end,
+    })
+    RunBox:AddButton("Stop", function()
+        if Job.name == "Tree farm" and Options.FarmTrees then
+            Options.FarmTrees:SetValue(false)
+        end
+        stopJob("Stopped")
+    end)
+    toggle(RunBox, "ReturnAfterRun", "Go back to where I was after a chest run", "ReturnAfterRun")
+    RunBox:AddLabel("Kid rescue needs a sack. It goes to each kid, picks it up and brings it to the camp fire. Turn on kill aura first", true)
+
+    local KidsBox = ExploreTab:AddRightGroupbox("Lost kids", "baby")
+    toggle(KidsBox, "AutoBagKids", "Auto pick up kids", "AutoBagKids",
+        "Puts a lost kid in your sack as soon as you're within 15 studs (the game's reach). Needs room in the sack")
+    toggle(KidsBox, "AutoDropKids", "Auto drop kids at camp", "AutoDropKids",
+        "Takes kids out of your sack when you're within 30 studs of the camp fire")
+
+    local LootBox = ExploreTab:AddRightGroupbox("Loot", "package-open")
+    toggle(LootBox, "AutoChests", "Auto open chests in range", "AutoChests",
+        "Opens a chest once you're inside its own prompt range, without the hold. Skips locked and opened ones")
+    toggle(LootBox, "AutoCoins", "Auto collect coins and diamonds", "AutoCoins")
+    slider(LootBox, "CoinRange", "Collect range", "CoinRange", 5, 80, " studs")
+    toggle(LootBox, "InstantPrompts", "Instant interact (no hold)", "InstantPrompts", nil, setInstantPrompts)
+end
+
+-- Movement ------------------------------------------------------------------------
 local refreshPlaces, refreshLandmarks, refreshChests, refreshKids, refreshItems
 do
--- Movement ------------------------------------------------------------------------
-local MoveTab = Window:AddTab("Movement", "footprints", "Speed, jump, fly and teleports")
+    local MoveTab = UI.Window:AddTab("Movement", "footprints", "Speed, jump, fly and teleports")
 
-local MoveBox = MoveTab:AddLeftGroupbox("Movement", "move")
-MoveBox:AddToggle("Speed", {
-    Text = "Speed",
-    Default = false,
-    Callback = function(v)
-        Settings.Speed = v
-        if not v then
-            local hum = humanoid()
-            if hum and Settings.SpeedMethod == "WalkSpeed" then
-                hum.WalkSpeed = 16
-            end
+    local MoveBox = MoveTab:AddLeftGroupbox("Movement", "move")
+    toggle(MoveBox, "Speed", "Speed", "Speed", nil, function(v)
+        local hum = humanoid()
+        if not v and hum and Settings.SpeedMethod == "WalkSpeed" then
+            hum.WalkSpeed = 16
         end
-    end,
-})
-MoveBox:AddSlider("SpeedValue", {
-    Text = "Walk speed",
-    Default = Settings.SpeedValue,
-    Min = 16,
-    Max = 150,
-    Callback = function(v)
-        Settings.SpeedValue = v
-    end,
-})
-MoveBox:AddDropdown("SpeedMethod", {
-    Text = "Speed method",
-    Values = { "WalkSpeed", "CFrame" },
-    Default = Settings.SpeedMethod,
-    Tooltip = "CFrame leaves the game's walk speed alone and pushes you along on top of it",
-    Callback = function(v)
-        Settings.SpeedMethod = v or "WalkSpeed"
-    end,
-})
-MoveBox:AddDivider()
-MoveBox:AddToggle("Jump", {
-    Text = "Jump power",
-    Default = false,
-    Callback = function(v)
-        Settings.Jump = v
+    end)
+    slider(MoveBox, "SpeedValue", "Walk speed", "SpeedValue", 16, 150)
+    choice(MoveBox, "SpeedMethod", "Speed method", "SpeedMethod", { "WalkSpeed", "CFrame" },
+        "CFrame leaves the game's walk speed alone and pushes you along on top of it")
+    MoveBox:AddDivider()
+    toggle(MoveBox, "Jump", "Jump power", "Jump", nil, function(v)
         if not v then
             restoreJump()
         end
-    end,
-})
-MoveBox:AddSlider("JumpValue", {
-    Text = "Jump power",
-    Default = Settings.JumpValue,
-    Min = 50,
-    Max = 250,
-    Callback = function(v)
-        Settings.JumpValue = v
-    end,
-})
-MoveBox:AddToggle("InfJump", {
-    Text = "Infinite jump",
-    Default = false,
-    Callback = function(v)
-        Settings.InfJump = v
-    end,
-})
-MoveBox:AddDivider()
-MoveBox:AddToggle("Fly", {
-    Text = "Fly",
-    Default = false,
-    Tooltip = "Thumbstick or WASD to move where the camera looks. Space/E up, Ctrl/Q down, or the ▲▼ buttons on mobile",
-    Callback = function(v)
-        Settings.Fly = v
-        if not v then
-            stopFly()
-            FlyUpHeld, FlyDownHeld = false, false
-        end
-    end,
-}):AddKeyPicker("FlyKey", { Default = "F", Mode = "Toggle", SyncToggleState = true, Text = "Fly" })
-MoveBox:AddSlider("FlySpeed", {
-    Text = "Fly speed",
-    Default = Settings.FlySpeed,
-    Min = 16,
-    Max = 280,
-    Callback = function(v)
-        Settings.FlySpeed = v
-    end,
-})
-MoveBox:AddToggle("Noclip", {
-    Text = "Noclip",
-    Default = false,
-    Callback = function(v)
-        Settings.Noclip = v
-        if not v then
+    end)
+    slider(MoveBox, "JumpValue", "Jump power", "JumpValue", 50, 250)
+    toggle(MoveBox, "InfJump", "Infinite jump", "InfJump")
+    MoveBox:AddDivider()
+    toggle(MoveBox, "Fly", "Fly", "Fly",
+        "Thumbstick or WASD to move where the camera looks. Space/E up, Ctrl/Q down, or the ▲▼ buttons on mobile",
+        function(v)
+            if not v then
+                stopFly()
+                FlyUpHeld, FlyDownHeld = false, false
+            end
+        end):AddKeyPicker("FlyKey", { Default = "F", Mode = "Toggle", SyncToggleState = true, Text = "Fly" })
+    slider(MoveBox, "FlySpeed", "Fly speed", "FlySpeed", 16, 280)
+    toggle(MoveBox, "Noclip", "Noclip", "Noclip", nil, function(v)
+        if not v and not Travelling then
             restoreNoclip()
         end
-    end,
-})
-MoveBox:AddToggle("AntiAfk", {
-    Text = "Anti AFK",
-    Default = Settings.AntiAfk,
-    Callback = function(v)
-        Settings.AntiAfk = v
-    end,
-})
+    end)
+    toggle(MoveBox, "AntiAfk", "Anti AFK", "AntiAfk")
 
-local TpSetBox = MoveTab:AddLeftGroupbox("Teleport settings", "settings")
-TpSetBox:AddDropdown("TpMethod", {
-    Text = "Teleport method",
-    Values = { "Instant", "Tween" },
-    Default = Settings.TpMethod,
-    Callback = function(v)
-        Settings.TpMethod = v or "Instant"
-    end,
-})
-TpSetBox:AddSlider("TpSpeed", {
-    Text = "Tween speed",
-    Default = Settings.TpSpeed,
-    Min = 30,
-    Max = 280,
-    Callback = function(v)
-        Settings.TpSpeed = v
-    end,
-})
-TpSetBox:AddButton("Stop tween", function()
-    tpToken += 1
-end)
+    local TpSetBox = MoveTab:AddLeftGroupbox("Teleport settings", "settings")
+    choice(TpSetBox, "TpMethod", "Teleport method", "TpMethod", { "Tween", "Instant" },
+        "Tween glides there through walls at the speed below. Instant jumps straight there")
+    slider(TpSetBox, "TpSpeed", "Tween speed", "TpSpeed", 30, 280)
+    toggle(TpSetBox, "TpGround", "Land on the ground", "TpGround", "Finds the ground under where you're going, so you never land in a tree top")
+    TpSetBox:AddButton("Stop moving", function()
+        tpToken += 1
+    end)
 
--- Each teleport dropdown keeps a label -> target map that refreshes rebuild.
-local function teleportPicker(box, idx, text, build, resolve)
-    local map = {}
-    local dropdown = box:AddDropdown(idx, { Text = text, Values = {}, Searchable = true, AllowNull = true })
-    local function refresh()
-        local list, order = build()
-        map = list
-        dropdown:SetValues(order)
-    end
-    box:AddButton({
-        Text = "Teleport",
-        Func = function()
-            local label = dropdown.Value
-            if not label or map[label] == nil then
-                Library:Notify({ Title = "Teleport", Description = "Pick something first", Time = 2 })
-                return
-            end
-            teleportTo(resolve(map[label]))
-        end,
-    }):AddButton({ Text = "Refresh", Func = refresh })
-    return refresh
-end
-
-local PlaceBox = MoveTab:AddRightGroupbox("Places", "map-pin")
-refreshPlaces = teleportPicker(PlaceBox, "TpPlace", "Camp and caves", placeTargets, function(getPos)
-    return getPos()
-end)
-
-local LandBox = MoveTab:AddRightGroupbox("Landmarks", "landmark")
-local landmarkEverything = false
-refreshLandmarks = teleportPicker(LandBox, "TpLandmark", "Landmark", function()
-    return landmarkTargets(landmarkEverything)
-end, pivotPos)
-LandBox:AddToggle("LandmarkAll", {
-    Text = "List every landmark",
-    Default = false,
-    Tooltip = "Off lists the named ones (caves, ponds, traps, the mother tree...). On adds spawns, huts, graves and the rest",
-    Callback = function(v)
-        landmarkEverything = v
-        refreshLandmarks()
-    end,
-})
-
-local ChestBox = MoveTab:AddRightGroupbox("Chests", "package")
-refreshChests = teleportPicker(ChestBox, "TpChest", "Chest (nearest first)", chestTargets, pivotPos)
-ChestBox:AddButton("Nearest chest", function()
-    local list, order = chestTargets()
-    for _, label in order do
-        if not label:find("(locked)", 1, true) then
-            teleportTo(pivotPos(list[label]))
-            return
+    -- Each teleport dropdown keeps a label -> target map that refreshes rebuild.
+    local function teleportPicker(box, idx, text, build, resolve)
+        local map = {}
+        local dropdown = box:AddDropdown(idx, { Text = text, Values = {}, Searchable = true, AllowNull = true })
+        local function refresh()
+            local list, order = build()
+            map = list
+            dropdown:SetValues(order)
         end
+        box:AddButton({
+            Text = "Teleport",
+            Func = function()
+                local label = dropdown.Value
+                if not label or map[label] == nil then
+                    notify("Teleport", "Pick something first", 2)
+                    return
+                end
+                local pos, opts = resolve(map[label])
+                teleportTo(pos, opts)
+            end,
+        }):AddButton({ Text = "Refresh", Func = refresh })
+        return refresh
     end
-    Library:Notify({ Title = "Teleport", Description = "No chest loaded", Time = 2 })
-end)
 
-local KidBox = MoveTab:AddLeftGroupbox("Lost kids", "baby")
-refreshKids = teleportPicker(KidBox, "TpKid", "Kid", function()
-    local list, order = {}, {}
-    for kidId, info in kidPositions() do
-        local label = info.name or spaced(kidId)
-        list[label] = kidId
-        table.insert(order, label)
-    end
-    table.sort(order)
-    return list, order
-end, function(kidId)
-    local info = kidPositions()[kidId]
-    if not info then
-        return nil
-    end
-    local pos = info.pos
-    if not info.live and pos.Y == 0 then
-        -- The map point has no height; land well above and let gravity finish.
-        pos = Vector3.new(pos.X, 60, pos.Z)
-    end
-    return pos
-end)
+    local PlaceBox = MoveTab:AddRightGroupbox("Places", "map-pin")
+    refreshPlaces = teleportPicker(PlaceBox, "TpPlace", "Camp and caves", placeTargets, function(getPos)
+        return getPos()
+    end)
 
-local ItemBox = MoveTab:AddLeftGroupbox("Items", "box")
-refreshItems = teleportPicker(ItemBox, "TpItem", "Nearest item of type", function()
-    local list = {}
-    local order = itemNameTargets()
-    for _, name in order do
-        list[name] = name
-    end
-    return list, order
-end, function(name)
-    return pivotPos(nearestItemNamed(name))
-end)
+    local LandBox = MoveTab:AddRightGroupbox("Landmarks", "landmark")
+    local landmarkEverything = false
+    refreshLandmarks = teleportPicker(LandBox, "TpLandmark", "Landmark", function()
+        return landmarkTargets(landmarkEverything)
+    end, pivotPos)
+    LandBox:AddToggle("LandmarkAll", {
+        Text = "List every landmark",
+        Default = false,
+        Tooltip = "Off lists the named ones (caves, ponds, traps, the mother tree...). On adds spawns, huts, graves and the rest",
+        Callback = function(v)
+            landmarkEverything = v
+            refreshLandmarks()
+        end,
+    })
 
-local PlayerBox = MoveTab:AddRightGroupbox("Players", "users")
-PlayerBox:AddDropdown("TpPlayer", { Text = "Player", SpecialType = "Player", ExcludeLocalPlayer = true })
-PlayerBox:AddButton("Teleport", function()
-    local name = Options.TpPlayer and Options.TpPlayer.Value
-    local player = name and Players:FindFirstChild(name)
-    local hrp = player and player.Character and player.Character:FindFirstChild("HumanoidRootPart")
-    teleportTo(hrp and hrp.Position)
-end)
+    local ChestBox = MoveTab:AddRightGroupbox("Chests", "package")
+    refreshChests = teleportPicker(ChestBox, "TpChest", "Chest (nearest first)", chestTargets, function(chest)
+        local pos = pivotPos(chest)
+        return pos and besideOf(pos, 4)
+    end)
+    ChestBox:AddButton("Nearest unopened chest", function()
+        local items = itemsFolder()
+        local best, bestD
+        for _, chest in items and items:GetChildren() or {} do
+            if openableChest(chest) then
+                local d = distanceTo(pivotPos(chest))
+                if not bestD or d < bestD then
+                    best, bestD = chest, d
+                end
+            end
+        end
+        if best then
+            teleportTo(besideOf(pivotPos(best), 4))
+        else
+            notify("Teleport", "No unopened chest loaded", 2)
+        end
+    end)
+
+    local KidBox = MoveTab:AddLeftGroupbox("Lost kids", "baby")
+    refreshKids = teleportPicker(KidBox, "TpKid", "Kid", function()
+        local list, order = {}, {}
+        for kidId, info in kidPositions() do
+            local label = info.name or spaced(kidId)
+            list[label] = kidId
+            table.insert(order, label)
+        end
+        table.sort(order)
+        return list, order
+    end, function(kidId)
+        local info = kidPositions()[kidId]
+        if not info then
+            return nil
+        end
+        -- A map point has no height; the landing finds the ground once it loads.
+        return info.pos, { unknownHeight = not info.live and info.pos.Y == 0 }
+    end)
+
+    local ItemBox = MoveTab:AddLeftGroupbox("Items", "box")
+    refreshItems = teleportPicker(ItemBox, "TpItem", "Nearest item of type", function()
+        local list = {}
+        local order = itemNames()
+        for _, name in order do
+            list[name] = name
+        end
+        return list, order
+    end, function(name)
+        return pivotPos(nearestItemNamed(name))
+    end)
+
+    local PlayerBox = MoveTab:AddRightGroupbox("Players", "users")
+    PlayerBox:AddDropdown("TpPlayer", { Text = "Player", SpecialType = "Player", ExcludeLocalPlayer = true })
+    PlayerBox:AddButton("Teleport", function()
+        local name = Options.TpPlayer and Options.TpPlayer.Value
+        local player = name and Players:FindFirstChild(name)
+        local hrp = player and player.Character and player.Character:FindFirstChild("HumanoidRootPart")
+        teleportTo(hrp and hrp.Position)
+    end)
 end
 
-do
 -- Visuals -------------------------------------------------------------------------
-local VisTab = Window:AddTab("Visuals", "eye", "ESP, kid dots and lighting")
+do
+    local VisTab = UI.Window:AddTab("Visuals", "eye", "ESP, kid dots and lighting")
 
-local KidEspBox = VisTab:AddLeftGroupbox("Kid dots", "baby")
-KidEspBox:AddToggle("KidDots", {
-    Text = "Kid dots",
-    Default = false,
-    Tooltip = "A dot on each missing kid, from the server's map points, so they show even when not loaded. Off screen dots stick to the edge",
-    Callback = function(v)
-        Settings.KidDots = v
-    end,
-}):AddColorPicker("KidColor", {
-    Default = Settings.KidColor,
-    Title = "Kid color",
-    Callback = function(c)
-        Settings.KidColor = c
-        MobColors.Kid = c
-    end,
-})
-KidEspBox:AddToggle("KidLabels", {
-    Text = "Show name and distance",
-    Default = true,
-    Callback = function(v)
-        Settings.KidLabels = v
-    end,
-})
+    local KidEspBox = VisTab:AddLeftGroupbox("Kid dots", "baby")
+    toggle(KidEspBox, "KidDots", "Kid dots", "KidDots",
+        "A dot on each missing kid, from the server's map points, so they show even when not loaded. Off screen dots stick to the edge")
+        :AddColorPicker("KidColor", {
+            Default = Settings.KidColor,
+            Title = "Kid color",
+            Callback = function(c)
+                Settings.KidColor = c
+                MobColors.Kid = c
+            end,
+        })
+    toggle(KidEspBox, "KidLabels", "Show name and distance", "KidLabels")
 
-local EspBox = VisTab:AddLeftGroupbox("ESP", "scan-eye")
-EspBox:AddToggle("EspMobs", {
-    Text = "Mobs",
-    Default = false,
-    Tooltip = "Red hostile, orange can attack, green passive, blue pets",
-    Callback = function(v)
-        Settings.EspMobs = v
-    end,
-})
-EspBox:AddToggle("EspKids", {
-    Text = "Kids (loaded)",
-    Default = false,
-    Callback = function(v)
-        Settings.EspKids = v
-    end,
-})
-EspBox:AddToggle("EspPlayers", {
-    Text = "Players",
-    Default = false,
-    Callback = function(v)
-        Settings.EspPlayers = v
-    end,
-}):AddColorPicker("PlayerColor", {
-    Default = Settings.PlayerColor,
-    Title = "Player color",
-    Callback = function(c)
-        Settings.PlayerColor = c
-    end,
-})
-EspBox:AddToggle("EspChests", {
-    Text = "Chests",
-    Default = false,
-    Callback = function(v)
-        Settings.EspChests = v
-    end,
-}):AddColorPicker("ChestColor", {
-    Default = Settings.ChestColor,
-    Title = "Chest color",
-    Callback = function(c)
-        Settings.ChestColor = c
-    end,
-})
-EspBox:AddToggle("EspItems", {
-    Text = "Items",
-    Default = false,
-    Callback = function(v)
-        Settings.EspItems = v
-    end,
-}):AddColorPicker("ItemColor", {
-    Default = Settings.ItemColor,
-    Title = "Item color",
-    Callback = function(c)
-        Settings.ItemColor = c
-    end,
-})
-EspBox:AddDropdown("EspItemKinds", {
-    Text = "Item types",
-    Values = { "Fuel", "Food", "Heals", "Scrap", "Gems", "Ammo", "Gear", "Seeds", "Currency", "Other" },
-    Default = { "Fuel", "Food", "Heals", "Scrap", "Gems", "Ammo", "Gear", "Seeds", "Currency" },
-    Multi = true,
-    Tooltip = "Sorted by what the item does (burns, feeds, scraps...), so new items fall in on their own",
-    Callback = function(v)
-        Settings.EspItemKinds = v
-    end,
-})
+    local EspBox = VisTab:AddLeftGroupbox("ESP", "scan-eye")
+    toggle(EspBox, "EspMobs", "Mobs", "EspMobs", "Red hostile, orange can attack, green passive, blue pets. ⚠ = chasing you")
+    toggle(EspBox, "EspKids", "Kids (loaded)", "EspKids")
+    toggle(EspBox, "EspPlayers", "Players", "EspPlayers"):AddColorPicker("PlayerColor", {
+        Default = Settings.PlayerColor,
+        Title = "Player color",
+        Callback = function(c)
+            Settings.PlayerColor = c
+        end,
+    })
+    toggle(EspBox, "EspChests", "Chests (unopened)", "EspChests"):AddColorPicker("ChestColor", {
+        Default = Settings.ChestColor,
+        Title = "Chest color",
+        Callback = function(c)
+            Settings.ChestColor = c
+        end,
+    })
+    toggle(EspBox, "EspItems", "Items", "EspItems"):AddColorPicker("ItemColor", {
+        Default = Settings.ItemColor,
+        Title = "Item color",
+        Callback = function(c)
+            Settings.ItemColor = c
+        end,
+    })
+    multi(EspBox, "EspItemKinds", "Item types", "EspItemKinds",
+        { "Fuel", "Food", "Heals", "Scrap", "Gems", "Ammo", "Gear", "Seeds", "Currency", "Other" },
+        { "Fuel", "Food", "Heals", "Scrap", "Gems", "Ammo", "Gear", "Seeds", "Currency" },
+        "Sorted by what the item does (burns, feeds, scraps...), so new items fall in on their own")
 
-local EspSetBox = VisTab:AddRightGroupbox("ESP settings", "sliders-horizontal")
-EspSetBox:AddToggle("EspHighlight", {
-    Text = "Highlights",
-    Default = true,
-    Tooltip = "Roblox draws at most 31 highlights at once; names always show",
-    Callback = function(v)
-        Settings.EspHighlight = v
-    end,
-})
-EspSetBox:AddToggle("EspShowHealth", {
-    Text = "Mob health",
-    Default = true,
-    Callback = function(v)
-        Settings.EspShowHealth = v
-    end,
-})
-EspSetBox:AddSlider("EspDistance", {
-    Text = "Max distance",
-    Default = Settings.EspDistance,
-    Min = 50,
-    Max = 2000,
-    Suffix = " studs",
-    Callback = function(v)
-        Settings.EspDistance = v
-    end,
-})
+    local EspSetBox = VisTab:AddRightGroupbox("ESP settings", "sliders-horizontal")
+    toggle(EspSetBox, "EspHighlight", "Highlights", "EspHighlight", "On the nearest 30 (Roblox's limit); names show on everything")
+    toggle(EspSetBox, "EspShowHealth", "Mob health", "EspShowHealth")
+    slider(EspSetBox, "EspDistance", "Max distance", "EspDistance", 50, 2000, " studs")
 
-local WorldBox = VisTab:AddRightGroupbox("World", "sun")
-WorldBox:AddToggle("Fullbright", {
-    Text = "Fullbright",
-    Default = false,
-    Callback = function(v)
-        Settings.Fullbright = v
-        restoreLighting()
-    end,
-})
-WorldBox:AddToggle("NoFog", {
-    Text = "No fog",
-    Default = false,
-    Callback = function(v)
-        Settings.NoFog = v
-        restoreLighting()
-    end,
-})
-WorldBox:AddToggle("AlwaysDay", {
-    Text = "Always day (only on your screen)",
-    Default = false,
-    Callback = function(v)
-        Settings.AlwaysDay = v
-        restoreLighting()
-    end,
-})
-WorldBox:AddToggle("FovOn", {
-    Text = "Field of view",
-    Default = false,
-    Callback = function(v)
-        Settings.FovOn = v
+    local WorldBox = VisTab:AddRightGroupbox("World", "sun")
+    toggle(WorldBox, "Fullbright", "Fullbright", "Fullbright", nil, restoreLighting)
+    toggle(WorldBox, "NoFog", "No fog", "NoFog", nil, restoreLighting)
+    toggle(WorldBox, "AlwaysDay", "Always day (only on your screen)", "AlwaysDay", nil, restoreLighting)
+    toggle(WorldBox, "FovOn", "Field of view", "FovOn", nil, function(v)
         if not v then
             Camera.FieldOfView = 70
         end
-    end,
-})
-WorldBox:AddSlider("Fov", {
-    Text = "FOV",
-    Default = Settings.Fov,
-    Min = 50,
-    Max = 120,
-    Callback = function(v)
-        Settings.Fov = v
-    end,
-})
-end
-
-do
--- Extra ---------------------------------------------------------------------------
-local ExtraTab = Window:AddTab("Extra", "sparkles", "Chests, kids, coins and survival helpers")
-
-local LootBox = ExtraTab:AddLeftGroupbox("Loot", "package-open")
-LootBox:AddToggle("AutoChests", {
-    Text = "Auto open chests in range",
-    Default = false,
-    Tooltip = "Opens a chest once you're inside its own prompt range, without the 5.5 s hold. Skips locked and opened ones",
-    Callback = function(v)
-        Settings.AutoChests = v
-    end,
-})
-LootBox:AddToggle("AutoCoins", {
-    Text = "Auto collect coins and diamonds",
-    Default = false,
-    Callback = function(v)
-        Settings.AutoCoins = v
-    end,
-})
-LootBox:AddSlider("CoinRange", {
-    Text = "Collect range",
-    Default = Settings.CoinRange,
-    Min = 5,
-    Max = 80,
-    Suffix = " studs",
-    Callback = function(v)
-        Settings.CoinRange = v
-    end,
-})
-LootBox:AddToggle("InstantPrompts", {
-    Text = "Instant interact (no hold)",
-    Default = false,
-    Callback = function(v)
-        Settings.InstantPrompts = v
-        setInstantPrompts(v)
-    end,
-})
-
-local KidsBox = ExtraTab:AddRightGroupbox("Lost kids", "baby")
-KidsBox:AddToggle("AutoBagKids", {
-    Text = "Auto pick up kids",
-    Default = false,
-    Tooltip = "Puts a lost kid in your sack as soon as you're within 15 studs (the game's reach). Needs room in the sack",
-    Callback = function(v)
-        Settings.AutoBagKids = v
-    end,
-})
-KidsBox:AddToggle("AutoDropKids", {
-    Text = "Auto drop kids at camp",
-    Default = false,
-    Tooltip = "Takes kids out of your sack when you're within 30 studs of the camp fire",
-    Callback = function(v)
-        Settings.AutoDropKids = v
-    end,
-})
-
-local SurviveBox = ExtraTab:AddLeftGroupbox("Survival", "heart-pulse")
-SurviveBox:AddToggle("AutoEat", {
-    Text = "Auto eat",
-    Default = false,
-    Tooltip = "Eats the nearest food in reach when hunger drops below the line",
-    Callback = function(v)
-        Settings.AutoEat = v
-    end,
-})
-SurviveBox:AddSlider("EatBelow", {
-    Text = "Eat below hunger",
-    Default = Settings.EatBelow,
-    Min = 10,
-    Max = 200,
-    Callback = function(v)
-        Settings.EatBelow = v
-    end,
-})
-SurviveBox:AddToggle("AutoHeal", {
-    Text = "Auto heal",
-    Default = false,
-    Tooltip = "Uses the nearest bandage or medkit in reach when health drops below the line",
-    Callback = function(v)
-        Settings.AutoHeal = v
-    end,
-})
-SurviveBox:AddSlider("HealBelow", {
-    Text = "Heal below health",
-    Default = Settings.HealBelow,
-    Min = 5,
-    Max = 95,
-    Suffix = "%",
-    Callback = function(v)
-        Settings.HealBelow = v
-    end,
-})
-SurviveBox:AddSlider("ConsumeRange", {
-    Text = "Eat / heal reach",
-    Default = Settings.ConsumeRange,
-    Min = 5,
-    Max = 80,
-    Suffix = " studs",
-    Tooltip = "The game lets you use things within 15 studs; more may or may not be accepted",
-    Callback = function(v)
-        Settings.ConsumeRange = v
-    end,
-})
-
-local FireBox = ExtraTab:AddRightGroupbox("Camp fire", "flame")
-FireBox:AddToggle("KeepFireFed", {
-    Text = "Keep the fire fed",
-    Default = false,
-    Tooltip = "Brings fuel to the camp fire (and burns it) whenever its fuel drops below the line",
-    Callback = function(v)
-        Settings.KeepFireFed = v
-    end,
-})
-FireBox:AddSlider("FireBelow", {
-    Text = "Feed below fuel",
-    Default = Settings.FireBelow,
-    Min = 1,
-    Max = 500,
-    Callback = function(v)
-        Settings.FireBelow = v
-    end,
-})
+    end)
+    slider(WorldBox, "Fov", "FOV", "Fov", 50, 120)
 end
 
 --// Loops \\--
@@ -2731,197 +3073,176 @@ bind(RunService.RenderStepped, function()
     end
 end)
 
-task.spawn(function()
-    while alive() do
-        pcall(updateEsp)
-        task.wait(0.25)
+loop(0.25, updateEsp)
+
+-- Teleport lists fill themselves once things load, and new resource types and
+-- item names reach their pickers.
+local lastLists = 0
+loop(1, function()
+    if os.clock() - lastLists > 15 then
+        lastLists = os.clock()
+        for _, refresh in { refreshPlaces, refreshLandmarks, refreshChests, refreshKids, refreshItems } do
+            pcall(refresh)
+        end
+    end
+    if #UI.BringNames.Values == 0 then
+        local names = itemNames()
+        UI.BringNames:SetValues(names)
+        UI.BringExclude:SetValues(names)
+    end
+    if pendingTypes and Options.ChopTypes then
+        pendingTypes = false
+        local types = {}
+        for kind in ResourceTypes do
+            table.insert(types, kind)
+        end
+        table.sort(types)
+        Options.ChopTypes:SetValues(types)
     end
 end)
 
--- Teleport lists fill themselves once things load and when chests come or go.
-task.spawn(function()
-    task.wait(2)
-    local lastAuto = 0
-    while alive() do
-        if os.clock() - lastAuto > 15 then
-            lastAuto = os.clock()
-            for _, refresh in { refreshPlaces, refreshLandmarks, refreshChests, refreshKids, refreshItems } do
-                pcall(refresh)
-            end
-        end
-        if #BringNames.Values == 0 then
-            pcall(function()
-                BringNames:SetValues(itemNames())
-            end)
-        end
-        if pendingTypes and Options.ChopTypes then
-            pendingTypes = false
-            local types = {}
-            for kind in ResourceTypes do
-                table.insert(types, kind)
-            end
-            table.sort(types)
-            Options.ChopTypes:SetValues(types)
-        end
-        task.wait(1)
+-- Survival helpers, safety and auto bring.
+local lastAutoBring = 0
+loop(0.3, function()
+    survivalTick()
+    safetyTick()
+    if Settings.AutoBring and not Bring.running and os.clock() - lastAutoBring >= Settings.AutoBringEvery then
+        lastAutoBring = os.clock()
+        runBring(currentBringWhat(), Settings.BringDest)
     end
-end)
-
--- Extra helpers and auto bring.
-task.spawn(function()
-    local lastAutoBring = 0
-    while alive() do
-        pcall(extraTick)
-        if Settings.AutoBring and not Bring.running and os.clock() - lastAutoBring >= Settings.AutoBringEvery then
-            lastAutoBring = os.clock()
-            pcall(runBring, Settings.BringKinds, Settings.BringNames, Settings.BringByName, Settings.BringDest)
-        end
-        if Bring.running then
-            BringStatus:SetText(string.format("Bringing %d / %d", math.min(Bring.done, Bring.total), Bring.total))
-        elseif Bring.total > 0 then
-            BringStatus:SetText(string.format("Done: %d item%s", Bring.total, Bring.total == 1 and "" or "s"))
-        end
-        task.wait(0.3)
+    if Bring.running then
+        UI.BringStatus:SetText(string.format("Bringing %d / %d", math.min(Bring.done, Bring.total), Bring.total))
+    elseif Bring.total > 0 then
+        UI.BringStatus:SetText(string.format("Done: %d item%s", Bring.total, Bring.total == 1 and "" or "s"))
     end
+    UI.JobLabel:SetText(Job.name and (Job.name .. ": " .. Job.status) or Job.status)
 end)
 
 -- Dashboard.
-local Phase = { state = nil, max = 1, day = nil, weather = nil, cultist = nil }
+do
+local Phase = { state = nil, max = 1, day = nil, weather = nil, cultist = nil, missing = nil }
 local ChasedBy = {}
 local startTime = os.clock()
 
-local function logEvent(text, color)
-    pcall(EventLog.Log, EventLog, text, color)
-end
+loop(0.25, function()
+    local state = Workspace:GetAttribute("State") or "-"
+    local left = Workspace:GetAttribute("SecondsLeft") or 0
+    local day = Workspace:GetAttribute("StoryDayCounter") or Workspace:GetAttribute("RealDayCounter")
+    local weather = Workspace:GetAttribute("Weather") or "-"
+    local cultist = Workspace:GetAttribute("CultistAttackDay") == true
+    local missing = missingCount()
 
-task.spawn(function()
-    while alive() do
-        pcall(function()
-            local state = Workspace:GetAttribute("State") or "-"
-            local left = Workspace:GetAttribute("SecondsLeft") or 0
-            local day = Workspace:GetAttribute("StoryDayCounter") or Workspace:GetAttribute("RealDayCounter")
-            local weather = Workspace:GetAttribute("Weather") or "-"
-            local cultist = Workspace:GetAttribute("CultistAttackDay") == true
-
-            if state ~= Phase.state then
-                if Phase.state ~= nil then
-                    logEvent((state == "Night" and "Night" or "Day") .. " started (day " .. tostring(day) .. ")",
-                        state == "Night" and Color3.fromRGB(150, 140, 255) or Color3.fromRGB(255, 220, 120))
-                end
-                Phase.state = state
-                Phase.max = math.max(left, 1)
-            end
-            Phase.max = math.max(Phase.max, left)
-            if day ~= Phase.day then
-                if Phase.day ~= nil then
-                    logEvent("Day " .. tostring(day))
-                end
-                Phase.day = day
-            end
-            if weather ~= Phase.weather then
-                if Phase.weather ~= nil then
-                    logEvent("Weather: " .. tostring(weather))
-                end
-                Phase.weather = weather
-            end
-            if cultist ~= Phase.cultist then
-                if cultist then
-                    logEvent("Cultist attack tonight", Color3.fromRGB(255, 90, 90))
-                end
-                Phase.cultist = cultist
-            end
-
-            NightCards:SetValue("Day", tostring(day or "-"))
-            NightCards:SetValue("Phase", state)
-            NightCards:SetValue("Time left", clock(left))
-            NightCards:SetValue("Weather", tostring(weather))
-            PhaseBar:SetText(state == "Night" and "Until morning" or "Until night")
-            PhaseBar:SetMax(Phase.max)
-            PhaseBar:SetValue(Phase.max - left)
-
-            local missing = 0
-            local missingFolder = mapFolder("MissingKids")
-            if missingFolder then
-                for _, value in missingFolder:GetAttributes() do
-                    if typeof(value) == "Vector3" then
-                        missing += 1
-                    end
-                end
-            end
-            local counts = { Hostile = 0, ["Can attack"] = 0, Passive = 0 }
-            local folder = charactersFolder()
-            local hrp = rootPart()
-            if folder then
-                for _, model in folder:GetChildren() do
-                    local kind = mobKind(model)
-                    if counts[kind] and hrp then
-                        local pos = mobPos(model)
-                        if pos and (pos - hrp.Position).Magnitude <= math.max(Settings.AuraRange, 60) then
-                            counts[kind] += 1
-                        end
-                    end
-                    if kind == "Hostile" and model:GetAttribute("ChasingPlayer") == LocalPlayer.UserId and model:GetAttribute("State") == "Chase" then
-                        if not ChasedBy[model] then
-                            ChasedBy[model] = true
-                            local name = model:GetAttribute("Name") or cleanName(model.Name)
-                            logEvent(name .. " is chasing you", Color3.fromRGB(255, 120, 90))
-                        end
-                    elseif ChasedBy[model] then
-                        ChasedBy[model] = nil
-                    end
-                end
-            end
-            for model in ChasedBy do
-                if not model.Parent then
-                    ChasedBy[model] = nil
-                end
-            end
-
-            NightCards2:SetValue("Cultist attack", cultist and "Tonight" or "No")
-            NightCards2:SetValue("Biome", tostring(Workspace:GetAttribute("Biome") or "-"))
-            NightCards2:SetValue("Kids missing", tostring(missing))
-            NightCards2:SetValue("Hostiles near", tostring(counts.Hostile))
-            AuraNearLabel:SetText(string.format("Nearby: %d hostile · %d can attack · %d passive", counts.Hostile, counts["Can attack"], counts.Passive))
-            AxeLabel:SetText("Axe: " .. SwingInfo.axe)
-            WeaponLabel:SetText("Weapon: " .. SwingInfo.weapon)
-            if Settings.AutoChop and SwingInfo.blocked > 0 then
-                BlockedLabel:SetText(string.format("%d tree%s in range need%s a tier %s axe",
-                    SwingInfo.blocked, SwingInfo.blocked == 1 and "" or "s", SwingInfo.blocked == 1 and "s" or "",
-                    tostring(SwingInfo.blockedTier or "?")))
-            else
-                BlockedLabel:SetText("")
-            end
-
-            local hum = humanoid()
-            local hunger = LocalPlayer:GetAttribute("Hunger") or 0
-            local temp = LocalPlayer:GetAttribute("Temperature")
-            local class = LocalPlayer:GetAttribute("Class")
-            YouCards:SetValue("Health", hum and string.format("%d / %d", math.floor(hum.Health), math.floor(hum.MaxHealth)) or "-")
-            YouCards:SetValue("Hunger", string.format("%d / 200", math.floor(hunger)))
-            YouCards:SetValue("Temperature", temp and tostring(math.floor(temp)) or "-")
-            YouCards:SetValue("Class", class and (class .. " " .. tostring(LocalPlayer:GetAttribute("ClassLevel") or "")) or "-")
-            HungerBar:SetMax(math.max(200, hunger))
-            HungerBar:SetValue(hunger)
-            if hum then
-                HealthBar:SetMax(math.max(hum.MaxHealth, 1))
-                HealthBar:SetValue(hum.Health)
-            end
-
-            local camp = mapFolder("Campground")
-            local fire = camp and camp:FindFirstChild("MainFire")
-            local fuel = fire and fire:GetAttribute("FuelRemaining") or 0
-            GameCards:SetValue("Camp fire fuel", fire and tostring(math.floor(fuel)) or "-")
-            GameCards:SetValue("Diamonds", tostring(LocalPlayer:GetAttribute("Diamonds") or "-"))
-            GameCards:SetValue("Players", #Players:GetPlayers() .. " / " .. Players.MaxPlayers)
-            GameCards:SetValue("Server age", clock(Workspace.DistributedGameTime))
-            FireBar:SetMax(math.max(FireBar.Max, fuel, 1))
-            FireBar:SetValue(fuel)
-        end)
-        task.wait(0.25)
+    if state ~= Phase.state then
+        if Phase.state ~= nil then
+            logEvent((state == "Night" and "Night" or "Day") .. " started (day " .. tostring(day) .. ")",
+                state == "Night" and Color3.fromRGB(150, 140, 255) or Color3.fromRGB(255, 220, 120))
+        end
+        Phase.state = state
+        Phase.max = math.max(left, 1)
     end
+    Phase.max = math.max(Phase.max, left)
+    if day ~= Phase.day then
+        if Phase.day ~= nil then
+            logEvent("Day " .. tostring(day))
+        end
+        Phase.day = day
+    end
+    if weather ~= Phase.weather then
+        if Phase.weather ~= nil then
+            logEvent("Weather: " .. tostring(weather))
+        end
+        Phase.weather = weather
+    end
+    if cultist ~= Phase.cultist then
+        if cultist then
+            logEvent("Cultist attack tonight", Color3.fromRGB(255, 90, 90))
+        end
+        Phase.cultist = cultist
+    end
+    if Phase.missing and missing < Phase.missing then
+        logEvent(string.format("A kid is back at camp (%d still missing)", missing), Color3.fromRGB(255, 220, 80))
+    end
+    Phase.missing = missing
+
+    UI.NightCards:SetValue("Day", tostring(day or "-"))
+    UI.NightCards:SetValue("Phase", state)
+    UI.NightCards:SetValue("Time left", clock(left))
+    UI.NightCards:SetValue("Weather", tostring(weather))
+    UI.PhaseBar:SetText(state == "Night" and "Until morning" or "Until night")
+    UI.PhaseBar:SetMax(Phase.max)
+    UI.PhaseBar:SetValue(Phase.max - left)
+
+    local counts = { Hostile = 0, ["Can attack"] = 0, Passive = 0 }
+    local folder = charactersFolder()
+    local hrp = rootPart()
+    if folder then
+        for _, model in folder:GetChildren() do
+            local kind = mobKind(model)
+            if counts[kind] and hrp then
+                local pos = mobPos(model)
+                if pos and (pos - hrp.Position).Magnitude <= math.max(Settings.AuraRange, 60) then
+                    counts[kind] += 1
+                end
+            end
+            if kind == "Hostile" and chasingMe(model) and model:GetAttribute("State") == "Chase" then
+                if not ChasedBy[model] then
+                    ChasedBy[model] = true
+                    local name = model:GetAttribute("Name") or cleanName(model.Name)
+                    logEvent(name .. " is chasing you", Color3.fromRGB(255, 120, 90))
+                end
+            elseif ChasedBy[model] then
+                ChasedBy[model] = nil
+            end
+        end
+    end
+    for model in ChasedBy do
+        if not model.Parent then
+            ChasedBy[model] = nil
+        end
+    end
+
+    UI.NightCards2:SetValue("Cultist attack", cultist and "Tonight" or "No")
+    UI.NightCards2:SetValue("Biome", tostring(Workspace:GetAttribute("Biome") or "-"))
+    UI.NightCards2:SetValue("Kids missing", tostring(missing))
+    UI.NightCards2:SetValue("Hostiles near", tostring(counts.Hostile))
+    UI.AuraNearLabel:SetText(string.format("Nearby: %d hostile · %d can attack · %d passive", counts.Hostile, counts["Can attack"], counts.Passive))
+    UI.AxeLabel:SetText("Axe: " .. SwingInfo.axe)
+    UI.WeaponLabel:SetText("Weapon: " .. SwingInfo.weapon)
+    if (Settings.AutoChop or FarmTarget) and SwingInfo.blocked > 0 then
+        UI.BlockedLabel:SetText(string.format("%d tree%s in range need%s a tier %s axe",
+            SwingInfo.blocked, SwingInfo.blocked == 1 and "" or "s", SwingInfo.blocked == 1 and "s" or "",
+            tostring(SwingInfo.blockedTier or "?")))
+    else
+        UI.BlockedLabel:SetText("")
+    end
+
+    local hum = humanoid()
+    local hunger = LocalPlayer:GetAttribute("Hunger") or 0
+    local temp = LocalPlayer:GetAttribute("Temperature")
+    local class = LocalPlayer:GetAttribute("Class")
+    UI.YouCards:SetValue("Health", hum and string.format("%d / %d", math.floor(hum.Health), math.floor(hum.MaxHealth)) or "-")
+    UI.YouCards:SetValue("Hunger", string.format("%d / 200", math.floor(hunger)))
+    UI.YouCards:SetValue("Temperature", temp and tostring(math.floor(temp)) or "-")
+    UI.YouCards:SetValue("Class", class and (class .. " " .. tostring(LocalPlayer:GetAttribute("ClassLevel") or "")) or "-")
+    UI.HungerBar:SetMax(math.max(200, hunger))
+    UI.HungerBar:SetValue(hunger)
+    if hum then
+        UI.HealthBar:SetMax(math.max(hum.MaxHealth, 1))
+        UI.HealthBar:SetValue(hum.Health)
+    end
+
+    local fire = campPart("MainFire")
+    local fuel = fire and fire:GetAttribute("FuelRemaining") or 0
+    UI.GameCards:SetValue("Camp fire fuel", fire and tostring(math.floor(fuel)) or "-")
+    UI.GameCards:SetValue("Diamonds", tostring(LocalPlayer:GetAttribute("Diamonds") or "-"))
+    UI.GameCards:SetValue("Players", #Players:GetPlayers() .. " / " .. Players.MaxPlayers)
+    UI.GameCards:SetValue("Automation", Job.name or "Idle")
+    UI.FireBar:SetMax(math.max(UI.FireBar.Max, fuel, 1))
+    UI.FireBar:SetValue(fuel)
 end)
 
 logEvent("Loaded in " .. string.format("%.1fs", os.clock() - startTime) .. " · place " .. game.PlaceId)
+end
 
 --// Unload \\--
 local function cleanup()
@@ -2933,7 +3254,7 @@ local function cleanup()
         pcall(c.Disconnect, c)
     end
     table.clear(Connections)
-    tpToken += 1
+    stopJob()
     Bring.token += 1
     if Settings.InstantPrompts then
         Settings.InstantPrompts = false
