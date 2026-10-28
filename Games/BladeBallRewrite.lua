@@ -31,7 +31,7 @@
 
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.93"
+local SCRIPT_VERSION = "rewrite-0.5.95"
 
 -- ---------------------------------------------------------------------------
 -- Single instance.
@@ -1457,6 +1457,12 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         if not ok or not size then return 3 end
         return math.max(size.X, size.Y, size.Z) * 0.5 + 1.5
     end
+    -- auto parry's contact distance: contact_gap PLUS your own body (~1.5
+    -- studs from the root to your side). Without it auto parry thought the ball
+    -- touched you a couple of studs later than it does -- nothing on a fast
+    -- ball, a big slice of time on a slow one: the "slow ball got too close /
+    -- killed us at 100%".
+    function Core.ap_gap(ball) return contact_gap(ball) + 1.5 end
     local function time_to_contact(path, gap, speed, accel)
         local d = math.max(path - gap, 0)
         if accel > 1 then return (math.sqrt(speed * speed + 2 * accel * d) - speed) / accel end
@@ -2194,8 +2200,10 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         local dir, want = vel / speed, offset / dist
         local heading = dir:Dot(want)
         local W = parry_window() or 0.5
-        local reach = reach_time() - adj
-        local gap = contact_gap(ball)
+        -- reach_time carries jitter, and safe_margin adds it again on top:
+        -- counted once here (0.5.94), it was firing early by a whole jitter
+        local reach = reach_time() - jitter() - adj
+        local gap = Core.ap_gap(ball)
         local rem = math.max(dist - gap, 0)
         local accel = speed_gain(st, speed, now)
         local h = track_homing(st, dir, want, dist, now)
@@ -2232,7 +2240,7 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         --         fire is on this, at the Accuracy lead: a curve is never
         --         parried before even its slowest version is due, so no early
         --         hits on wide or bait curves.
-        --   FAST  turning 1.4x as hard (the model's max with Hard curve guard)
+        --   FAST  turning 1.25x as hard (the model's max with Hard curve guard)
         --         -- the SOONEST. If it would land before a parry fired now is
         --         up (reach + safety), fire at once whatever else: you can't
         --         be curved past.
@@ -2247,7 +2255,7 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         local rv = root.AssemblyLinearVelocity
         local tvel = Vector3.new(rv.X, 0, rv.Z)
         if tvel.Magnitude < 1 then tvel = nil end
-        local k_fast = S.hard_curve and K_MAX or math.min(km * 1.4, K_MAX)
+        local k_fast = S.hard_curve and K_MAX or math.min(km * 1.25, K_MAX)
         local fast = math.max(sim_prop(bpos, v, rpos, gap, k_fast, accel, must_by + 0.05, tvel) or math.huge, t_min)
         info.fast = fast
         if info.dbg then info.dbg.fast = fast end
@@ -2322,10 +2330,10 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         if speed < 1 then return false end
         local bpos, adj = Core.ball_now(ball)
         local dist = (root.Position - bpos).Magnitude
-        local gap = contact_gap(ball)
+        local gap = Core.ap_gap(ball)
         local soonest = math.max(dist - gap, 0) / speed
         local W = math.min(parry_window() or 0.5, 0.6)
-        local reach = reach_time() - adj
+        local reach = reach_time() - jitter() - adj
         local must_by = reach + safe_margin()
         local lead = math.max(reach + cushion_for(speed, W), must_by)
         local holds = reach + W - (jitter() + frame_dt + 0.03)
@@ -4616,6 +4624,146 @@ function NoRender.stop()
         for prop, old in pairs(props) do pcall(function() inst[prop] = old end) end
     end
 end
+-- ----- Device spoofer -----
+-- The game decides PC / Phone / Tablet / Console in
+-- ClientGameModules.DeviceListener (Bbs dump): Gamepad last input -> Console,
+-- Mouse + Keyboard -> PC, touch with a viewport height <= 500 -> Phone, else
+-- Tablet. It reads UserInputService through ReplicatedStorage.UserInputService,
+-- a wrapper that indexes the real service -- so ONE __index hook (in the game's
+-- locked metatable, like the capture hook) answers those reads with the picked
+-- device. It answers only the game's own scripts: our script reads the real
+-- values (checkcaller), and Roblox's PlayerModule (your thumbstick / camera)
+-- and CoreGui keep the real device, so movement never breaks. The listener's
+-- current device is set straight away too (require'd -- already loaded, so
+-- that only returns its table). Off = the hook answers nothing (it stays in,
+-- inert) and the real device is put back.
+local DeviceSpoof = { on = false, device = "PC", hooked = false, real = nil, p = nil, lastfn = nil,
+    skip = setmetatable({}, { __mode = "k" }), dl = setmetatable({}, { __mode = "k" }) }
+local function device_profiles()
+    local PI = {}
+    pcall(function() PI.kbm, PI.touch, PI.pad = Enum.PreferredInput.KeyboardAndMouse, Enum.PreferredInput.Touch, Enum.PreferredInput.Gamepad end)
+    return {
+        PC = { TouchEnabled = false, KeyboardEnabled = true, MouseEnabled = true, GamepadEnabled = false,
+            PreferredInput = PI.kbm, last = Enum.UserInputType.MouseMovement },
+        Phone = { TouchEnabled = true, KeyboardEnabled = false, MouseEnabled = false, GamepadEnabled = false,
+            PreferredInput = PI.touch, last = Enum.UserInputType.Touch, vpY = 400 },
+        Tablet = { TouchEnabled = true, KeyboardEnabled = false, MouseEnabled = false, GamepadEnabled = false,
+            PreferredInput = PI.touch, last = Enum.UserInputType.Touch, vpY = 900 },
+        Console = { TouchEnabled = false, KeyboardEnabled = false, MouseEnabled = false, GamepadEnabled = true,
+            PreferredInput = PI.pad, last = Enum.UserInputType.Gamepad1 },
+    }
+end
+function DeviceSpoof.install()
+    if DeviceSpoof.hooked then return true end
+    if type(hookmetamethod) ~= "function" or type(checkcaller) ~= "function" then return false end
+    local RealUIS = game:GetService("UserInputService")
+    local RealGui = game:GetService("GuiService")
+    local RealCore = game:GetService("CoreGui")
+    local getcs = getcallingscript
+    local UIS_KEYS = { TouchEnabled = true, KeyboardEnabled = true, MouseEnabled = true, GamepadEnabled = true,
+        PreferredInput = true, GetLastInputType = true }
+    -- the calling script is one of the game's own (not PlayerModule / CoreGui)
+    local function game_script()
+        if type(getcs) ~= "function" then return false end
+        local ok, sc = pcall(getcs)
+        if not ok or typeof(sc) ~= "Instance" then return false end
+        local c = DeviceSpoof.skip[sc]
+        if c == nil then
+            local ok2, keep_real = pcall(function()
+                return sc:FindFirstAncestor("PlayerModule") ~= nil or sc:IsDescendantOf(RealCore)
+            end)
+            c = ok2 and not keep_real
+            DeviceSpoof.skip[sc] = c
+        end
+        return c, sc
+    end
+    DeviceSpoof.lastfn = newcclosure(function() return DeviceSpoof.p and DeviceSpoof.p.last end)
+    local old
+    local ok = pcall(function()
+        old = hookmetamethod(game, "__index", newcclosure(function(self, k)
+            if DeviceSpoof.on and type(k) == "string" and not checkcaller() then
+                local p = DeviceSpoof.p
+                if p then
+                    if UIS_KEYS[k] and rawequal(self, RealUIS) then
+                        if game_script() then
+                            if k == "GetLastInputType" then return DeviceSpoof.lastfn end
+                            local v = p[k]
+                            if v ~= nil then return v end
+                        end
+                    elseif k == "TouchControlsEnabled" and rawequal(self, RealGui) then
+                        if game_script() then return p.TouchEnabled end
+                    elseif k == "ViewportSize" and p.vpY then
+                        -- Phone / Tablet are told apart by the viewport height:
+                        -- answered for DeviceListener only (the rest of the UI
+                        -- keeps the real screen size)
+                        local gs, sc = game_script()
+                        if gs then
+                            local is_dl = DeviceSpoof.dl[sc]
+                            if is_dl == nil then
+                                local okn, n = pcall(function() return sc.Name end)
+                                is_dl = okn and n == "DeviceListener"
+                                DeviceSpoof.dl[sc] = is_dl
+                            end
+                            if is_dl then
+                                local real = old(self, k)
+                                return Vector2.new(real.X, p.vpY)
+                            end
+                        end
+                    end
+                end
+            end
+            return old(self, k)
+        end))
+    end)
+    DeviceSpoof.hooked = ok and type(old) == "function"
+    return DeviceSpoof.hooked
+end
+-- put the picked (or, when off, the real) device into the game's listener now
+function DeviceSpoof.apply()
+    pcall(function()
+        local DL = require(ReplicatedStorage.ClientGameModules.DeviceListener)
+        if DeviceSpoof.real == nil then DeviceSpoof.real = DL.Device end
+        local dev = DeviceSpoof.on and DeviceSpoof.device or DeviceSpoof.real
+        if dev and DL.Device ~= dev then
+            DL.Device = dev
+            pcall(function() DL.State:Set(dev) end)
+            pcall(function() DL.OnChange:Fire(dev) end)
+        end
+    end)
+end
+local DeviceSpoofF = Feature("DeviceSpoof")
+function DeviceSpoofF.start()
+    DeviceSpoof.p = device_profiles()[DeviceSpoof.device] or device_profiles().PC
+    if not DeviceSpoof.install() then
+        Notify("Device spoofer", "Your executor is missing hookmetamethod / checkcaller.", 4)
+        return
+    end
+    DeviceSpoof.apply() -- reads the real device first, before anything is spoofed
+    DeviceSpoof.on = true
+    DeviceSpoof.apply()
+    -- keep it: the listener re-checks on input-type / screen changes
+    DeviceSpoofF:loop(2, function() DeviceSpoof.apply() end)
+end
+function DeviceSpoofF.stop()
+    DeviceSpoof.on = false
+    DeviceSpoof.apply()
+end
+
+local DS = Tabs.Misc:AddLeftGroupbox("Device spoofer", "smartphone")
+DS:AddToggle("DeviceSpoof", {
+    Text = "Device spoofer", Default = false,
+    Tooltip = "The game treats you as the device below (its mobile buttons, layouts and anything it decides by device). Your real thumbstick and camera keep working. Off puts your real device back.",
+    Callback = function(v) DeviceSpoofF:setEnabled(v) end,
+})
+DS:AddDropdown("DeviceSpoofType", {
+    Values = { "PC", "Phone", "Tablet", "Console" }, Default = "PC", Text = "Device",
+    Callback = function(v)
+        DeviceSpoof.device = v
+        DeviceSpoof.p = device_profiles()[v]
+        if DeviceSpoof.on then DeviceSpoof.apply() end
+    end,
+})
+
 local NR = Tabs.Misc:AddRightGroupbox("Performance", "cpu")
 NR:AddToggle("NoRender", { Text = "No render", Default = false, Tooltip = "Turns off what's picked below.",
     Callback = function(v) NoRender:setEnabled(v) end })
