@@ -168,7 +168,7 @@ local Fingerprints = {
     -- Workspace.Alive round folder. No other game in this loader has that combo.
     {
         Name = 'Blade Ball',
-        Script = 'Games/BladeBall.lua',
+        Script = 'Games/BladeBallRewrite.lua',
         Match = function()
             local ReplicatedStorage = game:GetService('ReplicatedStorage')
             local remotes = ReplicatedStorage:FindFirstChild('Remotes')
