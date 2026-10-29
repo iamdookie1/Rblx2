@@ -31,7 +31,7 @@
 
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.97"
+local SCRIPT_VERSION = "rewrite-0.5.98"
 
 -- ---------------------------------------------------------------------------
 -- Single instance.
@@ -1698,8 +1698,9 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
     --         constant along its path even though the swing rate isn't;
     --   away  the swing is carrying it AWAY from us (curve bait / wide curve);
     --   distance samples -> its real closing speed and how fast that's rising.
-    -- Three arrival estimates are made from that, each wrong in different
-    -- situations, and the MEDIAN is used, never less than flying straight in.
+    -- decide() runs the homing sim at the gain band (soonest / latest) and
+    -- checks the latest against the model-free closing-speed estimate, so a
+    -- gain it hasn't measured right yet can't make it fire late.
     local K_DEFAULT, K_MIN, K_MAX = 5, 0.8, 40
     local W_DEFAULT, W_MIN = 4, 1
     local SIM_DT = 1 / 120
@@ -1711,10 +1712,18 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
             return h
         end
         local dt = now - h.t
+        -- a gap this long (hitch, the ball paused) would average a whip-in over
+        -- the whole gap: start a fresh baseline instead of measuring across it
+        if dt > 0.2 then
+            h.t, h.dir, h.want, h.samples = now, dir, want, { { t = now, d = dist } }
+            return h
+        end
         if dt >= 0.03 then
             local turned = math.acos(math.clamp(h.dir:Dot(dir), -1, 1))
             local omega = turned / dt
-            local th = math.acos(math.clamp(h.dir:Dot(h.want), -1, 1))
+            -- the angle off the line to us at the MIDDLE of the step: the turn
+            -- happened across it, and the start alone over-reads k as it closes
+            local th = (math.acos(math.clamp(h.dir:Dot(h.want), -1, 1)) + math.acos(math.clamp(dir:Dot(want), -1, 1))) * 0.5
             local perp = h.want - h.dir * h.dir:Dot(h.want)
             local toward = perp.Magnitude < 1e-4 or (dir - h.dir):Dot(perp) >= 0
             if turned > 2e-3 then
@@ -1722,8 +1731,14 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
                     h.away = false
                     h.w = h.w and math.max(h.w * 0.5 + omega * 0.5, omega * 0.85) or omega
                     if th > 0.06 then
-                        local ks = omega / math.max(math.sin(th), 0.15)
-                        h.k = h.k and (h.k * 0.4 + ks * 0.6) or ks
+                        local ks = math.min(omega / math.max(math.sin(th), 0.15), K_MAX * 1.5)
+                        -- one spiky sample (a velocity snap, a server correction)
+                        -- mustn't drag k up and fire the must-check early: a
+                        -- reading far above what it has been turning at only
+                        -- counts a little until it repeats
+                        local wgt = (h.k and ks > h.k * 2.5) and 0.25 or 0.6
+                        h.k = h.k and (h.k * (1 - wgt) + ks * wgt) or ks
+                        h.kn = (h.kn or 0) + 1
                     end
                 elseif omega > 0.5 then
                     h.away = true
@@ -1784,39 +1799,6 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
             t = t + SIM_DT
         end
         return nil
-    end
-    -- constant turn rate toward us
-    local function sim_const(pos, vel, target, gap, turn, accel, horizon)
-        local speed = vel.Magnitude
-        if speed < 1 then return nil end
-        local dir, t = vel / speed, 0
-        while t < horizon do
-            local to = target - pos
-            local dist = to.Magnitude
-            if dist <= gap then return t end
-            local want = to / dist
-            local angle = math.acos(math.clamp(dir:Dot(want), -1, 1))
-            if angle > 1e-3 and turn > 0 then
-                local swing = turn * SIM_DT
-                if swing >= angle then dir = want
-                else
-                    local mixed = dir:Lerp(want, swing / angle)
-                    if mixed.Magnitude < 1e-3 then mixed = dir:Cross(Vector3.yAxis) end
-                    dir = mixed.Unit
-                end
-            end
-            speed = speed + accel * SIM_DT
-            local move = speed * SIM_DT
-            if dir:Dot(want) > 0 and move >= dist - gap then return t + (dist - gap) / speed end
-            pos = pos + dir * move
-            t = t + SIM_DT
-        end
-        return nil
-    end
-    local function median3(a, b, c)
-        if a > b then a, b = b, a end
-        if c < a then return a elseif c > b then return b end
-        return c
     end
 
     local live_cache = { at = -1, list = {} }
@@ -2428,7 +2410,7 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
             local e = DBG.eval
             e.t, e.via, e.speed, e.dist, e.heading, e.reach, e.lead, e.t_min, e.k, e.feed = now, via or "frame",
                 speed, dist, heading, reach, lead, t_min, h.k, adj > 0
-            e.fast, e.slow = nil, nil
+            e.fast, e.slow, e.radial = nil, nil, nil
             info.dbg = e
             -- the first look at this pass already had it landing inside our reach:
             -- it was late before we could do anything (retarget / data arrived late)
@@ -2456,7 +2438,21 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         --         up (reach + safety), fire at once whatever else: you can't
         --         be curved past.
         -- A ball swinging away waits to come round (FAST still guards it).
-        local km = math.clamp(h.k or st.k_mem or K_DEFAULT, K_MIN, K_MAX)
+        -- Until this pass has measured its own turn (2 readings), the gain is
+        -- a guess -- the last pass's was another player's curve -- so the band
+        -- is widened both ways: FAST from the harder of the two, SLOW from the
+        -- softer. The closing-speed check below keeps the soft side honest.
+        -- 0.5.98: the latest arrival is also checked against the ball's REAL
+        -- closing speed (radial_eta). A curve turning harder than k says used
+        -- to be parried on SLOW only when it was nearly on us; now, while it is
+        -- clearly coming in (closing at 35%+ of its speed), whichever of the
+        -- two says sooner wins. A wide or bait curve barely closes, so it
+        -- still waits for SLOW.
+        local measured = h.k and (h.kn or 0) >= 2
+        local guess = st.k_mem or K_DEFAULT
+        local km = math.clamp(h.k or guess, K_MIN, K_MAX)
+        local km_hi = measured and km or math.clamp(math.max(km, guess, K_DEFAULT), K_MIN, K_MAX)
+        local km_lo = measured and km or math.clamp(math.min(km, guess, K_DEFAULT), K_MIN, K_MAX)
         local v = vel
         if heading < -0.95 then -- dead away: nudge it off the line so the sim can turn it
             local side = dir:Cross(Vector3.yAxis)
@@ -2466,7 +2462,7 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         local rv = root.AssemblyLinearVelocity
         local tvel = Vector3.new(rv.X, 0, rv.Z)
         if tvel.Magnitude < 1 then tvel = nil end
-        local k_fast = S.hard_curve and K_MAX or math.min(km * 1.25, K_MAX)
+        local k_fast = S.hard_curve and K_MAX or math.min(km_hi * 1.25, K_MAX)
         local fast = math.max(sim_prop(bpos, v, rpos, gap, k_fast, accel, must_by + 0.05, tvel) or math.huge, t_min)
         info.fast = fast
         if info.dbg then info.dbg.fast = fast end
@@ -2475,10 +2471,23 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
             return fire(st, now, tag .. " (curve, must)", info, ball)
         end
         if h.away then return end
-        local slow = math.max(sim_prop(bpos, v, rpos, gap, math.max(km * 0.75, K_MIN), accel, lead + 0.05, tvel) or math.huge, t_min)
-        info.eta, info.slow = slow, slow
+        local slow = math.max(sim_prop(bpos, v, rpos, gap, math.max(km_lo * 0.75, K_MIN), accel, lead + 0.05, tvel) or math.huge, t_min)
+        info.eta, info.slow, info.k = slow, slow, km
         if info.dbg then info.dbg.slow = slow end
         if slow <= lead + half then return fire(st, now, tag .. " (curve)", info, ball) end
+        local s = h.samples
+        local closing = #s >= 2 and (s[#s - 1].d - s[#s].d) / math.max(s[#s].t - s[#s - 1].t, 1e-3) or 0
+        if closing >= speed * 0.35 then
+            local radial = radial_eta(h, rem, speed)
+            if radial then
+                radial = math.max(radial, t_min)
+                if info.dbg then info.dbg.radial = radial end
+                if radial <= lead + half then
+                    info.eta = radial
+                    return fire(st, now, tag .. " (curve, closing)", info, ball)
+                end
+            end
+        end
     end
 
     local function trigger(ball, st, now)
@@ -3068,9 +3077,10 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         local e = DBG.eval
         if e.t and now - e.t < 1.5 then
             L[#L + 1] = ("check (%s%s): spd %.0f  d %.0f  heading %.2f"):format(e.via, e.feed and ", feed" or "", e.speed, e.dist, e.heading)
-            L[#L + 1] = ("  soonest %.2fs  lead %.2fs  reach %.2fs%s%s%s"):format(math.min(e.t_min, 9.99), e.lead, e.reach,
+            L[#L + 1] = ("  soonest %.2fs  lead %.2fs  reach %.2fs%s%s%s%s"):format(math.min(e.t_min, 9.99), e.lead, e.reach,
                 e.fast and ("  curve fast %.2f"):format(math.min(e.fast, 9.99)) or "",
                 e.slow and (" slow %.2f"):format(math.min(e.slow, 9.99)) or "",
+                e.radial and (" closing %.2f"):format(math.min(e.radial, 9.99)) or "",
                 e.k and ("  k %.1f"):format(e.k) or "")
         end
         if DBG.block and now - DBG.block_at < 2 then L[#L + 1] = ("held: %s (%.1fs ago)"):format(DBG.block, now - DBG.block_at) end
