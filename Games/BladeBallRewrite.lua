@@ -31,7 +31,7 @@
 
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.98"
+local SCRIPT_VERSION = "rewrite-0.5.99"
 
 -- ---------------------------------------------------------------------------
 -- Single instance.
@@ -4704,7 +4704,64 @@ do
             end)
         end
     end
-    function SkinChanger.apply() if SkinChanger.on then save_skin(); set_sword() end end
+    -- Parry effect. ClientFX plays it from ParrySuccessAll(fxName, fxParent,
+    -- sword, player, ...) (Bbs dump, parrySuccessAll) -- fxName is the slash the
+    -- SERVER picked from the sword you really own, and it goes straight to
+    -- SwordFX:GetInstance, so the GetSword remap never touches it: the skin
+    -- was on but the effect stayed your real sword's. The game's handler is
+    -- paused and called through us; for YOUR parries only, fxName and sword are
+    -- swapped for the skin's. Everyone else's pass through untouched, and the
+    -- handler is put back when the skin changer goes off.
+    local fx_paused, swordFX = {}, nil
+    local function skin_slash()
+        local ok, data = pcall(realGetSword, swords, Skin.name)
+        return (ok and type(data) == "table" and type(data.SlashName) == "string") and data.SlashName or "SlashEffect"
+    end
+    local function prefetch_slash()
+        -- the game only fetches the slashes of swords people own: fetch the skin's
+        task.spawn(function()
+            pcall(function()
+                swordFX = swordFX or require(ReplicatedStorage.Shared.ReplicatedInstances.SwordFX)
+                swordFX:GetInstance(skin_slash())
+            end)
+        end)
+    end
+    local function c_fx_script()
+        local ok, s = pcall(function() return LocalPlayer.PlayerScripts.EffectScripts.ClientFX end)
+        return ok and s or nil
+    end
+    local function swap_parry_fx()
+        local R = get_remotes()
+        if not (R and getconnections) then return false end
+        local isours = isexecutorclosure or is_synapse_function or isourclosure
+        local found = false
+        for _, sig in ipairs({ R:FindFirstChild("ParrySuccessAll") and R.ParrySuccessAll.OnClientEvent,
+                R:FindFirstChild("ParrySuccessClient") and R.ParrySuccessClient.Event }) do
+            for _, c in ipairs(sig and getconnections(sig) or {}) do
+                local f = c.Function
+                if type(f) == "function" and not fx_paused[c] and (not isours or not isours(f))
+                    and (not islclosure or islclosure(f)) then
+                    fx_paused[c] = true
+                    found = true
+                    c:Disable()
+                    -- connected raw (not SkinChanger:connect): if this instance
+                    -- dies it must keep passing parries through, not drop them
+                    SkinChanger._conns[#SkinChanger._conns + 1] = sig:Connect(function(...)
+                        -- No render switched ClientFX off: its effects stay off
+                        local cfx = c_fx_script()
+                        if cfx and cfx.Disabled then return end
+                        local args = table.pack(...)
+                        if is_live() and SkinChanger.on and Skin.name ~= "" and args[4] == LocalPlayer then
+                            pcall(function() args[1], args[3] = skin_slash(), Skin.name end)
+                        end
+                        f(table.unpack(args, 1, args.n))
+                    end)
+                end
+            end
+        end
+        return found
+    end
+    function SkinChanger.apply() if SkinChanger.on then save_skin(); set_sword(); if swords then prefetch_slash() end end end
     function SkinChanger.start()
         local token = SkinChanger._token
         task.spawn(function()
@@ -4747,6 +4804,12 @@ do
             end
             if not SkinChanger:alive(token) then return end
             set_sword()
+            prefetch_slash()
+            -- ClientFX connects its handler once it's started: retry ~10s
+            for _ = 1, 40 do
+                if not SkinChanger:alive(token) or swap_parry_fx() then break end
+                task.wait(0.25)
+            end
             SkinChanger:connect(LocalPlayer.CharacterAdded, function()
                 task.wait(2.5)
                 if SkinChanger:alive(token) then set_sword() end
@@ -4768,6 +4831,9 @@ do
     function SkinChanger.stop()
         -- put the game's own resolver back
         if swords and realGetSword then pcall(function() rawset(swords, "GetSword", realGetSword) end) end
+        -- and the game's parry effect handler (our pass-throughs go in release)
+        for c in pairs(fx_paused) do pcall(function() c:Enable() end) end
+        fx_paused = {}
     end
 end
 
