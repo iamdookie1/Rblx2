@@ -215,7 +215,7 @@ local function drawPoints(pool, points)
             p.Color = pool.Color
             p.Size = Vector3.new(pool.Width, 0.12, (w - last).Magnitude + 0.05)
             p.CFrame = CFrame.lookAt((last + w) / 2, w)
-            p.Transparency = 0.15
+            p.Transparency = pool.Alpha or 0.15
             last = w
         end
     end
@@ -531,6 +531,8 @@ local Opt = {
     Families = { Lines = true, Bends = true, Arcs = true, Curves = true, Waves = true, Steps = true, Bumps = true, Fancy = false,
         Calculus = true },
     MaxLen = 60,          -- longest equation the solver hands you
+    Longer = false,       -- longer ones too: up to the game's limit, plus two-shape combos
+    Multi = false,        -- a drawn path through several players aims at all of them
     MaxDec = 2,           -- most decimals in any number
     Prefer = "Shortest",  -- Shortest / Closest to drawing / Hits most
     KeypadOnly = true,    -- only what the touch keypad can type
@@ -681,7 +683,7 @@ end
 
 -- does an option fit the Math tab's rules?
 local function allowed(text, family)
-    if #text > Opt.MaxLen then return false end
+    if #text > (Opt.Longer and (Config.EXPR and Config.EXPR.MAX_LEN or 1024) or Opt.MaxLen) then return false end
     if family and not Opt.Families[family] then return false end
     -- calculus shapes need calculus mode, which is keyboard only anyway
     if family == "Calculus" then return calcOn() end
@@ -1284,6 +1286,39 @@ local function aimOptions(target)
             end
         end
     end
+    -- longer ones too: a tilted shape with a second, smaller one on top,
+    -- tilted so the pair still lands on the target
+    if Opt.Longer then
+        local base = {}
+        for _, s in ipairs(SHAPES) do
+            if (s.fam == "Waves" or s.fam == "Steps" or s.fam == "Bumps") and familyOn(s.fam) then base[#base + 1] = s end
+        end
+        for i1, s1 in ipairs(base) do
+            for i2, s2 in ipairs(base) do
+                if i1 ~= i2 then
+                    for _, bf1 in ipairs({ 0.18, 0.4 }) do
+                        local b1, h1 = math.max(1, du * bf1), F * du * 0.5
+                        local span1 = s1.g((tx - h1) / b1) - s1.g(-h1 / b1)
+                        for _, amp1 in ipairs({ 14, -14 }) do
+                            for _, bf2 in ipairs({ 0.07, 0.14 }) do
+                                local b2, h2 = math.max(1, du * bf2), F * du * 0.3
+                                local span2 = s2.g((tx - h2) / b2) - s2.g(-h2 / b2)
+                                for _, amp2 in ipairs({ 5, -5 }) do
+                                    local c = (dy - amp1 * span1 - amp2 * span2) / tx
+                                    if math.abs(c) < 20 and c == c then
+                                        shapes[#shapes + 1] = {
+                                            Combo = { s1, amp1, b1, h1, s2, amp2, b2, h2, c }, Family = s1.fam,
+                                            Label = s1.key:lower() .. " + " .. s2.key:lower(),
+                                        }
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
     -- routes with your drawing's bends, ending on the target
     if raw then
         local corners = {}
@@ -1322,6 +1357,14 @@ local function aimOptions(target)
             makeForm = function(dec) return brokenForm(sh.Poly, dec) end
         elseif sh.Arc then
             makeForm = function(dec) return arcForm(sh.Arc[1], sh.Arc[2], dec) end
+        elseif sh.Combo then
+            local k = sh.Combo
+            makeForm = function(dec)
+                local t1, f1 = shapeForm(k[1], k[2], k[3], k[4], dec, k[9])
+                local t2, f2 = shapeForm(k[5], k[6], k[7], k[8], dec)
+                if not t1 or not t2 then return nil end
+                return t1 .. (t2:sub(1, 1) == "-" and "" or "+") .. t2, function(x) return f1(x) + f2(x) end
+            end
         else
             makeForm = function(dec) return shapeForm(sh.Shape, sh.A, sh.B, sh.H, dec, sh.C) end
         end
@@ -1350,6 +1393,19 @@ local function aimOptions(target)
         if ra ~= rb then return ra < rb end
         return a.Gap < b.Gap
     end)
+    -- longer ones too: every other route is a long one, so Other route
+    -- reaches them without stepping through every short shot first
+    if Opt.Longer then
+        local short, long = {}, {}
+        for _, c in ipairs(found) do
+            if #c.Text > Opt.MaxLen or c.Label:find(" + ", 1, true) then long[#long + 1] = c else short[#short + 1] = c end
+        end
+        found = {}
+        for i = 1, math.max(#short, #long) do
+            if short[i] then found[#found + 1] = short[i] end
+            if long[i] then found[#found + 1] = long[i] end
+        end
+    end
     return { List = found, F = F, X0 = x0, Y0 = y0, Grid = grid, Target = target, Next = 1 }
 end
 
@@ -1363,8 +1419,13 @@ local function nextAimRoute(aim)
         if not seen[c.Text] then
             seen[c.Text] = true
             if compiles(c.Text) then
-                local f = flight(c.Text, aim.X0, aim.Y0, aim.F, aim.Grid, { aim.Target })
-                if f and f.Hits[aim.Target] then
+                local need = aim.Targets or { aim.Target }
+                local f = flight(c.Text, aim.X0, aim.Y0, aim.F, aim.Grid, need)
+                local all = f ~= nil
+                for _, t in ipairs(f and need or {}) do
+                    if not f.Hits[t] then all = false end
+                end
+                if all then
                     c.Flight = f
                     return c
                 end
@@ -1373,6 +1434,149 @@ local function nextAimRoute(aim)
         if aim.Next % 6 == 0 then task.wait() end
     end
     return nil
+end
+
+local aimMulti, targetsOfDrag
+do
+    -- every player the drag passes near (multi target), in the order it reaches them
+    targetsOfDrag = function(raw, F)
+        local x0, y0 = origin()
+        if not x0 then return {} end
+        local out = {}
+        for _, c in ipairs(combatants()) do
+            local best
+            for _, q in ipairs(raw) do
+                local px, py = x0 + q[1] * F, y0 + q[2]
+                local d = (px - c.X) ^ 2 + (py - c.Y) ^ 2
+                if d <= (HITBOX + 6) ^ 2 and (not best or q[1] < best) then best = q[1] end
+            end
+            if best and (c.X - x0) * F > 1 then out[#out + 1] = c end
+        end
+        table.sort(out, function(a, b) return (a.X - x0) * F < (b.X - x0) * F end)
+        while #out > 5 do table.remove(out) end
+        return out
+    end
+
+    -- does fn pass every target (any order) before a block or the board's edge?
+    local function quickMulti(fn, F, x0, y0, grid, targets, maxU)
+        local ok0, f0 = pcall(fn, 0)
+        if not ok0 or f0 ~= f0 then return false end
+        local reach = (HITBOX - 0.6) ^ 2
+        local left = #targets
+        local got = {}
+        local px, py, u = x0, y0, 0
+        while u < maxU do
+            u = math.min(maxU, u + 0.5)
+            local ok, fy = pcall(fn, F * u)
+            if not ok then return false end
+            local y = y0 + fy - f0
+            if y ~= y or y < ARENA.YMIN or y > ARENA.YMAX then return false end
+            local x = x0 + F * u
+            local steps = math.max(1, math.ceil(math.abs(y - py) / 0.5))
+            if steps > 400 then return false end
+            for st = 1, steps do
+                local t = st / steps
+                local sx, sy = px + (x - px) * t, py + (y - py) * t
+                for i, c in ipairs(targets) do
+                    if not got[i] and (sx - c.X) ^ 2 + (sy - c.Y) ^ 2 <= reach then
+                        got[i] = true
+                        left -= 1
+                        if left == 0 then return true end
+                    end
+                end
+                if blockAt(grid, sx, sy, Opt.Clearance) then return false end
+            end
+            px, py = x, y
+        end
+        return false
+    end
+
+    -- f(x) = c1 x + c2 (x/10)^2 + ... from the rounded numbers, through you and
+    -- every point (signed x)
+    local function throughForm(pts, dec)
+        local n = #pts
+        local rows, rhs = {}, {}
+        for i, p in ipairs(pts) do
+            local row = {}
+            for k = 1, n do row[k] = (p[1] / 10) ^ k end
+            rows[i], rhs[i] = row, p[2]
+        end
+        local c = solveLS(rows, rhs, n)
+        if not c then return nil end
+        local terms, used = {}, {}
+        for k = 1, n do
+            local coef = k == 1 and c[1] / 10 or c[k]
+            local str, r = fmt(coef, dec)
+            if r ~= 0 then
+                local v = coef < 0 and -r or r
+                used[#used + 1] = { k, v }
+                if str == "1" then str = "" end
+                terms[#terms + 1] = { coef < 0 and "-" or "+", str .. (k == 1 and "x" or ("(x/10)^" .. k)) }
+            end
+        end
+        return joinTerms(terms), function(x)
+            local y = 0
+            for _, t in ipairs(used) do y += t[1] == 1 and t[2] * x or t[2] * (x / 10) ^ t[1] end
+            return y
+        end
+    end
+
+    -- a drawn path past several players: shots that go through all of them
+    aimMulti = function(targets)
+        local x0, y0 = origin()
+        if not x0 or #targets < 2 then return nil end
+        local F = Made.Facing
+        local pts = {}
+        for _, t in ipairs(targets) do
+            local u = (t.X - x0) * F
+            if u > 1 and (#pts == 0 or u - pts[#pts][1] > 1.5) then pts[#pts + 1] = { u, t.Y - y0 } end
+        end
+        if #pts < 2 then return nil end
+        local grid = buildBlocks()
+        local edge = F > 0 and (ARENA.XMAX - x0) or (x0 - ARENA.XMIN)
+        local maxU = math.min(pts[#pts][1] + HITBOX + 3, maxRange(x0, F) or math.huge, edge)
+        local names = {}
+        for _, t in ipairs(targets) do names[#names + 1] = t.Name end
+
+        local shapes = {}
+        -- straight through each one, then with a detour between any two
+        local base = { { 0, 0 } }
+        for _, p in ipairs(pts) do base[#base + 1] = { p[1], p[2] } end
+        shapes[#shapes + 1] = { Poly = signedPoly(base, F), Label = "through " .. #pts, Family = "Bends" }
+        for gap = 1, #base - 1 do
+            local a, b = base[gap], base[gap + 1]
+            for _, lift in ipairs({ 6, -6, 12, -12, 20, -20 }) do
+                local corner = { (a[1] + b[1]) / 2, (a[2] + b[2]) / 2 + lift }
+                local route = {}
+                for i, q in ipairs(base) do
+                    route[#route + 1] = q
+                    if i == gap then route[#route + 1] = corner end
+                end
+                shapes[#shapes + 1] = { Poly = signedPoly(route, F), Label = "through " .. #pts .. ", around", Family = "Bends" }
+            end
+        end
+        -- one smooth curve through all of them
+        local signed = {}
+        for i, p in ipairs(pts) do signed[i] = { F * p[1], p[2] } end
+        shapes[#shapes + 1] = { Through = signed, Label = "curve through " .. #pts, Family = #pts == 2 and "Arcs" or "Curves" }
+
+        local found = {}
+        for _, sh in ipairs(shapes) do
+            for dec = 0, Opt.MaxDec do
+                local text, fn
+                if sh.Poly then text, fn = brokenForm(sh.Poly, dec) else text, fn = throughForm(sh.Through, dec) end
+                if text and allowed(text, sh.Family) and quickMulti(fn, F, x0, y0, grid, targets, maxU) then
+                    found[#found + 1] = { Text = text, Label = sh.Label, Family = sh.Family, Gap = 0, Extra = #targets - 1 }
+                    break
+                end
+            end
+        end
+        table.sort(found, function(a, b) return #a.Text < #b.Text end)
+        return {
+            List = found, F = F, X0 = x0, Y0 = y0, Grid = grid, Next = 1, Targets = targets,
+            Target = { Name = table.concat(names, " + ") },
+        }
+    end
 end
 
 --// following the drawing -------------------------------------------------------------
@@ -1805,7 +2009,7 @@ end
 
 -- settings that last between games (when the executor can write files)
 local SAVE_FILE = "MathWarsPathTools.json"
-local Saved = { Preview = true, Snap = true, LockAim = true, Guide = false }
+local Saved = { Preview = true, Snap = true, LockAim = true, Guide = false, Others = false, OthersAlpha = 0.35, HideDrafts = false }
 local function loadSettings()
     if typeof(readfile) ~= "function" or typeof(isfile) ~= "function" then return end
     local ok, data = pcall(function()
@@ -1819,7 +2023,7 @@ local function loadSettings()
             Opt[k] = v
         end
     end
-    for k, v in pairs(data.Saved or {}) do if Saved[k] ~= nil and type(v) == "boolean" then Saved[k] = v end end
+    for k, v in pairs(data.Saved or {}) do if Saved[k] ~= nil and type(v) == type(Saved[k]) then Saved[k] = v end end
 end
 local function saveSettings()
     if typeof(writefile) ~= "function" then return end
@@ -1868,55 +2072,61 @@ local function changed()
     end)
 end
 
-section(MathPage, "Shapes the solver may use")
-local FamilyChips = chips(MathPage, FAMILIES, function(f) return Opt.Families[f] end, function(f, v)
-    Opt.Families[f] = v
-    changed()
-end)
-note(MathPage, "Lines a·x · Bends abs() · Arcs x² · Curves x³ · Waves sin/cos · Steps tanh · Bumps hills · Fancy braids · Calculus ∫ Σ cosh", 26)
-section(MathPage, "Calculus mode")
 do
-local CalcToggle = toggle(MathPage, "Calculus mode", "the game's own switch (PC): lets the solver use ∫, Σ, cosh, cbrt",
-    calcOn, function(v)
-        local remotes = MR and MR:FindFirstChild("Remotes")
-        local ev = remotes and remotes:FindFirstChild("SetAdvancedMode")
-        if ev then pcall(function() ev:FireServer(v) end) end
+    section(MathPage, "Shapes the solver may use")
+    local FamilyChips = chips(MathPage, FAMILIES, function(f) return Opt.Families[f] end, function(f, v)
+        Opt.Families[f] = v
+        changed()
     end)
-track(LocalPlayer:GetAttributeChangedSignal("AdvancedMode"):Connect(function()
-    CalcToggle.Refresh()
-    changed()
-end))
+    note(MathPage, "Lines a·x · Bends abs() · Arcs x² · Curves x³ · Waves sin/cos · Steps tanh · Bumps hills · Fancy braids · Calculus ∫ Σ cosh", 26)
+    section(MathPage, "Calculus mode")
+    do
+    local CalcToggle = toggle(MathPage, "Calculus mode", "the game's own switch (PC): lets the solver use ∫, Σ, cosh, cbrt",
+        calcOn, function(v)
+            local remotes = MR and MR:FindFirstChild("Remotes")
+            local ev = remotes and remotes:FindFirstChild("SetAdvancedMode")
+            if ev then pcall(function() ev:FireServer(v) end) end
+        end)
+    track(LocalPlayer:GetAttributeChangedSignal("AdvancedMode"):Connect(function()
+        CalcToggle.Refresh()
+        changed()
+    end))
+    end
+    section(MathPage, "Limits")
+    slider(MathPage, "Max length", 6, 200, 1, function() return Opt.MaxLen end, function(v) Opt.MaxLen = v changed() end,
+        function(v) return v .. " chars" end)
+    slider(MathPage, "Max decimals", 0, 3, 1, function() return Opt.MaxDec end, function(v) Opt.MaxDec = v changed() end)
+    slider(MathPage, "Max corners", 1, 6, 1, function() return Opt.MaxBends end, function(v) Opt.MaxBends = v changed() end)
+    slider(MathPage, "Space from blocks", 0, 2, 0.05, function() return Opt.Clearance end, function(v) Opt.Clearance = v changed() end,
+        function(v) return ("%.2f"):format(v) end)
+    choice(MathPage, "Prefer", { { "Shortest", "Shortest" }, { "Closest to drawing", "My drawing" }, { "Hits most", "Hits most" } },
+        function() return Opt.Prefer end, function(v) Opt.Prefer = v changed() end)
+    section(MathPage, "Rules")
+    toggle(MathPage, "Keypad friendly", "only what the touch keypad can type (not calculus)", function() return Opt.KeypadOnly end,
+        function(v) Opt.KeypadOnly = v changed() end)
+    toggle(MathPage, "Lock aim", "keep the launch angle and end point you drew", function() return Made.LockAim end,
+        function(v) Made.LockAim = v Saved.LockAim = v changed() end)
+    toggle(MathPage, "Snap to enemy", "aim at the player your drag ends on", function() return Made.Snap end,
+        function(v) Made.Snap = v Saved.Snap = v changed() end)
+    toggle(MathPage, "Multi target", "a drawn path past several players goes through all of them", function() return Opt.Multi end,
+        function(v) Opt.Multi = v changed() end)
+    toggle(MathPage, "Longer ones too", "ignores max length (game limit) and adds two-shape combos", function() return Opt.Longer end,
+        function(v) Opt.Longer = v changed() end)
+    section(MathPage, "Presets")
+    local presets = row(MathPage, 24)
+    track(button(presets, "Simple only").Activated:Connect(function()
+        for _, f in ipairs(FAMILIES) do Opt.Families[f] = f == "Lines" or f == "Bends" or f == "Arcs" end
+        Opt.MaxLen, Opt.MaxDec = 24, 1
+        FamilyChips.Refresh()
+        changed()
+    end))
+    track(button(presets, "Everything").Activated:Connect(function()
+        for _, f in ipairs(FAMILIES) do Opt.Families[f] = true end
+        Opt.MaxLen, Opt.MaxDec = 200, 3
+        FamilyChips.Refresh()
+        changed()
+    end))
 end
-section(MathPage, "Limits")
-slider(MathPage, "Max length", 6, 200, 1, function() return Opt.MaxLen end, function(v) Opt.MaxLen = v changed() end,
-    function(v) return v .. " chars" end)
-slider(MathPage, "Max decimals", 0, 3, 1, function() return Opt.MaxDec end, function(v) Opt.MaxDec = v changed() end)
-slider(MathPage, "Max corners", 1, 6, 1, function() return Opt.MaxBends end, function(v) Opt.MaxBends = v changed() end)
-slider(MathPage, "Space from blocks", 0, 2, 0.05, function() return Opt.Clearance end, function(v) Opt.Clearance = v changed() end,
-    function(v) return ("%.2f"):format(v) end)
-choice(MathPage, "Prefer", { { "Shortest", "Shortest" }, { "Closest to drawing", "My drawing" }, { "Hits most", "Hits most" } },
-    function() return Opt.Prefer end, function(v) Opt.Prefer = v changed() end)
-section(MathPage, "Rules")
-toggle(MathPage, "Keypad friendly", "only what the touch keypad can type (not calculus)", function() return Opt.KeypadOnly end,
-    function(v) Opt.KeypadOnly = v changed() end)
-toggle(MathPage, "Lock aim", "keep the launch angle and end point you drew", function() return Made.LockAim end,
-    function(v) Made.LockAim = v Saved.LockAim = v changed() end)
-toggle(MathPage, "Snap to enemy", "aim at the player your drag ends on", function() return Made.Snap end,
-    function(v) Made.Snap = v Saved.Snap = v changed() end)
-section(MathPage, "Presets")
-local presets = row(MathPage, 24)
-track(button(presets, "Simple only").Activated:Connect(function()
-    for _, f in ipairs(FAMILIES) do Opt.Families[f] = f == "Lines" or f == "Bends" or f == "Arcs" end
-    Opt.MaxLen, Opt.MaxDec = 24, 1
-    FamilyChips.Refresh()
-    changed()
-end))
-track(button(presets, "Everything").Activated:Connect(function()
-    for _, f in ipairs(FAMILIES) do Opt.Families[f] = true end
-    Opt.MaxLen, Opt.MaxDec = 200, 3
-    FamilyChips.Refresh()
-    changed()
-end))
 
 local PreviewOn = Saved.Preview
 section(ExtrasPage, "Helpers")
@@ -1931,6 +2141,18 @@ toggle(ExtrasPage, "Key guide", "highlights the next key to tap on the keypad", 
     saveSettings()
     if setGuideOn then setGuideOn(v) end
 end)
+section(ExtrasPage, "Other players")
+local Others = {} -- Info label; Set is filled in by the others' aims section
+toggle(ExtrasPage, "Show others' aims", "draws where everyone's typed equation goes", function() return Saved.Others end, function(v)
+    Saved.Others = v
+    saveSettings()
+    if Others.Set then Others.Set(v) end
+end)
+slider(ExtrasPage, "Their lines see-through", 0, 0.95, 0.05, function() return Saved.OthersAlpha end,
+    function(v) Saved.OthersAlpha = v saveSettings() end, function(v) return ("%d%%"):format(math.floor(v * 100 + 0.5)) end)
+Others.Info = note(ExtrasPage, "", 26)
+toggle(ExtrasPage, "Hide mine from spectators", "your draft only goes out in the last 1.5s; Lock In still shows it",
+    function() return Saved.HideDrafts end, function(v) Saved.HideDrafts = v saveSettings() end)
 section(ExtrasPage, "Recent equations")
 local HistoryBox = make("Frame", { BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y,
     LayoutOrder = nextOrder(), ZIndex = 11 }, ExtrasPage)
@@ -2095,6 +2317,19 @@ solveDrag = function()
     Made.Aim, Made.Route, Made.NoAimFor, Made.Mode, Made.Target = nil, nil, nil, "follow", nil
     setStatus("Working it out...", THEME.Dim)
     task.spawn(function()
+        if Made.Snap and Opt.Multi then
+            local many = targetsOfDrag(Made.Raw, Made.Facing)
+            if #many >= 2 then
+                setStatus("Aiming through " .. #many .. " players...", THEME.Dim)
+                local aim = aimMulti(many)
+                if aim and #aim.List > 0 then
+                    Made.Aim, Made.Mode = aim, "aim"
+                    showResult()
+                    if Made.Text then return end
+                    Made.Aim, Made.Route, Made.Mode = nil, nil, "follow"
+                end
+            end
+        end
         local target = Made.Snap and targetOfDrag(Made.Raw, Made.Facing)
         if target then
             setStatus("Aiming at " .. target.Name .. "...", THEME.Dim)
@@ -2366,6 +2601,120 @@ task.spawn(function()
         task.wait(0.15)
     end
 end)
+
+--// other players' aims ---------------------------------------------------------------
+-- What spectators see: the game's SpectateEquation remote answers with every
+-- player's typed equation ({ id = CombatantId, expression, facing }) and its
+-- spectate view draws them. Here they're traced the same way from each
+-- player's spot and drawn in their colour. The server decides who it
+-- answers; if it only answers spectators, the note says so.
+--
+-- Hiding yours: the game sends your typed equation as a draft through
+-- SubmitFunction (4th argument false) every 0.3s, and that's what spectators
+-- see; when time runs out the last draft is the shot. With the toggle on,
+-- drafts are answered "retry" on your side (nothing leaves) until the last
+-- 1.5s of the turn, when they go through as normal. Lock In always goes.
+do
+    local remotes = MR and MR:FindFirstChild("Remotes")
+    local spectate = remotes and remotes:FindFirstChild("SpectateEquation")
+    local submit = remotes and remotes:FindFirstChild("SubmitFunction")
+    local state = remotes and remotes:FindFirstChild("State")
+    local OthersOn = Saved.Others
+    local pools, cache = {}, {}
+
+    local function info(text) Others.Info.Text = text end
+    local function dropAll()
+        for id, pool in pairs(pools) do clearPool(pool) pools[id], cache[id] = nil, nil end
+    end
+    Others.Set = function(on)
+        OthersOn = on
+        if not on then dropAll() info("") end
+    end
+
+    local function modelFor(id)
+        for _, m in ipairs(Workspace:GetChildren()) do
+            if m:IsA("Model") and m:GetAttribute("CombatantId") == id then return m end
+        end
+    end
+
+    local function drawOthers()
+        if not spectate then info("this server has no spectate data") return end
+        local ok, reply = pcall(function() return spectate:InvokeServer() end)
+        if not ok or type(reply) ~= "table" then info("couldn't reach the server") return end
+        if not reply.ok or type(reply.equations) ~= "table" then
+            dropAll()
+            info("the server only shares these while you spectate")
+            return
+        end
+        local mine = LocalPlayer:GetAttribute("CombatantId")
+        local ox, oy = boardOffset()
+        local seen, shown = {}, 0
+        for _, eq in ipairs(reply.equations) do
+            local m = eq.id ~= mine and modelFor(eq.id)
+            if m and m.PrimaryPart and (m:GetAttribute("HP") or 1) > 0 and type(eq.expression) == "string" and eq.expression ~= "" then
+                seen[eq.id] = true
+                local x, y = toMath(m.PrimaryPart.Position)
+                x, y = x - ox, y + MUZZLE - oy
+                local f = eq.facing == -1 and -1 or 1
+                local key = ("%s|%d|%d|%d"):format(eq.expression, f, math.round(x * 10), math.round(y * 10))
+                local pool = pools[eq.id]
+                if not pool then
+                    pool = newPool(m:GetAttribute("Color") or Color3.fromRGB(50, 153, 213), 0.45, 0.02)
+                    pools[eq.id] = pool
+                end
+                pool.Alpha = Saved.OthersAlpha
+                if cache[eq.id] ~= key or pool.ShownAlpha ~= pool.Alpha then
+                    cache[eq.id] = key
+                    pool.ShownAlpha = pool.Alpha
+                    local path = trace(eq.expression, x, y, f)
+                    if path then drawPoints(pool, pathPoints(path)) else clearPool(pool) end
+                end
+                shown += 1
+            end
+        end
+        for id, pool in pairs(pools) do
+            if not seen[id] then clearPool(pool) pools[id], cache[id] = nil, nil end
+        end
+        info(shown == 0 and "nobody's typing yet" or (shown .. " shown"))
+    end
+
+    task.spawn(function()
+        while not Unloaded do
+            if OthersOn then pcall(drawOthers) end
+            task.wait(0.3)
+        end
+        dropAll()
+    end)
+
+    -- hiding yours: one hook per session, steered through Genv so a re-run
+    -- of the script takes it over instead of stacking another
+    local Hide = Genv.__MathWarsHide or {}
+    Genv.__MathWarsHide = Hide
+    Hide.On = function() return not Unloaded and Saved.HideDrafts end
+    Hide.Submit = submit
+    Hide.TimeLeft = function()
+        if not state then return 0 end
+        if state:GetAttribute("TimerPaused") == true then return state:GetAttribute("PausedTimeLeft") or 0 end
+        return (state:GetAttribute("PhaseEndsAt") or 0) - Workspace:GetServerTimeNow()
+    end
+    if submit and not Hide.Hooked and typeof(hookmetamethod) == "function" and typeof(getnamecallmethod) == "function" then
+        Hide.Hooked = true
+        local wrap = typeof(newcclosure) == "function" and newcclosure or function(f) return f end
+        local old
+        old = hookmetamethod(game, "__namecall", wrap(function(self, ...)
+            local h = Genv.__MathWarsHide
+            if h and self == h.Submit and h.On() and getnamecallmethod() == "InvokeServer"
+                and not (typeof(checkcaller) == "function" and checkcaller()) then
+                local locked = select(4, ...)
+                if locked == false and h.TimeLeft() > 1.5 then return { retry = true } end
+            end
+            return old(self, ...)
+        end))
+    end
+    if not submit or (not Hide.Hooked and typeof(hookmetamethod) ~= "function") then
+        Hide.Missing = true
+    end
+end
 
 --// key guide -------------------------------------------------------------------------
 local Mark, MarkNext
