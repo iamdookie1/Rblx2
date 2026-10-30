@@ -839,52 +839,161 @@ local function rankedCandidates(level)
 end
 
 --// the board: blocks and players ----------------------------------------------------
--- Blocks are parts under workspace.Arena with a "Cell" or "ObstacleId"
--- attribute (what the game's own teleport check looks for); a shot stops at
--- the first one. Players are workspace models with a "CombatantId" and HP
--- left, hit within Config.HITBOX_RADIUS of their PrimaryPart, and a shot can
--- go through several of them.
+-- Blocks are the obstacle shapes under workspace.Arena. Each one is an
+-- invisible 1x1x1 marker (with "ObstacleId", "Shape" and "Radius") whose real
+-- outline is its "ShapeBody" children: a turned box for squares, an upright
+-- cylinder for circles and wedge pairs for triangles, hexagons, stars and
+-- anything already broken. Those are read back into board outlines here, so
+-- damage shows up too. Older maps tag full size cells with "Cell" instead.
+-- A shot stops at the first one. Players are workspace models with a
+-- "CombatantId" and HP left, hit within Config.HITBOX_RADIUS of their
+-- PrimaryPart, and a shot can go through several of them.
 
 local HITBOX = Config.HITBOX_RADIUS or 2.8
 local HASH = 4
 
-local function buildBlocks()
-    local grid = {}
-    local arena = Workspace:FindFirstChild("Arena")
-    if not arena then return grid end
-    local ox, oy = boardOffset()
-    for _, d in ipairs(arena:GetDescendants()) do
-        if d:IsA("BasePart") and (d:GetAttribute("Cell") ~= nil or d:GetAttribute("ObstacleId") ~= nil) then
-            local cf, size = d.CFrame, d.Size
-            local function half(axis)
-                return (math.abs(cf.RightVector[axis]) * size.X + math.abs(cf.UpVector[axis]) * size.Y
-                    + math.abs(cf.LookVector[axis]) * size.Z) / 2
+local buildBlocks, blockAt
+do
+    -- a board point from a world position
+    local function boardPoint(v, ox, oy)
+        return v.X - ox, -v.Z - oy
+    end
+
+    -- the outline of one block part on the board: a circle or a convex polygon
+    local function outlineOf(d, ox, oy)
+        local cf, size = d.CFrame, d.Size
+        local pos, R, U, Z = cf.Position, cf.RightVector, cf.UpVector, -cf.LookVector
+        local function at(lx, ly, lz)
+            return boardPoint(pos + R * lx + U * ly + Z * lz, ox, oy)
+        end
+        local sx, sy, sz = size.X / 2, size.Y / 2, size.Z / 2
+        if d:IsA("WedgePart") then
+            -- the side profile is a right triangle; whichever axis is upright,
+            -- the other two span it on the board
+            local axes = { { R, sx }, { U, sy }, { Z, sz } }
+            local up = 1
+            for i = 2, 3 do
+                if math.abs(axes[i][1].Y) > math.abs(axes[up][1].Y) then up = i end
             end
-            local hx, hy, hz = half("X"), half("Y"), half("Z")
-            local pos = cf.Position
-            if pos.Y - hy <= PLANE_Y and pos.Y + hy >= PLANE_Y then
-                local rect = { pos.X - hx - ox, pos.X + hx - ox, -(pos.Z + hz) - oy, -(pos.Z - hz) - oy }
-                for gx = math.floor((rect[1] - 0.5) / HASH), math.floor((rect[2] + 0.5) / HASH) do
-                    for gy = math.floor((rect[3] - 0.5) / HASH), math.floor((rect[4] + 0.5) / HASH) do
-                        local key = gx * 1000 + gy
-                        local cell = grid[key]
-                        if not cell then cell = {} grid[key] = cell end
-                        cell[#cell + 1] = rect
+            if up ~= 1 then
+                -- lying on its side: fall back to its footprint
+                local x, y = boardPoint(pos, ox, oy)
+                local r = math.sqrt(sx * sx + sy * sy + sz * sz)
+                return { Circle = true, X = x, Y = y, R = r, MinX = x - r, MaxX = x + r, MinY = y - r, MaxY = y + r }
+            end
+            local ax, ay = at(0, -sy, -sz)
+            local bx, by = at(0, -sy, sz)
+            local cx, cy = at(0, sy, sz)
+            return { Pts = { ax, ay, bx, by, cx, cy } }
+        end
+        if d:IsA("Part") and d.Shape == Enum.PartType.Cylinder then
+            local x, y = boardPoint(pos, ox, oy)
+            local r = math.max(sy, sz)
+            if math.abs(R.Y) < 0.7 then r = math.max(r, sx) end
+            return { Circle = true, X = x, Y = y, R = r, MinX = x - r, MaxX = x + r, MinY = y - r, MaxY = y + r }
+        end
+        if d:IsA("Part") and d.Shape == Enum.PartType.Ball then
+            local x, y = boardPoint(pos, ox, oy)
+            local r = math.max(sx, sy, sz)
+            return { Circle = true, X = x, Y = y, R = r, MinX = x - r, MaxX = x + r, MinY = y - r, MaxY = y + r }
+        end
+        -- a box: its footprint, taken across the two axes that lie flat
+        local axes = { { R, sx }, { U, sy }, { Z, sz } }
+        local up = 1
+        for i = 2, 3 do
+            if math.abs(axes[i][1].Y) > math.abs(axes[up][1].Y) then up = i end
+        end
+        local a, b
+        for i = 1, 3 do
+            if i ~= up then
+                if a then b = axes[i] else a = axes[i] end
+            end
+        end
+        local pts = {}
+        for _, s in ipairs({ { 1, 1 }, { 1, -1 }, { -1, -1 }, { -1, 1 } }) do
+            local x, y = boardPoint(pos + a[1] * (a[2] * s[1]) + b[1] * (b[2] * s[2]), ox, oy)
+            pts[#pts + 1] = x
+            pts[#pts + 1] = y
+        end
+        return { Pts = pts }
+    end
+
+    -- is (x, y) inside outline o, or within margin of it?
+    local function nearOutline(o, x, y, margin)
+        if x < o.MinX - margin or x > o.MaxX + margin or y < o.MinY - margin or y > o.MaxY + margin then return false end
+        if o.Circle then
+            return (x - o.X) ^ 2 + (y - o.Y) ^ 2 <= (o.R + margin) ^ 2
+        end
+        local p, n = o.Pts, #o.Pts
+        local inside = false
+        local m2 = margin * margin
+        local jx, jy = p[n - 1], p[n]
+        for i = 1, n, 2 do
+            local ix, iy = p[i], p[i + 1]
+            if (iy > y) ~= (jy > y) and x < (jx - ix) * (y - iy) / (jy - iy) + ix then inside = not inside end
+            if margin > 0 then
+                local ex, ey = jx - ix, jy - iy
+                local len = ex * ex + ey * ey
+                local t = len > 0 and math.clamp(((x - ix) * ex + (y - iy) * ey) / len, 0, 1) or 0
+                local qx, qy = ix + ex * t - x, iy + ey * t - y
+                if qx * qx + qy * qy <= m2 then return true end
+            end
+            jx, jy = ix, iy
+        end
+        return inside
+    end
+
+    local function isBlockPart(d)
+        if d.Name == "Stud" then return false end
+        if d:GetAttribute("Cell") ~= nil then return true end
+        if d.Name == "ShapeBody" then return d.CanCollide ~= false end
+        -- an obstacle marker counts only when it has no body under it
+        if d:GetAttribute("ObstacleId") ~= nil then
+            return d:FindFirstChild("ShapeBody") == nil and d.Size.X > 1.5
+        end
+        return false
+    end
+
+    function buildBlocks()
+        local grid = {}
+        local arena = Workspace:FindFirstChild("Arena")
+        if not arena then return grid end
+        local ox, oy = boardOffset()
+        for _, d in ipairs(arena:GetDescendants()) do
+            if d:IsA("BasePart") and isBlockPart(d) then
+                local ok, o = pcall(outlineOf, d, ox, oy)
+                if ok and o then
+                    if o.Pts then
+                        local p = o.Pts
+                        o.MinX, o.MaxX, o.MinY, o.MaxY = math.huge, -math.huge, math.huge, -math.huge
+                        for i = 1, #p, 2 do
+                            o.MinX, o.MaxX = math.min(o.MinX, p[i]), math.max(o.MaxX, p[i])
+                            o.MinY, o.MaxY = math.min(o.MinY, p[i + 1]), math.max(o.MaxY, p[i + 1])
+                        end
+                    end
+                    -- filed under every cell it might reach with the widest margin
+                    for gx = math.floor((o.MinX - 2.5) / HASH), math.floor((o.MaxX + 2.5) / HASH) do
+                        for gy = math.floor((o.MinY - 2.5) / HASH), math.floor((o.MaxY + 2.5) / HASH) do
+                            local key = gx * 1000 + gy
+                            local cell = grid[key]
+                            if not cell then cell = {} grid[key] = cell end
+                            cell[#cell + 1] = o
+                        end
                     end
                 end
             end
         end
+        return grid
     end
-    return grid
-end
 
-local function blockAt(grid, x, y, margin)
-    local cell = grid[math.floor(x / HASH) * 1000 + math.floor(y / HASH)]
-    if not cell then return false end
-    for _, r in ipairs(cell) do
-        if x >= r[1] - margin and x <= r[2] + margin and y >= r[3] - margin and y <= r[4] + margin then return true end
+    function blockAt(grid, x, y, margin)
+        local cell = grid[math.floor(x / HASH) * 1000 + math.floor(y / HASH)]
+        if not cell then return false end
+        for _, o in ipairs(cell) do
+            if nearOutline(o, x, y, margin) then return true end
+        end
+        return false
     end
-    return false
 end
 
 local function combatants()
