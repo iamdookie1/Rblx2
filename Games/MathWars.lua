@@ -520,13 +520,16 @@ end
 --   Steps   smooth steps (tanh, logistic)
 --   Bumps   single hills (gaussian and friends)
 --   Fancy   the game's showpiece shapes (beat braid, chirp, crown, ...)
+--   Calculus  integrals, sums, cosh/sinh and roots; only while the game's
+--           CALCULUS MODE is on (a PC setting), typed on a keyboard
 -- The shapes are the same base curves the game's own equation library
 -- (PracticeLessons) builds its presets from: a*g((x-h)/b). Constants don't
 -- change a shot, so only a (height), b (width) and h (shift) are searched.
 
-local FAMILIES = { "Lines", "Bends", "Arcs", "Curves", "Waves", "Steps", "Bumps", "Fancy" }
+local FAMILIES = { "Lines", "Bends", "Arcs", "Curves", "Waves", "Steps", "Bumps", "Fancy", "Calculus" }
 local Opt = {
-    Families = { Lines = true, Bends = true, Arcs = true, Curves = true, Waves = true, Steps = true, Bumps = true, Fancy = false },
+    Families = { Lines = true, Bends = true, Arcs = true, Curves = true, Waves = true, Steps = true, Bumps = true, Fancy = false,
+        Calculus = true },
     MaxLen = 60,          -- longest equation the solver hands you
     MaxDec = 2,           -- most decimals in any number
     Prefer = "Shortest",  -- Shortest / Closest to drawing / Hits most
@@ -536,39 +539,88 @@ local Opt = {
 }
 
 local function tanh(t) return math.tanh(t) end
--- text(bare, atom): bare is the inside for a function's brackets ("x/15"),
--- atom the same thing safe to multiply or raise ("(x/15)"). Numbers go in
--- front by implicit multiplication ("15sin(x/15)"), which the game reads and
--- keeps equations short; no body starts with a digit.
-local SHAPES = {
-    { key = "Wave", fam = "Waves", g = math.sin, text = function(t) return "sin(" .. t .. ")" end },
-    { key = "Cosine wave", fam = "Waves", g = math.cos, text = function(t) return "cos(" .. t .. ")" end },
-    { key = "Arches", fam = "Waves", g = function(t) return math.sin(t) ^ 2 end, text = function(t) return "sin(" .. t .. ")^2" end },
-    { key = "Zigzag", fam = "Waves", g = function(t) return math.asin(math.sin(t)) end, text = function(t) return "arcsin(sin(" .. t .. "))" end },
-    { key = "Square wave", fam = "Steps", g = function(t) return tanh(5 * math.sin(t)) end, text = function(t) return "tanh(5sin(" .. t .. "))" end },
-    { key = "Step", fam = "Steps", g = tanh, text = function(t) return "tanh(" .. t .. ")" end },
-    { key = "Logistic step", fam = "Steps", g = function(t) return 1 / (1 + math.exp(-t)) end,
-        text = function(_, a) return "(1/(1+exp(-" .. a .. ")))" end },
-    { key = "Smooth stairs", fam = "Steps", g = function(t) return t - math.sin(t) end,
-        text = function(t, a) return "(" .. a .. "-sin(" .. t .. "))" end },
-    { key = "Hill", fam = "Bumps", g = function(t) return math.exp(-t * t) end, text = function(_, a) return "exp(-" .. a .. "^2)" end },
-    { key = "Twin hills", fam = "Bumps", g = function(t) return math.exp(-(t - 1) ^ 2) + math.exp(-(t + 1) ^ 2) end,
-        text = function(t) return "(exp(-(" .. t .. "-1)^2)+exp(-(" .. t .. "+1)^2))" end },
-    { key = "Bridge", fam = "Bumps", g = function(t) return tanh(t + 1) - tanh(t - 1) end,
-        text = function(t) return "(tanh(" .. t .. "+1)-tanh(" .. t .. "-1))" end },
-    { key = "Cubic", fam = "Curves", g = function(t) return t ^ 3 end, text = function(_, a) return a .. "^3" end },
-    { key = "Beat braid", fam = "Fancy", g = function(t) return math.sin(6 * t) * math.cos(t) end,
-        text = function(t, a) return "sin(6" .. a .. ")cos(" .. t .. ")" end },
-    { key = "Ribbon", fam = "Fancy", g = function(t) return math.sin(t + 2 * math.sin(t)) end,
-        text = function(t) return "sin(" .. t .. "+2sin(" .. t .. "))" end },
-    { key = "Chirp", fam = "Fancy", g = function(t) return math.sin(t * t) end, text = function(_, a) return "sin(" .. a .. "^2)" end },
-    { key = "Hill wave", fam = "Fancy", g = function(t) return math.exp(-t * t) * math.sin(6 * t) end,
-        text = function(_, a) return "exp(-" .. a .. "^2)sin(6" .. a .. ")" end },
-    { key = "Crown", fam = "Fancy", g = function(t) return math.abs(math.sin(t)) + 0.3 * math.cos(6 * t) end,
-        text = function(t, a) return "(abs(sin(" .. t .. "))+0.3cos(6" .. a .. "))" end },
-    { key = "Serpent", fam = "Fancy", g = function(t) return math.sin(3 * math.sin(t)) end,
-        text = function(t) return "sin(3sin(" .. t .. "))" end },
-}
+
+-- the game's calculus mode: the player's "AdvancedMode" attribute, switched
+-- by its own CALCULUS MODE button (Remotes.SetAdvancedMode)
+local function calcOn() return LocalPlayer:GetAttribute("AdvancedMode") == true end
+
+local SHAPES
+do
+    -- t -> the integral of f from 0 to t, from a table filled once (Simpson
+    -- steps out to +-span, flat past the ends)
+    local function integralOf(f, span, step)
+        local n = math.floor(span / step + 0.5)
+        local pos, neg = { [0] = 0 }, { [0] = 0 }
+        for i = 1, n do
+            local a, b = (i - 1) * step, i * step
+            pos[i] = pos[i - 1] + (f(a) + 4 * f((a + b) / 2) + f(b)) * step / 6
+            neg[i] = neg[i - 1] - (f(-a) + 4 * f(-(a + b) / 2) + f(-b)) * step / 6
+        end
+        return function(t)
+            local tab = t >= 0 and pos or neg
+            local u = math.min(math.abs(t) / step, n)
+            local i = math.floor(u)
+            if i >= n then return tab[n] end
+            return tab[i] + (tab[i + 1] - tab[i]) * (u - i)
+        end
+    end
+    local function oddSum(t, terms)
+        local s = 0
+        for k = 1, terms do s += math.sin((2 * k - 1) * t) / (2 * k - 1) end
+        return s
+    end
+    local function sawSum(t, terms)
+        local s = 0
+        for k = 1, terms do s += (k % 2 == 1 and 1 or -1) * math.sin(k * t) / k end
+        return s
+    end
+    -- text(bare, atom): bare is the inside for a function's brackets ("x/15"),
+    -- atom the same thing safe to multiply or raise ("(x/15)"). Numbers go in
+    -- front by implicit multiplication ("15sin(x/15)"), which the game reads and
+    -- keeps equations short; no body starts with a digit.
+    SHAPES = {
+        { key = "Wave", fam = "Waves", g = math.sin, text = function(t) return "sin(" .. t .. ")" end },
+        { key = "Cosine wave", fam = "Waves", g = math.cos, text = function(t) return "cos(" .. t .. ")" end },
+        { key = "Arches", fam = "Waves", g = function(t) return math.sin(t) ^ 2 end, text = function(t) return "sin(" .. t .. ")^2" end },
+        { key = "Zigzag", fam = "Waves", g = function(t) return math.asin(math.sin(t)) end, text = function(t) return "arcsin(sin(" .. t .. "))" end },
+        { key = "Square wave", fam = "Steps", g = function(t) return tanh(5 * math.sin(t)) end, text = function(t) return "tanh(5sin(" .. t .. "))" end },
+        { key = "Step", fam = "Steps", g = tanh, text = function(t) return "tanh(" .. t .. ")" end },
+        { key = "Logistic step", fam = "Steps", g = function(t) return 1 / (1 + math.exp(-t)) end,
+            text = function(_, a) return "(1/(1+exp(-" .. a .. ")))" end },
+        { key = "Smooth stairs", fam = "Steps", g = function(t) return t - math.sin(t) end,
+            text = function(t, a) return "(" .. a .. "-sin(" .. t .. "))" end },
+        { key = "Hill", fam = "Bumps", g = function(t) return math.exp(-t * t) end, text = function(_, a) return "exp(-" .. a .. "^2)" end },
+        { key = "Twin hills", fam = "Bumps", g = function(t) return math.exp(-(t - 1) ^ 2) + math.exp(-(t + 1) ^ 2) end,
+            text = function(t) return "(exp(-(" .. t .. "-1)^2)+exp(-(" .. t .. "+1)^2))" end },
+        { key = "Bridge", fam = "Bumps", g = function(t) return tanh(t + 1) - tanh(t - 1) end,
+            text = function(t) return "(tanh(" .. t .. "+1)-tanh(" .. t .. "-1))" end },
+        { key = "Cubic", fam = "Curves", g = function(t) return t ^ 3 end, text = function(_, a) return a .. "^3" end },
+        { key = "Beat braid", fam = "Fancy", g = function(t) return math.sin(6 * t) * math.cos(t) end,
+            text = function(t, a) return "sin(6" .. a .. ")cos(" .. t .. ")" end },
+        { key = "Ribbon", fam = "Fancy", g = function(t) return math.sin(t + 2 * math.sin(t)) end,
+            text = function(t) return "sin(" .. t .. "+2sin(" .. t .. "))" end },
+        { key = "Chirp", fam = "Fancy", g = function(t) return math.sin(t * t) end, text = function(_, a) return "sin(" .. a .. "^2)" end },
+        { key = "Hill wave", fam = "Fancy", g = function(t) return math.exp(-t * t) * math.sin(6 * t) end,
+            text = function(_, a) return "exp(-" .. a .. "^2)sin(6" .. a .. ")" end },
+        { key = "Crown", fam = "Fancy", g = function(t) return math.abs(math.sin(t)) + 0.3 * math.cos(6 * t) end,
+            text = function(t, a) return "(abs(sin(" .. t .. "))+0.3cos(6" .. a .. "))" end },
+        { key = "Serpent", fam = "Fancy", g = function(t) return math.sin(3 * math.sin(t)) end,
+            text = function(t) return "sin(3sin(" .. t .. "))" end },
+        -- calculus mode: written the way the game's calculus box shows them
+        { key = "Bell step", fam = "Calculus", g = integralOf(function(t) return math.exp(-t * t) end, 6, 0.02),
+            text = function(t) return "∫_(0)^(" .. t .. ")(exp(-t^2))dt" end },
+        { key = "Fresnel curl", fam = "Calculus", g = integralOf(function(t) return math.sin(t * t) end, 100, 0.004),
+            text = function(t) return "∫_(0)^(" .. t .. ")(sin(t^2))dt" end },
+        { key = "Fourier square", fam = "Calculus", g = function(t) return oddSum(t, 3) end,
+            text = function(_, a) return "Σ_(n=1)^(3)(sin((2n-1)" .. a .. ")/(2n-1))" end },
+        { key = "Fourier saw", fam = "Calculus", g = function(t) return sawSum(t, 4) end,
+            text = function(_, a) return "Σ_(n=1)^(4)((-1)^(n+1)sin(n" .. a .. ")/n)" end },
+        { key = "Catenary", fam = "Calculus", g = function(t) return math.cosh(math.clamp(t, -30, 30)) end, text = function(t) return "cosh(" .. t .. ")" end },
+        { key = "Sinh curve", fam = "Calculus", g = function(t) return math.sinh(math.clamp(t, -30, 30)) end, text = function(t) return "sinh(" .. t .. ")" end },
+        { key = "Cube root", fam = "Calculus", g = function(t) return t < 0 and -(-t) ^ (1 / 3) or t ^ (1 / 3) end,
+            text = function(t) return "cbrt(" .. t .. ")" end },
+    }
+end
 
 -- the inside of a shape, (x - h)/b, bare and as an atom (b is always
 -- positive here); the rounded b and h come back too
@@ -622,10 +674,17 @@ local function keypadOk(text)
     return not text:find("[^%w%.%+%-%*/%^%(%)]")
 end
 
+-- is a family usable right now? (Calculus also needs calculus mode on)
+local function familyOn(family)
+    return Opt.Families[family] == true and (family ~= "Calculus" or calcOn())
+end
+
 -- does an option fit the Math tab's rules?
 local function allowed(text, family)
     if #text > Opt.MaxLen then return false end
     if family and not Opt.Families[family] then return false end
+    -- calculus shapes need calculus mode, which is keyboard only anyway
+    if family == "Calculus" then return calcOn() end
     if Opt.KeypadOnly and not keypadOk(text) then return false end
     return true
 end
@@ -728,7 +787,7 @@ local function buildCandidates()
     -- only the closest few get compiled and scored for real
     local fits = {}
     for _, shape in ipairs(SHAPES) do
-        if Opt.Families[shape.fam] then
+        if familyOn(shape.fam) then
             for _, bf in ipairs({ 0.06, 0.1, 0.16, 0.25, 0.4, 0.65, 1 }) do
                 local b = math.max(1, total * bf)
                 for _, hf in ipairs({ 0, 0.25, 0.5, 0.75 }) do
@@ -1198,7 +1257,7 @@ local function aimOptions(target)
     -- the game's shapes through you and the target: for a width and shift,
     -- the height that lands on the target is a single division
     for _, shape in ipairs(SHAPES) do
-        if Opt.Families[shape.fam] then
+        if familyOn(shape.fam) then
             for _, bf in ipairs({ 0.08, 0.12, 0.18, 0.27, 0.4, 0.6, 0.9 }) do
                 local b = math.max(1, du * bf)
                 for _, hf in ipairs({ 0, 0.25, 0.5, 0.75 }) do
@@ -1464,8 +1523,7 @@ local Panel = make("Frame", {
 }, Gui)
 corner(Panel, 10)
 gradient(Panel, THEME.BgTop, THEME.Bg, 90)
-local PanelStroke = stroke(Panel, Color3.new(1, 1, 1), 0)
-gradient(PanelStroke, THEME.Steel, THEME.Line, 90)
+gradient(stroke(Panel, Color3.new(1, 1, 1), 0), THEME.Steel, THEME.Line, 90)
 
 -- header: title, collapse button, and a thin steel line under it
 local Bar = make("Frame", { BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 38), ZIndex = 11, Active = true }, Panel)
@@ -1775,17 +1833,20 @@ local PathPage = newTab("Path")
 local MathPage = newTab("Math")
 local ExtrasPage = newTab("Extras")
 
-local r1 = row(PathPage, 28)
-local CreateBtn = button(r1, "Create path", "primary")
-local AimBtn = button(r1, "Aim at nearest", "primary")
-local r2 = row(PathPage, 24)
-local SimplifyBtn = button(r2, "Simplify")
-local TargetBtn = button(r2, "Next target")
-local r3 = row(PathPage, 24)
-local CopyBtn = button(r3, "Copy")
-local PasteBtn = button(r3, "Put in box")
-local r4 = row(PathPage, 24)
-local ClearBtn = button(r4, "Clear", "normal", 1)
+local CreateBtn, AimBtn, SimplifyBtn, TargetBtn, CopyBtn, PasteBtn, ClearBtn
+do
+    local r = row(PathPage, 28)
+    CreateBtn = button(r, "Create path", "primary")
+    AimBtn = button(r, "Aim at nearest", "primary")
+    r = row(PathPage, 24)
+    SimplifyBtn = button(r, "Simplify")
+    TargetBtn = button(r, "Next target")
+    r = row(PathPage, 24)
+    CopyBtn = button(r, "Copy")
+    PasteBtn = button(r, "Put in box")
+    r = row(PathPage, 24)
+    ClearBtn = button(r, "Clear", "normal", 1)
+end
 
 local Status = text({
     Text = "Press Create path and drag on the board, or Aim at nearest.", TextSize = 11, TextColor3 = THEME.Dim,
@@ -1812,7 +1873,20 @@ local FamilyChips = chips(MathPage, FAMILIES, function(f) return Opt.Families[f]
     Opt.Families[f] = v
     changed()
 end)
-note(MathPage, "Lines a·x · Bends abs() · Arcs x² · Curves x³ · Waves sin/cos · Steps tanh · Bumps hills · Fancy braids, chirps", 26)
+note(MathPage, "Lines a·x · Bends abs() · Arcs x² · Curves x³ · Waves sin/cos · Steps tanh · Bumps hills · Fancy braids · Calculus ∫ Σ cosh", 26)
+section(MathPage, "Calculus mode")
+do
+local CalcToggle = toggle(MathPage, "Calculus mode", "the game's own switch (PC): lets the solver use ∫, Σ, cosh, cbrt",
+    calcOn, function(v)
+        local remotes = MR and MR:FindFirstChild("Remotes")
+        local ev = remotes and remotes:FindFirstChild("SetAdvancedMode")
+        if ev then pcall(function() ev:FireServer(v) end) end
+    end)
+track(LocalPlayer:GetAttributeChangedSignal("AdvancedMode"):Connect(function()
+    CalcToggle.Refresh()
+    changed()
+end))
+end
 section(MathPage, "Limits")
 slider(MathPage, "Max length", 6, 200, 1, function() return Opt.MaxLen end, function(v) Opt.MaxLen = v changed() end,
     function(v) return v .. " chars" end)
@@ -1823,7 +1897,7 @@ slider(MathPage, "Space from blocks", 0, 2, 0.05, function() return Opt.Clearanc
 choice(MathPage, "Prefer", { { "Shortest", "Shortest" }, { "Closest to drawing", "My drawing" }, { "Hits most", "Hits most" } },
     function() return Opt.Prefer end, function(v) Opt.Prefer = v changed() end)
 section(MathPage, "Rules")
-toggle(MathPage, "Keypad friendly", "only what the touch keypad can type", function() return Opt.KeypadOnly end,
+toggle(MathPage, "Keypad friendly", "only what the touch keypad can type (not calculus)", function() return Opt.KeypadOnly end,
     function(v) Opt.KeypadOnly = v changed() end)
 toggle(MathPage, "Lock aim", "keep the launch angle and end point you drew", function() return Made.LockAim end,
     function(v) Made.LockAim = v Saved.LockAim = v changed() end)
@@ -2294,6 +2368,8 @@ task.spawn(function()
 end)
 
 --// key guide -------------------------------------------------------------------------
+local Mark, MarkNext
+do
 -- The game's touch keypad (MathKeypad) is a Numbers pad that's always up
 -- (digits, x, ., UNDO, left, right) and a Functions pad with three pages
 -- (TRIG, POWERS, SYMBOLS) that its SwitchPage button steps through. Every key
@@ -2390,7 +2466,7 @@ end
 
 local Guide = { On = false, Plan = nil, StuckText = nil, StuckSince = 0 }
 
-local Mark = make("Frame", {
+Mark = make("Frame", {
     Name = "GuideMark", BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1), ZIndex = 60, Active = false,
 }, nil)
 make("UICorner", { CornerRadius = UDim.new(0, 8) }, Mark)
@@ -2406,7 +2482,7 @@ make("UICorner", { CornerRadius = UDim.new(0, 8) }, MarkFill)
 -- the tap after that: a purple ring just outside the button, so it still
 -- shows when it's the same button as the yellow one (a key twice in a row,
 -- or the page switch twice)
-local MarkNext = make("Frame", {
+MarkNext = make("Frame", {
     Name = "GuideMarkNext", BackgroundTransparency = 1, Size = UDim2.new(1, 10, 1, 10),
     Position = UDim2.fromOffset(-5, -5), ZIndex = 61, Active = false,
 }, nil)
@@ -2529,11 +2605,6 @@ end
 local function guideStep()
     local target = Made.Text
     if not target then markOff() setInfo("make a path first") return end
-    if not Guide.Plan or Guide.Plan.Target ~= target then
-        local plan, err = planFor(target)
-        if not plan then markOff() setInfo(err, Color3.fromRGB(255, 110, 110)) return end
-        Guide.Plan = plan
-    end
 
     local box = equationBox()
     local text = box and box.Text or typedText()
@@ -2561,8 +2632,13 @@ local function guideStep()
     end
     if LocalPlayer:GetAttribute("AdvancedMode") == true then
         markOff()
-        setInfo("turn advanced mode off to use the guide", Color3.fromRGB(255, 170, 90))
+        setInfo("calculus mode: use Put in box, or type: " .. target, Color3.fromRGB(255, 170, 90))
         return
+    end
+    if not Guide.Plan or Guide.Plan.Target ~= target then
+        local plan, err = planFor(target)
+        if not plan then markOff() setInfo(err, Color3.fromRGB(255, 110, 110)) return end
+        Guide.Plan = plan
     end
 
     local display = findNamed("MathDisplay", "GuiButton")
@@ -2611,6 +2687,7 @@ task.spawn(function()
         task.wait(0.1)
     end
 end)
+end
 
 --// teardown -------------------------------------------------------------------------
 
