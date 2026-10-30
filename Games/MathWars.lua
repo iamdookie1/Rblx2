@@ -1282,8 +1282,10 @@ local function buildEquation()
 end
 
 --// the window ----------------------------------------------------------------------
--- A small black window with soft gradients, three tabs (Path, Math, Extras),
--- draggable by its header and always kept on screen. Right Shift hides it.
+-- A small gray window with three tabs (Path, Math, Extras), draggable by its header
+-- and always kept on screen. Right Shift hides it.
+-- A UIGradient tints everything its parent draws, text included, so gradients only
+-- go on plain frames; every label and button sits on top of one with no gradient.
 
 local HttpService = game:GetService("HttpService")
 
@@ -1305,18 +1307,22 @@ local function make(class, props, parent)
     return o
 end
 
+local rgb = Color3.fromRGB
 local THEME = {
-    Bg = Color3.fromRGB(12, 12, 15), BgTop = Color3.fromRGB(24, 24, 30), Card = Color3.fromRGB(22, 22, 28),
-    CardTop = Color3.fromRGB(30, 30, 38), Line = Color3.fromRGB(46, 46, 58),
-    A = Color3.fromRGB(150, 92, 255), B = Color3.fromRGB(56, 196, 255), Hot = Color3.fromRGB(255, 96, 140),
-    Btn = Color3.fromRGB(30, 30, 38), On = Color3.fromRGB(150, 92, 255),
-    Text = Color3.fromRGB(238, 240, 246), Dim = Color3.fromRGB(140, 144, 160),
-    Good = Color3.fromRGB(110, 232, 150), Warn = Color3.fromRGB(255, 176, 90), Bad = Color3.fromRGB(255, 104, 112),
+    BgTop = rgb(44, 44, 48), Bg = rgb(22, 22, 25),
+    CardTop = rgb(38, 38, 42), Card = rgb(29, 29, 32),
+    Line = rgb(64, 64, 70), LineHot = rgb(120, 120, 128),
+    BtnTop = rgb(62, 62, 68), Btn = rgb(44, 44, 49),
+    PriTop = rgb(122, 122, 130), Pri = rgb(86, 86, 94),
+    ActTop = rgb(150, 86, 86), Act = rgb(108, 58, 60),
+    Shine = rgb(228, 228, 234), Steel = rgb(140, 140, 148),
+    Text = rgb(242, 242, 245), Dim = rgb(166, 166, 174),
+    Good = rgb(120, 220, 150), Warn = rgb(240, 186, 100), Bad = rgb(240, 112, 116),
 }
 local FONT, FONT_BOLD = Enum.Font.GothamMedium, Enum.Font.GothamBold
-local W = 312
+local W, H = 252, 340
 
-local function corner(o, r) return make("UICorner", { CornerRadius = UDim.new(0, r or 8) }, o) end
+local function corner(o, r) return make("UICorner", { CornerRadius = UDim.new(0, r or 6) }, o) end
 local function gradient(o, a, b, rot)
     return make("UIGradient", { Color = ColorSequence.new(a, b), Rotation = rot or 90 }, o)
 end
@@ -1324,59 +1330,70 @@ local function stroke(o, color, trans)
     return make("UIStroke", { Color = color or THEME.Line, Thickness = 1, Transparency = trans or 0,
         ApplyStrokeMode = Enum.ApplyStrokeMode.Border }, o)
 end
+local function text(props, parent)
+    props.BackgroundTransparency = 1
+    props.Font = props.Font or FONT
+    props.TextColor3 = props.TextColor3 or THEME.Text
+    props.TextXAlignment = props.TextXAlignment or Enum.TextXAlignment.Left
+    return make("TextLabel", props, parent)
+end
 
 -- the layer that takes the drag while armed (under the window)
 local Capture = make("TextButton", {
     Name = "Capture", Text = "", AutoButtonColor = false, Active = true, Modal = false,
-    BackgroundColor3 = Color3.fromRGB(120, 90, 255), BackgroundTransparency = 0.93,
+    BackgroundColor3 = rgb(255, 255, 255), BackgroundTransparency = 0.96,
     Size = UDim2.fromScale(1, 1), Visible = false, ZIndex = 1, BorderSizePixel = 0,
 }, Gui)
-make("TextLabel", {
-    Text = "Drag your path on the board", Font = FONT_BOLD, TextSize = 18, TextColor3 = THEME.Text,
-    BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 40), Position = UDim2.new(0, 0, 0, 60), ZIndex = 2,
-    TextStrokeTransparency = 0.5,
+text({
+    Text = "Drag your path on the board", Font = FONT_BOLD, TextSize = 18, TextStrokeTransparency = 0.4,
+    TextXAlignment = Enum.TextXAlignment.Center, Size = UDim2.new(1, 0, 0, 40), Position = UDim2.new(0, 0, 0, 60), ZIndex = 2,
 }, Capture)
 
 local Panel = make("Frame", {
     Name = "Panel", BackgroundColor3 = Color3.new(1, 1, 1), BorderSizePixel = 0,
-    Size = UDim2.fromOffset(W, 452), Position = UDim2.fromOffset(24, 110), ZIndex = 10, Active = true,
+    Size = UDim2.fromOffset(W, H), Position = UDim2.fromOffset(24, 110), ZIndex = 10, Active = true,
 }, Gui)
-corner(Panel, 12)
+corner(Panel, 10)
 gradient(Panel, THEME.BgTop, THEME.Bg, 90)
-local PanelStroke = stroke(Panel, Color3.new(1, 1, 1), 0.2)
-gradient(PanelStroke, THEME.A, THEME.B, 0)
+local PanelStroke = stroke(Panel, Color3.new(1, 1, 1), 0)
+gradient(PanelStroke, THEME.Steel, THEME.Line, 90)
 
--- header: gradient title, collapse button, and a thin accent line under it
-local Bar = make("Frame", { BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 46), ZIndex = 11, Active = true }, Panel)
-local Title = make("TextLabel", {
-    Text = "MATH WARS", Font = FONT_BOLD, TextSize = 17, TextColor3 = Color3.new(1, 1, 1), BackgroundTransparency = 1,
-    Size = UDim2.new(1, -60, 0, 22), Position = UDim2.fromOffset(14, 6), TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 12,
+-- header: title, collapse button, and a thin steel line under it
+local Bar = make("Frame", { BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 38), ZIndex = 11, Active = true }, Panel)
+text({
+    Text = "Math Wars", Font = FONT_BOLD, TextSize = 14, Size = UDim2.new(1, -50, 0, 16), Position = UDim2.fromOffset(12, 5), ZIndex = 12,
 }, Bar)
-gradient(Title, THEME.A, THEME.B, 0)
-make("TextLabel", {
-    Text = "path tools · right shift hides", Font = FONT, TextSize = 11, TextColor3 = THEME.Dim, BackgroundTransparency = 1,
-    Size = UDim2.new(1, -60, 0, 14), Position = UDim2.fromOffset(14, 27), TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 12,
+text({
+    Text = "path tools  ·  right shift hides", TextSize = 10, TextColor3 = THEME.Dim,
+    Size = UDim2.new(1, -50, 0, 12), Position = UDim2.fromOffset(12, 21), ZIndex = 12,
 }, Bar)
+local CollapseBack = make("Frame", {
+    BackgroundColor3 = Color3.new(1, 1, 1), Size = UDim2.fromOffset(22, 22), Position = UDim2.new(1, -32, 0, 8), ZIndex = 12,
+}, Bar)
+corner(CollapseBack, 6)
+gradient(CollapseBack, THEME.BtnTop, THEME.Btn, 90)
+stroke(CollapseBack)
 local Collapse = make("TextButton", {
-    Text = "–", Font = FONT_BOLD, TextSize = 18, TextColor3 = THEME.Text, BackgroundColor3 = THEME.Card, AutoButtonColor = true,
-    Size = UDim2.fromOffset(28, 28), Position = UDim2.new(1, -40, 0, 9), ZIndex = 12,
-}, Bar)
-corner(Collapse, 8)
-stroke(Collapse)
+    Text = "–", Font = FONT_BOLD, TextSize = 14, TextColor3 = THEME.Text, BackgroundTransparency = 1, AutoButtonColor = false,
+    Size = UDim2.fromScale(1, 1), ZIndex = 13,
+}, CollapseBack)
 local Accent = make("Frame", {
-    BackgroundColor3 = Color3.new(1, 1, 1), BorderSizePixel = 0, Size = UDim2.new(1, -28, 0, 2), Position = UDim2.fromOffset(14, 45), ZIndex = 11,
+    BackgroundColor3 = Color3.new(1, 1, 1), BorderSizePixel = 0, Size = UDim2.new(1, -24, 0, 1), Position = UDim2.fromOffset(12, 37), ZIndex = 11,
 }, Panel)
-gradient(Accent, THEME.A, THEME.B, 0)
+make("UIGradient", {
+    Color = ColorSequence.new(THEME.Line, THEME.Shine), Rotation = 0,
+    Transparency = NumberSequence.new({ NumberSequenceKeypoint.new(0, 0.8), NumberSequenceKeypoint.new(0.5, 0.1), NumberSequenceKeypoint.new(1, 0.8) }),
+}, Accent)
 
 local Body = make("Frame", {
-    BackgroundTransparency = 1, Size = UDim2.new(1, -20, 1, -58), Position = UDim2.fromOffset(10, 54), ZIndex = 10,
+    BackgroundTransparency = 1, Size = UDim2.new(1, -16, 1, -50), Position = UDim2.fromOffset(8, 44), ZIndex = 10,
 }, Panel)
 
--- tabs ------------------------------------------------------------------------------
-local TabBar = make("Frame", { BackgroundColor3 = THEME.Card, Size = UDim2.new(1, 0, 0, 30), ZIndex = 11 }, Body)
-corner(TabBar, 9)
+-- tabs: the selected one gets a raised gray back; the label is a separate, untinted button
+local TabBar = make("Frame", { BackgroundColor3 = THEME.Card, Size = UDim2.new(1, 0, 0, 24), ZIndex = 11 }, Body)
+corner(TabBar, 7)
 stroke(TabBar)
-make("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 4),
+make("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 2),
     HorizontalAlignment = Enum.HorizontalAlignment.Center, VerticalAlignment = Enum.VerticalAlignment.Center }, TabBar)
 
 local Pages, TabButtons = {}, {}
@@ -1384,24 +1401,27 @@ local function selectTab(name)
     for tab, page in pairs(Pages) do
         page.Visible = tab == name
         local b = TabButtons[tab]
-        b.BackgroundTransparency = tab == name and 0 or 1
+        b.Parent.BackgroundTransparency = tab == name and 0 or 1
         b.TextColor3 = tab == name and THEME.Text or THEME.Dim
     end
 end
 local function newTab(name)
-    local b = make("TextButton", {
-        Text = name, Font = FONT_BOLD, TextSize = 13, TextColor3 = THEME.Dim, AutoButtonColor = false,
-        BackgroundColor3 = Color3.new(1, 1, 1), BackgroundTransparency = 1, Size = UDim2.new(1 / 3, -6, 1, -6), ZIndex = 12,
+    local back = make("Frame", {
+        BackgroundColor3 = Color3.new(1, 1, 1), BackgroundTransparency = 1, Size = UDim2.new(1 / 3, -3, 1, -4), ZIndex = 12,
     }, TabBar)
-    corner(b, 7)
-    gradient(b, THEME.A, THEME.B, 0)
+    corner(back, 5)
+    gradient(back, THEME.PriTop, THEME.Pri, 90)
+    local b = make("TextButton", {
+        Text = name, Font = FONT_BOLD, TextSize = 12, TextColor3 = THEME.Dim, AutoButtonColor = false,
+        BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1), ZIndex = 13,
+    }, back)
     local page = make("ScrollingFrame", {
-        BackgroundTransparency = 1, BorderSizePixel = 0, Size = UDim2.new(1, 0, 1, -38), Position = UDim2.fromOffset(0, 38),
-        ScrollBarThickness = 3, ScrollBarImageColor3 = THEME.A, CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y,
+        BackgroundTransparency = 1, BorderSizePixel = 0, Size = UDim2.new(1, 0, 1, -30), Position = UDim2.fromOffset(0, 30),
+        ScrollBarThickness = 2, ScrollBarImageColor3 = THEME.Steel, CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y,
         ScrollingDirection = Enum.ScrollingDirection.Y, Visible = false, ZIndex = 11,
     }, Body)
-    make("UIListLayout", { Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder }, page)
-    make("UIPadding", { PaddingRight = UDim.new(0, 6), PaddingBottom = UDim.new(0, 6) }, page)
+    make("UIListLayout", { Padding = UDim.new(0, 5), SortOrder = Enum.SortOrder.LayoutOrder }, page)
+    make("UIPadding", { PaddingRight = UDim.new(0, 5), PaddingBottom = UDim.new(0, 4) }, page)
     Pages[name], TabButtons[name] = page, b
     track(b.Activated:Connect(function() selectTab(name) end))
     return page
@@ -1411,84 +1431,96 @@ end
 local order = 0
 local function nextOrder() order += 1 return order end
 
-local function section(page, text)
-    return make("TextLabel", {
-        Text = string.upper(text), Font = FONT_BOLD, TextSize = 11, TextColor3 = THEME.Dim, BackgroundTransparency = 1,
-        Size = UDim2.new(1, 0, 0, 18), TextXAlignment = Enum.TextXAlignment.Left, LayoutOrder = nextOrder(), ZIndex = 12,
+local function section(page, label)
+    return text({
+        Text = string.upper(label), Font = FONT_BOLD, TextSize = 10, TextColor3 = THEME.Dim,
+        Size = UDim2.new(1, 0, 0, 14), LayoutOrder = nextOrder(), ZIndex = 12,
     }, page)
 end
 
-local function note(page, text, height)
-    return make("TextLabel", {
-        Text = text, Font = FONT, TextSize = 11, TextColor3 = THEME.Dim, BackgroundTransparency = 1, TextWrapped = true,
-        Size = UDim2.new(1, 0, 0, height or 28), TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top,
-        LayoutOrder = nextOrder(), ZIndex = 12,
+local function note(page, label, height)
+    return text({
+        Text = label, TextSize = 10, TextColor3 = THEME.Dim, TextWrapped = true, TextYAlignment = Enum.TextYAlignment.Top,
+        Size = UDim2.new(1, 0, 0, height or 26), LayoutOrder = nextOrder(), ZIndex = 12,
     }, page)
 end
 
--- buttons: "primary" has the accent gradient, "active" the hot one, else a dark card
+-- buttons: a gradient back with the text button laid over it.
+-- "primary" is light gray, "active" (armed) a muted red, anything else dark gray.
 local function style(b, kind)
-    local g = b:FindFirstChildOfClass("UIGradient")
-    if kind == "primary" or kind == "active" then
-        b.BackgroundColor3 = Color3.new(1, 1, 1)
-        g.Color = kind == "active" and ColorSequence.new(THEME.Hot, THEME.A) or ColorSequence.new(THEME.A, THEME.B)
+    local back = b.Parent
+    local g = back:FindFirstChildOfClass("UIGradient")
+    if kind == "active" then
+        g.Color = ColorSequence.new(THEME.ActTop, THEME.Act)
+    elseif kind == "primary" then
+        g.Color = ColorSequence.new(THEME.PriTop, THEME.Pri)
     else
-        b.BackgroundColor3 = Color3.new(1, 1, 1)
-        g.Color = ColorSequence.new(THEME.CardTop, THEME.Card)
+        g.Color = ColorSequence.new(THEME.BtnTop, THEME.Btn)
     end
+    b.TextColor3 = THEME.Text
     b:SetAttribute("Kind", kind)
 end
 local function setPrimary(b, active) style(b, active and "active" or "primary") end
 
 local function row(page, height)
-    local r = make("Frame", { BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, height or 32), LayoutOrder = nextOrder(), ZIndex = 11 }, page)
-    make("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 6) }, r)
+    local r = make("Frame", { BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, height or 24), LayoutOrder = nextOrder(), ZIndex = 11 }, page)
+    make("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 5) }, r)
     return r
 end
 
-local function button(parent, text, kind, widthScale)
-    local b = make("TextButton", {
-        Text = text, Font = FONT_BOLD, TextSize = 13, TextColor3 = THEME.Text, AutoButtonColor = false,
+local function button(parent, label, kind, widthScale)
+    local back = make("Frame", {
         BackgroundColor3 = Color3.new(1, 1, 1), BorderSizePixel = 0, Size = UDim2.new(widthScale or 0.5, -3, 1, 0), ZIndex = 12,
     }, parent)
-    corner(b, 8)
-    gradient(b, THEME.CardTop, THEME.Card, 90)
-    stroke(b, THEME.Line, 0.2)
+    corner(back, 6)
+    gradient(back, THEME.BtnTop, THEME.Btn, 90)
+    local edge = stroke(back, THEME.Line, 0)
+    local b = make("TextButton", {
+        Text = label, Font = FONT_BOLD, TextSize = 12, TextColor3 = THEME.Text, AutoButtonColor = false,
+        BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1), ZIndex = 13, TextTruncate = Enum.TextTruncate.AtEnd,
+    }, back)
     style(b, kind or "normal")
-    track(b.MouseEnter:Connect(function() b.BackgroundTransparency = 0.12 end))
-    track(b.MouseLeave:Connect(function() b.BackgroundTransparency = 0 end))
+    track(b.MouseEnter:Connect(function() edge.Color = THEME.LineHot end))
+    track(b.MouseLeave:Connect(function() edge.Color = THEME.Line end))
     return b
 end
 
--- a labelled on/off switch
-local function toggle(page, text, hint, get, set)
-    local r = make("TextButton", {
-        Text = "", AutoButtonColor = false, BackgroundColor3 = THEME.Card, Size = UDim2.new(1, 0, 0, hint and 42 or 32),
-        LayoutOrder = nextOrder(), ZIndex = 11,
+-- a card: a plain frame with a soft gray gradient (nothing on it is tinted)
+local function card(page, height, class)
+    local c = make(class or "Frame", {
+        BackgroundColor3 = Color3.new(1, 1, 1), Size = UDim2.new(1, 0, 0, height), LayoutOrder = nextOrder(), ZIndex = 11,
     }, page)
-    corner(r, 8)
-    stroke(r)
-    make("TextLabel", {
-        Text = text, Font = FONT, TextSize = 13, TextColor3 = THEME.Text, BackgroundTransparency = 1,
-        Size = UDim2.new(1, -60, 0, 18), Position = UDim2.fromOffset(10, hint and 4 or 7), TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 12,
+    if class == "TextButton" then c.Text, c.AutoButtonColor = "", false end
+    corner(c, 6)
+    gradient(c, THEME.CardTop, THEME.Card, 90)
+    stroke(c)
+    return c
+end
+
+-- a labelled on/off switch
+local function toggle(page, label, hint, get, set)
+    local r = card(page, hint and 36 or 26, "TextButton")
+    text({
+        Text = label, TextSize = 12, Size = UDim2.new(1, -52, 0, 14), Position = UDim2.fromOffset(9, hint and 4 or 6), ZIndex = 12,
     }, r)
     if hint then
-        make("TextLabel", {
-            Text = hint, Font = FONT, TextSize = 10, TextColor3 = THEME.Dim, BackgroundTransparency = 1, TextTruncate = Enum.TextTruncate.AtEnd,
-            Size = UDim2.new(1, -60, 0, 14), Position = UDim2.fromOffset(10, 23), TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 12,
+        text({
+            Text = hint, TextSize = 10, TextColor3 = THEME.Dim, TextTruncate = Enum.TextTruncate.AtEnd,
+            Size = UDim2.new(1, -52, 0, 12), Position = UDim2.fromOffset(9, 19), ZIndex = 12,
         }, r)
     end
     local pill = make("Frame", {
-        BackgroundColor3 = Color3.new(1, 1, 1), Size = UDim2.fromOffset(38, 20), Position = UDim2.new(1, -48, 0.5, -10), ZIndex = 12,
+        BackgroundColor3 = Color3.new(1, 1, 1), Size = UDim2.fromOffset(30, 16), Position = UDim2.new(1, -39, 0.5, -8), ZIndex = 12,
     }, r)
-    corner(pill, 10)
-    local pillGrad = gradient(pill, THEME.A, THEME.B, 0)
-    local knob = make("Frame", { BackgroundColor3 = THEME.Text, Size = UDim2.fromOffset(16, 16), ZIndex = 13 }, pill)
-    corner(knob, 8)
+    corner(pill, 8)
+    local pillGrad = gradient(pill, THEME.Shine, THEME.Steel, 90)
+    local knob = make("Frame", { BackgroundColor3 = THEME.Text, Size = UDim2.fromOffset(12, 12), ZIndex = 13 }, pill)
+    corner(knob, 6)
     local function show()
         local on = get()
-        pillGrad.Color = on and ColorSequence.new(THEME.A, THEME.B) or ColorSequence.new(THEME.Line, THEME.Line)
-        knob.Position = on and UDim2.fromOffset(20, 2) or UDim2.fromOffset(2, 2)
+        pillGrad.Color = on and ColorSequence.new(THEME.Shine, THEME.Steel) or ColorSequence.new(THEME.Line, THEME.Line)
+        knob.BackgroundColor3 = on and THEME.Bg or THEME.Dim
+        knob.Position = on and UDim2.fromOffset(16, 2) or UDim2.fromOffset(2, 2)
     end
     show()
     track(r.Activated:Connect(function()
@@ -1499,25 +1531,22 @@ local function toggle(page, text, hint, get, set)
 end
 
 -- a slider with its value on the right
-local function slider(page, text, min, max, step, get, set, format)
-    local r = make("Frame", { BackgroundColor3 = THEME.Card, Size = UDim2.new(1, 0, 0, 44), LayoutOrder = nextOrder(), ZIndex = 11 }, page)
-    corner(r, 8)
-    stroke(r)
-    make("TextLabel", {
-        Text = text, Font = FONT, TextSize = 13, TextColor3 = THEME.Text, BackgroundTransparency = 1,
-        Size = UDim2.new(1, -70, 0, 18), Position = UDim2.fromOffset(10, 4), TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 12,
+local function slider(page, label, min, max, step, get, set, format)
+    local r = card(page, 36)
+    text({
+        Text = label, TextSize = 12, Size = UDim2.new(1, -70, 0, 14), Position = UDim2.fromOffset(9, 4), ZIndex = 12,
     }, r)
-    local value = make("TextLabel", {
-        Text = "", Font = FONT_BOLD, TextSize = 13, TextColor3 = THEME.B, BackgroundTransparency = 1,
-        Size = UDim2.fromOffset(60, 18), Position = UDim2.new(1, -70, 0, 4), TextXAlignment = Enum.TextXAlignment.Right, ZIndex = 12,
+    local value = text({
+        Text = "", Font = FONT_BOLD, TextSize = 12, TextXAlignment = Enum.TextXAlignment.Right,
+        Size = UDim2.fromOffset(60, 14), Position = UDim2.new(1, -69, 0, 4), ZIndex = 12,
     }, r)
     local track_ = make("TextButton", {
-        Text = "", AutoButtonColor = false, BackgroundColor3 = THEME.Line, Size = UDim2.new(1, -20, 0, 6), Position = UDim2.fromOffset(10, 30), ZIndex = 12,
+        Text = "", AutoButtonColor = false, BackgroundColor3 = rgb(16, 16, 18), Size = UDim2.new(1, -18, 0, 5), Position = UDim2.fromOffset(9, 25), ZIndex = 12,
     }, r)
     corner(track_, 3)
     local fill = make("Frame", { BackgroundColor3 = Color3.new(1, 1, 1), Size = UDim2.fromScale(0, 1), ZIndex = 13 }, track_)
     corner(fill, 3)
-    gradient(fill, THEME.A, THEME.B, 0)
+    gradient(fill, THEME.Steel, THEME.Shine, 0)
     local function show()
         local v = get()
         fill.Size = UDim2.fromScale((v - min) / (max - min), 1)
@@ -1550,16 +1579,16 @@ local function slider(page, text, min, max, step, get, set, format)
 end
 
 -- one of a few choices, as segments
-local function choice(page, text, options, get, set)
-    section(page, text)
-    local r = row(page, 30)
+local function choice(page, label, options, get, set)
+    section(page, label)
+    local r = row(page, 24)
     local buttons = {}
     local function show()
         for value, b in pairs(buttons) do style(b, get() == value and "primary" or "normal") end
     end
     for _, opt in ipairs(options) do
         local b = button(r, opt[2], "normal", 1 / #options)
-        b.TextSize = 12
+        b.TextSize = 11
         buttons[opt[1]] = b
         track(b.Activated:Connect(function()
             set(opt[1])
@@ -1574,12 +1603,16 @@ end
 local function chips(page, items, get, set)
     local holder = make("Frame", { BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y,
         LayoutOrder = nextOrder(), ZIndex = 11 }, page)
-    make("UIGridLayout", { CellSize = UDim2.new(0.25, -5, 0, 28), CellPadding = UDim2.fromOffset(6, 6) }, holder)
+    make("UIGridLayout", { CellSize = UDim2.new(0.25, -4, 0, 22), CellPadding = UDim2.fromOffset(5, 5) }, holder)
     local all = {}
     for _, item in ipairs(items) do
         local b = button(holder, item, "normal")
-        b.TextSize = 12
-        local function show() style(b, get(item) and "primary" or "normal") end
+        b.TextSize = 11
+        local function show()
+            local on = get(item)
+            style(b, on and "primary" or "normal")
+            b.TextColor3 = on and THEME.Text or THEME.Dim
+        end
         all[#all + 1] = show
         show()
         track(b.Activated:Connect(function()
@@ -1592,15 +1625,14 @@ end
 
 local function outputBox(page)
     local box = make("TextBox", {
-        Text = "", PlaceholderText = "your equation shows up here", Font = Enum.Font.Code, TextSize = 13, TextColor3 = THEME.Text,
-        PlaceholderColor3 = THEME.Dim, BackgroundColor3 = Color3.fromRGB(8, 8, 10), BorderSizePixel = 0, TextWrapped = true,
+        Text = "", PlaceholderText = "your equation shows up here", Font = Enum.Font.Code, TextSize = 12, TextColor3 = THEME.Text,
+        PlaceholderColor3 = THEME.Dim, BackgroundColor3 = rgb(14, 14, 16), BorderSizePixel = 0, TextWrapped = true,
         ClearTextOnFocus = false, TextEditable = false, MultiLine = true, TextXAlignment = Enum.TextXAlignment.Left,
-        TextYAlignment = Enum.TextYAlignment.Top, Size = UDim2.new(1, 0, 0, 74), LayoutOrder = nextOrder(), ZIndex = 12,
+        TextYAlignment = Enum.TextYAlignment.Top, Size = UDim2.new(1, 0, 0, 58), LayoutOrder = nextOrder(), ZIndex = 12,
     }, page)
-    corner(box, 8)
-    local s = stroke(box, Color3.new(1, 1, 1), 0.35)
-    gradient(s, THEME.A, THEME.B, 0)
-    make("UIPadding", { PaddingLeft = UDim.new(0, 8), PaddingRight = UDim.new(0, 8), PaddingTop = UDim.new(0, 6) }, box)
+    corner(box, 6)
+    stroke(box)
+    make("UIPadding", { PaddingLeft = UDim.new(0, 7), PaddingRight = UDim.new(0, 7), PaddingTop = UDim.new(0, 5) }, box)
     return box
 end
 
@@ -1634,25 +1666,25 @@ local PathPage = newTab("Path")
 local MathPage = newTab("Math")
 local ExtrasPage = newTab("Extras")
 
-local r1 = row(PathPage, 34)
+local r1 = row(PathPage, 28)
 local CreateBtn = button(r1, "Create path", "primary")
 local AimBtn = button(r1, "Aim at nearest", "primary")
-local r2 = row(PathPage, 30)
+local r2 = row(PathPage, 24)
 local SimplifyBtn = button(r2, "Simplify")
 local TargetBtn = button(r2, "Next target")
-local r3 = row(PathPage, 30)
+local r3 = row(PathPage, 24)
 local CopyBtn = button(r3, "Copy")
 local PasteBtn = button(r3, "Put in box")
-local r4 = row(PathPage, 30)
+local r4 = row(PathPage, 24)
 local ClearBtn = button(r4, "Clear", "normal", 1)
 
-local Status = make("TextLabel", {
-    Text = "Press Create path and drag on the board, or Aim at nearest.", Font = FONT, TextSize = 12, TextColor3 = THEME.Dim,
-    BackgroundTransparency = 1, TextWrapped = true, TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top,
-    Size = UDim2.new(1, 0, 0, 50), LayoutOrder = nextOrder(), ZIndex = 12,
+local Status = text({
+    Text = "Press Create path and drag on the board, or Aim at nearest.", TextSize = 11, TextColor3 = THEME.Dim,
+    TextWrapped = true, TextYAlignment = Enum.TextYAlignment.Top,
+    Size = UDim2.new(1, 0, 0, 40), LayoutOrder = nextOrder(), ZIndex = 12,
 }, PathPage)
 local Output = outputBox(PathPage)
-local GuideInfo = note(PathPage, "key guide (Extras tab): yellow = tap now, purple = tap after", 30)
+local GuideInfo = note(PathPage, "key guide (Extras tab): yellow = tap now, purple = tap after", 26)
 
 -- re-solve the last path or target a moment after a setting changes
 local resolveToken = 0
@@ -1671,7 +1703,7 @@ local FamilyChips = chips(MathPage, FAMILIES, function(f) return Opt.Families[f]
     Opt.Families[f] = v
     changed()
 end)
-note(MathPage, "Lines a·x · Bends abs() corners · Arcs x² · Curves x³+ · Waves sin/cos · Steps tanh · Bumps hills · Fancy braids, chirps, crowns", 40)
+note(MathPage, "Lines a·x · Bends abs() · Arcs x² · Curves x³ · Waves sin/cos · Steps tanh · Bumps hills · Fancy braids, chirps", 26)
 section(MathPage, "Limits")
 slider(MathPage, "Max length", 6, 200, 1, function() return Opt.MaxLen end, function(v) Opt.MaxLen = v changed() end,
     function(v) return v .. " chars" end)
@@ -1688,7 +1720,8 @@ toggle(MathPage, "Lock aim", "keep the launch angle and end point you drew", fun
     function(v) Made.LockAim = v Saved.LockAim = v changed() end)
 toggle(MathPage, "Snap to enemy", "aim at the player your drag ends on", function() return Made.Snap end,
     function(v) Made.Snap = v Saved.Snap = v changed() end)
-local presets = row(MathPage, 30)
+section(MathPage, "Presets")
+local presets = row(MathPage, 24)
 track(button(presets, "Simple only").Activated:Connect(function()
     for _, f in ipairs(FAMILIES) do Opt.Families[f] = f == "Lines" or f == "Bends" or f == "Arcs" end
     Opt.MaxLen, Opt.MaxDec = 24, 1
@@ -1719,7 +1752,7 @@ section(ExtrasPage, "Recent equations")
 local HistoryBox = make("Frame", { BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y,
     LayoutOrder = nextOrder(), ZIndex = 11 }, ExtrasPage)
 make("UIListLayout", { Padding = UDim.new(0, 4) }, HistoryBox)
-note(ExtrasPage, "Tap one to use it again. Settings save between games when your executor can write files.", 30)
+note(ExtrasPage, "Tap one to use it again. Settings save between games when your executor can write files.", 26)
 
 selectTab("Path")
 
@@ -1766,7 +1799,7 @@ track(Collapse.Activated:Connect(function()
     Body.Visible = not collapsed
     Accent.Visible = not collapsed
     Collapse.Text = collapsed and "+" or "–"
-    Panel.Size = collapsed and UDim2.fromOffset(W, 48) or UDim2.fromOffset(W, 452)
+    Panel.Size = collapsed and UDim2.fromOffset(W, 40) or UDim2.fromOffset(W, H)
     clampPanel()
 end))
 
@@ -1790,11 +1823,11 @@ local function refreshHistory()
     end
     for i, entry in ipairs(History) do
         local b = make("TextButton", {
-            Text = entry.Text, Font = Enum.Font.Code, TextSize = 12, TextColor3 = THEME.Text, TextTruncate = Enum.TextTruncate.AtEnd,
-            TextXAlignment = Enum.TextXAlignment.Left, AutoButtonColor = true, BackgroundColor3 = THEME.Card, Size = UDim2.new(1, 0, 0, 26),
+            Text = entry.Text, Font = Enum.Font.Code, TextSize = 11, TextColor3 = THEME.Text, TextTruncate = Enum.TextTruncate.AtEnd,
+            TextXAlignment = Enum.TextXAlignment.Left, AutoButtonColor = true, BackgroundColor3 = THEME.Card, Size = UDim2.new(1, 0, 0, 22),
             LayoutOrder = i, ZIndex = 12,
         }, HistoryBox)
-        corner(b, 7)
+        corner(b, 6)
         stroke(b)
         make("UIPadding", { PaddingLeft = UDim.new(0, 8), PaddingRight = UDim.new(0, 8) }, b)
         track(b.Activated:Connect(function()
