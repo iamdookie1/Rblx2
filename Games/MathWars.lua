@@ -21,6 +21,14 @@
 --    drawn line exactly. Simplify drops the least important corners and rounds
 --    harder. Every equation is checked with the game's own compiler and traced
 --    with its tracer, so the error it shows is the real one.
+--  * The Math tab picks what the solver may use: the families below, a max
+--    length, max decimals and corners, how much room to leave blocks, and
+--    what to prefer. Past lines, bends and arcs it can use the same base
+--    curves as the game's own equation library (waves, steps, hills and the
+--    showpiece shapes), as a*g((x-h)/b), optionally tilted by c*x so a hill
+--    can clear a wall and still land on the target. Numbers sit in front by
+--    implicit multiplication ("15sin(x/15)"), which the game reads. Pure
+--    sine waves go through the game's own wave tracer.
 --  * The camera only pans on presses the game hasn't handled, so while you
 --    draw a full-screen layer takes the press, and the camera is held still
 --    on top of that so the drawing lines up with the board.
@@ -501,6 +509,127 @@ local function polyToText(c, S, dec)
     return joinTerms(terms)
 end
 
+
+--// math options and the shape library ------------------------------------------------
+-- What the solver may use, set on the Math tab. Families:
+--   Lines   straight shots (a*x)
+--   Bends   corners made with abs()
+--   Arcs    one smooth bend (x^2)
+--   Curves  higher powers (x^3 and up)
+--   Waves   sin, cos and friends
+--   Steps   smooth steps (tanh, logistic)
+--   Bumps   single hills (gaussian and friends)
+--   Fancy   the game's showpiece shapes (beat braid, chirp, crown, ...)
+-- The shapes are the same base curves the game's own equation library
+-- (PracticeLessons) builds its presets from: a*g((x-h)/b). Constants don't
+-- change a shot, so only a (height), b (width) and h (shift) are searched.
+
+local FAMILIES = { "Lines", "Bends", "Arcs", "Curves", "Waves", "Steps", "Bumps", "Fancy" }
+local Opt = {
+    Families = { Lines = true, Bends = true, Arcs = true, Curves = true, Waves = true, Steps = true, Bumps = true, Fancy = false },
+    MaxLen = 60,          -- longest equation the solver hands you
+    MaxDec = 2,           -- most decimals in any number
+    Prefer = "Shortest",  -- Shortest / Closest to drawing / Hits most
+    KeypadOnly = true,    -- only what the touch keypad can type
+    MaxBends = 3,         -- most corners in a bent line
+    Clearance = 0.35,     -- studs kept from blocks when aiming
+}
+
+local function tanh(t) return math.tanh(t) end
+-- text(bare, atom): bare is the inside for a function's brackets ("x/15"),
+-- atom the same thing safe to multiply or raise ("(x/15)"). Numbers go in
+-- front by implicit multiplication ("15sin(x/15)"), which the game reads and
+-- keeps equations short; no body starts with a digit.
+local SHAPES = {
+    { key = "Wave", fam = "Waves", g = math.sin, text = function(t) return "sin(" .. t .. ")" end },
+    { key = "Cosine wave", fam = "Waves", g = math.cos, text = function(t) return "cos(" .. t .. ")" end },
+    { key = "Arches", fam = "Waves", g = function(t) return math.sin(t) ^ 2 end, text = function(t) return "sin(" .. t .. ")^2" end },
+    { key = "Zigzag", fam = "Waves", g = function(t) return math.asin(math.sin(t)) end, text = function(t) return "arcsin(sin(" .. t .. "))" end },
+    { key = "Square wave", fam = "Steps", g = function(t) return tanh(5 * math.sin(t)) end, text = function(t) return "tanh(5sin(" .. t .. "))" end },
+    { key = "Step", fam = "Steps", g = tanh, text = function(t) return "tanh(" .. t .. ")" end },
+    { key = "Logistic step", fam = "Steps", g = function(t) return 1 / (1 + math.exp(-t)) end,
+        text = function(_, a) return "(1/(1+exp(-" .. a .. ")))" end },
+    { key = "Smooth stairs", fam = "Steps", g = function(t) return t - math.sin(t) end,
+        text = function(t, a) return "(" .. a .. "-sin(" .. t .. "))" end },
+    { key = "Hill", fam = "Bumps", g = function(t) return math.exp(-t * t) end, text = function(_, a) return "exp(-" .. a .. "^2)" end },
+    { key = "Twin hills", fam = "Bumps", g = function(t) return math.exp(-(t - 1) ^ 2) + math.exp(-(t + 1) ^ 2) end,
+        text = function(t) return "(exp(-(" .. t .. "-1)^2)+exp(-(" .. t .. "+1)^2))" end },
+    { key = "Bridge", fam = "Bumps", g = function(t) return tanh(t + 1) - tanh(t - 1) end,
+        text = function(t) return "(tanh(" .. t .. "+1)-tanh(" .. t .. "-1))" end },
+    { key = "Cubic", fam = "Curves", g = function(t) return t ^ 3 end, text = function(_, a) return a .. "^3" end },
+    { key = "Beat braid", fam = "Fancy", g = function(t) return math.sin(6 * t) * math.cos(t) end,
+        text = function(t, a) return "sin(6" .. a .. ")cos(" .. t .. ")" end },
+    { key = "Ribbon", fam = "Fancy", g = function(t) return math.sin(t + 2 * math.sin(t)) end,
+        text = function(t) return "sin(" .. t .. "+2sin(" .. t .. "))" end },
+    { key = "Chirp", fam = "Fancy", g = function(t) return math.sin(t * t) end, text = function(_, a) return "sin(" .. a .. "^2)" end },
+    { key = "Hill wave", fam = "Fancy", g = function(t) return math.exp(-t * t) * math.sin(6 * t) end,
+        text = function(_, a) return "exp(-" .. a .. "^2)sin(6" .. a .. ")" end },
+    { key = "Crown", fam = "Fancy", g = function(t) return math.abs(math.sin(t)) + 0.3 * math.cos(6 * t) end,
+        text = function(t, a) return "(abs(sin(" .. t .. "))+0.3cos(6" .. a .. "))" end },
+    { key = "Serpent", fam = "Fancy", g = function(t) return math.sin(3 * math.sin(t)) end,
+        text = function(t) return "sin(3sin(" .. t .. "))" end },
+}
+
+-- the inside of a shape, (x - h)/b, bare and as an atom (b is always
+-- positive here); the rounded b and h come back too
+local function innerText(b, h, dec)
+    local bs, br = fmt(b, dec)
+    local hs, hr = fmt(h, dec)
+    if br == 0 then return nil end
+    local hv = h < 0 and -hr or hr
+    local shifted = hr == 0 and "x" or ("x" .. (h < 0 and "+" or "-") .. hs)
+    local bare
+    if bs == "1" then
+        bare = shifted
+    else
+        bare = (hr == 0 and shifted or ("(" .. shifted .. ")")) .. "/" .. bs
+    end
+    local atom = bare == "x" and "x" or ("(" .. bare .. ")")
+    return bare, atom, br, hv
+end
+
+-- c*x + a*g((x-h)/b) as text (c is the tilt, often 0), plus a function made
+-- from the very same rounded numbers
+local function shapeForm(shape, a, b, h, dec, c)
+    local bare, atom, bv, hv = innerText(b, h, dec)
+    if not bare then return nil end
+    local as, ar = fmt(a, dec)
+    if ar == 0 then return nil end
+    local av = a < 0 and -ar or ar
+    local body = (as == "1" and "" or as) .. shape.text(bare, atom)
+    local cv, text = 0, nil
+    if c then
+        local cs, cr = fmt(c, dec)
+        cv = c < 0 and -cr or cr
+        if cr ~= 0 then
+            text = (cv < 0 and "-" or "") .. (cs == "1" and "" or cs) .. "x" .. (av < 0 and "-" or "+") .. body
+        end
+    end
+    text = text or ((av < 0 and "-" or "") .. body)
+    local g = shape.g
+    return text, function(x) return cv * x + av * g((x - hv) / bv) end
+end
+
+-- the keypad can type digits, x, . + - * / ^ ( ) and its function keys
+local KEYPAD_NAMES = {
+    sin = true, cos = true, tan = true, arcsin = true, arccos = true, arctan = true,
+    tanh = true, abs = true, sqrt = true, log = true, ln = true, exp = true,
+}
+local function keypadOk(text)
+    for name in text:gmatch("%a+") do
+        if name ~= "x" and not KEYPAD_NAMES[name] then return false end
+    end
+    return not text:find("[^%w%.%+%-%*/%^%(%)]")
+end
+
+-- does an option fit the Math tab's rules?
+local function allowed(text, family)
+    if #text > Opt.MaxLen then return false end
+    if family and not Opt.Families[family] then return false end
+    if Opt.KeypadOnly and not keypadOk(text) then return false end
+    return true
+end
+
 -- how far an equation is from the drag (the game's own compiled function,
 -- shifted the way the tracer shifts it), and its launch angle
 local function score(text, sample, F, endX, endY)
@@ -535,11 +664,14 @@ local function buildCandidates()
     sample[#sample + 1] = { total * F, endV }
 
     local list, seen = {}, {}
-    local function consider(text, kind, pieces)
+    local function consider(text, kind, pieces, family, label)
         if seen[text] or #text > 1000 then return end
         seen[text] = true
         local worst, angle, endErr = score(text, sample, F, total * F, endV)
-        if worst then list[#list + 1] = { Text = text, Err = worst, Angle = angle, EndErr = endErr, Kind = kind, Pieces = pieces } end
+        if worst then
+            list[#list + 1] = { Text = text, Err = worst, Angle = angle, EndErr = endErr, Kind = kind, Pieces = pieces,
+                Family = family, Label = label }
+        end
     end
 
     -- bent lines: corners from the drawing, heights fitted
@@ -564,7 +696,7 @@ local function buildCandidates()
         local key = table.concat(knots, ",")
         if key ~= lastKey then
             lastKey = key
-            local ys = fitBroken(raw, knots, fixed)
+            local ys = (#knots - 2 <= Opt.MaxBends or #knots <= 2) and fitBroken(raw, knots, fixed)
             if ys then
                 local poly = {}
                 for j, u in ipairs(knots) do poly[j] = { u * F, ys[j] } end
@@ -573,7 +705,8 @@ local function buildCandidates()
                     for i = #poly, 1, -1 do rev[#rev + 1] = poly[i] end
                     poly = rev
                 end
-                for dec = 0, 3 do consider(polylineToText(poly, dec), "line", #knots - 1) end
+                local family = #knots <= 2 and "Lines" or "Bends"
+                for dec = 0, Opt.MaxDec do consider(polylineToText(poly, dec), "line", #knots - 1, family) end
             end
         end
     end
@@ -583,9 +716,87 @@ local function buildCandidates()
     local rawSigned = {}
     for i = 1, #raw, step do rawSigned[#rawSigned + 1] = { raw[i][1] * F, raw[i][2] } end
     for deg = 1, 6 do
-        local c = fitPoly(rawSigned, deg, S, s0 * F, lock, total * F, endV)
+        local family = deg == 1 and "Lines" or deg == 2 and "Arcs" or "Curves"
+        local c = Opt.Families[family] and fitPoly(rawSigned, deg, S, s0 * F, lock, total * F, endV)
         if c then
-            for dec = 0, 3 do consider(polyToText(c, S, dec), "curve", deg) end
+            for dec = 0, Opt.MaxDec do consider(polyToText(c, S, dec), "curve", deg, family) end
+        end
+    end
+
+    -- the game's shapes: for each width and shift the best height is a
+    -- straight least-squares answer, so every combination is cheap to try;
+    -- only the closest few get compiled and scored for real
+    local fits = {}
+    for _, shape in ipairs(SHAPES) do
+        if Opt.Families[shape.fam] then
+            for _, bf in ipairs({ 0.06, 0.1, 0.16, 0.25, 0.4, 0.65, 1 }) do
+                local b = math.max(1, total * bf)
+                for _, hf in ipairs({ 0, 0.25, 0.5, 0.75 }) do
+                    local h = F * total * hf
+                    local g0 = shape.g((0 - h) / b)
+                    local sgv, sgg = 0, 0
+                    for _, q in ipairs(rawSigned) do
+                        local gx = shape.g((q[1] - h) / b) - g0
+                        sgv += gx * q[2]
+                        sgg += gx * gx
+                    end
+                    if sgg > 1e-6 then
+                        local a = sgv / sgg
+                        local err = 0
+                        for _, q in ipairs(rawSigned) do
+                            err = math.max(err, math.abs(a * (shape.g((q[1] - h) / b) - g0) - q[2]))
+                        end
+                        if err == err then fits[#fits + 1] = { Shape = shape, A = a, B = b, H = h, Err = err } end
+                    end
+                end
+            end
+        end
+    end
+    table.sort(fits, function(x, y) return x.Err < y.Err end)
+    -- fine-tune the best few: nudge width and shift while the fit improves
+    local function refit(shape, b, h)
+        local g0 = shape.g((0 - h) / b)
+        local sgv, sgg = 0, 0
+        for _, q in ipairs(rawSigned) do
+            local gx = shape.g((q[1] - h) / b) - g0
+            sgv += gx * q[2]
+            sgg += gx * gx
+        end
+        if sgg <= 1e-6 then return nil end
+        local a = sgv / sgg
+        local err = 0
+        for _, q in ipairs(rawSigned) do
+            err = math.max(err, math.abs(a * (shape.g((q[1] - h) / b) - g0) - q[2]))
+        end
+        if err ~= err then return nil end
+        return a, err
+    end
+    for i = 1, math.min(10, #fits) do
+        local fit = fits[i]
+        local stepB, stepH = fit.B * 0.25, math.max(1, total * 0.1)
+        for _ = 1, 24 do
+            local improved = false
+            for _, d in ipairs({ { stepB, 0 }, { -stepB, 0 }, { 0, stepH }, { 0, -stepH } }) do
+                local b, h = fit.B + d[1], fit.H + d[2]
+                if b >= 0.5 then
+                    local a, err = refit(fit.Shape, b, h)
+                    if a and err < fit.Err then
+                        fit.A, fit.B, fit.H, fit.Err, improved = a, b, h, err, true
+                    end
+                end
+            end
+            if not improved then
+                stepB, stepH = stepB / 2, stepH / 2
+                if stepB < 0.01 and stepH < 0.01 then break end
+            end
+        end
+    end
+    table.sort(fits, function(x, y) return x.Err < y.Err end)
+    for i = 1, math.min(10, #fits) do
+        local fit = fits[i]
+        for dec = 0, Opt.MaxDec do
+            local text = shapeForm(fit.Shape, fit.A, fit.B, fit.H, dec)
+            if text then consider(text, "shape", 1, fit.Shape.fam, fit.Shape.key) end
         end
     end
 
@@ -601,12 +812,18 @@ local BUDGETS = { 0.5, 1, 2, 4, 8, 16, 32, 64 }
 local function rankedCandidates(level)
     local list = Made.Candidates or buildCandidates()
     local budget = BUDGETS[math.clamp(level + 1, 1, #BUDGETS)]
+    -- locked: keep the launch angle you drew, unless the option follows the
+    -- whole drawing so closely that it's the drawing anyway
     local function aimOk(c)
-        return not Made.LockAim or (c.Angle and math.abs(c.Angle - Made.Angle0) <= 0.75 and c.EndErr <= 1.5)
+        if not Made.LockAim then return true end
+        if c.EndErr > 1.5 then return false end
+        return c.Err <= 0.5 or (c.Angle ~= nil and math.abs(c.Angle - Made.Angle0) <= 0.75)
     end
     local inside, rest = {}, {}
     for _, c in ipairs(list) do
-        if aimOk(c) and c.Err <= budget then inside[#inside + 1] = c else rest[#rest + 1] = c end
+        if allowed(c.Text, c.Family) then
+            if aimOk(c) and c.Err <= budget then inside[#inside + 1] = c else rest[#rest + 1] = c end
+        end
     end
     table.sort(inside, function(a, b)
         if #a.Text ~= #b.Text then return #a.Text < #b.Text end
@@ -789,21 +1006,37 @@ end
 
 -- a quick flight of fn from you: does it reach the target before a block or
 -- the edge of the board? (steep stretches are stepped through finely)
-local function quickShot(fn, F, x0, y0, grid, target, maxU)
-    local f0 = fn(0)
+-- Also counts the other players it passes through first (for Hits most).
+local function quickShot(fn, F, x0, y0, grid, target, maxU, others)
+    local ok0, f0 = pcall(fn, 0)
+    if not ok0 or f0 ~= f0 then return false end
     local reach = (HITBOX - 0.6) ^ 2
+    local margin = Opt.Clearance
     local px, py, u = x0, y0, 0
+    local extra, passed = 0, nil
     while u < maxU do
         u = math.min(maxU, u + 0.5)
-        local y = y0 + fn(F * u) - f0
+        local ok, fy = pcall(fn, F * u)
+        if not ok then return false end
+        local y = y0 + fy - f0
         if y ~= y or y < ARENA.YMIN or y > ARENA.YMAX then return false end
         local x = x0 + F * u
         local steps = math.max(1, math.ceil(math.abs(y - py) / 0.5))
+        if steps > 400 then return false end
         for st = 1, steps do
             local t = st / steps
             local sx, sy = px + (x - px) * t, py + (y - py) * t
-            if (sx - target.X) ^ 2 + (sy - target.Y) ^ 2 <= reach then return true end
-            if blockAt(grid, sx, sy, 0.35) then return false end
+            if (sx - target.X) ^ 2 + (sy - target.Y) ^ 2 <= reach then return true, extra end
+            if blockAt(grid, sx, sy, margin) then return false end
+            if others then
+                for _, c in ipairs(others) do
+                    if c ~= target and not (passed and passed[c]) and (sx - c.X) ^ 2 + (sy - c.Y) ^ 2 <= HITBOX ^ 2 then
+                        passed = passed or {}
+                        passed[c] = true
+                        extra += 1
+                    end
+                end
+            end
         end
         px, py = x, y
     end
@@ -836,16 +1069,52 @@ local function aimOptions(target)
     local raw = Made.Raw
 
     local shapes = {}
-    local function bent(uPts, label) shapes[#shapes + 1] = { Poly = signedPoly(uPts, F), Label = label } end
-    bent({ { 0, 0 }, { du, dy } }, "straight")
+    local function bent(uPts, label, family)
+        if Opt.Families[family] and #uPts - 2 <= Opt.MaxBends then
+            shapes[#shapes + 1] = { Poly = signedPoly(uPts, F), Label = label, Family = family }
+        end
+    end
+    bent({ { 0, 0 }, { du, dy } }, "straight", "Lines")
     for _, fk in ipairs({ 0.15, 0.3, 0.45, 0.6, 0.75, 0.9 }) do
-        for h = ylo, yhi, 4 do bent({ { 0, 0 }, { du * fk, h }, { du, dy } }, "one bend") end
+        for h = ylo, yhi, 4 do bent({ { 0, 0 }, { du * fk, h }, { du, dy } }, "one bend", "Bends") end
     end
     -- arcs through you and the target, leaving at every angle
     local tx = F * du
-    for deg = -80, 80, 4 do
-        local a = F * math.tan(math.rad(deg))
-        shapes[#shapes + 1] = { Arc = { a, (dy - a * tx) / (tx * tx) }, Label = "arc" }
+    if Opt.Families.Arcs then
+        for deg = -80, 80, 4 do
+            local a = F * math.tan(math.rad(deg))
+            shapes[#shapes + 1] = { Arc = { a, (dy - a * tx) / (tx * tx) }, Label = "arc", Family = "Arcs" }
+        end
+    end
+    -- the game's shapes through you and the target: for a width and shift,
+    -- the height that lands on the target is a single division
+    for _, shape in ipairs(SHAPES) do
+        if Opt.Families[shape.fam] then
+            for _, bf in ipairs({ 0.08, 0.12, 0.18, 0.27, 0.4, 0.6, 0.9 }) do
+                local b = math.max(1, du * bf)
+                for _, hf in ipairs({ 0, 0.25, 0.5, 0.75 }) do
+                    local h = F * du * hf
+                    local span = shape.g((tx - h) / b) - shape.g((0 - h) / b)
+                    if math.abs(span) > 0.05 then
+                        local a = dy / span
+                        if math.abs(a) < 400 then
+                            shapes[#shapes + 1] = { Shape = shape, A = a, B = b, H = h, Label = shape.key:lower(), Family = shape.fam }
+                        end
+                    end
+                    -- tilted: pick the shape's height, then the slope that
+                    -- still lands on the target (gets hills over walls)
+                    if hf > 0 and bf >= 0.12 and bf <= 0.6 then
+                        for _, amp in ipairs({ 8, 16, 30, -8, -16, -30 }) do
+                            local c = (dy - amp * span) / tx
+                            if math.abs(c) < 20 then
+                                shapes[#shapes + 1] = { Shape = shape, A = amp, B = b, H = h, C = c,
+                                    Label = "tilted " .. shape.key:lower(), Family = shape.fam }
+                            end
+                        end
+                    end
+                end
+            end
+        end
     end
     -- routes with your drawing's bends, ending on the target
     if raw then
@@ -859,7 +1128,7 @@ local function aimOptions(target)
                 local pts = { { 0, 0 } }
                 for _, q in ipairs(corners) do pts[#pts + 1] = { q[1], q[2] + shift } end
                 pts[#pts + 1] = { du, dy }
-                bent(pts, #corners == 1 and "one bend" or "two bends")
+                bent(pts, #corners == 1 and "one bend" or "two bends", "Bends")
             end
         end
     end
@@ -876,28 +1145,38 @@ local function aimOptions(target)
         return n > 0 and sum / n or 0
     end
 
+    local people = combatants()
     local found = {}
     for i, sh in ipairs(shapes) do
         if i % 40 == 0 then task.wait() end
         local makeForm
         if sh.Poly then
             makeForm = function(dec) return brokenForm(sh.Poly, dec) end
-        else
+        elseif sh.Arc then
             makeForm = function(dec) return arcForm(sh.Arc[1], sh.Arc[2], dec) end
+        else
+            makeForm = function(dec) return shapeForm(sh.Shape, sh.A, sh.B, sh.H, dec, sh.C) end
         end
         local _, exact = makeForm(6)
-        if quickShot(exact, F, x0, y0, grid, target, maxU) then
-            for dec = 0, 3 do
+        if exact and quickShot(exact, F, x0, y0, grid, target, maxU) then
+            for dec = 0, Opt.MaxDec do
                 local text, fn = makeForm(dec)
-                if quickShot(fn, F, x0, y0, grid, target, maxU) then
-                    found[#found + 1] = { Text = text, Label = sh.Label, Gap = drawnGap(fn) }
-                    break
+                if text and allowed(text, sh.Family) then
+                    local hit, extra = quickShot(fn, F, x0, y0, grid, target, maxU, people)
+                    if hit then
+                        found[#found + 1] = { Text = text, Label = sh.Label, Family = sh.Family, Gap = drawnGap(fn), Extra = extra or 0 }
+                        break
+                    end
                 end
             end
         end
     end
-    -- shortest first; between ones about as short, the one nearer your drawing
-    local function rank(c) return #c.Text + math.min(c.Gap, 40) * 0.08 end
+    -- by the Math tab's preference; Shortest breaks near-ties toward your drawing
+    local function rank(c)
+        if Opt.Prefer == "Closest to drawing" then return math.min(c.Gap, 200) + #c.Text * 0.02 end
+        if Opt.Prefer == "Hits most" then return -c.Extra * 1000 + #c.Text end
+        return #c.Text + math.min(c.Gap, 40) * 0.08
+    end
     table.sort(found, function(a, b)
         local ra, rb = rank(a), rank(b)
         if ra ~= rb then return ra < rb end
@@ -968,7 +1247,7 @@ end
 
 local function buildEquation()
     local raw = Made.Raw
-    if not raw or #raw < 2 then return nil, "draw a longer path" end
+    if (not raw or #raw < 2) and not (Made.Mode == "aim" and Made.Aim) then return nil, "draw a longer path" end
     if Made.Mode == "aim" and Made.Aim then
         local route = Made.Route or nextAimRoute(Made.Aim)
         Made.Route = route
@@ -980,9 +1259,12 @@ local function buildEquation()
         end
         Made.Mode = "follow"
         Made.NoAimFor = Made.Aim.Target.Name
+        if not raw or #raw < 2 then
+            return nil, "no shot within your Math tab rules reaches " .. Made.Aim.Target.Name .. " (try more families or a longer max length)"
+        end
     end
     local pick = followPick(Made.Level)
-    if not pick then return nil, "couldn't fit an equation the game accepts" end
+    if not pick then return nil, "nothing fits your Math tab rules (allow more families, decimals or length)" end
     local c = pick.C
     local result = {
         Mode = "follow", Text = c.Text, Kind = c.Kind, Pieces = c.Pieces, Worst = c.Err,
@@ -999,7 +1281,11 @@ local function buildEquation()
     return result
 end
 
---// mini ui --------------------------------------------------------------------
+--// the window ----------------------------------------------------------------------
+-- A small black window with soft gradients, three tabs (Path, Math, Extras),
+-- draggable by its header and always kept on screen. Right Shift hides it.
+
+local HttpService = game:GetService("HttpService")
 
 local Gui = Instance.new("ScreenGui")
 Gui.Name = "PathTools"
@@ -1020,85 +1306,424 @@ local function make(class, props, parent)
 end
 
 local THEME = {
-    Bg = Color3.fromRGB(22, 24, 32), Bar = Color3.fromRGB(32, 36, 48), Btn = Color3.fromRGB(44, 50, 66),
-    On = Color3.fromRGB(46, 140, 220), Text = Color3.fromRGB(235, 238, 245), Dim = Color3.fromRGB(150, 158, 175),
+    Bg = Color3.fromRGB(12, 12, 15), BgTop = Color3.fromRGB(24, 24, 30), Card = Color3.fromRGB(22, 22, 28),
+    CardTop = Color3.fromRGB(30, 30, 38), Line = Color3.fromRGB(46, 46, 58),
+    A = Color3.fromRGB(150, 92, 255), B = Color3.fromRGB(56, 196, 255), Hot = Color3.fromRGB(255, 96, 140),
+    Btn = Color3.fromRGB(30, 30, 38), On = Color3.fromRGB(150, 92, 255),
+    Text = Color3.fromRGB(238, 240, 246), Dim = Color3.fromRGB(140, 144, 160),
+    Good = Color3.fromRGB(110, 232, 150), Warn = Color3.fromRGB(255, 176, 90), Bad = Color3.fromRGB(255, 104, 112),
 }
+local FONT, FONT_BOLD = Enum.Font.GothamMedium, Enum.Font.GothamBold
+local W = 312
 
--- the layer that takes the drag while armed (under the mini ui)
+local function corner(o, r) return make("UICorner", { CornerRadius = UDim.new(0, r or 8) }, o) end
+local function gradient(o, a, b, rot)
+    return make("UIGradient", { Color = ColorSequence.new(a, b), Rotation = rot or 90 }, o)
+end
+local function stroke(o, color, trans)
+    return make("UIStroke", { Color = color or THEME.Line, Thickness = 1, Transparency = trans or 0,
+        ApplyStrokeMode = Enum.ApplyStrokeMode.Border }, o)
+end
+
+-- the layer that takes the drag while armed (under the window)
 local Capture = make("TextButton", {
     Name = "Capture", Text = "", AutoButtonColor = false, Active = true, Modal = false,
-    BackgroundColor3 = Color3.fromRGB(64, 220, 255), BackgroundTransparency = 0.94,
+    BackgroundColor3 = Color3.fromRGB(120, 90, 255), BackgroundTransparency = 0.93,
     Size = UDim2.fromScale(1, 1), Visible = false, ZIndex = 1, BorderSizePixel = 0,
 }, Gui)
 make("TextLabel", {
-    Text = "Drag your path on the board", Font = Enum.Font.GothamBold, TextSize = 18, TextColor3 = THEME.Text,
+    Text = "Drag your path on the board", Font = FONT_BOLD, TextSize = 18, TextColor3 = THEME.Text,
     BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 40), Position = UDim2.new(0, 0, 0, 60), ZIndex = 2,
     TextStrokeTransparency = 0.5,
 }, Capture)
 
 local Panel = make("Frame", {
-    Name = "Panel", BackgroundColor3 = THEME.Bg, BorderSizePixel = 0,
-    Size = UDim2.fromOffset(276, 316), Position = UDim2.fromOffset(24, 120), ZIndex = 10, Active = true,
+    Name = "Panel", BackgroundColor3 = Color3.new(1, 1, 1), BorderSizePixel = 0,
+    Size = UDim2.fromOffset(W, 452), Position = UDim2.fromOffset(24, 110), ZIndex = 10, Active = true,
 }, Gui)
-make("UICorner", { CornerRadius = UDim.new(0, 10) }, Panel)
-make("UIStroke", { Color = Color3.fromRGB(70, 80, 105), Thickness = 1 }, Panel)
+corner(Panel, 12)
+gradient(Panel, THEME.BgTop, THEME.Bg, 90)
+local PanelStroke = stroke(Panel, Color3.new(1, 1, 1), 0.2)
+gradient(PanelStroke, THEME.A, THEME.B, 0)
 
-local Bar = make("Frame", {
-    BackgroundColor3 = THEME.Bar, BorderSizePixel = 0, Size = UDim2.new(1, 0, 0, 30), ZIndex = 11, Active = true,
-}, Panel)
-make("UICorner", { CornerRadius = UDim.new(0, 10) }, Bar)
+-- header: gradient title, collapse button, and a thin accent line under it
+local Bar = make("Frame", { BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 46), ZIndex = 11, Active = true }, Panel)
+local Title = make("TextLabel", {
+    Text = "MATH WARS", Font = FONT_BOLD, TextSize = 17, TextColor3 = Color3.new(1, 1, 1), BackgroundTransparency = 1,
+    Size = UDim2.new(1, -60, 0, 22), Position = UDim2.fromOffset(14, 6), TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 12,
+}, Bar)
+gradient(Title, THEME.A, THEME.B, 0)
 make("TextLabel", {
-    Text = "Path tools", Font = Enum.Font.GothamBold, TextSize = 14, TextColor3 = THEME.Text, BackgroundTransparency = 1,
-    Size = UDim2.new(1, -40, 1, 0), Position = UDim2.fromOffset(12, 0), TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 12,
+    Text = "path tools · right shift hides", Font = FONT, TextSize = 11, TextColor3 = THEME.Dim, BackgroundTransparency = 1,
+    Size = UDim2.new(1, -60, 0, 14), Position = UDim2.fromOffset(14, 27), TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 12,
 }, Bar)
 local Collapse = make("TextButton", {
-    Text = "–", Font = Enum.Font.GothamBold, TextSize = 18, TextColor3 = THEME.Text, BackgroundTransparency = 1,
-    Size = UDim2.fromOffset(30, 30), Position = UDim2.new(1, -30, 0, 0), ZIndex = 12,
+    Text = "–", Font = FONT_BOLD, TextSize = 18, TextColor3 = THEME.Text, BackgroundColor3 = THEME.Card, AutoButtonColor = true,
+    Size = UDim2.fromOffset(28, 28), Position = UDim2.new(1, -40, 0, 9), ZIndex = 12,
 }, Bar)
+corner(Collapse, 8)
+stroke(Collapse)
+local Accent = make("Frame", {
+    BackgroundColor3 = Color3.new(1, 1, 1), BorderSizePixel = 0, Size = UDim2.new(1, -28, 0, 2), Position = UDim2.fromOffset(14, 45), ZIndex = 11,
+}, Panel)
+gradient(Accent, THEME.A, THEME.B, 0)
 
 local Body = make("Frame", {
-    BackgroundTransparency = 1, Size = UDim2.new(1, -16, 1, -38), Position = UDim2.fromOffset(8, 34), ZIndex = 10,
+    BackgroundTransparency = 1, Size = UDim2.new(1, -20, 1, -58), Position = UDim2.fromOffset(10, 54), ZIndex = 10,
 }, Panel)
 
-local function button(text, x, y, w)
+-- tabs ------------------------------------------------------------------------------
+local TabBar = make("Frame", { BackgroundColor3 = THEME.Card, Size = UDim2.new(1, 0, 0, 30), ZIndex = 11 }, Body)
+corner(TabBar, 9)
+stroke(TabBar)
+make("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 4),
+    HorizontalAlignment = Enum.HorizontalAlignment.Center, VerticalAlignment = Enum.VerticalAlignment.Center }, TabBar)
+
+local Pages, TabButtons = {}, {}
+local function selectTab(name)
+    for tab, page in pairs(Pages) do
+        page.Visible = tab == name
+        local b = TabButtons[tab]
+        b.BackgroundTransparency = tab == name and 0 or 1
+        b.TextColor3 = tab == name and THEME.Text or THEME.Dim
+    end
+end
+local function newTab(name)
     local b = make("TextButton", {
-        Text = text, Font = Enum.Font.GothamMedium, TextSize = 13, TextColor3 = THEME.Text, AutoButtonColor = true,
-        BackgroundColor3 = THEME.Btn, BorderSizePixel = 0, Size = UDim2.fromOffset(w or 126, 28), Position = UDim2.fromOffset(x, y), ZIndex = 11,
+        Text = name, Font = FONT_BOLD, TextSize = 13, TextColor3 = THEME.Dim, AutoButtonColor = false,
+        BackgroundColor3 = Color3.new(1, 1, 1), BackgroundTransparency = 1, Size = UDim2.new(1 / 3, -6, 1, -6), ZIndex = 12,
+    }, TabBar)
+    corner(b, 7)
+    gradient(b, THEME.A, THEME.B, 0)
+    local page = make("ScrollingFrame", {
+        BackgroundTransparency = 1, BorderSizePixel = 0, Size = UDim2.new(1, 0, 1, -38), Position = UDim2.fromOffset(0, 38),
+        ScrollBarThickness = 3, ScrollBarImageColor3 = THEME.A, CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y,
+        ScrollingDirection = Enum.ScrollingDirection.Y, Visible = false, ZIndex = 11,
     }, Body)
-    make("UICorner", { CornerRadius = UDim.new(0, 6) }, b)
+    make("UIListLayout", { Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder }, page)
+    make("UIPadding", { PaddingRight = UDim.new(0, 6), PaddingBottom = UDim.new(0, 6) }, page)
+    Pages[name], TabButtons[name] = page, b
+    track(b.Activated:Connect(function() selectTab(name) end))
+    return page
+end
+
+-- components ---------------------------------------------------------------------
+local order = 0
+local function nextOrder() order += 1 return order end
+
+local function section(page, text)
+    return make("TextLabel", {
+        Text = string.upper(text), Font = FONT_BOLD, TextSize = 11, TextColor3 = THEME.Dim, BackgroundTransparency = 1,
+        Size = UDim2.new(1, 0, 0, 18), TextXAlignment = Enum.TextXAlignment.Left, LayoutOrder = nextOrder(), ZIndex = 12,
+    }, page)
+end
+
+local function note(page, text, height)
+    return make("TextLabel", {
+        Text = text, Font = FONT, TextSize = 11, TextColor3 = THEME.Dim, BackgroundTransparency = 1, TextWrapped = true,
+        Size = UDim2.new(1, 0, 0, height or 28), TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top,
+        LayoutOrder = nextOrder(), ZIndex = 12,
+    }, page)
+end
+
+-- buttons: "primary" has the accent gradient, "active" the hot one, else a dark card
+local function style(b, kind)
+    local g = b:FindFirstChildOfClass("UIGradient")
+    if kind == "primary" or kind == "active" then
+        b.BackgroundColor3 = Color3.new(1, 1, 1)
+        g.Color = kind == "active" and ColorSequence.new(THEME.Hot, THEME.A) or ColorSequence.new(THEME.A, THEME.B)
+    else
+        b.BackgroundColor3 = Color3.new(1, 1, 1)
+        g.Color = ColorSequence.new(THEME.CardTop, THEME.Card)
+    end
+    b:SetAttribute("Kind", kind)
+end
+local function setPrimary(b, active) style(b, active and "active" or "primary") end
+
+local function row(page, height)
+    local r = make("Frame", { BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, height or 32), LayoutOrder = nextOrder(), ZIndex = 11 }, page)
+    make("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 6) }, r)
+    return r
+end
+
+local function button(parent, text, kind, widthScale)
+    local b = make("TextButton", {
+        Text = text, Font = FONT_BOLD, TextSize = 13, TextColor3 = THEME.Text, AutoButtonColor = false,
+        BackgroundColor3 = Color3.new(1, 1, 1), BorderSizePixel = 0, Size = UDim2.new(widthScale or 0.5, -3, 1, 0), ZIndex = 12,
+    }, parent)
+    corner(b, 8)
+    gradient(b, THEME.CardTop, THEME.Card, 90)
+    stroke(b, THEME.Line, 0.2)
+    style(b, kind or "normal")
+    track(b.MouseEnter:Connect(function() b.BackgroundTransparency = 0.12 end))
+    track(b.MouseLeave:Connect(function() b.BackgroundTransparency = 0 end))
     return b
 end
 
-local CreateBtn = button("Create path", 0, 0)
-local SimplifyBtn = button("Simplify", 134, 0)
-local CopyBtn = button("Copy", 0, 34)
-local ClearBtn = button("Clear", 134, 34)
-local PreviewBtn = button("Preview typed: on", 0, 68)
-local SnapBtn = button("Snap to enemy: on", 134, 68)
-local LockBtn = button("Lock aim: on", 0, 102)
-local GuideBtn = button("Key guide: off", 134, 102)
-local GuideInfo = make("TextLabel", {
-    Text = "key guide: yellow = tap now, purple = tap after", Font = Enum.Font.Gotham, TextSize = 11, TextColor3 = THEME.Dim,
-    BackgroundTransparency = 1, TextWrapped = true, TextXAlignment = Enum.TextXAlignment.Left,
-    Size = UDim2.new(1, 0, 0, 20), Position = UDim2.fromOffset(0, 134), ZIndex = 11,
-}, Body)
+-- a labelled on/off switch
+local function toggle(page, text, hint, get, set)
+    local r = make("TextButton", {
+        Text = "", AutoButtonColor = false, BackgroundColor3 = THEME.Card, Size = UDim2.new(1, 0, 0, hint and 42 or 32),
+        LayoutOrder = nextOrder(), ZIndex = 11,
+    }, page)
+    corner(r, 8)
+    stroke(r)
+    make("TextLabel", {
+        Text = text, Font = FONT, TextSize = 13, TextColor3 = THEME.Text, BackgroundTransparency = 1,
+        Size = UDim2.new(1, -60, 0, 18), Position = UDim2.fromOffset(10, hint and 4 or 7), TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 12,
+    }, r)
+    if hint then
+        make("TextLabel", {
+            Text = hint, Font = FONT, TextSize = 10, TextColor3 = THEME.Dim, BackgroundTransparency = 1, TextTruncate = Enum.TextTruncate.AtEnd,
+            Size = UDim2.new(1, -60, 0, 14), Position = UDim2.fromOffset(10, 23), TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 12,
+        }, r)
+    end
+    local pill = make("Frame", {
+        BackgroundColor3 = Color3.new(1, 1, 1), Size = UDim2.fromOffset(38, 20), Position = UDim2.new(1, -48, 0.5, -10), ZIndex = 12,
+    }, r)
+    corner(pill, 10)
+    local pillGrad = gradient(pill, THEME.A, THEME.B, 0)
+    local knob = make("Frame", { BackgroundColor3 = THEME.Text, Size = UDim2.fromOffset(16, 16), ZIndex = 13 }, pill)
+    corner(knob, 8)
+    local function show()
+        local on = get()
+        pillGrad.Color = on and ColorSequence.new(THEME.A, THEME.B) or ColorSequence.new(THEME.Line, THEME.Line)
+        knob.Position = on and UDim2.fromOffset(20, 2) or UDim2.fromOffset(2, 2)
+    end
+    show()
+    track(r.Activated:Connect(function()
+        set(not get())
+        show()
+    end))
+    return { Refresh = show }
+end
+
+-- a slider with its value on the right
+local function slider(page, text, min, max, step, get, set, format)
+    local r = make("Frame", { BackgroundColor3 = THEME.Card, Size = UDim2.new(1, 0, 0, 44), LayoutOrder = nextOrder(), ZIndex = 11 }, page)
+    corner(r, 8)
+    stroke(r)
+    make("TextLabel", {
+        Text = text, Font = FONT, TextSize = 13, TextColor3 = THEME.Text, BackgroundTransparency = 1,
+        Size = UDim2.new(1, -70, 0, 18), Position = UDim2.fromOffset(10, 4), TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 12,
+    }, r)
+    local value = make("TextLabel", {
+        Text = "", Font = FONT_BOLD, TextSize = 13, TextColor3 = THEME.B, BackgroundTransparency = 1,
+        Size = UDim2.fromOffset(60, 18), Position = UDim2.new(1, -70, 0, 4), TextXAlignment = Enum.TextXAlignment.Right, ZIndex = 12,
+    }, r)
+    local track_ = make("TextButton", {
+        Text = "", AutoButtonColor = false, BackgroundColor3 = THEME.Line, Size = UDim2.new(1, -20, 0, 6), Position = UDim2.fromOffset(10, 30), ZIndex = 12,
+    }, r)
+    corner(track_, 3)
+    local fill = make("Frame", { BackgroundColor3 = Color3.new(1, 1, 1), Size = UDim2.fromScale(0, 1), ZIndex = 13 }, track_)
+    corner(fill, 3)
+    gradient(fill, THEME.A, THEME.B, 0)
+    local function show()
+        local v = get()
+        fill.Size = UDim2.fromScale((v - min) / (max - min), 1)
+        value.Text = format and format(v) or tostring(v)
+    end
+    local sliding
+    local function setFrom(x)
+        local t = math.clamp((x - track_.AbsolutePosition.X) / math.max(track_.AbsoluteSize.X, 1), 0, 1)
+        local v = min + math.floor((max - min) * t / step + 0.5) * step
+        v = math.clamp(math.floor(v / step + 0.5) * step, min, max)
+        if v ~= get() then
+            set(v)
+        end
+        show()
+    end
+    track(track_.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            sliding = input
+            setFrom(input.Position.X)
+        end
+    end))
+    track(UserInputService.InputChanged:Connect(function(input)
+        if sliding and (input == sliding or input.UserInputType == Enum.UserInputType.MouseMovement) then setFrom(input.Position.X) end
+    end))
+    track(UserInputService.InputEnded:Connect(function(input)
+        if sliding and (input == sliding or input.UserInputType == Enum.UserInputType.MouseButton1) then sliding = nil end
+    end))
+    show()
+    return { Refresh = show }
+end
+
+-- one of a few choices, as segments
+local function choice(page, text, options, get, set)
+    section(page, text)
+    local r = row(page, 30)
+    local buttons = {}
+    local function show()
+        for value, b in pairs(buttons) do style(b, get() == value and "primary" or "normal") end
+    end
+    for _, opt in ipairs(options) do
+        local b = button(r, opt[2], "normal", 1 / #options)
+        b.TextSize = 12
+        buttons[opt[1]] = b
+        track(b.Activated:Connect(function()
+            set(opt[1])
+            show()
+        end))
+    end
+    show()
+    return { Refresh = show }
+end
+
+-- a grid of on/off chips
+local function chips(page, items, get, set)
+    local holder = make("Frame", { BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y,
+        LayoutOrder = nextOrder(), ZIndex = 11 }, page)
+    make("UIGridLayout", { CellSize = UDim2.new(0.25, -5, 0, 28), CellPadding = UDim2.fromOffset(6, 6) }, holder)
+    local all = {}
+    for _, item in ipairs(items) do
+        local b = button(holder, item, "normal")
+        b.TextSize = 12
+        local function show() style(b, get(item) and "primary" or "normal") end
+        all[#all + 1] = show
+        show()
+        track(b.Activated:Connect(function()
+            set(item, not get(item))
+            show()
+        end))
+    end
+    return { Refresh = function() for _, f in ipairs(all) do f() end end }
+end
+
+local function outputBox(page)
+    local box = make("TextBox", {
+        Text = "", PlaceholderText = "your equation shows up here", Font = Enum.Font.Code, TextSize = 13, TextColor3 = THEME.Text,
+        PlaceholderColor3 = THEME.Dim, BackgroundColor3 = Color3.fromRGB(8, 8, 10), BorderSizePixel = 0, TextWrapped = true,
+        ClearTextOnFocus = false, TextEditable = false, MultiLine = true, TextXAlignment = Enum.TextXAlignment.Left,
+        TextYAlignment = Enum.TextYAlignment.Top, Size = UDim2.new(1, 0, 0, 74), LayoutOrder = nextOrder(), ZIndex = 12,
+    }, page)
+    corner(box, 8)
+    local s = stroke(box, Color3.new(1, 1, 1), 0.35)
+    gradient(s, THEME.A, THEME.B, 0)
+    make("UIPadding", { PaddingLeft = UDim.new(0, 8), PaddingRight = UDim.new(0, 8), PaddingTop = UDim.new(0, 6) }, box)
+    return box
+end
+
+-- settings that last between games (when the executor can write files)
+local SAVE_FILE = "MathWarsPathTools.json"
+local Saved = { Preview = true, Snap = true, LockAim = true, Guide = false }
+local function loadSettings()
+    if typeof(readfile) ~= "function" or typeof(isfile) ~= "function" then return end
+    local ok, data = pcall(function()
+        return isfile(SAVE_FILE) and HttpService:JSONDecode(readfile(SAVE_FILE)) or nil
+    end)
+    if not ok or type(data) ~= "table" then return end
+    for k, v in pairs(data.Opt or {}) do
+        if k == "Families" and type(v) == "table" then
+            for fam, on in pairs(v) do if Opt.Families[fam] ~= nil then Opt.Families[fam] = on == true end end
+        elseif Opt[k] ~= nil and type(v) == type(Opt[k]) then
+            Opt[k] = v
+        end
+    end
+    for k, v in pairs(data.Saved or {}) do if Saved[k] ~= nil and type(v) == "boolean" then Saved[k] = v end end
+end
+local function saveSettings()
+    if typeof(writefile) ~= "function" then return end
+    pcall(function() writefile(SAVE_FILE, HttpService:JSONEncode({ Opt = Opt, Saved = Saved })) end)
+end
+loadSettings()
+Made.Snap, Made.LockAim = Saved.Snap, Saved.LockAim
+
+-- the three pages -------------------------------------------------------------------
+local PathPage = newTab("Path")
+local MathPage = newTab("Math")
+local ExtrasPage = newTab("Extras")
+
+local r1 = row(PathPage, 34)
+local CreateBtn = button(r1, "Create path", "primary")
+local AimBtn = button(r1, "Aim at nearest", "primary")
+local r2 = row(PathPage, 30)
+local SimplifyBtn = button(r2, "Simplify")
+local TargetBtn = button(r2, "Next target")
+local r3 = row(PathPage, 30)
+local CopyBtn = button(r3, "Copy")
+local PasteBtn = button(r3, "Put in box")
+local r4 = row(PathPage, 30)
+local ClearBtn = button(r4, "Clear", "normal", 1)
 
 local Status = make("TextLabel", {
-    Text = "Press Create path, then drag on the board.", Font = Enum.Font.Gotham, TextSize = 12, TextColor3 = THEME.Dim,
+    Text = "Press Create path and drag on the board, or Aim at nearest.", Font = FONT, TextSize = 12, TextColor3 = THEME.Dim,
     BackgroundTransparency = 1, TextWrapped = true, TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top,
-    Size = UDim2.new(1, 0, 0, 42), Position = UDim2.fromOffset(0, 156), ZIndex = 11,
-}, Body)
+    Size = UDim2.new(1, 0, 0, 50), LayoutOrder = nextOrder(), ZIndex = 12,
+}, PathPage)
+local Output = outputBox(PathPage)
+local GuideInfo = note(PathPage, "key guide (Extras tab): yellow = tap now, purple = tap after", 30)
 
-local Output = make("TextBox", {
-    Text = "", PlaceholderText = "your equation shows up here", Font = Enum.Font.Code, TextSize = 13, TextColor3 = THEME.Text,
-    PlaceholderColor3 = THEME.Dim, BackgroundColor3 = Color3.fromRGB(14, 16, 22), BorderSizePixel = 0, TextWrapped = true,
-    ClearTextOnFocus = false, TextEditable = false, MultiLine = true, TextXAlignment = Enum.TextXAlignment.Left,
-    TextYAlignment = Enum.TextYAlignment.Top, Size = UDim2.new(1, 0, 0, 70), Position = UDim2.fromOffset(0, 202), ZIndex = 11,
-}, Body)
-make("UICorner", { CornerRadius = UDim.new(0, 6) }, Output)
-make("UIPadding", { PaddingLeft = UDim.new(0, 6), PaddingRight = UDim.new(0, 6), PaddingTop = UDim.new(0, 4) }, Output)
+-- re-solve the last path or target a moment after a setting changes
+local resolveToken = 0
+local solveAgain
+local function changed()
+    saveSettings()
+    resolveToken += 1
+    local token = resolveToken
+    task.delay(0.35, function()
+        if token == resolveToken and solveAgain then solveAgain() end
+    end)
+end
 
--- keep the panel fully on screen, whatever it's dragged to or the screen does
+section(MathPage, "Shapes the solver may use")
+local FamilyChips = chips(MathPage, FAMILIES, function(f) return Opt.Families[f] end, function(f, v)
+    Opt.Families[f] = v
+    changed()
+end)
+note(MathPage, "Lines a·x · Bends abs() corners · Arcs x² · Curves x³+ · Waves sin/cos · Steps tanh · Bumps hills · Fancy braids, chirps, crowns", 40)
+section(MathPage, "Limits")
+slider(MathPage, "Max length", 6, 200, 1, function() return Opt.MaxLen end, function(v) Opt.MaxLen = v changed() end,
+    function(v) return v .. " chars" end)
+slider(MathPage, "Max decimals", 0, 3, 1, function() return Opt.MaxDec end, function(v) Opt.MaxDec = v changed() end)
+slider(MathPage, "Max corners", 1, 6, 1, function() return Opt.MaxBends end, function(v) Opt.MaxBends = v changed() end)
+slider(MathPage, "Space from blocks", 0, 2, 0.05, function() return Opt.Clearance end, function(v) Opt.Clearance = v changed() end,
+    function(v) return ("%.2f"):format(v) end)
+choice(MathPage, "Prefer", { { "Shortest", "Shortest" }, { "Closest to drawing", "My drawing" }, { "Hits most", "Hits most" } },
+    function() return Opt.Prefer end, function(v) Opt.Prefer = v changed() end)
+section(MathPage, "Rules")
+toggle(MathPage, "Keypad friendly", "only what the touch keypad can type", function() return Opt.KeypadOnly end,
+    function(v) Opt.KeypadOnly = v changed() end)
+toggle(MathPage, "Lock aim", "keep the launch angle and end point you drew", function() return Made.LockAim end,
+    function(v) Made.LockAim = v Saved.LockAim = v changed() end)
+toggle(MathPage, "Snap to enemy", "aim at the player your drag ends on", function() return Made.Snap end,
+    function(v) Made.Snap = v Saved.Snap = v changed() end)
+local presets = row(MathPage, 30)
+track(button(presets, "Simple only").Activated:Connect(function()
+    for _, f in ipairs(FAMILIES) do Opt.Families[f] = f == "Lines" or f == "Bends" or f == "Arcs" end
+    Opt.MaxLen, Opt.MaxDec = 24, 1
+    FamilyChips.Refresh()
+    changed()
+end))
+track(button(presets, "Everything").Activated:Connect(function()
+    for _, f in ipairs(FAMILIES) do Opt.Families[f] = true end
+    Opt.MaxLen, Opt.MaxDec = 200, 3
+    FamilyChips.Refresh()
+    changed()
+end))
+
+local PreviewOn = Saved.Preview
+section(ExtrasPage, "Helpers")
+toggle(ExtrasPage, "Preview what's typed", "draws the equation in the box on the board", function() return PreviewOn end, function(v)
+    PreviewOn = v
+    Saved.Preview = v
+    saveSettings()
+end)
+local setGuideOn -- filled in by the key guide below
+toggle(ExtrasPage, "Key guide", "highlights the next key to tap on the keypad", function() return Saved.Guide end, function(v)
+    Saved.Guide = v
+    saveSettings()
+    if setGuideOn then setGuideOn(v) end
+end)
+section(ExtrasPage, "Recent equations")
+local HistoryBox = make("Frame", { BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y,
+    LayoutOrder = nextOrder(), ZIndex = 11 }, ExtrasPage)
+make("UIListLayout", { Padding = UDim.new(0, 4) }, HistoryBox)
+note(ExtrasPage, "Tap one to use it again. Settings save between games when your executor can write files.", 30)
+
+selectTab("Path")
+
+-- dragging the window, keeping it on screen ---------------------------------------
 local function clampPanel()
     local view = Gui.AbsoluteSize
     local size = Panel.AbsoluteSize
@@ -1139,9 +1764,14 @@ local collapsed = false
 track(Collapse.Activated:Connect(function()
     collapsed = not collapsed
     Body.Visible = not collapsed
+    Accent.Visible = not collapsed
     Collapse.Text = collapsed and "+" or "–"
-    Panel.Size = collapsed and UDim2.fromOffset(276, 30) or UDim2.fromOffset(276, 316)
+    Panel.Size = collapsed and UDim2.fromOffset(W, 48) or UDim2.fromOffset(W, 452)
     clampPanel()
+end))
+
+track(UserInputService.InputBegan:Connect(function(input, processed)
+    if not processed and input.KeyCode == Enum.KeyCode.RightShift then Panel.Visible = not Panel.Visible end
 end))
 
 local function setStatus(text, color)
@@ -1151,6 +1781,36 @@ end
 
 local function faceName(f) return f > 0 and "right" or "left" end
 
+-- recent equations -------------------------------------------------------------------
+local History = {}
+local useEquation
+local function refreshHistory()
+    for _, c in ipairs(HistoryBox:GetChildren()) do
+        if c:IsA("TextButton") then c:Destroy() end
+    end
+    for i, entry in ipairs(History) do
+        local b = make("TextButton", {
+            Text = entry.Text, Font = Enum.Font.Code, TextSize = 12, TextColor3 = THEME.Text, TextTruncate = Enum.TextTruncate.AtEnd,
+            TextXAlignment = Enum.TextXAlignment.Left, AutoButtonColor = true, BackgroundColor3 = THEME.Card, Size = UDim2.new(1, 0, 0, 26),
+            LayoutOrder = i, ZIndex = 12,
+        }, HistoryBox)
+        corner(b, 7)
+        stroke(b)
+        make("UIPadding", { PaddingLeft = UDim.new(0, 8), PaddingRight = UDim.new(0, 8) }, b)
+        track(b.Activated:Connect(function()
+            if useEquation then useEquation(entry.Text, entry.Note) end
+        end))
+    end
+end
+local function remember(text, label)
+    for i = #History, 1, -1 do
+        if History[i].Text == text then table.remove(History, i) end
+    end
+    table.insert(History, 1, { Text = text, Note = label })
+    while #History > 8 do table.remove(History) end
+    refreshHistory()
+end
+
 local solveDrag
 
 local function showResult()
@@ -1158,7 +1818,7 @@ local function showResult()
     if not r then
         Made.Text = nil
         Output.Text = ""
-        setStatus(err, Color3.fromRGB(255, 110, 110))
+        setStatus(err, THEME.Bad)
         clearPool(Pools.Made)
         return
     end
@@ -1174,15 +1834,19 @@ local function showResult()
     SimplifyBtn.Text = r.Mode == "aim" and "Other route" or "Simplify"
     local face = ("face %s%s"):format(faceName(r.Facing), facing() ~= r.Facing and " (flip your facing!)" or "")
     if r.Mode == "aim" then
-        setStatus(("hits %s · %s · %d chars · %s"):format(r.Target.Name, r.Label, #r.Text, face), Color3.fromRGB(120, 230, 140))
+        remember(r.Text, "hits " .. r.Target.Name)
+        setStatus(("hits %s · %s · %d chars · %s"):format(r.Target.Name, r.Label, #r.Text, face), THEME.Good)
         return
     end
     local shape
     if r.Kind == "curve" then
         shape = r.Pieces == 1 and "straight line" or ("smooth curve (power %d)"):format(r.Pieces)
+    elseif r.Kind == "shape" then
+        shape = (r.Label or "shape"):lower()
     else
         shape = ("%d-piece line"):format(r.Pieces or 1)
     end
+    remember(r.Text, shape)
     local parts = { face, ("%s, %d chars"):format(shape, #r.Text) }
     if Made.NoAimFor then table.insert(parts, 1, "no clear short shot at " .. Made.NoAimFor .. ", following your drawing") end
     if r.Angle then
@@ -1190,8 +1854,21 @@ local function showResult()
     end
     if r.Worst then parts[#parts + 1] = ("off by at most %.2f"):format(r.Worst) end
     if r.Blocked then parts[#parts + 1] = "hits a block on the way" end
-    if r.TraceError then parts[#parts + 1] = "trace: " .. tostring(r.TraceError) end
     setStatus(table.concat(parts, " · "), THEME.Text)
+end
+
+-- aim at one player directly, no drawing needed
+local Targets, TargetIndex = {}, 0
+local function aimAt(target)
+    Made.Level, Made.Candidates, Made.FollowCache = 0, nil, nil
+    Made.Aim, Made.Route, Made.NoAimFor, Made.Mode = nil, nil, nil, "follow"
+    Made.Target = target
+    setStatus("Aiming at " .. target.Name .. "...", THEME.Dim)
+    task.spawn(function()
+        local aim = aimOptions(target)
+        if aim then Made.Aim, Made.Mode, Made.Facing = aim, "aim", aim.F end
+        showResult()
+    end)
 end
 
 -- work the last drag out again: aim at the player it ends on if there is
@@ -1199,7 +1876,7 @@ end
 solveDrag = function()
     if not Made.Raw then return end
     Made.Level, Made.Candidates, Made.FollowCache = 0, nil, nil
-    Made.Aim, Made.Route, Made.NoAimFor, Made.Mode = nil, nil, nil, "follow"
+    Made.Aim, Made.Route, Made.NoAimFor, Made.Mode, Made.Target = nil, nil, nil, "follow", nil
     setStatus("Working it out...", THEME.Dim)
     task.spawn(function()
         local target = Made.Snap and targetOfDrag(Made.Raw, Made.Facing)
@@ -1210,6 +1887,24 @@ solveDrag = function()
         end
         showResult()
     end)
+end
+
+solveAgain = function()
+    if Made.Raw then
+        solveDrag()
+    elseif Made.Target and Made.Target.Model and Made.Target.Model.Parent then
+        aimAt(Made.Target)
+    end
+end
+
+useEquation = function(text, label)
+    Made.Text = text
+    Output.Text = text
+    setStatus(("from history · %s · %d chars"):format(label or "equation", #text), THEME.Text)
+    local x0, y0 = origin()
+    local path = x0 and trace(text, x0, y0, facing())
+    if path then drawPoints(Pools.Made, pathPoints(path)) else clearPool(Pools.Made) end
+    selectTab("Path")
 end
 
 --// capturing the drag ------------------------------------------------------------
@@ -1234,7 +1929,7 @@ local function setArmed(on)
     Armed = on
     Capture.Visible = on
     CreateBtn.Text = on and "Cancel" or "Create path"
-    CreateBtn.BackgroundColor3 = on and THEME.On or THEME.Btn
+    setPrimary(CreateBtn, on)
     if on then setStatus("Drag your path now. It starts when you press and ends when you let go.", THEME.Text) end
 end
 
@@ -1331,8 +2026,37 @@ track(CreateBtn.Activated:Connect(function()
     if not Armed then setStatus("Cancelled.", THEME.Dim) end
 end))
 
+-- enemies nearest first; Aim takes the nearest, Next target walks the list
+local function refreshTargets()
+    local x0, y0 = origin()
+    Targets = combatants()
+    if x0 then
+        table.sort(Targets, function(a, b)
+            return (a.X - x0) ^ 2 + (a.Y - y0) ^ 2 < (b.X - x0) ^ 2 + (b.Y - y0) ^ 2
+        end)
+    end
+end
+
+track(AimBtn.Activated:Connect(function()
+    refreshTargets()
+    if #Targets == 0 then setStatus("No enemy on the board.", THEME.Warn) return end
+    Made.Raw = nil
+    clearPool(Pools.Drag)
+    TargetIndex = 1
+    aimAt(Targets[1])
+end))
+
+track(TargetBtn.Activated:Connect(function()
+    refreshTargets()
+    if #Targets == 0 then setStatus("No enemy on the board.", THEME.Warn) return end
+    Made.Raw = nil
+    clearPool(Pools.Drag)
+    TargetIndex = TargetIndex % #Targets + 1
+    aimAt(Targets[TargetIndex])
+end))
+
 track(SimplifyBtn.Activated:Connect(function()
-    if not Made.Raw then setStatus("Make a path first.", THEME.Dim) return end
+    if not Made.Raw and not Made.Aim then setStatus("Make a path or aim first.", THEME.Dim) return end
     task.spawn(function()
         -- aiming: the next route the game's tracer agrees hits (round again
         -- from the shortest once they run out)
@@ -1346,7 +2070,7 @@ track(SimplifyBtn.Activated:Connect(function()
                 Made.Route = route
                 showResult()
             else
-                setStatus("No other route hits " .. Made.Aim.Target.Name .. ".", Color3.fromRGB(255, 170, 90))
+                setStatus("No other route hits " .. Made.Aim.Target.Name .. ".", THEME.Warn)
             end
             return
         end
@@ -1362,7 +2086,7 @@ track(SimplifyBtn.Activated:Connect(function()
                 return
             end
         end
-        setStatus("That's as simple as it gets for this drag.", Color3.fromRGB(255, 170, 90))
+        setStatus("That's as simple as it gets for this drag.", THEME.Warn)
     end)
 end))
 
@@ -1373,40 +2097,34 @@ track(CopyBtn.Activated:Connect(function()
         pcall(copy, Made.Text)
         setStatus("Copied. Paste or type it into the equation box.", THEME.Text)
     else
-        setStatus("No clipboard in this executor; type it from the box below.", Color3.fromRGB(255, 170, 90))
+        setStatus("No clipboard in this executor; type it from the box below.", THEME.Warn)
     end
+end))
+
+-- writes the equation straight into the game's equation box (keyboard play);
+-- on a phone the keypad builds the text, so the key guide is the way there
+track(PasteBtn.Activated:Connect(function()
+    if not Made.Text then setStatus("Nothing to put in yet.", THEME.Dim) return end
+    local box = equationBox()
+    if box and box.Visible ~= false then
+        local ok = pcall(function() box.Text = Made.Text end)
+        if ok and box.Text == Made.Text then
+            setStatus("In the equation box. Check your facing and fire.", THEME.Good)
+            return
+        end
+    end
+    setStatus(UserInputService.TouchEnabled and "On a phone the keypad types it: turn on the key guide (Extras)."
+        or "Couldn't find the equation box: open it first.", THEME.Warn)
 end))
 
 track(ClearBtn.Activated:Connect(function()
     Made.Raw, Made.Text, Made.Level, Made.Candidates, Made.FollowCache = nil, nil, 0, nil, nil
-    Made.Aim, Made.Route, Made.NoAimFor, Made.Mode = nil, nil, nil, "follow"
+    Made.Aim, Made.Route, Made.NoAimFor, Made.Mode, Made.Target = nil, nil, nil, "follow", nil
     SimplifyBtn.Text = "Simplify"
     Output.Text = ""
     clearPool(Pools.Made)
     clearPool(Pools.Drag)
     setStatus("Cleared.", THEME.Dim)
-end))
-
-local PreviewOn = true
-track(PreviewBtn.Activated:Connect(function()
-    PreviewOn = not PreviewOn
-    PreviewBtn.Text = "Preview typed: " .. (PreviewOn and "on" or "off")
-    PreviewBtn.BackgroundColor3 = PreviewOn and THEME.Btn or Color3.fromRGB(60, 40, 44)
-    if not PreviewOn then clearPool(Pools.Typed) end
-end))
-
-track(LockBtn.Activated:Connect(function()
-    Made.LockAim = not Made.LockAim
-    LockBtn.Text = "Lock aim: " .. (Made.LockAim and "on" or "off")
-    LockBtn.BackgroundColor3 = Made.LockAim and THEME.Btn or Color3.fromRGB(60, 40, 44)
-    if Made.Raw then solveDrag() end
-end))
-
-track(SnapBtn.Activated:Connect(function()
-    Made.Snap = not Made.Snap
-    SnapBtn.Text = "Snap to enemy: " .. (Made.Snap and "on" or "off")
-    SnapBtn.BackgroundColor3 = Made.Snap and THEME.Btn or Color3.fromRGB(60, 40, 44)
-    if Made.Raw then solveDrag() end
 end))
 
 --// live preview of what's typed ------------------------------------------------------
@@ -1736,15 +2454,14 @@ local function guideStep()
     end
 end
 
-track(GuideBtn.Activated:Connect(function()
-    Guide.On = not Guide.On
-    GuideBtn.Text = "Key guide: " .. (Guide.On and "on" or "off")
-    GuideBtn.BackgroundColor3 = Guide.On and THEME.On or THEME.Btn
-    if not Guide.On then
+setGuideOn = function(on)
+    Guide.On = on
+    if not on then
         markOff()
         setInfo("highlights the next key")
     end
-end))
+end
+setGuideOn(Saved.Guide)
 
 task.spawn(function()
     while not Unloaded do
