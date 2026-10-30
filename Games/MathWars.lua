@@ -2388,6 +2388,7 @@ local KEY_FUNCS = {
 }
 local KEY_NAMES = {
     left = "←", right = "→", undo = "UNDO", clear = "CLR", sqrt = "√", ["-"] = "−", ["*"] = "×", ["/"] = "÷",
+    ["tpl:int"] = "∫", ["tpl:sum"] = "Σ", ["tpl:prod"] = "Π", ["tpl:cbrt"] = "∛", pi = "π",
 }
 
 -- the keypad's own edit(text, cursor, key), found in memory
@@ -2407,7 +2408,8 @@ local function findKeypadEdit()
 end
 
 -- the same rules, for the keys the guide uses, if it can't be found
-local function copyEdit(text, cursor, key)
+-- (literal: type a letter key as itself, not as name())
+local function copyEdit(text, cursor, key, literal)
     local len = utf8.len(text) or #text
     cursor = math.clamp(cursor, 0, len)
     if key == "left" then return text, math.max(0, cursor - 1) end
@@ -2422,19 +2424,188 @@ local function copyEdit(text, cursor, key)
     local insert, step = key, #key
     if key == "(" then
         insert, step = "()", 1
-    elseif key:match("^[a-z]+$") and key ~= "x" and key ~= "pi" and key ~= "e" then
+    elseif not literal and key:match("^[a-z]+$") and key ~= "x" and key ~= "pi" and key ~= "e" then
         insert, step = key .. "()", #key + 1
     end
     return before .. insert .. after, cursor + step
 end
 
-local function keypadEdit(text, cursor, key)
+local function keypadEdit(text, cursor, key, literal)
     local e = findKeypadEdit()
     if e then
-        local ok, t, c = pcall(e, text, cursor, key)
+        local ok, t, c = pcall(e, text, cursor, key, literal)
         if ok and type(t) == "string" and type(c) == "number" then return t, c end
     end
-    return copyEdit(text, cursor, key)
+    return copyEdit(text, cursor, key, literal)
+end
+
+-- Calculus mode swaps the paged keys for one scrolling list of every key
+-- (FunctionList: SYMBOLS, TRIG, ..., CALCULUS, HYPERBOLIC), and every press,
+-- digits too, goes through ExperimentalKeypad.edit: ^ and / open boxes
+-- ("^(|)", "(a)/(|)"), the big operators are templates ("∫_(|)^()dt",
+-- "Σ_(n=|)^()"), and the arrow keys hop between boxes. What it types can
+-- differ from the solver's text (extra brackets round a fraction), so the
+-- plan is checked by value instead of by letter.
+local calcPlanFor
+do
+    local CalcEdit
+    local function findCalcEdit()
+        if CalcEdit then return CalcEdit end
+        local ok, mod = pcall(function()
+            local scripts = LocalPlayer:FindFirstChild("PlayerScripts")
+            local m = scripts and scripts:FindFirstChild("ExperimentalKeypad", true)
+            return m and require(m)
+        end)
+        if ok and type(mod) == "table" and type(mod.edit) == "function" then
+            CalcEdit = mod.edit
+        elseif typeof(getgc) == "function" then
+            local okg, list = pcall(getgc, true)
+            for _, v in ipairs(okg and type(list) == "table" and list or {}) do
+                if type(v) == "table" and type(rawget(v, "edit")) == "function" and rawget(v, "mountList") then
+                    CalcEdit = v.edit
+                    break
+                end
+            end
+        end
+        return CalcEdit
+    end
+
+    local function calcEdit(text, cursor, key)
+        local e = findCalcEdit()
+        if not e then return nil end
+        local k = key == "right" and "boxright" or key == "left" and "boxleft" or key
+        local ok, t, c = pcall(e, text, cursor, k, keypadEdit)
+        if ok and type(t) == "string" and type(c) == "number" then return t, c end
+        return nil
+    end
+
+    local CALC_FUNCS = {
+        sin = true, cos = true, tan = true, csc = true, sec = true, cot = true,
+        arcsin = true, arccos = true, arctan = true, arccsc = true, arcsec = true, arccot = true,
+        sinh = true, cosh = true, tanh = true, csch = true, sech = true, coth = true,
+        arcsinh = true, arccosh = true, arctanh = true,
+        log = true, ln = true, exp = true, abs = true, sqrt = true, cbrt = "tpl:cbrt",
+    }
+
+    -- the presses for target on the calculus keypad, by its own structure
+    local function calcKeys(target)
+        local keys, i, n = {}, 1, #target
+        local function add(k) keys[#keys + 1] = k end
+        local function at(s) return target:sub(i, i + #s - 1) == s end
+        local item
+        -- everything up to the ")" closing this group (eaten, no press: the
+        -- bracket is already there and the caller steps past it)
+        local function group()
+            while i <= n do
+                if target:sub(i, i) == ")" then i += 1 return true end
+                if not item() then return false end
+            end
+            return true
+        end
+        -- what goes in a ^ or / box: a bracket group (typed with its own
+        -- brackets, so a + inside doesn't hop out of the box) or one number or x
+        local function boxed()
+            if at("(") then
+                if not item() then return false end
+            else
+                local atom = target:match("^%d*%.?%d+", i) or target:match("^[xnt]", i)
+                if not atom then return false end
+                for ch in atom:gmatch(".") do add(ch) end
+                i += #atom
+            end
+            add("right")
+            return true
+        end
+        function item()
+            if at("∫_(") then
+                add("tpl:int")
+                i += #"∫_("
+                if not group() then return false end
+                add("right")
+                if not at("^(") then return false end
+                i += 2
+                if not group() then return false end
+                add("right")
+                if not at("(") then return false end
+                if not item() then return false end
+                if not at("dt") then return false end
+                i += 2
+                return true
+            end
+            for _, big in ipairs({ { "Σ_(n=", "tpl:sum" }, { "Π_(n=", "tpl:prod" } }) do
+                if at(big[1]) then
+                    add(big[2])
+                    i += #big[1]
+                    if not group() then return false end
+                    add("right")
+                    if not at("^(") then return false end
+                    i += 2
+                    if not group() then return false end
+                    add("right")
+                    return true
+                end
+            end
+            local name = target:match("^(%a+)%(", i)
+            if name and CALC_FUNCS[name] then
+                add(CALC_FUNCS[name] == true and name or CALC_FUNCS[name])
+                i += #name + 1
+                if not group() then return false end
+                add("right")
+                return true
+            end
+            local ch = target:sub(i, i)
+            if ch == "(" then
+                add("(")
+                i += 1
+                if not group() then return false end
+                add("right")
+                return true
+            end
+            if ch == "^" or ch == "/" then
+                add(ch)
+                i += 1
+                return boxed()
+            end
+            if at("pi") then add("pi") i += 2 return true end
+            if ch:match("[%d%.xent%+%-%*]") then add(ch) i += 1 return true end
+            return false
+        end
+        while i <= n do
+            if not item() then return nil end
+        end
+        return keys
+    end
+
+    -- do two equations draw the same curve?
+    local function sameCurve(a, b)
+        if a == b then return true end
+        if not MathExpression or not MathExpression.compile then return false end
+        local oka, ca = pcall(MathExpression.compile, a, true)
+        local okb, cb = pcall(MathExpression.compile, b, true)
+        if not (oka and okb and type(ca) == "table" and type(cb) == "table" and ca.ok and cb.ok) then return false end
+        for _, x in ipairs({ -71.3, -37.3, -11, -2.5, 0, 1.7, 6, 13.1, 29, 44.4, 71, 118 }) do
+            local okx, va = pcall(ca.fn, x)
+            local oky, vb = pcall(cb.fn, x)
+            if okx ~= oky then return false end
+            if okx and not (va ~= va and vb ~= vb) and math.abs(va - vb) > 1e-6 * (1 + math.abs(va)) then return false end
+        end
+        return true
+    end
+
+    calcPlanFor = function(target)
+        if not findCalcEdit() then return nil, "calculus keypad not found: use Put in box" end
+        local keys = calcKeys(target)
+        if not keys then return nil, "can't plan this one on the keypad: use Put in box" end
+        local states = { { "", 0 } }
+        local text, cursor = "", 0
+        for _, key in ipairs(keys) do
+            text, cursor = calcEdit(text, cursor, key)
+            if not text then return nil, "couldn't plan the presses: use Put in box" end
+            states[#states + 1] = { text, cursor }
+        end
+        if not sameCurve(text, target) then return nil, "the keypad would type it differently: use Put in box" end
+        return { Keys = keys, States = states, Target = target, Calc = true, Typed = text }
+    end
 end
 
 -- every press that types target from an empty box, and the box after each
@@ -2543,6 +2714,13 @@ end
 -- the button to tap for a key: the key if it's up, else the page switch
 -- (toward whichever page has it in the fewest taps)
 local function buttonFor(kp, key)
+    if LocalPlayer:GetAttribute("AdvancedMode") == true then
+        -- calculus keypad: one scrolling list, no pages
+        for _, b in ipairs(kp:GetDescendants()) do
+            if b:IsA("GuiButton") and b:GetAttribute("Key") == key and shown(b) then return b, nil, 0 end
+        end
+        return nil, nil, 0
+    end
     local functions = kp:FindFirstChild("Functions")
     local current = table.find(PAGES, functions and functions:GetAttribute("Page") or "") or 3
     local bestPage, bestTaps
@@ -2562,6 +2740,17 @@ local function buttonFor(kp, key)
         return switch, PAGES[bestPage], bestTaps
     end
     return nil, nil, 0
+end
+
+-- bring a key in the scrolling calculus list into view
+local function scrollTo(btn)
+    local list = btn:FindFirstAncestorWhichIsA("ScrollingFrame")
+    if not list then return end
+    local top = btn.AbsolutePosition.Y - list.AbsolutePosition.Y
+    local bottom = top + btn.AbsoluteSize.Y
+    if top < 0 or bottom > list.AbsoluteSize.Y then
+        list.CanvasPosition = Vector2.new(list.CanvasPosition.X, math.max(0, list.CanvasPosition.Y + top - 6))
+    end
 end
 
 local function commonPrefix(a, b)
@@ -2630,14 +2819,16 @@ local function guideStep()
         setInfo(done == #text and ("type: " .. target:sub(done + 1)) or "box doesn't match, fix it", THEME.Text)
         return
     end
-    if LocalPlayer:GetAttribute("AdvancedMode") == true then
-        markOff()
-        setInfo("calculus mode: use Put in box, or type: " .. target, Color3.fromRGB(255, 170, 90))
-        return
-    end
-    if not Guide.Plan or Guide.Plan.Target ~= target then
-        local plan, err = planFor(target)
-        if not plan then markOff() setInfo(err, Color3.fromRGB(255, 110, 110)) return end
+    local calc = LocalPlayer:GetAttribute("AdvancedMode") == true
+    if not Guide.Plan or Guide.Plan.Target ~= target or (Guide.Plan.Calc == true) ~= calc then
+        local plan, err
+        if calc then plan, err = calcPlanFor(target) else plan, err = planFor(target) end
+        if not plan then
+            Guide.Plan = nil
+            markOff()
+            setInfo(err, Color3.fromRGB(255, 170, 90))
+            return
+        end
         Guide.Plan = plan
     end
 
@@ -2651,6 +2842,7 @@ local function guideStep()
     end
     local btn, page, taps = buttonFor(kp, key)
     if not btn then markOff() setInfo("can't find the " .. (KEY_NAMES[key] or key) .. " key") return end
+    scrollTo(btn)
     markOn(btn)
     local label = KEY_NAMES[key] or key
     if page then
