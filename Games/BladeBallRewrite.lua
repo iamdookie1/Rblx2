@@ -31,7 +31,7 @@
 
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.99"
+local SCRIPT_VERSION = "rewrite-0.5.100"
 
 -- ---------------------------------------------------------------------------
 -- Single instance.
@@ -324,7 +324,7 @@ end
 do
     local me = LocalPlayer.Name
     local Core = { cap = nil, pending = nil, misses = 0, interp = 0.14, last_parry = nil,
-        ctx = "match", caps = {}, gen = 0, last_send_at = -math.huge, tune = 0, verdict = nil,
+        ctx = "match", gen = 0, last_send_at = -math.huge, tune = 0, verdict = nil,
         feed = { n = 0, total = 0, since = 0, ahead = nil, urs = 0,
             pos = setmetatable({}, { __mode = "k" }), at = setmetatable({}, { __mode = "k" }) } }
     local G = { until_t = 0, m1 = false, m1_at = 0 }
@@ -1393,7 +1393,6 @@ end]]
             verified = real ~= nil and hash == real, hookless = true, holder = found.holder, token = found.token, key_uid = uid }
         if H.fire or H.nc then pcall(Core.unhook) end
         Core.cap, Core.misses, Core.pending = cap, 0, nil
-        Core.caps.match, Core.caps.training = cap, cap
         say(("ARMED with no parry: remote %s, hash %s, uid %d chars, key %d bytes"):format(remote.Name,
             cap.verified and "real (BAC_HASH)" or "from the sender", #uid, #key))
         return true
@@ -2808,15 +2807,19 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
             if dt then frame_dt = math.clamp(dt, 1 / 240, 0.1) end
             Core.fid = (Core.fid or 0) + 1
             Pump.frame = Pump.frame + 1
-            -- captures are per place: entering / leaving lobby training swaps them
+            -- ONE capture serves lobby training and matches (0.5.100): both go
+            -- through the same PRY sender -- same remote, hash, uid and key, and
+            -- the same packet shape (training only changes the target list,
+            -- which packet_parts builds per parry). Until then each place kept
+            -- its own and you had to parry once in each. A capture that does go
+            -- stale is still caught by the hash check / miss counter in send.
             local ctx = in_lobby_training() and "training" or "match"
             if ctx ~= Core.ctx then
-                -- dying in training ends it (this swap) before the parry's answer
-                -- deadline: say why it missed first (until 0.5.11 it was dropped
-                -- silently, so no training death ever got a verdict)
+                -- dying in training ends it before the parry's answer deadline:
+                -- say why it missed first (until 0.5.11 it was dropped silently,
+                -- so no training death ever got a verdict)
                 if Core.pending then logp(miss_verdict(Core.watch) .. " [round ended]") end
-                Core.caps[Core.ctx] = Core.cap
-                Core.ctx, Core.cap = ctx, Core.caps[ctx]
+                Core.ctx = ctx
                 Core.misses, Core.pending, Core.watch = 0, nil, nil
             end
             local w = Core.watch
@@ -3000,10 +3003,23 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         if who and who ~= me and active then
             local reopened = false
             local r = getRoot()
+            local their = character_root(who)
             for ball, st in pairs(tracked) do
+                -- only THIS ball's exchange counts (0.5.100): our parry has
+                -- landed, or the one who parried is right at the ball. Before,
+                -- ANY player's parry anywhere on the map reopened a pass we'd
+                -- fired on but that hadn't landed yet -- a ball still on its way
+                -- in -- and auto parry fired on it a second time: the double
+                -- parry. (Their hit back lands inside clash range, plus the
+                -- ball's travel while the message was on its way.)
+                local near = false
+                if their and ball.Parent then
+                    local spd = ball_velocity(ball).Magnitude
+                    near = (their.Position - Core.ball_now(ball)).Magnitude <= clash_range(spd) + spd * (ping_s() + 0.1)
+                end
                 -- only a ball coming back at us (multi-ball: one we just sent
                 -- away, still flying off, stays as it is)
-                if r and st.target == me and (st.parried or st.landed) and ball.Parent then
+                if r and st.target == me and (st.landed or (st.parried and near)) and ball.Parent then
                     if ball_velocity(ball):Dot(r.Position - Core.ball_now(ball)) > 0 then
                         open_pass(st); reopened = true
                     else
@@ -3155,7 +3171,7 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
     -- ball comes first).
     function Parry.rehook()
         pcall(unhook)
-        Core.cap, Core.pending, Core.misses, Core.caps = nil, nil, 0, {}
+        Core.cap, Core.pending, Core.misses = nil, nil, 0
         tok_cache.cap = nil
         Capture.dry, Capture.last_press = 0, -math.huge
         Capture.since = canParryNow() and (clock_() - 1) or nil
@@ -3935,7 +3951,7 @@ local ClashLabel = AS:AddLabel("Status: off", true)
 -- Avatar changer
 local Avatar = { target = "", original = nil }
 local AvatarChanger = Feature("AvatarChanger")
-AvatarChanger.round_only = true -- touches your character / game state: rounds only (lobby detection)
+-- AvatarChanger works in the lobby too (0.5.100): it only touches your own character
 do
     local function strip(char)
         for _, obj in ipairs(char:GetChildren()) do
@@ -4097,14 +4113,14 @@ local function apply_korblox(char, on)
     end
 end
 local Headless = Feature("Headless")
-Headless.round_only = true -- touches your character / game state: rounds only (lobby detection)
+-- Headless works in the lobby too (0.5.100): it only touches your own character
 function Headless.start()
     pcall(apply_headless, LocalPlayer.Character, true)
     Headless:connect(LocalPlayer.CharacterAdded, function(c) task.wait(0.5); if Headless.on then pcall(apply_headless, c, true) end end)
 end
 function Headless.stop() pcall(apply_headless, LocalPlayer.Character, false) end
 local Korblox = Feature("Korblox")
-Korblox.round_only = true -- touches your character / game state: rounds only (lobby detection)
+-- Korblox works in the lobby too (0.5.100): it only touches your own character
 function Korblox.start()
     pcall(apply_korblox, LocalPlayer.Character, true)
     Korblox:connect(LocalPlayer.CharacterAdded, function(c) task.wait(0.5); if Korblox.on then pcall(apply_korblox, c, true) end end)
@@ -4678,7 +4694,7 @@ local function save_skin()
     end)
 end
 local SkinChanger = Feature("SkinChanger")
-SkinChanger.round_only = true -- touches your character / game state: rounds only (lobby detection)
+-- SkinChanger works in the lobby too (0.5.100): it only touches your own character
 do
     local swords, controller, realGetSword
     local function our_sword(name)
@@ -4711,8 +4727,10 @@ do
     -- was on but the effect stayed your real sword's. The game's handler is
     -- paused and called through us; for YOUR parries only, fxName and sword are
     -- swapped for the skin's. Everyone else's pass through untouched, and the
-    -- handler is put back when the skin changer goes off.
-    local fx_paused, swordFX = {}, nil
+    -- handler is put back when the skin changer goes off -- and whenever you're
+    -- out of a round: the skin itself works in the lobby too (0.5.100), but a
+    -- listener on a game remote attached in the lobby is what BAC kicks on.
+    local fx_paused, fx_wraps, swordFX = {}, {}, nil
     local function skin_slash()
         local ok, data = pcall(realGetSword, swords, Skin.name)
         return (ok and type(data) == "table" and type(data.SlashName) == "string") and data.SlashName or "SlashEffect"
@@ -4746,7 +4764,7 @@ do
                     c:Disable()
                     -- connected raw (not SkinChanger:connect): if this instance
                     -- dies it must keep passing parries through, not drop them
-                    SkinChanger._conns[#SkinChanger._conns + 1] = sig:Connect(function(...)
+                    fx_wraps[#fx_wraps + 1] = sig:Connect(function(...)
                         -- No render switched ClientFX off: its effects stay off
                         local cfx = c_fx_script()
                         if cfx and cfx.Disabled then return end
@@ -4760,6 +4778,11 @@ do
             end
         end
         return found
+    end
+    local function unswap_parry_fx()
+        for c in pairs(fx_paused) do pcall(function() c:Enable() end) end
+        for _, c in ipairs(fx_wraps) do pcall(function() c:Disconnect() end) end
+        fx_paused, fx_wraps = {}, {}
     end
     function SkinChanger.apply() if SkinChanger.on then save_skin(); set_sword(); if swords then prefetch_slash() end end end
     function SkinChanger.start()
@@ -4805,16 +4828,15 @@ do
             if not SkinChanger:alive(token) then return end
             set_sword()
             prefetch_slash()
-            -- ClientFX connects its handler once it's started: retry ~10s
-            for _ = 1, 40 do
-                if not SkinChanger:alive(token) or swap_parry_fx() then break end
-                task.wait(0.25)
-            end
             SkinChanger:connect(LocalPlayer.CharacterAdded, function()
                 task.wait(2.5)
                 if SkinChanger:alive(token) then set_sword() end
             end)
             SkinChanger:loop(1, function()
+                -- the parry effect swap: in a round / training only (see above)
+                local inr = Stagger.round_check and Stagger.round_check()
+                if inr and Skin.name ~= "" and next(fx_paused) == nil then swap_parry_fx()
+                elseif not inr and next(fx_paused) ~= nil then unswap_parry_fx() end
                 if Skin.name == "" then return end
                 local char = LocalPlayer.Character
                 if not char then return end
@@ -4831,9 +4853,8 @@ do
     function SkinChanger.stop()
         -- put the game's own resolver back
         if swords and realGetSword then pcall(function() rawset(swords, "GetSword", realGetSword) end) end
-        -- and the game's parry effect handler (our pass-throughs go in release)
-        for c in pairs(fx_paused) do pcall(function() c:Enable() end) end
-        fx_paused = {}
+        -- and the game's parry effect handler
+        unswap_parry_fx()
     end
 end
 
