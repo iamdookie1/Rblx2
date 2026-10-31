@@ -168,7 +168,7 @@ local Settings = {
     -- bring
     BringCategory = "Fuel", BringPicks = {}, BringExclude = {}, BringOrder = "Nearest first",
     BringDest = "You", BringMode = "Fast", BringPerFrame = 10, BringHold = 100,
-    BringMax = 100, BringRange = 2000, BringSkipNear = true, SavedSpot = nil,
+    BringMax = 100, BringRange = 2000, BringSkipNear = true, SavedSpot = nil, BringHeight = 0,
     AutoBring = false, AutoBringEvery = 10,
     ChestLoot = false, ChestLootDest = "You",
     ChestLootKinds = { Fuel = true, Food = true, Heals = true, Scrap = true, Gems = true, Ammo = true, Gear = true, Seeds = true, Keys = true, Other = true },
@@ -2053,7 +2053,7 @@ local function runBring(what, dest, limit)
                         break
                     end
                     if model.Parent then
-                        local cf = CFrame.new(base.Position + slotOffset(i, dest))
+                        local cf = CFrame.new(base.Position + slotOffset(i, dest) + Vector3.new(0, Settings.BringHeight, 0))
                         start:FireServer(model)
                         placeItem(model, cf)
                         task.delay(Settings.BringHold / 1000, function()
@@ -2076,7 +2076,7 @@ local function runBring(what, dest, limit)
                     break
                 end
                 if model.Parent then
-                    local cf = CFrame.new(base.Position + slotOffset(i, dest))
+                    local cf = CFrame.new(base.Position + slotOffset(i, dest) + Vector3.new(0, Settings.BringHeight, 0))
                     local part = model.PrimaryPart or anyPart(model)
                     start:FireServer(model)
                     local t0 = os.clock()
@@ -4814,6 +4814,8 @@ do
     slider(HowBox, "BringPerFrame", "Items per frame (fast)", "BringPerFrame", 1, 50)
     slider(HowBox, "BringHold", "Hold before letting go", "BringHold", 0, 500, " ms", "Raise this if items snap back to where they were")
     slider(HowBox, "BringMax", "Max items per bring", "BringMax", 1, 500)
+    slider(HowBox, "BringHeight", "Drop height above target", "BringHeight", 0, 30, " studs",
+        "How far above the spot items are placed. If items glitch or break when brought straight onto it, raise this so they drop in from above")
     slider(HowBox, "BringRange", "Only items within", "BringRange", 25, 5000, " studs",
         "Bring only takes items your game has loaded (the map around you, plus anything the game keeps loaded everywhere); this caps how far from you they can be")
     toggle(HowBox, "BringSkipNear", "Skip items already there", "BringSkipNear")
