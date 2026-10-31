@@ -156,7 +156,7 @@ local Settings = {
     Speed = false, SpeedValue = 32, SpeedMethod = "WalkSpeed",
     Jump = false, JumpValue = 75, InfJump = false,
     Fly = false, FlySpeed = 60, Noclip = false, AntiAfk = true,
-    TpMethod = "Tween", TpSpeed = 150, TpGround = true,
+    TpMethod = "Teleport", RunMethod = "Teleport", TpSpeed = 150, TpGround = true,
     -- visuals
     KidDots = false, KidLabels = true, KidColor = Color3.fromRGB(255, 220, 80),
     EspMobs = false, EspKids = false, EspPlayers = false, EspChests = false, EspItems = false,
@@ -177,7 +177,10 @@ local Settings = {
     AutoHeal = false, HealBelow = 50, HealBring = true, ConsumeRange = 15,
     KeepFireFed = false, FireBelow = 40, FuelOrder = "Strongest first", KeepScrapping = false,
     NightCamp = false, Escape = false, EscapeBelow = 25,
-    AutoReviveOthers = false, AutoSelfRevive = false,
+    AutoReviveOthers = false, AutoSelfRevive = false, ReviveGoTo = false, ReviveGoRange = 500, ReviveReturn = true,
+    InfSack = false, StashHeight = 250, AutoGrab = false, GrabRange = 12, BringFar = false,
+    GrabKinds = { Fuel = true, Food = true, Heals = true, Scrap = true, Gems = true, Ammo = true, Gear = true, Seeds = true, Keys = true, Other = true },
+    AutoCultistGems = false, AutoFrogKeys = false, AutoOwlFeathers = false, AutoSnowBell = false, AutoEasterEggs = false, AutoHappyPieces = false,
     AutoClearWeather = false, AutoNightSkip = false, AutoDryWood = false,
     -- farm
     AutoCook = false, AutoCrockpot = false,
@@ -333,6 +336,8 @@ local Index = {
     mobs = {}, -- Workspace.Characters model -> true
     kids = {}, -- lost kid model -> true
     namesVersion = 0, -- bumps whenever an item name appears or disappears
+    onAdd = {}, -- fn(model, entry) for every item indexed (the tracker)
+    onRemove = {}, -- fn(model, entry) for every item that leaves Workspace.Items
 }
 
 local Remotes = ReplicatedStorage:WaitForChild("RemoteEvents", 15)
@@ -1211,7 +1216,9 @@ function moveTo(pos, opts)
     local target = opts.exact and pos or landingSpot(pos, opts.unknownHeight)
     local look = hrp.CFrame.Rotation
 
-    if Settings.TpMethod == "Instant" then
+    -- Teleports and the runs/automations each have their own method.
+    local method = opts.method or (opts.run and Settings.RunMethod) or Settings.TpMethod
+    if method == "Teleport" or method == "Instant" then
         hrp.CFrame = CFrame.new(target) * look
         hrp.AssemblyLinearVelocity = Vector3.zero
         if Travelling then
@@ -1364,7 +1371,7 @@ end
 -- How the runs (chest run, kid rescue) travel: faster than a plain teleport
 -- tween, over the top of mobs.
 local function runOpts(extra)
-    local opts = { speed = Settings.RunSpeed, high = Settings.RunHigh }
+    local opts = { speed = Settings.RunSpeed, high = Settings.RunHigh, run = true }
     for k, v in extra or {} do
         opts[k] = v
     end
@@ -1686,6 +1693,9 @@ local function indexItem(model)
     if onItemAdded then
         onItemAdded(model, kind)
     end
+    for _, fn in Index.onAdd do
+        pcall(fn, model, Index.items[model])
+    end
 end
 
 local function unindexItem(model)
@@ -1695,6 +1705,9 @@ local function unindexItem(model)
         return
     end
     Index.items[model] = nil
+    for _, fn in Index.onRemove do
+        pcall(fn, model, entry)
+    end
     local set = Index.byKind[entry.kind]
     if set then
         set[model] = nil
@@ -3788,25 +3801,57 @@ local function hasReviveKit()
     return inv and (inv:FindFirstChild("Bandage") or inv:FindFirstChild("MedKit")) ~= nil
 end
 
-function Feat.reviveTick()
-    if Settings.AutoReviveOthers and hasReviveKit() then
-        local hrp = rootPart()
-        for _, player in Players:GetPlayers() do
-            local body = player ~= LocalPlayer and player.Character
-            if body and body:GetAttribute("Interaction") == "Revive" and hrp then
-                local pos = pivotPos(body)
-                if pos and (pos - hrp.Position).Magnitude < 20 and tryOnce(body, 4) then
-                    fire("RequestRevivePlayer", body)
-                end
-            end
+-- Downed players are bodies tagged PlayerBody (attribute PlayerBody = their
+-- UserId) in Workspace.Characters; the game revives one with
+-- RequestRevivePlayer(body) when you have a bandage or medkit. A body someone
+-- carries in their sack sits in their ItemBag folder and is left alone.
+local function downedBodies()
+    local out, seen = {}, {}
+    local function consider(model)
+        local id = model:IsA("Model") and model:GetAttribute("PlayerBody")
+        if id and id ~= LocalPlayer.UserId and not seen[model] and model.Parent and model.Parent.Name ~= "ItemBag" then
+            seen[model] = true
+            table.insert(out, model)
         end
-        -- Bodies left in the item folder sort as "Other".
-        for model in Index.byKind.Other or {} do
-            if model:GetAttribute("Interaction") == "Revive" and hrp then
-                local pos = pivotPos(model)
-                if pos and (pos - hrp.Position).Magnitude < 20 and tryOnce(model, 4) then
-                    fire("RequestRevivePlayer", model)
-                end
+    end
+    pcall(function()
+        for _, model in game:GetService("CollectionService"):GetTagged("PlayerBody") do
+            consider(model)
+        end
+    end)
+    local folder = charactersFolder()
+    for _, model in folder and folder:GetChildren() or {} do
+        consider(model)
+    end
+    return out
+end
+Feat.downedBodies = downedBodies
+
+local reviveBusy = false
+function Feat.reviveTick()
+    if Settings.AutoReviveOthers and hasReviveKit() and not reviveBusy then
+        local hrp = rootPart()
+        for _, body in downedBodies() do
+            local pos = pivotPos(body)
+            local d = pos and hrp and (pos - hrp.Position).Magnitude
+            if d and d < 15 and tryOnce(body, 3) then
+                fire("RequestRevivePlayer", body)
+            elseif d and Settings.ReviveGoTo and d <= Settings.ReviveGoRange and not Job.name and tryOnce(body, 8) then
+                -- Go to them, revive, and come back.
+                reviveBusy = true
+                task.spawn(function()
+                    local back = hrp.CFrame
+                    if moveTo(besideOf(pos, 3), { run = true }) and body.Parent then
+                        task.wait(0.15)
+                        fire("RequestRevivePlayer", body)
+                        task.wait(0.4)
+                    end
+                    if Settings.ReviveReturn and rootPart() then
+                        moveTo(back.Position, { run = true, exact = true })
+                    end
+                    reviveBusy = false
+                end)
+                return
             end
         end
     end
@@ -4220,6 +4265,719 @@ bind(RunService.RenderStepped, function()
     end
 end)
 return Feat, fire
+end)()
+
+--// Item tracker, endless sack, auto grab and more events \\--
+-- Its own function too, for the same 200-locals reason.
+local Extra = (function()
+local Extra = {}
+local CollectionService = game:GetService("CollectionService")
+local tryOnceExtra -- defined with the event helpers below
+
+local function invoke(name, ...)
+    local r = remote(name)
+    if not r then
+        return nil
+    end
+    local ok, result = pcall(r.InvokeServer, r, ...)
+    return ok and result or nil
+end
+
+local function tagged(tag)
+    local ok, list = pcall(CollectionService.GetTagged, CollectionService, tag)
+    return ok and list or {}
+end
+
+-- Item tracker -----------------------------------------------------------------
+-- The map streams: far items are removed from your game and come back as new
+-- objects when you get near again, so a plain list forgets them. Every item
+-- gets a record (name, kind, last spot, what happened) that outlives its
+-- object. When an item comes back it's matched to its record by name and
+-- spot. When one leaves, the record says why as well as the game lets us
+-- tell: used up (the game marks it Destroyed), put in a sack (it moved into a
+-- player's ItemBag or the game's temp storage on its way there), gone out of
+-- range (it left while far from you), or taken (it left right next to you).
+local Tracker = { records = {}, byModel = {}, far = {}, version = 0 }
+Extra.Tracker = Tracker
+
+local function streamRadius()
+    local ok, r = pcall(function()
+        return Workspace.StreamingEnabled and Workspace.StreamingMinRadius or nil
+    end)
+    return ok and r or nil
+end
+
+-- Records without a live object, filed by name and 8-stud map cell, so an
+-- item coming back finds its record without a scan of every record.
+local function cellKey(name, cx, cz)
+    return name .. "@" .. cx .. "," .. cz
+end
+
+local function fileFar(rec)
+    local key = cellKey(rec.name, math.floor(rec.pos.X / 8), math.floor(rec.pos.Z / 8))
+    local list = Tracker.far[key]
+    if not list then
+        list = {}
+        Tracker.far[key] = list
+    end
+    list[rec] = true
+    rec.farKey = key
+end
+
+local function unfileFar(rec)
+    local list = rec.farKey and Tracker.far[rec.farKey]
+    if list then
+        list[rec] = nil
+        if next(list) == nil then
+            Tracker.far[rec.farKey] = nil
+        end
+    end
+    rec.farKey = nil
+end
+
+-- The out-of-range record of `name` at `pos`, if any. Far items are put to
+-- sleep by the server, so one coming back sits where it was left; the match
+-- is tight so a pile of the same item keeps one record each.
+local function findUnloaded(name, pos)
+    local cx, cz = math.floor(pos.X / 8), math.floor(pos.Z / 8)
+    for dx = -1, 1 do
+        for dz = -1, 1 do
+            for rec in Tracker.far[cellKey(name, cx + dx, cz + dz)] or {} do
+                if rec.status == "Out of range" and (rec.pos - pos).Magnitude < 0.75 then
+                    return rec
+                end
+            end
+        end
+    end
+    return nil
+end
+
+table.insert(Index.onAdd, function(model, entry)
+    if not entry then
+        return
+    end
+    local pos = pivotPos(model)
+    if not pos then
+        return
+    end
+    local rec = findUnloaded(entry.name, pos)
+    if rec then
+        unfileFar(rec)
+    else
+        rec = { name = entry.name, kind = entry.kind }
+        table.insert(Tracker.records, rec)
+    end
+    rec.model, rec.pos, rec.status, rec.t = model, pos, "Here", os.clock()
+    Tracker.byModel[model] = rec
+    Tracker.version += 1
+end)
+
+table.insert(Index.onRemove, function(model, entry)
+    local rec = Tracker.byModel[model]
+    Tracker.byModel[model] = nil
+    if not rec then
+        return
+    end
+    rec.model = nil
+    rec.t = os.clock()
+    local pos = pivotPos(model)
+    if pos and pos.Magnitude < 1e6 then
+        rec.pos = pos
+    end
+    local parent = model.Parent
+    local hrp = rootPart()
+    local radius = streamRadius()
+    if model:GetAttribute("Destroyed") then
+        rec.status = "Used up"
+    elseif parent and parent.Name == "ItemBag" and parent.Parent and parent.Parent:IsA("Player") then
+        rec.status = "In " .. (parent.Parent == LocalPlayer and "your" or (parent.Parent.DisplayName .. "'s")) .. " sack"
+    elseif parent and parent.Name == "TempStorage" then
+        rec.status = "Picked up"
+    elseif radius and hrp and (rec.pos - hrp.Position).Magnitude > radius - 24 then
+        rec.status = "Out of range"
+    elseif parent == nil then
+        rec.status = "Taken or used"
+    else
+        rec.status = "Moved"
+    end
+    if rec.status ~= "Used up" then
+        fileFar(rec)
+    end
+    Tracker.version += 1
+end)
+
+-- Keep spots fresh (a few hundred a tick) and forget gone ones after 10 minutes.
+local refreshAt = 1
+function Extra.trackerTick()
+    local list = Tracker.records
+    local n = #list
+    local now = os.clock()
+    for _ = 1, math.min(300, n) do
+        if refreshAt > #list then
+            refreshAt = 1
+        end
+        local rec = list[refreshAt]
+        if not rec then
+            break
+        end
+        if rec.model then
+            if rec.model.Parent then
+                local pos = pivotPos(rec.model)
+                if pos then
+                    rec.pos = pos
+                end
+            end
+            refreshAt += 1
+        elseif rec.status ~= "Out of range" and now - rec.t > 600 then
+            unfileFar(rec)
+            table.remove(list, refreshAt)
+        else
+            refreshAt += 1
+        end
+    end
+end
+
+-- Counts per item name: here (loaded) and out of range (remembered).
+function Extra.trackedSummary()
+    local here, far, gone = {}, {}, {}
+    for _, rec in Tracker.records do
+        if rec.model then
+            here[rec.name] = (here[rec.name] or 0) + 1
+        elseif rec.status == "Out of range" then
+            far[rec.name] = (far[rec.name] or 0) + 1
+        else
+            gone[rec.status] = (gone[rec.status] or 0) + 1
+        end
+    end
+    return here, far, gone
+end
+
+-- Out-of-range records that `what` (bring's { kinds, names, exclude }) wants.
+local function wantedFar(what)
+    local names = what.names and next(what.names) and what.names or nil
+    local out = {}
+    for _, rec in Tracker.records do
+        if not rec.model and rec.status == "Out of range" and rec.kind ~= "Currency" then
+            local ok = true
+            if names then
+                ok = names[rec.name] == true
+            elseif what.kinds then
+                ok = what.kinds[rec.kind] == true
+            end
+            if ok and what.exclude and what.exclude[rec.name] then
+                ok = false
+            end
+            if ok then
+                table.insert(out, rec)
+            end
+        end
+    end
+    return out
+end
+Extra.wantedFar = wantedFar
+
+-- Asks the server to stream in the areas holding the far items `what` wants,
+-- nearest areas first, so bring (or anything else) can see them again.
+function Extra.loadFor(what, maxAreas)
+    local recs = wantedFar(what)
+    local hrp = rootPart()
+    if #recs == 0 or not hrp then
+        return 0
+    end
+    local areas = {}
+    for _, rec in recs do
+        local placed = false
+        for _, area in areas do
+            if (area.pos - rec.pos).Magnitude < 120 then
+                area.n += 1
+                placed = true
+                break
+            end
+        end
+        if not placed then
+            table.insert(areas, { pos = rec.pos, n = 1 })
+        end
+    end
+    table.sort(areas, function(a, b)
+        return (a.pos - hrp.Position).Magnitude < (b.pos - hrp.Position).Magnitude
+    end)
+    local loaded = 0
+    for i = 1, math.min(#areas, maxAreas or 12) do
+        if pcall(LocalPlayer.RequestStreamAroundAsync, LocalPlayer, areas[i].pos, 3) then
+            loaded += areas[i].n
+        end
+    end
+    task.wait(0.4)
+    return loaded
+end
+
+-- Endless sack -----------------------------------------------------------------
+-- The sack's size is checked by the server, so it can't really grow. Instead
+-- it never fills: when it's full, the oldest item (never a lost kid) comes
+-- out and goes to your stash, high above camp, where the script keeps holding
+-- it. A held item counts as yours to the game, so other players can't drag,
+-- bag or use it; if the game ever lets one go it falls toward camp, and the
+-- stash keeper grabs it straight back. Take items back from the Bring tab.
+local Stash = { held = {}, order = {}, pending = {} }
+Extra.Stash = Stash
+
+local function stashBase()
+    local fire = campPart("MainFire")
+    local pos = fire and pivotPos(fire)
+    if not pos then
+        local hrp = rootPart()
+        pos = hrp and hrp.Position
+    end
+    return pos and (pos + Vector3.new(0, Settings.StashHeight, 0))
+end
+
+local function stashSlot(i)
+    local base = stashBase()
+    if not base then
+        return nil
+    end
+    local r = (i - 1) % 64
+    local layer = (i - 1) // 64
+    return CFrame.new(base + Vector3.new((r % 8 - 3.5) * 2.2, layer * 2.2, (r // 8 - 3.5) * 2.2))
+end
+
+function Extra.stashCount()
+    local n = 0
+    for model in Stash.held do
+        if model.Parent then
+            n += 1
+        end
+    end
+    return n
+end
+
+local function hold(model)
+    local start = remote("RequestStartDraggingItem")
+    if not start or not model.Parent then
+        return false
+    end
+    if not Stash.held[model] then
+        table.insert(Stash.order, model)
+        Stash.held[model] = #Stash.order
+    end
+    start:FireServer(model)
+    local cf = stashSlot(Stash.held[model])
+    if cf then
+        placeItem(model, cf)
+    end
+    return true
+end
+
+-- An item that just came out of the sack lands in Workspace.Items next to
+-- you: catch it and hold it in the stash.
+-- The stash streams out when you go far from camp; its items come back as
+-- new objects, so anything that streams in at the stash is taken back too.
+table.insert(Index.onAdd, function(model, entry)
+    local pos, hrp = pivotPos(model), rootPart()
+    local want = entry and Stash.pending[entry.name]
+    if want and want > 0 and pos and hrp and (pos - hrp.Position).Magnitude < 25 then
+        Stash.pending[entry.name] = want - 1
+        task.defer(hold, model)
+        return
+    end
+    local base = pos and Settings.InfSack and stashBase()
+    if base and math.abs(pos.Y - base.Y) < 30 and (Vector3.new(pos.X, base.Y, pos.Z) - base).Magnitude < 30 and mineOrFree(model) then
+        task.defer(hold, model)
+    end
+end)
+
+-- Which sack item makes room: the oldest that isn't a kid or a body.
+local function overflowItem()
+    for _, item in bagContents() do
+        if not item:GetAttribute("KidId") and not item:GetAttribute("PlayerBody") and not item:GetAttribute("CanBeBagged") then
+            return item
+        end
+    end
+    return nil
+end
+
+local lastOverflow = 0
+function Extra.stashTick()
+    -- Keep held items where they belong; grab back any the game let go of.
+    local mine = UID
+    for i, model in Stash.order do
+        if model.Parent and Stash.held[model] then
+            local owner = model:GetAttribute("Owner")
+            local cf = stashSlot(Stash.held[model])
+            local pos = pivotPos(model)
+            if owner ~= mine or (cf and pos and (pos - cf.Position).Magnitude > 6) then
+                if owner == nil or owner == mine then
+                    hold(model)
+                end
+            elseif cf then
+                placeItem(model, cf)
+            end
+        end
+    end
+    -- Tidy the order list.
+    if #Stash.order > 0 and os.clock() % 10 < 0.5 then
+        local keep = {}
+        for _, model in Stash.order do
+            if model.Parent and Stash.held[model] then
+                table.insert(keep, model)
+                Stash.held[model] = #keep
+            else
+                Stash.held[model] = nil
+            end
+        end
+        Stash.order = keep
+    end
+    if not Settings.InfSack or os.clock() - lastOverflow < 0.4 then
+        return
+    end
+    local bag = itemBag()
+    if bag and sackSpace() <= 0 then
+        local item = overflowItem()
+        local drop = remote("RequestBagDropItem")
+        if item and drop then
+            lastOverflow = os.clock()
+            local name = cleanName(item.Name)
+            Stash.pending[name] = (Stash.pending[name] or 0) + 1
+            drop:FireServer(bag, item, #bagContents() <= 1)
+        end
+    end
+end
+
+-- Lets go of stashed items next to you (or into the sack while it has room).
+function Extra.takeFromStash(count, intoSack)
+    local stop = remote("StopDraggingItem")
+    local hrp = rootPart()
+    if not stop or not hrp then
+        return 0
+    end
+    local taken = 0
+    local bag = intoSack and itemBag()
+    local store = remote("RequestBagStoreItem")
+    for _, model in table.clone(Stash.order) do
+        if taken >= (count or math.huge) then
+            break
+        end
+        if model.Parent and Stash.held[model] then
+            Stash.held[model] = nil
+            local cf = hrp.CFrame * CFrame.new((taken % 5 - 2) * 1.6, 1, -5 - (taken // 5) * 1.6)
+            placeItem(model, cf)
+            task.wait(0.05)
+            placeItem(model, cf)
+            stop:FireServer(model)
+            if bag and store and sackSpace() > 0 then
+                task.spawn(pcall, store.InvokeServer, store, bag, model)
+            end
+            taken += 1
+        end
+    end
+    return taken
+end
+
+-- The sack's count shows the stash too, out of ∞.
+local labelHooks = setmetatable({}, { __mode = "k" })
+local function fixLabel(label)
+    if not Settings.InfSack then
+        return
+    end
+    local n = label.Text:match("^(%d+)/")
+    if n and not label.Text:find("∞", 1, true) then
+        local extra = Extra.stashCount()
+        label.Text = (extra > 0 and (n .. "+" .. extra) or n) .. "/∞"
+        label.TextColor3 = Color3.fromRGB(255, 255, 255)
+    end
+end
+function Extra.sackLabelTick()
+    for _, root in { character(), Workspace.CurrentCamera } do
+        for _, gui in root and root:GetDescendants() or {} do
+            if gui.Name == "BagAmount" and gui:IsA("BillboardGui") then
+                local label = gui:FindFirstChild("TextLabel")
+                if label and not labelHooks[label] then
+                    labelHooks[label] = true
+                    bind(label:GetPropertyChangedSignal("Text"), function()
+                        fixLabel(label)
+                    end)
+                end
+                if label then
+                    fixLabel(label)
+                end
+            end
+        end
+    end
+end
+
+-- Auto grab --------------------------------------------------------------------
+-- Bags loose items of the chosen types within reach, the way pressing the
+-- sack on them does. With the endless sack on, a full sack keeps emptying
+-- into the stash, so this never stops.
+function Extra.grabTick()
+    if not Settings.AutoGrab then
+        return
+    end
+    local bag, store, hrp = itemBag(), remote("RequestBagStoreItem"), rootPart()
+    if not bag or not store or not hrp then
+        return
+    end
+    local space = sackSpace()
+    if space <= 0 then
+        return
+    end
+    local kinds = Settings.GrabKinds or {}
+    local grabbed = 0
+    for model, entry in Index.items do
+        if grabbed >= math.min(space, 4) then
+            break
+        end
+        if kinds[entry.kind] and model.Parent and mineOrFree(model) and not Stash.held[model] and not ((Stash.pending[entry.name] or 0) > 0)
+            and not model:GetAttribute("Destroyed") and not model:GetAttribute("Ignited") and not model:GetAttribute("BeingUsed")
+            and not model:GetAttribute("Locked") and model:GetAttribute("Interaction") ~= "NightPlant" then
+            local pos = pivotPos(model)
+            if pos and (pos - hrp.Position).Magnitude <= Settings.GrabRange and tryOnceExtra(model, 3) then
+                grabbed += 1
+                task.spawn(pcall, store.InvokeServer, store, bag, model)
+            end
+        end
+    end
+end
+
+-- More events and biomes ---------------------------------------------------------
+-- Each follows what the game's own touch zone does: carry the item onto the
+-- zone, then send the same request with the same arguments.
+local busy = false
+local function deliver(model, zonePos, request, ...)
+    busy = true
+    local args = table.pack(...)
+    task.spawn(function()
+        if carryTo(model, zonePos + Vector3.new(0, 1, 0)) then
+            invoke(request, model, table.unpack(args, 1, args.n))
+        end
+        busy = false
+    end)
+end
+
+local function itemsWhere(test)
+    local out = {}
+    local folder = itemsFolder()
+    for _, model in folder and folder:GetChildren() or {} do
+        if model:IsA("Model") and not model:GetAttribute("Destroyed") and not model:GetAttribute("BeingUsed") and mineOrFree(model) then
+            local ok, hit = pcall(test, model)
+            if ok and hit then
+                table.insert(out, model)
+            end
+        end
+    end
+    return out
+end
+
+local Tried = setmetatable({}, { __mode = "k" })
+tryOnceExtra = function(model, every)
+    local last = Tried[model]
+    if last and os.clock() - last < (every or 4) then
+        return false
+    end
+    Tried[model] = os.clock()
+    return true
+end
+
+-- Volcano: Cultist Gems onto the cultist king palace's empty podiums.
+function Extra.cultistGemsTick()
+    if not Settings.AutoCultistGems or busy then
+        return
+    end
+    for _, palace in tagged("CultistKingPalace") do
+        local functional = palace:FindFirstChild("Functional")
+        local podiums = functional and functional:FindFirstChild("Podiums")
+        for _, podium in podiums and podiums:GetChildren() or {} do
+            local zone = podium:FindFirstChild("TouchZone")
+            if zone and not podium:GetAttribute("GemAdded") then
+                local gem = itemsWhere(function(m)
+                    return m.Name == "Cultist Gem"
+                end)[1]
+                if gem and tryOnceExtra(gem, 6) then
+                    deliver(gem, zone.Position, "RequestAddCultistPalaceGem", podium)
+                    return
+                end
+            end
+        end
+    end
+end
+
+-- Frog gate: Frog Keys into its empty locks.
+function Extra.frogKeysTick()
+    if not Settings.AutoFrogKeys or busy then
+        return
+    end
+    for _, gate in tagged("FrogGate") do
+        local functional = gate:FindFirstChild("Functional")
+        local zone = functional and functional:FindFirstChild("TouchZone")
+        if zone then
+            for _, lock in functional:GetChildren() do
+                if lock.Name == "FrogLock" and not lock:GetAttribute("Unlocked") then
+                    local key = itemsWhere(function(m)
+                        return m.Name == "Frog Key"
+                    end)[1]
+                    if key and tryOnceExtra(key, 6) then
+                        deliver(key, zone.Position, "RequestAddFrogKey", lock)
+                        return
+                    end
+                    break
+                end
+            end
+        end
+    end
+end
+
+-- Snow: owl feathers into the nest's empty feather spots.
+function Extra.owlFeathersTick()
+    if not Settings.AutoOwlFeathers or busy then
+        return
+    end
+    for _, nest in tagged("OwlNest") do
+        local functional = nest:FindFirstChild("Functional")
+        local zone = functional and functional:FindFirstChild("TouchZone")
+        local spots = functional and functional:FindFirstChild("PlacedFeathers")
+        if zone and spots and not nest:GetAttribute("Completed") then
+            local feather = itemsWhere(function(m)
+                return m:HasTag("OwlFeather")
+            end)[1]
+            if feather and tryOnceExtra(feather, 6) then
+                local best, bestD
+                for _, spot in spots:GetChildren() do
+                    if spot:HasTag("PlacedOwlFeather") and not spot:GetAttribute("Placed") then
+                        local d = (spot:GetPivot().Position - zone.Position).Magnitude
+                        if not bestD or d < bestD then
+                            best, bestD = spot, d
+                        end
+                    end
+                end
+                if best then
+                    deliver(feather, zone.Position, "RequestPlaceOwlFeather", best)
+                    return
+                end
+            end
+        end
+    end
+end
+
+-- Snow: the bell tower's rope (Interaction "BellRope").
+local function bellRopes()
+    local out = {}
+    for _, inst in tagged("Interaction") do
+        if inst:GetAttribute("Interaction") == "BellRope" then
+            table.insert(out, inst)
+        end
+    end
+    return out
+end
+Extra.bellRopes = bellRopes
+function Extra.ringBell(rope)
+    return fire("RequestRingSnowBell", rope)
+end
+function Extra.snowBellTick()
+    if not Settings.AutoSnowBell or Workspace:GetAttribute("SnowBellRung") then
+        return
+    end
+    local hrp = rootPart()
+    for _, rope in bellRopes() do
+        local pos = pivotPos(rope) or (rope:IsA("BasePart") and rope.Position)
+        if pos and hrp and (pos - hrp.Position).Magnitude < 30 and tryOnceExtra(rope, 20) then
+            Extra.ringBell(rope)
+        end
+    end
+end
+
+-- Easter: ready eggs to the egg drop zone.
+function Extra.easterTick()
+    if not Settings.AutoEasterEggs or busy then
+        return
+    end
+    local zone = tagged("EasterEggDropZone")[1]
+    local touch = zone and zone:FindFirstChild("TouchPart")
+    if not touch then
+        return
+    end
+    local egg = itemsWhere(function(m)
+        return m:GetAttribute("EasterEggId") ~= nil and not m:GetAttribute("EggLocked")
+    end)[1]
+    if egg and tryOnceExtra(egg, 6) then
+        deliver(egg, touch.Position, "RequestGiveEasterEgg", zone)
+    end
+end
+
+-- Halloween: Happy's body pieces back onto his figure (while you're helping him).
+function Extra.happyTick()
+    if not Settings.AutoHappyPieces or busy or not LocalPlayer:GetAttribute("HelpingHappyHalloween") then
+        return
+    end
+    for _, figure in tagged("RebuildHappyHalloween") do
+        local zone = figure:FindFirstChild("TouchZone")
+        if zone then
+            local pieces = itemsWhere(function(m)
+                return m:GetAttribute("HalloweenPartId") ~= nil
+            end)
+            for _, piece in pieces do
+                local id = piece:GetAttribute("HalloweenPartId")
+                for _, ghost in figure:GetChildren() do
+                    if ghost:IsA("Model") and ghost:GetAttribute("HalloweenPartId") == id and not ghost:GetAttribute("Placed") then
+                        if tryOnceExtra(piece, 6) then
+                            deliver(piece, zone.Position, "RequestPlaceHappyHalloweenPart", ghost)
+                            return
+                        end
+                    end
+                end
+            end
+        end
+    end
+end
+
+-- Where each event or biome spot is, for the teleport buttons.
+function Extra.spot(which)
+    local list
+    if which == "Cultist palace" then
+        list = tagged("CultistKingPalace")
+    elseif which == "Frog gate" then
+        list = tagged("FrogGate")
+    elseif which == "Owl nest" then
+        list = tagged("OwlNest")
+    elseif which == "Snow bell" then
+        list = bellRopes()
+    elseif which == "Easter egg drop" then
+        list = tagged("EasterEggDropZone")
+    elseif which == "Happy's figure" then
+        list = tagged("RebuildHappyHalloween")
+    elseif which == "Start Happy's quest" then
+        list = tagged("StartHelpHappyQuest")
+    end
+    local hrp = rootPart()
+    local best, bestD
+    for _, inst in list or {} do
+        local pos = inst:IsA("BasePart") and inst.Position or pivotPos(inst)
+        local d = pos and hrp and (pos - hrp.Position).Magnitude
+        if d and (not bestD or d < bestD) then
+            best, bestD = pos, d
+        end
+    end
+    return best
+end
+Extra.SPOTS = { "Cultist palace", "Frog gate", "Owl nest", "Snow bell", "Easter egg drop", "Happy's figure", "Start Happy's quest" }
+
+-- The biome items each event wants, for "load far ones".
+Extra.EVENT_ITEMS = {
+    ["Crystal Skull Key"] = true, ["Cultist Gem"] = true, ["Frog Key"] = true,
+}
+
+local TICKS = { "trackerTick", "stashTick", "sackLabelTick", "grabTick", "cultistGemsTick", "frogKeysTick", "owlFeathersTick",
+    "snowBellTick", "easterTick", "happyTick" }
+local errs = {}
+loop(0.25, function()
+    for _, name in TICKS do
+        local ok, err = pcall(Extra[name])
+        if not ok and not errs[name] then
+            errs[name] = true
+            warn("[99 Nights] " .. name .. ": " .. tostring(err))
+        end
+    end
+end)
+return Extra
 end)()
 
 -- The UI and the loops run in their own function for the same reason.
@@ -4794,9 +5552,19 @@ do
     GoBox:AddButton({
         Text = "Bring now",
         Func = function()
-            if runBring(currentBringWhat(), Settings.BringDest) == 0 then
-                UI.BringStatus:SetText("Nothing to bring")
-            end
+            task.spawn(function()
+                local what = currentBringWhat()
+                if Settings.BringFar then
+                    local n = Extra.loadFor(what)
+                    if n > 0 then
+                        UI.BringStatus:SetText(("Loading %d far item%s..."):format(n, n == 1 and "" or "s"))
+                        task.wait(0.6)
+                    end
+                end
+                if runBring(what, Settings.BringDest) == 0 then
+                    UI.BringStatus:SetText("Nothing to bring")
+                end
+            end)
         end,
     }):AddButton({
         Text = "Stop",
@@ -4807,6 +5575,48 @@ do
     })
     toggle(GoBox, "AutoBring", "Auto bring", "AutoBring")
     slider(GoBox, "AutoBringEvery", "Every", "AutoBringEvery", 2, 60, " s")
+    toggle(GoBox, "BringFar", "Load far items first", "BringFar",
+        "Bring now first asks the server to load the areas where the tracker last saw the picked items, so ones out of range come too")
+
+    local SackBox = BringTab:AddRightGroupbox("Endless sack", "infinity")
+    toggle(SackBox, "InfSack", "Endless sack", "InfSack",
+        "When your sack is full, its oldest item (never a kid) moves to your stash above camp, so the sack always has room. The sack shows ∞. Stashed items are held by you, so other players can't take them")
+    slider(SackBox, "StashHeight", "Stash height above camp", "StashHeight", 60, 600, " studs")
+    UI.StashLabel = SackBox:AddLabel("Stash: empty", true)
+    SackBox:AddButton({
+        Text = "Take 10",
+        Func = function()
+            task.spawn(Extra.takeFromStash, 10, false)
+        end,
+    }):AddButton({
+        Text = "Take all",
+        Func = function()
+            task.spawn(Extra.takeFromStash, nil, false)
+        end,
+    })
+    SackBox:AddButton({
+        Text = "Take into sack (while it has room)",
+        Func = function()
+            task.spawn(Extra.takeFromStash, nil, true)
+        end,
+    })
+
+    local GrabBox = BringTab:AddLeftGroupbox("Auto grab", "hand")
+    toggle(GrabBox, "AutoGrab", "Auto grab", "AutoGrab", "Puts loose items of the types below into your sack as you pass them (hold the sack in your inventory)")
+    multi(GrabBox, "GrabKinds", "Grab types", "GrabKinds", ITEM_KINDS, ITEM_KINDS)
+    slider(GrabBox, "GrabRange", "Reach", "GrabRange", 4, 20, " studs", "The game only lets the sack take items close to you")
+
+    local TrackBox = BringTab:AddRightGroupbox("Item tracker", "radar")
+    UI.TrackLabel = TrackBox:AddLabel("Tracking...", true)
+    TrackBox:AddButton({
+        Text = "Load far ones of my pick",
+        Func = function()
+            task.spawn(function()
+                local n = Extra.loadFor(currentBringWhat(), 20)
+                notify("Item tracker", n > 0 and ("Loading areas with " .. n .. " far items") or "None of the picked items are out of range", 3)
+            end)
+        end,
+    })
 
     local HowBox = BringTab:AddLeftGroupbox("How", "gauge")
     choice(HowBox, "BringMode", "Method", "BringMode", { "Fast", "Safe" },
@@ -4888,8 +5698,12 @@ do
     local ReviveBox = SurvivalTab:AddLeftGroupbox("Revive", "cross")
     toggle(EatBox, "AutoArmour", "Wear better armour", "AutoArmour",
         "Brings over and puts on any armour on the map that beats what you wear in that slot")
-    toggle(ReviveBox, "AutoReviveOthers", "Revive teammates near me", "AutoReviveOthers",
-        "Revives downed players within 20 studs. Needs a bandage or medkit in your inventory, like reviving by hand")
+    toggle(ReviveBox, "AutoReviveOthers", "Revive downed teammates", "AutoReviveOthers",
+        "Revives downed players' bodies within 15 studs. Needs a bandage or medkit in your inventory, like reviving by hand")
+    toggle(ReviveBox, "ReviveGoTo", "Go to downed teammates", "ReviveGoTo",
+        "Travels to a downed teammate within the range below to revive them (uses the runs' move method), when no automation is running")
+    slider(ReviveBox, "ReviveGoRange", "Go to them within", "ReviveGoRange", 25, 3000, " studs")
+    toggle(ReviveBox, "ReviveReturn", "Come back after reviving", "ReviveReturn")
     toggle(ReviveBox, "AutoSelfRevive", "Self revive when offered", "AutoSelfRevive",
         "Presses the game's own self-revive button when it shows. If the game asks for a purchase you still have to confirm it")
 
@@ -5061,6 +5875,58 @@ do
     toggle(JungleBox, "AutoTempleKeys", "Crystal skulls to the temple", "AutoTempleKeys",
         "Puts each Crystal Skull Key on an empty jungle temple podium")
     toggle(JungleBox, "AutoKeys", "Use keys on their locks", "AutoKeys", "Takes each key to the lock it opens")
+    JungleBox:AddButton({
+        Text = "Load far skull keys",
+        Func = function()
+            task.spawn(function()
+                local n = Extra.loadFor({ names = { ["Crystal Skull Key"] = true } }, 20)
+                notify("Skull keys", n > 0 and ("Loading " .. n .. " skull keys the tracker remembers") or "No skull keys out of range that the tracker knows of", 3)
+            end)
+        end,
+    })
+
+    local BiomeBox = EventTab:AddRightGroupbox("Biomes", "mountain-snow")
+    toggle(BiomeBox, "AutoCultistGems", "Cultist Gems to the palace", "AutoCultistGems",
+        "Volcano: puts each Cultist Gem on an empty podium of the cultist king's palace")
+    toggle(BiomeBox, "AutoFrogKeys", "Frog Keys into the frog gate", "AutoFrogKeys", "Puts each Frog Key in an empty lock of the frog gate")
+    toggle(BiomeBox, "AutoOwlFeathers", "Owl feathers to the nest", "AutoOwlFeathers",
+        "Snow: puts each owl feather in an empty spot of the owl nest")
+    toggle(BiomeBox, "AutoSnowBell", "Ring the snow bell", "AutoSnowBell", "Snow: rings the bell tower when you're near its rope and it hasn't been rung")
+    BiomeBox:AddButton({
+        Text = "Load far biome items",
+        Func = function()
+            task.spawn(function()
+                local n = Extra.loadFor({ names = Extra.EVENT_ITEMS }, 20)
+                notify("Biomes", n > 0 and ("Loading " .. n .. " gems and keys the tracker remembers") or "No biome items out of range that the tracker knows of", 3)
+            end)
+        end,
+    })
+
+    local MoreBox = EventTab:AddLeftGroupbox("More events", "party-popper")
+    toggle(MoreBox, "AutoHappyPieces", "Happy's body pieces", "AutoHappyPieces",
+        "Halloween: while you're helping Happy, puts each of his body pieces back on his figure")
+    toggle(MoreBox, "AutoEasterEggs", "Easter eggs to the drop zone", "AutoEasterEggs", "Easter: takes each ready egg to the egg drop zone")
+    UI.SpotPick = MoreBox:AddDropdown("EventSpot", { Text = "Go to", Values = Extra.SPOTS, Default = Extra.SPOTS[1] })
+    MoreBox:AddButton({
+        Text = "Go",
+        Func = function()
+            local which = Options.EventSpot and Options.EventSpot.Value or Extra.SPOTS[1]
+            local pos = Extra.spot(which)
+            if not pos then
+                notify("Events", which .. " isn't loaded or isn't in this server", 3)
+                return
+            end
+            task.spawn(function()
+                if moveTo(pos) and which == "Snow bell" then
+                    for _, rope in Extra.bellRopes() do
+                        Extra.ringBell(rope)
+                    end
+                elseif which == "Start Happy's quest" then
+                    fire("RequestStartHelpHappyQuest")
+                end
+            end)
+        end,
+    })
 
     local GemBox = EventTab:AddRightGroupbox("Gems", "gem")
     toggle(GemBox, "AutoGemClaim", "Claim gem rain and diamond tree gems", "AutoGemClaim", nil, function(v)
@@ -5096,6 +5962,8 @@ do
         end
         stopJob("Stopped")
     end)
+    choice(RunBox, "RunMethod", "Runs and automations move by", "RunMethod", { "Teleport", "Tween" },
+        "How chest runs, kid rescue, trick or treat and the other automations travel. Teleport is fastest; Tween flies over mobs at the run speed below")
     toggle(RunBox, "ReturnAfterRun", "Go back to where I was after a chest run", "ReturnAfterRun")
     slider(RunBox, "RunSpeed", "Run speed", "RunSpeed", 100, 600, " studs/s",
         "How fast chest runs and kid rescue travel. Moves by position, so the game's speed check doesn't see it")
@@ -5194,8 +6062,8 @@ do
     toggle(MoveBox, "AntiAfk", "Anti AFK", "AntiAfk")
 
     local TpSetBox = MoveTab:AddLeftGroupbox("Teleport settings", "settings")
-    choice(TpSetBox, "TpMethod", "Teleport method", "TpMethod", { "Tween", "Instant" },
-        "Tween glides there through walls at the speed below. Instant jumps straight there")
+    choice(TpSetBox, "TpMethod", "Teleports move by", "TpMethod", { "Teleport", "Tween" },
+        "Teleport jumps straight there (fastest). Tween glides there through walls at the speed below")
     slider(TpSetBox, "TpSpeed", "Tween speed", "TpSpeed", 30, 280)
     toggle(TpSetBox, "TpGround", "Land on the ground", "TpGround", "Finds the ground under where you're going, so you never land in a tree top")
     TpSetBox:AddButton("Stop moving", function()
@@ -5463,6 +6331,38 @@ loop(0.3, function()
         setText(UI.BringStatus, string.format("Done: %d item%s", Bring.total, Bring.total == 1 and "" or "s"))
     end
     setText(UI.JobLabel, Job.name and (Job.name .. ": " .. Job.status) or Job.status)
+    local stashed = Extra.stashCount()
+    setText(UI.StashLabel, stashed > 0 and ("Stash: %d item%s above camp"):format(stashed, stashed == 1 and "" or "s") or "Stash: empty")
+end)
+
+-- Item tracker summary.
+loop(2, function()
+    local here, far, gone = Extra.trackedSummary()
+    local nHere, nFar = 0, 0
+    for _, n in here do
+        nHere += n
+    end
+    local farList = {}
+    for name, n in far do
+        nFar += n
+        table.insert(farList, { name, n })
+    end
+    table.sort(farList, function(a, b)
+        return a[2] > b[2]
+    end)
+    local lines = { ("%d here, %d out of range"):format(nHere, nFar) }
+    for i = 1, math.min(6, #farList) do
+        table.insert(lines, ("  %s x%d (far)"):format(farList[i][1], farList[i][2]))
+    end
+    local goneParts = {}
+    for status, n in gone do
+        table.insert(goneParts, status:lower() .. " " .. n)
+    end
+    if #goneParts > 0 then
+        table.sort(goneParts)
+        table.insert(lines, "Recently: " .. table.concat(goneParts, ", "))
+    end
+    setText(UI.TrackLabel, table.concat(lines, "\n"))
 end)
 
 -- Dashboard.
