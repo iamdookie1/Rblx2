@@ -31,7 +31,7 @@
 
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.100"
+local SCRIPT_VERSION = "rewrite-0.5.101"
 
 -- ---------------------------------------------------------------------------
 -- Single instance.
@@ -201,11 +201,13 @@ local Parry = {}
 -- PARRY ANIMATION (mirrors the game's own block action, so remote parries and
 -- spam look like real presses). Defines only; the game's SwordAPI folder is read
 -- the first time a swing is actually played.
---   * which tracks: every animation in the sword's set (the skin's set while the
---     skin changer is on) tagged Parry or GrabParry, picked by attribute;
---   * how: loaded once per animator with the Animation's attributes copied onto
---     the track (PlaySpeed, PlayFadeTime, StopFadeTime...) -- the game's success
---     handler finds what to stop by those, so block and success swing never stack;
+--   * which tracks: the game's own pick -- SwordAPI:GetAnimations with the
+--     sword's (the skin's, while the skin changer is on) AnimationType AND
+--     SwordType, accessory / style folders included; a folder scan if that fails;
+--   * how: loaded through the game's AnimationController (its registry, so its
+--     own stop / success code handles our block like a real one), played with
+--     the track's PlaySpeed / PlayFadeTime / PlayWeight -- or the noob parry's
+--     faster swing for your first 5 parries ever, as the game does;
 --   * when: like the game, a new block starts only once the last one landed
 --     (ParrySuccess) or its 1.3s cooldown ran out, and after a landed parry it
 --     waits for the success swing to show and the ball to be back on you. So spam
@@ -221,19 +223,50 @@ do
     local own_swing = setmetatable({}, { __mode = 'k' })  -- track -> when we played it
     local gate = { last = -math.huge, landed = true, landed_at = -math.huge }
     local success_at, grab_track = -math.huge, nil
+    -- the game's own modules (0.5.101), required on the first swing (already
+    -- loaded, so require only hands back the cached table): SwordAPI picks the
+    -- animations exactly as the real parry does, AnimationController loads them
+    -- into the game's track registry -- so the game's own success swing finds and
+    -- stops our block like its own. Either missing -> the old folder scan.
+    local game_mods
+    local function mods()
+        if game_mods == nil then
+            game_mods = false
+            pcall(function()
+                local api = require(ReplicatedStorage.Shared.SwordAPI)
+                local ac = require(ReplicatedStorage.Controllers.AnimationController)
+                if type(api) == "table" and type(api.GetAnimations) == "function" then
+                    game_mods = { api = api, ac = (type(ac) == "table" and type(ac.LoadAnimation) == "function") and ac or nil }
+                end
+            end)
+        end
+        return game_mods or nil
+    end
     local function sword_info(char)
         local name = (Anim.skin and Anim.skin()) or char:GetAttribute("CurrentlyEquippedSword") or ""
         local info = info_cache[name]
         if info then return info end
-        info = { collection = "Default" }
+        -- AnimationType AND SwordType, like the game's SetSword (until 0.5.101
+        -- only the first: dual / special sword types swung the wrong set)
+        info = { collection = "Default", sword_type = "Single" }
         if name ~= "" then
             local ok, data = pcall(function() return ReplicatedStorage.Shared.ReplicatedInstances.Swords.GetSword:Invoke(name) end)
-            if ok and type(data) == "table" and data.AnimationType then info.collection = data.AnimationType end
+            if ok and type(data) == "table" then
+                if data.AnimationType then info.collection = data.AnimationType end
+                if data.SwordType then info.sword_type = data.SwordType end
+            end
         end
         info_cache[name] = info
         return info
     end
-    local function find_animations(info)
+    local function find_animations(info, char)
+        local m = mods()
+        if m then
+            -- the real parry's call: GetAnimations(char, {"Parry","GrabParry"},
+            -- AnimationCollection, SwordType) -- accessory / style folders included
+            local ok, list = pcall(m.api.GetAnimations, m.api, char, { "Parry", "GrabParry" }, info.collection, info.sword_type)
+            if ok and type(list) == "table" and #list > 0 then return list end
+        end
         local list = {}
         local ok, folder = pcall(function()
             local col = ReplicatedStorage.Shared.SwordAPI:FindFirstChild("Collection")
@@ -249,6 +282,14 @@ do
         return list
     end
     local function load_track(animator, humanoid, anim)
+        local m = mods()
+        if m and m.ac then
+            -- the game's loader (reuse = true, as the real parry calls it): it
+            -- caches per animator itself, copies the attributes, tags the track
+            -- and keeps it in the registry its own stop / success code walks
+            local ok, t = pcall(m.ac.LoadAnimation, m.ac, animator, anim, true)
+            if ok and typeof(t) == "Instance" then return t end
+        end
         local per = own_tracks[animator]
         if not per then per = {}; own_tracks[animator] = per end
         local track = per[anim]
@@ -283,13 +324,27 @@ do
         for _, track in ipairs(animator:GetPlayingAnimationTracks()) do
             if track:GetAttribute("SuccessParry") or track:GetAttribute("Parry") then track:Stop(track:GetAttribute("StopFadeTime")) end
         end
+        -- the game's own registry has tracks ours doesn't (a real press's): stop those too
+        local m = mods()
+        if m and m.ac and m.ac.GetPlayingAnimationTracks then
+            pcall(function()
+                for _, track in m.ac:GetPlayingAnimationTracks(animator) do
+                    if track:GetAttribute("SuccessParry") or track:GetAttribute("Parry") then track:Stop(track:GetAttribute("StopFadeTime")) end
+                end
+            end)
+        end
+        -- your first 5 parries ever swing faster and snap in (the game's noob
+        -- parry: fade 0.05, weight 1, speed times/5 + 1)
+        local times = Parry.timesParried and Parry.timesParried()
+        local noob = type(times) == "number" and times < 5
         local parry_time = char:GetAttribute("ParryTime") or 0
-        for _, anim in ipairs(find_animations(sword_info(char))) do
+        for _, anim in ipairs(find_animations(sword_info(char), char)) do
             local ok, track = pcall(load_track, animator, humanoid, anim)
             if ok and track then
-                local speed = track:GetAttribute("PlaySpeed") or 1
+                local speed = noob and (times / 5 + 1) or track:GetAttribute("PlaySpeed") or 1
                 own_swing[track] = os.clock()
-                track:Play(track:GetAttribute("PlayFadeTime"), track:GetAttribute("PlayWeight"), speed)
+                if noob then track:Play(0.05, 1, speed)
+                else track:Play(track:GetAttribute("PlayFadeTime"), track:GetAttribute("PlayWeight"), speed) end
                 grab_track = track
                 local left = track.Length == 0 and 1 or (track.Length - track.TimePosition) * speed
                 if left > parry_time then parry_time = left end
@@ -487,8 +542,59 @@ do
     end
 
     -- ---------- window / lockout gate ----------
+    -- The window the game sends as the parry packet's 4th argument (n6) and
+    -- its lockout (n2), worked out exactly as SwordsController's parry does
+    -- (Bbs dump): 1.5 / 1.25 / 1 / 0.75 / 0.625 for your first 5 parries ever
+    -- (Data.timesParried), else 0.5 / 1.3 -- and, where noob parry is on (casual
+    -- servers), both scaled by kills / 20 until you have 20 kills. The server
+    -- checks it ("SERVER-VALIDATED", see v186 below): until 0.5.101 every forged
+    -- parry said 0.5, which a new / low-kill account's server never takes.
+    -- Which rule applies is read off the window the captured packet carried.
+    local Win = { at = -1, times = nil, kills = nil, data = nil }
+    local function base_window(times)
+        if times == 0 then return 1.5, 1.5 elseif times == 1 then return 1.25, 1.3
+        elseif times == 2 then return 1, 1.3 elseif times == 3 then return 0.75, 1.3
+        elseif times == 4 then return 0.625, 1.3 end
+        return 0.5, 1.3
+    end
+    function Parry.timesParried() return (Win.read()) end
+    function Win.read()
+        local now = clock_()
+        if now - Win.at < 1 then return Win.times, Win.kills end
+        Win.at = now
+        pcall(function()
+            if not Win.data then
+                local R = require(ReplicatedStorage.Packages.Replion)
+                Win.data = R.Client:GetReplion("Data")
+            end
+            if Win.data then
+                Win.times = tonumber(Win.data:Get("timesParried")) or 0
+                Win.kills = tonumber(Win.data:Get("TotalStats.Kills")) or 0
+            end
+        end)
+        return Win.times, Win.kills
+    end
+    -- which rule a captured window number follows: "base", "scaled" or "fixed"
+    function Win.classify(w)
+        local times, kills = Win.read()
+        if type(w) ~= "number" or not times then return "fixed" end
+        local b6 = base_window(times)
+        if math.abs(w - b6) < 1e-4 then return "base" end
+        if kills < 20 and math.abs(w - kills / 20 * b6) < 1e-4 then return "scaled" end
+        return "fixed"
+    end
     local function parry_window()
-        local cw = Core.cap and Core.cap.win
+        local cap = Core.cap
+        local mode = cap and cap.win_mode
+        if mode == "base" or mode == "scaled" then
+            local times, kills = Win.read()
+            if times then
+                local n6, n2 = base_window(times)
+                if mode == "scaled" and kills < 20 then n6, n2 = kills / 20 * n6, kills / 20 * n2 end
+                return n6, n2
+            end
+        end
+        local cw = cap and cap.win
         if cw and cw > 0 then return cw, 1.3 * math.min(cw / 0.5, 1) end
         return 0.5, 1.3
     end
@@ -779,80 +885,14 @@ do
         for i = 1, #text do key[i] = bxor_(byte_(token, i), (byte_(text, i) + i) % 256) end
         local prev = Core.cap
         Core.cap = { remote = remote, hash = hash, uid = uid, key = key, len = #text, ball2 = typeof_(a4) == "CFrame",
-            verified = Core.bac() == hash }
+            verified = Core.bac() == hash, raw_tok = token, raw_t = t,
+            win = type_(a4) == "number" and a4 or nil }
+        if type_(a4) == "number" then Core.cap.win_mode = Win.classify(a4) end
+        if Core.bind_live then task.defer(pcall, Core.bind_live, Core.cap) end
         Core.misses, Core.pending = 0, nil
         Core.new_capture = { prev = prev }
         if Parry.onCapture then task.defer(pcall, Parry.onCapture, Core.cap) end
-        task.defer(pcall, Core.analyze_capture, Core.cap)
         DBG.ev(Core.cap.verified and "CAPTURE: real parry hash confirmed" or "CAPTURE: taken (real hash not readable)")
-    end
-
-    -- CAPTURE ANALYSIS (read-only research for parry-free captures). After a
-    -- capture: is the key derived from something readable (uid / hash /
-    -- UserId / JobId, byte for byte or with a constant offset)? what is the uid?
-    -- and against the capture saved from the LAST server (executor file, the
-    -- game can't see it): same key? same uid? same remote? If the key and uid
-    -- stay the same across servers, one capture ever could serve every later
-    -- server with no parry and no hook. Sends nothing, hooks nothing.
-    function Core.analyze_capture(cap)
-        if not cap or not cap.key then return end
-        local path = "BladeBall/capture_memory.json"
-        local key = cap.key
-        local hexk = {}
-        for i = 1, #key do hexk[i] = ("%02x"):format(key[i]) end
-        local entry = { key = table.concat(hexk), uid = tostring(cap.uid), len = cap.len,
-            remote = (cap.remote and cap.remote.Name) or "?", hash = cap.hash, job = game.JobId, t = os.time() }
-        local prev
-        pcall(function()
-            if isfile and isfile(path) then prev = HttpService:JSONDecode(readfile(path)) end
-        end)
-        local uid, uidsrc = tostring(cap.uid), nil
-        if uid == tostring(LocalPlayer.UserId) then uidsrc = "your UserId"
-        elseif uid == LocalPlayer.Name then uidsrc = "your name"
-        else
-            pcall(function()
-                for k, v in pairs(LocalPlayer:GetAttributes()) do
-                    if tostring(v) == uid then uidsrc = "your player attribute " .. k; break end
-                end
-            end)
-        end
-        local keysrc
-        local function test(name, str)
-            if keysrc or type(str) ~= "string" or #str < #key then return end
-            local off
-            for i = 1, #key do
-                local d = (key[i] - str:byte(i)) % 256
-                if off == nil then off = d elseif d ~= off then return end
-            end
-            keysrc = name .. (off ~= 0 and (" +%d"):format(off) or "")
-        end
-        test("uid", uid); test("hash", cap.hash); test("UserId", tostring(LocalPlayer.UserId)); test("JobId", game.JobId)
-        local lines = {
-            ("capture analysis: uid is %s (%d chars), key %s (%d bytes)"):format(uidsrc or "from an unknown source", #uid,
-                keysrc and ("= " .. keysrc) or "not derived from uid/hash/UserId/JobId", #key),
-        }
-        if prev and prev.key then
-            if prev.job == entry.job then
-                lines[#lines + 1] = "capture analysis: last saved capture is from THIS server -- rejoin another server and capture again to compare"
-            else
-                lines[#lines + 1] = ("capture analysis vs last server: key %s, uid %s, remote name %s"):format(
-                    prev.key == entry.key and "SAME" or "different", prev.uid == entry.uid and "SAME" or "different",
-                    prev.remote == entry.remote and "same" or "different")
-                if prev.key == entry.key and prev.uid == entry.uid then
-                    lines[#lines + 1] = "capture analysis: key + uid carry across servers -- a parry-free capture is possible"
-                end
-            end
-        else
-            lines[#lines + 1] = "capture analysis: first capture saved -- capture once in another server to compare"
-        end
-        if not (prev and prev.job == entry.job) then
-            pcall(function()
-                if makefolder and isfolder and not isfolder("BladeBall") then makefolder("BladeBall") end
-                if writefile then writefile(path, HttpService:JSONEncode(entry)) end
-            end)
-        end
-        for _, l in ipairs(lines) do logp(l); DBG.ev(l) end
-        if Parry.onCaptureAnalysis then pcall(Parry.onCaptureAnalysis, lines[#lines]) end
     end
 
     -- A real parry: (hash, id, token, window, cameraCF, points, aim, flag), or on
@@ -1319,14 +1359,16 @@ end]]
         for i = 1, len do key[i] = string.byte(k, (i - 1) % #k + 1) end
         return key, len
     end
-    function Parry.hooklessCapture()
-        local function say(t) logp("hookless capture: " .. t); DBG.ev("hookless: " .. t) end
+    -- PRY's send function, read-only: its upvalues hold the Net package, the
+    -- remote's name, the first argument, the uid holder and the token function.
+    -- Returns found, or nil + why + how many functions were read.
+    function Core.find_sender()
         local getups = reflect_getups()
-        if type(getups) ~= "function" then say("getupvalues not available"); return false, "no getupvalues" end
+        if type(getups) ~= "function" then return nil, "getupvalues not available", 0 end
         local pry = forge_find_pry()
-        if not pry then say("SwordsController.PRY not found"); return false, "PRY not found" end
+        if not pry then return nil, "PRY not found", 0 end
         local ok, entry = pcall(require, pry)
-        if not ok or type(entry) ~= "function" then say("require(PRY) gave " .. typeof(entry)); return false, "PRY isn't a function" end
+        if not ok or type(entry) ~= "function" then return nil, "require(PRY) gave " .. typeof(entry), 0 end
         local function is_net(v) return type(v) == "table" and type(rawget(v, "RemoteEvent")) == "function" end
         local function is_holder(v)
             if is_net(v) then return false end
@@ -1373,9 +1415,15 @@ end]]
                 end
             end
         end
+        if not found then return nil, "send function not found -- the layout changed", nodes end
+        return found, nil, nodes
+    end
+    function Parry.hooklessCapture()
+        local function say(t) logp("hookless capture: " .. t); DBG.ev("hookless: " .. t) end
+        local found, why, nodes = Core.find_sender()
         if not found then
-            say(("send function not found (%d functions read) -- the layout changed"):format(nodes))
-            return false, "layout not found"
+            say(("%s (%d functions read)"):format(why, nodes))
+            return false, why
         end
         say(("send function found after reading %d function(s)"):format(nodes))
         local uid = Core.holder_value(found.holder)
@@ -1396,6 +1444,55 @@ end]]
         say(("ARMED with no parry: remote %s, hash %s, uid %d chars, key %d bytes"):format(remote.Name,
             cap.verified and "real (BAC_HASH)" or "from the sender", #uid, #key))
         return true
+    end
+
+    -- LIVE BINDING for a HOOKED capture (0.5.101). A hooked capture froze two
+    -- things from ONE packet: the uid, and a key worked out against the server
+    -- time the hook read. The uid lives in a holder the sender re-reads every
+    -- parry -- once it moves on, every forged parry carries a dead uid and a
+    -- dead key: animation, no parry (while a capture taken right after it moved
+    -- worked: the "perfect capture"). And a hook read a centisecond after the
+    -- sender's own clock read gives a key wrong in its last bytes.
+    -- So, read-only, find the sender's uid holder + token function (the same
+    -- reads as the hookless capture) and bind to them -- but ONLY when all of it
+    -- checks out against the real packet we captured:
+    --   * the holder holds exactly the captured uid,
+    --   * Net:RemoteEvent(name) is exactly the captured remote,
+    --   * token(uid) rebuilds the captured token, byte for byte, at a server
+    --     time within a few centiseconds of the hook's read.
+    -- Remote and hash are never changed (they're the real packet's). Anything
+    -- that doesn't check out leaves the capture exactly as it was.
+    function Core.bind_live(cap)
+        if not cap or cap.holder or cap.ball2 or not cap.raw_tok then return end
+        local function no(why) logp("capture: live uid not bound (" .. why .. ") -- keeping the captured uid/key") end
+        local found, why = Core.find_sender()
+        if Core.cap ~= cap then return end
+        if not found then return no(why) end
+        local uid = Core.holder_value(found.holder)
+        if uid ~= cap.uid then return no("the uid holder doesn't hold the captured uid") end
+        local remote = Core.game_call(false, rawget(found.net, "RemoteEvent"), found.net, found.name)
+        if remote ~= cap.remote then return no("the sender's remote isn't the captured one") end
+        local key, len = Core.key_for(found.token, uid, false)
+        if not key or len ~= cap.len then return no("the token function gave no key") end
+        local base, tok, hit = math.floor(cap.raw_t * 100), cap.raw_tok, nil
+        for _, d in ipairs({ 0, -1, -2, -3, 1 }) do
+            local text = tostring(base + d)
+            if #text == #tok then
+                local same = true
+                for i = 1, #text do
+                    if bit32.bxor((string.byte(text, i) + i) % 256, key[i]) ~= string.byte(tok, i) then same = false; break end
+                end
+                if same then hit = d; break end
+            end
+        end
+        if not hit then return no("the token function doesn't rebuild the captured token") end
+        if Core.cap ~= cap then return end
+        local fixed = false
+        for i = 1, #key do if key[i] ~= cap.key[i] then fixed = true; break end end
+        cap.key, cap.holder, cap.token, cap.key_uid = key, found.holder, found.token, uid
+        logp(("capture: bound to the live uid (re-read every parry)%s"):format(
+            fixed and (" -- the captured key was off (clock read %+d0ms): fixed"):format(-hit) or ", key confirmed"))
+        DBG.ev("CAPTURE: bound to the live uid" .. (fixed and ", key fixed" or ""))
     end
 
     local GC = { last_msg = nil }
@@ -1552,15 +1649,16 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
     end
 
     -- ---------- token + send ----------
-    local tok_cache = { cap = nil, text = nil, tok = nil }
+    local tok_cache = { cap = nil, key = nil, text = nil, tok = nil }
     local function make_token(cap)
         local text = tostring(math.floor(Workspace:GetServerTimeNow() * 100))
         local c = tok_cache
-        if c.cap == cap and c.text == text then return c.tok end
+        -- keyed on the key too: a live uid / fixed key swaps it on the same capture
+        if c.cap == cap and c.key == cap.key and c.text == text then return c.tok end
         if #text ~= cap.len then return nil end
         local out = table.create(#text)
         for i = 1, #text do out[i] = string.char(bit32.bxor((string.byte(text, i) + i) % 256, cap.key[i])) end
-        c.cap, c.text, c.tok = cap, text, table.concat(out)
+        c.cap, c.key, c.text, c.tok = cap, cap.key, text, table.concat(out)
         return c.tok
     end
     -- "sent" / "unarmed" / "blocked". spam = true skips the lockout gate.
@@ -3718,7 +3816,6 @@ CAP:AddToggle("AutoPressCapture", {
     Tooltip = "The script presses block once itself to take the capture (synthetic input) instead of waiting for your own parry.",
     Callback = function(v) Parry.Capture.mode = v and "Auto press" or "Your press" end,
 })
-Parry.onCaptureAnalysis = function(text) Notify("Capture analysis", text, 8) end
 Parry.onCapture = function(cap)
     Notify("Parry remote captured", cap.verified and "Real parry hash confirmed -- auto parry is armed."
         or "Captured (couldn't read the game's real hash to confirm it).", 4)
