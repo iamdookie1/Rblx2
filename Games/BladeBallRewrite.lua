@@ -31,7 +31,7 @@
 
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.101"
+local SCRIPT_VERSION = "rewrite-0.5.102"
 
 -- ---------------------------------------------------------------------------
 -- Single instance.
@@ -885,10 +885,9 @@ do
         for i = 1, #text do key[i] = bxor_(byte_(token, i), (byte_(text, i) + i) % 256) end
         local prev = Core.cap
         Core.cap = { remote = remote, hash = hash, uid = uid, key = key, len = #text, ball2 = typeof_(a4) == "CFrame",
-            verified = Core.bac() == hash, raw_tok = token, raw_t = t,
+            verified = Core.bac() == hash,
             win = type_(a4) == "number" and a4 or nil }
         if type_(a4) == "number" then Core.cap.win_mode = Win.classify(a4) end
-        if Core.bind_live then task.defer(pcall, Core.bind_live, Core.cap) end
         Core.misses, Core.pending = 0, nil
         Core.new_capture = { prev = prev }
         if Parry.onCapture then task.defer(pcall, Parry.onCapture, Core.cap) end
@@ -1444,55 +1443,6 @@ end]]
         say(("ARMED with no parry: remote %s, hash %s, uid %d chars, key %d bytes"):format(remote.Name,
             cap.verified and "real (BAC_HASH)" or "from the sender", #uid, #key))
         return true
-    end
-
-    -- LIVE BINDING for a HOOKED capture (0.5.101). A hooked capture froze two
-    -- things from ONE packet: the uid, and a key worked out against the server
-    -- time the hook read. The uid lives in a holder the sender re-reads every
-    -- parry -- once it moves on, every forged parry carries a dead uid and a
-    -- dead key: animation, no parry (while a capture taken right after it moved
-    -- worked: the "perfect capture"). And a hook read a centisecond after the
-    -- sender's own clock read gives a key wrong in its last bytes.
-    -- So, read-only, find the sender's uid holder + token function (the same
-    -- reads as the hookless capture) and bind to them -- but ONLY when all of it
-    -- checks out against the real packet we captured:
-    --   * the holder holds exactly the captured uid,
-    --   * Net:RemoteEvent(name) is exactly the captured remote,
-    --   * token(uid) rebuilds the captured token, byte for byte, at a server
-    --     time within a few centiseconds of the hook's read.
-    -- Remote and hash are never changed (they're the real packet's). Anything
-    -- that doesn't check out leaves the capture exactly as it was.
-    function Core.bind_live(cap)
-        if not cap or cap.holder or cap.ball2 or not cap.raw_tok then return end
-        local function no(why) logp("capture: live uid not bound (" .. why .. ") -- keeping the captured uid/key") end
-        local found, why = Core.find_sender()
-        if Core.cap ~= cap then return end
-        if not found then return no(why) end
-        local uid = Core.holder_value(found.holder)
-        if uid ~= cap.uid then return no("the uid holder doesn't hold the captured uid") end
-        local remote = Core.game_call(false, rawget(found.net, "RemoteEvent"), found.net, found.name)
-        if remote ~= cap.remote then return no("the sender's remote isn't the captured one") end
-        local key, len = Core.key_for(found.token, uid, false)
-        if not key or len ~= cap.len then return no("the token function gave no key") end
-        local base, tok, hit = math.floor(cap.raw_t * 100), cap.raw_tok, nil
-        for _, d in ipairs({ 0, -1, -2, -3, 1 }) do
-            local text = tostring(base + d)
-            if #text == #tok then
-                local same = true
-                for i = 1, #text do
-                    if bit32.bxor((string.byte(text, i) + i) % 256, key[i]) ~= string.byte(tok, i) then same = false; break end
-                end
-                if same then hit = d; break end
-            end
-        end
-        if not hit then return no("the token function doesn't rebuild the captured token") end
-        if Core.cap ~= cap then return end
-        local fixed = false
-        for i = 1, #key do if key[i] ~= cap.key[i] then fixed = true; break end end
-        cap.key, cap.holder, cap.token, cap.key_uid = key, found.holder, found.token, uid
-        logp(("capture: bound to the live uid (re-read every parry)%s"):format(
-            fixed and (" -- the captured key was off (clock read %+d0ms): fixed"):format(-hit) or ", key confirmed"))
-        DBG.ev("CAPTURE: bound to the live uid" .. (fixed and ", key fixed" or ""))
     end
 
     local GC = { last_msg = nil }
