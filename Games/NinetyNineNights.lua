@@ -188,6 +188,11 @@ local Settings = {
     PerfectFlute = false, InstaTame = false, AutoStartTaming = false, AutoFeedTaming = false, AutoHealPets = false,
     AutoUpgradeTools = false, AutoArmour = false, EspFishSpots = false,
     AutoPlant = false, PlantRadius = 60, AutoBenchUpgrade = false, CraftPick = nil,
+    PlantPattern = "Rings", PlantSpacing = 7, PlantRings = 3, PlantPerTick = 6, PlantEvery = 0.4, PlantCarry = true,
+    PlantKinds = { Saplings = true, ["Seed boxes"] = true, Acorns = true },
+    TameCarry = true, TameFeedDelay = 0.3,
+    WallAuto = true, WallRadius = 60, WallMargin = 10, WallGates = 4, WallGateAngle = 0, WallOverlap = 4, WallPoison = false,
+    BuildDelay = 0.2, PreviewSeconds = 12,
     AutoUpgradeDefense = false,
     -- events
     AutoCandy = false, AutoTrickOrTreat = false, AutoLightHouses = true, AutoPumpkins = false,
@@ -2238,7 +2243,16 @@ local function openChest(chest)
     end
     local prompt = chestPrompt(chest)
     if prompt and typeof(fireproximityprompt) == "function" then
-        pcall(fireproximityprompt, prompt, 0)
+        -- (its second argument is a fire count in most executors, so it's
+        -- left out and the hold zeroed for the call instead)
+        local hold = prompt.HoldDuration
+        pcall(function()
+            prompt.HoldDuration = 0
+        end)
+        pcall(fireproximityprompt, prompt)
+        pcall(function()
+            prompt.HoldDuration = hold
+        end)
         noteChestOpened(chest)
         return true
     end
@@ -2996,7 +3010,7 @@ end
 -- Cooking --------------------------------------------------------------------------
 local lastCook = 0
 function Feat.cookTick()
-    if not Settings.AutoCook or Bring.running or os.clock() - lastCook < 3 then
+    if not Settings.AutoCook or Bring.running or os.clock() - lastCook < 1 then
         return
     end
     local fire = campPart("MainFire")
@@ -3282,27 +3296,49 @@ end
 local feedBusy = setmetatable({}, { __mode = "k" })
 function Feat.tamingTick()
     if Settings.AutoFeedTaming then
+        -- Every open food slot at once, each with its own food; the slot is
+        -- marked fed locally the way the game does, so it isn't fed twice.
         for _, animal in tagged("CanFeed_" .. UID) do
             if animal.Parent and animal:GetAttribute("PlayerFeeding") == UID and not feedBusy[animal] then
-                -- The first food slot that's still open, and something on the map that fills it.
-                local slot, want = nil, {}
+                local pos = pivotPos(animal)
+                local used = {}
+                local jobs = {}
                 for n = 1, 3 do
-                    local food = animal:GetAttribute("Food" .. n .. "Type")
-                    if food and animal:GetAttribute("Food" .. n .. "Done") == nil and animal:GetAttribute("Food" .. n .. "DoneLocal") == nil then
-                        slot = n
-                        want = { [food] = true, ["Cooked " .. food] = true }
-                        break
+                    local kind = animal:GetAttribute("Food" .. n .. "Type")
+                    if pos and kind and animal:GetAttribute("Food" .. n .. "Done") == nil and animal:GetAttribute("Food" .. n .. "DoneLocal") == nil then
+                        local best, bestD
+                        for name in { [kind] = true, ["Cooked " .. kind] = true } do
+                            for model in Index.byName[name] or {} do
+                                if model.Parent and not used[model] and mineOrFree(model) and not model:GetAttribute("FoodRot") then
+                                    local d = (pivotPos(model) - pos).Magnitude
+                                    if not bestD or d < bestD then
+                                        best, bestD = model, d
+                                    end
+                                end
+                            end
+                        end
+                        if best then
+                            used[best] = true
+                            table.insert(jobs, { slot = n, food = best })
+                        end
                     end
                 end
-                local pos = pivotPos(animal)
-                local food = slot and pos and nearestNamed(want, pos)
-                if food then
+                if #jobs > 0 then
                     feedBusy[animal] = true
-                    task.spawn(function()
-                        if carryTo(food, (pivotPos(animal) or pos) + Vector3.new(0, 2, 0)) then
-                            invoke("RequestTame_Feed", animal, food, slot)
-                        end
-                        task.wait(1.5)
+                    for _, job in jobs do
+                        animal:SetAttribute("Food" .. job.slot .. "DoneLocal", true)
+                        task.spawn(function()
+                            if not Settings.TameCarry or carryTo(job.food, (pivotPos(animal) or pos) + Vector3.new(0, 2, 0)) then
+                                invoke("RequestTame_Feed", animal, job.food, job.slot)
+                            end
+                            task.delay(2, function()
+                                if animal.Parent then
+                                    animal:SetAttribute("Food" .. job.slot .. "DoneLocal", nil)
+                                end
+                            end)
+                        end)
+                    end
+                    task.delay(Settings.TameFeedDelay, function()
                         feedBusy[animal] = nil
                     end)
                 end
@@ -3322,10 +3358,10 @@ function Feat.tamingTick()
                 if food then
                     feedBusy[pet] = true
                     task.spawn(function()
-                        if carryTo(food, (pivotPos(pet) or pos) + Vector3.new(0, 2, 0)) then
+                        if not Settings.TameCarry or carryTo(food, (pivotPos(pet) or pos) + Vector3.new(0, 2, 0)) then
                             fire("RequestFeedHealPet", pet, food)
                         end
-                        task.wait(2)
+                        task.wait(math.max(Settings.TameFeedDelay, 0.5))
                         feedBusy[pet] = nil
                     end)
                 end
@@ -3346,65 +3382,162 @@ end
 
 -- Planting -------------------------------------------------------------------------
 -- Saplings must go 40+ studs from the fire (52 for a Giant Sapling), on the
--- map's ground. Spots are taken around the camp in a ring.
+-- map's ground: RequestPlantItem(sapling, groundSpot). Spots come from the
+-- chosen pattern, kept the chosen spacing from everything planted this
+-- session, several at once.
 local PlantParams = RaycastParams.new()
 PlantParams.FilterType = Enum.RaycastFilterType.Include
 PlantParams.IgnoreWater = true
-local plantAngle = 0
+local Planted = {} -- spots used this session
+local plantCursor = 0
 
-local function plantSpot(radius)
-    local center = campPos()
+local function groundBelow(x, z)
     local map = Workspace:FindFirstChild("Map")
     local ground = map and map:FindFirstChild("Ground")
-    if not center or not ground then
+    if not ground then
         return nil
     end
     PlantParams.FilterDescendantsInstances = { ground, map:FindFirstChild("Snow") }
-    for _ = 1, 24 do
-        plantAngle += 0.6
-        local probe = center + Vector3.new(math.cos(plantAngle) * radius, 40, math.sin(plantAngle) * radius)
-        local hit = Workspace:Raycast(probe, Vector3.new(0, -120, 0), PlantParams)
-        if hit then
-            return hit.Position
+    local hit = Workspace:Raycast(Vector3.new(x, 400, z), Vector3.new(0, -800, 0), PlantParams)
+    return hit and hit.Position
+end
+
+-- The k-th candidate spot of the pattern around `center` (flat, no height).
+-- The spiral walks on from where it was and the grid's cells are sorted
+-- once per size, so asking for the next spot stays cheap.
+local spiral = { k = -1 }
+local gridCache = {}
+local function patternSpot(k, center, base, spacing)
+    local pattern = Settings.PlantPattern
+    if pattern == "Spiral" then
+        -- Archimedean spiral starting at `base`, arms `spacing` apart.
+        if spiral.base ~= base or spiral.spacing ~= spacing or k < spiral.k or spiral.k < 0 then
+            spiral = { k = 0, theta = 0, r = base, base = base, spacing = spacing }
         end
+        while spiral.k < k do
+            spiral.theta += spacing / math.max(spiral.r, 1)
+            spiral.r = base + spacing * spiral.theta / (2 * math.pi)
+            spiral.k += 1
+        end
+        return center + Vector3.new(math.cos(spiral.theta) * spiral.r, 0, math.sin(spiral.theta) * spiral.r)
+    elseif pattern == "Grid" then
+        -- Square grid cells, nearest the ring first.
+        local key = base .. ":" .. spacing
+        local cells = gridCache[key]
+        if not cells then
+            cells = {}
+            local side = math.ceil(base / spacing) + 30
+            for gx = -side, side do
+                for gz = -side, side do
+                    local d = math.sqrt(gx * gx + gz * gz) * spacing
+                    if d >= base then
+                        table.insert(cells, { gx, gz, d })
+                    end
+                end
+            end
+            table.sort(cells, function(a, b)
+                return a[3] < b[3]
+            end)
+            gridCache[key] = cells
+        end
+        local c = cells[k + 1]
+        if not c then
+            return nil
+        end
+        return center + Vector3.new(c[1] * spacing, 0, c[2] * spacing)
+    elseif pattern == "Around me" then
+        local hrp = rootPart()
+        local me = hrp and hrp.Position or center
+        local ring = 1 + k // 12
+        local angle = (k % 12) / 12 * math.pi * 2 + ring * 0.26
+        return me + Vector3.new(math.cos(angle) * spacing * ring, 0, math.sin(angle) * spacing * ring)
+    end
+    -- Rings: one ring at `base`, then the next one `spacing` further out.
+    local r = base
+    local left = k
+    for _ = 1, Settings.PlantRings do
+        local count = math.max(6, math.floor(2 * math.pi * r / spacing))
+        if left < count then
+            local angle = left / count * math.pi * 2
+            return center + Vector3.new(math.cos(angle) * r, 0, math.sin(angle) * r)
+        end
+        left -= count
+        r += spacing
     end
     return nil
 end
 
-local plantBusy = false
+-- The next free spot at least `minFromFire` from the fire.
+local function nextPlantSpot(minFromFire)
+    local center = campPos()
+    if not center then
+        return nil
+    end
+    local base = math.max(Settings.PlantRadius, minFromFire)
+    local spacing = Settings.PlantSpacing
+    for _ = 1, 400 do
+        local flat = patternSpot(plantCursor, center, base, spacing)
+        plantCursor += 1
+        if not flat then
+            plantCursor = 0
+            return nil
+        end
+        if (Vector3.new(flat.X, center.Y, flat.Z) - center).Magnitude >= minFromFire then
+            local free = true
+            for _, used in Planted do
+                if (Vector3.new(used.X, 0, used.Z) - Vector3.new(flat.X, 0, flat.Z)).Magnitude < spacing * 0.9 then
+                    free = false
+                    break
+                end
+            end
+            local spot = free and groundBelow(flat.X, flat.Z)
+            if spot then
+                table.insert(Planted, spot)
+                return spot
+            end
+        end
+    end
+    return nil
+end
+function Feat.resetPlanting()
+    table.clear(Planted)
+    plantCursor = 0
+end
+
 local lastPlant = 0
 function Feat.plantTick()
-    if not Settings.AutoPlant or plantBusy or os.clock() - lastPlant < 2 then
+    if not Settings.AutoPlant or os.clock() - lastPlant < Settings.PlantEvery then
         return
     end
     lastPlant = os.clock()
-    local hrp = rootPart()
-    if not hrp then
-        return
-    end
+    local started = 0
+    local kinds = Settings.PlantKinds or {}
     for model in Index.byKind.Seeds or {} do
-        if model.Parent and mineOrFree(model) and tryOnce(model, 6) then
+        if started >= Settings.PlantPerTick then
+            break
+        end
+        if model.Parent and mineOrFree(model) and tryOnce(model, 4) then
             if model:HasTag("SeedBox") and model:GetAttribute("SeedType") then
-                task.spawn(invoke, "RequestPlantSeeds", model)
-                return
-            elseif model:HasTag("Acorn") then
-                local roots = gameModule("TreeRootClient")
-                if roots and roots.PlantAcorn then
-                    task.spawn(pcall, roots.PlantAcorn, model)
-                    return
+                if kinds["Seed boxes"] then
+                    started += 1
+                    task.spawn(invoke, "RequestPlantSeeds", model)
                 end
-            elseif model:HasTag("Plantable") then
-                local radius = math.max(Settings.PlantRadius, cleanName(model.Name) == "Giant Sapling" and 55 or 44)
-                local spot = plantSpot(radius)
+            elseif model:HasTag("Acorn") then
+                local roots = kinds.Acorns and gameModule("TreeRootClient")
+                if roots and roots.PlantAcorn then
+                    started += 1
+                    task.spawn(pcall, roots.PlantAcorn, model)
+                end
+            elseif model:HasTag("Plantable") and kinds.Saplings then
+                local giant = cleanName(model.Name) == "Giant Sapling"
+                local spot = nextPlantSpot(giant and 53 or 41)
                 if spot then
-                    plantBusy = true
+                    started += 1
                     task.spawn(function()
-                        if carryTo(model, spot + Vector3.new(0, 3, 0)) then
+                        if not Settings.PlantCarry or carryTo(model, spot + Vector3.new(0, 3, 0)) then
                             invoke("RequestPlantItem", model, spot)
                         end
-                        plantBusy = false
                     end)
-                    return
                 end
             end
         end
@@ -3437,7 +3570,7 @@ end
 
 local lastBench = 0
 function Feat.benchTick()
-    if not Settings.AutoBenchUpgrade or os.clock() - lastBench < 10 then
+    if not Settings.AutoBenchUpgrade or os.clock() - lastBench < 4 then
         return
     end
     lastBench = os.clock()
@@ -3546,7 +3679,7 @@ function Feat.trickOrTreat(still)
                         waitFor(20, function()
                             return house:GetAttribute("Visited_" .. UID) ~= nil
                         end, still)
-                        task.wait(4)
+                        task.wait(1.5)
                         visited += 1
                         did = true
                     end
@@ -3644,10 +3777,17 @@ function Feat.hollowPlants(still)
             if moveTo(besideOf(pos, 4)) and still() then
                 for _, prompt in plant:GetDescendants() do
                     if prompt:IsA("ProximityPrompt") and typeof(fireproximityprompt) == "function" then
-                        pcall(fireproximityprompt, prompt, 0)
+                        local hold = prompt.HoldDuration
+                        pcall(function()
+                            prompt.HoldDuration = 0
+                        end)
+                        pcall(fireproximityprompt, prompt)
+                        pcall(function()
+                            prompt.HoldDuration = hold
+                        end)
                     end
                 end
-                task.wait(1)
+                task.wait(0.35)
                 picked += 1
             end
         end
@@ -3895,7 +4035,7 @@ end
 
 local lastDry = 0
 function Feat.dryTick()
-    if not Settings.AutoDryWood or Bring.running or os.clock() - lastDry < 15 or not rainStorage() then
+    if not Settings.AutoDryWood or Bring.running or os.clock() - lastDry < 8 or not rainStorage() then
         return
     end
     lastDry = os.clock()
@@ -4058,7 +4198,7 @@ function Feat.upgradeTools(still)
                 if not (fn and pcall(fn, bench)) then
                     invoke(entry.kind.remote, entry.item, bench)
                 end
-                task.wait(2)
+                task.wait(0.8)
                 done += 1
             end
         end
@@ -4965,6 +5105,255 @@ Extra.EVENT_ITEMS = {
     ["Crystal Skull Key"] = true, ["Cultist Gem"] = true, ["Frog Key"] = true,
 }
 
+-- Base builder ------------------------------------------------------------------
+-- A ring of Log Walls around camp with Log Gates as the ways in. Sizes come
+-- from the game's own structure templates, so the count fits whatever the
+-- walls measure. Each piece: craft its blueprint (CraftItem, paid from the
+-- camp's TotalWood), then RequestPlaceStructure(blueprint, { Valid, Position,
+-- CFrame }, rotation) as the game's placement does. Pieces already standing
+-- are skipped, so running it again fills gaps.
+local WOOD = { ["Log Wall"] = 12, ["Poisoned Log Wall"] = 12, ["Log Gate"] = 20 }
+local BuildParams = RaycastParams.new()
+BuildParams.FilterType = Enum.RaycastFilterType.Include
+BuildParams.IgnoreWater = true
+
+local function structureTemplate(name)
+    local assets = ReplicatedStorage:FindFirstChild("Assets")
+    local folder = assets and assets:FindFirstChild("StructureTemplates")
+    return folder and folder:FindFirstChild(name)
+end
+
+-- Long side, short side, height offset and which axis is long.
+local function footprint(name)
+    local t = structureTemplate(name)
+    local part = t and (t.PrimaryPart or t:FindFirstChildWhichIsA("BasePart"))
+    if not part then
+        -- Fallback guess until the template loads.
+        return name == "Log Gate" and 10 or 8, 2, 3, "X", false
+    end
+    local size = part.Size
+    local long = size.X >= size.Z and "X" or "Z"
+    return math.max(size.X, size.Z), math.min(size.X, size.Z), t:GetAttribute("StructureHeightOffset") or size.Y / 2, long, true
+end
+
+local function campWood()
+    local map = Workspace:FindFirstChild("Map")
+    local camp = map and map:FindFirstChild("Campground")
+    return camp and camp:GetAttribute("TotalWood") or 0
+end
+
+-- Auto size: past the farthest structure of the camp (yours and the
+-- campground's, within 150 studs of the fire) plus the margin.
+function Extra.autoRadius()
+    local center = campPos()
+    if not center then
+        return Settings.WallRadius
+    end
+    local far = 25
+    local map = Workspace:FindFirstChild("Map")
+    for _, folder in { Workspace:FindFirstChild("Structures"), map and map:FindFirstChild("Campground") } do
+        for _, s in folder and folder:GetChildren() or {} do
+            local name = s.Name
+            if not WOOD[name] and name ~= "Spooky Log Wall" and name ~= "Spooky Log Gate" then
+                local pos = pivotPos(s)
+                local d = pos and (Vector3.new(pos.X, center.Y, pos.Z) - center).Magnitude
+                if d and d < 150 and d > far then
+                    far = d
+                end
+            end
+        end
+    end
+    return math.floor(far + Settings.WallMargin + 0.5)
+end
+
+local function groundAtXZ(x, z)
+    local map = Workspace:FindFirstChild("Map")
+    local ground = map and map:FindFirstChild("Ground")
+    if not ground then
+        return nil
+    end
+    BuildParams.FilterDescendantsInstances = { ground, map:FindFirstChild("Snow") }
+    local hit = Workspace:Raycast(Vector3.new(x, 400, z), Vector3.new(0, -800, 0), BuildParams)
+    return hit and hit.Position
+end
+
+-- Every piece of the ring: name, angle, ground spot, placement CFrame and
+-- rotation; plus the counts and the wood it all costs.
+function Extra.wallPlan()
+    local center = campPos()
+    if not center then
+        return nil, "camp isn't loaded"
+    end
+    local radius = Settings.WallAuto and Extra.autoRadius() or Settings.WallRadius
+    local wallName = Settings.WallPoison and "Poisoned Log Wall" or "Log Wall"
+    local wallW, _, wallH, wallLong, wallKnown = footprint(wallName)
+    local gateW, _, gateH, gateLong, gateKnown = footprint("Log Gate")
+    local step = wallW * (1 - Settings.WallOverlap / 100)
+    local pieces = {}
+    local function add(name, angle, width, height, long)
+        local flat = center + Vector3.new(math.cos(angle) * radius, 0, math.sin(angle) * radius)
+        local ground = groundAtXZ(flat.X, flat.Z) or Vector3.new(flat.X, center.Y, flat.Z)
+        local radial = Vector3.new(math.cos(angle), 0, math.sin(angle))
+        local tangent = Vector3.new(-math.sin(angle), 0, math.cos(angle))
+        local rot = long == "X" and CFrame.fromMatrix(Vector3.zero, tangent, Vector3.yAxis)
+            or CFrame.fromMatrix(Vector3.zero, radial, Vector3.yAxis)
+        table.insert(pieces, {
+            name = name, angle = angle, ground = ground, rot = rot,
+            cf = rot + ground + Vector3.new(0, height, 0), inside = ground - radial * 5,
+        })
+    end
+    local gates = Settings.WallGates
+    local offset = math.rad(Settings.WallGateAngle)
+    if gates == 0 then
+        local n = math.ceil(2 * math.pi * radius / step)
+        for i = 0, n - 1 do
+            add(wallName, offset + i / n * math.pi * 2, wallW, wallH, wallLong)
+        end
+    else
+        local gap = math.pi * 2 / gates
+        local gateArc = gateW / radius
+        for g = 0, gates - 1 do
+            local a = offset + g * gap
+            add("Log Gate", a, gateW, gateH, gateLong)
+            -- Fill the arc to the next gate with evenly spaced walls.
+            local arc = gap - gateArc
+            local n = math.max(1, math.ceil(arc * radius / step))
+            for i = 1, n do
+                add(wallName, a + gateArc / 2 + (i - 0.5) / n * arc, wallW, wallH, wallLong)
+            end
+        end
+    end
+    local walls, gateCount, wood = 0, 0, 0
+    for _, p in pieces do
+        if p.name == "Log Gate" then
+            gateCount += 1
+        else
+            walls += 1
+        end
+        wood += WOOD[p.name] or 12
+    end
+    return {
+        center = center, radius = radius, pieces = pieces, walls = walls, gates = gateCount, wood = wood,
+        have = campWood(), wallW = wallW, gateW = gateW, measured = wallKnown and gateKnown, wallName = wallName,
+    }
+end
+
+local function standing(name, pos)
+    local folder = Workspace:FindFirstChild("Structures")
+    for _, s in folder and folder:GetChildren() or {} do
+        if (s.Name == name or s.Name == "Spooky " .. name) then
+            local p = pivotPos(s)
+            if p and (Vector3.new(p.X, pos.Y, p.Z) - pos).Magnitude < 2.5 then
+                return true
+            end
+        end
+    end
+    return false
+end
+
+-- A blueprint for `name` you're carrying, or one lying near you (picked up).
+local function blueprintFor(name)
+    for _, item in inventoryItems() do
+        if item:GetAttribute("StructureName") == name then
+            return item
+        end
+    end
+    local folder = itemsFolder()
+    local hrp = rootPart()
+    for _, item in folder and folder:GetChildren() or {} do
+        if item:GetAttribute("StructureName") == name and item:GetAttribute("ToolName") == "Blueprint" and mineOrFree(item) then
+            local pos = pivotPos(item)
+            if pos and hrp and (pos - hrp.Position).Magnitude < 200 then
+                invoke("RequestHotbarItem", item)
+                return item
+            end
+        end
+    end
+    return nil
+end
+
+-- Builds the ring piece by piece (as a job, so it can be stopped).
+function Extra.buildRing(still, status)
+    status = status or function(text)
+        setStatus(text)
+        Job.status = text
+    end
+    local plan, err = Extra.wallPlan()
+    if not plan then
+        status(err)
+        return
+    end
+    local placed, skipped = 0, 0
+    for i, piece in plan.pieces do
+        if not still() then
+            return
+        end
+        if standing(piece.name, piece.ground) then
+            skipped += 1
+        else
+            local bp = blueprintFor(piece.name)
+            if not bp then
+                local price = WOOD[piece.name] or 12
+                if campWood() < price then
+                    status(("Stopped: need %d wood for the next %s, camp has %d (%d/%d done)"):format(price, piece.name, campWood(), i - 1, #plan.pieces))
+                    return
+                end
+                status(("Crafting %s (%d/%d)"):format(piece.name, i, #plan.pieces))
+                Feat.craft(piece.name)
+                local t0 = os.clock()
+                repeat
+                    task.wait(0.1)
+                    bp = blueprintFor(piece.name)
+                until bp or os.clock() - t0 > 2.5 or not still()
+            end
+            if not bp then
+                status("Couldn't get a " .. piece.name .. " blueprint (bench tier?)")
+                return
+            end
+            status(("Placing %s (%d/%d)"):format(piece.name, i, #plan.pieces))
+            moveTo(piece.inside, { exact = true })
+            task.wait(0.05)
+            local result = invoke("RequestPlaceStructure", bp,
+                { Valid = true, Position = piece.ground, CFrame = piece.cf }, piece.rot, nil)
+            if type(result) == "table" and result.Success == false then
+                status(("%s %d refused: %s"):format(piece.name, i, tostring(result.Error)))
+            else
+                placed += 1
+            end
+            task.wait(Settings.BuildDelay)
+        end
+    end
+    status(("Ring done: %d placed, %d were already up"):format(placed, skipped))
+end
+
+-- Little markers where each piece will go, for a few seconds.
+function Extra.previewRing()
+    local plan = Extra.wallPlan()
+    if not plan then
+        return
+    end
+    local folder = Instance.new("Folder")
+    folder.Name = "RingPreview"
+    folder.Parent = Workspace
+    for _, piece in plan.pieces do
+        local p = Instance.new("Part")
+        p.Anchored, p.CanCollide, p.CanQuery, p.CanTouch = true, false, false, false
+        p.Material = Enum.Material.Neon
+        p.Transparency = 0.4
+        p.Color = piece.name == "Log Gate" and Color3.fromRGB(90, 200, 255) or Color3.fromRGB(255, 200, 90)
+        local w = piece.name == "Log Gate" and plan.gateW or plan.wallW
+        p.Size = Vector3.new(w, 1, 1)
+        p.CFrame = CFrame.fromMatrix(piece.ground + Vector3.new(0, 1, 0), piece.rot.RightVector, Vector3.yAxis)
+        if select(4, footprint(piece.name)) == "Z" then
+            p.CFrame = CFrame.fromMatrix(piece.ground + Vector3.new(0, 1, 0), piece.rot.LookVector * -1, Vector3.yAxis)
+        end
+        p.Parent = folder
+    end
+    task.delay(Settings.PreviewSeconds, function()
+        folder:Destroy()
+    end)
+end
+
 local TICKS = { "trackerTick", "stashTick", "sackLabelTick", "grabTick", "cultistGemsTick", "frogKeysTick", "owlFeathersTick",
     "snowBellTick", "easterTick", "happyTick" }
 local errs = {}
@@ -5262,9 +5651,14 @@ local function toggle(box, idx, text, key, tooltip, after)
 end
 
 local function slider(box, idx, text, key, min, max, suffix, tooltip)
+    -- Ui3 rounds to whole numbers unless told otherwise: times in seconds
+    -- and fractional defaults keep decimals.
+    local default = Settings[key] or min
+    local rounding = (suffix == " s" or default % 1 ~= 0 or min % 1 ~= 0) and 2 or 0
     return box:AddSlider(idx, {
         Text = text,
-        Default = Settings[key],
+        Default = default,
+        Rounding = rounding,
         Min = min,
         Max = max,
         Suffix = suffix,
@@ -5762,7 +6156,9 @@ do
     toggle(TameBox, "AutoStartTaming", "Start taming the nearest animal", "AutoStartTaming",
         "While you hold the flute, plays it at the nearest tameable animal in reach")
     toggle(TameBox, "AutoFeedTaming", "Feed the animal I'm taming", "AutoFeedTaming",
-        "Brings the food the animal asks for (raw or cooked) and feeds it")
+        "Brings every food the animal asks for (raw or cooked) at once and feeds it")
+    toggle(TameBox, "TameCarry", "Carry the food to it first", "TameCarry", "Off feeds straight away (faster if your server accepts it)")
+    slider(TameBox, "TameFeedDelay", "Wait between feeds", "TameFeedDelay", 0, 2, " s")
     toggle(TameBox, "AutoHealPets", "Heal hurt pets", "AutoHealPets", "Feeds a hurt pet one of its favourite foods")
     TameBox:AddButton({
         Text = "Summon all pets",
@@ -5784,9 +6180,21 @@ do
 
     local PlantBox = FarmTab:AddRightGroupbox("Planting", "sprout")
     toggle(PlantBox, "AutoPlant", "Auto plant", "AutoPlant",
-        "Plants saplings in a ring around camp, opens seed boxes and plants acorns")
-    slider(PlantBox, "PlantRadius", "Ring distance from the fire", "PlantRadius", 44, 200, " studs",
+        "Plants saplings around camp in the pattern below, several at once, opens seed boxes and plants acorns")
+    multi(PlantBox, "PlantKinds", "Plant", "PlantKinds", { "Saplings", "Seed boxes", "Acorns" }, { "Saplings", "Seed boxes", "Acorns" })
+    choice(PlantBox, "PlantPattern", "Pattern", "PlantPattern", { "Rings", "Spiral", "Grid", "Around me" },
+        "Rings: rings around the fire. Spiral: one arm outward. Grid: a square grid. Around me: rings around where you stand (still 40+ from the fire)")
+    slider(PlantBox, "PlantRadius", "Start distance from the fire", "PlantRadius", 41, 250, " studs",
         "The game needs 40+ studs from the fire (52+ for a Giant Sapling)")
+    slider(PlantBox, "PlantSpacing", "Spacing", "PlantSpacing", 3, 30, " studs")
+    slider(PlantBox, "PlantRings", "Rings", "PlantRings", 1, 10)
+    slider(PlantBox, "PlantPerTick", "At once", "PlantPerTick", 1, 25)
+    slider(PlantBox, "PlantEvery", "Every", "PlantEvery", 0.1, 3, " s")
+    toggle(PlantBox, "PlantCarry", "Carry each one to its spot first", "PlantCarry",
+        "Safer. Off plants straight away, which is faster if your server accepts it")
+    PlantBox:AddButton("Restart the pattern", function()
+        Feat.resetPlanting()
+    end)
 
     local CraftBox = FarmTab:AddLeftGroupbox("Crafting", "hammer")
     local blueprints = {}
@@ -5806,6 +6214,28 @@ do
         "Crafts the next Crafting Bench tier as soon as the camp has the wood and scrap")
     toggle(CraftBox, "AutoUpgradeDefense", "Upgrade defences (Base Defender)", "AutoUpgradeDefense",
         "Base Defender class only: upgrades every defence structure that isn't upgraded yet")
+
+    local WallBox = FarmTab:AddLeftGroupbox("Base walls", "brick-wall")
+    UI.WallPlan = WallBox:AddLabel("Working out the ring...", true)
+    toggle(WallBox, "WallAuto", "Size to fit the camp", "WallAuto",
+        "Puts the ring just past the farthest camp structure, plus the margin. Off uses the radius below")
+    slider(WallBox, "WallMargin", "Margin", "WallMargin", 0, 60, " studs")
+    slider(WallBox, "WallRadius", "Radius (when not auto)", "WallRadius", 20, 200, " studs")
+    slider(WallBox, "WallGates", "Gates (ways in)", "WallGates", 0, 8)
+    slider(WallBox, "WallGateAngle", "Turn the gates", "WallGateAngle", 0, 359, "°")
+    slider(WallBox, "WallOverlap", "Overlap between walls", "WallOverlap", 0, 25, "%")
+    toggle(WallBox, "WallPoison", "Poisoned Log Walls", "WallPoison", "Needs the Log Wall upgrade")
+    slider(WallBox, "BuildDelay", "Wait between pieces", "BuildDelay", 0, 2, " s")
+    WallBox:AddButton("Preview", function()
+        Extra.previewRing()
+    end):AddButton("Build", function()
+        startJob("Build walls", Extra.buildRing)
+    end)
+    WallBox:AddButton("Stop", function()
+        if Job.name == "Build walls" then
+            stopJob("Stopped building")
+        end
+    end)
 
     local UpBox = FarmTab:AddRightGroupbox("Tool upgrades", "arrow-big-up")
     toggle(UpBox, "AutoUpgradeTools", "Auto upgrade rod and flute", "AutoUpgradeTools",
@@ -6333,6 +6763,19 @@ loop(0.3, function()
     setText(UI.JobLabel, Job.name and (Job.name .. ": " .. Job.status) or Job.status)
     local stashed = Extra.stashCount()
     setText(UI.StashLabel, stashed > 0 and ("Stash: %d item%s above camp"):format(stashed, stashed == 1 and "" or "s") or "Stash: empty")
+end)
+
+-- Base wall plan.
+loop(2, function()
+    local plan, err = Extra.wallPlan()
+    if not plan then
+        setText(UI.WallPlan, "Ring: " .. tostring(err))
+        return
+    end
+    setText(UI.WallPlan, ("Radius %d studs · %d %s + %d gates\nWood %d, camp has %d%s%s"):format(
+        plan.radius, plan.walls, plan.wallName == "Log Wall" and "walls" or "poisoned walls", plan.gates,
+        plan.wood, plan.have, plan.have >= plan.wood and " ✓" or (" (need " .. plan.wood - plan.have .. " more)"),
+        plan.measured and "" or "\n(sizes are a guess until the templates load)"))
 end)
 
 -- Item tracker summary.
