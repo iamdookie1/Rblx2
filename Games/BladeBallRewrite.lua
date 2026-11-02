@@ -31,7 +31,7 @@
 
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.103"
+local SCRIPT_VERSION = "rewrite-0.5.104"
 
 -- ---------------------------------------------------------------------------
 -- Single instance.
@@ -222,7 +222,13 @@ do
     local r15_clones = {}
     local own_swing = setmetatable({}, { __mode = 'k' })  -- track -> when we played it
     local gate = { last = -math.huge, landed = true, landed_at = -math.huge }
-    local success_at, grab_track = -math.huge, nil
+    local success_at, swing_tracks = -math.huge, {}
+    -- the game's block lockout (n2): 1.3, 1.5 on your first parry ever, less on
+    -- a low-kill account -- read off the capture's window (Parry.lockout)
+    local function cooldown()
+        local n2 = Parry.lockout and Parry.lockout()
+        return (type(n2) == "number" and n2 > 0) and n2 or BLOCK_COOLDOWN
+    end
     local function sword_info(char)
         local name = (Anim.skin and Anim.skin()) or char:GetAttribute("CurrentlyEquippedSword") or ""
         local info = info_cache[name]
@@ -301,12 +307,13 @@ do
         if not animator then return end
         local now = os.clock()
         -- the last block didn't land: no new one inside the game's block cooldown
-        if not gate.landed and now - gate.last < BLOCK_COOLDOWN then return end
+        local cd = cooldown()
+        if not gate.landed and now - gate.last < cd then return end
         -- it landed: let the success swing show, and start the next block when the
         -- ball is back on us (give up waiting after the cooldown)
         if gate.landed and gate.landed_at > gate.last then
             if now - gate.landed_at < SWING_SHOW then return end
-            if not Parry.ballOnMe() and now - gate.landed_at < BLOCK_COOLDOWN then return end
+            if not Parry.ballOnMe() and now - gate.landed_at < cd then return end
         end
         gate.last, gate.landed = now, false
         for _, track in ipairs(animator:GetPlayingAnimationTracks()) do
@@ -317,6 +324,7 @@ do
         local times = Parry.timesParried and Parry.timesParried()
         local noob = type(times) == "number" and times < 5
         local parry_time = char:GetAttribute("ParryTime") or 0
+        swing_tracks = {}
         for _, anim in ipairs(find_animations(sword_info(char), char)) do
             local ok, track = pcall(load_track, animator, humanoid, anim)
             if ok and track then
@@ -324,7 +332,7 @@ do
                 own_swing[track] = os.clock()
                 if noob then track:Play(0.05, 1, speed)
                 else track:Play(track:GetAttribute("PlayFadeTime"), track:GetAttribute("PlayWeight"), speed) end
-                grab_track = track
+                swing_tracks[#swing_tracks + 1] = track
                 local left = track.Length == 0 and 1 or (track.Length - track.TimePosition) * speed
                 if left > parry_time then parry_time = left end
             end
@@ -338,10 +346,13 @@ do
     function Anim.onSuccess()
         local now = os.clock()
         success_at, gate.landed, gate.landed_at = now, true, now
-        -- the game plays its own success swing now; take our block pose off it
-        if grab_track then pcall(function() grab_track:Stop(grab_track:GetAttribute("StopFadeTime")) end) end
+        -- the game plays its own success swing now and stops the block tracks IT
+        -- loaded -- ours aren't in its registry, so take every one of them off
+        -- (until 0.5.104 only the last: a multi-track set kept swinging over it)
+        for _, t in ipairs(swing_tracks) do pcall(function() t:Stop(t:GetAttribute("StopFadeTime")) end) end
+        swing_tracks = {}
     end
-    function Anim.reset() gate.last, gate.landed, gate.landed_at, grab_track = -math.huge, true, -math.huge, nil end
+    function Anim.reset() gate.last, gate.landed, gate.landed_at, swing_tracks = -math.huge, true, -math.huge, {} end
     -- a swing the GAME started from a real press (yours, tap to block, a capture
     -- press) -- not our own swing and not a landed parry's success swing
     function Anim.isGamePress(track)
@@ -373,7 +384,7 @@ do
 
     local S = {
         autoparry = false, triggerbot = false, parry_mode = "Remote",
-        preparry = false, preparry_range = 20, hp_preparry = false, hard_curve = false, self_tune = false, fast_retarget = false,
+        one_parry_capture = true, preparry = false, preparry_range = 20, hp_preparry = false, hard_curve = false, self_tune = false, fast_retarget = false,
         anticurve = "Smart", dot_threshold = 0.5, curve_bias = 0.5, close_anticurve = true, close_range = 30, instant_retarget = true,
         accuracy = 50, accuracy_base = 50, divisor_multiplier = 1.1, timing_mult = 1,
         extra_distance = 0, ping_compensation = false, retry_delay = 1,
@@ -537,6 +548,7 @@ do
         if cw and cw > 0 then return cw, cw == 1.5 and 1.5 or 1.3 * math.min(cw / 0.5, 1) end
         return 0.5, 1.3
     end
+    function Parry.lockout() local _, n2 = parry_window(); return n2 end
     local function lockout_margin() return math.clamp(jitter() + frame_dt + 0.03, 0.06, 0.15) end
     local function gate_start()
         local now = clock_()
@@ -799,7 +811,17 @@ do
     -- Namecall only since 0.5.86: the FireServer / Both hooks changed the
     -- FireServer function itself, which a game script can probe; the parry
     -- sender's :FireServer calls all go through __namecall anyway.
-    local function capture_method() return "Namecall" end
+    -- ONE-PARRY CAPTURE (0.5.104). PRY's sender fires the real packet one of two
+    -- ways at random, 50/50 (Bbs dump): remote:FireServer(...) -- a namecall --
+    -- or local f = remote.FireServer; f(remote, ...) -- a plain call that never
+    -- touches __namecall. Namecall-only saw half your parries: it took 2 on
+    -- average, sometimes 4+. "Both" also hooks FireServer itself, only while
+    -- there's no capture (it comes off with the namecall hook), so the first
+    -- real parry is caught either way. A packet seen on that plain-call path is
+    -- taken ONLY when its hash is the game's real one (_G.BAC_HASH) -- the
+    -- sender's decoys go out that way too, and a decoy hash on a decoy remote
+    -- is the kick. Off: Namecall only, as before.
+    local function capture_method() return S.one_parry_capture and "Both" or "Namecall" end
     Core.capture_method = capture_method
 
     -- __namecall goes back exactly: the original function object written straight
@@ -844,6 +866,8 @@ do
         local real, f1, f2 = Core.bac()
         if a1 == f1 or a1 == f2 then return false end
         if real and a1 ~= real then return false end
+        -- the plain-call path carries the decoys too: real hash confirmed or nothing
+        if entry[5] == "fire" and not (real and a1 == real) then return false end
         if typeof_(self) == 'Instance' and self.ClassName == 'RemoteEvent'
             and type_(a1) == 'string' and #a1 == 36 and a1 ~= JOB_ID and type_(a2) == 'string' and type_(a3) == 'string'
             and ((type_(a4) == 'number' and typeof_(a5) == 'CFrame') or (typeof_(a4) == 'CFrame' and typeof_(a5) == 'CFrame')) then
@@ -905,14 +929,14 @@ end]]
     local NC_BODY = function(self, ...)
         if select_("#", ...) >= 6 and box.want and getnamecallmethod_() == "FireServer" then
             local l = box.list
-            if #l < 4 then l[#l + 1] = { self, select_("#", ...), { ... }, box.now(box.ws) } end
+            if #l < 4 then l[#l + 1] = { self, select_("#", ...), { ... }, box.now(box.ws), "nc" } end
         end
         return box.nc(self, ...)
     end
     local FIRE_BODY = function(self, ...)
         if select_("#", ...) >= 6 and box.want then
             local l = box.list
-            if #l < 4 then l[#l + 1] = { self, select_("#", ...), { ... }, box.now(box.ws) } end
+            if #l < 4 then l[#l + 1] = { self, select_("#", ...), { ... }, box.now(box.ws), "fire" } end
         end
         return box.fire(self, ...)
     end
@@ -1560,10 +1584,14 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         -- a capture whose hash isn't the game's real one (the hash rotated, or
         -- an old decoy capture): drop it and take a fresh one
         local real = Core.bac()
+        -- the game's real hash moved on (or wasn't readable at capture): it's the
+        -- same sender, remote and uid, so carry the capture onto the real hash
+        -- (0.5.104 -- it used to be dropped, costing a parry to recapture). If
+        -- the next two parries on it both go unanswered, it's dropped then.
         if real and cap.hash ~= real then
-            Core.cap = nil
-            logp("capture: its hash is not the game's real one -- dropped, taking a fresh one")
-            return "unarmed"
+            cap.hash, cap.verified, cap.adopted, Core.misses = real, true, true, 0
+            tok_cache.cap = nil
+            logp("capture: the game's real hash changed -- carried the capture onto it")
         end
         if not spam and not gate_open() then return "blocked" end
         -- hookless capture: the uid is re-read from the game's holder every
@@ -2634,9 +2662,9 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         -- whatever started it -- it comes down the moment the capture is in, or
         -- 0.5s after you leave the round. Namecall only (__namecall is
         -- exploit-side; the FireServer methods are the detectable ones).
-        if capture_method() == "Namecall" and Capture.mode ~= "Auto press" then
-            local was_up = H.nc ~= nil
-            if arm(0.5) and not was_up then logp("capture: namecall hook up until your first real parry") end
+        if capture_method() ~= "getgc" and Capture.mode ~= "Auto press" then
+            local was_up = (H.nc or H.fire) ~= nil
+            if arm(0.5) and not was_up then logp(("capture: %s hook up until your first real parry"):format(capture_method())) end
             return
         end
         -- Synthetic-press bootstrap ("Auto press" capture mode): when no
@@ -2820,6 +2848,11 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
                 Core.pending, Core.misses = nil, Core.misses + 1
                 Core.verdict = nil
                 logp(miss_verdict(Core.watch))
+                -- a capture carried onto a new hash that the server won't answer
+                if Core.cap and Core.cap.adopted and Core.misses >= 2 then
+                    Core.cap = nil
+                    logp("capture: two parries unanswered on the carried-over hash -- dropped, parry once to recapture")
+                end
                 if DBG.on then DBG.ev("MISS: " .. miss_verdict(Core.watch):gsub("\n.*", "")) end
                 -- Self-tune (toggle): an EARLY / LATE miss moves the fire time a
                 -- little the other way -- half the miss, at most 15ms a step,
@@ -3699,6 +3732,11 @@ AIM:AddLabel("Previous curve"):AddKeyPicker("PrevCurveKey", {
 
 local CAP = Tabs.Parry:AddLeftGroupbox("Capture", "key-round")
 CAP:AddLabel("Parry once yourself: the hook reads that real parry (the real hash only, never the game's decoys) and auto parry takes over. A notification says when it has it.", true)
+CAP:AddToggle("OneParryCapture", {
+    Text = "One-parry capture", Default = true,
+    Tooltip = "Catches your first parry every time: also hooks FireServer while there's no capture (the game sends half its parries that way). That path only takes the game's real hash. Off = namecall only, which can take a few parries.",
+    Callback = function(v) S.one_parry_capture = v end,
+})
 CAP:AddToggle("AutoPressCapture", {
     Text = "Auto press capture", Default = false,
     Tooltip = "The script presses block once itself to take the capture (synthetic input) instead of waiting for your own parry.",
