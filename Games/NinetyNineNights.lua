@@ -168,7 +168,7 @@ local Settings = {
     -- bring
     BringCategory = "Fuel", BringPicks = {}, BringExclude = {}, BringOrder = "Nearest first",
     BringDest = "You", BringMode = "Fast", BringPerFrame = 10, BringHold = 100,
-    BringMax = 100, BringRange = 2000, BringSkipNear = true, SavedSpot = nil, BringHeight = 0,
+    BringMax = 100, BringNoLimit = false, BringRange = 2000, BringSkipNear = true, SavedSpot = nil, BringHeight = 0,
     AutoBring = false, AutoBringEvery = 10,
     ChestLoot = false, ChestLootDest = "You",
     ChestLootKinds = { Fuel = true, Food = true, Heals = true, Scrap = true, Gems = true, Ammo = true, Gear = true, Seeds = true, Keys = true, Other = true },
@@ -2047,7 +2047,7 @@ end
 local function runBring(what, dest, limit)
     Bring.token += 1
     local token = Bring.token
-    local list = bringList(what, dest, limit or Settings.BringMax)
+    local list = bringList(what, dest, limit or (Settings.BringNoLimit and math.huge) or Settings.BringMax)
     local start, stop = remote("RequestStartDraggingItem"), remote("StopDraggingItem")
     Bring.total, Bring.done = #list, 0
     if #list == 0 or not start or not stop then
@@ -6018,6 +6018,8 @@ do
     slider(HowBox, "BringPerFrame", "Items per frame (fast)", "BringPerFrame", 1, 50)
     slider(HowBox, "BringHold", "Hold before letting go", "BringHold", 0, 500, " ms", "Raise this if items snap back to where they were")
     slider(HowBox, "BringMax", "Max items per bring", "BringMax", 1, 500)
+    toggle(HowBox, "BringNoLimit", "No limit", "BringNoLimit",
+        "Ignores the max above and brings every matching item in range. Big piles spread into more layers, so raise the drop height if they pile badly")
     slider(HowBox, "BringHeight", "Drop height above target", "BringHeight", 0, 30, " studs",
         "How far above the spot items are placed. If items glitch or break when brought straight onto it, raise this so they drop in from above")
     slider(HowBox, "BringRange", "Only items within", "BringRange", 25, 5000, " studs",
