@@ -31,7 +31,7 @@
 
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.104"
+local SCRIPT_VERSION = "rewrite-0.5.105"
 
 -- ---------------------------------------------------------------------------
 -- Single instance.
@@ -656,7 +656,9 @@ do
     local function choose_target(cam)
         local mode = TARGET_NAMES[S.target_mode] or "Cursor"
         local now = clock_()
-        if target_hold.mode == mode and now - target_hold.at < 0.1 then return target_hold.name, target_hold.pos, mode end
+        -- held one frame (spam: same pick for every parry in it). It was 0.1s --
+        -- a quick camera turn kept sending the ball to the old pick
+        if target_hold.mode == mode and now - target_hold.at < 1 / 60 then return target_hold.name, target_hold.pos, mode end
         local _, _, others = packet_parts(cam)
         local root = getRoot()
         local origin = root and root.Position or cam.CFrame.Position
@@ -671,18 +673,35 @@ do
                     if (mode == "Closest" and d < best) or (mode == "Farthest" and d > best) then best, name, pos = d, t.name, t.pos end
                 end
             else
-                local vp = cam.ViewportSize
-                local anchor = Vector2.new(vp.X / 2, vp.Y / 2)
+                -- Camera / Cursor (0.5.105): the player the view (or the mouse
+                -- ray) points AT -- the smallest 3D angle off that ray, not the
+                -- smallest pixel gap on screen. Pixels measured to the root part's
+                -- dot: someone right in front of you but off centre lost to a
+                -- speck far behind them at the centre. Alive players only; a
+                -- touch of distance breaks near-ties toward the nearer one.
+                local ccf = cam.CFrame
+                local o, look = ccf.Position, ccf.LookVector
                 if mode == "Cursor" and not isMobile then
                     local ok, m = pcall(UserInputService.GetMouseLocation, UserInputService)
-                    if ok and m then anchor = m end
+                    if ok and m then
+                        local ray = cam:ScreenPointToRay(m.X, m.Y, 0) -- the game's own mouse ray
+                        o, look = ray.Origin, ray.Direction.Unit
+                    end
                 end
                 local best = math.huge
                 for _, t in ipairs(others) do
-                    local s = t.screen
-                    if s.Z > 0 and s.X >= 0 and s.Y >= 0 and s.X <= vp.X and s.Y <= vp.Y then
-                        local d = (Vector2.new(s.X, s.Y) - anchor).Magnitude
-                        if d < best then best, name, pos = d, t.name, t.pos end
+                    local m = Alive and Alive:FindFirstChild(t.name)
+                    local hum = m and m:FindFirstChildOfClass("Humanoid")
+                    if not (hum and hum.Health <= 0) then
+                        local to = t.pos - o
+                        local d = to.Magnitude
+                        if d > 1e-3 then
+                            local dot = look:Dot(to / d)
+                            if dot > 0 then
+                                local score = math.acos(math.clamp(dot, -1, 1)) + d * 0.0004
+                                if score < best then best, name, pos = score, t.name, t.pos end
+                            end
+                        end
                     end
                 end
                 if not name then
@@ -1750,6 +1769,12 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
                         -- reading far above what it has been turning at only
                         -- counts a little until it repeats
                         local wgt = (h.k and ks > h.k * 2.5) and 0.25 or 0.6
+                        -- how much the readings scatter (relative): a steady
+                        -- curve earns a tighter SLOW band (see decide)
+                        if h.k then
+                            local rel = math.abs(ks - h.k) / math.max(h.k, K_MIN)
+                            h.kspread = h.kspread and (h.kspread * 0.6 + rel * 0.4) or rel
+                        end
                         h.k = h.k and (h.k * (1 - wgt) + ks * wgt) or ks
                         h.kn = (h.kn or 0) + 1
                     end
@@ -2385,7 +2410,7 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
     --          past lead there is nothing to do and nothing is simulated.
     -- Then:
     --   touching                 -> fire
-    --   pointed at us (>= 0.97)  -> fire when t_min is due
+    --   pointed at us (>= 0.996) -> fire when t_min is due
     --   anything else = a curve  -> see "anti curve" below: fire on its
     --     LATEST arrival at the Accuracy lead, and at once if its SOONEST
     --     arrival would beat a parry fired now.
@@ -2438,7 +2463,11 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         local tag = (via and ("auto parry (" .. via .. ")") or "auto parry") .. ((adj > 0 and via ~= "feed") and " [feed]" or "")
         if rem <= 3 then return fire(st, now, tag .. " (contact)", info, ball) end
         if t_min > lead + half then return end
-        if heading >= 0.97 then return fire(st, now, tag, info, ball) end
+        -- straight in: within ~5 deg of us (0.5.105 -- it was 0.97, ~14 deg: a
+        -- ball still swinging in was timed as if flying straight, firing ahead
+        -- of the Accuracy you set; those go through the curve path now, which
+        -- comes out at the straight time for a ball that really is straight)
+        if heading >= 0.996 then return fire(st, now, tag, info, ball) end
         -- ===== a curve (anti curve, rewritten 0.5.88) =====
         -- Two runs of its homing path, with the turn gain it has actually been
         -- measured turning at (kept across passes; default until measured):
@@ -2483,8 +2512,20 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
             info.eta = fast
             return fire(st, now, tag .. " (curve, must)", info, ball)
         end
-        if h.away then return end
-        local slow = math.max(sim_prop(bpos, v, rpos, gap, math.max(km_lo * 0.75, K_MIN), accel, lead + 0.05, tvel) or math.huge, t_min)
+        -- swinging away waits -- unless it's already within ~14 deg of us (a wobble)
+        if h.away and heading < 0.97 then return end
+        -- SLOW's gain (0.5.105): 0.75x was the floor for every curve, so every
+        -- curve fired on its slowest version -- later (closer) than the
+        -- Accuracy you set, by however much harder it really turned. Once this
+        -- pass has 3+ readings of its turn that agree (scatter under 40%), it's
+        -- run at 1 - scatter/2 of the measured gain (a steady curve: ~0.9-0.95x,
+        -- its real path), so the fire lands at your Accuracy lead. A noisy or
+        -- unmeasured one keeps 0.75x; FAST still guards all of them.
+        local slow_f = 0.75
+        if measured and (h.kn or 0) >= 3 and h.kspread and h.kspread < 0.4 then
+            slow_f = math.clamp(1 - h.kspread * 0.5, 0.8, 0.95)
+        end
+        local slow = math.max(sim_prop(bpos, v, rpos, gap, math.max(km_lo * slow_f, K_MIN), accel, lead + 0.05, tvel) or math.huge, t_min)
         info.eta, info.slow, info.k = slow, slow, km
         if info.dbg then info.dbg.slow = slow end
         if slow <= lead + half then return fire(st, now, tag .. " (curve)", info, ball) end
