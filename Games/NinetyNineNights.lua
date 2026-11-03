@@ -178,7 +178,7 @@ local Settings = {
     KeepFireFed = false, FireBelow = 40, FuelOrder = "Strongest first", KeepScrapping = false,
     NightCamp = false, Escape = false, EscapeBelow = 25,
     AutoReviveOthers = false, AutoSelfRevive = false, ReviveGoTo = false, ReviveGoRange = 500, ReviveReturn = true,
-    InfSack = false, StashHeight = 12, BringFarTravel = false, AutoGrab = false, GrabRange = 12, BringFar = false,
+    InfSack = false, StashHeight = 12, BringFarTravel = false, UncoverHeight = 300, UncoverWait = 0.6, UncoverSpacing = 100, AutoGrab = false, GrabRange = 12, BringFar = false,
     GrabKinds = { Fuel = true, Food = true, Heals = true, Scrap = true, Gems = true, Ammo = true, Gear = true, Seeds = true, Keys = true, Other = true },
     AutoCultistGems = false, AutoFrogKeys = false, AutoOwlFeathers = false, AutoSnowBell = false, AutoEasterEggs = false, AutoHappyPieces = false,
     AutoClearWeather = false, AutoNightSkip = false, AutoDryWood = false,
@@ -5484,6 +5484,122 @@ function Extra.revealMapCells()
     return sent
 end
 
+-- The map only opens where a player has been: every half second the game
+-- marks the cells within 75 studs (flat distance, height doesn't count) of
+-- each player and reports them to the server, which keeps them for the whole
+-- server. So the route flies a grid of stops ~100 studs apart over the whole
+-- map (MapRange + 25 from the centre), held high above the ground every
+-- frame so nothing can reach you, waits at each stop for the game's check,
+-- skips what the server already has, and brings you back after.
+function Extra.uncoverRoute(still, status)
+    status = status or function(text)
+        setStatus(text)
+        Job.status = text
+    end
+    local hrp = rootPart()
+    if not hrp then
+        return
+    end
+    local start = hrp.CFrame
+    local range = (Workspace:GetAttribute("MapRange") or 1300) + 25
+    local done = {}
+    local function mark(r, c)
+        done[r] = done[r] or {}
+        done[r][c] = true
+    end
+    local ok, progress = pcall(function()
+        return remote("RequestServerMapProgress"):InvokeServer(LocalPlayer)
+    end)
+    if ok and type(progress) == "table" then
+        for r, cols in progress do
+            for c in type(cols) == "table" and cols or {} do
+                if tonumber(r) and tonumber(c) then
+                    mark(tonumber(r), tonumber(c))
+                end
+            end
+        end
+    end
+    -- Cells still to find: inside the map, outside the always-open middle.
+    local todo = {}
+    for r = 0, 70 do
+        for c = 0, 70 do
+            local x, z = c * 40 - 1400, r * 40 - 1400
+            local d2 = x * x + z * z
+            if d2 <= range * range and d2 > 11025 and not (done[r] and done[r][c]) then
+                table.insert(todo, { r = r, c = c, x = x, z = z })
+            end
+        end
+    end
+    -- Stops on a grid, kept only where some cell is still to find; rows run
+    -- back and forth so each hop is short.
+    local step = Settings.UncoverSpacing
+    local stops, row = {}, 0
+    for z = -range, range, step do
+        local line = {}
+        for x = -range, range, step do
+            for _, cell in todo do
+                if (cell.x - x) ^ 2 + (cell.z - z) ^ 2 < 70 * 70 then
+                    table.insert(line, Vector3.new(x, Settings.UncoverHeight, z))
+                    break
+                end
+            end
+        end
+        if row % 2 == 1 then
+            for i = 1, #line // 2 do
+                line[i], line[#line - i + 1] = line[#line - i + 1], line[i]
+            end
+        end
+        for _, p in line do
+            table.insert(stops, p)
+        end
+        row += 1
+    end
+    if #stops == 0 then
+        status("The whole map is already uncovered")
+        return
+    end
+    -- Hold the current stop every frame (no falling, no velocity).
+    local hold = CFrame.new(start.Position)
+    local holding = RunService.Heartbeat:Connect(function()
+        local r = rootPart()
+        if r then
+            r.CFrame = hold
+            r.AssemblyLinearVelocity = Vector3.zero
+            r.AssemblyAngularVelocity = Vector3.zero
+        end
+    end)
+    Extra.clearFogWalls()
+    local t0 = os.clock()
+    for i, stop in stops do
+        if not still() or not alive() then
+            break
+        end
+        hold = CFrame.new(stop)
+        pcall(LocalPlayer.RequestStreamAroundAsync, LocalPlayer, stop, 0.2)
+        local left = (#stops - i) * Settings.UncoverWait
+        status(("Uncovering %d/%d · about %ds left"):format(i, #stops, math.ceil(left)))
+        task.wait(Settings.UncoverWait)
+    end
+    holding:Disconnect()
+    if rootPart() then
+        rootPart().CFrame = start
+        rootPart().AssemblyLinearVelocity = Vector3.zero
+    end
+    -- What the server has now.
+    local after = 0
+    local ok2, now = pcall(function()
+        return remote("RequestServerMapProgress"):InvokeServer(LocalPlayer)
+    end)
+    if ok2 and type(now) == "table" then
+        for _, cols in now do
+            for _ in type(cols) == "table" and cols or {} do
+                after += 1
+            end
+        end
+    end
+    status(("Map route done in %ds%s"):format(math.floor(os.clock() - t0), after > 0 and (" · server has " .. after .. " cells") or ""))
+end
+
 local TICKS = { "trackerTick", "stashTick", "sackLabelTick", "grabTick", "cultistGemsTick", "frogKeysTick", "owlFeathersTick",
     "snowBellTick", "easterTick", "happyTick" }
 local errs = {}
@@ -6546,13 +6662,20 @@ do
     MapBox:AddButton({
         Text = "Uncover the whole map",
         Func = function()
-            task.spawn(function()
-                local walls = Extra.clearFogWalls()
-                local cells = Extra.revealMapCells()
-                notify("Map", ("Cleared %d fog walls and sent %d map cells, for everyone in the server"):format(walls, cells), 4)
-            end)
+            startJob("Uncover map", Extra.uncoverRoute)
+        end,
+    }):AddButton({
+        Text = "Stop",
+        Func = function()
+            if Job.name == "Uncover map" then
+                stopJob("Stopped uncovering")
+            end
         end,
     })
+    slider(MapBox, "UncoverHeight", "Fly at height", "UncoverHeight", 100, 800, " studs", "Held up there every frame, out of reach")
+    slider(MapBox, "UncoverWait", "Wait at each stop", "UncoverWait", 0.5, 2, " s",
+        "The game checks where you are every half second; a bit more makes sure each stop counts")
+    slider(MapBox, "UncoverSpacing", "Stop spacing", "UncoverSpacing", 60, 105, " studs", "Each stop uncovers 75 studs around it; 105 is the widest with no gaps")
     MapBox:AddButton({
         Text = "Clear fog walls only",
         Func = function()
@@ -6561,7 +6684,7 @@ do
             end)
         end,
     })
-    MapBox:AddLabel("Other players see it too: the fog fade goes to everyone and the map cells are saved on the server", true)
+    MapBox:AddLabel("Flies the map high up (stops you already uncovered are skipped) and brings you back. The server keeps map progress for everyone, and fog walls fade for everyone", true)
 
     local KidsBox = ExploreTab:AddRightGroupbox("Lost kids", "baby")
     toggle(KidsBox, "AutoBagKids", "Auto pick up kids", "AutoBagKids",
