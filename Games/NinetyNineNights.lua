@@ -178,7 +178,7 @@ local Settings = {
     KeepFireFed = false, FireBelow = 40, FuelOrder = "Strongest first", KeepScrapping = false,
     NightCamp = false, Escape = false, EscapeBelow = 25,
     AutoReviveOthers = false, AutoSelfRevive = false, ReviveGoTo = false, ReviveGoRange = 500, ReviveReturn = true,
-    InfSack = false, StashHeight = 250, AutoGrab = false, GrabRange = 12, BringFar = false,
+    InfSack = false, StashHeight = 12, BringFarTravel = false, AutoGrab = false, GrabRange = 12, BringFar = false,
     GrabKinds = { Fuel = true, Food = true, Heals = true, Scrap = true, Gems = true, Ammo = true, Gear = true, Seeds = true, Keys = true, Other = true },
     AutoCultistGems = false, AutoFrogKeys = false, AutoOwlFeathers = false, AutoSnowBell = false, AutoEasterEggs = false, AutoHappyPieces = false,
     AutoClearWeather = false, AutoNightSkip = false, AutoDryWood = false,
@@ -4533,7 +4533,9 @@ table.insert(Index.onRemove, function(model, entry)
         rec.status = "In " .. (parent.Parent == LocalPlayer and "your" or (parent.Parent.DisplayName .. "'s")) .. " sack"
     elseif parent and parent.Name == "TempStorage" then
         rec.status = "Picked up"
-    elseif radius and hrp and (rec.pos - hrp.Position).Magnitude > radius - 24 then
+    elseif not hrp or (rec.pos - hrp.Position).Magnitude > 40 or (radius and (rec.pos - hrp.Position).Magnitude > radius - 24) then
+        -- Gone while away from you: unloaded (streaming, or the game putting
+        -- far items to sleep), never forgotten.
         rec.status = "Out of range"
     elseif parent == nil then
         rec.status = "Taken or used"
@@ -4618,6 +4620,84 @@ Extra.wantedFar = wantedFar
 
 -- Asks the server to stream in the areas holding the far items `what` wants,
 -- nearest areas first, so bring (or anything else) can see them again.
+-- Brings items the tracker remembers out of range: area by area (nearest
+-- first) asks the server to load it, waits for the items to come back, and
+-- brings them; areas that won't load are visited when travel is on. Items
+-- go where bring would have sent them from where you started.
+function Extra.bringFar(what, dest, still, status)
+    local recs = wantedFar(what)
+    local hrp = rootPart()
+    if #recs == 0 or not hrp then
+        return 0
+    end
+    local start = hrp.CFrame
+    local areas = {}
+    for _, rec in recs do
+        local placed = false
+        for _, area in areas do
+            if (area.pos - rec.pos).Magnitude < 120 then
+                table.insert(area.recs, rec)
+                placed = true
+                break
+            end
+        end
+        if not placed then
+            table.insert(areas, { pos = rec.pos, recs = { rec } })
+        end
+    end
+    table.sort(areas, function(a, b)
+        return (a.pos - start.Position).Magnitude < (b.pos - start.Position).Magnitude
+    end)
+    local anchor = dest == "You" and (start * CFrame.new(0, 1, -7)) or nil
+    local brought, travelled = 0, false
+    for i, area in areas do
+        if still and not still() then
+            break
+        end
+        status(("Far items: area %d/%d (%d items)"):format(i, #areas, #area.recs))
+        pcall(LocalPlayer.RequestStreamAroundAsync, LocalPlayer, area.pos, 3)
+        local function loaded()
+            local list = {}
+            for _, rec in area.recs do
+                if rec.model and rec.model.Parent then
+                    table.insert(list, rec.model)
+                end
+            end
+            return list
+        end
+        local t0 = os.clock()
+        while #loaded() < #area.recs and os.clock() - t0 < 1.5 do
+            task.wait(0.1)
+        end
+        if #loaded() == 0 and Settings.BringFarTravel then
+            travelled = true
+            moveTo(area.pos, { run = true })
+            t0 = os.clock()
+            while #loaded() < #area.recs and os.clock() - t0 < 2.5 do
+                task.wait(0.1)
+            end
+        end
+        local list = loaded()
+        if #list > 0 then
+            runBring({ list = list, at = anchor }, dest, #list)
+            while Bring.running and (not still or still()) do
+                task.wait(0.05)
+            end
+            brought += #list
+        else
+            -- Nothing there any more: someone moved or used them.
+            for _, rec in area.recs do
+                rec.status = "Gone (not where it was)"
+            end
+        end
+    end
+    if travelled and rootPart() then
+        moveTo(start.Position, { run = true, exact = true })
+    end
+    status(("Far items: brought %d"):format(brought))
+    return brought
+end
+
 function Extra.loadFor(what, maxAreas)
     local recs = wantedFar(what)
     local hrp = rootPart()
@@ -4661,14 +4741,10 @@ end
 local Stash = { held = {}, order = {}, pending = {} }
 Extra.Stash = Stash
 
+-- Above your head, so it stays loaded wherever you go and the sack can reach it.
 local function stashBase()
-    local fire = campPart("MainFire")
-    local pos = fire and pivotPos(fire)
-    if not pos then
-        local hrp = rootPart()
-        pos = hrp and hrp.Position
-    end
-    return pos and (pos + Vector3.new(0, Settings.StashHeight, 0))
+    local hrp = rootPart()
+    return hrp and (hrp.Position + Vector3.new(0, Settings.StashHeight, 0))
 end
 
 local function stashSlot(i)
@@ -4710,18 +4786,13 @@ end
 
 -- An item that just came out of the sack lands in Workspace.Items next to
 -- you: catch it and hold it in the stash.
--- The stash streams out when you go far from camp; its items come back as
--- new objects, so anything that streams in at the stash is taken back too.
+-- An item that just came out of the sack lands next to you: catch it and
+-- hold it in the stash.
 table.insert(Index.onAdd, function(model, entry)
     local pos, hrp = pivotPos(model), rootPart()
     local want = entry and Stash.pending[entry.name]
     if want and want > 0 and pos and hrp and (pos - hrp.Position).Magnitude < 25 then
         Stash.pending[entry.name] = want - 1
-        task.defer(hold, model)
-        return
-    end
-    local base = pos and Settings.InfSack and stashBase()
-    if base and math.abs(pos.Y - base.Y) < 30 and (Vector3.new(pos.X, base.Y, pos.Z) - base).Magnitude < 30 and mineOrFree(model) then
         task.defer(hold, model)
     end
 end)
@@ -4744,12 +4815,11 @@ function Extra.stashTick()
         if model.Parent and Stash.held[model] then
             local owner = model:GetAttribute("Owner")
             local cf = stashSlot(Stash.held[model])
-            local pos = pivotPos(model)
-            if owner ~= mine or (cf and pos and (pos - cf.Position).Magnitude > 6) then
-                if owner == nil or owner == mine then
-                    hold(model)
-                end
-            elseif cf then
+            if owner == nil then
+                -- The game let go of it: take it back.
+                hold(model)
+            elseif owner == mine and cf then
+                -- Follows you around.
                 placeItem(model, cf)
             end
         end
@@ -4771,7 +4841,8 @@ function Extra.stashTick()
         return
     end
     local bag = itemBag()
-    if bag and sackSpace() <= 0 then
+    local space = bag and sackSpace() or 0
+    if bag and space <= 0 then
         local item = overflowItem()
         local drop = remote("RequestBagDropItem")
         if item and drop then
@@ -4779,6 +4850,19 @@ function Extra.stashTick()
             local name = cleanName(item.Name)
             Stash.pending[name] = (Stash.pending[name] or 0) + 1
             drop:FireServer(bag, item, #bagContents() <= 1)
+        end
+    elseif bag and space >= 2 and os.clock() - lastOverflow > 1.5 then
+        -- Room in the sack again (you took something out): the stash fills it
+        -- back up, leaving one slot free so picking things up still works.
+        local stop, store = remote("StopDraggingItem"), remote("RequestBagStoreItem")
+        for _, model in Stash.order do
+            if model.Parent and Stash.held[model] and stop and store then
+                Stash.held[model] = nil
+                stop:FireServer(model)
+                task.spawn(pcall, store.InvokeServer, store, bag, model)
+                lastOverflow = os.clock() - 1
+                break
+            end
         end
     end
 end
@@ -4819,10 +4903,9 @@ local function fixLabel(label)
     if not Settings.InfSack then
         return
     end
-    local n = label.Text:match("^(%d+)/")
+    local n = tonumber(label.Text:match("^(%d+)/"))
     if n and not label.Text:find("∞", 1, true) then
-        local extra = Extra.stashCount()
-        label.Text = (extra > 0 and (n .. "+" .. extra) or n) .. "/∞"
+        label.Text = (n + Extra.stashCount()) .. "/∞"
         label.TextColor3 = Color3.fromRGB(255, 255, 255)
     end
 end
@@ -5352,6 +5435,53 @@ function Extra.previewRing()
     task.delay(Settings.PreviewSeconds, function()
         folder:Destroy()
     end)
+end
+
+-- Uncover the map, for everyone ------------------------------------------------
+-- Two kinds of fog. The fog walls (tag FogBlock) fade when you touch one: the
+-- game tells every player with FadeOutFogBlock:FireServer("FireAllClients",
+-- block). The map screen is a 70 x 70 grid of 40-stud cells kept on the
+-- server for the whole server; the client reports what it's found with
+-- MapCellsDiscovered(cells, caveCells), cells as { Row, Col }. Both are sent
+-- here for everything, so the other players' maps open up too.
+function Extra.clearFogWalls()
+    local relay = remote("FadeOutFogBlock")
+    local n = 0
+    for _, block in tagged("FogBlock") do
+        if block.Parent and not block:GetAttribute("Destroyed") then
+            if relay then
+                relay:FireServer("FireAllClients", block)
+            end
+            pcall(function()
+                block:SetAttribute("Destroyed", true)
+                block:Destroy()
+            end)
+            n += 1
+            if n % 60 == 0 then
+                task.wait()
+            end
+        end
+    end
+    return n
+end
+function Extra.revealMapCells()
+    local batch, sent = {}, 0
+    for row = 0, 69 do
+        for col = 0, 69 do
+            table.insert(batch, { Row = row, Col = col })
+            if #batch >= 140 then
+                fire("MapCellsDiscovered", batch, {})
+                sent += #batch
+                batch = {}
+                task.wait(0.05)
+            end
+        end
+    end
+    if #batch > 0 then
+        fire("MapCellsDiscovered", batch, {})
+        sent += #batch
+    end
+    return sent
 end
 
 local TICKS = { "trackerTick", "stashTick", "sackLabelTick", "grabTick", "cultistGemsTick", "frogKeysTick", "owlFeathersTick",
@@ -5948,14 +6078,17 @@ do
         Func = function()
             task.spawn(function()
                 local what = currentBringWhat()
-                if Settings.BringFar then
-                    local n = Extra.loadFor(what)
-                    if n > 0 then
-                        UI.BringStatus:SetText(("Loading %d far item%s..."):format(n, n == 1 and "" or "s"))
-                        task.wait(0.6)
-                    end
+                local near = runBring(what, Settings.BringDest)
+                while Bring.running do
+                    task.wait(0.05)
                 end
-                if runBring(what, Settings.BringDest) == 0 then
+                local far = 0
+                if Settings.BringFar then
+                    far = Extra.bringFar(what, Settings.BringDest, nil, function(text)
+                        UI.BringStatus:SetText(text)
+                    end)
+                end
+                if near == 0 and far == 0 then
                     UI.BringStatus:SetText("Nothing to bring")
                 end
             end)
@@ -5969,13 +6102,16 @@ do
     })
     toggle(GoBox, "AutoBring", "Auto bring", "AutoBring")
     slider(GoBox, "AutoBringEvery", "Every", "AutoBringEvery", 2, 60, " s")
-    toggle(GoBox, "BringFar", "Load far items first", "BringFar",
-        "Bring now first asks the server to load the areas where the tracker last saw the picked items, so ones out of range come too")
+    toggle(GoBox, "BringFar", "Bring unloaded items too", "BringFar",
+        "After the loaded ones, Bring now loads each area where the tracker last saw picked items (nearest first) and brings them as they appear")
+    toggle(GoBox, "BringFarTravel", "Go there if an area won't load", "BringFarTravel",
+        "Visits areas the server won't stream to you, brings from there, and comes back. Items still go to where you started")
 
     local SackBox = BringTab:AddRightGroupbox("Endless sack", "infinity")
     toggle(SackBox, "InfSack", "Endless sack", "InfSack",
-        "When your sack is full, its oldest item (never a kid) moves to your stash above camp, so the sack always has room. The sack shows ∞. Stashed items are held by you, so other players can't take them")
-    slider(SackBox, "StashHeight", "Stash height above camp", "StashHeight", 60, 600, " studs")
+        "When your sack is full, its oldest item (never a kid) moves to your stash, which floats above you and follows you; when there's room again it goes back in the sack. The sack shows the real total out of ∞. Stashed items are held by you, so other players can't take them")
+    slider(SackBox, "StashHeight", "Stash height above you", "StashHeight", 6, 60, " studs",
+        "The stash floats above your head and follows you, so it stays loaded and goes back in the sack when there's room")
     UI.StashLabel = SackBox:AddLabel("Stash: empty", true)
     SackBox:AddButton({
         Text = "Take 10",
@@ -6015,7 +6151,7 @@ do
     local HowBox = BringTab:AddLeftGroupbox("How", "gauge")
     choice(HowBox, "BringMode", "Method", "BringMode", { "Fast", "Safe" },
         "Fast moves many items per frame (100+ a second). Safe moves one at a time and waits until the server hands it over")
-    slider(HowBox, "BringPerFrame", "Items per frame (fast)", "BringPerFrame", 1, 50)
+    slider(HowBox, "BringPerFrame", "Items per frame (fast)", "BringPerFrame", 1, 500)
     slider(HowBox, "BringHold", "Hold before letting go", "BringHold", 0, 500, " ms", "Raise this if items snap back to where they were")
     slider(HowBox, "BringMax", "Max items per bring", "BringMax", 1, 500)
     toggle(HowBox, "BringNoLimit", "No limit", "BringNoLimit",
@@ -6405,6 +6541,27 @@ do
         "Chest run leaves a chest alone when a hostile mob is this close to it, unless kill aura is on")
     slider(RunBox, "GuardRadius", "Mob distance", "GuardRadius", 5, 40, " studs")
     RunBox:AddLabel("Kid rescue needs a sack. It goes to each kid, picks it up and brings it to the camp fire. Turn on kill aura first", true)
+
+    local MapBox = ExploreTab:AddRightGroupbox("Map", "map")
+    MapBox:AddButton({
+        Text = "Uncover the whole map",
+        Func = function()
+            task.spawn(function()
+                local walls = Extra.clearFogWalls()
+                local cells = Extra.revealMapCells()
+                notify("Map", ("Cleared %d fog walls and sent %d map cells, for everyone in the server"):format(walls, cells), 4)
+            end)
+        end,
+    })
+    MapBox:AddButton({
+        Text = "Clear fog walls only",
+        Func = function()
+            task.spawn(function()
+                notify("Map", ("Cleared %d fog walls for everyone"):format(Extra.clearFogWalls()), 3)
+            end)
+        end,
+    })
+    MapBox:AddLabel("Other players see it too: the fog fade goes to everyone and the map cells are saved on the server", true)
 
     local KidsBox = ExploreTab:AddRightGroupbox("Lost kids", "baby")
     toggle(KidsBox, "AutoBagKids", "Auto pick up kids", "AutoBagKids",
