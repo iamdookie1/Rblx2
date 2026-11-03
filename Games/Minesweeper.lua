@@ -1,1387 +1,1193 @@
---// Minesweeper -------------------------------------------------------------------
--- Board:   workspace.Flag.Parts        (one Part per tile)
--- Number:  part.NumberGui.TextLabel.Text
--- Flag:    an object carrying a UserId attribute (names who placed it)
+--// Minesweeper -------------------------------------------------------------------------
+-- place 7871169780. Rewritten on Ui3.
 --
--- Mine positions are never replicated - the server reveals a tile only once it
--- is touched - so nothing hidden is being read. Everything below is derived from
--- the revealed numbers, which the client necessarily has because it draws them,
--- and a tile is only marked when it is provably safe or provably mined.
+-- How the game works (as the client sees it):
+--   Board   workspace.Flag.Parts, one Part per tile, laid out on a grid with gaps.
+--   Number  a revealed tile has part.NumberGui.TextLabel; empty text means 0.
+--   Flag    an object carrying a UserId attribute (who placed it): the tile
+--           itself, a child, a grandchild, or a model lying on the tile.
+--   Mines   never replicated: the server reveals a tile when it's touched.
+--           Everything here comes from the numbers the client already draws.
+--   Flags   PlaceFlag:FireServer(part, token, true) in
+--           ReplicatedStorage.Events.FlagEvents. The token is read from
+--           workspace.Salasana at startup and then destroyed, so it's taken
+--           from there if still present, else from the upvalues of the game's
+--           own handler; touch devices also get a ClickDetector whose handler
+--           sends the token itself.
+--   Watch   the game counts tiles coloured exactly pure green or pure red and
+--           reports it; nothing here recolours a tile, and the colour pickers
+--           never hand out those two exact colours.
 --
--- On placing flags: the game reads a token out of workspace.Salasana at startup
--- and then zeroes, renames and destroys it, so a script injected later cannot
--- read it. Every PlaceFlag:FireServer(part, token, true) needs that value, which
--- is why blindly firing the remote does nothing. Two routes actually work:
--- recover the token from the upvalues of the game's own handler, or fire the
--- ClickDetector the game made and let its handler send the token for us.
+-- Everything here is LOCAL PLAYER ONLY.
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Workspace = workspace
-
 local LocalPlayer = Players.LocalPlayer
-local Camera = Workspace.CurrentCamera
 
-local function resolveEvent(modern, legacy)
-    local ok, ev = pcall(function() return RunService[modern] end)
-    if ok and ev then return ev end
-    return RunService[legacy]
+-- A second run retires the first.
+local Genv = (typeof(getgenv) == "function" and getgenv()) or _G
+if Genv.__MinesweeperUnload then
+    pcall(Genv.__MinesweeperUnload)
 end
-local PostSimulation = resolveEvent("PostSimulation", "Heartbeat")
+Genv.__MinesweeperRun = (Genv.__MinesweeperRun or 0) + 1
+local RUN = Genv.__MinesweeperRun
+local Unloaded = false
+local function alive()
+    return not Unloaded and Genv.__MinesweeperRun == RUN
+end
 
-local Connections = {}
-local Unloading = false
-local function track(c) Connections[#Connections + 1] = c return c end
+--// Ui3, from the latest commit so a cached main branch never wins \\--
+local Library
+do
+    local ref = "main"
+    local ok, sha = pcall(function()
+        return game:GetService("HttpService"):JSONDecode(game:HttpGet("https://api.github.com/repos/iamdookie1/Ui3/commits/main")).sha
+    end)
+    if ok and sha then
+        ref = sha
+    end
+    Library = loadstring(game:HttpGet(("https://raw.githubusercontent.com/iamdookie1/Ui3/%s/Ui.lua"):format(ref)))()
+end
+local Options = Library.Options
+if not alive() then
+    return
+end
 
---// Config ------------------------------------------------------------------------
-local Config = {
-    ShowSafe = false,
-    SafeMethod = "Highlight",
-    SafeColor = Color3.fromRGB(70, 170, 255),
-
-    ShowMines = false,
-    MineMethod = "Highlight",
-    MineColor = Color3.fromRGB(255, 60, 60),
-
+local Settings = {
+    -- markers
+    ShowSafe = true, SafeMethod = "Highlight", SafeColor = Color3.fromRGB(70, 170, 255),
+    ShowMines = true, MineMethod = "Highlight", MineColor = Color3.fromRGB(255, 70, 70),
+    ShowWrongFlags = true, WrongFlagColor = Color3.fromRGB(255, 150, 0),
+    ShowChances = false, ShowBestGuess = false, GuessColor = Color3.fromRGB(255, 225, 90),
     Transparency = 0.5,
-    -- Solving is event driven, so this is only how often the safety sweep runs.
-    Backstop = 1,
-
-    AutoFlag = false,
-    FlagRange = 16,
-    FlagDelay = 0.06,
-    FlagMethod = "Auto",
-
-    -- Exhaustive enumeration over connected groups. Finds everything the board
-    -- proves, at a cost, so it is opt in and capped.
-    DeepThink = false,
-    DeepLimit = 16,
-    DeepSolutionCap = 20000,
-
-    ShowFalseFlags = false,
-    FalseFlagColor = Color3.fromRGB(255, 140, 0),
-    ShowChances = false,
+    -- solver
+    DeepThink = true, DeepLimit = 18, DeepCap = 30000, Backstop = 1,
+    -- auto
+    AutoFlag = false, FlagMethod = "Auto", FlagRange = 30, FlagDelay = 0.05,
+    StepSafe = false, StepMethod = "Teleport", StepRange = 60, StepDelay = 0.15,
 }
 
 local Stats = {
-    Tiles = 0, Revealed = 0, Unknown = 0, Flagged = 0,
-    Safe = 0, Mines = 0, LastSolve = 0, Changed = 0,
-    Neighbours = 0, FalseFlags = 0, Token = "not found", Status = "waiting for board",
+    Tiles = 0, Revealed = 0, Unknown = 0, Flagged = 0, Safe = 0, Mines = 0, WrongFlags = 0,
+    SolveMs = 0, Status = "waiting for the board", Token = "not looked for yet", Neighbours = 0,
 }
 
---// Board -------------------------------------------------------------------------
-local FlagModel, PartsFolder
-local boardPitch = nil
-local tiles = {}          -- [part] = tile
-local tileList = {}
-local dirty, dirtyCount = {}, 0
-local classification = {} -- [part] = "safe" | "mine" | "falseflag"
-local chanceOf = {}       -- [part] = chance of being a mine, when unproven
-local refreshChanceLabels -- defined once visuals exist
-local visuals = {}
-local flaggedByUs = {}
+--// Plumbing \\--
+local Connections = {}
+local function bind(signal, fn)
+    local c = signal:Connect(fn)
+    table.insert(Connections, c)
+    return c
+end
+local function loop(every, fn)
+    task.spawn(function()
+        while alive() do
+            local ok, err = pcall(fn)
+            if not ok then
+                warn("[Minesweeper] " .. tostring(err))
+            end
+            task.wait(type(every) == "function" and every() or every)
+        end
+    end)
+end
+local function notify(text, seconds)
+    pcall(Library.Notify, Library, { Title = "Minesweeper", Description = text, Time = seconds or 3 })
+end
+local function rootPart()
+    local c = LocalPlayer.Character
+    return c and c:FindFirstChild("HumanoidRootPart")
+end
 
-local function markDirty(tile)
-    if tile and not dirty[tile] then
-        dirty[tile] = true
-        dirtyCount = dirtyCount + 1
+-- The game reports tiles painted exactly pure green or pure red; no colour
+-- handed out here is ever exactly one of those.
+local function guardColor(c)
+    local r, g, b = math.floor(c.R * 255 + 0.5), math.floor(c.G * 255 + 0.5), math.floor(c.B * 255 + 0.5)
+    if (r == 0 and g == 255 and b == 0) or (r == 255 and g == 0 and b == 0) then
+        return Color3.fromRGB(math.max(r - 6, 0) + (r == 0 and 6 or 0), math.max(g - 6, 0) + (g == 0 and 6 or 0), b + 6)
+    end
+    return c
+end
+
+--// Board \\--
+-- Tiles are matched to neighbours by distance on a spatial hash sized to the
+-- board's own pitch (the gap between tiles makes size-based indexing put
+-- every tile in its own cell).
+local Board = { tiles = {}, list = {}, pitch = nil, folder = nil, ready = false }
+local OURS = "MSW_" -- prefix on everything this script parents to a tile
+
+local function boardFolder()
+    local model = Workspace:FindFirstChild("Flag")
+    return model and model:FindFirstChild("Parts")
+end
+
+local function carriesUserId(inst)
+    return inst:GetAttribute("UserId") ~= nil
+end
+
+-- Flags lying on a tile rather than parented to it, found once per board.
+local Loose = {}
+local function findLooseFlags()
+    table.clear(Loose)
+    local pitch = Board.pitch
+    if not pitch or #Board.list == 0 then
+        return
+    end
+    local byCell = {}
+    for _, t in Board.list do
+        byCell[t.key] = t
+    end
+    local budget = 8000
+    for _, inst in Workspace:GetDescendants() do
+        budget -= 1
+        if budget <= 0 then
+            break
+        end
+        if (inst:IsA("BasePart") or inst:IsA("Model")) and not Board.tiles[inst] and carriesUserId(inst) then
+            local ok, pos = pcall(function()
+                return inst:IsA("Model") and inst:GetPivot().Position or inst.Position
+            end)
+            if ok and pos then
+                local t = byCell[("%d_%d"):format(math.floor(pos.X / pitch + 0.5), math.floor(pos.Z / pitch + 0.5))]
+                if t then
+                    Loose[t.part] = true
+                end
+            end
+        end
     end
 end
 
---// Reading -----------------------------------------------------------------------
+local function readFlag(part)
+    if carriesUserId(part) or Loose[part] then
+        return true
+    end
+    for _, child in part:GetChildren() do
+        if child.Name:sub(1, #OURS) ~= OURS then
+            if carriesUserId(child) then
+                return true
+            end
+            for _, sub in child:GetChildren() do
+                if carriesUserId(sub) then
+                    return true
+                end
+            end
+        end
+    end
+    return false
+end
+
 local function readNumber(part)
     local gui = part:FindFirstChild("NumberGui")
-    if not gui then return nil end
+    if not gui then
+        return nil
+    end
     local label = gui:FindFirstChild("TextLabel") or gui:FindFirstChildWhichIsA("TextLabel", true)
-    if not label then return nil end
+    if not label then
+        return nil
+    end
     local text = label.Text
-    if not text or text == "" then
-        -- An opened tile with no text is a zero: every neighbour is safe, which
-        -- is the single most useful constraint on the board.
+    if text == nil or text == "" then
         return 0
     end
     return tonumber(text)
 end
 
--- Marker on everything this script parents to a tile, so foreign-child
--- detection below cannot mistake our own highlights for a flag.
-local OURS = "MSV_"
-
--- A flag carries a UserId attribute naming whoever placed it. That is the one
--- unambiguous marker: the name is server-built and varies, and "anything
--- foreign parented to the tile" catches decor that is not a flag at all.
--- GetAttribute never throws on an Instance, so the pcall this used to carry was
--- pure overhead at a few thousand calls a second.
-local function carriesUserId(inst)
-    return inst:GetAttribute("UserId") ~= nil
-end
-
--- Flags placed away from the tile rather than parented to it.
-local looseFlags = {}
-
--- Flag state is cached per tile and only recomputed when something is actually
--- added to or removed from that tile. Walking GetDescendants on six hundred
--- tiles every sweep was allocating a table per tile per second for an answer
--- that almost never changes.
-local flagCache = {}
-
-local function computeFlag(part)
-    if carriesUserId(part) then return true end
-    for _, child in ipairs(part:GetChildren()) do
-        if child.Name:sub(1, #OURS) ~= OURS then
-            if carriesUserId(child) then return true end
-            -- One level deeper covers a flag model wrapping its own parts,
-            -- without the unbounded walk a full descendant scan does.
-            for _, sub in ipairs(child:GetChildren()) do
-                if carriesUserId(sub) then return true end
-            end
-        end
+local function readTile(t)
+    if readFlag(t.part) then
+        return "flagged", nil
     end
-    return false
-end
-
-local function invalidateFlag(part)
-    flagCache[part] = nil
-end
-
-local function hasFlag(part)
-    local cached = flagCache[part]
-    if cached == nil then
-        cached = computeFlag(part)
-        flagCache[part] = cached
+    local n = readNumber(t.part)
+    if n then
+        return "revealed", n
     end
-    return cached or looseFlags[part] == true
-end
-
--- Pins flag objects that live outside the tiles onto the tile beneath them.
--- Buckets by grid cell instead of comparing every flag against every tile, and
--- runs once per board rather than on repeat - the old version rescanned six
--- thousand descendants against six hundred tiles every second precisely when
--- flag detection was failing, which is what made it crawl.
-local looseSweepDone = false
-
-local function refreshLooseFlags(pitch)
-    looseFlags = {}
-    if not pitch or #tileList == 0 then return end
-
-    local byCell = {}
-    for _, tile in ipairs(tileList) do
-        local p = tile.part.Position
-        local key = ("%d_%d"):format(math.floor(p.X / pitch + 0.5), math.floor(p.Z / pitch + 0.5))
-        byCell[key] = tile
-    end
-
-    local budget = 6000
-    for _, inst in ipairs(Workspace:GetDescendants()) do
-        if budget <= 0 then break end
-        budget = budget - 1
-        if (inst:IsA("BasePart") or inst:IsA("Model")) and not tiles[inst] and carriesUserId(inst) then
-            local ok, pos = pcall(function()
-                if inst:IsA("Model") then return inst:GetPivot().Position end
-                return inst.Position
-            end)
-            if ok and pos then
-                local key = ("%d_%d"):format(math.floor(pos.X / pitch + 0.5), math.floor(pos.Z / pitch + 0.5))
-                local tile = byCell[key]
-                if tile then looseFlags[tile.part] = true end
-            end
-        end
-    end
-    looseSweepDone = true
-end
-
--- "revealed" once a number can be read, "flagged" if a flag sits on it, else
--- still unknown and therefore still worth solving for.
-local function readTile(part)
-    if hasFlag(part) then return "flagged", nil end
-    local n = readNumber(part)
-    if n then return "revealed", n end
     return "unknown", nil
 end
 
---// Discovery ---------------------------------------------------------------------
--- Neighbours are matched by distance rather than by dividing position by tile
--- size: the board leaves a gap between tiles, so size-based cell maths puts
--- every tile on its own index with no neighbours at all - which looks identical
--- to a healthy board from the counts and can never solve anything.
 local function buildBoard()
-    FlagModel = Workspace:FindFirstChild("Flag")
-    PartsFolder = FlagModel and FlagModel:FindFirstChild("Parts")
-    if not PartsFolder then return false end
-
-    tiles, tileList = {}, {}
-    local parts = {}
-    for _, part in ipairs(PartsFolder:GetChildren()) do
-        if part:IsA("BasePart") then parts[#parts + 1] = part end
+    local folder = boardFolder()
+    if not folder then
+        return false
     end
-    if #parts == 0 then return false end
-
-    -- Spacing measured off the board itself, then used as the bucket size for a
-    -- spatial hash so neighbour matching stays linear instead of comparing every
-    -- tile against every other one.
+    local parts = {}
+    for _, p in folder:GetChildren() do
+        if p:IsA("BasePart") then
+            table.insert(parts, p)
+        end
+    end
+    if #parts == 0 then
+        return false
+    end
+    -- Pitch: the smallest gap between tile centres, from a sample.
     local pitch = math.huge
     local sample = math.min(#parts, 200)
     for i = 1, sample do
         for j = i + 1, sample do
             local d = (parts[i].Position - parts[j].Position).Magnitude
-            if d > 0.05 and d < pitch then pitch = d end
+            if d > 0.05 and d < pitch then
+                pitch = d
+            end
         end
     end
-    if pitch == math.huge then pitch = parts[1].Size.X end
-    boardPitch = pitch
-
-    local buckets = {}
-    local function keyOf(pos)
-        return ("%d_%d"):format(math.floor(pos.X / pitch + 0.5), math.floor(pos.Z / pitch + 0.5))
+    if pitch == math.huge then
+        pitch = math.max(parts[1].Size.X, 1)
     end
-
-    for _, part in ipairs(parts) do
-        local tile = { part = part, state = "unknown", number = nil, neighbours = {} }
-        tiles[part] = tile
-        tileList[#tileList + 1] = tile
-        local k = keyOf(part.Position)
-        buckets[k] = buckets[k] or {}
-        table.insert(buckets[k], tile)
+    local tiles, list, buckets = {}, {}, {}
+    for _, part in parts do
+        local gx = math.floor(part.Position.X / pitch + 0.5)
+        local gz = math.floor(part.Position.Z / pitch + 0.5)
+        local t = { part = part, gx = gx, gz = gz, key = ("%d_%d"):format(gx, gz), state = "unknown", number = nil, near = {} }
+        tiles[part] = t
+        table.insert(list, t)
+        buckets[t.key] = buckets[t.key] or {}
+        table.insert(buckets[t.key], t)
     end
-
-    local reach = pitch * 1.6
-    for _, tile in ipairs(tileList) do
-        local pos = tile.part.Position
-        local bx = math.floor(pos.X / pitch + 0.5)
-        local bz = math.floor(pos.Z / pitch + 0.5)
-        local list = {}
+    local reach, links = pitch * 1.6, 0
+    for _, t in list do
         for dx = -1, 1 do
             for dz = -1, 1 do
-                local bucket = buckets[("%d_%d"):format(bx + dx, bz + dz)]
-                if bucket then
-                    for _, other in ipairs(bucket) do
-                        if other ~= tile then
-                            local d = (other.part.Position - pos).Magnitude
-                            if d <= reach then list[#list + 1] = other end
-                        end
+                for _, o in buckets[("%d_%d"):format(t.gx + dx, t.gz + dz)] or {} do
+                    if o ~= t and (o.part.Position - t.part.Position).Magnitude <= reach then
+                        table.insert(t.near, o)
+                        links += 1
                     end
                 end
             end
         end
-        tile.neighbours = list
     end
-
-    local total = 0
-    for _, t in ipairs(tileList) do total = total + #t.neighbours end
-    Stats.Neighbours = #tileList > 0 and total / #tileList or 0
-    Stats.Tiles = #tileList
+    Board.tiles, Board.list, Board.pitch, Board.folder = tiles, list, pitch, folder
+    Stats.Tiles = #list
+    Stats.Neighbours = #list > 0 and links / #list or 0
+    findLooseFlags()
+    for _, t in list do
+        t.state, t.number = readTile(t)
+    end
     return true
 end
 
---// Flag token --------------------------------------------------------------------
--- workspace.Salasana is destroyed by the game before an injected script can read
--- it, so the value is recovered from where it still lives: captured as an upvalue
--- inside the handler the game connected. A closure that holds the PlaceFlag
--- remote is the one we want, and its numeric upvalue is the token.
-local PlaceFlagRemote
-local flagToken = nil
+--// Solver \\--
+-- Constraints: each revealed number with unknown neighbours says "exactly
+-- `need` mines among these". Three exact passes, repeated until nothing new
+-- turns up:
+--   1. a number already satisfied frees the rest; one needing every unknown
+--      mines them all;
+--   2. subset elimination between overlapping numbers;
+--   3. (better thinking) every mine arrangement of each connected clump of
+--      unknowns: a mine in all of them is a mine, safe in all of them is
+--      safe, and the share of arrangements with a mine is a real chance.
+-- A wrong flag shows up when the same solve, with flags opened back up,
+-- proves a flagged tile safe.
+local Result = { class = {}, chance = {}, wrong = {}, guess = nil }
 
-local function findPlaceFlagRemote()
-    local events = ReplicatedStorage:FindFirstChild("Events")
-    local folder = events and events:FindFirstChild("FlagEvents")
-    return folder and folder:FindFirstChild("PlaceFlag")
-end
-
-local function recoverToken()
-    PlaceFlagRemote = PlaceFlagRemote or findPlaceFlagRemote()
-
-    -- Free if we got in early enough: the value is still sitting there.
-    local salasana = Workspace:FindFirstChild("Salasana")
-    if salasana and salasana:IsA("ValueBase") then
-        local ok, v = pcall(function() return salasana.Value end)
-        if ok and typeof(v) == "number" and v ~= 0 then
-            flagToken = v
-            Stats.Token = "read from Salasana"
-            return true
-        end
-    end
-
-    if not PlaceFlagRemote then return false end
-    if typeof(getgc) ~= "function" or typeof(debug) ~= "table" or typeof(debug.getupvalues) ~= "function" then
-        Stats.Token = "no getgc on this executor"
-        return false
-    end
-
-    local found = nil
-    pcall(function()
-        for _, fn in ipairs(getgc()) do
-            if type(fn) == "function" then
-                local ok, ups = pcall(debug.getupvalues, fn)
-                if ok and type(ups) == "table" then
-                    local holdsRemote, candidate = false, nil
-                    for _, up in pairs(ups) do
-                        if up == PlaceFlagRemote then
-                            holdsRemote = true
-                        elseif typeof(up) == "number" and up ~= 0 then
-                            candidate = up
-                        end
-                    end
-                    -- Some closures capture ReplicatedStorage rather than the
-                    -- remote itself, so a nearby numeric upvalue alone is not
-                    -- enough; the remote has to be in the same closure.
-                    if holdsRemote and candidate then
-                        found = candidate
-                        break
-                    end
-                end
-            end
-        end
-    end)
-
-    if found then
-        flagToken = found
-        Stats.Token = "recovered from handler"
-        return true
-    end
-
-    Stats.Token = "not found"
-    return false
-end
-
-local function placeFlag(part)
-    local method = Config.FlagMethod
-
-    if method == "Auto" or method == "Token" then
-        if not flagToken then recoverToken() end
-        if flagToken and PlaceFlagRemote then
-            local ok = pcall(function()
-                PlaceFlagRemote:FireServer(part, flagToken, true)
-            end)
-            if ok then return true end
-        end
-        if method == "Token" then return false end
-    end
-
-    -- The game only creates ClickDetectors on touch devices, but where one
-    -- exists its handler already holds the token, so firing it is the most
-    -- faithful route available.
-    local detector = part:FindFirstChildOfClass("ClickDetector")
-    if detector and typeof(fireclickdetector) == "function" then
-        local ok = pcall(fireclickdetector, detector)
-        if ok then return true end
-    end
-
-    return false
-end
-
---// Visuals ----------------------------------------------------------------------
-local function clearVisual(part)
-    local v = visuals[part]
-    if not v then return end
-    for _, inst in ipairs(v.Objects) do
-        pcall(function() inst:Destroy() end)
-    end
-    visuals[part] = nil
-end
-
-local function buildVisual(part, method, color)
-    local made = {}
-
-    local function add(inst)
-        -- Tagged so flag detection can tell our own markers apart from a real
-        -- flag the game placed.
-        inst.Name = OURS .. inst.ClassName
-        made[#made + 1] = inst
-        return inst
-    end
-
-    if method == "Highlight" then
-        local h = add(Instance.new("Highlight"))
-        h.FillColor, h.OutlineColor = color, color
-        h.FillTransparency = Config.Transparency
-        h.OutlineTransparency = 0
-        h.Adornee = part
-        h.Parent = part
-    elseif method == "SelectionBox" then
-        local b = add(Instance.new("SelectionBox"))
-        b.Color3, b.SurfaceColor3 = color, color
-        b.LineThickness = 0.05
-        b.SurfaceTransparency = Config.Transparency
-        b.Adornee = part
-        b.Parent = part
-    elseif method == "BoxAdornment" then
-        local b = add(Instance.new("BoxHandleAdornment"))
-        b.Size = part.Size * 1.02
-        b.Color3 = color
-        b.Transparency = Config.Transparency
-        b.AlwaysOnTop = true
-        b.ZIndex = 1
-        b.Adornee = part
-        b.Parent = part
-    elseif method == "SphereAdornment" then
-        local s = add(Instance.new("SphereHandleAdornment"))
-        s.Radius = math.max(part.Size.X, part.Size.Z) / 2
-        s.Color3 = color
-        s.Transparency = Config.Transparency
-        s.AlwaysOnTop = true
-        s.Adornee = part
-        s.Parent = part
-    elseif method == "SurfaceGui" then
-        local g = add(Instance.new("SurfaceGui"))
-        g.Face = Enum.NormalId.Top
-        g.AlwaysOnTop = true
-        g.Adornee = part
-        g.Parent = part
-        local f = Instance.new("Frame")
-        f.Size = UDim2.fromScale(1, 1)
-        f.BackgroundColor3 = color
-        f.BackgroundTransparency = Config.Transparency
-        f.BorderSizePixel = 0
-        f.Parent = g
-    elseif method == "Billboard" then
-        local b = add(Instance.new("BillboardGui"))
-        b.Size = UDim2.fromOffset(28, 28)
-        b.AlwaysOnTop = true
-        b.Adornee = part
-        b.Parent = part
-        local f = Instance.new("Frame")
-        f.Size = UDim2.fromScale(1, 1)
-        f.BackgroundColor3 = color
-        f.BackgroundTransparency = Config.Transparency
-        f.BorderSizePixel = 0
-        f.Parent = b
-    elseif method == "PointLight" then
-        local l = add(Instance.new("PointLight"))
-        l.Color = color
-        l.Brightness = 3
-        l.Range = 8
-        l.Parent = part
-    elseif method == "Neon Overlay" then
-        local p = add(Instance.new("Part"))
-        p.Size = part.Size * 1.02
-        p.CFrame = part.CFrame
-        p.Anchored = true
-        p.CanCollide = false
-        p.CanQuery = false
-        p.CanTouch = false
-        p.Material = Enum.Material.Neon
-        p.Color = color
-        p.Transparency = Config.Transparency
-        p.Parent = part
-    end
-
-    return made
-end
-
-local function applyVisual(part, kind)
-    local method = kind == "mine" and Config.MineMethod or Config.SafeMethod
-    local color = kind == "mine" and Config.MineColor or Config.SafeColor
-    if kind == "falseflag" then
-        method = "Highlight"
-        color = Config.FalseFlagColor
-    end
-    local existing = visuals[part]
-
-    -- Same kind and method: only cheap properties are touched, so dragging the
-    -- transparency slider never rebuilds a single instance.
-    if existing and existing.Kind == kind and existing.Method == method then
-        for _, inst in ipairs(existing.Objects) do
-            pcall(function()
-                if inst:IsA("Highlight") then
-                    inst.FillColor, inst.OutlineColor = color, color
-                    inst.FillTransparency = Config.Transparency
-                elseif inst:IsA("SelectionBox") then
-                    inst.Color3, inst.SurfaceColor3 = color, color
-                    inst.SurfaceTransparency = Config.Transparency
-                elseif inst:IsA("HandleAdornment") then
-                    inst.Color3 = color
-                    inst.Transparency = Config.Transparency
-                elseif inst:IsA("BasePart") then
-                    inst.Color = color
-                    inst.Transparency = Config.Transparency
-                elseif inst:IsA("PointLight") then
-                    inst.Color = color
-                elseif inst:IsA("SurfaceGui") or inst:IsA("BillboardGui") then
-                    local f = inst:FindFirstChildWhichIsA("Frame")
-                    if f then
-                        f.BackgroundColor3 = color
-                        f.BackgroundTransparency = Config.Transparency
-                    end
-                end
-            end)
-        end
-        return
-    end
-
-    clearVisual(part)
-    visuals[part] = { Kind = kind, Method = method, Objects = buildVisual(part, method, color) }
-end
-
--- The game runs a detector once a second that counts tiles whose Color is
--- exactly Color3.new(0,1,0) or Color3.new(1,0,0) and reports the number to the
--- server over ReplicatedStorage.Message with the tag "Color". It is aimed
--- squarely at solver scripts that paint tiles pure green and pure red.
---
--- Nothing here writes a tile's own Color, so the detector has nothing to see -
--- but a colour picked at exactly those two values would still be an odd thing
--- to be wearing, so both are nudged off the exact match.
-local function safeColor(color)
-    local r = math.floor(color.R * 255 + 0.5)
-    local g = math.floor(color.G * 255 + 0.5)
-    local b = math.floor(color.B * 255 + 0.5)
-    if (r == 0 and g == 255 and b == 0) or (r == 255 and g == 0 and b == 0) then
-        return Color3.fromRGB(math.min(r + 8, 255), math.min(g, 247) + 8, b + 8)
-    end
-    return color
-end
-
--- Chance of being a mine for tiles nothing proves, keyed by part. Written by
--- the solver, read by the labels.
-local chanceLabels = {}
-
-function refreshChanceLabels()
-    if not Config.ShowChances then
-        for part, gui in pairs(chanceLabels) do
-            pcall(function() gui:Destroy() end)
-            chanceLabels[part] = nil
-        end
-        return
-    end
-
-    local seen = {}
-    for part, chance in pairs(chanceOf) do
-        local tile = tiles[part]
-        -- A proven tile already says what it is with colour; a number on top of
-        -- that is noise. Chances are only for the genuinely undecided.
-        if tile and tile.state == "unknown" and not classification[part] then
-            seen[part] = true
-            local gui = chanceLabels[part]
-            if not gui then
-                gui = Instance.new("BillboardGui")
-                gui.Name = OURS .. "Chance"
-                gui.Adornee = part
-                gui.Size = UDim2.fromOffset(46, 20)
-                gui.AlwaysOnTop = true
-                local text = Instance.new("TextLabel")
-                text.Name = "T"
-                text.BackgroundTransparency = 1
-                text.Size = UDim2.fromScale(1, 1)
-                text.Font = Enum.Font.GothamBold
-                text.TextSize = 13
-                text.TextStrokeTransparency = 0.4
-                text.Parent = gui
-                gui.Parent = part
-                chanceLabels[part] = gui
-            end
-            local label = gui:FindFirstChild("T")
-            if label then
-                local pct = math.floor(chance * 100 + 0.5)
-                label.Text = pct .. "%"
-                -- Green through red by risk, so the reading is glanceable
-                -- without doing arithmetic.
-                label.TextColor3 = Color3.fromRGB(
-                    math.floor(60 + 195 * chance),
-                    math.floor(220 - 160 * chance),
-                    80
-                )
-            end
-        end
-    end
-
-    for part, gui in pairs(chanceLabels) do
-        if not seen[part] then
-            pcall(function() gui:Destroy() end)
-            chanceLabels[part] = nil
-        end
-    end
-end
-
-local function wanted(kind)
-    if kind == "falseflag" then return Config.ShowFalseFlags end
-    return (kind == "safe" and Config.ShowSafe) or (kind == "mine" and Config.ShowMines)
-end
-
-local function applyDiff(newClass, falseFlags)
-    falseFlags = falseFlags or {}
-    local safe, mines = 0, 0
-
-    -- A wrong flag is drawn even though its tile is not "unknown", because the
-    -- whole point is that it is sitting somewhere it should not be.
-    local combined = {}
-    for part, kind in pairs(newClass) do combined[part] = kind end
-    for part in pairs(falseFlags) do combined[part] = "falseflag" end
-
-    for part, kind in pairs(combined) do
-        if kind == "safe" then safe = safe + 1
-        elseif kind == "mine" then mines = mines + 1 end
-        if wanted(kind) then
-            if classification[part] ~= kind or not visuals[part] then
-                applyVisual(part, kind)
-            end
-        else
-            clearVisual(part)
-        end
-    end
-
-    -- Only tiles that stopped being classified lose their visual. Nothing else
-    -- is touched.
-    for part in pairs(classification) do
-        if not combined[part] then clearVisual(part) end
-    end
-    classification = combined
-    Stats.Safe, Stats.Mines = safe, mines
-
-    refreshChanceLabels()
-end
-
-local function refreshVisualsOnly()
-    for part, kind in pairs(classification) do
-        if wanted(kind) then applyVisual(part, kind) else clearVisual(part) end
-    end
-    refreshChanceLabels()
-end
-
---// Solver -------------------------------------------------------------------------
--- treatFlagsAsUnknown re-opens every flagged tile as a candidate. That is how a
--- wrong flag gets caught: with the flag taken at face value its tile is simply
--- excluded and can never be questioned, but treated as unknown the surrounding
--- numbers can prove it safe, which means the flag on it is wrong.
-local function buildConstraints(scope, treatFlagsAsUnknown)
+local function constraints(treatFlagsOpen, known)
     local out = {}
-    for _, tile in ipairs(scope) do
-        if tile.state == "revealed" and tile.number then
-            local unknowns, flags = {}, 0
-            for _, n in ipairs(tile.neighbours) do
-                if n.state == "unknown" then unknowns[#unknowns + 1] = n
+    for _, t in Board.list do
+        if t.state == "revealed" and t.number then
+            local unknowns, mines = {}, 0
+            for _, n in t.near do
+                local kind = known[n]
+                if kind == "mine" then
+                    mines += 1
+                elseif kind == "safe" then
+                    -- settled, not part of the constraint
+                elseif n.state == "unknown" or (treatFlagsOpen and n.state == "flagged") then
+                    table.insert(unknowns, n)
                 elseif n.state == "flagged" then
-                    if treatFlagsAsUnknown then
-                        unknowns[#unknowns + 1] = n
-                    else
-                        flags = flags + 1
-                    end
+                    mines += 1
                 end
             end
-            if #unknowns > 0 then
-                local remaining = tile.number - flags
-                -- A negative remainder means the flags nearby are wrong; acting
-                -- on it would produce confident nonsense, so it is dropped.
-                if remaining >= 0 then
-                    out[#out + 1] = { unknowns = unknowns, count = #unknowns, remaining = remaining }
-                end
+            local need = t.number - mines
+            if #unknowns > 0 and need >= 0 and need <= #unknowns then
+                table.insert(out, { cells = unknowns, need = need })
             end
         end
     end
     return out
 end
 
--- Returns result (proven safe/mine) and probs (chance of being a mine, for the
--- tiles nothing proves either way). Probabilities only exist when the deep pass
--- runs, because they come out of counting arrangements.
-local function solveScope(scope, treatFlagsAsUnknown)
-    local cs = buildConstraints(scope, treatFlagsAsUnknown)
-    local result = {}
-    local probs = {}
-
-    -- Pass 1: a number with its mines already flagged frees the rest; a number
-    -- needing as many mines as it has unknowns mines them all.
-    for _, c in ipairs(cs) do
-        if c.remaining == 0 then
-            for _, u in ipairs(c.unknowns) do result[u.part] = "safe" end
-        elseif c.remaining == c.count then
-            for _, u in ipairs(c.unknowns) do result[u.part] = "mine" end
+local function solve(treatFlagsOpen)
+    local known = {} -- tile -> "safe" | "mine"
+    local chance = {}
+    local function set(t, kind)
+        if known[t] == nil then
+            known[t] = kind
+            return true
         end
+        return false
     end
-
-    -- Pass 2: subset elimination, but only between constraints that actually
-    -- share a tile. Comparing every pair was O(n^2) with a linear search inside
-    -- it; indexing by tile first cuts that to the handful that could ever
-    -- overlap.
-    local byTile = {}
-    for _, c in ipairs(cs) do
-        for _, u in ipairs(c.unknowns) do
-            local list = byTile[u]
-            if not list then list = {} byTile[u] = list end
-            list[#list + 1] = c
-        end
-    end
-
-    for _, a in ipairs(cs) do
-        local inA = {}
-        for _, u in ipairs(a.unknowns) do inA[u] = true end
-
-        local candidates, seenC = {}, {}
-        for _, u in ipairs(a.unknowns) do
-            for _, c in ipairs(byTile[u] or {}) do
-                if c ~= a and not seenC[c] and c.count > a.count then
-                    seenC[c] = true
-                    candidates[#candidates + 1] = c
+    for _ = 1, 12 do
+        local changed = false
+        local cs = constraints(treatFlagsOpen, known)
+        -- Pass 1.
+        for _, c in cs do
+            if c.need == 0 then
+                for _, u in c.cells do
+                    changed = set(u, "safe") or changed
+                end
+            elseif c.need == #c.cells then
+                for _, u in c.cells do
+                    changed = set(u, "mine") or changed
                 end
             end
         end
-
-        for _, b in ipairs(candidates) do
-            -- A is inside B exactly when B contains as many of A's tiles as A
-            -- has. Counting that is the whole subset test; no separate pass
-            -- needed.
-            local contained = 0
-            for _, u in ipairs(b.unknowns) do
-                if inA[u] then contained = contained + 1 end
-            end
-            if contained == a.count then
-                local extra = b.count - a.count
-                local mines = b.remaining - a.remaining
-                if mines == 0 or mines == extra then
-                    local kind = mines == 0 and "safe" or "mine"
-                    for _, u in ipairs(b.unknowns) do
-                        if not inA[u] then result[u.part] = kind end
-                    end
-                end
+        -- Pass 2: only between constraints that share a tile.
+        local byTile = {}
+        for _, c in cs do
+            for _, u in c.cells do
+                byTile[u] = byTile[u] or {}
+                table.insert(byTile[u], c)
             end
         end
-    end
-
-    -- Pass 3, optional: exhaustive enumeration over each connected group of
-    -- unknowns. Anything that is a mine in every valid arrangement is a mine,
-    -- anything safe in all of them is safe. This finds everything the board
-    -- logically proves, including the cases the two passes above cannot reach -
-    -- it is just expensive, hence the toggle and the caps.
-    --
-    -- It also runs when chances are being shown, because a real percentage can
-    -- only come from counting arrangements: how many of the valid layouts put a
-    -- mine on this tile. The two passes above only ever answer yes/no/unknown,
-    -- so without enumeration there is nothing honest to put on the label.
-    if Config.DeepThink or Config.ShowChances then
-        local groupOf, groups = {}, {}
-        local function unite(a, b)
-            local ga, gb = groupOf[a], groupOf[b]
-            if ga and gb and ga ~= gb then
-                for _, t in ipairs(gb) do
-                    ga[#ga + 1] = t
-                    groupOf[t] = ga
-                end
-                for i, g in ipairs(groups) do
-                    if g == gb then table.remove(groups, i) break end
-                end
-            elseif ga and not gb then
-                ga[#ga + 1] = b
-                groupOf[b] = ga
-            elseif gb and not ga then
-                gb[#gb + 1] = a
-                groupOf[a] = gb
-            elseif not ga and not gb then
-                local g = { a }
-                groupOf[a] = g
-                if a ~= b then g[#g + 1] = b groupOf[b] = g end
-                groups[#groups + 1] = g
+        for _, a in cs do
+            local inA = {}
+            for _, u in a.cells do
+                inA[u] = true
             end
-        end
-
-        for _, c in ipairs(cs) do
-            local first = c.unknowns[1]
-            if not groupOf[first] then unite(first, first) end
-            for i = 2, #c.unknowns do unite(first, c.unknowns[i]) end
-        end
-
-        for _, group in ipairs(groups) do
-            -- Beyond this size the arrangement count explodes and the two
-            -- passes above have almost certainly already settled it.
-            if #group <= Config.DeepLimit then
-                local index = {}
-                for i, t in ipairs(group) do index[t] = i end
-
-                local local_cs = {}
-                local seen = {}
-                for _, t in ipairs(group) do
-                    for _, c in ipairs(byTile[t] or {}) do
-                        if not seen[c] then
-                            seen[c] = true
-                            local idxs = {}
-                            for _, u in ipairs(c.unknowns) do
-                                local i = index[u]
-                                if i then idxs[#idxs + 1] = i end
+            local seen = {}
+            for _, u in a.cells do
+                for _, b in byTile[u] do
+                    if b ~= a and not seen[b] and #b.cells > #a.cells then
+                        seen[b] = true
+                        local shared = 0
+                        for _, v in b.cells do
+                            if inA[v] then
+                                shared += 1
                             end
-                            local_cs[#local_cs + 1] = { idxs = idxs, remaining = c.remaining }
+                        end
+                        if shared == #a.cells then
+                            local extra, mines = #b.cells - #a.cells, b.need - a.need
+                            if mines == 0 or mines == extra then
+                                for _, v in b.cells do
+                                    if not inA[v] then
+                                        changed = set(v, mines == 0 and "safe" or "mine") or changed
+                                    end
+                                end
+                            end
                         end
                     end
                 end
-
-                local n = #group
-                local assign = {}
-                local mineIn = {}
-                for i = 1, n do mineIn[i] = 0 end
-                local total = 0
-
-                -- Prunes as soon as a constraint is already over its mine count
-                -- or can no longer reach it, so most branches die early.
-                local function feasible(pos)
-                    for _, c in ipairs(local_cs) do
-                        local mines, open = 0, 0
-                        for _, i in ipairs(c.idxs) do
-                            if i <= pos then
-                                if assign[i] then mines = mines + 1 end
+            end
+        end
+        -- Pass 3 (and chances): clumps of linked unknowns, every arrangement.
+        if (Settings.DeepThink or Settings.ShowChances or Settings.ShowBestGuess) and not changed then
+            cs = constraints(treatFlagsOpen, known)
+            local parent = {}
+            local function find(x)
+                while parent[x] ~= x do
+                    parent[x] = parent[parent[x]]
+                    x = parent[x]
+                end
+                return x
+            end
+            for _, c in cs do
+                for _, u in c.cells do
+                    parent[u] = parent[u] or u
+                end
+                for i = 2, #c.cells do
+                    local a, b = find(c.cells[1]), find(c.cells[i])
+                    if a ~= b then
+                        parent[a] = b
+                    end
+                end
+            end
+            local clumps = {}
+            for u in parent do
+                local r = find(u)
+                clumps[r] = clumps[r] or {}
+                table.insert(clumps[r], u)
+            end
+            for _, clump in clumps do
+                if #clump <= Settings.DeepLimit then
+                    local index = {}
+                    for i, u in clump do
+                        index[u] = i
+                    end
+                    local local_cs = {}
+                    for _, c in cs do
+                        if index[c.cells[1]] then
+                            local idx = {}
+                            for _, u in c.cells do
+                                table.insert(idx, index[u])
+                            end
+                            table.insert(local_cs, { idx = idx, need = c.need })
+                        end
+                    end
+                    -- Which constraints each cell is in, so a check only looks at those.
+                    local of = {}
+                    for ci, c in local_cs do
+                        for _, i in c.idx do
+                            of[i] = of[i] or {}
+                            table.insert(of[i], ci)
+                        end
+                    end
+                    local n, assign, mineIn, total = #clump, {}, table.create(#clump, 0), 0
+                    local function ok(pos)
+                        for _, ci in of[pos] or {} do
+                            local c = local_cs[ci]
+                            local mines, open = 0, 0
+                            for _, i in c.idx do
+                                if i <= pos then
+                                    if assign[i] then
+                                        mines += 1
+                                    end
+                                else
+                                    open += 1
+                                end
+                            end
+                            if mines > c.need or mines + open < c.need then
+                                return false
+                            end
+                        end
+                        return true
+                    end
+                    local function walk(pos)
+                        if total > Settings.DeepCap then
+                            return
+                        end
+                        if pos > n then
+                            total += 1
+                            for i = 1, n do
+                                if assign[i] then
+                                    mineIn[i] += 1
+                                end
+                            end
+                            return
+                        end
+                        assign[pos] = false
+                        if ok(pos) then
+                            walk(pos + 1)
+                        end
+                        assign[pos] = true
+                        if ok(pos) then
+                            walk(pos + 1)
+                        end
+                        assign[pos] = nil
+                    end
+                    walk(1)
+                    if total > 0 and total <= Settings.DeepCap then
+                        for i, u in clump do
+                            if mineIn[i] == total then
+                                if Settings.DeepThink then
+                                    changed = set(u, "mine") or changed
+                                end
+                            elseif mineIn[i] == 0 then
+                                if Settings.DeepThink then
+                                    changed = set(u, "safe") or changed
+                                end
                             else
-                                open = open + 1
+                                chance[u] = mineIn[i] / total
                             end
-                        end
-                        if mines > c.remaining then return false end
-                        if mines + open < c.remaining then return false end
-                    end
-                    return true
-                end
-
-                local function recurse(pos)
-                    if total > Config.DeepSolutionCap then return end
-                    if pos > n then
-                        total = total + 1
-                        for i = 1, n do
-                            if assign[i] then mineIn[i] = mineIn[i] + 1 end
-                        end
-                        return
-                    end
-                    assign[pos] = false
-                    if feasible(pos) then recurse(pos + 1) end
-                    assign[pos] = true
-                    if feasible(pos) then recurse(pos + 1) end
-                    assign[pos] = nil
-                end
-
-                recurse(1)
-
-                -- Only trustworthy if the search finished rather than hitting
-                -- the cap, otherwise "in every solution" means "in every
-                -- solution we bothered to look at".
-                if total > 0 and total <= Config.DeepSolutionCap then
-                    for i, tile in ipairs(group) do
-                        if mineIn[i] == total then
-                            result[tile.part] = "mine"
-                        elseif mineIn[i] == 0 then
-                            result[tile.part] = "safe"
-                        else
-                            -- Neither proven: the share of valid arrangements
-                            -- that put a mine here is a genuine probability,
-                            -- not a heuristic.
-                            probs[tile.part] = mineIn[i] / total
                         end
                     end
                 end
             end
         end
+        if not changed then
+            break
+        end
     end
-
-    return result, probs
+    return known, chance
 end
 
--- Solving the whole board is worth far more than solving a slice of it, but it
--- is no longer free, so it is not allowed to run flat out on every frame of a
--- reveal cascade. The gate is the cost of the last solve: a solve that took a
--- millisecond may run again immediately, one that took twenty has to wait
--- roughly its own duration first. Cheap boards stay frame-instant, heavy ones
--- settle at spending about half a frame's worth of time on thinking instead of
--- all of it, and the request is never dropped - only deferred.
-local lastSolveCost, lastSolveAt = 0, 0
+local Solve = { queued = true, lastCost = 0, lastAt = 0 }
+local function requestSolve()
+    Solve.queued = true
+end
 
--- Set by anything that changes the board; the frame loop at the bottom picks it
--- up on the very next step. Coalescing through a flag means a burst of twenty
--- reveals costs one solve rather than twenty.
-local solveQueued = false
-local function requestSolve() solveQueued = true end
+local function runSolve()
+    local t0 = os.clock()
+    local known, chance = solve(false)
+    local class = {}
+    local safe, mines = 0, 0
+    for t, kind in known do
+        if t.state == "unknown" then
+            class[t.part] = kind
+            if kind == "safe" then
+                safe += 1
+            else
+                mines += 1
+            end
+        end
+    end
+    local wrong = {}
+    if Settings.ShowWrongFlags then
+        local reopened = solve(true)
+        for t, kind in reopened do
+            if t.state == "flagged" and kind == "safe" then
+                wrong[t.part] = true
+            end
+        end
+    end
+    local chances, guess, best = {}, nil, nil
+    for t, p in chance do
+        if t.state == "unknown" and not class[t.part] then
+            chances[t.part] = p
+            if not best or p < best then
+                guess, best = t.part, p
+            end
+        end
+    end
+    -- A guess is only worth showing when there's nothing proven to open.
+    if safe > 0 then
+        guess = nil
+    end
+    Result.class, Result.chance, Result.wrong, Result.guess = class, chances, wrong, guess
+    Stats.Safe, Stats.Mines = safe, mines
+    local n = 0
+    for _ in wrong do
+        n += 1
+    end
+    Stats.WrongFlags = n
+    local cost = os.clock() - t0
+    Stats.SolveMs = cost * 1000
+    -- A heavy solve waits about its own length before the next one.
+    Solve.lastCost = math.clamp(cost - 0.004, 0, 0.15)
+    Solve.lastAt = os.clock()
+end
 
-local function solveIncremental()
-    if dirtyCount == 0 then return end
-    if os.clock() - lastSolveAt < lastSolveCost then
-        requestSolve()
+--// Markers \\--
+local METHODS = { "Highlight", "SelectionBox", "BoxAdornment", "SphereAdornment", "SurfaceGui", "Billboard", "PointLight", "Neon Overlay" }
+local Marks = {} -- part -> { kind, method, objects }
+local ChanceTags = {} -- part -> BillboardGui
+
+local function makeMarker(part, method, color)
+    local made = {}
+    local function add(inst)
+        inst.Name = OURS .. inst.ClassName
+        table.insert(made, inst)
+        return inst
+    end
+    local tr = Settings.Transparency
+    if method == "Highlight" then
+        local h = add(Instance.new("Highlight"))
+        h.FillColor, h.OutlineColor, h.FillTransparency, h.OutlineTransparency = color, color, tr, 0
+        h.Adornee = part
+        h.Parent = part
+    elseif method == "SelectionBox" then
+        local b = add(Instance.new("SelectionBox"))
+        b.Color3, b.SurfaceColor3, b.LineThickness, b.SurfaceTransparency = color, color, 0.05, tr
+        b.Adornee = part
+        b.Parent = part
+    elseif method == "BoxAdornment" then
+        local b = add(Instance.new("BoxHandleAdornment"))
+        b.Size, b.Color3, b.Transparency, b.AlwaysOnTop, b.ZIndex = part.Size * 1.02, color, tr, true, 1
+        b.Adornee = part
+        b.Parent = part
+    elseif method == "SphereAdornment" then
+        local s = add(Instance.new("SphereHandleAdornment"))
+        s.Radius, s.Color3, s.Transparency, s.AlwaysOnTop = math.max(part.Size.X, part.Size.Z) / 2, color, tr, true
+        s.Adornee = part
+        s.Parent = part
+    elseif method == "SurfaceGui" or method == "Billboard" then
+        local g
+        if method == "SurfaceGui" then
+            g = add(Instance.new("SurfaceGui"))
+            g.Face = Enum.NormalId.Top
+        else
+            g = add(Instance.new("BillboardGui"))
+            g.Size = UDim2.fromOffset(28, 28)
+        end
+        g.AlwaysOnTop = true
+        g.Adornee = part
+        g.Parent = part
+        local f = Instance.new("Frame")
+        f.Size, f.BackgroundColor3, f.BackgroundTransparency, f.BorderSizePixel = UDim2.fromScale(1, 1), color, tr, 0
+        f.Parent = g
+    elseif method == "PointLight" then
+        local l = add(Instance.new("PointLight"))
+        l.Color, l.Brightness, l.Range = color, 3, 8
+        l.Parent = part
+    elseif method == "Neon Overlay" then
+        local p = add(Instance.new("Part"))
+        p.Size, p.CFrame, p.Anchored = part.Size * 1.02, part.CFrame, true
+        p.CanCollide, p.CanQuery, p.CanTouch = false, false, false
+        p.Material, p.Color, p.Transparency = Enum.Material.Neon, color, tr
+        p.Parent = part
+    end
+    return made
+end
+
+local function recolor(objects, color)
+    local tr = Settings.Transparency
+    for _, inst in objects do
+        pcall(function()
+            if inst:IsA("Highlight") then
+                inst.FillColor, inst.OutlineColor, inst.FillTransparency = color, color, tr
+            elseif inst:IsA("SelectionBox") then
+                inst.Color3, inst.SurfaceColor3, inst.SurfaceTransparency = color, color, tr
+            elseif inst:IsA("HandleAdornment") then
+                inst.Color3, inst.Transparency = color, tr
+            elseif inst:IsA("BasePart") then
+                inst.Color, inst.Transparency = color, tr
+            elseif inst:IsA("PointLight") then
+                inst.Color = color
+            elseif inst:IsA("LayerCollector") then
+                local f = inst:FindFirstChildWhichIsA("Frame")
+                if f then
+                    f.BackgroundColor3, f.BackgroundTransparency = color, tr
+                end
+            end
+        end)
+    end
+end
+
+local function unmark(part)
+    local m = Marks[part]
+    if m then
+        for _, inst in m.objects do
+            pcall(inst.Destroy, inst)
+        end
+        Marks[part] = nil
+    end
+end
+
+local function styleOf(kind)
+    if kind == "safe" then
+        return Settings.ShowSafe, Settings.SafeMethod, Settings.SafeColor
+    elseif kind == "mine" then
+        return Settings.ShowMines, Settings.MineMethod, Settings.MineColor
+    elseif kind == "wrong" then
+        return Settings.ShowWrongFlags, "Highlight", Settings.WrongFlagColor
+    elseif kind == "guess" then
+        return Settings.ShowBestGuess, "Highlight", Settings.GuessColor
+    end
+end
+
+local function mark(part, kind)
+    local show, method, color = styleOf(kind)
+    if not show then
+        unmark(part)
         return
     end
-
-    -- The whole board, every time. Restricting the solve to two rings around
-    -- whatever changed was the reason it sat idle on positions it could already
-    -- prove: a corner 1 with a single unknown left is solvable the moment it is
-    -- revealed, but if nothing near it changed afterwards it never got looked at
-    -- again. Scoping was a saving on cost that has since been paid for
-    -- elsewhere, and it was quietly costing answers.
-    local started = os.clock()
-    local result, probs = solveScope(tileList, false)
-
-    local merged = {}
-    for part, kind in pairs(result) do
-        local tile = tiles[part]
-        if tile and tile.state == "unknown" then merged[part] = kind end
+    local m = Marks[part]
+    if m and m.kind == kind and m.method == method then
+        recolor(m.objects, color)
+        return
     end
+    unmark(part)
+    Marks[part] = { kind = kind, method = method, objects = makeMarker(part, method, color) }
+end
 
-    -- False flags: re-run with flagged tiles treated as open. Anything the
-    -- numbers prove safe while a flag sits on it is a flag in the wrong place,
-    -- and it poisons every constraint around it until it is moved.
-    -- Deliberately not gated on better thinking: the two exact passes are quite
-    -- capable of proving a flagged tile safe on their own, and a wrong flag is
-    -- worth catching whether or not the expensive pass is switched on.
-    local falseFlags = {}
-    if Config.ShowFalseFlags then
-        local reopened = solveScope(tileList, true)
-        for part, kind in pairs(reopened) do
-            local tile = tiles[part]
-            if tile and tile.state == "flagged" and kind == "safe" then
-                falseFlags[part] = true
+local function drawChances()
+    local seen = {}
+    if Settings.ShowChances then
+        for part, p in Result.chance do
+            seen[part] = true
+            local gui = ChanceTags[part]
+            if not gui then
+                gui = Instance.new("BillboardGui")
+                gui.Name = OURS .. "Chance"
+                gui.Adornee, gui.Size, gui.AlwaysOnTop = part, UDim2.fromOffset(46, 20), true
+                local text = Instance.new("TextLabel")
+                text.Name = "T"
+                text.BackgroundTransparency, text.Size = 1, UDim2.fromScale(1, 1)
+                text.Font, text.TextSize, text.TextStrokeTransparency = Enum.Font.GothamBold, 13, 0.4
+                text.Parent = gui
+                gui.Parent = part
+                ChanceTags[part] = gui
+            end
+            local label = gui:FindFirstChild("T")
+            if label then
+                label.Text = math.floor(p * 100 + 0.5) .. "%"
+                label.TextColor3 = Color3.fromRGB(math.floor(60 + 195 * p), math.floor(220 - 160 * p), 80)
             end
         end
     end
-
-    chanceOf = probs or {}
-    applyDiff(merged, falseFlags)
-
-    local wrong = 0
-    for _ in pairs(falseFlags) do wrong = wrong + 1 end
-    Stats.FalseFlags = wrong
-    local elapsed = os.clock() - started
-    Stats.LastSolve = elapsed * 1000
-    Stats.Changed = dirtyCount
-    -- Only a solve that overran a slice of the frame buys itself a cooldown, and
-    -- the cooldown is capped so a single pathological board cannot stall
-    -- updates for a noticeable stretch.
-    lastSolveCost = math.min(math.max(elapsed - 0.004, 0), 0.15)
-    lastSolveAt = os.clock()
-    dirty, dirtyCount = {}, 0
+    for part, gui in ChanceTags do
+        if not seen[part] then
+            pcall(gui.Destroy, gui)
+            ChanceTags[part] = nil
+        end
+    end
 end
 
---// Change tracking -----------------------------------------------------------------
-
-local function refreshTile(tile)
-    if not tile.part.Parent then return end
-    local state, number = readTile(tile.part)
-    if state ~= tile.state or number ~= tile.number then
-        tile.state, tile.number = state, number
-
-        -- A tile that just got flagged or revealed is no longer something to
-        -- point at, so its marker goes immediately rather than surviving until
-        -- the next solve. This is the flag-a-bomb-and-it-vanishes case.
-        if state ~= "unknown" and classification[tile.part] then
-            clearVisual(tile.part)
-            classification[tile.part] = nil
+-- Draws the current result: only what changed is touched.
+local function draw()
+    local want = {}
+    for part, kind in Result.class do
+        want[part] = kind
+    end
+    for part in Result.wrong do
+        want[part] = "wrong"
+    end
+    if Result.guess and not want[Result.guess] then
+        want[Result.guess] = "guess"
+    end
+    for part, kind in want do
+        mark(part, kind)
+    end
+    for part in Marks do
+        if not want[part] then
+            unmark(part)
         end
+    end
+    drawChances()
+end
 
-        markDirty(tile)
-        -- A reveal or a flag changes every constraint touching this tile.
-        for _, n in ipairs(tile.neighbours) do markDirty(n) end
+local function clearAll()
+    for part in Marks do
+        unmark(part)
+    end
+    for part, gui in ChanceTags do
+        pcall(gui.Destroy, gui)
+        ChanceTags[part] = nil
+    end
+end
+
+--// Flags \\--
+local Flagging = { remote = nil, token = nil, ours = {} }
+
+local function placeFlagRemote()
+    local events = ReplicatedStorage:FindFirstChild("Events")
+    local folder = events and events:FindFirstChild("FlagEvents")
+    return folder and folder:FindFirstChild("PlaceFlag")
+end
+
+local function findToken()
+    Flagging.remote = Flagging.remote or placeFlagRemote()
+    local salasana = Workspace:FindFirstChild("Salasana")
+    if salasana and salasana:IsA("ValueBase") then
+        local ok, v = pcall(function()
+            return salasana.Value
+        end)
+        if ok and typeof(v) == "number" and v ~= 0 then
+            Flagging.token = v
+            Stats.Token = "read from Salasana"
+            return true
+        end
+    end
+    if not Flagging.remote then
+        Stats.Token = "no PlaceFlag remote"
+        return false
+    end
+    if typeof(getgc) ~= "function" or typeof(debug) ~= "table" or typeof(debug.getupvalues) ~= "function" then
+        Stats.Token = "this executor has no getgc"
+        return false
+    end
+    -- The handler that holds the PlaceFlag remote also holds the token.
+    local found
+    pcall(function()
+        for _, fn in getgc() do
+            if type(fn) == "function" then
+                local ok, ups = pcall(debug.getupvalues, fn)
+                if ok and type(ups) == "table" then
+                    local hasRemote, number = false, nil
+                    for _, up in ups do
+                        if up == Flagging.remote then
+                            hasRemote = true
+                        elseif typeof(up) == "number" and up ~= 0 then
+                            number = up
+                        end
+                    end
+                    if hasRemote and number then
+                        found = number
+                        break
+                    end
+                end
+            end
+        end
+    end)
+    if found then
+        Flagging.token = found
+        Stats.Token = "taken from the game's handler"
+        return true
+    end
+    Stats.Token = "not found"
+    return false
+end
+
+local function placeFlag(part)
+    local method = Settings.FlagMethod
+    if method ~= "ClickDetector" then
+        if not Flagging.token then
+            findToken()
+        end
+        if Flagging.token and Flagging.remote then
+            if pcall(Flagging.remote.FireServer, Flagging.remote, part, Flagging.token, true) then
+                return true
+            end
+        end
+        if method == "Token" then
+            return false
+        end
+    end
+    local detector = part:FindFirstChildOfClass("ClickDetector")
+    if detector and typeof(fireclickdetector) == "function" then
+        return pcall(fireclickdetector, detector)
+    end
+    return false
+end
+
+local function flagPass()
+    if not Settings.AutoFlag then
+        return
+    end
+    local hrp = rootPart()
+    if not hrp then
+        return
+    end
+    local queue = {}
+    for part, kind in Result.class do
+        local t = Board.tiles[part]
+        if kind == "mine" and t and t.state == "unknown" and not Flagging.ours[part] then
+            local d = (part.Position - hrp.Position).Magnitude
+            if d <= Settings.FlagRange then
+                table.insert(queue, { part = part, d = d })
+            end
+        end
+    end
+    table.sort(queue, function(a, b)
+        return a.d < b.d
+    end)
+    for _, q in queue do
+        if not alive() or not Settings.AutoFlag then
+            break
+        end
+        if q.part.Parent and not readFlag(q.part) then
+            Flagging.ours[q.part] = true
+            placeFlag(q.part)
+            task.wait(Settings.FlagDelay)
+        end
+    end
+end
+
+--// Stepping on safe tiles \\--
+-- A tile opens when you touch it; proven safe ones are stepped on, nearest
+-- first, by teleport or by walking.
+local Stepping = { tried = {} }
+local function stepPass()
+    if not Settings.StepSafe then
+        return
+    end
+    local hrp = rootPart()
+    local hum = hrp and hrp.Parent:FindFirstChildOfClass("Humanoid")
+    if not hrp or not hum then
+        return
+    end
+    local best, bestD
+    for part, kind in Result.class do
+        local t = Board.tiles[part]
+        if kind == "safe" and t and t.state == "unknown" and (Stepping.tried[part] or 0) < os.clock() then
+            local d = (part.Position - hrp.Position).Magnitude
+            if d <= Settings.StepRange and (not bestD or d < bestD) then
+                best, bestD = part, d
+            end
+        end
+    end
+    if not best then
+        return
+    end
+    Stepping.tried[best] = os.clock() + 3
+    local top = best.Position + Vector3.new(0, best.Size.Y / 2 + 3, 0)
+    if Settings.StepMethod == "Teleport" then
+        hrp.CFrame = CFrame.new(top) * hrp.CFrame.Rotation
+        hrp.AssemblyLinearVelocity = Vector3.zero
+        task.wait(Settings.StepDelay)
+    else
+        hum:MoveTo(best.Position)
+        local t0 = os.clock()
+        repeat
+            task.wait(0.05)
+        until not alive() or (Board.tiles[best] and Board.tiles[best].state ~= "unknown") or os.clock() - t0 > 3
+    end
+end
+
+--// Watching the board \\--
+local function refresh(t)
+    if not t.part.Parent then
+        return
+    end
+    local state, number = readTile(t)
+    if state ~= t.state or number ~= t.number then
+        t.state, t.number = state, number
+        if state ~= "unknown" then
+            unmark(t.part)
+            Result.class[t.part] = nil
+        end
         requestSolve()
     end
 end
 
-local function fullRescanCounts()
+local function counts()
     local r, u, f = 0, 0, 0
-    for _, t in ipairs(tileList) do
-        if t.state == "revealed" then r = r + 1
-        elseif t.state == "flagged" then f = f + 1
-        else u = u + 1 end
+    for _, t in Board.list do
+        if t.state == "revealed" then
+            r += 1
+        elseif t.state == "flagged" then
+            f += 1
+        else
+            u += 1
+        end
     end
     Stats.Revealed, Stats.Unknown, Stats.Flagged = r, u, f
 end
 
---// Auto flag ------------------------------------------------------------------------
-local flagBusy = false
-
-local function autoFlagPass()
-    if flagBusy or not Config.AutoFlag then return end
-    local char = LocalPlayer.Character
-    local root = char and char:FindFirstChild("HumanoidRootPart")
-    if not root then return end
-
-    flagBusy = true
-
-    local queue = {}
-    for part, kind in pairs(classification) do
-        if kind == "mine" and part.Parent and not flaggedByUs[part] then
-            local tile = tiles[part]
-            if tile and tile.state == "unknown" then
-                local d = (part.Position - root.Position).Magnitude
-                if d <= Config.FlagRange then
-                    queue[#queue + 1] = { part = part, d = d }
-                end
-            end
-        end
+local BoardConns = {}
+local function dropBoard(why)
+    for _, c in BoardConns do
+        pcall(c.Disconnect, c)
     end
-    table.sort(queue, function(a, b) return a.d < b.d end)
-
-    for _, entry in ipairs(queue) do
-        if Unloading or not Config.AutoFlag then break end
-        if entry.part.Parent and not hasFlag(entry.part) then
-            flaggedByUs[entry.part] = true
-            placeFlag(entry.part)
-            task.wait(Config.FlagDelay)
-        end
-    end
-
-    flagBusy = false
+    table.clear(BoardConns)
+    clearAll()
+    Result.class, Result.chance, Result.wrong, Result.guess = {}, {}, {}, nil
+    table.clear(Flagging.ours)
+    table.clear(Stepping.tried)
+    Board.ready = false
+    Stats.Status = why
 end
 
---// Main loop -------------------------------------------------------------------------
-local boardReady = false
-
-task.spawn(function()
-    while not Unloading do
-        if not boardReady then
-            local ok = pcall(buildBoard)
-            if ok and #tileList > 0 then
-                boardReady = true
-                Stats.Status = ("board found: %d tiles"):format(#tileList)
-                for _, t in ipairs(tileList) do refreshTile(t) markDirty(t) end
-                recoverToken()
-
-                -- Event driven from here: a tile only changes when something is
-                -- added to it, so polling every tile every frame is wasted work.
-                -- The cached flag state is dropped here and nowhere else, so it
-                -- is recomputed exactly when a tile's contents actually change
-                -- rather than on every sweep.
-                track(PartsFolder.DescendantAdded:Connect(function(d)
-                    local part = d:FindFirstAncestorWhichIsA("BasePart")
-                    if part and tiles[part] then
-                        invalidateFlag(part)
-                        refreshTile(tiles[part])
-                    end
-                end))
-                track(PartsFolder.DescendantRemoving:Connect(function(d)
-                    local part = d:FindFirstAncestorWhichIsA("BasePart")
-                    if part and tiles[part] then
-                        task.defer(function()
-                            if tiles[part] then
-                                invalidateFlag(part)
-                                refreshTile(tiles[part])
-                            end
-                        end)
-                    end
-                end))
-                track(PartsFolder.ChildRemoved:Connect(function()
-                    boardReady = false
-                end))
-            else
-                Stats.Status = "waiting for board"
-                task.wait(1)
-            end
-        else
-            if not PartsFolder or not PartsFolder.Parent or #tileList == 0 then
-                boardReady = false
-                for part in pairs(visuals) do clearVisual(part) end
-                classification, flaggedByUs = {}, {}
-                Stats.Status = "board gone, rescanning"
-            else
-                -- Backstop only. The events above drive everything in real
-                -- time; this exists purely to catch a change that somehow did
-                -- not raise one, so it runs rarely instead of every tick.
-                -- Once per board, and only if no flag has turned up on a tile.
-                -- Repeating this every sweep is what made the whole thing
-                -- crawl, since a failing flag check kept it permanently on.
-                if Stats.Flagged == 0 and not looseSweepDone then
-                    pcall(refreshLooseFlags, boardPitch)
-                end
-                for _, t in ipairs(tileList) do
-                    if t.state ~= "revealed" then refreshTile(t) end
-                end
-                fullRescanCounts()
-            end
-        end
-        task.wait(Config.Backstop)
+local function watchBoard()
+    local folder = Board.folder
+    local function tileOf(inst)
+        local part = inst:FindFirstAncestorWhichIsA("BasePart")
+        return part and Board.tiles[part]
     end
-end)
-
--- Auto flag gets its own tight loop rather than riding the backstop. Hanging it
--- off a one second sweep meant flags came out in a burst and then nothing for a
--- second regardless of what had come into range, which is what made it feel
--- like it fired whenever it felt like it.
-task.spawn(function()
-    while not Unloading do
-        if Config.AutoFlag and boardReady then
-            pcall(autoFlagPass)
+    table.insert(BoardConns, folder.DescendantAdded:Connect(function(d)
+        local t = tileOf(d)
+        if t then
+            refresh(t)
         end
-        task.wait(0.1)
-    end
-end)
+    end))
+    table.insert(BoardConns, folder.DescendantRemoving:Connect(function(d)
+        local t = tileOf(d)
+        if t then
+            task.defer(refresh, t)
+        end
+    end))
+    table.insert(BoardConns, folder.ChildRemoved:Connect(function()
+        dropBoard("the board changed, reading it again")
+    end))
+    table.insert(BoardConns, folder.ChildAdded:Connect(function()
+        dropBoard("the board changed, reading it again")
+    end))
+end
 
--- Solving runs on the frame after a change lands, not on a timer. Nothing
--- happens on frames where the board did not move, so this costs nothing while
--- idle and updates immediately when it matters.
-track(PostSimulation:Connect(function()
-    if Unloading or not boardReady or not solveQueued then return end
-    solveQueued = false
-    pcall(solveIncremental)
-    fullRescanCounts()
-end))
-
---// UI ---------------------------------------------------------------------------
-local Centrl = loadstring(game:HttpGet('https://raw.githubusercontent.com/iamdookie1/Rblx2/main/UI/Lib2.lua'))()
-
-local Window = Centrl:Window({
-    Title = 'minesweeper',
-    SubTitle = 'solver',
-    Folder = 'MinesweeperSolver',
-    ToggleKey = Enum.KeyCode.RightShift,
-    Accent = Color3.fromRGB(90, 200, 255),
-})
-
-local METHODS = {
-    'Highlight', 'SelectionBox', 'BoxAdornment', 'SphereAdornment',
-    'SurfaceGui', 'Billboard', 'PointLight', 'Neon Overlay',
-}
-
-local MainTab = Window:Tab({ Title = 'main', Icon = 'grid-3x3' })
-
-local SafeSection = MainTab:Section({ Title = 'safe tiles', Side = 'left' })
-
-SafeSection:Toggle({
-    Title = 'show safe',
-    Flag = 'ms_safe',
-    Default = false,
-    Callback = function(v) Config.ShowSafe = v refreshVisualsOnly() end,
-})
-
-SafeSection:Dropdown({
-    Title = 'show as',
-    Flag = 'ms_safe_method',
-    Options = METHODS,
-    Default = 'Highlight',
-    Callback = function(v) Config.SafeMethod = v refreshVisualsOnly() end,
-})
-
-SafeSection:Colorpicker({
-    Title = 'safe color',
-    Flag = 'ms_safe_color',
-    Default = Color3.fromRGB(70, 170, 255),
-    Callback = function(v) Config.SafeColor = safeColor(v) refreshVisualsOnly() end,
-})
-
-local MineSection = MainTab:Section({ Title = 'mines', Side = 'right' })
-
-MineSection:Toggle({
-    Title = 'show mines',
-    Flag = 'ms_mines',
-    Default = false,
-    Callback = function(v) Config.ShowMines = v refreshVisualsOnly() end,
-})
-
-MineSection:Dropdown({
-    Title = 'show as',
-    Flag = 'ms_mine_method',
-    Options = METHODS,
-    Default = 'Highlight',
-    Callback = function(v) Config.MineMethod = v refreshVisualsOnly() end,
-})
-
-MineSection:Colorpicker({
-    Title = 'mine color',
-    Flag = 'ms_mine_color',
-    Default = Color3.fromRGB(255, 60, 60),
-    Callback = function(v) Config.MineColor = safeColor(v) refreshVisualsOnly() end,
-})
-
-local DisplaySection = MainTab:Section({ Title = 'display', Side = 'left' })
-
-DisplaySection:Slider({
-    Title = 'transparency',
-    Flag = 'ms_transparency',
-    Min = 0, Max = 1, Increment = 0.05, Default = 0.5,
-    Callback = function(v) Config.Transparency = v refreshVisualsOnly() end,
-})
-
-DisplaySection:Slider({
-    Title = 'backstop sweep',
-    Flag = 'ms_backstop',
-    Min = 0.25, Max = 5, Increment = 0.25, Default = 1,
-    Suffix = 's',
-    Callback = function(v) Config.Backstop = v end,
-})
-
-DisplaySection:Paragraph({
-    Title = 'updates are instant',
-    Text = 'Solving is driven by the board changing, not by a timer: a reveal or a flag re-solves on the very next frame, and frames where nothing moved cost nothing at all. A tile also loses its marker the moment it stops being unknown, so flagging a bomb clears it immediately rather than on the next pass. The sweep above is only a safety net for a change that somehow raised no event, which is why it can sit at a second or more.',
-})
-
-DisplaySection:Toggle({
-    Title = 'better thinking',
-    Flag = 'ms_deep',
-    Default = false,
-    Callback = function(v)
-        Config.DeepThink = v
-        for _, t in ipairs(tileList) do markDirty(t) end
-        requestSolve()
-    end,
-})
-
-DisplaySection:Slider({
-    Title = 'thinking depth',
-    Flag = 'ms_deep_limit',
-    Min = 8, Max = 22, Increment = 1, Default = 16,
-    Suffix = ' tiles',
-    Callback = function(v) Config.DeepLimit = v end,
-})
-
-DisplaySection:Paragraph({
-    Title = 'what better thinking does',
-    Text = 'The normal passes look at one number at a time and then at pairs of overlapping numbers. This one takes each connected clump of unknown tiles and works through every mine arrangement the numbers permit: anything that is a mine in all of them is a mine, anything safe in all of them is safe. It finds everything the board actually proves rather than only what pairwise logic reaches. Still no guessing. Depth caps the clump size it will attempt, since the arrangements grow fast - raise it if clumps are being skipped, lower it if solves get heavy.',
-})
-
-DisplaySection:Toggle({
-    Title = 'highlight false flags',
-    Flag = 'ms_falseflags',
-    Default = false,
-    Callback = function(v)
-        Config.ShowFalseFlags = v
-        for _, t in ipairs(tileList) do markDirty(t) end
-        requestSolve()
-    end,
-})
-
-DisplaySection:Colorpicker({
-    Title = 'false flag color',
-    Flag = 'ms_falseflag_color',
-    Default = Color3.fromRGB(255, 140, 0),
-    Callback = function(v) Config.FalseFlagColor = safeColor(v) refreshVisualsOnly() end,
-})
-
-DisplaySection:Paragraph({
-    Title = 'what a false flag is',
-    Text = 'A flag someone put on a tile the numbers can prove is safe. It is worth seeing for its own sake, but the real damage is that every number touching it counts it as a mine, so the whole neighbourhood solves wrong until it comes off - which is how a corner that should be obvious ends up looking undecidable. Detection re-runs the solve with flags treated as open tiles; anything that comes back safe while wearing a flag is marked. Works with better thinking off, finds more with it on.',
-})
-
-DisplaySection:Toggle({
-    Title = 'show chances',
-    Flag = 'ms_chances',
-    Default = false,
-    Callback = function(v)
-        Config.ShowChances = v
-        if v then
-            for _, t in ipairs(tileList) do markDirty(t) end
+-- Finds the board, then keeps a slow safety sweep going (events drive the rest).
+loop(function()
+    return Settings.Backstop
+end, function()
+    if not Board.ready then
+        if buildBoard() then
+            Board.ready = true
+            Stats.Status = ("%d tiles"):format(#Board.list)
+            watchBoard()
+            findToken()
             requestSolve()
         else
-            refreshChanceLabels()
+            Stats.Status = "waiting for the board"
         end
-    end,
-})
-
-DisplaySection:Paragraph({
-    Title = 'what the percentages are',
-    Text = 'Every tile a number touches but nothing proves gets a real figure: the solver counts every mine arrangement the surrounding numbers permit and shows the share of them that put a mine here. 33% means one arrangement in three, not a guess at one. Proven tiles get no number because their colour already says it. Turning this on runs the counting pass whether or not better thinking is enabled, since nothing cheaper can produce an actual probability.',
-})
-
-DisplaySection:Paragraph({
-    Title = 'the game watches for this',
-    Text = 'It counts tiles coloured exactly pure green or pure red once a second and reports the total to the server as a "Color" message - a detector aimed at solver scripts that repaint tiles. Nothing here writes a tile\'s own colour, so it sees nothing, and the pickers refuse those two exact values anyway. Worth knowing before switching to any method that tints the tile itself.',
-})
-
-DisplaySection:Paragraph({
-    Title = 'colour still means certainty',
-    Text = 'A tile is coloured only when the surrounding numbers prove it. Two exact passes run: single constraints first, then subset elimination between overlapping ones, which resolves the pairs simple logic cannot. Positions that genuinely need a guess are never coloured - if chances are on they carry a percentage instead, which is a different statement and reads as one.',
-})
-
-local FlagSection = MainTab:Section({ Title = 'auto flag', Side = 'right' })
-
-FlagSection:Toggle({
-    Title = 'auto flag mines',
-    Flag = 'ms_autoflag',
-    Default = false,
-    Callback = function(v)
-        Config.AutoFlag = v
-        if v then
-            flaggedByUs = {}
-            recoverToken()
+        return
+    end
+    if not Board.folder or not Board.folder.Parent then
+        dropBoard("board gone, looking again")
+        return
+    end
+    for _, t in Board.list do
+        if t.state ~= "revealed" then
+            refresh(t)
         end
-    end,
-})
+    end
+    counts()
+end)
 
-FlagSection:Dropdown({
-    Title = 'method',
-    Flag = 'ms_flag_method',
-    Options = { 'Auto', 'Token', 'ClickDetector' },
-    Default = 'Auto',
-    Callback = function(v) Config.FlagMethod = v end,
-})
+-- Solves on the frame after the board moves.
+bind(RunService.Heartbeat, function()
+    if not alive() or not Board.ready or not Solve.queued then
+        return
+    end
+    if os.clock() - Solve.lastAt < Solve.lastCost then
+        return
+    end
+    Solve.queued = false
+    local ok, err = pcall(runSolve)
+    if not ok then
+        warn("[Minesweeper] solve: " .. tostring(err))
+    end
+    pcall(draw)
+    counts()
+end)
 
-FlagSection:Slider({
-    Title = 'flag range',
-    Flag = 'ms_flag_range',
-    Min = 4, Max = 200, Increment = 2, Default = 16,
-    Suffix = ' studs',
-    Callback = function(v) Config.FlagRange = v end,
-})
-
-FlagSection:Slider({
-    Title = 'delay between flags',
-    Flag = 'ms_flag_delay',
-    Min = 0.02, Max = 0.5, Increment = 0.02, Default = 0.06,
-    Suffix = 's',
-    Callback = function(v) Config.FlagDelay = v end,
-})
-
-FlagSection:Button({
-    Title = 'find flag token',
-    Callback = function()
-        recoverToken()
-        Centrl:Notify({
-            Title = 'minesweeper',
-            Content = 'Token: ' .. Stats.Token,
-            Type = flagToken and 'success' or 'warning',
-            Duration = 5,
-        })
-    end,
-})
-
-FlagSection:Paragraph({
-    Title = 'why flags need a token',
-    Text = 'The game reads a value out of workspace.Salasana at startup and then destroys it, and every PlaceFlag call has to include it - which is why firing the remote blind does nothing. If the script loads before that happens the value is read directly; otherwise it is recovered from the upvalues of the handler the game connected. ClickDetector mode instead fires the game\'s own detector and lets its handler supply the token, which only exists on touch devices.',
-})
-
-local StatusSection = MainTab:Section({ Title = 'status', Side = 'left' })
-
-local boardLabel = StatusSection:Label({ Title = 'board: --' })
-local countLabel = StatusSection:Label({ Title = 'revealed 0 / unknown 0 / flagged 0' })
-local resultLabel = StatusSection:Label({ Title = 'safe 0 / mines 0' })
-local wrongLabel = StatusSection:Label({ Title = 'false flags: off' })
-local perfLabel = StatusSection:Label({ Title = 'solve: --' })
-local tokenLabel = StatusSection:Label({ Title = 'token: --' })
-
-StatusSection:Button({
-    Title = 'rescan board',
-    Callback = function()
-        boardReady = false
-        for part in pairs(visuals) do clearVisual(part) end
-        classification, flaggedByUs = {}, {}
-        chanceOf = {}
-        refreshChanceLabels()
-        dirty, dirtyCount = {}, 0
-    end,
-})
-
-StatusSection:Button({
-    Title = 'unload',
-    Callback = function()
-        Unloading = true
-        for _, c in ipairs(Connections) do pcall(function() c:Disconnect() end) end
-        for part in pairs(visuals) do clearVisual(part) end
-        Config.ShowChances = false
-        refreshChanceLabels()
-        Centrl:Unload()
-    end,
-})
-
-task.spawn(function()
-    while not Unloading do
-        task.wait(0.25)
-        pcall(function()
-            boardLabel:Set(('board: %s (%.1f neighbours avg)'):format(Stats.Status, Stats.Neighbours))
-            countLabel:Set(('revealed %d / unknown %d / flagged %d'):format(Stats.Revealed, Stats.Unknown, Stats.Flagged))
-            resultLabel:Set(('safe %d / mines %d'):format(Stats.Safe, Stats.Mines))
-            if Config.ShowFalseFlags then
-                wrongLabel:Set(('false flags: %d'):format(Stats.FalseFlags))
-            else
-                wrongLabel:Set('false flags: off')
-            end
-            if Stats.LastSolve > 0 then
-                perfLabel:Set(('solve: %.2f ms over %d changed'):format(Stats.LastSolve, Stats.Changed))
-            else
-                perfLabel:Set('solve: --')
-            end
-            tokenLabel:Set('token: ' .. tostring(Stats.Token))
-        end)
+loop(0.1, function()
+    if Board.ready then
+        flagPass()
+    end
+end)
+loop(0.05, function()
+    if Board.ready then
+        stepPass()
     end
 end)
 
-Window:Load()
-
-Centrl:Notify({
-    Title = 'minesweeper',
-    Content = 'Loaded. RightShift toggles the menu.',
-    Type = 'success',
-    Duration = 5,
+--// UI \\--
+local Window = Library:CreateWindow({
+    Title = "Minesweeper",
+    Footer = "dookie hub · Ui3",
+    Icon = "grid-3x3",
+    Size = UDim2.fromOffset(660, 520),
+    ConfigFolder = "Ui3/Minesweeper",
 })
+
+local function redraw()
+    pcall(draw)
+end
+local function resolve()
+    requestSolve()
+end
+local function toggle(box, idx, text, key, tooltip, after)
+    return box:AddToggle(idx, {
+        Text = text, Default = Settings[key], Tooltip = tooltip,
+        Callback = function(v)
+            Settings[key] = v
+            if after then
+                after(v)
+            end
+        end,
+    })
+end
+local function slider(box, idx, text, key, min, max, rounding, suffix, tooltip, after)
+    return box:AddSlider(idx, {
+        Text = text, Default = Settings[key], Min = min, Max = max, Rounding = rounding, Suffix = suffix, Tooltip = tooltip,
+        Callback = function(v)
+            Settings[key] = v
+            if after then
+                after(v)
+            end
+        end,
+    })
+end
+local function choice(box, idx, text, key, values, tooltip, after)
+    return box:AddDropdown(idx, {
+        Text = text, Values = values, Default = Settings[key], Tooltip = tooltip,
+        Callback = function(v)
+            Settings[key] = v or values[1]
+            if after then
+                after(v)
+            end
+        end,
+    })
+end
+local function color(toggleObj, idx, title, key)
+    toggleObj:AddColorPicker(idx, {
+        Default = Settings[key], Title = title,
+        Callback = function(c)
+            Settings[key] = guardColor(c)
+            redraw()
+        end,
+    })
+end
+
+-- Solver tab
+do
+    local Tab = Window:AddTab("Solver", "brain", "What the board proves")
+    local StatusBox = Tab:AddLeftGroupbox("Board", "grid-3x3")
+    local BoardLabel = StatusBox:AddLabel("...", true)
+    local CountLabel = StatusBox:AddLabel("...", true)
+    local ResultLabel = StatusBox:AddLabel("...", true)
+    StatusBox:AddButton({
+        Text = "Read the board again",
+        Func = function()
+            dropBoard("reading the board again")
+        end,
+    })
+
+    local ThinkBox = Tab:AddRightGroupbox("Thinking", "cpu")
+    toggle(ThinkBox, "DeepThink", "Better thinking", "DeepThink",
+        "Works through every mine arrangement of each clump of unknown tiles: a mine in all of them is a mine, safe in all of them is safe. Finds everything the board proves", resolve)
+    slider(ThinkBox, "DeepLimit", "Biggest clump", "DeepLimit", 8, 26, 0, " tiles",
+        "Arrangements grow fast with clump size; bigger clumps are left to the simpler passes", resolve)
+    slider(ThinkBox, "Backstop", "Safety sweep every", "Backstop", 0.25, 5, 2, " s",
+        "Changes are picked up the moment they happen; this sweep only catches one that raised no event")
+    ThinkBox:AddLabel("Only proven tiles get coloured. Chances and the best guess are a separate, honest statement: the share of valid arrangements with a mine there", true)
+    local PerfLabel = ThinkBox:AddLabel("...", true)
+
+    loop(0.25, function()
+        BoardLabel:SetText(("Board: %s · %.1f neighbours each"):format(Stats.Status, Stats.Neighbours))
+        CountLabel:SetText(("Revealed %d · unknown %d · flagged %d"):format(Stats.Revealed, Stats.Unknown, Stats.Flagged))
+        ResultLabel:SetText(("Safe %d · mines %d%s"):format(Stats.Safe, Stats.Mines,
+            Settings.ShowWrongFlags and (" · wrong flags %d"):format(Stats.WrongFlags) or ""))
+        PerfLabel:SetText(("Last solve %.2f ms"):format(Stats.SolveMs))
+    end)
+end
+
+-- Markers tab
+do
+    local Tab = Window:AddTab("Markers", "eye", "How proven tiles look")
+    local SafeBox = Tab:AddLeftGroupbox("Safe tiles", "shield-check")
+    color(toggle(SafeBox, "ShowSafe", "Show safe tiles", "ShowSafe", nil, redraw), "SafeColor", "Safe colour", "SafeColor")
+    choice(SafeBox, "SafeMethod", "Look", "SafeMethod", METHODS, nil, redraw)
+
+    local MineBox = Tab:AddRightGroupbox("Mines", "bomb")
+    color(toggle(MineBox, "ShowMines", "Show mines", "ShowMines", nil, redraw), "MineColor", "Mine colour", "MineColor")
+    choice(MineBox, "MineMethod", "Look", "MineMethod", METHODS, nil, redraw)
+
+    local ExtraBox = Tab:AddLeftGroupbox("More", "sparkles")
+    color(toggle(ExtraBox, "ShowWrongFlags", "Wrong flags", "ShowWrongFlags",
+        "A flag on a tile the numbers prove safe. Every number around it counts it as a mine, so the area solves wrong until it comes off",
+        resolve), "WrongFlagColor", "Wrong flag colour", "WrongFlagColor")
+    toggle(ExtraBox, "ShowChances", "Chance on undecided tiles", "ShowChances",
+        "The share of valid mine arrangements that put a mine on each tile nothing proves", resolve)
+    color(toggle(ExtraBox, "ShowBestGuess", "Mark the best guess", "ShowBestGuess",
+        "When nothing is proven, the undecided tile with the lowest chance of a mine", resolve), "GuessColor", "Guess colour", "GuessColor")
+
+    local LookBox = Tab:AddRightGroupbox("Look", "palette")
+    slider(LookBox, "Transparency", "Transparency", "Transparency", 0, 1, 2, nil, nil, redraw)
+    LookBox:AddLabel("The game reports tiles painted exactly pure green or red. Nothing here paints a tile, and the colour pickers never give those two exact colours", true)
+end
+
+-- Auto tab
+do
+    local Tab = Window:AddTab("Auto", "zap", "Flagging and stepping")
+    local FlagBox = Tab:AddLeftGroupbox("Auto flag", "flag")
+    toggle(FlagBox, "AutoFlag", "Flag proven mines", "AutoFlag", "Flags every proven mine within range, nearest first", function(v)
+        if v then
+            table.clear(Flagging.ours)
+            findToken()
+        end
+    end)
+    choice(FlagBox, "FlagMethod", "Method", "FlagMethod", { "Auto", "Token", "ClickDetector" },
+        "Token: the game's own flag request with the recovered token. ClickDetector: the game's detector (touch devices). Auto: token, else detector")
+    slider(FlagBox, "FlagRange", "Range", "FlagRange", 4, 300, 0, " studs")
+    slider(FlagBox, "FlagDelay", "Between flags", "FlagDelay", 0, 0.5, 2, " s")
+    local TokenLabel = FlagBox:AddLabel("Token: ...", true)
+    FlagBox:AddButton({
+        Text = "Look for the token again",
+        Func = function()
+            Flagging.token = nil
+            findToken()
+            notify("Token: " .. Stats.Token, 4)
+        end,
+    })
+
+    local StepBox = Tab:AddRightGroupbox("Step on safe tiles", "footprints")
+    toggle(StepBox, "StepSafe", "Step on proven safe tiles", "StepSafe",
+        "Opens proven safe tiles by stepping on them, nearest first. With auto flag this plays the board out as far as it can be proven")
+    choice(StepBox, "StepMethod", "Move by", "StepMethod", { "Teleport", "Walk" })
+    slider(StepBox, "StepRange", "Range", "StepRange", 8, 400, 0, " studs")
+    slider(StepBox, "StepDelay", "Wait on each tile", "StepDelay", 0.05, 1, 2, " s")
+
+    loop(0.5, function()
+        TokenLabel:SetText("Token: " .. tostring(Stats.Token))
+    end)
+end
+
+-- Unload
+local function cleanup()
+    if Unloaded then
+        return
+    end
+    Unloaded = true
+    for _, c in Connections do
+        pcall(c.Disconnect, c)
+    end
+    for _, c in BoardConns do
+        pcall(c.Disconnect, c)
+    end
+    clearAll()
+end
+Library:OnUnload(cleanup)
+Genv.__MinesweeperUnload = function()
+    cleanup()
+    pcall(Library.Unload, Library)
+end
+
+notify("Loaded", 3)
