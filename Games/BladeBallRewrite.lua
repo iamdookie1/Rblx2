@@ -31,7 +31,7 @@
 
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.105"
+local SCRIPT_VERSION = "rewrite-0.5.106"
 
 -- ---------------------------------------------------------------------------
 -- Single instance.
@@ -389,7 +389,7 @@ do
         accuracy = 50, accuracy_base = 50, divisor_multiplier = 1.1, timing_mult = 1,
         extra_distance = 0, ping_compensation = false, retry_delay = 1,
         random_accuracy = false, random_accuracy_amount = 10,
-        target_mode = 1, curve_mode = 1, random_curve = false,
+        target_mode = 1, target_method = "Angle", curve_mode = 1, random_curve = false,
         auto_ability = false, cooldown_protection = false,
     }
     local SP = {
@@ -673,17 +673,26 @@ do
                     if (mode == "Closest" and d < best) or (mode == "Farthest" and d > best) then best, name, pos = d, t.name, t.pos end
                 end
             else
-                -- Camera / Cursor (0.5.105): the player the view (or the mouse
-                -- ray) points AT -- the smallest 3D angle off that ray, not the
-                -- smallest pixel gap on screen. Pixels measured to the root part's
-                -- dot: someone right in front of you but off centre lost to a
-                -- speck far behind them at the centre. Alive players only; a
-                -- touch of distance breaks near-ties toward the nearer one.
+                -- Camera / Cursor: the player the view (or the mouse ray) points
+                -- at, scored by the Aim method (S.target_method, 0.5.106):
+                --   Angle         smallest 3D angle off the ray, a touch of
+                --                 distance breaking near-ties (default)
+                --   Ray distance  fewest studs off the ray: favours whoever the
+                --                 line actually passes nearest, near or far
+                --   Weighted      angle x (1 + distance / 150): leans hard toward
+                --                 nearer players, for crowded views
+                --   Screen        pixel gap to the screen centre / mouse (the old
+                --                 way; on-screen players only)
+                -- Alive players only.
+                local method = S.target_method or "Angle"
                 local ccf = cam.CFrame
                 local o, look = ccf.Position, ccf.LookVector
+                local vp = cam.ViewportSize
+                local anchor = Vector2.new(vp.X / 2, vp.Y / 2)
                 if mode == "Cursor" and not isMobile then
                     local ok, m = pcall(UserInputService.GetMouseLocation, UserInputService)
                     if ok and m then
+                        anchor = m
                         local ray = cam:ScreenPointToRay(m.X, m.Y, 0) -- the game's own mouse ray
                         o, look = ray.Origin, ray.Direction.Unit
                     end
@@ -695,13 +704,22 @@ do
                     if not (hum and hum.Health <= 0) then
                         local to = t.pos - o
                         local d = to.Magnitude
-                        if d > 1e-3 then
-                            local dot = look:Dot(to / d)
-                            if dot > 0 then
-                                local score = math.acos(math.clamp(dot, -1, 1)) + d * 0.0004
-                                if score < best then best, name, pos = score, t.name, t.pos end
+                        local score
+                        if method == "Screen" then
+                            local sc = t.screen
+                            if sc.Z > 0 and sc.X >= 0 and sc.Y >= 0 and sc.X <= vp.X and sc.Y <= vp.Y then
+                                score = (Vector2.new(sc.X, sc.Y) - anchor).Magnitude
+                            end
+                        elseif d > 1e-3 then
+                            local along = look:Dot(to)
+                            if along > 0 then
+                                local ang = math.acos(math.clamp(along / d, -1, 1))
+                                if method == "Ray distance" then score = (to - look * along).Magnitude
+                                elseif method == "Weighted" then score = ang * (1 + d / 150)
+                                else score = ang + d * 0.0004 end
                             end
                         end
+                        if score and score < best then best, name, pos = score, t.name, t.pos end
                     end
                 end
                 if not name then
@@ -3751,6 +3769,11 @@ AIM:AddDropdown("TargetMode", {
     Values = Parry.targetNames, Default = "Cursor", Text = "Target mode",
     Callback = function(v) Parry.setTargetMode(v) end,
 })
+AIM:AddDropdown("TargetMethod", {
+    Values = { "Angle", "Ray distance", "Weighted", "Screen" }, Default = "Angle", Text = "Aim method (Camera / Cursor)",
+    Tooltip = "How Camera and Cursor pick who you're aiming at. Angle: smallest angle off your view (best all-round). Ray distance: whoever your aim line passes closest to, in studs. Weighted: angle, leaning toward nearer players (crowds). Screen: pixel distance on screen (the old way).",
+    Callback = function(v) S.target_method = v end,
+})
 AIM:AddDropdown("CurveMode", {
     Values = Parry.curveNames, Default = "Camera", Text = "Curve mode", Searchable = true,
     Tooltip = "The direction sent with every parry (auto parry, triggerbot and spam).",
@@ -5132,6 +5155,74 @@ DS:AddDropdown("DeviceSpoofType", {
         DeviceSpoof.p = device_profiles()[v]
         if DeviceSpoof.on then DeviceSpoof.apply() end
     end,
+})
+
+-- Infinite movement abilities (0.5.106). Blink and Thunder Dash keep their
+-- charges / cooldown in their own LocalScript's locals (Bbs dump: Blink 3
+-- charges + 5.5s each, Thunder Dash a getAbilityCooldown delay) and move you
+-- ON YOUR CLIENT -- the server only gets Blinked / ThunderDash (start position
+-- + limb CFrames) for the effect. So the key below does exactly what the
+-- game's script does -- same distance (16 + 5 x upgrade / 22 + 10 x upgrade),
+-- same wall raycast, same remote -- with no charge count or cooldown. The
+-- game's own refusals stay: in a round, ability not red (disabled), moving,
+-- not frozen. Min 0.2s between uses. Server-side abilities (Time Hole,
+-- Infinity...) only send a request and the server decides: nothing to skip.
+local InfAbility = { on = false, last = -math.huge }
+local INF_ABILITIES = {
+    ["Blink"] = { remote = "Blinked", dist = function(up) return 16 + 5 * up end },
+    ["Thunder Dash"] = { remote = "ThunderDash", dist = function(up) return 22 + 10 * up end },
+}
+local function inf_equipped(char)
+    local folder = char:FindFirstChild("Abilities")
+    if not folder then return nil end
+    for name, def in pairs(INF_ABILITIES) do
+        if folder:FindFirstChild(name) then return name, def end
+    end
+    return nil
+end
+function InfAbility.use()
+    if not InfAbility.on or not is_live() then return end
+    local now = clock_()
+    if now - InfAbility.last < 0.2 then return end
+    local char = LocalPlayer.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    if not (hum and hrp) or char.Parent ~= Workspace:FindFirstChild("Alive") then return end
+    local okr, red = pcall(function() return LocalPlayer.PlayerGui.Hotbar.Ability.Red.Visible end)
+    if okr and red ~= false then return end
+    if hum.MoveDirection.Magnitude < 1e-3 then return end
+    if char.PrimaryPart and char.PrimaryPart:FindFirstChild("FREEZER") then return end
+    local name, def = inf_equipped(char)
+    if not name then Notify("Infinite ability", "Equip Blink or Thunder Dash.", 3); return end
+    InfAbility.last = now
+    local up = 0
+    pcall(function() up = LocalPlayer.Upgrades[name].Value end)
+    local dist = def.dist(up)
+    local pos, dir = hrp.Position, hum.MoveDirection.Unit
+    pcall(function()
+        ReplicatedStorage.Remotes[def.remote]:FireServer(pos, { char.Head.CFrame, char["Left Arm"].CFrame,
+            char["Right Arm"].CFrame, char["Right Leg"].CFrame, char["Left Leg"].CFrame, char.Torso.CFrame })
+    end)
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    local skip = {}
+    for _, n in ipairs({ "Runtime", "Alive", "Dead", "Balls", "TrainingBalls" }) do
+        local f = Workspace:FindFirstChild(n)
+        if f then skip[#skip + 1] = f end
+    end
+    params.FilterDescendantsInstances = skip
+    local hit = Workspace:Raycast(pos, dir * dist, params)
+    if hit and hit.Instance then hrp.CFrame = CFrame.new(hit.Position)
+    else hrp.CFrame = hrp.CFrame + dir * dist end
+end
+local IA = Tabs.Misc:AddRightGroupbox("Abilities", "zap")
+IA:AddToggle("InfAbility", {
+    Text = "Infinite Blink / Thunder Dash", Default = false,
+    Tooltip = "The key below blinks / thunder dashes like the game does, with no charges or cooldown (the game keeps those on your side). Experimental: the server sees every use -- if it kicks, turn it off.",
+    Callback = function(v) InfAbility.on = v end,
+})
+IA:AddLabel("Ability key"):AddKeyPicker("InfAbilityKey", {
+    Default = "None", Mode = "Toggle", Text = "Infinite ability", Callback = function() InfAbility.use() end,
 })
 
 local NR = Tabs.Misc:AddRightGroupbox("Performance", "cpu")
