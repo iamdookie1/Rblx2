@@ -31,7 +31,7 @@
 
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.106"
+local SCRIPT_VERSION = "rewrite-0.5.107"
 
 -- ---------------------------------------------------------------------------
 -- Single instance.
@@ -5215,11 +5215,59 @@ function InfAbility.use()
     if hit and hit.Instance then hrp.CFrame = CFrame.new(hit.Position)
     else hrp.CFrame = hrp.CFrame + dir * dist end
 end
+-- The ability BUTTON (phone / tablet, and the game's RequestAbilityUse) fires
+-- Remotes.AbilityButtonPress, a BindableEvent each ability's LocalScript
+-- listens to. While this is on and Blink / Thunder Dash is equipped, in a
+-- round: THAT script's listener (found by its source, ...Abilities.<name>) is
+-- paused and the button calls ours instead -- one blink per tap, no double
+-- with the game's own. Every other listener (the game's "ability blocked"
+-- notice etc.) is left alone. Re-checked every 0.5s (a respawn brings a new
+-- script); everything is put back when it goes off or you leave the round.
+InfAbility.paused, InfAbility.conn = {}, nil
+local function inf_unroute()
+    for c in pairs(InfAbility.paused) do pcall(function() c:Enable() end) end
+    InfAbility.paused = {}
+    if InfAbility.conn then pcall(function() InfAbility.conn:Disconnect() end); InfAbility.conn = nil end
+end
+local function inf_route(char, name)
+    local ev = ReplicatedStorage:FindFirstChild("Remotes") and ReplicatedStorage.Remotes:FindFirstChild("AbilityButtonPress")
+    if not (ev and getconnections) then return end
+    local tail = "Abilities." .. name
+    for _, c in ipairs(getconnections(ev.Event)) do
+        local f = c.Function
+        if type(f) == "function" and not InfAbility.paused[c] then
+            local ok, src = pcall(debug.info, f, "s")
+            if ok and type(src) == "string" and src:sub(-#tail) == tail then
+                InfAbility.paused[c] = true
+                pcall(function() c:Disable() end)
+            end
+        end
+    end
+    if not InfAbility.conn then
+        InfAbility.conn = ev.Event:Connect(function()
+            if InfAbility.on and is_live() then InfAbility.use() end
+        end)
+    end
+end
+function InfAbility.watch()
+    if InfAbility.watching then return end
+    InfAbility.watching = true
+    task.spawn(function()
+        while InfAbility.on and is_live() do
+            local char = LocalPlayer.Character
+            local name = char and char.Parent == Workspace:FindFirstChild("Alive") and inf_equipped(char)
+            if name then pcall(inf_route, char, name) elseif next(InfAbility.paused) or InfAbility.conn then inf_unroute() end
+            task.wait(0.5)
+        end
+        inf_unroute()
+        InfAbility.watching = false
+    end)
+end
 local IA = Tabs.Misc:AddRightGroupbox("Abilities", "zap")
 IA:AddToggle("InfAbility", {
     Text = "Infinite Blink / Thunder Dash", Default = false,
-    Tooltip = "The key below blinks / thunder dashes like the game does, with no charges or cooldown (the game keeps those on your side). Experimental: the server sees every use -- if it kicks, turn it off.",
-    Callback = function(v) InfAbility.on = v end,
+    Tooltip = "Blinks / thunder dashes like the game does, with no charges or cooldown (the game keeps those on your side). PC: the key below. Phone: your normal ability button does it while this is on. Experimental: the server sees every use -- if it kicks, turn it off.",
+    Callback = function(v) InfAbility.on = v; if v then InfAbility.watch() end end,
 })
 IA:AddLabel("Ability key"):AddKeyPicker("InfAbilityKey", {
     Default = "None", Mode = "Toggle", Text = "Infinite ability", Callback = function() InfAbility.use() end,
