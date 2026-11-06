@@ -31,7 +31,7 @@
 
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.108"
+local SCRIPT_VERSION = "rewrite-0.5.109"
 
 -- ---------------------------------------------------------------------------
 -- Single instance.
@@ -833,6 +833,16 @@ do
         local real, f1, f2 = rawget(g, "BAC_HASH"), rawget(g, "BAC_FAKE_1"), rawget(g, "BAC_FAKE_2")
         return type(real) == "string" and #real == 36 and real or nil, f1, f2
     end
+    -- The hashes as PRY's source sets them (Bbs dumps: the same in the main
+    -- place on 2026-10-22 and Training Mode on 2026-11-06). At RUNTIME the game
+    -- blanks _G.BAC_HASH / BAC_FAKE_1 / BAC_FAKE_2 to "" once the sender has
+    -- them (both dumps' GLOBALS), so Core.bac() above reads nothing in a live
+    -- server. These are used ONLY to confirm, never to send: a packet on the
+    -- plain-call path is taken only if it carries exactly KNOWN_REAL, and the
+    -- known decoys are always refused. After a game update that changes the
+    -- hash, nothing on that path matches -> namecall-only, as before.
+    local KNOWN_REAL = "5455ef47-de02-4074-808c-8d82c2cd12ec"
+    local KNOWN_FAKES = { ["90fa5062-066f-4376-b9e9-8adc47fbd983"] = true, ["2983784e-7f10-4278-a8d1-259db4906a2b"] = true }
 
     local H = { fire = nil, nc = nil, want = false, until_t = 0 }
 
@@ -884,7 +894,7 @@ do
         for i = 1, #text do key[i] = bxor_(byte_(token, i), (byte_(text, i) + i) % 256) end
         local prev = Core.cap
         Core.cap = { remote = remote, hash = hash, uid = uid, key = key, len = #text, ball2 = typeof_(a4) == "CFrame",
-            verified = Core.bac() == hash,
+            verified = Core.bac() == hash or hash == KNOWN_REAL,
             win = type_(a4) == "number" and a4 or nil }
         Core.misses, Core.pending = 0, nil
         Core.new_capture = { prev = prev }
@@ -902,10 +912,11 @@ do
         -- could be a FAKE packet -- then every forged parry carried the fake
         -- hash: animation, no parry, in some captures and not others
         local real, f1, f2 = Core.bac()
-        if a1 == f1 or a1 == f2 then return false end
+        if a1 == f1 or a1 == f2 or KNOWN_FAKES[a1] then return false end
         if real and a1 ~= real then return false end
-        -- the plain-call path carries the decoys too: real hash confirmed or nothing
-        if entry[5] == "fire" and not (real and a1 == real) then return false end
+        -- the plain-call path carries the decoys too: the real hash confirmed --
+        -- by the game's _G, or (blanked at runtime) the one in PRY's source -- or nothing
+        if entry[5] == "fire" and not (a1 == (real or KNOWN_REAL)) then return false end
         if typeof_(self) == 'Instance' and self.ClassName == 'RemoteEvent'
             and type_(a1) == 'string' and #a1 == 36 and a1 ~= JOB_ID and type_(a2) == 'string' and type_(a3) == 'string'
             and ((type_(a4) == 'number' and typeof_(a5) == 'CFrame') or (typeof_(a4) == 'CFrame' and typeof_(a5) == 'CFrame')) then
