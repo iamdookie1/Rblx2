@@ -53,6 +53,7 @@ local Has = {
     makefolder = has(makefolder),
     isfolder = has(isfolder),
     isfile = has(isfile),
+    delfile = has(delfile),
     decompile = has(decompile),
     scripthash = has(getscripthash),
     bytecode = has(getscriptbytecode),
@@ -118,6 +119,7 @@ local Config = {
     CollapseRepeats = true,
     SkipGuiValues = true,
     HideName = true,
+    MaxFileMB = 24,
     MaxDepth = 40,
     MaxScriptChars = 500000,
     DecompileTimeout = 10,
@@ -399,14 +401,60 @@ local function anonymise(text)
 end
 
 -- a few big writes rather than thousands of small ones
-local function writeChunks(path, chunks)
-    for i, chunk in ipairs(chunks) do chunks[i] = anonymise(chunk) end
+local function writeAll(path, chunks)
     if Has.appendfile then
         pcall(writefile, path, chunks[1] or "")
         for i = 2, #chunks do pcall(appendfile, path, chunks[i]) end
     else
         pcall(writefile, path, table.concat(chunks))
     end
+end
+-- Dump.txt, Dump_2.txt, Dump_3.txt ...
+local function partPath(path, n)
+    if n == 1 then return path end
+    return (path:gsub("%.txt$", "")) .. "_" .. n .. ".txt"
+end
+-- GitHub's web upload takes files up to 25 MB, so a file bigger than
+-- Config.MaxFileMB (0 = never) is written in parts, each cut at a line break.
+-- Line numbers in the contents / script index count through the parts in
+-- order, as if they were one file. Returns how many files were written.
+local function writeChunks(path, chunks)
+    for i, chunk in ipairs(chunks) do chunks[i] = anonymise(chunk) end
+    local limit = math.floor((tonumber(Config.MaxFileMB) or 0) * 1024 * 1024)
+    local total = 0
+    for _, chunk in ipairs(chunks) do total = total + #chunk end
+    local part, size, cur = 1, 0, {}
+    local function flush()
+        writeAll(partPath(path, part), cur)
+        part, size, cur = part + 1, 0, {}
+    end
+    if limit <= 0 or total <= limit then
+        writeAll(path, chunks); part = 2
+    else for _, chunk in ipairs(chunks) do
+        while #chunk > 0 do
+            local room = limit - size
+            if #chunk <= room then
+                cur[#cur + 1] = chunk; size = size + #chunk; chunk = ""
+            else
+                local cut = chunk:sub(1, room):match("^.*()\n")
+                if not cut and size > 0 then flush() -- no line break fits: start a fresh part
+                else
+                    cut = cut or room -- one line longer than a whole part: cut it
+                    cur[#cur + 1] = chunk:sub(1, cut)
+                    chunk = chunk:sub(cut + 1)
+                    flush()
+                end
+            end
+        end
+    end
+    if #cur > 0 then flush() end
+    end
+    -- a stale extra part from an earlier, bigger dump would confuse things
+    if Has.isfile and Has.delfile then
+        local n = part
+        while isfile(partPath(path, n)) do pcall(delfile, partPath(path, n)); n = n + 1 end
+    end
+    return part - 1
 end
 
 --// Crash memory ---------------------------------------------------------------------
@@ -1629,7 +1677,10 @@ local function writeOutputs(ctx)
         end
     end
     local path = filePath("Dump.txt")
-    writeChunks(path, chunks)
+    local parts = writeChunks(path, chunks)
+    if parts > 1 then
+        return ("%s  (in %d parts: Dump.txt, Dump_2.txt ... each under %d MB)"):format(path, parts, Config.MaxFileMB)
+    end
     return path
 end
 
@@ -1946,6 +1997,12 @@ do
         Callback = function(value) Config.Output = value or Config.Output end,
     })
     toggle(out, 'HideName', 'Hide my name in the file', 'your username is written as <you>, so a dump can be shared')
+    out:AddSlider('dumper_maxfile', {
+        Text = 'Max file size',
+        Min = 0, Max = 95, Default = Config.MaxFileMB, Rounding = 0, Suffix = ' MB',
+        Tooltip = 'bigger files are written in parts (Dump.txt, Dump_2.txt ...), cut at a line break. 24 fits GitHub web upload (25 MB). 0 = never split',
+        Callback = function(value) Config.MaxFileMB = tonumber(value) or Config.MaxFileMB end,
+    })
 
     Tab = Window:AddTab('Options', 'sliders-horizontal', 'Speed, filters and limits')
 
