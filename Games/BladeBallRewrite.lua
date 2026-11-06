@@ -31,7 +31,7 @@
 
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.107"
+local SCRIPT_VERSION = "rewrite-0.5.108"
 
 -- ---------------------------------------------------------------------------
 -- Single instance.
@@ -394,6 +394,7 @@ do
     }
     local SP = {
         manual = false, auto = false, mode = "Remote", max_rate = 1000, speed_mode = "700/s", method = "Fixed rate",
+        per_frame = false, per_frame_count = 1, timing = "Per second", interval_ms = 2,
         smart = true, range_bonus = 0, hold = 0.15, sensitivity = 1.3, predictive = true,
     }
     -- detection state (written by the detection features, read here)
@@ -2221,8 +2222,24 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
     -- hitches, blocked moments): 100% of target from 30 to 240 FPS, 300-2000/s.
     -- Spam speed: the picked rate ("50/s" .. "1000/s"), held exactly by the
     -- bucket below at any FPS.
+    -- Timing (0.5.108): "Per second" = the Speed dropdown; "Every X ms" = one
+    -- parry every Interval ms (2 ms = 500/s), the same exact bucket.
     function SP.rate_now(now)
+        if SP.timing == "Every X ms" then return 1000 / math.max(tonumber(SP.interval_ms) or 2, 0.5) end
         return tonumber(tostring(SP.speed_mode):match("%d+")) or 700
+    end
+    -- Per frame (toggle, or the old "Per frame" method): Count parries every
+    -- frame instead of a rate -- your FPS x Count a second
+    local function per_frame() return SP.per_frame or SP.method == "Per frame" end
+    local function frame_burst()
+        local n = math.clamp(math.floor(tonumber(SP.per_frame_count) or 1), 1, 20)
+        if SP.mode == "Keypress" then n = 1 end
+        local sent = false
+        while Pump.frame_fires < n do
+            if not fire_one() then break end
+            sent = true
+        end
+        return sent
     end
     -- Spam methods (Spam tab > Method):
     --   Fixed rate    the picked Speed, held exactly by the bucket (the original)
@@ -2263,11 +2280,12 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         if source == "manual" and SP.smart and not focus then Pump.on, Pump.waiting = false, true; return end
         Pump.waiting = false
         if SP.method == "On ball" and not SP.on_ball_now() then Pump.on = false; return end
-        if SP.method == "Per frame" then
-            -- once a frame, at its first point; no bucket
+        if per_frame() then
+            -- Count a frame, at its first point; no bucket
             if point == 1 then
                 Pump.on = true
-                if fire_one() and Pump.remote_sent then Anim.spamBlock() end
+                if Pump.fired_frame ~= Pump.frame then Pump.fired_frame, Pump.frame_fires = Pump.frame, 0 end
+                if frame_burst() and Pump.remote_sent then Anim.spamBlock() end
                 Pump.remote_sent = false
             end
             return
@@ -2301,9 +2319,11 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         local source = current_source(clock_())
         if not source or not LocalPlayer.Character then return end
         if source == "manual" and SP.smart and not spam_focus() then return end
-        if SP.method == "Per frame" then
-            -- at most the one parry this frame
-            if Pump.fired_frame ~= Pump.frame and fire_one() and Pump.remote_sent then Anim.spamBlock() end
+        if per_frame() then
+            -- at most this frame's Count (an instant fire uses one of them)
+            if Pump.fired_frame ~= Pump.frame then Pump.fired_frame, Pump.frame_fires = Pump.frame, 0 end
+            local n = (SP.mode == "Keypress") and 1 or math.clamp(math.floor(tonumber(SP.per_frame_count) or 1), 1, 20)
+            if Pump.frame_fires < n and fire_one() and Pump.remote_sent then Anim.spamBlock() end
             Pump.remote_sent = false
             return
         end
@@ -4005,6 +4025,29 @@ MS:AddDropdown("SpamSpeed", {
     Tooltip = "Parries a second for manual and auto spam, held exactly at this rate at any FPS.",
     Callback = function(v) SP.speed_mode = v end,
 })
+MS:AddToggle("SpamPerFrame", {
+    Text = "Per frame", Default = false,
+    Tooltip = "Fire a set number of parries every frame (your FPS x Count a second) instead of the timing below.",
+    Callback = function(v) SP.per_frame = v end,
+})
+MS:AddSlider("SpamPerFrameCount", {
+    Text = "Per frame count", Default = 1, Min = 1, Max = 20, Rounding = 0,
+    Tooltip = "Parries each frame while Per frame is on.",
+    Callback = function(v) SP.per_frame_count = v end,
+})
+MS:AddDropdown("SpamTiming", {
+    Values = { "Per second", "Every X ms" }, Default = "Per second", Text = "Timing",
+    Tooltip = "Per second: the Speed above. Every X ms: one parry every Interval ms. Ignored while Per frame is on.",
+    Callback = function(v) SP.timing = v end,
+})
+MS:AddInput("SpamIntervalMs", {
+    Text = "Interval (ms)", Default = "2", Numeric = true, Finished = true, Placeholder = "e.g. 2",
+    Tooltip = "Milliseconds between parries for Every X ms (0.5 - 1000). 2 ms = 500/s, 1 ms = 1000/s.",
+    Callback = function(v)
+        local n = tonumber(v)
+        if n then SP.interval_ms = math.clamp(n, 0.5, 1000) end
+    end,
+})
 local SpamRateLabel = MS:AddLabel("Actual: 0/s", true)
 
 local AS = Tabs.Spam:AddRightGroupbox("Auto Spam", "activity")
@@ -5157,48 +5200,62 @@ DS:AddDropdown("DeviceSpoofType", {
     end,
 })
 
--- Infinite movement abilities (0.5.106). Blink and Thunder Dash keep their
--- charges / cooldown in their own LocalScript's locals (Bbs dump: Blink 3
--- charges + 5.5s each, Thunder Dash a getAbilityCooldown delay) and move you
--- ON YOUR CLIENT -- the server only gets Blinked / ThunderDash (start position
--- + limb CFrames) for the effect. So the key below does exactly what the
--- game's script does -- same distance (16 + 5 x upgrade / 22 + 10 x upgrade),
--- same wall raycast, same remote -- with no charge count or cooldown. The
--- game's own refusals stay: in a round, ability not red (disabled), moving,
--- not frozen. Min 0.2s between uses. Server-side abilities (Time Hole,
--- Infinity...) only send a request and the server decides: nothing to skip.
-local InfAbility = { on = false, last = -math.huge }
+-- Infinite movement abilities (0.5.106; Dash + fixes 0.5.108). Blink, Thunder
+-- Dash and Dash keep their charges / cooldown in their own LocalScript's
+-- locals (Bbs dump: Blink 3 charges + 5.5s each, the others a
+-- getAbilityCooldown delay) and move you ON YOUR CLIENT -- the server only
+-- gets a remote for the effect. So this does exactly what the game's script
+-- does, with no charge count or cooldown:
+--   Blink / Thunder Dash  remote (start position + limb CFrames), then a wall
+--                         raycast and the teleport: 16 + 5 x upgrade / 22 +
+--                         10 x upgrade studs
+--   Dash                  PlrDashed, the FOV kick, the script's own Dash
+--                         animation, a one-frame LinearVelocity push (160 / 180
+--                         / 200 x scale) with the body massless and the Pin
+--                         constraint off for 0.3s, then the velocity zeroed
+-- The equipped ability is read the game's way: the player's AbilityOverride,
+-- else CurrentlyEquippedAbility (0.5.106-107 looked for the script in your
+-- character's Abilities folder -- but that folder holds EVERY ability's script,
+-- so Blink was always "equipped"). The game's refusals stay (in a round,
+-- ability not red, not frozen); Direction "Camera" works standing still.
+-- Server-side abilities (Time Hole, Infinity...) only send a request and the
+-- server decides: nothing to skip.
+local InfAbility = { on = false, last = -math.huge, direction = "Move", gap = 0.2, fov_base = nil, fov_until = 0, tracks = setmetatable({}, { __mode = 'k' }) }
 local INF_ABILITIES = {
-    ["Blink"] = { remote = "Blinked", dist = function(up) return 16 + 5 * up end },
-    ["Thunder Dash"] = { remote = "ThunderDash", dist = function(up) return 22 + 10 * up end },
+    ["Blink"] = { kind = "tp", remote = "Blinked", dist = function(up) return 16 + 5 * up end },
+    ["Thunder Dash"] = { kind = "tp", remote = "ThunderDash", dist = function(up) return 22 + 10 * up end },
+    ["Dash"] = { kind = "dash" },
 }
 local function inf_equipped(char)
+    local name = LocalPlayer:GetAttribute("AbilityOverride") or LocalPlayer:GetAttribute("CurrentlyEquippedAbility")
+        or LocalPlayer:GetAttribute("EquippedAbility")
     local folder = char:FindFirstChild("Abilities")
-    if not folder then return nil end
-    for name, def in pairs(INF_ABILITIES) do
-        if folder:FindFirstChild(name) then return name, def end
+    if type(name) == "string" then
+        if INF_ABILITIES[name] and (not folder or folder:FindFirstChild(name)) then return name, INF_ABILITIES[name] end
+        return nil
+    end
+    -- no attribute: the one ability script that's running
+    if folder then
+        for n, def in pairs(INF_ABILITIES) do
+            local sc = folder:FindFirstChild(n)
+            if sc and sc:IsA("LocalScript") and sc.Enabled then return n, def end
+        end
     end
     return nil
 end
-function InfAbility.use()
-    if not InfAbility.on or not is_live() then return end
-    local now = clock_()
-    if now - InfAbility.last < 0.2 then return end
-    local char = LocalPlayer.Character
-    local hum = char and char:FindFirstChildOfClass("Humanoid")
-    local hrp = char and char:FindFirstChild("HumanoidRootPart")
-    if not (hum and hrp) or char.Parent ~= Workspace:FindFirstChild("Alive") then return end
-    local okr, red = pcall(function() return LocalPlayer.PlayerGui.Hotbar.Ability.Red.Visible end)
-    if okr and red ~= false then return end
-    if hum.MoveDirection.Magnitude < 1e-3 then return end
-    if char.PrimaryPart and char.PrimaryPart:FindFirstChild("FREEZER") then return end
-    local name, def = inf_equipped(char)
-    if not name then Notify("Infinite ability", "Equip Blink or Thunder Dash.", 3); return end
-    InfAbility.last = now
-    local up = 0
-    pcall(function() up = LocalPlayer.Upgrades[name].Value end)
+local function inf_dir(hum)
+    if InfAbility.direction == "Camera" then
+        local look = Workspace.CurrentCamera.CFrame.LookVector
+        local flat = Vector3.new(look.X, 0, look.Z)
+        if flat.Magnitude > 1e-3 then return flat.Unit end
+    end
+    local md = hum.MoveDirection
+    if md.Magnitude > 1e-3 then return md.Unit end
+    return nil
+end
+local function inf_tp(char, hrp, def, up, dir)
     local dist = def.dist(up)
-    local pos, dir = hrp.Position, hum.MoveDirection.Unit
+    local pos = hrp.Position
     pcall(function()
         ReplicatedStorage.Remotes[def.remote]:FireServer(pos, { char.Head.CFrame, char["Left Arm"].CFrame,
             char["Right Arm"].CFrame, char["Right Leg"].CFrame, char["Left Leg"].CFrame, char.Torso.CFrame })
@@ -5214,6 +5271,80 @@ function InfAbility.use()
     local hit = Workspace:Raycast(pos, dir * dist, params)
     if hit and hit.Instance then hrp.CFrame = CFrame.new(hit.Position)
     else hrp.CFrame = hrp.CFrame + dir * dist end
+end
+local function inf_dash(char, hum, hrp, up, dir)
+    local now = clock_()
+    pcall(function() ReplicatedStorage.Remotes.PlrDashed:FireServer() end)
+    -- the FOV kick, from your real FOV (back-to-back dashes don't ratchet it up)
+    pcall(function()
+        local cam = Workspace.CurrentCamera
+        if now >= InfAbility.fov_until or not InfAbility.fov_base then InfAbility.fov_base = cam.FieldOfView end
+        InfAbility.fov_until = now + 0.5
+        cam.FieldOfView = InfAbility.fov_base
+        game:GetService("TweenService"):Create(cam, TweenInfo.new(0.25, Enum.EasingStyle.Linear, Enum.EasingDirection.Out, 0, true, 0),
+            { FieldOfView = InfAbility.fov_base * 1.25 }):Play()
+    end)
+    -- the script's own animation, loaded once per animator
+    pcall(function()
+        local anim = char.Abilities.Dash:FindFirstChild("Dash")
+        local animator = hum:FindFirstChildOfClass("Animator")
+        if anim and animator then
+            local t = InfAbility.tracks[animator]
+            if not t then t = animator:LoadAnimation(anim); InfAbility.tracks[animator] = t end
+            t:Play()
+        end
+    end)
+    local power = (up == 1 and 180) or (up == 2 and 200) or 160
+    local scale = 1
+    pcall(function() scale = char:GetScale() end)
+    if scale > 1 then power = power * scale end
+    local cf = hrp.CFrame
+    local look, right = cf.LookVector, cf.RightVector
+    local top = 1 - 1e-8
+    local f, r = math.clamp(dir:Dot(look), -1, top), math.clamp(dir:Dot(right), -1, top)
+    local att = Instance.new("Attachment")
+    att.Parent = hrp
+    local lv = Instance.new("LinearVelocity")
+    lv.Name = "Dash"
+    lv.ForceLimitMode = Enum.ForceLimitMode.PerAxis
+    lv.MaxAxesForce = Vector3.new(100000, 0, 100000)
+    lv.Attachment0 = att
+    lv.VectorVelocity = look * f * power + right * r * power
+    lv.Parent = att
+    task.delay(0.01, function() pcall(att.Destroy, att) end)
+    local made = {}
+    for _, v in ipairs(char:GetDescendants()) do
+        if v:IsA("BasePart") and not v.Massless then v.Massless = true; made[#made + 1] = v end
+    end
+    local pin
+    pcall(function() pin = char.Colliders.Pin:FindFirstChildWhichIsA("RigidConstraint") end)
+    if pin then pin.Enabled = false end
+    task.delay(0.3, function()
+        for _, v in ipairs(made) do pcall(function() v.Massless = false end) end
+        if pin then pcall(function() pin.Enabled = true end) end
+        local pp = char.PrimaryPart
+        if pp then pp.AssemblyLinearVelocity, pp.AssemblyAngularVelocity = Vector3.zero, Vector3.zero end
+    end)
+end
+function InfAbility.use()
+    if not InfAbility.on or not is_live() then return end
+    local now = clock_()
+    if now - InfAbility.last < InfAbility.gap then return end
+    local char = LocalPlayer.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    if not (hum and hrp) or hum.Health <= 0 or char.Parent ~= Workspace:FindFirstChild("Alive") then return end
+    local okr, red = pcall(function() return LocalPlayer.PlayerGui.Hotbar.Ability.Red.Visible end)
+    if okr and red ~= false then return end
+    if char.PrimaryPart and char.PrimaryPart:FindFirstChild("FREEZER") then return end
+    local name, def = inf_equipped(char)
+    if not name then Notify("Infinite ability", "Equip Blink, Thunder Dash or Dash.", 3); return end
+    local dir = inf_dir(hum)
+    if not dir then return end -- standing still with Direction "Move": the game refuses too
+    InfAbility.last = now
+    local up = 0
+    pcall(function() up = LocalPlayer.Upgrades[name].Value end)
+    if def.kind == "dash" then inf_dash(char, hum, hrp, up, dir) else inf_tp(char, hrp, def, up, dir) end
 end
 -- The ability BUTTON (phone / tablet, and the game's RequestAbilityUse) fires
 -- Remotes.AbilityButtonPress, a BindableEvent each ability's LocalScript
@@ -5265,9 +5396,18 @@ function InfAbility.watch()
 end
 local IA = Tabs.Misc:AddRightGroupbox("Abilities", "zap")
 IA:AddToggle("InfAbility", {
-    Text = "Infinite Blink / Thunder Dash", Default = false,
-    Tooltip = "Blinks / thunder dashes like the game does, with no charges or cooldown (the game keeps those on your side). PC: the key below. Phone: your normal ability button does it while this is on. Experimental: the server sees every use -- if it kicks, turn it off.",
+    Text = "Infinite Blink / Thunder Dash / Dash", Default = false,
+    Tooltip = "Uses your equipped Blink, Thunder Dash or Dash like the game does, with no charges or cooldown (the game keeps those on your side). PC: the key below. Phone: your normal ability button does it while this is on. Experimental: the server sees every use -- if it kicks, turn it off.",
     Callback = function(v) InfAbility.on = v; if v then InfAbility.watch() end end,
+})
+IA:AddDropdown("InfAbilityDir", {
+    Values = { "Move", "Camera" }, Default = "Move", Text = "Direction",
+    Tooltip = "Move: the way you're walking (the game's way). Camera: where you're looking, flat -- works standing still.",
+    Callback = function(v) InfAbility.direction = v end,
+})
+IA:AddSlider("InfAbilityGap", {
+    Text = "Min time between uses", Default = 0.2, Min = 0.05, Max = 2, Rounding = 2, Suffix = "s",
+    Callback = function(v) InfAbility.gap = v end,
 })
 IA:AddLabel("Ability key"):AddKeyPicker("InfAbilityKey", {
     Default = "None", Mode = "Toggle", Text = "Infinite ability", Callback = function() InfAbility.use() end,
