@@ -31,7 +31,7 @@
 
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.111"
+local SCRIPT_VERSION = "rewrite-0.5.112"
 
 -- ---------------------------------------------------------------------------
 -- Single instance.
@@ -1064,13 +1064,34 @@ end]]
     -- not size its own window or track dry/lat, so capture_window is a fixed hold
     -- and the Capture table just carries the fields prime_capture / spam read.
     local Capture = { mode = "Your press", armed_at = 0, dry = 0, last_spam_key = -math.huge, lat = nil, last_press = -math.huge, since = nil }
+    -- Auto capture modes (Capture tab, 0.5.112) -- the ones that press block
+    -- themselves until the capture is in:
+    --   "Auto parry"  auto parry fires with native F presses (the game sends the
+    --                 parry itself) and the hook reads that real packet
+    --   "Spam"        presses F every 0.1s while you're in a round / training
+    --                 until a press is taken and read
+    --   "Auto press"  ("Safe press" in the menu) one press when no ball can reach
+    --                 you inside the lockout, every 1.4s
+    -- "Your press" waits for your own block.
+    function Capture.auto() return Capture.mode == "Auto parry" or Capture.mode == "Spam" or Capture.mode == "Auto press" end
     Parry.Capture = Capture
     local function capture_window() return 0.2 end
     local function pressBlockKey()
         if not is_live() then return false end
         Core.last_send_at = clock_()
-        -- VirtualInputManager, fetched only here (never at load -- see the top).
-        -- keypress / keyrelease / keytap / keyclick(0x46) crash Delta (0.5.84).
+        -- keypress / keyrelease(0x46 = F): crashed Delta in 0.5.84, fixed
+        -- there since (0.5.112). They're OS-level input, so only while Roblox
+        -- is the focused window -- otherwise the F would land in whatever is.
+        -- VirtualInputManager (fetched only here, never at load -- see the
+        -- top) where they're missing.
+        if type(keypress) == "function" and type(keyrelease) == "function" then
+            if type(isrbxactive) == "function" then
+                local okA, active = pcall(isrbxactive)
+                if okA and active == false then return false end
+            end
+            local ok = pcall(function() keypress(0x46); keyrelease(0x46) end)
+            if ok then return true end
+        end
         local ok = pcall(function()
             local vim = cloneref(game:GetService('VirtualInputManager'))
             vim:SendKeyEvent(true, Enum.KeyCode.F, false, game)
@@ -2208,7 +2229,7 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         elseif not Core.cap then
             -- no capture yet. Default: wait for the player's own real parry (no
             -- synthetic press). "Auto press" capture bootstraps with a native press.
-            if Capture.mode ~= "Auto press" then return false end
+            if not Capture.auto() then return false end
             if clock_() - Capture.last_spam_key < 0.3 then return false end
             Capture.last_spam_key = clock_()
             ok = key_parry(true)
@@ -2381,12 +2402,12 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         -- read. With no key yet, do nothing and let prime_capture read the next
         -- real block. The "Auto press" capture mode restores the synthetic bootstrap.
         local hookmode = capture_method() ~= "getgc" and S.parry_mode ~= "Keypress"
-        if hookmode and Capture.mode ~= "Auto press" and not Core.cap then return false end
+        if hookmode and not Capture.auto() and not Core.cap then return false end
         -- no capture yet, or the last remote parry went unanswered (the capture
         -- may be stale): this parry is a native press, which parries by itself
         -- and takes / refreshes the capture on the way. Only in "Auto press" capture mode;
         -- getgc never goes "fresh" (it calls the game's own sender).
-        local fresh = hookmode and Capture.mode == "Auto press" and (not Core.cap or Core.misses >= 1)
+        local fresh = hookmode and Capture.auto() and (not Core.cap or Core.misses >= 1)
         if try_ability() then how = "ability"
         elseif S.parry_mode == "Keypress" or fresh then
             if not gate_open() or not canParryNow() then return false end
@@ -2752,9 +2773,26 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         -- whatever started it -- it comes down the moment the capture is in, or
         -- 0.5s after you leave the round. Namecall only (__namecall is
         -- exploit-side; the FireServer methods are the detectable ones).
-        if capture_method() ~= "getgc" and Capture.mode ~= "Auto press" then
+        if capture_method() ~= "getgc" and Capture.mode == "Spam" then
+            -- Spam: the hook stays up and F goes out every 0.1s; the game takes
+            -- the first press its own block cooldown allows, and that's read
             local was_up = (H.nc or H.fire) ~= nil
-            if arm(0.5) and not was_up then logp(("capture: %s hook up until your first real parry"):format(capture_method())) end
+            if arm(0.5) and not was_up then logp(("capture: spamming F until the remote is read (%s hook)"):format(capture_method())) end
+            if now - Capture.last_press >= 0.1 then
+                Capture.last_press = now
+                pressBlockKey()
+                if H.check then H.check() end
+            end
+            return
+        end
+        if capture_method() ~= "getgc" and Capture.mode ~= "Auto press" then
+            -- Your press / Auto parry: hook up until the first real parry --
+            -- yours, or (Auto parry) auto parry's own native press
+            local was_up = (H.nc or H.fire) ~= nil
+            if arm(0.5) and not was_up then
+                logp(("capture: %s hook up until %s"):format(capture_method(),
+                    Capture.mode == "Auto parry" and "auto parry's first press" or "your first real parry"))
+            end
             return
         end
         -- Synthetic-press bootstrap ("Auto press" capture mode): when no
@@ -3833,10 +3871,11 @@ CAP:AddToggle("OneParryCapture", {
     Tooltip = "Catches your first parry every time: also hooks FireServer while there's no capture (the game sends half its parries that way). That path only takes the game's real hash. Off = namecall only, which can take a few parries.",
     Callback = function(v) S.one_parry_capture = v end,
 })
-CAP:AddToggle("AutoPressCapture", {
-    Text = "Auto press capture", Default = false,
-    Tooltip = "The script presses block once itself to take the capture (synthetic input) instead of waiting for your own parry.",
-    Callback = function(v) Parry.Capture.mode = v and "Auto press" or "Your press" end,
+local CAPTURE_MODES = { ["Your press"] = "Your press", ["Auto parry"] = "Auto parry", ["Spam"] = "Spam", ["Safe press"] = "Auto press" }
+CAP:AddDropdown("AutoCaptureMode", {
+    Values = { "Your press", "Auto parry", "Spam", "Safe press" }, Default = "Your press", Text = "Auto capture",
+    Tooltip = "Your press: parry once yourself. Auto parry: auto parry presses F itself (a real parry) until the remote is read. Spam: presses F every 0.1s in a round / training until it's read. Safe press: one press when no ball is near. Presses use keypress (F), only while Roblox is focused.",
+    Callback = function(v) Parry.Capture.mode = CAPTURE_MODES[v] or "Your press" end,
 })
 Parry.onCapture = function(cap)
     Notify("Parry remote captured", cap.verified and "Real parry hash confirmed -- auto parry is armed."
