@@ -31,7 +31,7 @@
 
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.110"
+local SCRIPT_VERSION = "rewrite-0.5.111"
 
 -- ---------------------------------------------------------------------------
 -- Single instance.
@@ -5425,47 +5425,58 @@ IA:AddLabel("Ability key"):AddKeyPicker("InfAbilityKey", {
     Default = "None", Mode = "Toggle", Text = "Infinite ability", Callback = function() InfAbility.use() end,
 })
 
--- ----- Panel tab: the Training Mode server panel (0.5.110) -----
--- What the game's TrainingModeController sends from PlayerGui.
--- TrainingModeServerPanel (Bbs/Training dump), through the Net remotes in
--- Packages._Index.sleitnick_net@0.1.0.net (found by name: no require):
---   CustomModeResetPlayer(player)   the Reset button on a player
---   CustomModeTogglePlayer(player)  Add / Remove from the round queue
---   CustomModeStartMatch / CustomModeEndMatch
---   UpdateTrainingConfiguration({ key = value })  Difficulty, NumberOfBots
---     (0-10), GameMode, Respawn / BotsMove / AutoStart /
---     ChangeAbilitiesMiddleRound
--- OWNER ONLY: nothing is sent unless you're the server owner -- the game's
--- own ServerAdminAccess attribute, or its HasEditPermissions check
--- (ServerInfo.serverOwner, else the private server owner). The server checks
--- that itself; we just don't send what it would refuse.
--- Every action is a BUTTON: saved configs re-apply toggles / dropdowns at
--- load, and nothing here may fire a remote just because the script loaded.
+-- ----- Panel tab: the Training Mode server panel (0.5.110; 0.5.111) -----
+-- 0.5.110 fired the Net remotes by their readable names (RE/CustomModeReset
+-- Player...) and was KICKED on the first reset. Those are decoys: in the
+-- Training dump the Net folder has 551 readable-named remotes with 0
+-- listeners and 485 SHA-like hashed ones carrying all 138 listeners; the
+-- game reaches the real ones through Net:RemoteEvent(name), and the hashes
+-- share nothing between servers (3 dumps: 0 in common). So this never names
+-- a remote: it PRESSES THE GAME'S OWN PANEL BUTTONS (firesignal on their
+-- Activated, else each connection's :Fire()) -- TrainingModeController's
+-- handler then sends the real remote exactly as a click does:
+--   Start / End match   Frame.Server.StartRound / EndRound
+--   bots                Frame.Bots.BotIncrease / BotDecrease (Counter.Count "n/10")
+--   difficulty / mode   Frame.Bots.Difficulties.<name> / Frame.Game.Modes.<name>
+--   checkboxes          Frame.<group>.<box>.CheckFrame
+--   a player            PlayerPanel.Playing / NotPlaying row (Username "@name")
+--                       .Reset / .Toggle
+-- OWNER ONLY, as before: the game's ServerAdminAccess / HasEditPermissions.
+-- Every action is a button, so a loaded config never presses anything.
 local Panel = { sel = {}, spam = false, spam_for = 10, spam_every = 0.25, token = nil }
 local PANEL_PLACE = 15234596844
-function Panel.remote(name)
-    local ok, r = pcall(function()
-        return ReplicatedStorage.Packages._Index["sleitnick_net@0.1.0"].net:FindFirstChild("RE/" .. name)
-    end)
-    return ok and r or nil
-end
+function Panel.gui() return LocalPlayer.PlayerGui:FindFirstChild("TrainingModeServerPanel") end
 function Panel.owner()
     if LocalPlayer:GetAttribute("ServerAdminAccess") == true then return true end
-    local training = game.PlaceId == PANEL_PLACE or LocalPlayer.PlayerGui:FindFirstChild("TrainingModeServerPanel") ~= nil
+    local training = game.PlaceId == PANEL_PLACE or Panel.gui() ~= nil
     if not training then return false end
     local info = ReplicatedStorage:FindFirstChild("ServerInfo")
     local so = info and info:FindFirstChild("serverOwner")
     if so then return so.Value == LocalPlayer.UserId end
     return game.PrivateServerId ~= "" and game.PrivateServerOwnerId == LocalPlayer.UserId
 end
-function Panel.send(name, ...)
-    if not Panel.owner() then Notify("Panel", "You're not the owner of this training server.", 3); return false end
-    local r = Panel.remote(name)
-    if not r then Notify("Panel", "This server has no " .. name .. " (not a training server?).", 3); return false end
-    local ok = pcall(r.FireServer, r, ...)
-    return ok
+-- press a game button: its Activated handlers run as for a click
+function Panel.press(btn)
+    if typeof(btn) ~= "Instance" or not btn:IsA("GuiButton") then return false end
+    if type(firesignal) == "function" and pcall(firesignal, btn.Activated) then return true end
+    local ok, conns = pcall(getconnections, btn.Activated)
+    if not ok or type(conns) ~= "table" or #conns == 0 then return false end
+    for _, c in ipairs(conns) do pcall(function() c:Fire() end) end
+    return true
 end
-function Panel.config(t) return Panel.send("UpdateTrainingConfiguration", t) end
+-- the panel button at a path under the panel GUI, owner-checked
+function Panel.button(path)
+    if not Panel.owner() then Notify("Panel", "You're not the owner of this training server.", 3); return nil end
+    local gui = Panel.gui()
+    if not gui then Notify("Panel", "No training server panel here.", 3); return nil end
+    local node = gui
+    for _, part in ipairs(path) do
+        node = node and node:FindFirstChild(part)
+    end
+    if not node then Notify("Panel", "Couldn't find " .. table.concat(path, ".") .. " in the game's panel.", 3) end
+    return node
+end
+function Panel.click(path) local b = Panel.button(path); return b ~= nil and Panel.press(b) end
 -- the selected players still in the server
 function Panel.selected()
     local list = {}
@@ -5481,10 +5492,31 @@ function Panel.names()
     table.sort(list, function(a, b) return a:lower() < b:lower() end)
     return list
 end
+-- a player's row in the game's player panel (by its "@username" label)
+function Panel.row(plr)
+    local gui = Panel.gui()
+    local pp = gui and gui:FindFirstChild("PlayerPanel")
+    if not pp then return nil end
+    local want = "@" .. plr.Name
+    for _, list in ipairs({ pp:FindFirstChild("Playing"), pp:FindFirstChild("NotPlaying") }) do
+        for _, row in ipairs(list and list:GetChildren() or {}) do
+            local u = row:FindFirstChild("Username")
+            if u and u:IsA("TextLabel") and u.Text == want then return row end
+        end
+    end
+    return nil
+end
+function Panel.player_action(plr, which)
+    if not Panel.owner() then Notify("Panel", "You're not the owner of this training server.", 3); return false end
+    local row = Panel.row(plr)
+    local btn = row and row:FindFirstChild(which)
+    if not btn then return false end
+    return Panel.press(btn)
+end
 -- a panel checkbox's current state, read off the game's own panel UI
 function Panel.checked(path)
     local ok, v = pcall(function()
-        local f = LocalPlayer.PlayerGui.TrainingModeServerPanel.Frame
+        local f = Panel.gui().Frame
         for _, part in ipairs(path) do f = f[part] end
         return f.CheckFrame.CheckIcon.Visible
     end)
@@ -5494,17 +5526,32 @@ end
 function Panel.options(group, list)
     local names = {}
     pcall(function()
-        for _, c in ipairs(LocalPlayer.PlayerGui.TrainingModeServerPanel.Frame[group][list]:GetChildren()) do
+        for _, c in ipairs(Panel.gui().Frame[group][list]:GetChildren()) do
             if c:IsA("GuiButton") and c.Name ~= "Custom" then names[#names + 1] = c.Name end
         end
     end)
     table.sort(names)
     return names
 end
+function Panel.bot_count()
+    local ok, n = pcall(function() return tonumber(Panel.gui().Frame.Bots.Counter.Count.Text:match("^(%d+)")) end)
+    return ok and n or nil
+end
+-- step the game's +/- buttons to the wanted count (each press is one of its sends)
+function Panel.set_bots(want)
+    task.spawn(function()
+        for _ = 1, 12 do
+            local n = Panel.bot_count()
+            if not n or n == want then return end
+            if not Panel.click({ "Frame", "Bots", n < want and "BotIncrease" or "BotDecrease" }) then return end
+            task.wait(0.15)
+        end
+    end)
+end
 function Panel.reset_selected()
     local n = 0
     for _, plr in ipairs(Panel.selected()) do
-        if Panel.send("CustomModeResetPlayer", plr) then n = n + 1 else break end
+        if Panel.player_action(plr, "Reset") then n = n + 1 end
     end
     return n
 end
@@ -5534,29 +5581,27 @@ local function panel_status()
             or "Owner: no -- the server only takes these from its owner.")
     end)
 end
-PO:AddButton({ Text = "Start match", Func = function() Panel.send("CustomModeStartMatch") end })
-PO:AddButton({ Text = "End match", Func = function() Panel.send("CustomModeEndMatch") end })
+PO:AddButton({ Text = "Start match", Func = function() Panel.click({ "Frame", "Server", "StartRound" }) end })
+PO:AddButton({ Text = "End match", Func = function() Panel.click({ "Frame", "Server", "EndRound" }) end })
 PO:AddSlider("PanelBots", { Text = "Bots", Default = 1, Min = 0, Max = 10, Rounding = 0,
     Callback = function(v) Panel.bots = v end })
-PO:AddButton({ Text = "Set bots", Func = function() Panel.config({ NumberOfBots = Panel.bots or 1 }) end })
+PO:AddButton({ Text = "Set bots", Func = function() Panel.set_bots(Panel.bots or 1) end })
 local PanelDiff = PO:AddDropdown("PanelDifficulty", { Values = {}, Text = "Difficulty",
     Tooltip = "Filled from the game's panel -- press Refresh options if it's empty.",
     Callback = function(v) Panel.difficulty = v end })
 PO:AddButton({ Text = "Set difficulty", Func = function()
-    if Panel.difficulty then Panel.config({ Difficulty = Panel.difficulty }) end
+    if Panel.difficulty then Panel.click({ "Frame", "Bots", "Difficulties", Panel.difficulty }) end
 end })
 local PanelMode = PO:AddDropdown("PanelMode", { Values = {}, Text = "Game mode",
     Callback = function(v) Panel.mode = v end })
 PO:AddButton({ Text = "Set game mode", Func = function()
-    if Panel.mode then Panel.config({ GameMode = Panel.mode }) end
+    if Panel.mode then Panel.click({ "Frame", "Game", "Modes", Panel.mode }) end
 end })
--- the panel's checkboxes, flipped from what the game's panel shows (like its own buttons)
+-- the panel's checkboxes: pressing one flips it, as in the game's panel
 for _, cb in ipairs({ { "Respawn", { "Bots", "Respawn" } }, { "BotsMove", { "Bots", "Move" } },
         { "AutoStart", { "Server", "AutoStart" } }, { "ChangeAbilitiesMiddleRound", { "Game", "Abilitymidround" } } }) do
     PO:AddButton({ Text = "Toggle " .. cb[1], Func = function()
-        local cur = Panel.checked(cb[2])
-        if cur == nil then Notify("Panel", "Couldn't read " .. cb[1] .. " from the game's panel.", 3); return end
-        Panel.config({ [cb[1]] = not cur })
+        Panel.click({ "Frame", cb[2][1], cb[2][2], "CheckFrame" })
     end })
 end
 PO:AddButton({ Text = "Refresh options", Func = function()
@@ -5583,7 +5628,7 @@ end })
 PP2:AddButton({ Text = "Add / remove selected", Tooltip = "Adds or removes them from the round queue (the game won't toggle you).",
     Func = function()
         for _, plr in ipairs(Panel.selected()) do
-            if plr ~= LocalPlayer and not Panel.send("CustomModeTogglePlayer", plr) then break end
+            if plr ~= LocalPlayer then Panel.player_action(plr, "Toggle") end
         end
     end })
 PP2:AddToggle("PanelSpamReset", { Text = "Spam reset selected", Default = false,
