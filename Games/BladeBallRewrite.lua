@@ -31,7 +31,7 @@
 
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.112"
+local SCRIPT_VERSION = "rewrite-0.5.113"
 
 -- ---------------------------------------------------------------------------
 -- Single instance.
@@ -399,6 +399,9 @@ do
     }
     -- detection state (written by the detection features, read here)
     local Det = { infinity = false, deathslash = false, timehole = false, slashes = false, phantom_until = 0,
+        -- per ball (0.5.113): ball -> until when (weak keys: a removed ball drops out)
+        inf = setmetatable({}, { __mode = "k" }), death = setmetatable({}, { __mode = "k" }),
+        th_hold = setmetatable({}, { __mode = "k" }), timehole_on = false,
         tor = setmetatable({}, { __mode = "k" }), tor_fid = -1, tor_list = {} }
     Parry.S, Parry.SP, Parry.Det, Parry.targetNames, Parry.curveNames = S, SP, Det, TARGET_NAMES, CURVE_NAMES
 
@@ -528,8 +531,45 @@ do
         if not root or root:FindFirstChild('SingularityCape') or not canParryNow() then return nil end
         return root
     end
-    local function blocked_by_detection()
-        return Det.infinity or Det.deathslash or Det.timehole or Det.slashes or clock_() < Det.phantom_until
+    -- ABILITY DETECTION, PER BALL (0.5.113). Until then Infinity / Death Slash
+    -- set ONE global flag -- any ball anywhere in Infinity paused auto parry on
+    -- every ball, and a missed "off" message paused it for the rest of the
+    -- round -- and Time Hole / Slashes of Fury listened on the readable Net
+    -- names, which are decoys (never fire). Now, on the ball itself:
+    --   infinity    Remotes.InfinityBall(ball, on)  -- locked in an Infinity
+    --               aura; expires after 15s (the game's own effect lifetime)
+    --   death slash Remotes.DeathBall(ball, on); expires after 8s
+    --   time hole   the ball's IsInTimeHoleAOE attribute (halted in the area,
+    --               set by the server) or Remotes.TimeHoleHoldBall(ball, on)
+    -- (all from BallReplicationHandler, Bbs/Training dump). Slashes of Fury and
+    -- Phantom stay global: they're about you, not a ball.
+    local function ball_detected(ball)
+        if typeof(ball) ~= "Instance" or not ball.Parent then return nil end
+        local now = clock_()
+        local u = Det.inf[ball]
+        if u and now < u then return "infinity" end
+        u = Det.death[ball]
+        if u and now < u then return "death slash" end
+        if Det.timehole_on then
+            if ball:GetAttribute("IsInTimeHoleAOE") then return "time hole" end
+            u = Det.th_hold[ball]
+            if u and now < u then return "time hole" end
+        end
+        return nil
+    end
+    Det.ball_detected = ball_detected
+    -- with a ball: that ball only. Without one (auto spam start, status): any
+    -- live ball that's on us.
+    local function blocked_by_detection(ball)
+        if Det.slashes or clock_() < Det.phantom_until then return true end
+        if ball then return ball_detected(ball) ~= nil end
+        for _, name in ipairs({ "Balls", "TrainingBalls" }) do
+            local folder = Workspace:FindFirstChild(name)
+            for _, b in ipairs(folder and folder:GetChildren() or {}) do
+                if b:GetAttribute("realBall") and b:GetAttribute("target") == LocalPlayer.Name and ball_detected(b) then return true end
+            end
+        end
+        return false
     end
 
     -- ---------- window / lockout gate ----------
@@ -2488,7 +2528,7 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
     -- was never going to fly.
     local function decide(ball, st, root, now, via)
         if pass_busy(st, now) then DBG.held(st.landed and "this pass landed" or "already fired on this pass", now); return end
-        if blocked_by_detection() then DBG.held("ability detection", now); return end
+        if blocked_by_detection(ball) then DBG.held("ability detection: " .. (ball_detected(ball) or "you"), now); return end
         if Det.tornado(ball, now) then DBG.held("aerodynamic slash tornado", now); return end
         local vel = ball_velocity(ball)
         local speed = vel.Magnitude
@@ -2615,7 +2655,7 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
     end
 
     local function trigger(ball, st, now)
-        if pass_busy(st, now) or has_clash(ball, now) or blocked_by_detection() then return end
+        if pass_busy(st, now) or has_clash(ball, now) or blocked_by_detection(ball) then return end
         fire(st, now, "triggerbot", nil, ball)
     end
 
@@ -2626,7 +2666,7 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         end
         -- only when the Pre-parry toggles ask for it (never built in)
         if not (S.preparry or (S.hp_preparry and (Lag.avg or ping_s()) >= 0.08)) then return end
-        if not Core.cap or blocked_by_detection() then return end
+        if not Core.cap or blocked_by_detection(ball) then return end
         local target = st.target
         if type(target) ~= 'string' or target == '' or target == me then return end
         local their = character_root(target)
@@ -2669,7 +2709,7 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
     --   * a curve could make it fly up to TWICE that path (the old v36 rule):
     --     fire only if even that still lands before the parry runs out.
     function Core.fast_retarget(ball, st, root, now)
-        if pass_busy(st, now) or blocked_by_detection() or Det.tornado(ball, now) then return false end
+        if pass_busy(st, now) or blocked_by_detection(ball) or Det.tornado(ball, now) then return false end
         local speed = ball_velocity(ball).Magnitude
         if speed < 1 then return false end
         local bpos, adj = Core.ball_now(ball)
@@ -3924,45 +3964,52 @@ AB:AddToggle("CooldownProtection", {
 -- ----- Detection tab -----
 -- Each detection owns its listeners; they exist only while its toggle is on.
 local function get_remotes() return ReplicatedStorage:FindFirstChild("Remotes") end
-local function get_net()
-    local ok, net = pcall(function() return ReplicatedStorage.Packages._Index["sleitnick_net@0.1.0"].net end)
-    return ok and net or nil
-end
-local function is_local(player)
-    return player == LocalPlayer or player == LocalPlayer.Name or (typeof(player) == 'Instance' and player.Name == LocalPlayer.Name)
-end
 
 local DetInfinity = Feature("DetInfinity")
 DetInfinity.round_only = true -- game-signal listeners: rounds only (lobby kick)
 function DetInfinity.start()
     local R = get_remotes()
     if R and R:FindFirstChild("InfinityBall") then
-        DetInfinity:connect(R.InfinityBall.OnClientEvent, function(_, b) Det.infinity = b and true or false end)
+        -- (ball, on, fx): the ball locked in place by an Infinity aura
+        DetInfinity:connect(R.InfinityBall.OnClientEvent, function(ball, on)
+            if typeof(ball) == "Instance" then Det.inf[ball] = on and (clock_() + 15) or nil end
+        end)
     end
 end
-function DetInfinity.stop() Det.infinity = false end
+function DetInfinity.stop() table.clear(Det.inf) end
 
 local DetDeathSlash = Feature("DetDeathSlash")
 DetDeathSlash.round_only = true -- game-signal listeners: rounds only (lobby kick)
 function DetDeathSlash.start()
     local R = get_remotes()
     if R and R:FindFirstChild("DeathBall") then
-        DetDeathSlash:connect(R.DeathBall.OnClientEvent, function(_, d) Det.deathslash = d and true or false end)
+        DetDeathSlash:connect(R.DeathBall.OnClientEvent, function(ball, on)
+            if typeof(ball) == "Instance" then Det.death[ball] = on and (clock_() + 8) or nil end
+        end)
     end
 end
-function DetDeathSlash.stop() Det.deathslash = false end
+function DetDeathSlash.stop() table.clear(Det.death) end
 
 local DetTimeHole = Feature("DetTimeHole")
 DetTimeHole.round_only = true -- game-signal listeners: rounds only (lobby kick)
 function DetTimeHole.start()
-    local net = get_net()
-    if not net then return end
-    pcall(function() DetTimeHole:connect(net["RE/TimeHoleActivate"].OnClientEvent, function(p) if is_local(p) then Det.timehole = true end end) end)
-    pcall(function() DetTimeHole:connect(net["RE/TimeHoleDeactivate"].OnClientEvent, function() Det.timehole = false end) end)
+    -- the ball's IsInTimeHoleAOE attribute is read per check (no listener);
+    -- TimeHoleHoldBall is a plain Remotes event, not a hashed Net one
+    Det.timehole_on = true
+    local R = get_remotes()
+    if R and R:FindFirstChild("TimeHoleHoldBall") then
+        DetTimeHole:connect(R.TimeHoleHoldBall.OnClientEvent, function(ball, on)
+            if typeof(ball) == "Instance" then Det.th_hold[ball] = on and (clock_() + 15) or nil end
+        end)
+    end
 end
-function DetTimeHole.stop() Det.timehole = false end
+function DetTimeHole.stop() Det.timehole_on = false; table.clear(Det.th_hold) end
 
--- Slashes of Fury: while it's on you, parry it out (spam path), capped and paced.
+-- Slashes of Fury (yours): while the server has your character in the fury
+-- (its FuryCatch attribute -- what the game's own SoF script watches), parry
+-- the slashes out (spam path), paced, up to 36 (the game's combo counter
+-- tops out around 35). Until 0.5.113 this listened on the readable Net
+-- names, which are decoys and never fire.
 local Slashes = { delay = 0.05, max = 36, count = 0, looping = false }
 local DetSlashes = Feature("DetSlashes")
 DetSlashes.round_only = true -- game-signal listeners: rounds only (lobby kick)
@@ -3972,7 +4019,7 @@ local function run_slashes()
     local token = DetSlashes._token
     task.spawn(function()
         local sent = 0
-        while DetSlashes:alive(token) and Det.slashes and sent < Slashes.max and Slashes.count < Slashes.max and LocalPlayer.Character do
+        while DetSlashes:alive(token) and Det.slashes and sent < Slashes.max and LocalPlayer.Character do
             Parry.spamParry()
             sent = sent + 1
             task.wait(Slashes.delay)
@@ -3980,17 +4027,19 @@ local function run_slashes()
         Slashes.looping = false
     end)
 end
+local function watch_fury(char)
+    if not char then return end
+    local function update()
+        local on = char:GetAttribute("FuryCatch") and true or false
+        if on and not Det.slashes then Det.slashes, Slashes.count = true, 0; run_slashes()
+        elseif not on then Det.slashes = false end
+    end
+    DetSlashes:connect(char:GetAttributeChangedSignal("FuryCatch"), update)
+    update()
+end
 function DetSlashes.start()
-    local net = get_net()
-    if not net then return end
-    pcall(function() DetSlashes:connect(net["RE/SlashesOfFuryActivate"].OnClientEvent, function(p)
-        if is_local(p) then Det.slashes, Slashes.count = true, 0; run_slashes() end
-    end) end)
-    pcall(function() DetSlashes:connect(net["RE/SlashesOfFuryEnd"].OnClientEvent, function()
-        Det.slashes, Slashes.count, Slashes.looping = false, 0, false
-    end) end)
-    pcall(function() DetSlashes:connect(net["RE/SlashesOfFuryParry"].OnClientEvent, function() Slashes.count = Slashes.count + 1 end) end)
-    pcall(function() DetSlashes:connect(net["RE/SlashesOfFuryCatch"].OnClientEvent, function() run_slashes() end) end)
+    watch_fury(LocalPlayer.Character)
+    DetSlashes:connect(LocalPlayer.CharacterAdded, function(char) Det.slashes = false; watch_fury(char) end)
 end
 function DetSlashes.stop() Det.slashes, Slashes.count, Slashes.looping = false, 0, false end
 
