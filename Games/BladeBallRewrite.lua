@@ -31,7 +31,7 @@
 
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.114"
+local SCRIPT_VERSION = "rewrite-0.5.115"
 
 -- ---------------------------------------------------------------------------
 -- Single instance.
@@ -370,6 +370,10 @@ do
     local me = LocalPlayer.Name
     local Core = { cap = nil, pending = nil, misses = 0, interp = 0.14, last_parry = nil,
         ctx = "match", gen = 0, last_send_at = -math.huge, tune = 0, verdict = nil,
+        -- attempt answers + timing diagnostics (0.5.115, see Parry.onAttempt)
+        echo = { at = -math.huge, forged_ok = false, rtt = nil, seen = 0 }, await = nil,
+        last_spam_at = -math.huge, cap_n = 0,
+        diag = { fired = 0, landed = 0, early = 0, late = 0, ontime = 0, refused = 0, rescued = 0, bias = nil, spread = 0, n = 0 },
         feed = { n = 0, total = 0, since = 0, ahead = nil, urs = 0,
             pos = setmetatable({}, { __mode = "k" }), at = setmetatable({}, { __mode = "k" }) } }
     local G = { until_t = 0, m1 = false, m1_at = 0 }
@@ -384,7 +388,7 @@ do
 
     local S = {
         autoparry = false, triggerbot = false, parry_mode = "Remote",
-        one_parry_capture = true, preparry = false, preparry_range = 20, hp_preparry = false, hard_curve = false, self_tune = false, fast_retarget = false,
+        one_parry_capture = true, rescue_press = true, preparry = false, preparry_range = 20, hp_preparry = false, hard_curve = false, self_tune = false, fast_retarget = false,
         anticurve = "Smart", dot_threshold = 0.5, curve_bias = 0.5, close_anticurve = true, close_range = 30, instant_retarget = true,
         accuracy = 50, accuracy_base = 50, divisor_multiplier = 1.1, timing_mult = 1,
         extra_distance = 0, ping_compensation = false, retry_delay = 1,
@@ -460,21 +464,44 @@ do
         local now = clock_()
         if now - ping_cache.at > 0.05 then
             local ok, ping = pcall(function() return Stats.Network.ServerStatsItem['Data Ping']:GetValue() end)
-            ping_cache.ms, ping_cache.at = ok and ping or 0, now
+            ping = ok and tonumber(ping) or 0
+            if ping <= 0 then
+                -- the Stats item reads 0 for a while on some clients: the
+                -- player's own network ping (one way, seconds) stands in
+                local ok2, np = pcall(LocalPlayer.GetNetworkPing, LocalPlayer)
+                if ok2 and type(np) == "number" and np > 0 then ping = np * 2000 end
+            end
+            ping_cache.ms, ping_cache.at = ping, now
         end
         return ping_cache.ms
     end
     Parry.pingMs = pingMs
     local function ping_s() return math.min(pingMs(), 400) / 1000 end
-    local Lag = { avg = nil, jit = 0.005, at = -1 }
+    -- LATENCY (0.5.115). A 3s window of ping samples (one every 0.1s):
+    --   avg    the MEDIAN -- one spike (a hitch, a burst of packets) no longer
+    --          drags the estimate up for the next second like the old average
+    --   jit    the larger of the smoothed deviation and (90th percentile -
+    --          median): sustained jitter is covered, a lone spike isn't
+    -- Lag.echo is the measured round trip of our own parries (send -> the
+    -- server's attempt answer), shown in the timing diagnostics.
+    local Lag = { avg = nil, jit = 0.005, at = -1, win = {}, dev = 0.005, echo = nil }
     local function sample_lag()
         local now = clock_()
         if now - Lag.at < 0.1 then return end
         Lag.at = now
         local p = ping_s()
-        if not Lag.avg then Lag.avg = p; return end
-        Lag.jit = Lag.jit + (math.abs(p - Lag.avg) - Lag.jit) * 0.15
-        Lag.avg = Lag.avg + (p - Lag.avg) * 0.3
+        if p <= 0 then return end
+        local w = Lag.win
+        w[#w + 1] = p
+        if #w > 30 then table.remove(w, 1) end
+        local sorted = table.clone(w)
+        table.sort(sorted)
+        local n = #sorted
+        local med = sorted[math.ceil(n * 0.5)]
+        local p90 = sorted[math.max(math.ceil(n * 0.9), 1)]
+        Lag.dev = Lag.dev + (math.abs(p - med) - Lag.dev) * 0.15
+        Lag.avg = med
+        Lag.jit = math.max(Lag.dev, (p90 - med) * 0.5)
     end
     local function jitter() return math.clamp(Lag.jit * 2, 0.005, 0.12) end
     -- seconds from "fire now" until the parry is up, in the timeline of the ball we see.
@@ -544,7 +571,7 @@ do
     --               set by the server) or Remotes.TimeHoleHoldBall(ball, on)
     -- (all from BallReplicationHandler, Bbs/Training dump). Slashes of Fury and
     -- Phantom stay global: they're about you, not a ball.
-    local function ball_detected(ball)
+    function Det.ball_detected(ball)
         if typeof(ball) ~= "Instance" or not ball.Parent then return nil end
         local now = clock_()
         local u = Det.inf[ball]
@@ -558,16 +585,15 @@ do
         end
         return nil
     end
-    Det.ball_detected = ball_detected
     -- with a ball: that ball only. Without one (auto spam start, status): any
     -- live ball that's on us.
     local function blocked_by_detection(ball)
         if Det.slashes or clock_() < Det.phantom_until then return true end
-        if ball then return ball_detected(ball) ~= nil end
+        if ball then return Det.ball_detected(ball) ~= nil end
         for _, name in ipairs({ "Balls", "TrainingBalls" }) do
             local folder = Workspace:FindFirstChild(name)
             for _, b in ipairs(folder and folder:GetChildren() or {}) do
-                if b:GetAttribute("realBall") and b:GetAttribute("target") == LocalPlayer.Name and ball_detected(b) then return true end
+                if b:GetAttribute("realBall") and b:GetAttribute("target") == LocalPlayer.Name and Det.ball_detected(b) then return true end
             end
         end
         return false
@@ -579,11 +605,11 @@ do
     -- scaled by kills / 20 on casual servers until 20 kills. The server checks
     -- it; until 0.5.101 forged parries always said 0.5. Now: the number the
     -- captured packet carried (0.5.103: read off the packet, no Replion require).
-    local NOOB_WINDOWS = { [1.5] = 0, [1.25] = 1, [1] = 2, [0.75] = 3, [0.625] = 4 }
+    Core.noob_windows = { [1.5] = 0, [1.25] = 1, [1] = 2, [0.75] = 3, [0.625] = 4 }
     -- your first-5 noob parry index, when the captured window says so
     function Parry.timesParried()
         local w = Core.cap and Core.cap.win
-        return w and NOOB_WINDOWS[w] or nil
+        return w and Core.noob_windows[w] or nil
     end
     local function parry_window()
         local cw = Core.cap and Core.cap.win
@@ -884,11 +910,11 @@ do
     -- blanks _G.BAC_HASH / BAC_FAKE_1 / BAC_FAKE_2 to "" once the sender has
     -- them (both dumps' GLOBALS), so Core.bac() above reads nothing in a live
     -- server. These are used ONLY to confirm, never to send: a packet on the
-    -- plain-call path is taken only if it carries exactly KNOWN_REAL, and the
+    -- plain-call path is taken only if it carries exactly Core.known_real, and the
     -- known decoys are always refused. After a game update that changes the
     -- hash, nothing on that path matches -> namecall-only, as before.
-    local KNOWN_REAL = "5455ef47-de02-4074-808c-8d82c2cd12ec"
-    local KNOWN_FAKES = { ["90fa5062-066f-4376-b9e9-8adc47fbd983"] = true, ["2983784e-7f10-4278-a8d1-259db4906a2b"] = true }
+    Core.known_real = "5455ef47-de02-4074-808c-8d82c2cd12ec"
+    Core.known_fakes = { ["90fa5062-066f-4376-b9e9-8adc47fbd983"] = true, ["2983784e-7f10-4278-a8d1-259db4906a2b"] = true }
 
     local H = { fire = nil, nc = nil, want = false, until_t = 0 }
 
@@ -939,9 +965,26 @@ do
         local key = {}
         for i = 1, #text do key[i] = bxor_(byte_(token, i), (byte_(text, i) + i) % 256) end
         local prev = Core.cap
+        Core.cap_n = Core.cap_n + 1
         Core.cap = { remote = remote, hash = hash, uid = uid, key = key, len = #text, ball2 = typeof_(a4) == "CFrame",
-            verified = Core.bac() == hash or hash == KNOWN_REAL,
+            verified = Core.bac() == hash or hash == Core.known_real, id = Core.cap_n,
             win = type_(a4) == "number" and a4 or nil }
+        -- THE SECOND KEY (0.5.115). The key is worked out against the server
+        -- time the HOOK read; the sender read its own a moment earlier. When a
+        -- centisecond ticked in between, the key's last byte(s) come out wrong
+        -- and every forged parry carries a bad token: the swing plays, the
+        -- server ignores it -- "animation, no parry" on that capture only. The
+        -- key for one centisecond earlier is kept; if the server doesn't
+        -- answer this capture's first parry, it's swapped in (Core.refused).
+        local text2 = tostring_(floor_(t * 100) - 1)
+        if #text2 == #token then
+            local alt, differs = {}, false
+            for i = 1, #text2 do
+                alt[i] = bxor_(byte_(token, i), (byte_(text2, i) + i) % 256)
+                if alt[i] ~= key[i] then differs = true end
+            end
+            if differs then Core.cap.alt_key = alt end
+        end
         Core.misses, Core.pending = 0, nil
         Core.new_capture = { prev = prev }
         if Parry.onCapture then task.defer(pcall, Parry.onCapture, Core.cap) end
@@ -958,11 +1001,11 @@ do
         -- could be a FAKE packet -- then every forged parry carried the fake
         -- hash: animation, no parry, in some captures and not others
         local real, f1, f2 = Core.bac()
-        if a1 == f1 or a1 == f2 or KNOWN_FAKES[a1] then return false end
+        if a1 == f1 or a1 == f2 or Core.known_fakes[a1] then return false end
         if real and a1 ~= real then return false end
         -- the plain-call path carries the decoys too: the real hash confirmed --
         -- by the game's _G, or (blanked at runtime) the one in PRY's source -- or nothing
-        if entry[5] == "fire" and not (a1 == (real or KNOWN_REAL)) then return false end
+        if entry[5] == "fire" and not (a1 == (real or Core.known_real)) then return false end
         if typeof_(self) == 'Instance' and self.ClassName == 'RemoteEvent'
             and type_(a1) == 'string' and #a1 == 36 and a1 ~= JOB_ID and type_(a2) == 'string' and type_(a3) == 'string'
             and ((type_(a4) == 'number' and typeof_(a5) == 'CFrame') or (typeof_(a4) == 'CFrame' and typeof_(a5) == 'CFrame')) then
@@ -1743,7 +1786,8 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         else
             r:FireServer(cap.hash, cap.uid, tok, window, cf, points, aim, false)
         end
-        if not spam then Core.pending = clock_() + window + ping_s() + 0.25; cap.sent = (cap.sent or 0) + 1 end
+        if not spam then Core.pending = clock_() + window + ping_s() + 0.25; cap.sent = (cap.sent or 0) + 1
+        else Core.last_spam_at = Core.last_send_at end
         return "sent"
     end
 
@@ -1813,7 +1857,11 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         if not s then st.spd = { t = now, v = speed, a = 0 }; return 0 end
         local dt = now - s.t
         if dt >= 0.08 then
-            s.a = s.a * 0.5 + ((speed - s.v) / dt) * 0.5
+            -- a JUMP (an ability, a server correction: +25% or more inside one
+            -- sample) is a new speed, not an acceleration -- read as one it
+            -- predicted the ball far sooner than it came (0.5.115)
+            if speed > s.v * 1.25 or speed < s.v * 0.75 then s.a = 0
+            else s.a = s.a * 0.5 + ((speed - s.v) / dt) * 0.5 end
             s.t, s.v = now, speed
         end
         return math.clamp(s.a, 0, speed * 4)
@@ -1831,7 +1879,6 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
     -- checks the latest against the model-free closing-speed estimate, so a
     -- gain it hasn't measured right yet can't make it fire late.
     local K_DEFAULT, K_MIN, K_MAX = 5, 0.8, 40
-    local W_DEFAULT, W_MIN = 4, 1
     local SIM_DT = 1 / 120
     local function track_homing(st, dir, want, dist, now)
         local h = st.hm
@@ -1855,7 +1902,21 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
             local th = (math.acos(math.clamp(h.dir:Dot(h.want), -1, 1)) + math.acos(math.clamp(dir:Dot(want), -1, 1))) * 0.5
             local perp = h.want - h.dir * h.dir:Dot(h.want)
             local toward = perp.Magnitude < 1e-4 or (dir - h.dir):Dot(perp) >= 0
-            if turned > 2e-3 then
+            -- SUDDEN TURN (0.5.115): 20+ degrees inside one sample, and well
+            -- past what its homing has been turning at (3x + 4 rad/s) or away
+            -- from us -- a re-aim, an ability, a teleported ball. Everything
+            -- measured before it describes a path it's no longer on: the gain,
+            -- its scatter, "swinging away" and the closing samples start
+            -- over, and decide() guards the next 0.15s at the hardest turn.
+            local expect = (h.k or K_DEFAULT) * math.max(math.sin(th), 0.15)
+            local snap = turned > 0.35 and (not toward or omega > expect * 3 + 4)
+            if snap then
+                h.k, h.kn, h.kspread, h.w, h.away = nil, 0, nil, nil, false
+                h.samples, h.snap_at = {}, now
+                st.k_mem = nil
+                if DBG.on then DBG.ev(("sudden turn: %.0f deg in %.0fms -- curve tracking restarted"):format(math.deg(turned), dt * 1000)) end
+            end
+            if turned > 2e-3 and not snap then
                 if toward then
                     h.away = false
                     h.w = h.w and math.max(h.w * 0.5 + omega * 0.5, omega * 0.85) or omega
@@ -2335,8 +2396,7 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
     -- per tick only queue behind each other. While the spam ball is that fast,
     -- every spam mode is paced to Sends per tick x 60/s -- evenly, so each tick
     -- still gets a fresh parry -- and goes back to your setting below that.
-    local SERVER_HZ = 60
-    local function spam_ball_speed()
+    function SP.ball_speed()
         local b = AutoSpam.ball
         if b and b.Parent then return ball_velocity(b).Magnitude end
         local best = 0
@@ -2345,12 +2405,12 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         end
         return best
     end
-    local function high_speed() return SP.hs_fix and spam_ball_speed() >= (SP.hs_speed or 400) end
+    function SP.high_speed() return SP.hs_fix and SP.ball_speed() >= (SP.hs_speed or 400) end
     -- Per frame (toggle, or the old "Per frame" method): Count parries every
     -- frame instead of a rate -- your FPS x Count a second (not while the high
     -- speed fix is pacing: that's a rate)
-    local function per_frame() return (SP.per_frame or SP.method == "Per frame") and not high_speed() end
-    local function frame_burst()
+    function SP.per_frame_on() return (SP.per_frame or SP.method == "Per frame") and not SP.high_speed() end
+    function SP.frame_burst()
         local n = math.clamp(math.floor(tonumber(SP.per_frame_count) or 1), 1, 20)
         if SP.mode == "Keypress" then n = 1 end
         local sent = false
@@ -2385,9 +2445,9 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         if SP.method == "Ping adaptive" then
             rate = math.min(rate, math.max(60, 12 / math.max(ping_s(), 0.02)))
         end
-        if high_speed() then
+        if SP.high_speed() then
             -- per tick x 60; a slower Speed / interval stays as you set it
-            rate = math.min(rate, SERVER_HZ * math.clamp(math.floor(SP.hs_per_tick or 2), 1, 6))
+            rate = math.min(rate, 60 * math.clamp(math.floor(SP.hs_per_tick or 2), 1, 6))
         end
         return rate
     end
@@ -2403,12 +2463,12 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         if source == "manual" and SP.smart and not focus then Pump.on, Pump.waiting = false, true; return end
         Pump.waiting = false
         if SP.method == "On ball" and not SP.on_ball_now() then Pump.on = false; return end
-        if per_frame() then
+        if SP.per_frame_on() then
             -- Count a frame, at its first point; no bucket
             if point == 1 then
                 Pump.on, Pump.sent = true, nil -- the bucket restarts fresh if pacing takes over
                 if Pump.fired_frame ~= Pump.frame then Pump.fired_frame, Pump.frame_fires = Pump.frame, 0 end
-                if frame_burst() and Pump.remote_sent then Anim.spamBlock() end
+                if SP.frame_burst() and Pump.remote_sent then Anim.spamBlock() end
                 Pump.remote_sent = false
             end
             return
@@ -2442,7 +2502,7 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         local source = current_source(clock_())
         if not source or not LocalPlayer.Character then return end
         if source == "manual" and SP.smart and not spam_focus() then return end
-        if per_frame() then
+        if SP.per_frame_on() then
             -- at most this frame's Count (an instant fire uses one of them)
             if Pump.fired_frame ~= Pump.frame then Pump.fired_frame, Pump.frame_fires = Pump.frame, 0 end
             local n = (SP.mode == "Keypress") and 1 or math.clamp(math.floor(tonumber(SP.per_frame_count) or 1), 1, 20)
@@ -2493,25 +2553,37 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         -- read. With no key yet, do nothing and let prime_capture read the next
         -- real block. The "Auto press" capture mode restores the synthetic bootstrap.
         local hookmode = capture_method() ~= "getgc" and S.parry_mode ~= "Keypress"
-        if hookmode and not Capture.auto() and not Core.cap then return false end
         -- no capture yet, or the last remote parry went unanswered (the capture
         -- may be stale): this parry is a native press, which parries by itself
         -- and takes / refreshes the capture on the way. Only in "Auto press" capture mode;
         -- getgc never goes "fresh" (it calls the game's own sender).
+        -- RESCUE (0.5.115): the server didn't answer this pass's remote parry
+        -- (Core.refused) -- this one is a native press, a real parry, which
+        -- also takes a fresh capture when the old one was dropped
+        local rescue = st.rescue and S.rescue_press and S.parry_mode ~= "Keypress"
+        if hookmode and not Capture.auto() and not Core.cap and not rescue then return false end
         local fresh = hookmode and Capture.auto() and (not Core.cap or Core.misses >= 1)
         if try_ability() then how = "ability"
-        elseif S.parry_mode == "Keypress" or fresh then
+        elseif S.parry_mode == "Keypress" or fresh or rescue then
             if not gate_open() or not canParryNow() then return false end
-            key_parry(fresh); gate_start()
-            how = not fresh and "key" or (Core.cap and "key, refreshing capture" or "key, capturing")
+            local capturing = fresh or (rescue and not Core.cap)
+            key_parry(capturing); gate_start()
+            how = rescue and "key, rescue" or (not fresh and "key" or (Core.cap and "key, refreshing capture" or "key, capturing"))
+            if rescue then st.rescue = nil; Core.diag.rescued = Core.diag.rescued + 1 end
         else
             if send(false) ~= "sent" then return false end
             how = "remote"
+            -- wait for the server's attempt answer to this one (Parry.frame)
+            local t_send = clock_()
+            Core.await = { t = t_send, ball = ball, st = st, cap = Core.cap, spam_at = Core.last_spam_at,
+                gap = t_send - (Core.last_single_at or -math.huge) }
+            Core.last_single_at = t_send
             -- getgc calls the game's own parry handler, which plays the real
             -- swing; only a forged remote parry needs our animation
             if capture_method() ~= "getgc" then Anim.block() end
         end
         Core.last_parry = { t = now, via = via, info = info }
+        Core.diag.fired = Core.diag.fired + 1
         if DBG.on then
             DBG.ev(info and ("FIRE %s [%s] d %.0f spd %.0f eta %.2f lead %.2f"):format(via, how, info.dist or 0,
                 info.speed or 0, math.min(info.eta or 0, 9.99), info.lead or 0) or ("FIRE %s [%s]"):format(via, how))
@@ -2523,6 +2595,7 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         local root = getRoot()
         Core.watch = ball and root and { ball = ball, t = now, how = how, d0 = (ball.Position - root.Position).Magnitude,
             min_d = math.huge, min_t = now, ping = ping_s(), W = parry_window() or 0.5, lead = info and info.lead,
+            eta = info and info.eta,
             cap = how == "remote" and Core.cap or nil } or nil
         mark_parried(st, now)
         if info then
@@ -2579,7 +2652,7 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
     -- was never going to fly.
     local function decide(ball, st, root, now, via)
         if pass_busy(st, now) then DBG.held(st.landed and "this pass landed" or "already fired on this pass", now); return end
-        if blocked_by_detection(ball) then DBG.held("ability detection: " .. (ball_detected(ball) or "you"), now); return end
+        if blocked_by_detection(ball) then DBG.held("ability detection: " .. (Det.ball_detected(ball) or "you"), now); return end
         if Det.tornado(ball, now) then DBG.held("aerodynamic slash tornado", now); return end
         local vel = ball_velocity(ball)
         local speed = vel.Magnitude
@@ -2603,7 +2676,13 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         local must_by = reach + safe_margin() + math.max(tune, 0)
         local lead = math.max(reach + cushion_for(speed, W) + tune, must_by)
         local half = frame_dt * 0.5
-        local t_min = time_to_contact(dist, gap, speed, accel)
+        -- the CLOSING speed, not the ball's alone (0.5.115): running at the
+        -- ball it lands sooner, running from it later -- 16-30 studs/s of your
+        -- own is a fifth of a slow ball's speed, and the straight time ignored
+        -- it (the curve sims already moved you). Kept within half / 1.5x.
+        local mv = root.AssemblyLinearVelocity
+        local close_spd = math.clamp(speed - Vector3.new(mv.X, 0, mv.Z):Dot(want), speed * 0.5, speed * 1.5)
+        local t_min = time_to_contact(dist, gap, close_spd, accel)
         local info = { speed = speed, dist = dist, heading = heading, lead = lead, eta = t_min }
         if DBG.on then
             local e = DBG.eval
@@ -2665,7 +2744,9 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         local rv = root.AssemblyLinearVelocity
         local tvel = Vector3.new(rv.X, 0, rv.Z)
         if tvel.Magnitude < 1 then tvel = nil end
-        local k_fast = S.hard_curve and K_MAX or math.min(km_hi * 1.25, K_MAX)
+        -- just after a sudden turn the gain is unknown: guard at the hardest
+        local snapped = h.snap_at and now - h.snap_at < 0.15
+        local k_fast = (S.hard_curve or snapped) and K_MAX or math.min(km_hi * 1.25, K_MAX)
         local fast = math.max(sim_prop(bpos, v, rpos, gap, k_fast, accel, must_by + 0.05, tvel) or math.huge, t_min)
         info.fast = fast
         if info.dbg then info.dbg.fast = fast end
@@ -3055,6 +3136,25 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
                 Core.ctx = ctx
                 Core.misses, Core.pending, Core.watch = 0, nil, nil
             end
+            -- the server's answer to the last single remote parry (Parry.onAttempt)
+            local aw = Core.await
+            if aw then
+                local E = Core.echo
+                -- not checkable: answers never seen for remote parries, another
+                -- capture since, spam around it or a parry just before it (the
+                -- server may still be in its own cooldown and answer nothing)
+                local fair = E.forged_ok and aw.cap == Core.cap and aw.t - aw.spam_at > 1.5
+                    and Core.last_spam_at <= aw.spam_at and (aw.gap or math.huge) > 1.45
+                if not fair then
+                    if now - aw.t > 1 then Core.await = nil end
+                else
+                    local limit = math.max((E.rtt or ping_s()) * 2 + 0.03, ping_s() * 1.5 + jitter() * 2 + frame_dt * 2 + 0.06)
+                    if now - aw.t > limit then
+                        Core.await = nil
+                        Core.refused(aw, now, now - aw.t)
+                    end
+                end
+            end
             local w = Core.watch
             if w then
                 local root = getRoot()
@@ -3067,6 +3167,12 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
                 Core.pending, Core.misses = nil, Core.misses + 1
                 Core.verdict = nil
                 logp(miss_verdict(Core.watch))
+                do -- timing diagnostics: which way it missed
+                    local D = Core.diag
+                    if Core.verdict then
+                        if Core.verdict > 0 then D.late = D.late + 1 else D.early = D.early + 1 end
+                    elseif Core.watch and Core.watch.min_d <= 15 then D.ontime = D.ontime + 1 end
+                end
                 -- a capture carried onto a new hash that the server won't answer
                 if Core.cap and Core.cap.adopted and Core.misses >= 2 then
                     Core.cap = nil
@@ -3100,12 +3206,33 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         if S.autoparry or S.triggerbot then
             local root = ap_root()
             if root then
+                -- SEVERAL BALLS (0.5.115): the ones on us are taken soonest
+                -- first (straight time to us), not in folder order -- one parry
+                -- at a time can go out, and it went to whichever ball the
+                -- folder listed first, even when another was about to land.
+                local mine
                 for _, ball in ipairs(get_live_balls()) do
                     local st = get_ball_state(ball)
                     if st.target == me then
-                        if S.triggerbot then trigger(ball, st, now) else decide(ball, st, root, now) end
+                        if not mine then mine = { ball, st }
+                        else
+                            if not mine.list then mine = { list = { { ball = mine[1], st = mine[2] } } } end
+                            mine.list[#mine.list + 1] = { ball = ball, st = st }
+                        end
                     else
                         try_preparry(ball, st, root, now)
+                    end
+                end
+                if mine and not mine.list then
+                    if S.triggerbot then trigger(mine[1], mine[2], now) else decide(mine[1], mine[2], root, now) end
+                elseif mine then
+                    local rp = root.Position
+                    for _, e in ipairs(mine.list) do
+                        e.eta = (Core.ball_now(e.ball) - rp).Magnitude / math.max(ball_velocity(e.ball).Magnitude, 1)
+                    end
+                    table.sort(mine.list, function(x, y) return x.eta < y.eta end)
+                    for _, e in ipairs(mine.list) do
+                        if S.triggerbot then trigger(e.ball, e.st, now) else decide(e.ball, e.st, root, now) end
                     end
                 end
             end
@@ -3178,6 +3305,101 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         end
         return list
     end
+    -- THE SERVER'S ATTEMPT ANSWER (0.5.115). For every parry attempt it takes,
+    -- the server sends ParryAttempt to that player and ParryAttemptAll(part,
+    -- character) to everyone (ClientFX welds the swing effect to the torso,
+    -- Bbs/Training dump). A forged parry the server REFUSES -- a bad key, a
+    -- dead uid -- gets no answer. So after each single remote parry we wait
+    -- about one round trip for it (Parry.frame): no answer = the capture is bad,
+    -- known one parry in instead of after two deaths.
+    --   * Only trusted once an answer to a REMOTE parry has been seen at all
+    --     (remembered in BladeBall/echo.txt): if the server ever stops
+    --     answering forged parries, nothing here changes how it plays.
+    --   * It also gives the real round trip of our parries (Lag.echo).
+    pcall(function()
+        if isfile and isfile("BladeBall/echo.txt") and readfile("BladeBall/echo.txt") == "1" then Core.echo.forged_ok = true end
+    end)
+    function Parry.onAttempt(who)
+        if who ~= nil and who ~= LocalPlayer.Character then return end
+        local E, now = Core.echo, clock_()
+        E.at, E.seen = now, E.seen + 1
+        local aw = Core.await
+        if not aw then return end
+        Core.await = nil
+        local rtt = now - aw.t
+        -- only an answer inside a plausible round trip is THIS parry's
+        if rtt < 0 or rtt > ping_s() * 2.5 + 0.12 then return end
+        E.rtt = E.rtt and (E.rtt * 0.7 + rtt * 0.3) or rtt
+        Lag.echo = E.rtt
+        if aw.cap then aw.cap.taken, aw.cap.refused_row = (aw.cap.taken or 0) + 1, 0 end
+        if not E.forged_ok then
+            E.forged_ok = true
+            logp(("the server answers remote parry attempts (%.0fms round trip): captures are checked on every parry from now on"):format(rtt * 1000))
+            pcall(function()
+                if makefolder and isfolder and not isfolder("BladeBall") then makefolder("BladeBall") end
+                if writefile then writefile("BladeBall/echo.txt", "1") end
+            end)
+        end
+    end
+    -- A single remote parry the server didn't answer. In order:
+    --   1. the capture's SECOND KEY, once (see learn)
+    --   2. two unanswered in a row: the capture is dropped -- the hook goes back
+    --      up for your next real parry (or the auto capture mode takes one)
+    -- and, either way, THIS pass is reopened (the server never saw that parry,
+    -- so it started no cooldown) and with Rescue press on it's parried by a
+    -- native F press at its normal moment -- a real parry, which also takes
+    -- the fresh capture when the old one was dropped.
+    function Core.refused(aw, now, waited)
+        local cap, D = aw.cap, Core.diag
+        D.refused = D.refused + 1
+        if cap then
+            cap.refused, cap.refused_row = (cap.refused or 0) + 1, (cap.refused_row or 0) + 1
+            logp(("remote parry NOT taken by the server (no attempt answer in %.0fms): capture #%d, %d taken / %d refused"):format(
+                waited * 1000, cap.id or 0, cap.taken or 0, cap.refused))
+            if DBG.on then DBG.ev(("NOT TAKEN: no attempt answer in %.0fms"):format(waited * 1000)) end
+            if Core.cap == cap then
+                local never = (cap.taken or 0) == 0 and (cap.landed or 0) == 0
+                if never and cap.alt_key and not cap.alt_tried then
+                    -- never taken: its key may be the off-by-a-tick one
+                    cap.key, cap.alt_key, cap.alt_tried, cap.refused_row = cap.alt_key, cap.key, true, 0
+                    logp("  trying this capture's second key (the sender's clock ticked before the hook read it)")
+                elseif never or cap.refused_row >= 2 then
+                    -- never worked on either key, or a working one refused twice running
+                    Core.cap, Core.misses = nil, 0
+                    logp("  capture dropped: the server isn't taking it -- parry once to take a fresh one")
+                    if Parry.onCaptureBad then task.defer(pcall, Parry.onCaptureBad) end
+                end
+            end
+        end
+        local st, ball = aw.st, aw.ball
+        if st and ball and ball.Parent and st.target == me and not st.landed then
+            st.parried, st.parry_until = false, 0
+            G.until_t, Core.pending, Core.watch = 0, nil, nil
+            if S.rescue_press then st.rescue = true end
+            local root = ap_root()
+            if root and S.autoparry and not S.triggerbot then decide(ball, st, root, now, "not taken") end
+        end
+    end
+    -- Timing diagnostics (Debug tab / overlay / log)
+    function Parry.timingLines()
+        local D, E, L = Core.diag, Core.echo, {}
+        L[#L + 1] = ("parries: %d fired, %d landed, %d early, %d late, %d on time but not counted, %d not taken, %d rescued"):format(
+            D.fired, D.landed, D.early, D.late, D.ontime, D.refused, D.rescued)
+        if D.bias then
+            local b = D.bias * 1000
+            L[#L + 1] = ("prediction: the ball lands %+.0fms vs predicted (spread %.0fms, %d parries) -- %s"):format(b, D.spread * 1000, D.n,
+                math.abs(b) <= 15 and "on the mark" or (b > 0 and "firing a little early" or "firing a little late"))
+        else
+            L[#L + 1] = "prediction: no landed parries measured yet"
+        end
+        L[#L + 1] = ("latency: ping %.0fms (median of 3s), jitter %.0fms, reach %.0fms, parry round trip %s"):format(
+            (Lag.avg or 0) * 1000, jitter() * 1000, reach_time() * 1000, E.rtt and ("%.0fms"):format(E.rtt * 1000) or "not measured")
+        local cap = Core.cap
+        L[#L + 1] = cap and ("capture #%d: %d taken, %d refused%s%s"):format(cap.id or 0, cap.taken or 0, cap.refused or 0,
+                cap.alt_tried and ", on its second key" or "", E.forged_ok and "" or " (server answers not seen yet: can't be checked)")
+            or "capture: none"
+        return L
+    end
     function Parry.onParrySuccess()
         DBG.ev("our parry LANDED")
         Anim.onSuccess()
@@ -3185,10 +3407,29 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         if not (char and char:IsDescendantOf(Workspace)) then return end
         G.until_t = 0
         local w = Core.watch
+        Core.await = nil -- landed: it was taken
+        local D = Core.diag
+        D.landed = D.landed + 1
         if Core.pending and w then
             if w.cap then w.cap.landed = (w.cap.landed or 0) + 1 end
-            logp(("  -> landed %.2fs after the parry (fired at %.0f studs)"):format(clock_() - w.t, w.d0))
+            local took = clock_() - w.t
+            local note = ""
+            -- prediction check: this message leaves the server at contact and
+            -- takes half a round trip back, so the ball landed (took - ping/2)
+            -- after the fire; predicted was eta. + = it came later than predicted.
+            if w.eta and w.eta < 5 then
+                local err = took - w.ping * 0.5 - w.eta
+                if math.abs(err) < 0.5 then
+                    D.bias = D.bias and (D.bias * 0.8 + err * 0.2) or err
+                    D.spread = D.spread * 0.8 + math.abs(err - D.bias) * 0.2
+                    D.n = D.n + 1
+                    note = (", ball %+.0fms vs predicted"):format(err * 1000)
+                end
+            end
+            logp(("  -> landed %.2fs after the parry (fired at %.0f studs%s)"):format(took, w.d0, note))
+            if D.landed % 10 == 0 then for _, l in ipairs(Parry.timingLines()) do logp("  [timing] " .. l) end end
         end
+        local fired_ball = w and w.ball
         Core.watch = nil
         -- Core.interp stays fixed. Until 0.5.8 every landed remote parry nudged it
         -- by (predicted eta - time until this event). The event comes back about
@@ -3203,8 +3444,28 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         -- us -- and in a fast exchange the ball is already back on us when our
         -- ParrySuccess arrives, so the NEW incoming pass was marked landed and
         -- auto parry never fired on it: "ball hit back to me from close, no parry".
-        for _, st in pairs(tracked) do if st.target == me and st.pass_open and st.parried then st.landed = true end end
+        -- 0.5.115, several balls: the pass that landed is the one we fired on
+        -- (it marked EVERY fired pass on us, so with two balls the second
+        -- read as landed too and was left to hit) -- and the others on us are
+        -- decided right now: the lockout just reset, no waiting for a frame.
+        local fst = fired_ball and tracked[fired_ball]
+        if fst and fst.target == me and fst.pass_open and fst.parried then
+            fst.landed = true
+        else
+            for _, st in pairs(tracked) do if st.target == me and st.pass_open and st.parried then st.landed = true end end
+        end
         spam_instant()
+        if S.autoparry and not S.triggerbot then
+            local root = ap_root()
+            if root then
+                local now = clock_()
+                for ball, st in pairs(tracked) do
+                    if ball ~= fired_ball and st.target == me and ball.Parent and not st.landed then
+                        decide(ball, st, root, now, "after a landed parry")
+                    end
+                end
+            end
+        end
     end
     -- ParrySuccessAll(fxName, fxParent, sword, player, ...) (Bbs dump,
     -- parrySuccessAll). Until 0.5.87 "who" was the first Instance -- fxParent,
@@ -3338,6 +3599,7 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
                 e.k and ("  k %.1f"):format(e.k) or "")
         end
         if DBG.block and now - DBG.block_at < 2 then L[#L + 1] = ("held: %s (%.1fs ago)"):format(DBG.block, now - DBG.block_at) end
+        for _, l in ipairs(Parry.timingLines()) do L[#L + 1] = l end
         return L
     end
     function Parry.status()
@@ -3353,8 +3615,10 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         else clash = "watching for clashes" end
         local manual = not SP.manual and "off" or (Pump.waiting and "waiting for a threat" or "spamming")
         return {
-            armed = Core.cap and ("armed (" .. capture_method() .. ", " .. Core.ctx .. ")")
-                or (Capture.mode == "Your press" and "not armed -- press block once" or "not armed -- capturing at the next chance"),
+            armed = Core.cap and ("YES%s -- %d parries taken%s"):format(Core.cap.verified and " (real hash confirmed)" or "",
+                    math.max(Core.cap.taken or 0, Core.cap.landed or 0),
+                    (Core.cap.refused or 0) > 0 and (", %d refused"):format(Core.cap.refused) or "")
+                or (Capture.mode == "Your press" and "NO -- parry once yourself" or "NO -- taking one at the next chance"),
             last = last, clash = clash, manual = manual, rate = SpamMeter.rate, ping = pingMs(),
             target = SP.rate_now(clock_()), speed_mode = SP.speed_mode,
             curve = S.random_curve and "Random each parry" or (CURVE_NAMES[S.curve_mode] or "?"),
@@ -3475,6 +3739,9 @@ function Engine.start()
     local R = Parry.remotes()
     pcall(function() econnect(R.ParrySuccess.OnClientEvent, Parry.onParrySuccess) end)
     pcall(function() econnect(R.ParrySuccessAll.OnClientEvent, Parry.onParryAll) end)
+    -- the server's answer to a parry attempt: ours alone, and everyone's with the character
+    pcall(function() econnect(R.ParryAttempt.OnClientEvent, function() Parry.onAttempt(nil) end) end)
+    pcall(function() econnect(R.ParryAttemptAll.OnClientEvent, function(_, char) if char ~= nil then Parry.onAttempt(char) end end) end)
     pcall(function() econnect(R.NoobParryHappened.OnClientEvent, Parry.onNoobParry) end)
     pcall(function() econnect(R.M1Stop.Event, Parry.onM1Stop) end)
     econnect(UserInputService.InputBegan, Parry.onInput)
@@ -3864,8 +4131,6 @@ local Tabs = {
     Visuals = Window:AddTab("Visuals", "eye", "Overlays and ESP"),
     Orbit = Window:AddTab("Orbit", "orbit", "Circle a point you can walk, or the ball"),
     Misc = Window:AddTab("Misc", "wrench", "Skin changer and extras"),
-    Panel = Window:AddTab("Panel", "crown", "Training server owner panel"),
-    Status = Window:AddTab("Status", "gauge", "Live state and parry log"),
     Debug = Window:AddTab("Debug", "bug", "On-screen debug overlay"),
 }
 
@@ -3956,11 +4221,17 @@ AIM:AddLabel("Previous curve"):AddKeyPicker("PrevCurveKey", {
 
 
 local CAP = Tabs.Parry:AddLeftGroupbox("Capture", "key-round")
+local CapLabel = CAP:AddLabel("Capture: off (turn on auto parry or spam)", true)
 CAP:AddLabel("Parry once yourself: the hook reads that real parry (the real hash only, never the game's decoys) and auto parry takes over. A notification says when it has it.", true)
 CAP:AddToggle("OneParryCapture", {
     Text = "One-parry capture", Default = true,
     Tooltip = "Catches your first parry every time: also hooks FireServer while there's no capture (the game sends half its parries that way). That path only takes the game's real hash. Off = namecall only, which can take a few parries.",
     Callback = function(v) S.one_parry_capture = v end,
+})
+CAP:AddToggle("RescuePress", {
+    Text = "Rescue press", Default = true,
+    Tooltip = "When the server doesn't answer a remote parry (a bad capture: the swing plays, nothing is parried), that ball is parried with a real F press instead, and a dropped capture is retaken on that press.",
+    Callback = function(v) S.rescue_press = v end,
 })
 local CAPTURE_MODES = { ["Your press"] = "Your press", ["Auto parry"] = "Auto parry", ["Spam"] = "Spam", ["Safe press"] = "Auto press" }
 CAP:AddDropdown("AutoCaptureMode", {
@@ -3968,6 +4239,9 @@ CAP:AddDropdown("AutoCaptureMode", {
     Tooltip = "Your press: parry once yourself. Auto parry: auto parry presses F itself (a real parry) until the remote is read. Spam: presses F every 0.1s in a round / training until it's read. Safe press: one press when no ball is near. Presses use keypress (F), only while Roblox is focused.",
     Callback = function(v) Parry.Capture.mode = CAPTURE_MODES[v] or "Your press" end,
 })
+Parry.onCaptureBad = function()
+    Notify("Capture dropped", "The server wasn't taking its parries. Parry once to take a fresh one.", 5)
+end
 Parry.onCapture = function(cap)
     Notify("Parry remote captured", cap.verified and "Real parry hash confirmed -- auto parry is armed."
         or "Captured (couldn't read the game's real hash to confirm it).", 4)
@@ -5726,6 +6000,12 @@ function Panel.spam_start()
     end)
 end
 
+-- The tab exists ONLY for the owner of a training server (0.5.115): it is
+-- built the moment the game marks you ServerAdminAccess (its own
+-- HasEditPermissions: a training server and you own it) -- checked at load
+-- and every 3s after, since ownership can arrive late. Anyone else never
+-- sees a Panel tab.
+local function build_panel_ui()
 local PO = Tabs.Panel:AddLeftGroupbox("Server", "crown")
 local PanelStatus = PO:AddLabel("Owner: checking...", true)
 local function panel_status()
@@ -5800,6 +6080,24 @@ local PANEL_EVERY = { ["0.1s"] = 0.1, ["0.25s"] = 0.25, ["0.5s"] = 0.5, ["1s"] =
 PP2:AddDropdown("PanelSpamEvery", { Values = { "0.1s", "0.25s", "0.5s", "1s", "2s", "5s" }, Default = "0.25s", Text = "Every",
     Callback = function(v) Panel.spam_every = PANEL_EVERY[v] or 0.25 end })
 task.defer(panel_status)
+end
+local function panel_try()
+    if Panel.built or not is_live() then return end
+    local admin = LocalPlayer:GetAttribute("ServerAdminAccess") == true
+    if not admin and not (game.PlaceId == PANEL_PLACE and Panel.owner()) then return end
+    Panel.built = true
+    Tabs.Panel = Window:AddTab("Panel", "crown", "Training server owner panel")
+    build_panel_ui()
+end
+pcall(panel_try)
+if not Panel.built then
+    task.spawn(function()
+        while is_live() and not Panel.built do
+            task.wait(3)
+            pcall(panel_try)
+        end
+    end)
+end
 
 local NR = Tabs.Misc:AddRightGroupbox("Performance", "cpu")
 NR:AddToggle("NoRender", { Text = "No render", Default = false, Tooltip = "Turns off what's picked below.",
@@ -5848,42 +6146,24 @@ UA:AddButton({ Text = "Remove unlock UI", Func = function()
     end)
 end })
 
--- ----- Status tab -----
-local PL = Tabs.Status:AddBigGroupbox({ Name = "Parry log", Description = "Every parry with its timing -- use it to tune", IconName = "scroll-text" })
-local ParryLog = PL:AddLog("ParryLogLines", { Height = 170, MaxLines = 150, Timestamps = true })
-local ST = Tabs.Status:AddLeftGroupbox("Live", "activity")
-local L_capture = ST:AddLabel("Capture: idle", true)
-local L_last = ST:AddLabel("Last parry: none", true)
-local L_detect = ST:AddLabel("Detection: clear", true)
-local L_clash = ST:AddLabel("Auto spam: off", true)
-local L_manual = ST:AddLabel("Manual spam: off", true)
-local L_rate = ST:AddLabel("Spam rate: 0/s", true)
-local L_ping = ST:AddLabel("Ping: -", true)
-local L_curve = ST:AddLabel("Curve: Camera", true)
-local SB = Tabs.Status:AddRightGroupbox("Build", "info")
-SB:AddLabel("Version: " .. SCRIPT_VERSION)
-SB:AddLabel("Idle = nothing connected. Each feature connects only while it's on.", true)
-
-local function set(label, text) pcall(function() label:SetText(text) end) end
+-- ----- live labels (the Status tab is gone since 0.5.115) -----
+-- Capture state is on the Auto Parry tab (Capture box), spam rate / clash on
+-- the Spam tab, timing diagnostics on the Debug tab; the parry log is the
+-- file BladeBall/rewrite_log.txt and the debug overlay's event list.
+local TimingLabel -- set by the Debug tab below
+local function set(label, text) if label then pcall(function() label:SetText(text) end) end end
 StatusHook = function(s, armed)
     if not s then
-        set(L_capture, armed and "Capture: engine asleep in the lobby -- wakes when you join a round" or "Capture: idle (engine off)")
-        set(L_clash, "Auto spam: off"); set(L_manual, "Manual spam: off")
-        set(L_rate, "Spam rate: 0/s"); set(SpamRateLabel, "Actual: 0/s"); set(ClashLabel, "Status: off")
+        set(CapLabel, armed and "Capture: asleep in the lobby -- wakes when you join a round" or "Capture: off (turn on auto parry or spam)")
+        set(SpamRateLabel, "Actual: 0/s"); set(ClashLabel, "Status: off")
         return
     end
-    for _, line in ipairs(Parry.drainLog()) do pcall(function() ParryLog:Log(line) end) end
+    Parry.drainLog()
     if not Library.Toggled then return end
-    set(L_capture, "Capture: " .. s.armed)
-    set(L_last, "Last parry: " .. s.last)
-    set(L_detect, "Detection: " .. s.detect)
-    set(L_clash, "Auto spam: " .. s.clash)
-    set(L_manual, "Manual spam: " .. s.manual)
-    set(L_rate, ("Spam rate: %d/s"):format(math.floor(s.rate + 0.5)))
-    set(L_ping, ("Ping: %dms"):format(math.floor(s.ping + 0.5)))
-    set(L_curve, "Curve: " .. s.curve)
+    set(CapLabel, "Capture: " .. s.armed)
     set(SpamRateLabel, ("Actual: %d/s of %d (%s, %s)"):format(math.floor(s.rate + 0.5), math.floor((s.target or 0) + 0.5), tostring(s.speed_mode), s.manual))
     set(ClashLabel, "Status: " .. s.clash)
+    if TimingLabel then set(TimingLabel, table.concat(Parry.timingLines(), "\n")) end
 end
 UiTick = function(rate) Orb.tick(rate) end
 
@@ -5980,6 +6260,12 @@ function DebugUI.start()
 end
 function DebugUI.stop() Parry.DBG.on = false end
 
+-- Timing diagnostics (0.5.115): how the parries have gone and how well the
+-- arrival was predicted -- live while the menu is open, also in the overlay
+-- and written to the log file every 10 landed parries.
+local DBGTM = Tabs.Debug:AddRightGroupbox("Timing", "timer")
+TimingLabel = DBGTM:AddLabel("Timing: turn on auto parry and play a few parries.", true)
+DBGTM:AddLabel("Lands + = the ball came later than predicted (firing early); - = sooner (firing late). Not taken = the server ignored a remote parry (bad capture).", true)
 local DBGB = Tabs.Debug:AddLeftGroupbox("Debug overlay", "bug")
 DBGB:AddToggle("DebugUI", {
     Text = "Debug overlay", Default = false,
