@@ -31,7 +31,7 @@
 
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.113"
+local SCRIPT_VERSION = "rewrite-0.5.114"
 
 -- ---------------------------------------------------------------------------
 -- Single instance.
@@ -395,6 +395,7 @@ do
     local SP = {
         manual = false, auto = false, mode = "Remote", max_rate = 1000, speed_mode = "700/s", method = "Fixed rate",
         per_frame = false, per_frame_count = 1, timing = "Per second", interval_ms = 2,
+        hs_fix = false, hs_speed = 400, hs_per_tick = 2,
         smart = true, range_bonus = 0, hold = 0.15, sensitivity = 1.3, predictive = true,
     }
     -- detection state (written by the detection features, read here)
@@ -611,16 +612,21 @@ do
     --          + 10ms) -- close, but a slow ball isn't let onto you;
     --   1   -> EARLY: 35 studs ahead, and never past what the parry window
     --          (capped 0.6s) still covers -- so even 1 can't run out.
-    -- Squared toward SAFE: (1 - a)^2, so the middle of the slider is already
-    -- fairly close (50 = ~1/4 of the way out, 39 = ~2/5).
+    -- 0.5.114: LINEAR (was squared toward SAFE: 39 was only ~2/5 of the way
+    -- out -- ~16 studs -- and on a 600 ball 16 studs is 0.027s: a "perfect
+    -- parry" at 39). Plus a TIME floor that grows as Accuracy drops (0 at 100,
+    -- 0.12s at 1): studs alone shrink to nothing on a fast ball. Still capped by
+    -- what the parry window covers, so 1 can't run out.
+    --   39 -> ~23 studs ahead, never less than ~0.07s
     local function safe_margin() return jitter() + frame_dt + 0.01 end
     local function cushion_for(speed, W)
         local a = (math.clamp(S.accuracy or 50, 1, 100) - 1) / 99
         local sp = math.max(speed or 1, 1)
+        local f = 1 - a
         local safe = math.max(safe_margin(), 5 / sp)
-        local early = math.max(math.min(math.min(W or 0.5, 0.6) - (jitter() + frame_dt + 0.03), 35 / sp), safe)
-        local f = (1 - a) * (1 - a)
-        return safe + (early - safe) * f
+        local cap = math.max(math.min(W or 0.5, 0.6) - (jitter() + frame_dt + 0.03), safe)
+        local want = math.max((5 + 30 * f) / sp, 0.12 * f, safe)
+        return math.min(want, cap)
     end
     local function fire_lead(speed)
         return reach_time() + cushion_for(speed, parry_window() or 0.5)
@@ -2076,15 +2082,20 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         end
         return n
     end
+    -- you two trading parries: in the last 0.7s at least one parry was YOURS
+    -- and the rest add up to two (0.5.114: it counted the partner alone, so two
+    -- other players clashing next to you read as "you're trading" -> spam on a
+    -- ball that was never coming to you)
     local function trading_fast(now, partner)
-        local known, unknown = 0, 0
+        local mine, theirs, unknown = 0, 0, 0
         for i = #parry_all, 1, -1 do
             local e = parry_all[i]
             if now - e.t > 0.7 then break end
             if e.who == nil then unknown = unknown + 1
-            elseif e.who == me or e.who == partner then known = known + 1 end
+            elseif e.who == me then mine = mine + 1
+            elseif e.who == partner then theirs = theirs + 1 end
         end
-        return known >= 2 or unknown >= 3
+        return mine >= 1 and (theirs + unknown) >= 1
     end
     local function return_comes_to_us(their, root, partner, gap)
         local to = root.Position - their.Position
@@ -2129,7 +2140,22 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
             -- two parries in 0.7s at any speed over 30, started it ("too early"),
             -- and the lands-in test used sens - 0.1 on the lagging physics ball
             -- ("too late").
-            local eta = (bnow - root.Position).Magnitude / speed
+            -- 0.5.114: curve-aware. It used straight distance / speed, so a ball
+            -- curving round you -- or swinging away -- started spam. Pointed at
+            -- us: straight time. Otherwise the auto parry homing sim at the
+            -- turn this ball's been measured at; swinging away never starts it.
+            local off = root.Position - bnow
+            local dist = off.Magnitude
+            local heading = dist > 0.01 and (velocity / speed):Dot(off / dist) or 1
+            local eta = dist / speed
+            if heading < 0.97 then
+                local h = st.hm
+                if h and h.away then eta = math.huge
+                else
+                    local k = math.clamp((h and h.k) or st.k_mem or K_DEFAULT, K_MIN, K_MAX)
+                    eta = math.max(sim_prop(bnow, velocity, root.Position, Core.ap_gap(ball), k, 0, react * sens + 0.3) or math.huge, eta)
+                end
+            end
             if eta <= react * sens + 0.08 + frame_dt then return partner, ("lands in %.2fs, too fast to react"):format(eta), true end
             if handoffs >= 1 and too_fast then return partner, "quick hand-off", true end
             if trading and too_fast then return partner, "trading parries", false end
@@ -2137,6 +2163,9 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
             return nil
         end
         if held and owners[1] and now - owners[1].t <= tempo then return partner, "exchange on", false end
+        -- not ours: only a ball WE just sent to them starts it (0.5.114 -- a
+        -- clash between two other players next to you is none of ours)
+        if not (owners[2] and owners[2].name == me) then return nil end
         local to_them = their.Position - bnow
         local d_them = to_them.Magnitude
         if not (d_them < 6 or velocity:Dot(to_them / d_them) > speed * 0.3) then return nil end
@@ -2300,9 +2329,27 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         if SP.timing == "Every X ms" then return 1000 / math.max(tonumber(SP.interval_ms) or 2, 0.5) end
         return tonumber(tostring(SP.speed_mode):match("%d+")) or 700
     end
+    -- HIGH SPEED FIX (toggle, 0.5.114). Past a ball speed (High speed at), a
+    -- fast clash is settled in server ticks: the server steps ~60 times a
+    -- second and hits whatever is due in that step, so packets beyond a couple
+    -- per tick only queue behind each other. While the spam ball is that fast,
+    -- every spam mode is paced to Sends per tick x 60/s -- evenly, so each tick
+    -- still gets a fresh parry -- and goes back to your setting below that.
+    local SERVER_HZ = 60
+    local function spam_ball_speed()
+        local b = AutoSpam.ball
+        if b and b.Parent then return ball_velocity(b).Magnitude end
+        local best = 0
+        for _, ball in ipairs(get_live_balls()) do
+            if ball:GetAttribute('target') == me then best = math.max(best, ball_velocity(ball).Magnitude) end
+        end
+        return best
+    end
+    local function high_speed() return SP.hs_fix and spam_ball_speed() >= (SP.hs_speed or 400) end
     -- Per frame (toggle, or the old "Per frame" method): Count parries every
-    -- frame instead of a rate -- your FPS x Count a second
-    local function per_frame() return SP.per_frame or SP.method == "Per frame" end
+    -- frame instead of a rate -- your FPS x Count a second (not while the high
+    -- speed fix is pacing: that's a rate)
+    local function per_frame() return (SP.per_frame or SP.method == "Per frame") and not high_speed() end
     local function frame_burst()
         local n = math.clamp(math.floor(tonumber(SP.per_frame_count) or 1), 1, 20)
         if SP.mode == "Keypress" then n = 1 end
@@ -2336,7 +2383,11 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
     end
     function SP.method_rate(rate)
         if SP.method == "Ping adaptive" then
-            return math.min(rate, math.max(60, 12 / math.max(ping_s(), 0.02)))
+            rate = math.min(rate, math.max(60, 12 / math.max(ping_s(), 0.02)))
+        end
+        if high_speed() then
+            -- per tick x 60; a slower Speed / interval stays as you set it
+            rate = math.min(rate, SERVER_HZ * math.clamp(math.floor(SP.hs_per_tick or 2), 1, 6))
         end
         return rate
     end
@@ -2355,7 +2406,7 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         if per_frame() then
             -- Count a frame, at its first point; no bucket
             if point == 1 then
-                Pump.on = true
+                Pump.on, Pump.sent = true, nil -- the bucket restarts fresh if pacing takes over
                 if Pump.fired_frame ~= Pump.frame then Pump.fired_frame, Pump.frame_fires = Pump.frame, 0 end
                 if frame_burst() and Pump.remote_sent then Anim.spamBlock() end
                 Pump.remote_sent = false
@@ -2372,7 +2423,7 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         -- fire is blocked (stunned, respawn, no capture), the owed backlog is
         -- forgiven -- the start slides to now -- so it never bursts over the rate
         -- once it can fire again.
-        if not Pump.on then Pump.on, Pump.rate, Pump.t0, Pump.sent = true, rate, now, 0
+        if not Pump.on or not Pump.sent then Pump.on, Pump.rate, Pump.t0, Pump.sent = true, rate, now, 0
         elseif Pump.rate ~= rate then Pump.rate, Pump.t0 = rate, now - Pump.sent / rate end -- re-rate, no burst
         local allowed = math.floor((now - Pump.t0) * rate) + 1
         local sent = false
@@ -2404,7 +2455,7 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         -- fires on retarget / parry success never push the average over the slider
         local now = clock_()
         local rate = math.max(SP.method_rate(math.clamp(SP.rate_now(now), 1, 2000)), 1)
-        if not Pump.on then Pump.on, Pump.rate, Pump.t0, Pump.sent = true, rate, now, 0
+        if not Pump.on or not Pump.sent then Pump.on, Pump.rate, Pump.t0, Pump.sent = true, rate, now, 0
         elseif Pump.rate ~= rate then Pump.rate, Pump.t0 = rate, now - Pump.sent / rate end
         if Pump.sent > math.floor((now - Pump.t0) * rate) + 1 then return end
         if fire_one() then
@@ -3855,7 +3906,7 @@ AP:AddToggle("UnlockFPS", {
 local APS = Tabs.Parry:AddRightGroupbox("Timing", "sliders-horizontal")
 APS:AddSlider("Accuracy", {
     Text = "Accuracy", Default = 50, Min = 1, Max = 100, Rounding = 0,
-    Tooltip = "How close the ball gets before the parry, in ball travel at any speed: 100 = ~5 studs ahead, 1 = ~35 studs ahead (never past the parry window). The middle is already fairly close (50 = ~1/4 of the way out). Curves follow it too.",
+    Tooltip = "How close the ball gets before the parry: 100 = ~5 studs ahead, 1 = ~35 studs ahead, straight in between (50 = ~20 studs), and never less than a little time on fast balls (up to 0.12s at 1) so fast balls don't become perfect parries. Never past the parry window. Curves follow it too.",
     Callback = function(v) S.accuracy_base = v; Parry.roll() end,
 })
 APS:AddToggle("RandomAccuracy", { Text = "Randomize accuracy", Default = false, Callback = function(v) S.random_accuracy = v end })
@@ -4147,6 +4198,20 @@ MS:AddInput("SpamIntervalMs", {
         local n = tonumber(v)
         if n then SP.interval_ms = math.clamp(n, 0.5, 1000) end
     end,
+})
+MS:AddToggle("SpamHighSpeedFix", {
+    Text = "High speed fix", Default = false,
+    Tooltip = "Very fast balls are decided in server ticks (~60 a second): more than a couple of parries per tick just queue. While the ball is at least High speed at, every spam mode is paced to Sends per tick x 60/s, evenly, so every tick still gets one.",
+    Callback = function(v) SP.hs_fix = v end,
+})
+MS:AddSlider("SpamHighSpeedAt", {
+    Text = "High speed at", Default = 400, Min = 150, Max = 1500, Rounding = 0, Suffix = " sps",
+    Callback = function(v) SP.hs_speed = v end,
+})
+MS:AddSlider("SpamHighSpeedPerTick", {
+    Text = "Sends per tick", Default = 2, Min = 1, Max = 6, Rounding = 0,
+    Tooltip = "Parries per server tick while the high speed fix is pacing (2 = 120/s).",
+    Callback = function(v) SP.hs_per_tick = v end,
 })
 local SpamRateLabel = MS:AddLabel("Actual: 0/s", true)
 
