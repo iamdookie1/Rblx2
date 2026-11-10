@@ -1,6 +1,6 @@
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.116"
+local SCRIPT_VERSION = "rewrite-0.5.117"
 
 local genv = (getgenv and getgenv()) or _G
 if type(genv.__BladeBallShutdown) == 'function' then pcall(genv.__BladeBallShutdown) end
@@ -4977,7 +4977,9 @@ Gui.NR:AddDropdown("NoRenderWhat", {
 
 Mods.Unlock = Feature("UnlockAll")
 do
-    local U = { bypass = false }
+    local U = { bypass = false, saved = setmetatable({}, { __mode = "k" }) }
+    local function me(p) return p == nil or p == LocalPlayer end
+    local function act(p) return Mods.Unlock.on and not U.bypass and me(p) end
     local function ups(f)
         local g = getupvalues or (debug and debug.getupvalues)
         if type(g) ~= "function" or type(f) ~= "function" then return {} end
@@ -4993,30 +4995,86 @@ do
     local function nameOf(arg)
         local n = arg:match("^virtual_%d+_Sword_(.+)$")
         if n then return n end
-        local ok, it = pcall(function() return U.inv.Client:GetItem("Sword", arg) end)
-        return ok and type(it) == "table" and type(it.Name) == "string" and it.Name or arg
+        local it = U.byId and U.byId[arg]
+        if it then return it.Name end
+        U.bypass = true
+        local ok, real = pcall(function() return U.inv.Client:GetItem("Sword", arg) end)
+        U.bypass = false
+        return ok and type(real) == "table" and type(real.Name) == "string" and real.Name or arg
     end
-    local function equipState()
-        if not U.api then return nil end
-        for _, v in pairs(ups(rawget(U.api, "GetSwordData") or U.api.GetSwordData)) do
-            local st = type(v) == "table" and rawget(v, "Sword")
-            if type(st) == "table" and rawget(v, "Booth") ~= nil and type(st.Set) == "function" and type(st.Get) == "function" then return st end
-        end
+    local function build()
+        if U.byId then return true end
+        local ok, base = pcall(U.fn.BuildInventory, U.vi, LocalPlayer, "Sword")
+        if not ok or type(base) ~= "table" then return false end
+        U.byId, U.byName = base, {}
+        for id, it in pairs(base) do U.byName[it.Name] = id end
+        return true
     end
-    local function refresh()
-        if not (U.api and U.inv) then return end
-        local C = U.inv.Client
-        for kind, fn in pairs({ Sword = "GetSwordData", Explosion = "GetExplosionData", Ability = "GetAbilityData", Emote = "GetEmoteData", Booth = "GetBoothData" }) do
-            for _, cache in pairs(ups(rawget(U.api, fn) or U.api[fn])) do
-                local e = type(cache) == "table" and select(2, next(cache)) or nil
-                if type(e) == "table" and rawget(e, "OwnedCopies") and rawget(e, "ParsedItemKey") then
-                    for key, d in pairs(cache) do
-                        pcall(function()
-                            local n = #C:FindItemsWithKey(kind, key)
-                            d.OwnedCopies:Set(n)
-                            U.api:GetItemBaseOwnedState(kind, C:KeyToItem(key).Name):SetTag(key, n > 0)
-                        end)
+    local function patch()
+        local f = U.fn
+        local over = {
+            IsEnabledFor = function(self, p, ...)
+                if act(p) then return true end
+                return f.IsEnabledFor(self, p, ...)
+            end,
+            BuildInventory = function(self, p, kind, ...)
+                if act(p) then
+                    if kind == "Sword" then return table.clone(U.byId) end
+                    if not f.IsEnabledFor(self, p) then return nil end
+                end
+                return f.BuildInventory(self, p, kind, ...)
+            end,
+            GetItem = function(self, p, kind, id, ...)
+                if act(p) then
+                    if kind == "Sword" then
+                        local it = type(id) == "string" and (U.byId[id] or U.byId[U.byName[id] or ""])
+                        return it and table.clone(it) or nil
                     end
+                    if not f.IsEnabledFor(self, p) then return nil end
+                end
+                return f.GetItem(self, p, kind, id, ...)
+            end,
+            FindItems = function(self, p, kind, name, ...)
+                if act(p) then
+                    if kind == "Sword" then
+                        local id = type(name) == "string" and U.byName[name]
+                        return id and { id } or {}
+                    end
+                    if not f.IsEnabledFor(self, p) then return {} end
+                end
+                return f.FindItems(self, p, kind, name, ...)
+            end,
+        }
+        for k, v in pairs(over) do
+            if not pcall(rawset, U.vi, k, v) then return false end
+        end
+        return true
+    end
+    local function unpatch()
+        for k, v in pairs(U.fn or {}) do pcall(rawset, U.vi, k, v) end
+    end
+    local function refresh(on)
+        if not U.api then return end
+        local n = 0
+        for _, cache in pairs(ups(rawget(U.api, "GetSwordData") or U.api.GetSwordData)) do
+            local e = type(cache) == "table" and select(2, next(cache)) or nil
+            if type(e) == "table" and rawget(e, "OwnedCopies") and rawget(e, "ParsedItemKey") then
+                for key, d in pairs(cache) do
+                    if on ~= Mods.Unlock.on then return end
+                    pcall(function()
+                        local c
+                        if on then
+                            if U.saved[d] == nil then U.saved[d] = d.OwnedCopies:Get() or 0 end
+                            c = math.max(U.saved[d], 1)
+                        else
+                            c = U.saved[d] or d.OwnedCopies:Get() or 0
+                            U.saved[d] = nil
+                        end
+                        d.OwnedCopies:Set(c)
+                        U.api:GetItemBaseOwnedState("Sword", U.inv.Client:KeyToItem(key).Name):SetTag(key, c > 0)
+                    end)
+                    n = n + 1
+                    if n % 100 == 0 then task.wait() end
                 end
             end
         end
@@ -5029,45 +5087,30 @@ do
         if not Mods.SkinChanger.on then pcall(function() Toggles.SkinChanger:SetValue(true) end) end
         if not Mods.SkinChanger.on then Mods.SkinChanger:setEnabled(true) end
         Mods.SkinChanger.apply()
-        pcall(function() equipState():Set({ Name = name, Id = ("virtual_%d_Sword_%s"):format(LocalPlayer.UserId, name) }) end)
         Notify("Unlock All", "Sword: " .. name, 2)
     end
     local function route(remote, arg)
-        if type(arg) ~= "string" then return nil end
-        local kind = remote:match("RequestEquip(%a+)$")
-        if kind == "Sword" or kind == "SwordSkin" then
-            local name = nameOf(arg)
-            local real = owned(name)
-            task.spawn(pick, name)
-            if real then return "pass", real end
-            return "stop", true
-        end
-        if kind and arg:sub(1, 8) == "virtual_" then return "stop", false end
-        return nil
+        if type(arg) ~= "string" or not remote:find("RequestEquipSword", 1, true) then return nil end
+        local name = nameOf(arg)
+        local real = owned(name)
+        task.spawn(pick, name)
+        if real then return "pass", real end
+        return "stop", true
     end
     local function body(self, ...)
-        if Mods.Unlock.on and getnamecallmethod() == "InvokeServer" and typeof(self) == "Instance" and self.ClassName == "RemoteFunction" then
-            local ok, act, v = pcall(route, self.Name, ...)
-            if ok and act == "stop" then return v end
-            if ok and act == "pass" then return U.old(self, v, select(2, ...)) end
+        if Mods.Unlock.on and not (checkcaller and checkcaller()) and getnamecallmethod() == "InvokeServer" and typeof(self) == "Instance" and self.ClassName == "RemoteFunction" then
+            local ok, a, v = pcall(route, self.Name, ...)
+            if ok and a == "stop" then return v end
+            if ok and a == "pass" then return U.old(self, v, select(2, ...)) end
         end
         return U.old(self, ...)
     end
-    local function current()
-        local ok, mt = pcall(getrawmetatable, game)
-        return ok and type(mt) == "table" and rawget(mt, "__namecall") or nil
-    end
     local function hook()
+        if U.old then return true end
         if not (hookmetamethod and getnamecallmethod) then return false end
-        if U.fn and current() == U.fn then return true end
-        local f = newcclosure and newcclosure(body) or body
-        local ok, old = pcall(hookmetamethod, game, "__namecall", f)
-        if ok and type(old) == "function" then U.old, U.fn = old, f; return true end
+        local ok, old = pcall(hookmetamethod, game, "__namecall", newcclosure and newcclosure(body) or body)
+        if ok and type(old) == "function" then U.old = old; return true end
         return false
-    end
-    local function unhook()
-        if U.fn and U.old and current() == U.fn then pcall(hookmetamethod, game, "__namecall", U.old) end
-        U.fn = nil
     end
     function Mods.Unlock.start()
         local token = Mods.Unlock._token
@@ -5081,31 +5124,28 @@ do
                 if Mods.Unlock:alive(token) then Notify("Unlock All", "Couldn't load the game's inventory.", 4) end
                 return
             end
+            U.fn = U.fn or { IsEnabledFor = U.vi.IsEnabledFor, BuildInventory = U.vi.BuildInventory, GetItem = U.vi.GetItem, FindItems = U.vi.FindItems }
+            if not build() then Notify("Unlock All", "Couldn't read the sword list.", 4); return end
+            if not patch() then unpatch(); Notify("Unlock All", "Couldn't patch the inventory.", 4); return end
             pcall(function() U.api = U.api or require(ReplicatedStorage.Controllers.UI.ShopControllerAPI) end)
-            U.real = U.real or U.vi.IsEnabledFor
-            local set = pcall(rawset, U.vi, "IsEnabledFor", function(self, p, ...)
-                if Mods.Unlock.on and not U.bypass and (p == nil or p == LocalPlayer) then return true end
-                return U.real(self, p, ...)
-            end)
-            if not set then Notify("Unlock All", "Couldn't patch the inventory.", 4); return end
-            if not hook() then Notify("Unlock All", "No namecall hook: equips won't switch the skin.", 4) end
-            refresh()
-            Mods.Unlock:loop(1, function() if Parry.hookState() == "down" then hook() end end)
+            refresh(true)
+            for _ = 1, 50 do
+                if not Mods.Unlock:alive(token) then return end
+                if Parry.hookState() == "down" then break end
+                task.wait(0.1)
+            end
+            if not hook() then Notify("Unlock All", "No namecall hook: equips won't switch the sword.", 4) end
         end)
     end
     function Mods.Unlock.stop()
-        if U.vi and U.real then pcall(rawset, U.vi, "IsEnabledFor", U.real) end
-        unhook()
-        task.spawn(function()
-            refresh()
-            pcall(function() equipState():Set(U.api:GetEquippedItem("Sword")) end)
-        end)
+        unpatch()
+        task.spawn(refresh, false)
     end
 end
 
 Gui.UA = Gui.Tabs.Misc:AddRightGroupbox("Unlock All", "unlock")
-Gui.UA:AddToggle("UnlockAll", { Text = "Unlock all", Default = false,
-    Tooltip = "Shows every item as owned in your inventory (only you see it). Equipping a sword puts it on with the skin changer; other items stay visual.",
+Gui.UA:AddToggle("UnlockAll", { Text = "Unlock all swords", Default = false,
+    Tooltip = "Shows every sword as owned in your inventory (only you see it). Equipping one puts it on with the skin changer.",
     Callback = function(v) Mods.Unlock:setEnabled(v) end })
 
 local function set(label, text) if label then pcall(function() label:SetText(text) end) end end
