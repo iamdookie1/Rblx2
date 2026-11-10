@@ -1,94 +1,34 @@
--- Blade Ball -- clean rewrite
--- UI: Ui3 (https://github.com/iamdookie1/Ui3). Menu key, accent, DPI and
--- configs (save / load / autoload) live in Ui3's settings panel (gear icon).
---
--- DESIGN CONTRACT -- "inert until enabled":
---   At load this script builds the UI and NOTHING else -- no game remotes, no
---   RunService connections, no hooks, no module requires, no remote-folder
---   resolve -- only a listener for the kick message, so the log file can say
---   what was on when it came. One Engine owns every parry/spam connection; it starts with the
---   first parry/spam feature and tears everything down with the last. Every
---   other feature (detections, cosmetics, ESP, overlays, skins...) owns its own
---   connections and releases them when turned off. All off == UI-only footprint.
---
--- Installments: 1 foundation + Auto Jump | 2 capture core | 3 prediction, target
--- modes, instant retarget | 4 triggerbot, pre-parry, curves, spam + clash |
--- 5 (this file):
---   * anti curve v3: three independent arrival estimators (proportional homing
---     sim with a learned gain, constant-turn sim, and a model-free one from the
---     ball's real closing speed + acceleration) -> median, so one wrong model
---     can't fire the parry. Direction-aware danger zone (0.4's speed-scaled one
---     parried curving balls far too early). "Dot" mode as an alternative.
---   * spam that knows when to stop: auto spam ends the moment the exchange does
---     (third player, partner gone/out of range, ball left, slowed, not returned);
---     manual spam only fires while a ball is actually a threat (Smart stop)
---   * mobile manual-spam switch (tap to toggle, drag to move);
---     no on-screen UI on PC
---   * everything else: auto-parry Keypress mode, random curve, auto ability,
---     cooldown protection, Infinity / Death Slash / Time Hole / Phantom /
---     Slashes of Fury detection, avatar changer, headless, korblox, ball velocity
---     and ping overlays, ability ESP, skin changer, no render, unlock all, parry log
-
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.115"
+local SCRIPT_VERSION = "rewrite-0.5.116"
 
--- ---------------------------------------------------------------------------
--- Single instance.
--- ---------------------------------------------------------------------------
 local genv = (getgenv and getgenv()) or _G
 if type(genv.__BladeBallShutdown) == 'function' then pcall(genv.__BladeBallShutdown) end
 local INSTANCE = {}
 genv.__BladeBallInstance = INSTANCE
-local function is_live() return genv.__BladeBallInstance == INSTANCE end
+local function isLive() return genv.__BladeBallInstance == INSTANCE end
 
--- ---------------------------------------------------------------------------
--- Services (references only).
--- ---------------------------------------------------------------------------
 local cloneref = cloneref or function(x) return x end
-local Players = cloneref(game:GetService('Players'))
-local RunService = cloneref(game:GetService('RunService'))
-local UserInputService = cloneref(game:GetService('UserInputService'))
-local ReplicatedStorage = cloneref(game:GetService('ReplicatedStorage'))
-local Workspace = cloneref(game:GetService('Workspace'))
-local Stats = cloneref(game:GetService('Stats'))
-local CollectionService = cloneref(game:GetService('CollectionService'))
--- VirtualInputManager and Debris are NOT fetched at load: GetService creates a
--- service that doesn't exist yet, and a game script can then see it with
--- game:FindService -- a tell from a script that did nothing else (BBStop=0 kicked).
--- VirtualInputManager is fetched only when Keypress / Auto press actually presses.
-local HttpService = cloneref(game:GetService('HttpService'))
-local CoreGui = cloneref(game:GetService('CoreGui'))
-local LocalPlayer = Players.LocalPlayer
--- bisect switch, as the original used: getgenv().BBStop = N stops loading at
--- stage N -- 0 services only, 1 + parry core / engine / log (no UI), 2 + menu
--- library, 3 + whole menu and config. Idle and see which stage first kicks.
+local Players, RunService = cloneref(game:GetService('Players')), cloneref(game:GetService('RunService'))
+local UserInputService, ReplicatedStorage = cloneref(game:GetService('UserInputService')), cloneref(game:GetService('ReplicatedStorage'))
+local Workspace, Stats = cloneref(game:GetService('Workspace')), cloneref(game:GetService('Stats'))
+local CollectionService, HttpService = cloneref(game:GetService('CollectionService')), cloneref(game:GetService('HttpService'))
+local CoreGui, LocalPlayer = cloneref(game:GetService('CoreGui')), Players.LocalPlayer
 if getgenv().BBStop == 0 then return end
 local clock_ = os.clock
-local LOAD_T = clock_()
-local isMobile = UserInputService.TouchEnabled and not UserInputService.MouseEnabled
--- on-screen controls only on touch devices with no keyboard (no UI on PC)
+local LOAD_T, isMobile = clock_(), UserInputService.TouchEnabled and not UserInputService.MouseEnabled
 local touchUI = UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled
 
--- every GUI we make goes in the executor's hidden container
 local function hui()
     local ok, h = pcall(function() return gethui and gethui() end)
     if ok and typeof(h) == 'Instance' then return h end
     return CoreGui
 end
--- A random, innocuous instance name (no "BB_*" giveaway for a name scan).
 local function randName()
     local t = {}
     for i = 1, 12 do t[i] = string.char(math.random(97, 122)) end
     return table.concat(t)
 end
--- Park a GUI in the hidden container AND mark it protected where the executor
--- supports it, so a CoreGui/instance scan the game can run cannot enumerate it.
--- gethui alone hides it on most executors; protect_gui/protectgui is the
--- belt-and-braces for builds where it doesn't. Our hand-made GUIs (the mobile
--- spam switch, ability ESP, overlays) went in with a plain parent and a
--- distinctive name before this -- unlike the menu library, which protects
--- itself -- so they were the one scannable thing we left in the lobby.
 local function hideGui(gui)
     pcall(function() if syn and syn.protect_gui then syn.protect_gui(gui) end end)
     pcall(function() if protectgui then protectgui(gui) end end)
@@ -101,29 +41,10 @@ local function getRoot()
     return char and char.PrimaryPart
 end
 
--- ---------------------------------------------------------------------------
--- Feature framework: a feature owns its connections, instances and loops;
--- turning it off releases all of them.
--- ---------------------------------------------------------------------------
-local Features = {}
-local feature_log -- the log file writer (set once it exists, below)
--- Round gate for features that listen to game signals / touch game objects:
--- like the original (v91, e852d9c), which bisected the LOBBY reason-24 kick to
--- exactly such listeners attached at load (ability-detection remotes,
--- Runtime.ChildAdded, ...), they only run while you're in a round / training /
--- lobby parry and are torn down the moment you leave. Set below once in_play
--- exists; until then nothing round-only starts.
--- LOAD STAGGER. The original found (v27, 8d104a4): every build that switched
--- everything on in the first second after load got a BAC reason-24 kick (X24)
--- ~27s later, parries or not; a staged run that armed late with gaps between
--- steps never did. Same pattern here (all on at +0.4s, X24 at +31s). So
--- anything switched on during the load window (the config autoload) is queued
--- and started one at a time after the delay. Toggling later is instant.
--- OFF by default since 0.5.80: the lobby X24 turned out to be the
--- VirtualInputManager GetService at load (0.5.72), not the timing, so config
--- features start straight away. getgenv().BBStagger = seconds brings it back.
+local Features, Gui, Mods, Util = {}, {}, {}, {}
+local featureLog
 local Stagger = { t0 = os.clock(), delay = tonumber(getgenv().BBStagger) or 0, gap = 6, queue = {}, running = false,
-    round_check = nil } -- round_check: set once in_play exists (round gate, below)
+    round_check = nil }
 function Stagger.active() return Stagger.delay > 0 and os.clock() - Stagger.t0 < Stagger.delay end
 function Stagger.push(key, label, fn)
     for i, e in ipairs(Stagger.queue) do if e.key == key then table.remove(Stagger.queue, i); break end end
@@ -134,7 +55,7 @@ function Stagger.push(key, label, fn)
         task.wait(math.max(Stagger.delay - (os.clock() - Stagger.t0), 0))
         while #Stagger.queue > 0 do
             local e = table.remove(Stagger.queue, 1)
-            if feature_log then pcall(feature_log, "staged start: " .. tostring(e.label)) end
+            if featureLog then pcall(featureLog, "staged start: " .. tostring(e.label)) end
             pcall(e.fn)
             if #Stagger.queue > 0 then task.wait(Stagger.gap) end
         end
@@ -145,24 +66,23 @@ local function Feature(name)
     local f = { name = name, on = false, want = false, round_only = false, _conns = {}, _insts = {}, _token = nil }
     function f:connect(signal, fn)
         local c = signal:Connect(function(...)
-            if not is_live() then return end
+            if not isLive() then return end
             fn(...)
         end)
         self._conns[#self._conns + 1] = c
         return c
     end
     function f:own(inst) self._insts[#self._insts + 1] = inst; return inst end
-    -- a loop that lives exactly as long as this activation of the feature
     function f:loop(interval, fn)
         local token = self._token
         task.spawn(function()
-            while self.on and self._token == token and is_live() do
+            while self.on and self._token == token and isLive() do
                 pcall(fn)
                 task.wait(interval)
             end
         end)
     end
-    function f:alive(token) return self.on and self._token == token and is_live() end
+    function f:alive(token) return self.on and self._token == token and isLive() end
     function f:release()
         for _, c in ipairs(self._conns) do pcall(function() c:Disconnect() end) end
         for _, i in ipairs(self._insts) do pcall(function() i:Destroy() end) end
@@ -178,7 +98,7 @@ local function Feature(name)
         if v and self.round_only and not (Stagger.round_check and Stagger.round_check()) then v = false end
         if v == self.on then return end
         self.on = v
-        if feature_log then pcall(feature_log, ("%s %s"):format(name, v and "ON" or "OFF")) end
+        if featureLog then pcall(featureLog, ("%s %s"):format(name, v and "ON" or "OFF")) end
         if v then
             self._token = {}
             if self.start then pcall(self.start) end
@@ -192,49 +112,22 @@ local function Feature(name)
     return f
 end
 
--- ===========================================================================
--- PARRY + SPAM CORE (defines only; touches the game only after resolve())
--- ===========================================================================
 local Parry = {}
 
--- ===========================================================================
--- PARRY ANIMATION (mirrors the game's own block action, so remote parries and
--- spam look like real presses). Defines only; the game's SwordAPI folder is read
--- the first time a swing is actually played.
---   * which tracks: SwordAPI's pick, re-done by instance reads (no require) --
---     the sword's (the skin's, while the skin changer is on) AnimationType,
---     SwordType and Default collections, accessory / style folders included;
---   * how: loaded once per animator with the Animation's attributes copied onto
---     the track (PlaySpeed, PlayFadeTime, StopFadeTime...) -- the game's success
---     handler finds what to stop by those, so block and success swing never
---     stack -- or the noob parry's faster swing for your first 5 parries ever;
---   * when: like the game, a new block starts only once the last one landed
---     (ParrySuccess) or its 1.3s cooldown ran out, and after a landed parry it
---     waits for the success swing to show and the ball to be back on you. So spam
---     at hundreds a second reads as block -> success swing -> block, exactly what
---     a real held key looks like, instead of restarting the swing every few ms.
--- ===========================================================================
 local Anim = { enabled = true, spam = true, skin = nil }
 do
     local BLOCK_COOLDOWN, SWING_SHOW = 1.3, 0.08
-    local info_cache = {}
-    local own_tracks = setmetatable({}, { __mode = 'k' }) -- animator -> {[Animation] = track}
-    local r15_clones = {}
-    local own_swing = setmetatable({}, { __mode = 'k' })  -- track -> when we played it
+    local infoCache, ownTracks, r15Clones, ownSwing = {}, setmetatable({}, { __mode = 'k' }), {}, setmetatable({}, { __mode = 'k' })
     local gate = { last = -math.huge, landed = true, landed_at = -math.huge }
-    local success_at, swing_tracks = -math.huge, {}
-    -- the game's block lockout (n2): 1.3, 1.5 on your first parry ever, less on
-    -- a low-kill account -- read off the capture's window (Parry.lockout)
+    local successAt, swingTracks = -math.huge, {}
     local function cooldown()
         local n2 = Parry.lockout and Parry.lockout()
         return (type(n2) == "number" and n2 > 0) and n2 or BLOCK_COOLDOWN
     end
-    local function sword_info(char)
+    local function swordInfo(char)
         local name = (Anim.skin and Anim.skin()) or char:GetAttribute("CurrentlyEquippedSword") or ""
-        local info = info_cache[name]
+        local info = infoCache[name]
         if info then return info end
-        -- AnimationType AND SwordType, like the game's SetSword (until 0.5.101
-        -- only the first: dual / special sword types swung the wrong set)
         info = { collection = "Default", sword_type = "Single" }
         if name ~= "" then
             local ok, data = pcall(function() return ReplicatedStorage.Shared.ReplicatedInstances.Swords.GetSword:Invoke(name) end)
@@ -243,23 +136,17 @@ do
                 if data.SwordType then info.sword_type = data.SwordType end
             end
         end
-        info_cache[name] = info
+        infoCache[name] = info
         return info
     end
-    -- SwordAPI's pick, done with instance reads only (0.5.103 -- 0.5.101
-    -- required SwordAPI / AnimationController, and requiring a game module from
-    -- here re-runs it on many executors: the lag spike on the first swing after
-    -- a capture). Collections in its order: AnimationType, SwordType, Default;
-    -- in each, Base / Accessory -> AnimationStyle folder (a StringValue there
-    -- points at another collection), first one holding Parry / GrabParry wins.
-    local function resolve_folder(char, col, root)
+    local function resolveFolder(char, col, root)
         local sub = col:FindFirstChild(char:GetAttribute("HasAccessoryEquipped") and "Accessory" or "Base")
         if not sub then return col end
         local style = sub:FindFirstChild(char:GetAttribute("AnimationStyle") or "Default") or sub
         if style:IsA("StringValue") then return root:FindFirstChild(style.Value) end
         return style
     end
-    local function find_animations(info, char)
+    local function findAnims(info, char)
         local list = {}
         pcall(function()
             local root = ReplicatedStorage.Shared.SwordAPI:FindFirstChild("Collection")
@@ -271,7 +158,7 @@ do
             end
             for _, tag in ipairs({ "Parry", "GrabParry" }) do
                 for _, col in ipairs(cols) do
-                    local folder = resolve_folder(char, col, root)
+                    local folder = resolveFolder(char, col, root)
                     if folder then
                         for _, anim in ipairs(folder:GetChildren()) do
                             if anim:IsA("Animation") and anim:GetAttribute(tag) then list[#list + 1] = anim end
@@ -283,34 +170,29 @@ do
         end)
         return list
     end
-    local function load_track(animator, humanoid, anim)
-        local per = own_tracks[animator]
-        if not per then per = {}; own_tracks[animator] = per end
+    local function loadTrack(animator, humanoid, anim)
+        local per = ownTracks[animator]
+        if not per then per = {}; ownTracks[animator] = per end
         local track = per[anim]
         if track then return track end
-        local source = anim
-        local r15 = anim:GetAttribute("R15Id")
+        local source, r15 = anim, anim:GetAttribute("R15Id")
         if r15 and humanoid.RigType == Enum.HumanoidRigType.R15 then
-            source = r15_clones[anim]
-            if not source then source = Instance.new("Animation"); source.AnimationId = r15; r15_clones[anim] = source end
+            source = r15Clones[anim]
+            if not source then source = Instance.new("Animation"); source.AnimationId = r15; r15Clones[anim] = source end
         end
         track = animator:LoadAnimation(source)
         for k, v in pairs(anim:GetAttributes()) do pcall(track.SetAttribute, track, k, v) end
         per[anim] = track
         return track
     end
-    local function play_block()
+    local function playBlock()
         local char = LocalPlayer.Character
         if not char or char:GetAttribute("InOverdriveMech") then return end
         local humanoid = char:FindFirstChildOfClass("Humanoid")
         local animator = humanoid and humanoid:FindFirstChildOfClass("Animator")
         if not animator then return end
-        local now = os.clock()
-        -- the last block didn't land: no new one inside the game's block cooldown
-        local cd = cooldown()
+        local now, cd = os.clock(), cooldown()
         if not gate.landed and now - gate.last < cd then return end
-        -- it landed: let the success swing show, and start the next block when the
-        -- ball is back on us (give up waiting after the cooldown)
         if gate.landed and gate.landed_at > gate.last then
             if now - gate.landed_at < SWING_SHOW then return end
             if not Parry.ballOnMe() and now - gate.landed_at < cd then return end
@@ -319,48 +201,38 @@ do
         for _, track in ipairs(animator:GetPlayingAnimationTracks()) do
             if track:GetAttribute("SuccessParry") or track:GetAttribute("Parry") then track:Stop(track:GetAttribute("StopFadeTime")) end
         end
-        -- your first 5 parries ever swing faster and snap in (the game's noob
-        -- parry: fade 0.05, weight 1, speed times/5 + 1)
         local times = Parry.timesParried and Parry.timesParried()
-        local noob = type(times) == "number" and times < 5
-        local parry_time = char:GetAttribute("ParryTime") or 0
-        swing_tracks = {}
-        for _, anim in ipairs(find_animations(sword_info(char), char)) do
-            local ok, track = pcall(load_track, animator, humanoid, anim)
+        local noob, parryTime = type(times) == "number" and times < 5, char:GetAttribute("ParryTime") or 0
+        swingTracks = {}
+        for _, anim in ipairs(findAnims(swordInfo(char), char)) do
+            local ok, track = pcall(loadTrack, animator, humanoid, anim)
             if ok and track then
                 local speed = noob and (times / 5 + 1) or track:GetAttribute("PlaySpeed") or 1
-                own_swing[track] = os.clock()
+                ownSwing[track] = os.clock()
                 if noob then track:Play(0.05, 1, speed)
                 else track:Play(track:GetAttribute("PlayFadeTime"), track:GetAttribute("PlayWeight"), speed) end
-                swing_tracks[#swing_tracks + 1] = track
+                swingTracks[#swingTracks + 1] = track
                 local left = track.Length == 0 and 1 or (track.Length - track.TimePosition) * speed
-                if left > parry_time then parry_time = left end
+                if left > parryTime then parryTime = left end
             end
         end
-        pcall(char.SetAttribute, char, "ParryTime", parry_time)
+        pcall(char.SetAttribute, char, "ParryTime", parryTime)
     end
-    -- a single parry (auto parry, triggerbot, pre-parry)
-    function Anim.block() if Anim.enabled then pcall(play_block) end end
-    -- spam: same gate, so it plays like a held key
-    function Anim.spamBlock() if Anim.enabled and Anim.spam then pcall(play_block) end end
+    function Anim.block() if Anim.enabled then pcall(playBlock) end end
+    function Anim.spamBlock() if Anim.enabled and Anim.spam then pcall(playBlock) end end
     function Anim.onSuccess()
         local now = os.clock()
-        success_at, gate.landed, gate.landed_at = now, true, now
-        -- the game plays its own success swing now and stops the block tracks IT
-        -- loaded -- ours aren't in its registry, so take every one of them off
-        -- (until 0.5.104 only the last: a multi-track set kept swinging over it)
-        for _, t in ipairs(swing_tracks) do pcall(function() t:Stop(t:GetAttribute("StopFadeTime")) end) end
-        swing_tracks = {}
+        successAt, gate.landed, gate.landed_at = now, true, now
+        for _, t in ipairs(swingTracks) do pcall(function() t:Stop(t:GetAttribute("StopFadeTime")) end) end
+        swingTracks = {}
     end
-    function Anim.reset() gate.last, gate.landed, gate.landed_at, swing_tracks = -math.huge, true, -math.huge, {} end
-    -- a swing the GAME started from a real press (yours, tap to block, a capture
-    -- press) -- not our own swing and not a landed parry's success swing
+    function Anim.reset() gate.last, gate.landed, gate.landed_at, swingTracks = -math.huge, true, -math.huge, {} end
     function Anim.isGamePress(track)
         if track:GetAttribute("SuccessParry") then return false end
         if not (track:GetAttribute("Parry") or track:GetAttribute("GrabParry")) then return false end
         local now = os.clock()
-        if now - success_at < 0.35 then return false end
-        local at = own_swing[track]
+        if now - successAt < 0.35 then return false end
+        local at = ownSwing[track]
         if at and now - at < 0.25 then return false end
         return true
     end
@@ -370,19 +242,16 @@ do
     local me = LocalPlayer.Name
     local Core = { cap = nil, pending = nil, misses = 0, interp = 0.14, last_parry = nil,
         ctx = "match", gen = 0, last_send_at = -math.huge, tune = 0, verdict = nil,
-        -- attempt answers + timing diagnostics (0.5.115, see Parry.onAttempt)
         echo = { at = -math.huge, forged_ok = false, rtt = nil, seen = 0 }, await = nil,
         last_spam_at = -math.huge, cap_n = 0,
         diag = { fired = 0, landed = 0, early = 0, late = 0, ontime = 0, refused = 0, rescued = 0, bias = nil, spread = 0, n = 0 },
         feed = { n = 0, total = 0, since = 0, ahead = nil, urs = 0,
             pos = setmetatable({}, { __mode = "k" }), at = setmetatable({}, { __mode = "k" }) } }
-    local G = { until_t = 0, m1 = false, m1_at = 0 }
-    local frame_dt = 1 / 60
-    local active = false
+    local G, frameDt, active = { until_t = 0, m1 = false, m1_at = 0 }, 1 / 60, false
     local Alive, Remotes
 
-    local TARGET_NAMES = { 'Cursor', 'Camera', 'Closest', 'Farthest', 'Random' }
-    local CURVE_NAMES = { 'Camera', 'Straight', 'Normal', 'Accelerated', 'High', 'Slow', 'Backwards', 'Random',
+    Util.TARGET_NAMES = { 'Cursor', 'Camera', 'Closest', 'Farthest', 'Random' }
+    Util.CURVE_NAMES = { 'Camera', 'Straight', 'Normal', 'Accelerated', 'High', 'Slow', 'Backwards', 'Random',
         'Speed', 'Down', 'Left', 'Right', 'Sky', 'Ground', 'Alternate', 'Random Side', 'Zigzag', 'Spiral',
         'Cursor', 'Flick', 'Diagonal', 'Reverse' }
 
@@ -402,27 +271,20 @@ do
         hs_fix = false, hs_speed = 400, hs_per_tick = 2,
         smart = true, range_bonus = 0, hold = 0.15, sensitivity = 1.3, predictive = true,
     }
-    -- detection state (written by the detection features, read here)
     local Det = { infinity = false, deathslash = false, timehole = false, slashes = false, phantom_until = 0,
-        -- per ball (0.5.113): ball -> until when (weak keys: a removed ball drops out)
         inf = setmetatable({}, { __mode = "k" }), death = setmetatable({}, { __mode = "k" }),
         th_hold = setmetatable({}, { __mode = "k" }), timehole_on = false,
         tor = setmetatable({}, { __mode = "k" }), tor_fid = -1, tor_list = {} }
-    Parry.S, Parry.SP, Parry.Det, Parry.targetNames, Parry.curveNames = S, SP, Det, TARGET_NAMES, CURVE_NAMES
+    Parry.S, Parry.SP, Parry.Det, Parry.targetNames, Parry.curveNames = S, SP, Det, Util.TARGET_NAMES, Util.CURVE_NAMES
 
-    -- parry log: a ring buffer the Status tab drains
-    local LOG, log_new = {}, 0
+    local LOG, logNew = {}, 0
     local function logp(text)
         LOG[#LOG + 1] = text
         if #LOG > 60 then table.remove(LOG, 1) end
-        log_new = math.min(log_new + 1, 60)
-        if Parry.onLog then pcall(Parry.onLog, text) end -- the log file (see Flight)
+        logNew = math.min(logNew + 1, 60)
+        if Parry.onLog then pcall(Parry.onLog, text) end
     end
     Parry.logp = logp
-    -- ---------- debug feed (Debug tab) ----------
-    -- Collects only while the debug overlay is on: an event list (retargets,
-    -- fires, captures, their parries...), the last decision's numbers, why the
-    -- last check held, and update rates. Read by Parry.debugLines / the overlay.
     local DBG = { on = false, list = {}, eval = {}, block = nil, block_at = 0,
         counts = { vel = 0, feed = 0, since = clock_() }, rates = { vel = 0, feed = 0 } }
     Parry.DBG = DBG
@@ -435,61 +297,51 @@ do
     function DBG.held(why, now) if DBG.on then DBG.block, DBG.block_at = why, now end end
     function Parry.drainLog()
         local out = {}
-        for i = #LOG - log_new + 1, #LOG do if LOG[i] then out[#out + 1] = LOG[i] end end
-        log_new = 0
+        for i = #LOG - logNew + 1, #LOG do if LOG[i] then out[#out + 1] = LOG[i] end end
+        logNew = 0
         return out
     end
 
-    local function update_divisor() S.divisor_multiplier = 0.7 + (S.accuracy - 1) * (0.9 / 99) end
-    local function roll_accuracy()
+    function Util.updDivisor() S.divisor_multiplier = 0.7 + (S.accuracy - 1) * (0.9 / 99) end
+    function Util.rollAcc()
         local acc = S.accuracy_base
         if S.random_accuracy and S.random_accuracy_amount > 0 then
             acc = acc + math.random(-S.random_accuracy_amount, S.random_accuracy_amount)
         end
         S.accuracy = math.clamp(acc, 1, 100)
-        update_divisor()
+        Util.updDivisor()
     end
-    Parry.roll = roll_accuracy
+    Parry.roll = Util.rollAcc
     function Parry.resetTune() Core.tune = 0 end
-    update_divisor()
-    local function index_of(list, name)
+    Util.updDivisor()
+    function Util.indexOf(list, name)
         for i, n in ipairs(list) do if n == name then return i end end
     end
-    function Parry.setTargetMode(name) S.target_mode = index_of(TARGET_NAMES, name) or 1 end
-    function Parry.setCurveMode(name) S.curve_mode = index_of(CURVE_NAMES, name) or 1 end
+    function Parry.setTargetMode(name) S.target_mode = Util.indexOf(Util.TARGET_NAMES, name) or 1 end
+    function Parry.setCurveMode(name) S.curve_mode = Util.indexOf(Util.CURVE_NAMES, name) or 1 end
 
-    -- ---------- ping / lag / reach ----------
-    local ping_cache = { at = -1, ms = 0 }
+    local pingCache = { at = -1, ms = 0 }
     local function pingMs()
         local now = clock_()
-        if now - ping_cache.at > 0.05 then
+        if now - pingCache.at > 0.05 then
             local ok, ping = pcall(function() return Stats.Network.ServerStatsItem['Data Ping']:GetValue() end)
             ping = ok and tonumber(ping) or 0
             if ping <= 0 then
-                -- the Stats item reads 0 for a while on some clients: the
-                -- player's own network ping (one way, seconds) stands in
                 local ok2, np = pcall(LocalPlayer.GetNetworkPing, LocalPlayer)
                 if ok2 and type(np) == "number" and np > 0 then ping = np * 2000 end
             end
-            ping_cache.ms, ping_cache.at = ping, now
+            pingCache.ms, pingCache.at = ping, now
         end
-        return ping_cache.ms
+        return pingCache.ms
     end
     Parry.pingMs = pingMs
-    local function ping_s() return math.min(pingMs(), 400) / 1000 end
-    -- LATENCY (0.5.115). A 3s window of ping samples (one every 0.1s):
-    --   avg    the MEDIAN -- one spike (a hitch, a burst of packets) no longer
-    --          drags the estimate up for the next second like the old average
-    --   jit    the larger of the smoothed deviation and (90th percentile -
-    --          median): sustained jitter is covered, a lone spike isn't
-    -- Lag.echo is the measured round trip of our own parries (send -> the
-    -- server's attempt answer), shown in the timing diagnostics.
+    local function pingS() return math.min(pingMs(), 400) / 1000 end
     local Lag = { avg = nil, jit = 0.005, at = -1, win = {}, dev = 0.005, echo = nil }
-    local function sample_lag()
+    local function sampleLag()
         local now = clock_()
         if now - Lag.at < 0.1 then return end
         Lag.at = now
-        local p = ping_s()
+        local p = pingS()
         if p <= 0 then return end
         local w = Lag.win
         w[#w + 1] = p
@@ -497,30 +349,21 @@ do
         local sorted = table.clone(w)
         table.sort(sorted)
         local n = #sorted
-        local med = sorted[math.ceil(n * 0.5)]
-        local p90 = sorted[math.max(math.ceil(n * 0.9), 1)]
+        local med, p90 = sorted[math.ceil(n * 0.5)], sorted[math.max(math.ceil(n * 0.9), 1)]
         Lag.dev = Lag.dev + (math.abs(p - med) - Lag.dev) * 0.15
         Lag.avg = med
         Lag.jit = math.max(Lag.dev, (p90 - med) * 0.5)
     end
     local function jitter() return math.clamp(Lag.jit * 2, 0.005, 0.12) end
-    -- seconds from "fire now" until the parry is up, in the timeline of the ball we see.
-    -- Worked out once per frame (Core.fid ticks at the frame's first point) and
-    -- reused by every check in it, so no check waits on a Stats read.
-    local function reach_time()
+    local function reachT()
         if Core.rt_fid == Core.fid then return Core.rt end
-        sample_lag()
-        -- half the round trip, from the SMOOTHED ping. Full ping ("Ping
-        -- compensation", removed in 0.5.85) and max(avg, now) both made high
-        -- ping parry earlier and earlier -- worse than no compensation at all.
-        -- The ball we read is the server-feed one, so its own lag is already gone.
-        Core.rt = (Lag.avg or ping_s()) * 0.5 + jitter() + Core.interp + frame_dt * 0.5
+        sampleLag()
+        Core.rt = (Lag.avg or pingS()) * 0.5 + jitter() + Core.interp + frameDt * 0.5
         Core.rt_fid = Core.fid
         return Core.rt
     end
 
-    -- ---------- the player ----------
-    local function character_root(name)
+    local function charRoot(name)
         if type(name) ~= 'string' or name == '' or not Alive then return nil end
         local char = Alive:FindFirstChild(name)
         if not char then
@@ -545,36 +388,23 @@ do
         end
         return false
     end
-    local function in_match()
+    function Util.inMatch()
         local char = LocalPlayer.Character
         return char ~= nil and char.Parent == Alive
     end
-    local function in_training()
+    function Util.inTrain()
         if LocalPlayer:GetAttribute("LobbyTraining") or LocalPlayer:GetAttribute("LobbyParry") then return true end
         local char, dead = LocalPlayer.Character, Workspace:FindFirstChild("Dead")
         return char ~= nil and dead ~= nil and char.Parent == dead
     end
-    local function ap_root()
+    local function apRoot()
         local root = getRoot()
         if not root or root:FindFirstChild('SingularityCape') or not canParryNow() then return nil end
         return root
     end
-    -- ABILITY DETECTION, PER BALL (0.5.113). Until then Infinity / Death Slash
-    -- set ONE global flag -- any ball anywhere in Infinity paused auto parry on
-    -- every ball, and a missed "off" message paused it for the rest of the
-    -- round -- and Time Hole / Slashes of Fury listened on the readable Net
-    -- names, which are decoys (never fire). Now, on the ball itself:
-    --   infinity    Remotes.InfinityBall(ball, on)  -- locked in an Infinity
-    --               aura; expires after 15s (the game's own effect lifetime)
-    --   death slash Remotes.DeathBall(ball, on); expires after 8s
-    --   time hole   the ball's IsInTimeHoleAOE attribute (halted in the area,
-    --               set by the server) or Remotes.TimeHoleHoldBall(ball, on)
-    -- (all from BallReplicationHandler, Bbs/Training dump). Slashes of Fury and
-    -- Phantom stay global: they're about you, not a ball.
     function Det.ball_detected(ball)
         if typeof(ball) ~= "Instance" or not ball.Parent then return nil end
-        local now = clock_()
-        local u = Det.inf[ball]
+        local now, u = clock_(), Det.inf[ball]
         if u and now < u then return "infinity" end
         u = Det.death[ball]
         if u and now < u then return "death slash" end
@@ -585,9 +415,7 @@ do
         end
         return nil
     end
-    -- with a ball: that ball only. Without one (auto spam start, status): any
-    -- live ball that's on us.
-    local function blocked_by_detection(ball)
+    local function blocked(ball)
         if Det.slashes or clock_() < Det.phantom_until then return true end
         if ball then return Det.ball_detected(ball) ~= nil end
         for _, name in ipairs({ "Balls", "TrainingBalls" }) do
@@ -599,67 +427,41 @@ do
         return false
     end
 
-    -- ---------- window / lockout gate ----------
-    -- The window the game sends as the parry packet's 4th argument (n6): 0.5
-    -- normally, 1.5 / 1.25 / 1 / 0.75 / 0.625 for your first 5 parries ever,
-    -- scaled by kills / 20 on casual servers until 20 kills. The server checks
-    -- it; until 0.5.101 forged parries always said 0.5. Now: the number the
-    -- captured packet carried (0.5.103: read off the packet, no Replion require).
     Core.noob_windows = { [1.5] = 0, [1.25] = 1, [1] = 2, [0.75] = 3, [0.625] = 4 }
-    -- your first-5 noob parry index, when the captured window says so
     function Parry.timesParried()
         local w = Core.cap and Core.cap.win
         return w and Core.noob_windows[w] or nil
     end
-    local function parry_window()
+    local function parryWin()
         local cw = Core.cap and Core.cap.win
         if cw and cw > 0 then return cw, cw == 1.5 and 1.5 or 1.3 * math.min(cw / 0.5, 1) end
         return 0.5, 1.3
     end
-    function Parry.lockout() local _, n2 = parry_window(); return n2 end
-    local function lockout_margin() return math.clamp(jitter() + frame_dt + 0.03, 0.06, 0.15) end
-    local function gate_start()
+    function Parry.lockout() local _, n2 = parryWin(); return n2 end
+    local function lockMargin() return math.clamp(jitter() + frameDt + 0.03, 0.06, 0.15) end
+    local function gateStart()
         local now = clock_()
         if now < G.until_t then return end
-        local n6, n2 = parry_window()
-        G.until_t = now + math.max((n6 or 0.5) + 0.1, n2 or 1.3) + lockout_margin()
+        local n6, n2 = parryWin()
+        G.until_t = now + math.max((n6 or 0.5) + 0.1, n2 or 1.3) + lockMargin()
     end
-    local function gate_open()
+    local function gateOpen()
         if G.m1 and clock_() - G.m1_at < 3 then return false end
         return clock_() >= G.until_t
     end
 
-    -- ---------- timing ----------
-    -- The cushion: how far ahead of the ball's arrival (beyond our reach) the
-    -- parry goes. Since 0.5.88 it is set in BALL TRAVEL, not plain time -- a
-    -- time cushion is a different distance at every speed (0.34s at 39 was
-    -- ~100 studs on a 300 ball, yet 100's 30ms was nothing on a slow one):
-    --   100 -> SAFE:  5 studs of travel ahead (never less than jitter + a frame
-    --          + 10ms) -- close, but a slow ball isn't let onto you;
-    --   1   -> EARLY: 35 studs ahead, and never past what the parry window
-    --          (capped 0.6s) still covers -- so even 1 can't run out.
-    -- 0.5.114: LINEAR (was squared toward SAFE: 39 was only ~2/5 of the way
-    -- out -- ~16 studs -- and on a 600 ball 16 studs is 0.027s: a "perfect
-    -- parry" at 39). Plus a TIME floor that grows as Accuracy drops (0 at 100,
-    -- 0.12s at 1): studs alone shrink to nothing on a fast ball. Still capped by
-    -- what the parry window covers, so 1 can't run out.
-    --   39 -> ~23 studs ahead, never less than ~0.07s
-    local function safe_margin() return jitter() + frame_dt + 0.01 end
-    local function cushion_for(speed, W)
-        local a = (math.clamp(S.accuracy or 50, 1, 100) - 1) / 99
-        local sp = math.max(speed or 1, 1)
-        local f = 1 - a
-        local safe = math.max(safe_margin(), 5 / sp)
-        local cap = math.max(math.min(W or 0.5, 0.6) - (jitter() + frame_dt + 0.03), safe)
-        local want = math.max((5 + 30 * f) / sp, 0.12 * f, safe)
+    local function safeMargin() return jitter() + frameDt + 0.01 end
+    local function cushion(speed, W)
+        local a, sp = (math.clamp(S.accuracy or 50, 1, 100) - 1) / 99, math.max(speed or 1, 1)
+        local f, safe = 1 - a, math.max(safeMargin(), 5 / sp)
+        local cap, want = math.max(math.min(W or 0.5, 0.6) - (jitter() + frameDt + 0.03), safe), math.max((5 + 30 * f) / sp, 0.12 * f, safe)
         return math.min(want, cap)
     end
-    local function fire_lead(speed)
-        return reach_time() + cushion_for(speed, parry_window() or 0.5)
+    local function fireLead(speed)
+        return reachT() + cushion(speed, parryWin() or 0.5)
     end
 
-    -- ---------- screen points / aim / target ----------
-    local function build_screen_points(cam)
+    local function screenPts(cam)
         local points, others = {}, {}
         local char = LocalPlayer.Character
         local function add(name, pos)
@@ -670,8 +472,7 @@ do
         local dead = Workspace:FindFirstChild('Dead')
         if dead and char and char.Parent == dead and LocalPlayer:GetAttribute('LobbyTraining') then
             for _, other in ipairs(dead:GetChildren()) do
-                local plr = Players:GetPlayerFromCharacter(other)
-                local hrp = other:FindFirstChild('HumanoidRootPart')
+                local plr, hrp = Players:GetPlayerFromCharacter(other), other:FindFirstChild('HumanoidRootPart')
                 if plr and hrp and plr:GetAttribute('LobbyTraining') then add(other.Name, hrp.Position) end
             end
             for _, dummy in ipairs(CollectionService:GetTagged('LobbyTrainingTarget')) do
@@ -684,16 +485,15 @@ do
                     local team = LocalPlayer:GetAttribute("Team") or (char and char:GetAttribute("Team"))
                     if team == nil and LocalPlayer.Team then team = tonumber(LocalPlayer.Team.Name:match("%d+")) end
                     team = tonumber(team)
-                    local want = team and ("Goal%s"):format(tostring(team == 1 and 2 or 1))
-                    local root = char and char.PrimaryPart
-                    local best, best_d
+                    local want, root = team and ("Goal%s"):format(tostring(team == 1 and 2 or 1)), char and char.PrimaryPart
+                    local best, bestD
                     for _, goal in ipairs(CollectionService:GetTagged("HovergoalGoal")) do
                         local t = goal:FindFirstChild("Target")
                         if t then
                             if want then if goal.Name == want then best = goal; break end
                             elseif root then
                                 local d = (t.Position - root.Position).Magnitude
-                                if not best_d or d > best_d then best, best_d = goal, d end
+                                if not bestD or d > bestD then best, bestD = goal, d end
                             end
                         end
                     end
@@ -712,27 +512,24 @@ do
         end
         return points, others
     end
-    local PACKET_TTL = 1 / 240
-    local packet_cache = { at = -1, points = nil, aim = nil, others = nil }
-    local function packet_parts(cam)
+    Util.PACKET_TTL = 1 / 240
+    local packetCache = { at = -1, points = nil, aim = nil, others = nil }
+    local function packetParts(cam)
         local now = clock_()
-        if now - packet_cache.at > PACKET_TTL then
-            packet_cache.points, packet_cache.others = build_screen_points(cam)
+        if now - packetCache.at > Util.PACKET_TTL then
+            packetCache.points, packetCache.others = screenPts(cam)
             local ok, mouse = pcall(UserInputService.GetMouseLocation, UserInputService)
-            if ok and mouse then packet_cache.aim = { mouse.X, mouse.Y }
-            else local vp = cam.ViewportSize; packet_cache.aim = { vp.X / 2, vp.Y / 2 } end
-            packet_cache.at = now
+            if ok and mouse then packetCache.aim = { mouse.X, mouse.Y }
+            else local vp = cam.ViewportSize; packetCache.aim = { vp.X / 2, vp.Y / 2 } end
+            packetCache.at = now
         end
-        return packet_cache.points, packet_cache.aim, packet_cache.others
+        return packetCache.points, packetCache.aim, packetCache.others
     end
-    local target_hold = { at = -1, mode = nil, name = nil, pos = nil }
-    local function choose_target(cam)
-        local mode = TARGET_NAMES[S.target_mode] or "Cursor"
-        local now = clock_()
-        -- held one frame (spam: same pick for every parry in it). It was 0.1s --
-        -- a quick camera turn kept sending the ball to the old pick
-        if target_hold.mode == mode and now - target_hold.at < 1 / 60 then return target_hold.name, target_hold.pos, mode end
-        local _, _, others = packet_parts(cam)
+    local targetHold = { at = -1, mode = nil, name = nil, pos = nil }
+    local function pickTarget(cam)
+        local mode, now = Util.TARGET_NAMES[S.target_mode] or "Cursor", clock_()
+        if targetHold.mode == mode and now - targetHold.at < 1 / 60 then return targetHold.name, targetHold.pos, mode end
+        local _, _, others = packetParts(cam)
         local root = getRoot()
         local origin = root and root.Position or cam.CFrame.Position
         local name, pos
@@ -746,19 +543,7 @@ do
                     if (mode == "Closest" and d < best) or (mode == "Farthest" and d > best) then best, name, pos = d, t.name, t.pos end
                 end
             else
-                -- Camera / Cursor: the player the view (or the mouse ray) points
-                -- at, scored by the Aim method (S.target_method, 0.5.106):
-                --   Angle         smallest 3D angle off the ray, a touch of
-                --                 distance breaking near-ties (default)
-                --   Ray distance  fewest studs off the ray: favours whoever the
-                --                 line actually passes nearest, near or far
-                --   Weighted      angle x (1 + distance / 150): leans hard toward
-                --                 nearer players, for crowded views
-                --   Screen        pixel gap to the screen centre / mouse (the old
-                --                 way; on-screen players only)
-                -- Alive players only.
-                local method = S.target_method or "Angle"
-                local ccf = cam.CFrame
+                local method, ccf = S.target_method or "Angle", cam.CFrame
                 local o, look = ccf.Position, ccf.LookVector
                 local vp = cam.ViewportSize
                 local anchor = Vector2.new(vp.X / 2, vp.Y / 2)
@@ -766,7 +551,7 @@ do
                     local ok, m = pcall(UserInputService.GetMouseLocation, UserInputService)
                     if ok and m then
                         anchor = m
-                        local ray = cam:ScreenPointToRay(m.X, m.Y, 0) -- the game's own mouse ray
+                        local ray = cam:ScreenPointToRay(m.X, m.Y, 0)
                         o, look = ray.Origin, ray.Direction.Unit
                     end
                 end
@@ -804,20 +589,18 @@ do
                 end
             end
         end
-        target_hold.at, target_hold.mode, target_hold.name, target_hold.pos = now, mode, name, pos
+        targetHold.at, targetHold.mode, targetHold.name, targetHold.pos = now, mode, name, pos
         return name, pos, mode
     end
 
-    -- ---------- curve modes: the look direction sent with the parry ----------
-    local curve_flip = 1
-    local function curve_look(cam)
-        local mode = CURVE_NAMES[S.curve_mode] or "Camera"
-        if S.random_curve then mode = CURVE_NAMES[math.random(1, #CURVE_NAMES)] end
+    local curveFlip = 1
+    local function curveLook(cam)
+        local mode = Util.CURVE_NAMES[S.curve_mode] or "Camera"
+        if S.random_curve then mode = Util.CURVE_NAMES[math.random(1, #Util.CURVE_NAMES)] end
         if mode == "Camera" then return nil end
-        local ccf = cam.CFrame
-        local root = getRoot()
+        local ccf, root = cam.CFrame, getRoot()
         local origin = root and root.Position or ccf.Position
-        local _, tpos = choose_target(cam)
+        local _, tpos = pickTarget(cam)
         local to = tpos and (tpos - origin) or ccf.LookVector
         if to.Magnitude < 1e-3 then to = ccf.LookVector end
         local toT, up = to.Unit, Vector3.yAxis
@@ -837,9 +620,9 @@ do
         elseif mode == "Right" then d = ccf.RightVector
         elseif mode == "Sky" then d = up
         elseif mode == "Ground" then d = toT * 0.3 - up
-        elseif mode == "Alternate" then curve_flip = -curve_flip; d = toT * 0.2 + right * curve_flip
+        elseif mode == "Alternate" then curveFlip = -curveFlip; d = toT * 0.2 + right * curveFlip
         elseif mode == "Random Side" then d = toT * 0.2 + right * (math.random() < 0.5 and -1 or 1)
-        elseif mode == "Zigzag" then curve_flip = -curve_flip; d = toT + up * (1.5 * curve_flip)
+        elseif mode == "Zigzag" then curveFlip = -curveFlip; d = toT + up * (1.5 * curveFlip)
         elseif mode == "Spiral" then
             local a = clock_() * 8
             d = toT + (right * math.cos(a) + up * math.sin(a)) * 1.2
@@ -853,112 +636,49 @@ do
         if d ~= d or d.Magnitude < 1e-3 then return nil end
         return d.Unit
     end
-    local curve_cache = { at = -1, mode = nil, look = nil }
-    local function curve_look_cached(cam)
+    local curveCache = { at = -1, mode = nil, look = nil }
+    local function curveLookC(cam)
         local now = clock_()
-        if now - curve_cache.at > PACKET_TTL or curve_cache.mode ~= S.curve_mode then
-            curve_cache.look = curve_look(cam)
-            curve_cache.at, curve_cache.mode = now, S.curve_mode
+        if now - curveCache.at > Util.PACKET_TTL or curveCache.mode ~= S.curve_mode then
+            curveCache.look = curveLook(cam)
+            curveCache.at, curveCache.mode = now, S.curve_mode
         end
-        return curve_cache.look
+        return curveCache.look
     end
 
-    -- ---------- capture hook (BladeBall.lua v63 @5a84254, ported verbatim) ----------
-    -- Swapped in from the proven legacy script per request, in place of the
-    -- rewrite's own hook. The hook exists only for the one capture press. While
-    -- up it sits on the game's call stack, so the bodies: reject non-parry calls
-    -- on the cheapest check first (arg count); are compiled under the Net module's
-    -- chunk name so debug.info shows a game path, not ours; run in a clean game
-    -- env (getrenv globals, no writefile); and call nothing of ours -- they drop
-    -- the send into `box` and pass the call straight on. Our own thread reads the
-    -- box and takes the hook down the moment the parry is in (H.check right after
-    -- the press -> 0 frames up when the game sends inside the press).
-    --
-    -- Capture hook dropdown (getgenv.CaptureHook): "Namecall" (__namecall only),
-    -- "FireServer" (the FireServer function only), "Both". v63 has no "oth" mode,
-    -- so an "oth" setting hooks both channels (it is neither "Namecall" nor
-    -- "FireServer"), which still captures.
-
-    -- cached globals the ported hook / body use
     local pcall_, type_, typeof_, tostring_ = pcall, type, typeof, tostring
     local floor_, bxor_, byte_, select_ = math.floor, bit32.bxor, string.byte, select
-    local hookfunction_      = hookfunction
-    local restore_           = restorefunction
-    local hookmetamethod_    = hookmetamethod
-    local getnamecallmethod_ = getnamecallmethod
-    local getrawmetatable_   = getrawmetatable
-    local setreadonly_       = setreadonly or make_writeable
+    local hookfunction_, restore_, hookmetamethod_, getnamecallmethod_ = hookfunction, restorefunction, hookmetamethod, getnamecallmethod
+    local getrawmetatable_, setreadonly_ = getrawmetatable, setreadonly or make_writeable
     local newcclosure_       = newcclosure or function(f) return f end
     local flight = logp
-    -- the remote's FireServer, resolved in Parry.resolve() (never at load)
     local FIRE_FN
     local JOB_ID = game.JobId
-    -- The sender module (SwordsController.PRY, Bbs dump) opens with
-    --   _G.BAC_HASH   = "<real hash>"
-    --   _G.BAC_FAKE_1 / _G.BAC_FAKE_2 = "<decoy hashes>"
-    -- and every parry also fires decoy packets carrying the fake ones, same
-    -- shape as the real packet. Read from the game's own _G (a read the game
-    -- can't see); re-read each time, in case it rotates.
     function Core.bac()
         local ok, g = pcall(function() return getrenv and getrenv()._G end)
         if not ok or type(g) ~= "table" then return nil end
         local real, f1, f2 = rawget(g, "BAC_HASH"), rawget(g, "BAC_FAKE_1"), rawget(g, "BAC_FAKE_2")
         return type(real) == "string" and #real == 36 and real or nil, f1, f2
     end
-    -- The hashes as PRY's source sets them (Bbs dumps: the same in the main
-    -- place on 2026-10-22 and Training Mode on 2026-11-06). At RUNTIME the game
-    -- blanks _G.BAC_HASH / BAC_FAKE_1 / BAC_FAKE_2 to "" once the sender has
-    -- them (both dumps' GLOBALS), so Core.bac() above reads nothing in a live
-    -- server. These are used ONLY to confirm, never to send: a packet on the
-    -- plain-call path is taken only if it carries exactly Core.known_real, and the
-    -- known decoys are always refused. After a game update that changes the
-    -- hash, nothing on that path matches -> namecall-only, as before.
     Core.known_real = "5455ef47-de02-4074-808c-8d82c2cd12ec"
     Core.known_fakes = { ["90fa5062-066f-4376-b9e9-8adc47fbd983"] = true, ["2983784e-7f10-4278-a8d1-259db4906a2b"] = true }
 
     local H = { fire = nil, nc = nil, want = false, until_t = 0 }
 
-    -- Which hook(s) a capture press uses (Parry tab -> "Capture hook").
-    -- getgc (reflection: getgc/getupvalues/getconstants) is detected -- it kicks
-    -- even from the lobby, and getgenv().CaptureHook persists across reloads, so
-    -- a stale "getgc" is migrated to "Both" here and can never run the scan again.
-    -- Default "Namecall": a __namecall hook (hookmetamethod) lives in game's
-    -- LOCKED metatable, which a game LocalScript cannot read (getrawmetatable is
-    -- exploit-only) -- so the anticheat cannot see it. "Both"/"FireServer" also
-    -- replace the shared FireServer function, whose identity a game script CAN
-    -- cache and compare, so they are the detectable ones. getgc (reflection) is
-    -- always migrated away.
-    -- Namecall only since 0.5.86: the FireServer / Both hooks changed the
-    -- FireServer function itself, which a game script can probe; the parry
-    -- sender's :FireServer calls all go through __namecall anyway.
-    -- ONE-PARRY CAPTURE (0.5.104). PRY's sender fires the real packet one of two
-    -- ways at random, 50/50 (Bbs dump): remote:FireServer(...) -- a namecall --
-    -- or local f = remote.FireServer; f(remote, ...) -- a plain call that never
-    -- touches __namecall. Namecall-only saw half your parries: it took 2 on
-    -- average, sometimes 4+. "Both" also hooks FireServer itself, only while
-    -- there's no capture (it comes off with the namecall hook), so the first
-    -- real parry is caught either way. A packet seen on that plain-call path is
-    -- taken ONLY when its hash is the game's real one (_G.BAC_HASH) -- the
-    -- sender's decoys go out that way too, and a decoy hash on a decoy remote
-    -- is the kick. Off: Namecall only, as before.
-    local function capture_method() return S.one_parry_capture and "Both" or "Namecall" end
-    Core.capture_method = capture_method
+    local function capMethod() return S.one_parry_capture and "Both" or "Namecall" end
+    Core.capture_method = capMethod
 
-    -- __namecall goes back exactly: the original function object written straight
-    -- into the metatable (hookmetamethod can re-wrap it on some executors).
-    local function restore_namecall(original)
+    local function restoreNc(original)
         local ok = pcall_(function()
             local mt = getrawmetatable_(game)
-            local was_ro = isreadonly and isreadonly(mt)
+            local wasRo = isreadonly and isreadonly(mt)
             setreadonly_(mt, false)
             rawset(mt, "__namecall", original)
-            if was_ro ~= false then setreadonly_(mt, true) end
+            if wasRo ~= false then setreadonly_(mt, true) end
         end)
         if not ok then pcall_(hookmetamethod_, game, "__namecall", original) end
     end
 
-    -- Builds the capture from a send, on OUR thread (never inside the game's call).
-    -- t is the server time the hook read at the moment of the send.
     local function learn(remote, hash, uid, token, a4, t)
         local text = tostring_(floor_(t * 100))
         if #token ~= #text then return end
@@ -969,13 +689,6 @@ do
         Core.cap = { remote = remote, hash = hash, uid = uid, key = key, len = #text, ball2 = typeof_(a4) == "CFrame",
             verified = Core.bac() == hash or hash == Core.known_real, id = Core.cap_n,
             win = type_(a4) == "number" and a4 or nil }
-        -- THE SECOND KEY (0.5.115). The key is worked out against the server
-        -- time the HOOK read; the sender read its own a moment earlier. When a
-        -- centisecond ticked in between, the key's last byte(s) come out wrong
-        -- and every forged parry carries a bad token: the swing plays, the
-        -- server ignores it -- "animation, no parry" on that capture only. The
-        -- key for one centisecond earlier is kept; if the server doesn't
-        -- answer this capture's first parry, it's swapped in (Core.refused).
         local text2 = tostring_(floor_(t * 100) - 1)
         if #text2 == #token then
             local alt, differs = {}, false
@@ -991,20 +704,12 @@ do
         DBG.ev(Core.cap.verified and "CAPTURE: real parry hash confirmed" or "CAPTURE: taken (real hash not readable)")
     end
 
-    -- A real parry: (hash, id, token, window, cameraCF, points, aim, flag), or on
-    -- UseBall2 servers (hash, id, token, cameraCF, mouseCF, flag). Decoy reports
-    -- (JobId first) never match.
     local function inspect(entry)
         local self, a = entry[1], entry[3]
         local a1, a2, a3, a4, a5 = a[1], a[2], a[3], a[4], a[5]
-        -- the decoys: until 0.5.86 any 36-char hash was taken, so a capture
-        -- could be a FAKE packet -- then every forged parry carried the fake
-        -- hash: animation, no parry, in some captures and not others
         local real, f1, f2 = Core.bac()
         if a1 == f1 or a1 == f2 or Core.known_fakes[a1] then return false end
         if real and a1 ~= real then return false end
-        -- the plain-call path carries the decoys too: the real hash confirmed --
-        -- by the game's _G, or (blanked at runtime) the one in PRY's source -- or nothing
         if entry[5] == "fire" and not (a1 == (real or Core.known_real)) then return false end
         if typeof_(self) == 'Instance' and self.ClassName == 'RemoteEvent'
             and type_(a1) == 'string' and #a1 == 36 and a1 ~= JOB_ID and type_(a2) == 'string' and type_(a3) == 'string'
@@ -1015,14 +720,9 @@ do
         return false
     end
 
-    -- ISOLATED HOOK BODIES. Compiled under the Net module's chunk name, run in a
-    -- clean game env, and cut off from us: they drop the send into `box` and pass
-    -- the call straight on. The cheapest check (arg count) is first, so almost
-    -- every call the game makes while the hook is up costs one select() before
-    -- passing on.
     local box = { want = false, nc = nil, fire = nil, list = {}, ws = Workspace, now = Workspace.GetServerTimeNow }
-    local HOOK_NAME = "=ReplicatedStorage.Packages._Index.sleitnick_net@0.1.0.net"
-    local NC_SRC = [[
+    Util.HOOK_NAME = "=ReplicatedStorage.Packages._Index.sleitnick_net@0.1.0.net"
+    Util.NC_SRC = [[
 local box, getncm, sel = ...
 return function(self, ...)
     if sel("#", ...) >= 6 and box.want and getncm() == "FireServer" then
@@ -1031,7 +731,7 @@ return function(self, ...)
     end
     return box.nc(self, ...)
 end]]
-    local FIRE_SRC = [[
+    Util.FIRE_SRC = [[
 local box, sel = ...
 return function(self, ...)
     if sel("#", ...) >= 6 and box.want then
@@ -1040,29 +740,20 @@ return function(self, ...)
     end
     return box.fire(self, ...)
 end]]
-    local CLEAN_ENV
+    
     do
         local ok, renv = pcall(function() return getrenv and getrenv() end)
-        CLEAN_ENV = (ok and type(renv) == 'table' and renv.writefile == nil) and setmetatable({}, { __index = renv }) or {}
+        Util.CLEAN_ENV = (ok and type(renv) == 'table' and renv.writefile == nil) and setmetatable({}, { __index = renv }) or {}
     end
-    local function build_body(src, chunk, ...)
+    function Util.mkBody(src, chunk, ...)
         local args = table.pack(...)
         local ok, fn = pcall(function()
-            local factory = loadstring(src, chunk or HOOK_NAME)
-            if setfenv then setfenv(factory, CLEAN_ENV) end
+            local factory = loadstring(src, chunk or Util.HOOK_NAME)
+            if setfenv then setfenv(factory, Util.CLEAN_ENV) end
             return factory(table.unpack(args, 1, args.n))
         end)
         return ok and type(fn) == 'function' and fn or nil
     end
-    -- PLAIN closures -- NO loadstring, NO chunk-name disguise. The old isolated
-    -- bodies were compiled at LOAD under a chunk name that impersonated the real
-    -- Net module path (=ReplicatedStorage...sleitnick_net....net); creating that
-    -- impostor chunk at load is what the anticheat kicked on in the lobby (with
-    -- every feature off, hook never armed). It bought nothing: the sender's two
-    -- honeypots (debug.info hooked, writefile in a getfenv(i) walk) run at the
-    -- TOP of the sender, BEFORE it calls FireServer, so our hook is never on the
-    -- stack during that walk -- the hook body's env/name is irrelevant to them.
-    -- So these are ordinary closures, built with no loadstring at all.
     Core.isolated = false
     local NC_BODY = function(self, ...)
         if select_("#", ...) >= 6 and box.want and getnamecallmethod_() == "FireServer" then
@@ -1083,22 +774,18 @@ end]]
         local fire, nc = H.fire, H.nc
         H.fire, H.nc, H.want, box.want = nil, nil, false, false
         if fire and not (restore_ and pcall_(restore_, FIRE_FN)) then pcall_(hookfunction_, FIRE_FN, fire) end
-        if nc then restore_namecall(nc) end
+        if nc then restoreNc(nc) end
         box.nc, box.fire = nil, nil
     end
     Core.unhook = unhook
 
-    -- Up for one capture press. Our thread watches the box every frame; the first
-    -- real parry in it becomes the capture and the hook comes off. H.check lets a
-    -- caller take it down synchronously right after the press (0 frames up when
-    -- the game sent inside the press).
     local function arm(hold)
-        if Core.cap or not is_live() then return false end
-        if capture_method() == "getgc" then return false end -- getgc method never hooks
+        if Core.cap or not isLive() then return false end
+        if capMethod() == "getgc" then return false end
         H.want, H.until_t = true, clock_() + (hold or 0.2)
         if H.fire or H.nc then return true end
         box.list = {}
-        local method = capture_method()
+        local method = capMethod()
         if method ~= "Namecall" and hookfunction_ and FIRE_FN then
             local ok, old = pcall(hookfunction_, FIRE_FN, newcclosure_(FIRE_BODY))
             if ok and type(old) == 'function' then H.fire, box.fire = old, old end
@@ -1109,17 +796,15 @@ end]]
         end
         if not (H.fire or H.nc) then H.want = false; return false end
         box.want = true
-        local up_at = clock_()
-        local done = false
+        local upAt, done = clock_(), false
         local function finish()
             if done then return end
             done = true
             unhook()
             box.list = {}
-            pcall(flight, ("hook (%s) was up %.1fms -- %s"):format(capture_method(), (clock_() - up_at) * 1000,
+            pcall(flight, ("hook (%s) was up %.1fms -- %s"):format(capMethod(), (clock_() - upAt) * 1000,
                 Core.cap and "caught the parry" or "nothing caught"))
         end
-        -- Checks what the hook has seen; takes it down the moment the parry is in.
         H.check = function()
             if done then return true end
             local l = box.list
@@ -1127,8 +812,6 @@ end]]
                 if pcall_(inspect, l[i]) and Core.cap then break end
             end
             if Core.cap then finish(); return true end
-            -- nothing in it was a parry: empty it, or a hook that stays up would
-            -- fill its 4 slots with other sends and never catch the parry
             if #l > 0 then box.list = {} end
             return false
         end
@@ -1142,37 +825,18 @@ end]]
         return true
     end
 
-    -- hook state line for the Status tab / flight log
     function Parry.hookState()
         if H.fire or H.nc then return "UP right now (capturing)" end
         return "down"
     end
 
-    -- ---------- glue the rest of the rewrite calls ----------
-    -- Kept from the rewrite so nothing outside the hook changes. The v63 hook does
-    -- not size its own window or track dry/lat, so capture_window is a fixed hold
-    -- and the Capture table just carries the fields prime_capture / spam read.
     local Capture = { mode = "Your press", armed_at = 0, dry = 0, last_spam_key = -math.huge, lat = nil, last_press = -math.huge, since = nil }
-    -- Auto capture modes (Capture tab, 0.5.112) -- the ones that press block
-    -- themselves until the capture is in:
-    --   "Auto parry"  auto parry fires with native F presses (the game sends the
-    --                 parry itself) and the hook reads that real packet
-    --   "Spam"        presses F every 0.1s while you're in a round / training
-    --                 until a press is taken and read
-    --   "Auto press"  ("Safe press" in the menu) one press when no ball can reach
-    --                 you inside the lockout, every 1.4s
-    -- "Your press" waits for your own block.
     function Capture.auto() return Capture.mode == "Auto parry" or Capture.mode == "Spam" or Capture.mode == "Auto press" end
     Parry.Capture = Capture
-    local function capture_window() return 0.2 end
+    function Util.capWin() return 0.2 end
     local function pressBlockKey()
-        if not is_live() then return false end
+        if not isLive() then return false end
         Core.last_send_at = clock_()
-        -- keypress / keyrelease(0x46 = F): crashed Delta in 0.5.84, fixed
-        -- there since (0.5.112). They're OS-level input, so only while Roblox
-        -- is the focused window -- otherwise the F would land in whatever is.
-        -- VirtualInputManager (fetched only here, never at load -- see the
-        -- top) where they're missing.
         if type(keypress) == "function" and type(keyrelease) == "function" then
             if type(isrbxactive) == "function" then
                 local okA, active = pcall(isrbxactive)
@@ -1188,48 +852,35 @@ end]]
         end)
         return ok
     end
-    -- a native block press (the game sends the parry and animates it); with
-    -- capture = true the hook is up for it so its packet becomes the capture.
-    -- H.check right after the press takes the hook down inside the press when the
-    -- game already sent (0 frames up).
-    local function key_parry(capture)
-        if capture then arm(capture_window()) end
+    local function keyParry(capture)
+        if capture then arm(Util.capWin()) end
         local r = pressBlockKey()
         if capture and H.check then H.check() end
         return r
     end
-    local function in_lobby_training()
+    function Util.inLobbyTrain()
         if not LocalPlayer:GetAttribute("LobbyTraining") then return false end
         local char, dead = LocalPlayer.Character, Workspace:FindFirstChild("Dead")
         return char ~= nil and dead ~= nil and char.Parent == dead
     end
 
-    -- ---------- no-hook reflection probe (read-only) ----------
-    -- Step 1 of the hook-free "forge" path. It walks the game's own parry handler
-    -- (UserInputService.InputBegan -> the controller's block handler -> v190 ->
-    -- v50 -> v31, the sender) purely with getconnections + getupvalues and LOGS
-    -- what it finds -- the remote, the 36-char hash, the uid holder and the key
-    -- deriver. It only READS upvalues; it never calls the sender or the deriver,
-    -- so the sender's honeypots (which fire only when it is CALLED) stay quiet.
-    -- Safe to run anywhere. The log tells us the exact upvalue layout to wire the
-    -- live forge (build a token from the key, FireServer ourselves -- no hook).
-    local function reflect_getups()
+    function Util.rGetUps()
         local g = (getgenv and getgenv()) or {}
         return rawget(g, "getupvalues") or getupvalues or (debug and debug.getupvalues)
     end
-    local function reflect_connfn(c)
+    function Util.rConnFn(c)
         for _, k in ipairs({ "Function", "function" }) do
             local ok, f = pcall(function() return c[k] end)
             if ok and type(f) == "function" then return f end
         end
         return nil
     end
-    local function reflect_isNet(v)
+    function Util.rIsNet(v)
         if typeof(v) ~= "table" then return false end
         local re; pcall(function() re = rawget(v, "RemoteEvent") or v.RemoteEvent end)
         return type(re) == "function"
     end
-    local function reflect_classify(v)
+    function Util.rClass(v)
         local t = typeof(v)
         if t == "string" then return ("string(#%d)%s"):format(#v, #v == 36 and " <-- hash?" or "") end
         if t == "Instance" then return ("Instance<%s \"%s\">"):format(v.ClassName, v.Name) end
@@ -1237,24 +888,22 @@ end]]
             local ok, s = pcall(function() return debug.info(v, "s") end)
             return "function" .. (ok and (" @" .. tostring(s)) or "")
         end
-        if t == "table" then return reflect_isNet(v) and "table <-- Net?" or "table" end
+        if t == "table" then return Util.rIsNet(v) and "table <-- Net?" or "table" end
         return t
     end
-    -- dump a function's upvalues (optionally one level into table upvalues) to the log
-    local function reflect_dump(fn, getups, label)
+    function Util.rDump(fn, getups, label)
         local ok, ups = pcall(getups, fn)
         if not ok or type(ups) ~= "table" then logp(("reflect: getupvalues(%s) failed: %s"):format(label, tostring(ups))); return false end
         local n = 0
         for i, v in pairs(ups) do
             n = n + 1
-            logp(("   %s up[%s] = %s"):format(label, tostring(i), reflect_classify(v)))
-            -- one level into a Net-ish or uid-ish table so we can spot hash/uid strings
-            if typeof(v) == "table" and not reflect_isNet(v) then
+            logp(("   %s up[%s] = %s"):format(label, tostring(i), Util.rClass(v)))
+            if typeof(v) == "table" and not Util.rIsNet(v) then
                 local ok2 = pcall(function()
                     local c = 0
                     for k, vv in pairs(v) do
                         c = c + 1; if c > 6 then break end
-                        logp(("       .%s = %s"):format(tostring(k), reflect_classify(vv)))
+                        logp(("       .%s = %s"):format(tostring(k), Util.rClass(vv)))
                     end
                 end)
             end
@@ -1262,40 +911,34 @@ end]]
         if n == 0 then logp(("reflect: %s has no upvalues (maybe stripped)"):format(label)) end
         return true
     end
-    local function reflect_trunc(s) s = tostring(s); return #s > 64 and (s:sub(1, 64) .. "..") or s end
-    -- dump a function's string constants (reveals method names, "TIME", marker
-    -- strings, arg patterns -- i.e. the real send logic vs decoy/snitch paths)
-    local function reflect_consts(fn, label)
+    function Util.rTrunc(s) s = tostring(s); return #s > 64 and (s:sub(1, 64) .. "..") or s end
+    function Util.rConsts(fn, label)
         local gc = debug and debug.getconstants
         if type(gc) ~= "function" then return false end
         local ok, cs = pcall(gc, fn)
         if not ok or type(cs) ~= "table" then return true end
         local out, n = {}, 0
         for _, c in pairs(cs) do
-            if type(c) == "string" and #c > 0 then n = n + 1; out[#out + 1] = reflect_trunc(c); if n >= 48 then break end end
+            if type(c) == "string" and #c > 0 then n = n + 1; out[#out + 1] = Util.rTrunc(c); if n >= 48 then break end end
         end
         if #out > 0 then logp(("reflect: %s consts: %s"):format(label, table.concat(out, " | "))) end
         return true
     end
-    -- read-only deep dump of the sender: concrete string-upvalue values (hashes /
-    -- keys), the resolved uid, the Net table's keys, and the sender's + nested
-    -- protos' string constants (the real FireServer/token logic usually lives in a
-    -- nested proto). Nothing is called or fired.
-    local function reflect_deep(v31, getups)
+    function Util.rDeep(v31, getups)
         local ok, ups = pcall(getups, v31)
         if not ok or type(ups) ~= "table" then return end
         for i, v in pairs(ups) do
-            if type(v) == "string" then logp(("reflect: up[%s] value = %s"):format(tostring(i), reflect_trunc(v))) end
-            if typeof(v) == "table" and not reflect_isNet(v) then
+            if type(v) == "string" then logp(("reflect: up[%s] value = %s"):format(tostring(i), Util.rTrunc(v))) end
+            if typeof(v) == "table" and not Util.rIsNet(v) then
                 pcall(function()
                     local idx, tbl = v[1], v[2]
                     if type(tbl) == "table" and idx ~= nil then
                         logp(("reflect: up[%s] uid-holder? [1]=%s [3]=%s -> [2][[1]]=%s"):format(
-                            tostring(i), tostring(idx), reflect_trunc(v[3]), reflect_trunc(tbl[idx])))
+                            tostring(i), tostring(idx), Util.rTrunc(v[3]), Util.rTrunc(tbl[idx])))
                     end
                 end)
             end
-            if reflect_isNet(v) then
+            if Util.rIsNet(v) then
                 pcall(function()
                     local ks = {}
                     for k in pairs(v) do ks[#ks + 1] = tostring(k); if #ks >= 14 then break end end
@@ -1303,29 +946,22 @@ end]]
                 end)
             end
         end
-        local gotc = reflect_consts(v31, "v31")
+        local gotc = Util.rConsts(v31, "v31")
         if not gotc then logp("reflect: debug.getconstants unavailable") end
         local gp = debug and debug.getprotos
         if type(gp) == "function" then
             local ok2, ps = pcall(gp, v31)
             if ok2 and type(ps) == "table" then
                 logp(("reflect: v31 has %d nested proto(s)"):format(#ps))
-                for pi, pf in ipairs(ps) do reflect_consts(pf, "proto#" .. pi); if pi >= 6 then break end end
+                for pi, pf in ipairs(ps) do Util.rConsts(pf, "proto#" .. pi); if pi >= 6 then break end end
             end
         else
             logp("reflect: debug.getprotos unavailable")
         end
     end
     function Parry.reflectProbe()
-        local getups = reflect_getups()
+        local getups = Util.rGetUps()
         if type(getups) ~= "function" then logp("reflect: getupvalues NOT available on this executor"); return end
-        -- Primary: the sender is require(ReplicatedStorage.Controllers.SwordsController.PRY).
-        -- Requiring an already-loaded ModuleScript returns its CACHED value -- no code
-        -- runs, no traps -- and it is the same sender the game uses, so its upvalues
-        -- (remote, hash, uid, key deriver) are readable directly. No getgc, no hook.
-        -- Names on this path carry an invisible/odd character (the dump shows
-        -- "SwordsController .PRY" with a stray space), so FindFirstChild by exact
-        -- name misses. Match on alphanumerics only, which drops any such char.
         local function clean(s) return (tostring(s):gsub("[^%w]", "")) end
         local pry
         pcall(function()
@@ -1353,15 +989,15 @@ end]]
                 logp("reflect: require(PRY) errored: " .. tostring(v31))
             elseif type(v31) == "function" then
                 logp("reflect: PRY returned a FUNCTION (the sender). Upvalues:")
-                reflect_dump(v31, getups, "v31")
-                reflect_deep(v31, getups)
+                Util.rDump(v31, getups, "v31")
+                Util.rDeep(v31, getups)
                 logp("reflect: done (read-only, nothing called/fired). Send me these lines.")
                 return
             elseif type(v31) == "table" then
                 logp("reflect: PRY returned a TABLE; dumping its function fields' upvalues:")
                 local c = 0
                 for k, vv in pairs(v31) do
-                    if type(vv) == "function" then c = c + 1; reflect_dump(vv, getups, "PRY." .. tostring(k)) end
+                    if type(vv) == "function" then c = c + 1; Util.rDump(vv, getups, "PRY." .. tostring(k)) end
                     if c > 8 then break end
                 end
                 logp("reflect: done (read-only). Send me these lines.")
@@ -1372,7 +1008,6 @@ end]]
         else
             logp("reflect: ReplicatedStorage.Controllers.SwordsController.PRY not found (path changed?)")
         end
-        -- Fallback: walk InputBegan handlers' upvalues (no getgc).
         local getconns = getconnections
         if type(getconns) ~= "function" then logp("reflect: getconnections unavailable; cannot fall back"); return end
         local ok, conns = pcall(getconns, UserInputService.InputBegan)
@@ -1387,27 +1022,22 @@ end]]
             local has36, hasNet = false, false
             for _, v in pairs(ups) do
                 if typeof(v) == "string" and #v == 36 then has36 = true end
-                if reflect_isNet(v) then hasNet = true end
+                if Util.rIsNet(v) then hasNet = true end
             end
             if has36 and hasNet then found[#found + 1] = fn end
             for _, v in pairs(ups) do if type(v) == "function" then scan(v, depth + 1) end end
         end
-        for _, c in ipairs(conns) do local f = reflect_connfn(c); if f then scan(f, 0) end end
+        for _, c in ipairs(conns) do local f = Util.rConnFn(c); if f then scan(f, 0) end end
         if #found == 0 then
             logp("reflect: fallback found no sender candidate either. Send me the PRY lines above.")
             return
         end
         logp(("reflect: fallback found %d candidate(s):"):format(#found))
-        for n, fn in ipairs(found) do reflect_dump(fn, getups, "cand" .. n); if n >= 2 then break end end
+        for n, fn in ipairs(found) do Util.rDump(fn, getups, "cand" .. n); if n >= 2 then break end end
         logp("reflect: done (read-only). Send me these lines.")
     end
 
-    -- ---------- getgc capture backend (CaptureHook = "getgc") ----------
-    -- No hook, no key press, no getupvalues, no forging: it acquires the game's
-    -- own parry sender closure (require(PRY), or a getgc scan) and parries by
-    -- CALLING it on a clean thread -- the game builds the real token and fires
-    -- the real remote itself. See the gc_acquire / gc_fire block below.
-    local function forge_find_pry()
+    function Util.findPry()
         local function clean(s) return (tostring(s):gsub("[^%w]", "")) end
         local p
         pcall(function()
@@ -1428,28 +1058,11 @@ end]]
         end
         return p
     end
-    -- ---------- HOOKLESS CAPTURE (Debug button) ----------
-    -- Takes the capture with NO parry and NO hook, the way the original's
-    -- 924f4dd/a833314 read it -- minus getgc. PRY's send function holds, as
-    -- upvalues: the Net package, the remote's name right after it, the first
-    -- argument, a uid holder (holder[2][holder[1]] is the current uid) and the
-    -- token function (its first function upvalue: key = token(uid, "TIME")).
-    --   1. sender = require(PRY): already loaded, so this only returns its cached
-    --      value -- nothing runs.
-    --   2. walk function upvalues from there (getupvalues, read-only) to the send
-    --      function; tables read with rawget only (no metamethod can fire) and
-    --      only tables with no metatable are looked into.
-    --   3. hash from _G.BAC_HASH; uid read from the holder (re-read every parry).
-    --   4. the two calls into game code -- token(uid, "TIME") and
-    --      Net:RemoteEvent(name) -- run on a fresh thread whose globals and only
-    --      Lua frame are the GAME's env (e090d3d), so PRY's getfenv(1..10)
-    --      writefile check never sees ours.
     function Core.game_call(nowait, fn, ...)
         local args = table.pack(...)
         local env
         pcall(function() env = getrenv and getrenv() end)
-        local setenv = setfenv
-        local box = { done = false }
+        local setenv, box = setfenv, { done = false }
         local caller = function()
             if env and setenv then pcall(setenv, 0, env) end
             box.res = table.pack(pcall(fn, table.unpack(args, 1, args.n)))
@@ -1470,28 +1083,23 @@ end]]
         if k == nil or k ~= k or type(inner) ~= "table" then return nil end
         return rawget(inner, k)
     end
-    -- key bytes for a uid: token(uid, "TIME"), repeated to the time-text length
     function Core.key_for(token, uid, nowait)
         local k = Core.game_call(nowait, token, uid, "TIME")
         if type(k) ~= "string" or #k == 0 then return nil end
-        local len = #tostring(math.floor(Workspace:GetServerTimeNow() * 100))
-        local key = {}
+        local len, key = #tostring(math.floor(Workspace:GetServerTimeNow() * 100)), {}
         for i = 1, len do key[i] = string.byte(k, (i - 1) % #k + 1) end
         return key, len
     end
-    -- PRY's send function, read-only: its upvalues hold the Net package, the
-    -- remote's name, the first argument, the uid holder and the token function.
-    -- Returns found, or nil + why + how many functions were read.
     function Core.find_sender()
-        local getups = reflect_getups()
+        local getups = Util.rGetUps()
         if type(getups) ~= "function" then return nil, "getupvalues not available", 0 end
-        local pry = forge_find_pry()
+        local pry = Util.findPry()
         if not pry then return nil, "PRY not found", 0 end
         local ok, entry = pcall(require, pry)
         if not ok or type(entry) ~= "function" then return nil, "require(PRY) gave " .. typeof(entry), 0 end
-        local function is_net(v) return type(v) == "table" and type(rawget(v, "RemoteEvent")) == "function" end
-        local function is_holder(v)
-            if is_net(v) then return false end
+        local function isNet(v) return type(v) == "table" and type(rawget(v, "RemoteEvent")) == "function" end
+        local function isHolder(v)
+            if isNet(v) then return false end
             local val = Core.holder_value(v)
             return val ~= nil and type(val) ~= "function"
         end
@@ -1505,7 +1113,7 @@ end]]
                 nodes = nodes + 1
                 local okU, ups = pcall(getups, fn)
                 if okU and type(ups) == "table" then
-                    local has_remote, token, net_i, holder = false, nil, nil, nil
+                    local hasRemote, token, netI, holder = false, nil, nil, nil
                     local n = 0
                     for i, v in pairs(ups) do if type(i) == "number" and i > n then n = i end end
                     for i = 1, n do
@@ -1513,15 +1121,14 @@ end]]
                         local t = typeof(v)
                         if t == "Instance" then
                             local okR, r = pcall(function() return v.ClassName == "RemoteEvent" end)
-                            if okR and r then has_remote = true end
+                            if okR and r then hasRemote = true end
                         elseif t == "function" then
                             if not token then token = v end
                             if depth < 4 then queue[#queue + 1] = { v, depth + 1 } end
                         elseif t == "table" then
-                            if not net_i and is_net(v) then net_i = i
-                            elseif not holder and is_holder(v) then holder = v
+                            if not netI and isNet(v) then netI = i
+                            elseif not holder and isHolder(v) then holder = v
                             elseif depth < 4 and not (grm and grm(v)) then
-                                -- look one table deep for more functions (raw only)
                                 for j = 1, 32 do
                                     local f = rawget(v, j)
                                     if type(f) == "function" then queue[#queue + 1] = { f, depth + 1 } end
@@ -1529,8 +1136,8 @@ end]]
                             end
                         end
                     end
-                    if has_remote and token and net_i and holder and type(ups[net_i + 1]) == "string" then
-                        found = { token = token, net = ups[net_i], name = ups[net_i + 1], first = ups[net_i + 2], holder = holder }
+                    if hasRemote and token and netI and holder and type(ups[netI + 1]) == "string" then
+                        found = { token = token, net = ups[netI], name = ups[netI + 1], first = ups[netI + 2], holder = holder }
                     end
                 end
             end
@@ -1553,8 +1160,6 @@ end]]
         if not hash then say("no hash (no _G.BAC_HASH and no 36-char first argument)"); return false, "no hash" end
         local key, len = Core.key_for(found.token, uid, false)
         if not key then say("the token function gave no key"); return false, "no key" end
-        -- the game's own Net.RemoteEvent, called as net:RemoteEvent(name) -- no
-        -- closure of ours between it and the game-env caller frame
         local remote = Core.game_call(false, rawget(found.net, "RemoteEvent"), found.net, found.name)
         if typeof(remote) ~= "Instance" or not remote:IsA("RemoteEvent") then say("Net:RemoteEvent(name) found no remote"); return false, "no remote" end
         local cap = { remote = remote, hash = hash, uid = uid, key = key, len = len, ball2 = false,
@@ -1577,26 +1182,14 @@ end]]
         local ok, src = pcall(debug.info, f, "s")
         return ok and src ~= "[C]"
     end
-    -- The game's own F-key parry handler v186 (SwordsController, Bbs dump):
-    --   v7.InputBegan:Connect(function(p32,p33) if ... UseBind(p32,"Block") then v186() end end)
-    --   local function v186(p31) xpcall(...Deactivate...);
-    --       return not not v49(v184.CharacterSword or "Base Sword",
-    --           v184.SwordType or "Single", v184.AnimationCollection or "Single", not not p31) end
-    -- v186 -> v49 computes the SERVER-VALIDATED parry window (n6, from timesParried:
-    -- 1.5/1.25/1.0/0.75/0.625...), builds the target points, PLAYS the parry
-    -- animation, and only then calls the real sender v31. Calling v31 raw (0.5.42)
-    -- skipped the window and the animation -> server kicked "[CODE HSH-2]". So call
-    -- v186() with no args, exactly as the key press does -- the game does the rest.
-    -- v186 is identified by its string constants ("CharacterSword","Base Sword",
-    -- "AnimationCollection") via getconstants -- NOT getupvalues (the detected op).
-    local function fn_consts(f)
+    function Util.fnConsts(f)
         local gc = (debug and debug.getconstants) or getconstants
         if type(gc) ~= "function" then return nil end
         local ok, cs = pcall(gc, f)
         return ok and type(cs) == "table" and cs or nil
     end
-    local function is_handler(o)
-        local cs = fn_consts(o)
+    function Util.isHandler(o)
+        local cs = Util.fnConsts(o)
         if not cs then return false end
         local hasCS, hasBase, hasAC = false, false, false
         for _, c in pairs(cs) do
@@ -1606,24 +1199,24 @@ end]]
         end
         return hasCS and hasBase and hasAC
     end
-    local gc_scan = { handler = nil, started = false, done = false }
-    local function gc_scan_start()
-        if gc_scan.started then return end
-        if type(getgc) ~= "function" then gc_scan.done = true; return end
-        gc_scan.started = true
+    Util.gcScan = { handler = nil, started = false, done = false }
+    function Util.gcStart()
+        if Util.gcScan.started then return end
+        if type(getgc) ~= "function" then Util.gcScan.done = true; return end
+        Util.gcScan.started = true
         task.spawn(function()
             local list
             pcall(function() list = getgc(false) end)
             if type(list) == "table" then
                 for idx = 1, #list do
-                    if not is_live() then break end
+                    if not isLive() then break end
                     local o = list[idx]
                     if type(o) == "function" and GC.is_lua(o) then
                         local oks, src = pcall(debug.info, o, "s")
                         if oks and type(src) == "string" then
                             local c = GC.clean(src)
-                            if c:find("SwordsController") and not c:find("PRY") and is_handler(o) then
-                                gc_scan.handler = o; break
+                            if c:find("SwordsController") and not c:find("PRY") and Util.isHandler(o) then
+                                Util.gcScan.handler = o; break
                             end
                         end
                     end
@@ -1631,79 +1224,65 @@ end]]
                 end
             end
             list = nil
-            gc_scan.done = true
-            logp(gc_scan.handler and "getgc: parry handler (v186) found -- calling it directly"
+            Util.gcScan.done = true
+            logp(Util.gcScan.handler and "getgc: parry handler (v186) found -- calling it directly"
                 or "getgc: parry handler not found in scan")
         end)
     end
 
-    -- ---------- getgc: CALL the game's own parry handler (no upvalues, no key) ----
-    local gc_fail_at = -math.huge
+    Util.gcFailAt = -math.huge
     function GC.log(msg) if msg ~= GC.last_msg then GC.last_msg = msg; logp(msg) end end
-    local function gc_acquire()
+    function Util.gcGet()
         if type(GC.dispatcher) == "function" then
             if not Core.cap then Core.cap = { gc = true } end
             return true
         end
-        if clock_() - gc_fail_at < 1 then return false end
-        -- "handler" (default) = call v186 (the real F-key handler, found via getgc);
-        -- "pry" = call the raw sender v31 from require(PRY) (0.5.42 behaviour, for
-        -- comparison only -- it sends the wrong window and HSH-2 kicks).
+        if clock_() - Util.gcFailAt < 1 then return false end
         local mode = getgenv().GcSender or "handler"
         local fn, kind
         if mode == "pry" then
-            local pry = forge_find_pry()
+            local pry = Util.findPry()
             if pry then local ok, m = pcall(require, pry); if ok and type(m) == "function" then fn, kind = m, "pry" end end
         else
-            if type(gc_scan.handler) == "function" then fn, kind = gc_scan.handler, "handler"
+            if type(Util.gcScan.handler) == "function" then fn, kind = Util.gcScan.handler, "handler"
             else
-                gc_scan_start()
-                if not gc_scan.done then return false end     -- still scanning; quiet
-                fn = gc_scan.handler; if type(fn) == "function" then kind = "handler" end
+                Util.gcStart()
+                if not Util.gcScan.done then return false end
+                fn = Util.gcScan.handler; if type(fn) == "function" then kind = "handler" end
             end
         end
-        if type(fn) ~= "function" then gc_fail_at = clock_(); GC.log("getgc: parry function not found (mode=" .. mode .. ")"); return false end
-        -- the ONE clean dispatcher, built once. task.spawn(dispatcher) runs it as
-        -- the thread's main function, so when the sender's getfenv(i) stack-walk
-        -- runs (inside v31, reached via v186->v49), every frame up to ours is game
-        -- code and the top frame is this clean wrapper (writefile nil) -- both
-        -- honeypots pass. GcChunk=false skips the single debug.info source read.
+        if type(fn) ~= "function" then Util.gcFailAt = clock_(); GC.log("getgc: parry function not found (mode=" .. mode .. ")"); return false end
         local chunk
         if getgenv().GcChunk ~= false then pcall(function() chunk = debug.info(fn, "s") end) end
         local job = { n = 0 }
-        local disp = build_body([[
+        local disp = Util.mkBody([[
 local job, fn = ...
 return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
-        if type(disp) ~= "function" then gc_fail_at = clock_(); GC.log("getgc: could not build a clean dispatcher (no loadstring?)"); return false end
+        if type(disp) ~= "function" then Util.gcFailAt = clock_(); GC.log("getgc: could not build a clean dispatcher (no loadstring?)"); return false end
         GC.fn, GC.kind, GC.job, GC.dispatcher = fn, kind, job, disp
         Core.cap = { gc = true }
         Core.misses, Core.pending = 0, nil
         GC.log("getgc: parry acquired (" .. kind .. ") -- calling the game's own parry function (no upvalues, no key, no forge)")
         return true
     end
-    -- fire one real parry on a fresh clean thread
-    local function gc_fire(spam)
+    function Util.gcFire(spam)
         if type(GC.dispatcher) ~= "function" then return "unarmed" end
-        if not is_live() then return "blocked" end
+        if not isLive() then return "blocked" end
         if not canParryNow() then return "blocked" end
-        if not spam and not gate_open() then return "blocked" end
-        if not spam then gate_start() end
+        if not spam and not gateOpen() then return "blocked" end
+        if not spam then gateStart() end
         Core.last_send_at = clock_()
         local job = GC.job
         if GC.kind == "handler" then
-            -- v186(): no args, exactly as the F-key / tap handler calls it. v186 ->
-            -- v49 builds the correct window, targets and animation and fires itself.
             job.n = 0
         else
-            -- raw sender v31(window, cameraCF, points, aim, flag) -- comparison only
             local cam = Workspace.CurrentCamera
             if not cam then return "blocked" end
-            local window = parry_window()
-            local points, aim = packet_parts(cam)
-            local name, _, mode = choose_target(cam)
+            local window = parryWin()
+            local points, aim = packetParts(cam)
+            local name, _, mode = pickTarget(cam)
             if name and mode ~= "Cursor" then local sp = points[name]; if sp then aim = { sp.X, sp.Y } end end
-            local cf = cam.CFrame
-            local look = curve_look_cached(cam)
+            local cf, look = cam.CFrame, curveLookC(cam)
             if look then local o = cf.Position; cf = CFrame.lookAt(o, o + look) end
             if getgenv().GcBall2 then
                 local ray = cam:ScreenPointToRay(aim[1], aim[2], 0)
@@ -1715,16 +1294,13 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
             end
         end
         task.spawn(GC.dispatcher)
-        if not spam then Core.pending = clock_() + (parry_window() or 0.5) + ping_s() + 0.25 end
+        if not spam then Core.pending = clock_() + (parryWin() or 0.5) + pingS() + 0.25 end
         return "sent"
     end
 
-    -- ---------- token + send ----------
-    local tok_cache = { cap = nil, key = nil, text = nil, tok = nil }
-    local function make_token(cap)
-        local text = tostring(math.floor(Workspace:GetServerTimeNow() * 100))
-        local c = tok_cache
-        -- keyed on the key too: a live uid / fixed key swaps it on the same capture
+    local tokCache = { cap = nil, key = nil, text = nil, tok = nil }
+    local function mkToken(cap)
+        local text, c = tostring(math.floor(Workspace:GetServerTimeNow() * 100)), tokCache
         if c.cap == cap and c.key == cap.key and c.text == text then return c.tok end
         if #text ~= cap.len then return nil end
         local out = table.create(#text)
@@ -1732,30 +1308,20 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         c.cap, c.key, c.text, c.tok = cap, cap.key, text, table.concat(out)
         return c.tok
     end
-    -- "sent" / "unarmed" / "blocked". spam = true skips the lockout gate.
     local function send(spam)
-        if not is_live() then return "blocked" end
+        if not isLive() then return "blocked" end
         local cap = Core.cap
         if not cap then return "unarmed" end
-        if cap.gc then return gc_fire(spam) end   -- getgc: call the game's own sender
+        if cap.gc then return Util.gcFire(spam) end
         if not canParryNow() then return "blocked" end
         if not cap.remote.Parent then Core.cap = nil; return "unarmed" end
-        -- a capture whose hash isn't the game's real one (the hash rotated, or
-        -- an old decoy capture): drop it and take a fresh one
         local real = Core.bac()
-        -- the game's real hash moved on (or wasn't readable at capture): it's the
-        -- same sender, remote and uid, so carry the capture onto the real hash
-        -- (0.5.104 -- it used to be dropped, costing a parry to recapture). If
-        -- the next two parries on it both go unanswered, it's dropped then.
         if real and cap.hash ~= real then
             cap.hash, cap.verified, cap.adopted, Core.misses = real, true, true, 0
-            tok_cache.cap = nil
+            tokCache.cap = nil
             logp("capture: the game's real hash changed -- carried the capture onto it")
         end
-        if not spam and not gate_open() then return "blocked" end
-        -- hookless capture: the uid is re-read from the game's holder every
-        -- parry (the server may expect it to roll forward); a new uid gets its
-        -- own key from the token function (game-env thread, no wait)
+        if not spam and not gateOpen() then return "blocked" end
         if cap.holder then
             local uid = Core.holder_value(cap.holder)
             if type(uid) == "string" and uid ~= cap.key_uid then
@@ -1764,20 +1330,18 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
                 cap.uid, cap.key, cap.len, cap.key_uid = uid, key, len, uid
             end
         end
-        local window = parry_window()
-        local tok = make_token(cap)
+        local window, tok = parryWin(), mkToken(cap)
         if not tok then Core.cap = nil; return "unarmed" end
         local cam = Workspace.CurrentCamera
-        local points, aim = packet_parts(cam)
-        local name, _, mode = choose_target(cam)
+        local points, aim = packetParts(cam)
+        local name, _, mode = pickTarget(cam)
         if name and mode ~= "Cursor" then
             local screen = points[name]
             if screen then aim = { screen.X, screen.Y } end
         end
-        local cf = cam.CFrame
-        local look = curve_look_cached(cam)
+        local cf, look = cam.CFrame, curveLookC(cam)
         if look then local o = cf.Position; cf = CFrame.lookAt(o, o + look) end
-        if not spam then gate_start() end
+        if not spam then gateStart() end
         Core.last_send_at = clock_()
         local r = cap.remote
         if cap.ball2 then
@@ -1786,19 +1350,18 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         else
             r:FireServer(cap.hash, cap.uid, tok, window, cf, points, aim, false)
         end
-        if not spam then Core.pending = clock_() + window + ping_s() + 0.25; cap.sent = (cap.sent or 0) + 1
+        if not spam then Core.pending = clock_() + window + pingS() + 0.25; cap.sent = (cap.sent or 0) + 1
         else Core.last_spam_at = Core.last_send_at end
         return "sent"
     end
 
-    -- ---------- abilities (auto ability / cooldown protection) ----------
-    local ABILITY_PARRY = { "Raging Deflection", "Rapture", "Calming Deflection", "Aerodynamic Slash", "Fracture", "Death Slash" }
-    local ABILITY_PROTECT = { "Raging Deflection", "Rapture", "Calming Deflection" }
-    local function ability_ready()
+    Util.ABILITY_PARRY = { "Raging Deflection", "Rapture", "Calming Deflection", "Aerodynamic Slash", "Fracture", "Death Slash" }
+    Util.ABILITY_PROTECT = { "Raging Deflection", "Rapture", "Calming Deflection" }
+    function Util.abReady()
         local ok, ready = pcall(function() return LocalPlayer.PlayerGui.Hotbar.Ability.UIGradient.Offset.Y == 0.5 end)
         return ok and ready
     end
-    local function has_ability(list)
+    function Util.hasAbility(list)
         local abilities = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("Abilities")
         if not abilities then return false end
         for _, name in ipairs(list) do
@@ -1810,56 +1373,46 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         end
         return false
     end
-    local function ability_press()
+    function Util.abPress()
         local ok = pcall(function() Remotes.AbilityButtonPress:Fire() end)
         return ok
     end
-    Parry.abilityPress = ability_press
-    local function try_ability()
-        if not (S.auto_ability or S.cooldown_protection) or not Remotes or not ability_ready() then return false end
-        if S.auto_ability and has_ability(ABILITY_PARRY) then
-            if not ability_press() then return false end
+    Parry.abilityPress = Util.abPress
+    function Util.tryAbility()
+        if not (S.auto_ability or S.cooldown_protection) or not Remotes or not Util.abReady() then return false end
+        if S.auto_ability and Util.hasAbility(Util.ABILITY_PARRY) then
+            if not Util.abPress() then return false end
             task.delay(2.432, function()
                 local ds = Remotes and Remotes:FindFirstChild("DeathSlashShootActivation")
                 if ds then pcall(function() ds:FireServer(true) end) end
             end)
             return true
         end
-        if S.cooldown_protection and has_ability(ABILITY_PROTECT) then return ability_press() end
+        if S.cooldown_protection and Util.hasAbility(Util.ABILITY_PROTECT) then return Util.abPress() end
         return false
     end
 
-    -- ---------- ball physics ----------
-    local tracked = setmetatable({}, { __mode = 'k' })
-    local ball_conns = {}
-    local function ball_velocity(ball)
+    local tracked, ballConns = setmetatable({}, { __mode = 'k' }), {}
+    local function ballVel(ball)
         local z = ball:FindFirstChild('zoomies')
         return z and z.VectorVelocity or ball.AssemblyLinearVelocity
     end
-    local function contact_gap(ball)
+    local function contactGap(ball)
         local ok, size = pcall(function() return ball.Size end)
         if not ok or not size then return 3 end
         return math.max(size.X, size.Y, size.Z) * 0.5 + 1.5
     end
-    -- auto parry's contact distance: contact_gap PLUS your own body (~1.5
-    -- studs from the root to your side). Without it auto parry thought the ball
-    -- touched you a couple of studs later than it does -- nothing on a fast
-    -- ball, a big slice of time on a slow one: the "slow ball got too close /
-    -- killed us at 100%".
-    function Core.ap_gap(ball) return contact_gap(ball) + 1.5 end
-    local function time_to_contact(path, gap, speed, accel)
+    function Core.ap_gap(ball) return contactGap(ball) + 1.5 end
+    local function ttc(path, gap, speed, accel)
         local d = math.max(path - gap, 0)
         if accel > 1 then return (math.sqrt(speed * speed + 2 * accel * d) - speed) / accel end
         return d / speed
     end
-    local function speed_gain(st, speed, now)
+    local function speedGain(st, speed, now)
         local s = st.spd
         if not s then st.spd = { t = now, v = speed, a = 0 }; return 0 end
         local dt = now - s.t
         if dt >= 0.08 then
-            -- a JUMP (an ability, a server correction: +25% or more inside one
-            -- sample) is a new speed, not an acceleration -- read as one it
-            -- predicted the ball far sooner than it came (0.5.115)
             if speed > s.v * 1.25 or speed < s.v * 0.75 then s.a = 0
             else s.a = s.a * 0.5 + ((speed - s.v) / dt) * 0.5 end
             s.t, s.v = now, speed
@@ -1867,20 +1420,9 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         return math.clamp(s.a, 0, speed * 4)
     end
 
-    -- ===================== ANTI CURVE v3 =====================
-    -- Per pass we measure, every ~30ms:
-    --   w     how fast the ball's direction is swinging (rad/s);
-    --   k     the homing GAIN: swing rate / sin(angle off the line to us). A ball
-    --         steered by "lerp toward the target" turns at k*sin(angle), so k is
-    --         constant along its path even though the swing rate isn't;
-    --   away  the swing is carrying it AWAY from us (curve bait / wide curve);
-    --   distance samples -> its real closing speed and how fast that's rising.
-    -- decide() runs the homing sim at the gain band (soonest / latest) and
-    -- checks the latest against the model-free closing-speed estimate, so a
-    -- gain it hasn't measured right yet can't make it fire late.
     local K_DEFAULT, K_MIN, K_MAX = 5, 0.8, 40
-    local SIM_DT = 1 / 120
-    local function track_homing(st, dir, want, dist, now)
+    Util.SIM_DT = 1 / 120
+    local function trackHoming(st, dir, want, dist, now)
         local h = st.hm
         if not h then
             h = { t = now, dir = dir, want = want, k = nil, w = nil, away = false, n = 0, samples = { { t = now, d = dist } } }
@@ -1888,8 +1430,6 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
             return h
         end
         local dt = now - h.t
-        -- a gap this long (hitch, the ball paused) would average a whip-in over
-        -- the whole gap: start a fresh baseline instead of measuring across it
         if dt > 0.2 then
             h.t, h.dir, h.want, h.samples = now, dir, want, { { t = now, d = dist } }
             return h
@@ -1897,18 +1437,9 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         if dt >= 0.03 then
             local turned = math.acos(math.clamp(h.dir:Dot(dir), -1, 1))
             local omega = turned / dt
-            -- the angle off the line to us at the MIDDLE of the step: the turn
-            -- happened across it, and the start alone over-reads k as it closes
             local th = (math.acos(math.clamp(h.dir:Dot(h.want), -1, 1)) + math.acos(math.clamp(dir:Dot(want), -1, 1))) * 0.5
             local perp = h.want - h.dir * h.dir:Dot(h.want)
-            local toward = perp.Magnitude < 1e-4 or (dir - h.dir):Dot(perp) >= 0
-            -- SUDDEN TURN (0.5.115): 20+ degrees inside one sample, and well
-            -- past what its homing has been turning at (3x + 4 rad/s) or away
-            -- from us -- a re-aim, an ability, a teleported ball. Everything
-            -- measured before it describes a path it's no longer on: the gain,
-            -- its scatter, "swinging away" and the closing samples start
-            -- over, and decide() guards the next 0.15s at the hardest turn.
-            local expect = (h.k or K_DEFAULT) * math.max(math.sin(th), 0.15)
+            local toward, expect = perp.Magnitude < 1e-4 or (dir - h.dir):Dot(perp) >= 0, (h.k or K_DEFAULT) * math.max(math.sin(th), 0.15)
             local snap = turned > 0.35 and (not toward or omega > expect * 3 + 4)
             if snap then
                 h.k, h.kn, h.kspread, h.w, h.away = nil, 0, nil, nil, false
@@ -1922,13 +1453,7 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
                     h.w = h.w and math.max(h.w * 0.5 + omega * 0.5, omega * 0.85) or omega
                     if th > 0.06 then
                         local ks = math.min(omega / math.max(math.sin(th), 0.15), K_MAX * 1.5)
-                        -- one spiky sample (a velocity snap, a server correction)
-                        -- mustn't drag k up and fire the must-check early: a
-                        -- reading far above what it has been turning at only
-                        -- counts a little until it repeats
                         local wgt = (h.k and ks > h.k * 2.5) and 0.25 or 0.6
-                        -- how much the readings scatter (relative): a steady
-                        -- curve earns a tighter SLOW band (see decide)
                         if h.k then
                             local rel = math.abs(ks - h.k) / math.max(h.k, K_MIN)
                             h.kspread = h.kspread and (h.kspread * 0.6 + rel * 0.4) or rel
@@ -1947,8 +1472,7 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         end
         return h
     end
-    -- model-free: extrapolate the measured closing speed and its rise (capped at the ball's speed)
-    local function radial_eta(h, rem, speed)
+    local function radialEta(h, rem, speed)
         local s = h.samples
         local n = #s
         if n < 3 then return nil end
@@ -1967,15 +1491,11 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         end
         return rem / c2
     end
-    -- proportional homing: each step the direction lerps toward us by k*dt
-    -- tvel: how the target (us) is moving -- the ball homes on where we ARE, so
-    -- a running player's curve lands somewhere else than a standing one's
-    local function sim_prop(pos, vel, target, gap, k, accel, horizon, tvel)
+    local function simProp(pos, vel, target, gap, k, accel, horizon, tvel)
         local speed = vel.Magnitude
         if speed < 1 then return nil end
         local dir, t = vel / speed, 0
-        local a = math.clamp(k * SIM_DT, 0, 1)
-        local tstep = tvel and tvel * SIM_DT or nil
+        local a, tstep = math.clamp(k * Util.SIM_DT, 0, 1), tvel and tvel * Util.SIM_DT or nil
         while t < horizon do
             if tstep then target = target + tstep end
             local to = target - pos
@@ -1988,19 +1508,19 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
                 if mixed.Magnitude < 1e-3 then mixed = want end
             end
             dir = mixed.Unit
-            speed = speed + accel * SIM_DT
-            local move = speed * SIM_DT
+            speed = speed + accel * Util.SIM_DT
+            local move = speed * Util.SIM_DT
             if dir:Dot(want) > 0 and move >= dist - gap then return t + (dist - gap) / speed end
             pos = pos + dir * move
-            t = t + SIM_DT
+            t = t + Util.SIM_DT
         end
         return nil
     end
 
-    local live_cache = { at = -1, list = {} }
-    local function get_live_balls()
+    local liveCache = { at = -1, list = {} }
+    local function liveBalls()
         local now = clock_()
-        if now - live_cache.at < 1 / 240 then return live_cache.list end
+        if now - liveCache.at < 1 / 240 then return liveCache.list end
         local list = {}
         for _, name in ipairs({ "Balls", "TrainingBalls" }) do
             local folder = Workspace:FindFirstChild(name)
@@ -2010,66 +1530,60 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
                 end
             end
         end
-        live_cache.list, live_cache.at = list, now
+        liveCache.list, liveCache.at = list, now
         return list
     end
-    -- the ball that matters: the one on us, else the first live one
     function Parry.ballOnMe()
-        for _, b in ipairs(get_live_balls()) do if b:GetAttribute('target') == me then return true end end
+        for _, b in ipairs(liveBalls()) do if b:GetAttribute('target') == me then return true end end
         return false
     end
     function Parry.mainBall()
-        local balls = get_live_balls()
+        local balls = liveBalls()
         for _, b in ipairs(balls) do if b:GetAttribute('target') == me then return b end end
         return balls[1]
     end
-    Parry.ballVelocity = ball_velocity
+    Parry.ballVelocity = ballVel
 
-    -- ---------- ball tracking ----------
-    local on_retarget, on_velocity -- set below
-    local function open_pass(st)
+    local onRetarget, onVelocity
+    function Util.openPass(st)
         st.pass_open, st.parried, st.landed, st.parry_until = true, false, false, 0
         st.dbg_seen = nil
-        if st.hm and st.hm.k then st.k_mem = st.hm.k end -- the ball's turn, kept for the next pass
+        if st.hm and st.hm.k then st.k_mem = st.hm.k end
         st.spd, st.hm = nil, nil
         if st.preparried then
             st.parried, st.parry_until, st.preparried = true, st.preparry_until, false
         end
-        if S.random_accuracy then roll_accuracy() end
+        if S.random_accuracy then Util.rollAcc() end
     end
-    local function hook_zoomies(ball, st, z)
+    function Util.hookZoomies(ball, st, z)
         if st.zinst == z then return end
         st.zinst = z
-        ball_conns[#ball_conns + 1] = z:GetPropertyChangedSignal('VectorVelocity'):Connect(function()
-            if active and is_live() and st.target == me then on_velocity(ball, st) end
+        ballConns[#ballConns + 1] = z:GetPropertyChangedSignal('VectorVelocity'):Connect(function()
+            if active and isLive() and st.target == me then onVelocity(ball, st) end
         end)
     end
-    local function get_ball_state(ball)
+    local function ballState(ball)
         local st = tracked[ball]
         if st then return st end
         st = { target = ball:GetAttribute('target'), swaps = {}, pass_open = false, parried = false,
             landed = false, parry_until = 0, preparried = false, preparry_until = 0 }
         tracked[ball] = st
-        if st.target == me then open_pass(st) end
-        ball_conns[#ball_conns + 1] = ball:GetAttributeChangedSignal('target'):Connect(function()
-            if not active or not is_live() then return end
-            local new = ball:GetAttribute('target')
-            local now = clock_()
-            local swaps = st.swaps
+        if st.target == me then Util.openPass(st) end
+        ballConns[#ballConns + 1] = ball:GetAttributeChangedSignal('target'):Connect(function()
+            if not active or not isLive() then return end
+            local new, now, swaps = ball:GetAttribute('target'), clock_(), st.swaps
             swaps[#swaps + 1] = { t = now, from = st.target, to = new }
             if #swaps > 16 then table.remove(swaps, 1) end
-            local was_me = st.target == me
+            local wasMe = st.target == me
             if DBG.on then
                 local r = getRoot()
                 local d = r and (ball.Position - r.Position).Magnitude or 0
                 DBG.ev(("retarget %s -> %s  (%.0f studs, spd %.0f)%s"):format(tostring(st.target), tostring(new), d,
-                    ball_velocity(ball).Magnitude, new == me and "  << ON YOU" or (was_me and "  (left you)" or "")))
+                    ballVel(ball).Magnitude, new == me and "  << ON YOU" or (wasMe and "  (left you)" or "")))
             end
-            -- the partner's reaction: how long they held it before it came back
-            -- to us, minus the ball's flight to them (pre-parry timing uses it)
             if new == me and type(st.target) == 'string' and st.target ~= '' and st.target_at then
-                local their, root = character_root(st.target), getRoot()
-                local spd = ball_velocity(ball).Magnitude
+                local their, root = charRoot(st.target), getRoot()
+                local spd = ballVel(ball).Magnitude
                 if their and root and spd > 1 then
                     local r = math.clamp(now - st.target_at - (their.Position - root.Position).Magnitude / spd, 0, 0.3)
                     st.react = st.react and (st.react * 0.5 + r * 0.5) or r
@@ -2079,48 +1593,32 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
             st.target = new
             if type(new) == 'string' and new ~= '' and new ~= me then
                 st.pass_open, st.parried, st.landed = false, false, false
-                -- it left US for someone else: our parry landed (only a parry sends
-                -- it on). Open the lockout now instead of waiting a ping for the
-                -- ParrySuccess message -- in a close exchange the ball is often
-                -- back before that message, and the gate held the parry.
-                if was_me then G.until_t = 0 end
+                if wasMe then G.until_t = 0 end
             end
-            if new == me and not st.pass_open then open_pass(st) end
-            on_retarget(ball, st, new, now)
+            if new == me and not st.pass_open then Util.openPass(st) end
+            onRetarget(ball, st, new, now)
         end)
         local z = ball:FindFirstChild('zoomies')
-        if z then hook_zoomies(ball, st, z) end
-        ball_conns[#ball_conns + 1] = ball.ChildAdded:Connect(function(c)
-            if c.Name == 'zoomies' then hook_zoomies(ball, st, c) end
+        if z then Util.hookZoomies(ball, st, z) end
+        ballConns[#ballConns + 1] = ball.ChildAdded:Connect(function(c)
+            if c.Name == 'zoomies' then Util.hookZoomies(ball, st, c) end
         end)
         return st
     end
 
-    -- ===================== AUTO SPAM: clash detection =====================
-    -- START: a player within clash range AND (a quick hand-off, or the ball lands
-    -- inside your reaction time, or you two are trading landed parries fast, or --
-    -- predictive -- you just sent it to them and their return would be too fast).
-    -- KEEP while it stays between you two (25-30% slack) plus the Hold tail.
-    -- STOP at once on any hard sign the exchange is over (clash_stop): the ball
-    -- goes to a third player, disappears, flies off, slows right down, or they
-    -- don't send it back in time; or the partner dies / leaves range. A stopped
-    -- ball then cools for 0.25s so a stale reading can't restart it.
     local AutoSpam = { active_until = 0, ball = nil, partner = nil, reason = nil, was_active = false,
         peak = 0, cool_ball = nil, cool_until = 0 }
-    local parry_all = {}
-    -- the ball where the server has it (feed position carried to now) and the
-    -- feed's lead over the physics ball, or the physics ball and 0 -- the same
-    -- view auto parry uses, so spam's "too fast to react" sees the real gap
+    local parryAll = {}
     function Core.ball_now(ball)
         local F, now = Core.feed, clock_()
         local fp, ft = F.pos[ball], F.at[ball]
         if fp and ft and F.ahead and now - ft < 0.12 then
-            return fp + ball_velocity(ball) * (now - ft), math.clamp(F.ahead, 0, Core.interp - 0.02)
+            return fp + ballVel(ball) * (now - ft), math.clamp(F.ahead, 0, Core.interp - 0.02)
         end
         return ball.Position, 0
     end
-    local function clash_range(speed) return math.clamp(18 + speed * 0.08, 18, 50) + (SP.range_bonus or 0) end
-    local function ball_owners(st)
+    function Util.clashRange(speed) return math.clamp(18 + speed * 0.08, 18, 50) + (SP.range_bonus or 0) end
+    function Util.ballOwners(st)
         local owners = {}
         for i = #st.swaps, 1, -1 do
             local s = st.swaps[i]
@@ -2133,7 +1631,7 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         if #owners == 0 and type(st.target) == 'string' and st.target ~= '' then owners[1] = { name = st.target, t = 0 } end
         return owners
     end
-    local function quick_handoffs(owners, partner, tempo)
+    function Util.quickHandoffs(owners, partner, tempo)
         local n = 0
         for i = 1, #owners - 1 do
             local cur, prev = owners[i], owners[i + 1]
@@ -2143,14 +1641,10 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         end
         return n
     end
-    -- you two trading parries: in the last 0.7s at least one parry was YOURS
-    -- and the rest add up to two (0.5.114: it counted the partner alone, so two
-    -- other players clashing next to you read as "you're trading" -> spam on a
-    -- ball that was never coming to you)
-    local function trading_fast(now, partner)
+    function Util.tradingFast(now, partner)
         local mine, theirs, unknown = 0, 0, 0
-        for i = #parry_all, 1, -1 do
-            local e = parry_all[i]
+        for i = #parryAll, 1, -1 do
+            local e = parryAll[i]
             if now - e.t > 0.7 then break end
             if e.who == nil then unknown = unknown + 1
             elseif e.who == me then mine = mine + 1
@@ -2158,7 +1652,7 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         end
         return mine >= 1 and (theirs + unknown) >= 1
     end
-    local function return_comes_to_us(their, root, partner, gap)
+    function Util.returnsToUs(their, root, partner, gap)
         local to = root.Position - their.Position
         local m = to.Magnitude
         if m < 0.5 or their.CFrame.LookVector:Dot(to / m) > 0.5 then return true end
@@ -2170,88 +1664,65 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         end
         return true
     end
-    -- partner, why, strong -- or nil. held = this ball is the running clash.
-    local function clash_on(ball, root, now, held)
-        local st = get_ball_state(ball)
+    local function clashOn(ball, root, now, held)
+        local st = ballState(ball)
         local target = st.target
         if type(target) ~= 'string' or target == '' then return nil end
-        local owners = ball_owners(st)
+        local owners = Util.ballOwners(st)
         local partner = (target == me) and (owners[2] and owners[2].name) or target
         if not partner or partner == me then return nil end
         if held and AutoSpam.partner and partner ~= AutoSpam.partner then return nil end
-        local their = character_root(partner)
+        local their = charRoot(partner)
         if not their then return nil end
-        local velocity = ball_velocity(ball)
-        local speed = math.max(velocity.Magnitude, 1)
-        local gap = (their.Position - root.Position).Magnitude
-        if gap > clash_range(speed) * (held and 1.3 or 1) then return nil end
+        local velocity = ballVel(ball)
+        local speed, gap = math.max(velocity.Magnitude, 1), (their.Position - root.Position).Magnitude
+        if gap > Util.clashRange(speed) * (held and 1.3 or 1) then return nil end
         local bnow, adj = Core.ball_now(ball)
-        local react = reach_time() - adj
-        local sens = math.clamp(SP.sensitivity or 1.3, 0.6, 2.5)
-        local back = gap / (speed * 1.08)
-        local too_fast = back <= react * sens + 0.08
-        local tempo = math.clamp(gap / speed * 2 + react * 2 + 0.15, 0.3, 0.9) * (held and 1.25 or 1)
-        local handoffs = quick_handoffs(owners, partner, tempo)
-        local trading = trading_fast(now, partner)
+        local react, sens, back = reachT() - adj, math.clamp(SP.sensitivity or 1.3, 0.6, 2.5), gap / (speed * 1.08)
+        local tooFast, tempo = back <= react * sens + 0.08, math.clamp(gap / speed * 2 + react * 2 + 0.15, 0.3, 0.9) * (held and 1.25 or 1)
+        local handoffs, trading = Util.quickHandoffs(owners, partner, tempo), Util.tradingFast(now, partner)
         if target == me then
-            -- START on what can't be parried by reaction: the ball lands inside
-            -- our reach (+ sensitivity), seen on the server-feed position. A
-            -- hand-off / trading streak only counts if THEIR return is also too
-            -- fast -- before 0.5.83 one hand-off inside a slow 0.5-0.9s tempo, or
-            -- two parries in 0.7s at any speed over 30, started it ("too early"),
-            -- and the lands-in test used sens - 0.1 on the lagging physics ball
-            -- ("too late").
-            -- 0.5.114: curve-aware. It used straight distance / speed, so a ball
-            -- curving round you -- or swinging away -- started spam. Pointed at
-            -- us: straight time. Otherwise the auto parry homing sim at the
-            -- turn this ball's been measured at; swinging away never starts it.
             local off = root.Position - bnow
             local dist = off.Magnitude
-            local heading = dist > 0.01 and (velocity / speed):Dot(off / dist) or 1
-            local eta = dist / speed
+            local heading, eta = dist > 0.01 and (velocity / speed):Dot(off / dist) or 1, dist / speed
             if heading < 0.97 then
                 local h = st.hm
                 if h and h.away then eta = math.huge
                 else
                     local k = math.clamp((h and h.k) or st.k_mem or K_DEFAULT, K_MIN, K_MAX)
-                    eta = math.max(sim_prop(bnow, velocity, root.Position, Core.ap_gap(ball), k, 0, react * sens + 0.3) or math.huge, eta)
+                    eta = math.max(simProp(bnow, velocity, root.Position, Core.ap_gap(ball), k, 0, react * sens + 0.3) or math.huge, eta)
                 end
             end
-            if eta <= react * sens + 0.08 + frame_dt then return partner, ("lands in %.2fs, too fast to react"):format(eta), true end
-            if handoffs >= 1 and too_fast then return partner, "quick hand-off", true end
-            if trading and too_fast then return partner, "trading parries", false end
+            if eta <= react * sens + 0.08 + frameDt then return partner, ("lands in %.2fs, too fast to react"):format(eta), true end
+            if handoffs >= 1 and tooFast then return partner, "quick hand-off", true end
+            if trading and tooFast then return partner, "trading parries", false end
             if held then return partner, "exchange on", false end
             return nil
         end
         if held and owners[1] and now - owners[1].t <= tempo then return partner, "exchange on", false end
-        -- not ours: only a ball WE just sent to them starts it (0.5.114 -- a
-        -- clash between two other players next to you is none of ours)
         if not (owners[2] and owners[2].name == me) then return nil end
-        local to_them = their.Position - bnow
-        local d_them = to_them.Magnitude
-        if not (d_them < 6 or velocity:Dot(to_them / d_them) > speed * 0.3) then return nil end
+        local toThem = their.Position - bnow
+        local dThem = toThem.Magnitude
+        if not (dThem < 6 or velocity:Dot(toThem / dThem) > speed * 0.3) then return nil end
         if handoffs >= 2 then return partner, ("%d quick hand-offs"):format(handoffs), true end
-        if trading and too_fast then return partner, "trading parries", false end
-        local from_me = owners[2] and owners[2].name == me
-        if SP.predictive and from_me and too_fast and return_comes_to_us(their, root, partner, gap) then
+        if trading and tooFast then return partner, "trading parries", false end
+        local fromMe = owners[2] and owners[2].name == me
+        if SP.predictive and fromMe and tooFast and Util.returnsToUs(their, root, partner, gap) then
             return partner, ("predicted: return in %.2fs, you need %.2fs"):format(back, react), false
         end
         return nil
     end
-    -- a hard reason the running exchange is over, or nil
-    local function clash_stop(ball, root, now)
+    local function clashStop(ball, root, now)
         if not ball.Parent or not ball:GetAttribute('realBall') then return "ball gone" end
-        local partner = AutoSpam.partner
-        local target = ball:GetAttribute('target')
+        local partner, target = AutoSpam.partner, ball:GetAttribute('target')
         if type(target) == 'string' and target ~= '' and target ~= me and target ~= partner then
             return "ball went to " .. target
         end
-        local their = character_root(partner)
+        local their = charRoot(partner)
         if not their then return "partner gone" end
-        local speed = math.max(ball_velocity(ball).Magnitude, 1)
+        local speed = math.max(ballVel(ball).Magnitude, 1)
         AutoSpam.peak = math.max(AutoSpam.peak, speed)
-        local range = clash_range(speed)
-        local gap = (their.Position - root.Position).Magnitude
+        local range, gap = Util.clashRange(speed), (their.Position - root.Position).Magnitude
         if gap > range * 1.4 then return "partner out of range" end
         local bpos = Core.ball_now(ball)
         if math.min((bpos - root.Position).Magnitude, (bpos - their.Position).Magnitude) > range * 1.5 + 10 then
@@ -2260,19 +1731,19 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         if speed < 60 and speed < AutoSpam.peak * 0.35 then return "ball slowed down" end
         local st = tracked[ball]
         if st then
-            local o = ball_owners(st)[1]
+            local o = Util.ballOwners(st)[1]
             if o and o.name == partner and o.t > 0 then
-                local limit = math.max(math.clamp(gap / speed * 2 + reach_time() * 2 + 0.15, 0.3, 0.9) * 2, 0.6)
+                local limit = math.max(math.clamp(gap / speed * 2 + reachT() * 2 + 0.15, 0.3, 0.9) * 2, 0.6)
                 if now - o.t > limit then return "they stopped returning it" end
             end
         end
         return nil
     end
-    local function can_auto_spam(root)
+    local function canSpam(root)
         return SP.auto and root and not root:FindFirstChild('SingularityCape') and canParryNow()
-            and not in_training() and not blocked_by_detection()
+            and not Util.inTrain() and not blocked()
     end
-    local function mark_clash(ball, now, partner, why)
+    function Util.markClash(ball, now, partner, why)
         if AutoSpam.ball ~= ball or AutoSpam.partner ~= partner then
             logp(("auto spam ON vs %s (%s)"):format(tostring(partner), why))
             AutoSpam.peak = 0
@@ -2281,160 +1752,122 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         AutoSpam.active_until = now + math.clamp(SP.hold or 0.15, 0, 0.5) + 0.02
         AutoSpam.reason = ("vs %s (%s)"):format(partner, why)
     end
-    local function end_clash(why, cool)
+    function Util.endClash(why, cool)
         if AutoSpam.ball then
             logp("auto spam OFF: " .. tostring(why))
             if cool then AutoSpam.cool_ball, AutoSpam.cool_until = AutoSpam.ball, clock_() + 0.25 end
         end
         AutoSpam.active_until, AutoSpam.reason, AutoSpam.ball, AutoSpam.partner = 0, nil, nil, nil
     end
-    local function has_clash(ball, now) return AutoSpam.ball == ball and now < AutoSpam.active_until end
+    function Util.hasClash(ball, now) return AutoSpam.ball == ball and now < AutoSpam.active_until end
     local function cooling(ball, now) return ball == AutoSpam.cool_ball and now < AutoSpam.cool_until end
-    local function clash_check(ball, now)
+    local function clashCheck(ball, now)
         local root = getRoot()
-        if not can_auto_spam(root) then return false end
+        if not canSpam(root) then return false end
         local held = AutoSpam.ball == ball
-        local partner, why, strong = clash_on(ball, root, now, held)
+        local partner, why, strong = clashOn(ball, root, now, held)
         if not partner or (not held and cooling(ball, now) and not strong) then return false end
-        mark_clash(ball, now, partner, why)
+        Util.markClash(ball, now, partner, why)
         return true
     end
-    local function auto_spam_evaluate(now)
-        if not SP.auto then if AutoSpam.ball then end_clash("auto spam off") end; return end
+    local function spamEval(now)
+        if not SP.auto then if AutoSpam.ball then Util.endClash("auto spam off") end; return end
         local root = getRoot()
-        if not can_auto_spam(root) then if AutoSpam.ball then end_clash("can't spam here") end; return end
+        if not canSpam(root) then if AutoSpam.ball then Util.endClash("can't spam here") end; return end
         local cur = AutoSpam.ball
         if cur then
-            local why = clash_stop(cur, root, now)
+            local why = clashStop(cur, root, now)
             if why then
-                end_clash(why, true)
+                Util.endClash(why, true)
             else
-                local partner, reason = clash_on(cur, root, now, true)
-                if partner then mark_clash(cur, now, partner, reason); return end
-                if now < AutoSpam.active_until then return end -- the Hold tail
-                end_clash("clash over", true)
+                local partner, reason = clashOn(cur, root, now, true)
+                if partner then Util.markClash(cur, now, partner, reason); return end
+                if now < AutoSpam.active_until then return end
+                Util.endClash("clash over", true)
             end
         end
-        for _, ball in ipairs(get_live_balls()) do
-            local partner, why, strong = clash_on(ball, root, now, false)
-            if partner and (strong or not cooling(ball, now)) then mark_clash(ball, now, partner, why); return end
+        for _, ball in ipairs(liveBalls()) do
+            local partner, why, strong = clashOn(ball, root, now, false)
+            if partner and (strong or not cooling(ball, now)) then Util.markClash(ball, now, partner, why); return end
         end
     end
 
-    -- ===================== SPAM PUMP =====================
     local Pump = { credit = 0, last = clock_(), on = false, frame = 0, frame_fires = 0, fired_frame = -1, waiting = false }
     local SpamMeter = { count = 0, since = clock_(), rate = 0 }
-    local function current_source(now)
+    local function curSource(now)
         if SP.manual then return "manual" end
         if SP.auto and now < AutoSpam.active_until then return "auto" end
         return nil
     end
-    -- a ball is a threat right now: on us, close to us, or heading in within reach
-    local function spam_focus()
+    local function spamFocus()
         local root = getRoot()
         if not root then return false end
-        local horizon = reach_time() + 0.25
-        for _, ball in ipairs(get_live_balls()) do
-            local st = get_ball_state(ball)
+        local horizon = reachT() + 0.25
+        for _, ball in ipairs(liveBalls()) do
+            local st = ballState(ball)
             if st.target == me then return true end
-            local vel = ball_velocity(ball)
-            local speed = vel.Magnitude
-            local off = root.Position - ball.Position
+            local vel = ballVel(ball)
+            local speed, off = vel.Magnitude, root.Position - ball.Position
             local d = off.Magnitude
             if d <= 20 + speed * 0.05 then return true end
             if speed > 1 and d > 0.01 and (vel / speed):Dot(off / d) > 0.3 and d / speed <= horizon then return true end
         end
         return false
     end
-    local function fire_one()
+    local function fireOne()
         if Pump.fired_frame ~= Pump.frame then Pump.fired_frame, Pump.frame_fires = Pump.frame, 0 end
         if SP.mode == "Keypress" and Pump.frame_fires >= 1 then return false end
         local ok, remote = false, false
         if SP.mode == "Keypress" then ok = pressBlockKey()
-        elseif not Core.cap and capture_method() == "getgc" then
-            -- getgc method: acquire the sender (no hook, no press, no upvalues)
+        elseif not Core.cap and capMethod() == "getgc" then
             if clock_() - Capture.last_spam_key < 0.3 then return false end
             Capture.last_spam_key = clock_()
-            if gc_acquire() then ok = send(true) == "sent"; remote = ok end
+            if Util.gcGet() then ok = send(true) == "sent"; remote = ok end
         elseif not Core.cap then
-            -- no capture yet. Default: wait for the player's own real parry (no
-            -- synthetic press). "Auto press" capture bootstraps with a native press.
             if not Capture.auto() then return false end
             if clock_() - Capture.last_spam_key < 0.3 then return false end
             Capture.last_spam_key = clock_()
-            ok = key_parry(true)
+            ok = keyParry(true)
         else
             ok = send(true) == "sent"
             remote = ok
         end
         Pump.frame_fires = Pump.frame_fires + 1
         if ok then SpamMeter.count = SpamMeter.count + 1 end
-        -- getgc's handler plays the game's own swing; don't add ours on top
-        if capture_method() == "getgc" then remote = false end
+        if capMethod() == "getgc" then remote = false end
         Pump.remote_sent = Pump.remote_sent or remote
         return ok
     end
-    -- Holds the parries-a-second at the slider value at any FPS:
-    --   * credit grows with real time and carries ~2 frames (>= 50ms), so a 30 FPS
-    --     frame (33ms) no longer overflows it (0.5.2 kept 15ms: ~5% short at 30 FPS,
-    --     up to 12% short across hitches);
-    --   * a parry that can't go out right now (stunned, respawning, no capture)
-    --     keeps its credit instead of being counted as sent (0.5.2 lost ~5% there).
-    -- Simulated against real frame timing (3 signal points a frame, jitter,
-    -- hitches, blocked moments): 100% of target from 30 to 240 FPS, 300-2000/s.
-    -- Spam speed: the picked rate ("50/s" .. "1000/s"), held exactly by the
-    -- bucket below at any FPS.
-    -- Timing (0.5.108): "Per second" = the Speed dropdown; "Every X ms" = one
-    -- parry every Interval ms (2 ms = 500/s), the same exact bucket.
     function SP.rate_now(now)
         if SP.timing == "Every X ms" then return 1000 / math.max(tonumber(SP.interval_ms) or 2, 0.5) end
         return tonumber(tostring(SP.speed_mode):match("%d+")) or 700
     end
-    -- HIGH SPEED FIX (toggle, 0.5.114). Past a ball speed (High speed at), a
-    -- fast clash is settled in server ticks: the server steps ~60 times a
-    -- second and hits whatever is due in that step, so packets beyond a couple
-    -- per tick only queue behind each other. While the spam ball is that fast,
-    -- every spam mode is paced to Sends per tick x 60/s -- evenly, so each tick
-    -- still gets a fresh parry -- and goes back to your setting below that.
     function SP.ball_speed()
         local b = AutoSpam.ball
-        if b and b.Parent then return ball_velocity(b).Magnitude end
+        if b and b.Parent then return ballVel(b).Magnitude end
         local best = 0
-        for _, ball in ipairs(get_live_balls()) do
-            if ball:GetAttribute('target') == me then best = math.max(best, ball_velocity(ball).Magnitude) end
+        for _, ball in ipairs(liveBalls()) do
+            if ball:GetAttribute('target') == me then best = math.max(best, ballVel(ball).Magnitude) end
         end
         return best
     end
     function SP.high_speed() return SP.hs_fix and SP.ball_speed() >= (SP.hs_speed or 400) end
-    -- Per frame (toggle, or the old "Per frame" method): Count parries every
-    -- frame instead of a rate -- your FPS x Count a second (not while the high
-    -- speed fix is pacing: that's a rate)
     function SP.per_frame_on() return (SP.per_frame or SP.method == "Per frame") and not SP.high_speed() end
     function SP.frame_burst()
         local n = math.clamp(math.floor(tonumber(SP.per_frame_count) or 1), 1, 20)
         if SP.mode == "Keypress" then n = 1 end
         local sent = false
         while Pump.frame_fires < n do
-            if not fire_one() then break end
+            if not fireOne() then break end
             sent = true
         end
         return sent
     end
-    -- Spam methods (Spam tab > Method):
-    --   Fixed rate    the picked Speed, held exactly by the bucket (the original)
-    --   Per frame     one parry per frame -- your FPS is the rate (60-240/s); a
-    --                 send never queues behind another sent the same frame
-    --   Ping adaptive the picked Speed, capped at 12 parries per round trip
-    --                 (min 60/s): high ping gets fewer sends in flight -- the
-    --                 thing that clogs and desyncs -- low ping gets the full Speed
-    --   On ball       the picked Speed, but only while a ball is on you or about
-    --                 to be (none sent while it's on them), plus one the instant
-    --                 it turns to you and on each server ball update after that
     function SP.on_ball_now()
         local root = getRoot()
         if not root then return false end
-        for _, ball in ipairs(get_live_balls()) do
-            local st = get_ball_state(ball)
+        for _, ball in ipairs(liveBalls()) do
+            local st = ballState(ball)
             if st.target == me then return true end
             local bp = Core.ball_now(ball)
             if (bp - root.Position).Magnitude <= 12 then return true end
@@ -2443,82 +1876,65 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
     end
     function SP.method_rate(rate)
         if SP.method == "Ping adaptive" then
-            rate = math.min(rate, math.max(60, 12 / math.max(ping_s(), 0.02)))
+            rate = math.min(rate, math.max(60, 12 / math.max(pingS(), 0.02)))
         end
         if SP.high_speed() then
-            -- per tick x 60; a slower Speed / interval stays as you set it
             rate = math.min(rate, 60 * math.clamp(math.floor(SP.hs_per_tick or 2), 1, 6))
         end
         return rate
     end
-    local function spam_tick(now, point)
+    local function spamTick(now, point)
         local elapsed = math.min(now - Pump.last, 0.25)
         Pump.last = now
         local span = now - SpamMeter.since
         if span >= 1 then SpamMeter.rate, SpamMeter.count, SpamMeter.since = SpamMeter.count / span, 0, now end
-        local source = current_source(now)
+        local source = curSource(now)
         if not source or not LocalPlayer.Character then Pump.on, Pump.waiting = false, false; return end
-        local focus = spam_focus()
-        -- Smart stop: manual spam holds fire while nothing is a threat
+        local focus = spamFocus()
         if source == "manual" and SP.smart and not focus then Pump.on, Pump.waiting = false, true; return end
         Pump.waiting = false
         if SP.method == "On ball" and not SP.on_ball_now() then Pump.on = false; return end
         if SP.per_frame_on() then
-            -- Count a frame, at its first point; no bucket
             if point == 1 then
-                Pump.on, Pump.sent = true, nil -- the bucket restarts fresh if pacing takes over
+                Pump.on, Pump.sent = true, nil
                 if Pump.fired_frame ~= Pump.frame then Pump.fired_frame, Pump.frame_fires = Pump.frame, 0 end
                 if SP.frame_burst() and Pump.remote_sent then Anim.spamBlock() end
                 Pump.remote_sent = false
             end
             return
         end
-        -- the rate is EXACTLY the slider value (20-2000/s), no network throttle.
         local rate = SP.method_rate(math.clamp(SP.rate_now(now), 1, 2000))
-        if SP.mode == "Keypress" then rate = math.min(rate, 1 / frame_dt) end
+        if SP.mode == "Keypress" then rate = math.min(rate, 1 / frameDt) end
         rate = math.max(rate, 1)
-        -- STRICT time bucket: the number allowed so far is rate x (time since the
-        -- bucket started); fire until sent reaches it, so the average is exactly
-        -- the slider at any FPS (a long frame pays exactly what it owes). When a
-        -- fire is blocked (stunned, respawn, no capture), the owed backlog is
-        -- forgiven -- the start slides to now -- so it never bursts over the rate
-        -- once it can fire again.
         if not Pump.on or not Pump.sent then Pump.on, Pump.rate, Pump.t0, Pump.sent = true, rate, now, 0
-        elseif Pump.rate ~= rate then Pump.rate, Pump.t0 = rate, now - Pump.sent / rate end -- re-rate, no burst
-        local allowed = math.floor((now - Pump.t0) * rate) + 1
-        local sent = false
+        elseif Pump.rate ~= rate then Pump.rate, Pump.t0 = rate, now - Pump.sent / rate end
+        local allowed, sent = math.floor((now - Pump.t0) * rate) + 1, false
         while Pump.sent < allowed do
-            if not fire_one() then Pump.t0 = now - (Pump.sent - 1) / rate; break end
+            if not fireOne() then Pump.t0 = now - (Pump.sent - 1) / rate; break end
             Pump.sent = Pump.sent + 1
             sent = true
         end
-        -- one animation call per tick, through the held-key gate, and only for
-        -- remote sends (a native press -- Keypress mode or a capture press -- has
-        -- the game's own swing)
         if sent and Pump.remote_sent then Anim.spamBlock() end
         Pump.remote_sent = false
     end
-    local function spam_instant()
-        local source = current_source(clock_())
+    local function spamInstant()
+        local source = curSource(clock_())
         if not source or not LocalPlayer.Character then return end
-        if source == "manual" and SP.smart and not spam_focus() then return end
+        if source == "manual" and SP.smart and not spamFocus() then return end
         if SP.per_frame_on() then
-            -- at most this frame's Count (an instant fire uses one of them)
             if Pump.fired_frame ~= Pump.frame then Pump.fired_frame, Pump.frame_fires = Pump.frame, 0 end
             local n = (SP.mode == "Keypress") and 1 or math.clamp(math.floor(tonumber(SP.per_frame_count) or 1), 1, 20)
-            if Pump.frame_fires < n and fire_one() and Pump.remote_sent then Anim.spamBlock() end
+            if Pump.frame_fires < n and fireOne() and Pump.remote_sent then Anim.spamBlock() end
             Pump.remote_sent = false
             return
         end
         if SP.method == "On ball" and not SP.on_ball_now() then return end
-        -- counted against the same bucket (at most one ahead of it), so instant
-        -- fires on retarget / parry success never push the average over the slider
         local now = clock_()
         local rate = math.max(SP.method_rate(math.clamp(SP.rate_now(now), 1, 2000)), 1)
         if not Pump.on or not Pump.sent then Pump.on, Pump.rate, Pump.t0, Pump.sent = true, rate, now, 0
         elseif Pump.rate ~= rate then Pump.rate, Pump.t0 = rate, now - Pump.sent / rate end
         if Pump.sent > math.floor((now - Pump.t0) * rate) + 1 then return end
-        if fire_one() then
+        if fireOne() then
             Pump.sent = Pump.sent + 1
             if Pump.remote_sent then Anim.spamBlock() end
         end
@@ -2526,12 +1942,11 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
     end
     function Parry.spamWaiting() return Pump.waiting end
 
-    -- ===================== AUTO PARRY / TRIGGERBOT / PRE-PARRY =====================
-    local function mark_parried(st, now)
-        local _, n2 = parry_window()
+    local function markParried(st, now)
+        local _, n2 = parryWin()
         st.parried, st.parry_until = true, now + (n2 or 1.3) + 0.08
     end
-    local function pass_busy(st, now)
+    local function passBusy(st, now)
         if st.landed then return true end
         if st.parried then
             if now < st.parry_until then return true end
@@ -2541,46 +1956,29 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
     end
     local function fire(st, now, via, info, ball)
         local how
-        -- getgc capture method: get / refresh the capture by reflection (never a
-        -- hook, never a press), and if that can't produce one, skip rather than
-        -- fall back to a hook.
-        if capture_method() == "getgc" and S.parry_mode ~= "Keypress" then
-            if not Core.cap then pcall(gc_acquire) end
+        if capMethod() == "getgc" and S.parry_mode ~= "Keypress" then
+            if not Core.cap then pcall(Util.gcGet) end
             if not Core.cap then return false end
         end
-        -- Wait-for-your-parry hook capture (the default): never synthesize a press
-        -- to capture or refresh -- forge only once the player's own parry has been
-        -- read. With no key yet, do nothing and let prime_capture read the next
-        -- real block. The "Auto press" capture mode restores the synthetic bootstrap.
-        local hookmode = capture_method() ~= "getgc" and S.parry_mode ~= "Keypress"
-        -- no capture yet, or the last remote parry went unanswered (the capture
-        -- may be stale): this parry is a native press, which parries by itself
-        -- and takes / refreshes the capture on the way. Only in "Auto press" capture mode;
-        -- getgc never goes "fresh" (it calls the game's own sender).
-        -- RESCUE (0.5.115): the server didn't answer this pass's remote parry
-        -- (Core.refused) -- this one is a native press, a real parry, which
-        -- also takes a fresh capture when the old one was dropped
+        local hookmode = capMethod() ~= "getgc" and S.parry_mode ~= "Keypress"
         local rescue = st.rescue and S.rescue_press and S.parry_mode ~= "Keypress"
         if hookmode and not Capture.auto() and not Core.cap and not rescue then return false end
         local fresh = hookmode and Capture.auto() and (not Core.cap or Core.misses >= 1)
-        if try_ability() then how = "ability"
+        if Util.tryAbility() then how = "ability"
         elseif S.parry_mode == "Keypress" or fresh or rescue then
-            if not gate_open() or not canParryNow() then return false end
+            if not gateOpen() or not canParryNow() then return false end
             local capturing = fresh or (rescue and not Core.cap)
-            key_parry(capturing); gate_start()
+            keyParry(capturing); gateStart()
             how = rescue and "key, rescue" or (not fresh and "key" or (Core.cap and "key, refreshing capture" or "key, capturing"))
             if rescue then st.rescue = nil; Core.diag.rescued = Core.diag.rescued + 1 end
         else
             if send(false) ~= "sent" then return false end
             how = "remote"
-            -- wait for the server's attempt answer to this one (Parry.frame)
-            local t_send = clock_()
-            Core.await = { t = t_send, ball = ball, st = st, cap = Core.cap, spam_at = Core.last_spam_at,
-                gap = t_send - (Core.last_single_at or -math.huge) }
-            Core.last_single_at = t_send
-            -- getgc calls the game's own parry handler, which plays the real
-            -- swing; only a forged remote parry needs our animation
-            if capture_method() ~= "getgc" then Anim.block() end
+            local tSend = clock_()
+            Core.await = { t = tSend, ball = ball, st = st, cap = Core.cap, spam_at = Core.last_spam_at,
+                gap = tSend - (Core.last_single_at or -math.huge) }
+            Core.last_single_at = tSend
+            if capMethod() ~= "getgc" then Anim.block() end
         end
         Core.last_parry = { t = now, via = via, info = info }
         Core.diag.fired = Core.diag.fired + 1
@@ -2588,16 +1986,13 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
             DBG.ev(info and ("FIRE %s [%s] d %.0f spd %.0f eta %.2f lead %.2f"):format(via, how, info.dist or 0,
                 info.speed or 0, math.min(info.eta or 0, 9.99), info.lead or 0) or ("FIRE %s [%s]"):format(via, how))
         end
-        -- a key press is answered (or not) like a remote parry: same miss check
-        if how ~= "remote" and how ~= "ability" then Core.pending = clock_() + (parry_window() or 0.5) + ping_s() + 0.3 end
-        -- watch this ball until the parry is answered: when it actually got
-        -- closest to us says whether a miss was early, late, or on time
+        if how ~= "remote" and how ~= "ability" then Core.pending = clock_() + (parryWin() or 0.5) + pingS() + 0.3 end
         local root = getRoot()
         Core.watch = ball and root and { ball = ball, t = now, how = how, d0 = (ball.Position - root.Position).Magnitude,
-            min_d = math.huge, min_t = now, ping = ping_s(), W = parry_window() or 0.5, lead = info and info.lead,
+            min_d = math.huge, min_t = now, ping = pingS(), W = parryWin() or 0.5, lead = info and info.lead,
             eta = info and info.eta,
             cap = how == "remote" and Core.cap or nil } or nil
-        mark_parried(st, now)
+        markParried(st, now)
         if info then
             logp(("%s [%s] dist %.0f spd %.0f head %.2f eta %.2f lead %.2f%s"):format(via, how, info.dist or 0,
                 info.speed or 0, info.heading or 0, math.min(info.eta or 0, 9.99), info.lead or 0,
@@ -2608,11 +2003,6 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         return true
     end
 
-    -- Aerodynamic Slash (Bbs dump, observeTag "AerodynamicSlashTornado"): the
-    -- ability tags a tornado whose "Ball" attribute names the ball and whose
-    -- "TornadoTime" is how long the ball spins in it before it's sent. While it
-    -- spins it is near / over you and "targeting" you but can't hit -- the old
-    -- auto parry fired on it, far too early. Held until the spin is over.
     function Det.tornado(ball, now)
         if Det.tor_fid ~= Core.fid then
             Det.tor_fid = Core.fid
@@ -2633,28 +2023,11 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         end
         return Det.tor_list[ball.Name] == true
     end
-    -- ===================== THE DECISION (rewritten 0.5.85) =====================
-    -- For a ball on us, seen where the SERVER has it (feed position carried to
-    -- now; physics ball if the feed is stale). Three numbers:
-    --   reach  seconds until a parry fired now is up (half ping + jitter + the
-    --          physics lag the feed doesn't cover + half a frame)
-    --   lead   reach + the Accuracy cushion: fire when the ball is due by then
-    --   t_min  the soonest it can possibly land: straight in at full speed
-    --          (plus its speed-up). Nothing arrives sooner -- so while t_min is
-    --          past lead there is nothing to do and nothing is simulated.
-    -- Then:
-    --   touching                 -> fire
-    --   pointed at us (>= 0.996) -> fire when t_min is due
-    --   anything else = a curve  -> see "anti curve" below: fire on its
-    --     LATEST arrival at the Accuracy lead, and at once if its SOONEST
-    --     arrival would beat a parry fired now.
-    -- No straight-line distance rules: they fired on distances a curving ball
-    -- was never going to fly.
     local function decide(ball, st, root, now, via)
-        if pass_busy(st, now) then DBG.held(st.landed and "this pass landed" or "already fired on this pass", now); return end
-        if blocked_by_detection(ball) then DBG.held("ability detection: " .. (Det.ball_detected(ball) or "you"), now); return end
+        if passBusy(st, now) then DBG.held(st.landed and "this pass landed" or "already fired on this pass", now); return end
+        if blocked(ball) then DBG.held("ability detection: " .. (Det.ball_detected(ball) or "you"), now); return end
         if Det.tornado(ball, now) then DBG.held("aerodynamic slash tornado", now); return end
-        local vel = ball_velocity(ball)
+        local vel = ballVel(ball)
         local speed = vel.Magnitude
         if speed < 1 then return end
         local bpos, adj = Core.ball_now(ball)
@@ -2663,80 +2036,37 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         local dist = offset.Magnitude
         if dist < 0.01 then return end
         local dir, want = vel / speed, offset / dist
-        local heading = dir:Dot(want)
-        local W = parry_window() or 0.5
-        -- reach_time carries jitter, and safe_margin adds it again on top:
-        -- counted once here (0.5.94), it was firing early by a whole jitter
-        local reach = reach_time() - jitter() - adj
-        local gap = Core.ap_gap(ball)
-        local rem = math.max(dist - gap, 0)
-        local accel = speed_gain(st, speed, now)
-        local h = track_homing(st, dir, want, dist, now)
+        local heading, W, reach, gap = dir:Dot(want), parryWin() or 0.5, reachT() - jitter() - adj, Core.ap_gap(ball)
+        local rem, accel, h = math.max(dist - gap, 0), speedGain(st, speed, now), trackHoming(st, dir, want, dist, now)
         local tune = S.self_tune and Core.tune or 0
-        local must_by = reach + safe_margin() + math.max(tune, 0)
-        local lead = math.max(reach + cushion_for(speed, W) + tune, must_by)
-        local half = frame_dt * 0.5
-        -- the CLOSING speed, not the ball's alone (0.5.115): running at the
-        -- ball it lands sooner, running from it later -- 16-30 studs/s of your
-        -- own is a fifth of a slow ball's speed, and the straight time ignored
-        -- it (the curve sims already moved you). Kept within half / 1.5x.
-        local mv = root.AssemblyLinearVelocity
-        local close_spd = math.clamp(speed - Vector3.new(mv.X, 0, mv.Z):Dot(want), speed * 0.5, speed * 1.5)
-        local t_min = time_to_contact(dist, gap, close_spd, accel)
-        local info = { speed = speed, dist = dist, heading = heading, lead = lead, eta = t_min }
+        local mustBy = reach + safeMargin() + math.max(tune, 0)
+        local lead, half, mv = math.max(reach + cushion(speed, W) + tune, mustBy), frameDt * 0.5, root.AssemblyLinearVelocity
+        local closeSpd = math.clamp(speed - Vector3.new(mv.X, 0, mv.Z):Dot(want), speed * 0.5, speed * 1.5)
+        local tMin = ttc(dist, gap, closeSpd, accel)
+        local info = { speed = speed, dist = dist, heading = heading, lead = lead, eta = tMin }
         if DBG.on then
             local e = DBG.eval
             e.t, e.via, e.speed, e.dist, e.heading, e.reach, e.lead, e.t_min, e.k, e.feed = now, via or "frame",
-                speed, dist, heading, reach, lead, t_min, h.k, adj > 0
+                speed, dist, heading, reach, lead, tMin, h.k, adj > 0
             e.fast, e.slow, e.radial = nil, nil, nil
             info.dbg = e
-            -- the first look at this pass already had it landing inside our reach:
-            -- it was late before we could do anything (retarget / data arrived late)
             if not st.dbg_seen then
                 st.dbg_seen = true
-                if t_min < reach then
+                if tMin < reach then
                     DBG.ev(("LATE: first seen %.2fs from landing, reach %.2fs (%s) -- already too close when the data arrived"):format(
-                        t_min, reach, via or "frame"))
+                        tMin, reach, via or "frame"))
                 end
             end
         end
         local tag = (via and ("auto parry (" .. via .. ")") or "auto parry") .. ((adj > 0 and via ~= "feed") and " [feed]" or "")
         if rem <= 3 then return fire(st, now, tag .. " (contact)", info, ball) end
-        if t_min > lead + half then return end
-        -- straight in: within ~5 deg of us (0.5.105 -- it was 0.97, ~14 deg: a
-        -- ball still swinging in was timed as if flying straight, firing ahead
-        -- of the Accuracy you set; those go through the curve path now, which
-        -- comes out at the straight time for a ball that really is straight)
+        if tMin > lead + half then return end
         if heading >= 0.996 then return fire(st, now, tag, info, ball) end
-        -- ===== a curve (anti curve, rewritten 0.5.88) =====
-        -- Two runs of its homing path, with the turn gain it has actually been
-        -- measured turning at (kept across passes; default until measured):
-        --   SLOW  turning 0.75x as hard -- the LATEST it can arrive. The normal
-        --         fire is on this, at the Accuracy lead: a curve is never
-        --         parried before even its slowest version is due, so no early
-        --         hits on wide or bait curves.
-        --   FAST  turning 1.25x as hard (the model's max with Hard curve guard)
-        --         -- the SOONEST. If it would land before a parry fired now is
-        --         up (reach + safety), fire at once whatever else: you can't
-        --         be curved past.
-        -- A ball swinging away waits to come round (FAST still guards it).
-        -- Until this pass has measured its own turn (2 readings), the gain is
-        -- a guess -- the last pass's was another player's curve -- so the band
-        -- is widened both ways: FAST from the harder of the two, SLOW from the
-        -- softer. The closing-speed check below keeps the soft side honest.
-        -- 0.5.98: the latest arrival is also checked against the ball's REAL
-        -- closing speed (radial_eta). A curve turning harder than k says used
-        -- to be parried on SLOW only when it was nearly on us; now, while it is
-        -- clearly coming in (closing at 35%+ of its speed), whichever of the
-        -- two says sooner wins. A wide or bait curve barely closes, so it
-        -- still waits for SLOW.
-        local measured = h.k and (h.kn or 0) >= 2
-        local guess = st.k_mem or K_DEFAULT
+        local measured, guess = h.k and (h.kn or 0) >= 2, st.k_mem or K_DEFAULT
         local km = math.clamp(h.k or guess, K_MIN, K_MAX)
-        local km_hi = measured and km or math.clamp(math.max(km, guess, K_DEFAULT), K_MIN, K_MAX)
-        local km_lo = measured and km or math.clamp(math.min(km, guess, K_DEFAULT), K_MIN, K_MAX)
-        local v = vel
-        if heading < -0.95 then -- dead away: nudge it off the line so the sim can turn it
+        local kmHi = measured and km or math.clamp(math.max(km, guess, K_DEFAULT), K_MIN, K_MAX)
+        local kmLo, v = measured and km or math.clamp(math.min(km, guess, K_DEFAULT), K_MIN, K_MAX), vel
+        if heading < -0.95 then
             local side = dir:Cross(Vector3.yAxis)
             if side.Magnitude < 1e-3 then side = dir:Cross(Vector3.xAxis) end
             v = (dir + side.Unit * 0.08).Unit * speed
@@ -2744,39 +2074,30 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         local rv = root.AssemblyLinearVelocity
         local tvel = Vector3.new(rv.X, 0, rv.Z)
         if tvel.Magnitude < 1 then tvel = nil end
-        -- just after a sudden turn the gain is unknown: guard at the hardest
         local snapped = h.snap_at and now - h.snap_at < 0.15
-        local k_fast = (S.hard_curve or snapped) and K_MAX or math.min(km_hi * 1.25, K_MAX)
-        local fast = math.max(sim_prop(bpos, v, rpos, gap, k_fast, accel, must_by + 0.05, tvel) or math.huge, t_min)
+        local kFast = (S.hard_curve or snapped) and K_MAX or math.min(kmHi * 1.25, K_MAX)
+        local fast = math.max(simProp(bpos, v, rpos, gap, kFast, accel, mustBy + 0.05, tvel) or math.huge, tMin)
         info.fast = fast
         if info.dbg then info.dbg.fast = fast end
-        if fast <= must_by + half then
+        if fast <= mustBy + half then
             info.eta = fast
             return fire(st, now, tag .. " (curve, must)", info, ball)
         end
-        -- swinging away waits -- unless it's already within ~14 deg of us (a wobble)
         if h.away and heading < 0.97 then return end
-        -- SLOW's gain (0.5.105): 0.75x was the floor for every curve, so every
-        -- curve fired on its slowest version -- later (closer) than the
-        -- Accuracy you set, by however much harder it really turned. Once this
-        -- pass has 3+ readings of its turn that agree (scatter under 40%), it's
-        -- run at 1 - scatter/2 of the measured gain (a steady curve: ~0.9-0.95x,
-        -- its real path), so the fire lands at your Accuracy lead. A noisy or
-        -- unmeasured one keeps 0.75x; FAST still guards all of them.
-        local slow_f = 0.75
+        local slowF = 0.75
         if measured and (h.kn or 0) >= 3 and h.kspread and h.kspread < 0.4 then
-            slow_f = math.clamp(1 - h.kspread * 0.5, 0.8, 0.95)
+            slowF = math.clamp(1 - h.kspread * 0.5, 0.8, 0.95)
         end
-        local slow = math.max(sim_prop(bpos, v, rpos, gap, math.max(km_lo * slow_f, K_MIN), accel, lead + 0.05, tvel) or math.huge, t_min)
+        local slow = math.max(simProp(bpos, v, rpos, gap, math.max(kmLo * slowF, K_MIN), accel, lead + 0.05, tvel) or math.huge, tMin)
         info.eta, info.slow, info.k = slow, slow, km
         if info.dbg then info.dbg.slow = slow end
         if slow <= lead + half then return fire(st, now, tag .. " (curve)", info, ball) end
         local s = h.samples
         local closing = #s >= 2 and (s[#s - 1].d - s[#s].d) / math.max(s[#s].t - s[#s - 1].t, 1e-3) or 0
         if closing >= speed * 0.35 then
-            local radial = radial_eta(h, rem, speed)
+            local radial = radialEta(h, rem, speed)
             if radial then
-                radial = math.max(radial, t_min)
+                radial = math.max(radial, tMin)
                 if info.dbg then info.dbg.radial = radial end
                 if radial <= lead + half then
                     info.eta = radial
@@ -2787,40 +2108,36 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
     end
 
     local function trigger(ball, st, now)
-        if pass_busy(st, now) or has_clash(ball, now) or blocked_by_detection(ball) then return end
+        if passBusy(st, now) or Util.hasClash(ball, now) or blocked(ball) then return end
         fire(st, now, "triggerbot", nil, ball)
     end
 
-    local function try_preparry(ball, st, root, now)
+    local function tryPreparry(ball, st, root, now)
         if st.preparried then
             if now < st.preparry_until then return end
             st.preparried = false
         end
-        -- only when the Pre-parry toggles ask for it (never built in)
-        if not (S.preparry or (S.hp_preparry and (Lag.avg or ping_s()) >= 0.08)) then return end
-        if not Core.cap or blocked_by_detection(ball) then return end
+        if not (S.preparry or (S.hp_preparry and (Lag.avg or pingS()) >= 0.08)) then return end
+        if not Core.cap or blocked(ball) then return end
         local target = st.target
         if type(target) ~= 'string' or target == '' or target == me then return end
-        local their = character_root(target)
+        local their = charRoot(target)
         if not their then return end
-        local vel = ball_velocity(ball)
+        local vel = ballVel(ball)
         local speed = vel.Magnitude
         if speed < 1 then return end
         local gap = (their.Position - root.Position).Magnitude
         if gap > (S.preparry_range or 20) then return end
-        local to_them = their.Position - ball.Position
-        local d_them = to_them.Magnitude
-        if d_them > 3 and vel:Dot(to_them / d_them) < speed * 0.3 then return end
-        local back = gap / (speed * 1.1)
-        local reach = reach_time()
-        if back > reach + frame_dt * 2 then return end
-        -- flight to them + how long they hold it (measured) + flight back
-        local eta = d_them / speed + math.clamp(st.react or 0.05, 0, 0.3) + back
-        local lead = fire_lead(speed)
-        if eta > lead or has_clash(ball, now) then return end
+        local toThem = their.Position - ball.Position
+        local dThem = toThem.Magnitude
+        if dThem > 3 and vel:Dot(toThem / dThem) < speed * 0.3 then return end
+        local back, reach = gap / (speed * 1.1), reachT()
+        if back > reach + frameDt * 2 then return end
+        local eta, lead = dThem / speed + math.clamp(st.react or 0.05, 0, 0.3) + back, fireLead(speed)
+        if eta > lead or Util.hasClash(ball, now) then return end
         if send(false) == "sent" then
             Anim.block()
-            local W, n2 = parry_window()
+            local W, n2 = parryWin()
             st.preparried = true
             st.preparry_until = now + math.max((W or 0.5) + reach + 0.15, (n2 or 1.3) + 0.08)
             Core.last_parry = { t = now, via = "pre-parry", info = { eta = eta, lead = lead } }
@@ -2828,33 +2145,17 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         end
     end
 
-    -- FAST RETARGET (Debug toggle). The old script's instant retarget fired
-    -- straight from the target change on distance alone -- the ball's new
-    -- velocity isn't in yet then -- and every loose version of it parried
-    -- balls that hadn't turned yet, so the parry ran out. Remade to fire only
-    -- when it should, from that same instant (no defer, no waiting for the
-    -- velocity), on the ball's server-feed position and its speed:
-    --   soonest = (distance - contact gap) / speed, homing straight in -- it
-    --   can't land sooner (a speed-up only makes the next check sooner too)
-    --   * soonest inside reach + safety: fire now, fire or die;
-    --   * not yet due at the Accuracy lead: hold (the normal checks take it);
-    --   * a curve could make it fly up to TWICE that path (the old v36 rule):
-    --     fire only if even that still lands before the parry runs out.
     function Core.fast_retarget(ball, st, root, now)
-        if pass_busy(st, now) or blocked_by_detection(ball) or Det.tornado(ball, now) then return false end
-        local speed = ball_velocity(ball).Magnitude
+        if passBusy(st, now) or blocked(ball) or Det.tornado(ball, now) then return false end
+        local speed = ballVel(ball).Magnitude
         if speed < 1 then return false end
         local bpos, adj = Core.ball_now(ball)
-        local dist = (root.Position - bpos).Magnitude
-        local gap = Core.ap_gap(ball)
-        local soonest = math.max(dist - gap, 0) / speed
-        local W = math.min(parry_window() or 0.5, 0.6)
-        local reach = reach_time() - jitter() - adj
-        local must_by = reach + safe_margin()
-        local lead = math.max(reach + cushion_for(speed, W), must_by)
-        local holds = reach + W - (jitter() + frame_dt + 0.03)
+        local dist, gap = (root.Position - bpos).Magnitude, Core.ap_gap(ball)
+        local soonest, W, reach = math.max(dist - gap, 0) / speed, math.min(parryWin() or 0.5, 0.6), reachT() - jitter() - adj
+        local mustBy = reach + safeMargin()
+        local lead, holds = math.max(reach + cushion(speed, W), mustBy), reach + W - (jitter() + frameDt + 0.03)
         local info = { speed = speed, dist = dist, heading = 0, lead = lead, eta = soonest }
-        if soonest <= must_by then return fire(st, now, "fast retarget (must)", info, ball) end
+        if soonest <= mustBy then return fire(st, now, "fast retarget (must)", info, ball) end
         if soonest > lead then
             DBG.held(("fast retarget: not due (%.2fs > lead %.2fs)"):format(soonest, lead), now)
             return false
@@ -2865,91 +2166,68 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         end
         return fire(st, now, "fast retarget", info, ball)
     end
-    on_retarget = function(ball, st, new, now)
+    onRetarget = function(ball, st, new, now)
         if new == me then
             if S.fast_retarget and S.autoparry and not S.triggerbot then
-                local root = ap_root()
+                local root = apRoot()
                 if root then Core.fast_retarget(ball, st, root, now) end
             end
-            if SP.auto then clash_check(ball, now) end
-            if has_clash(ball, now) then spam_instant() end
-            -- instant decision, deferred ONE step: the rest of the same update
-            -- (the ball's new velocity) is applied first, so this sees its real
-            -- new path -- not the stale "flying away from the last hit" one the
-            -- old retarget fired on -- and still runs inside this frame
+            if SP.auto then clashCheck(ball, now) end
+            if Util.hasClash(ball, now) then spamInstant() end
             if S.autoparry and not S.triggerbot then
                 task.defer(function()
-                    if not active or not is_live() or st.target ~= me then return end
-                    local root = ap_root()
+                    if not active or not isLive() or st.target ~= me then return end
+                    local root = apRoot()
                     if root then decide(ball, st, root, clock_(), "retarget") end
                 end)
             end
             if S.triggerbot then
-                local root = ap_root()
+                local root = apRoot()
                 if root then trigger(ball, st, now) end
             end
-            if SP.manual then spam_instant() end
+            if SP.manual then spamInstant() end
         elseif SP.auto then
             if AutoSpam.ball == ball and type(new) == 'string' and new ~= '' and new ~= AutoSpam.partner then
-                end_clash("ball went to " .. new, true)
+                Util.endClash("ball went to " .. new, true)
             else
-                clash_check(ball, now)
+                clashCheck(ball, now)
             end
         end
     end
-    on_velocity = function(ball, st)
+    onVelocity = function(ball, st)
         DBG.counts.vel = DBG.counts.vel + 1
         if not (S.autoparry or S.triggerbot) then return end
-        local root = ap_root()
+        local root = apRoot()
         if not root then return end
         if st.reopen_until and clock_() < st.reopen_until and (st.parried or st.landed)
-            and ball_velocity(ball):Dot(root.Position - Core.ball_now(ball)) > 0 then
+            and ballVel(ball):Dot(root.Position - Core.ball_now(ball)) > 0 then
             st.reopen_until = nil
-            open_pass(st); G.until_t = 0
+            Util.openPass(st); G.until_t = 0
         end
         if S.triggerbot then trigger(ball, st, clock_()) else decide(ball, st, root, clock_(), "velocity") end
     end
 
-    -- ===================== per-frame (3 points a frame) =====================
-    -- ===================== proactive capture =====================
-    -- The old method, made safe: with no capture, press block to take one ahead
-    -- of time -- 1s after you can parry, then every 1.4s until it's in, pausing
-    -- 20s after 3 dry presses -- so you're armed before any ball comes to you.
-    -- The press is a real swing that opens the game's 1.3s lockout, so it only
-    -- goes when no ball can reach you inside that lockout (before 0.5.4 it
-    -- pressed regardless, and a ball arriving just after was parried late --
-    -- "animation, no parry"). If a ball is due before a safe moment comes, the
-    -- parry itself is a native press that captures (see fire).
-    local function capture_safe()
+    local function capSafe()
         local root = getRoot()
         if not root then return false end
-        for _, ball in ipairs(get_live_balls()) do
+        for _, ball in ipairs(liveBalls()) do
             if ball:GetAttribute('target') == me then return false end
-            local speed = ball_velocity(ball).Magnitude
-            local d = (ball.Position - root.Position).Magnitude
-            -- could turn to us and land before the lockout's over
+            local speed, d = ballVel(ball).Magnitude, (ball.Position - root.Position).Magnitude
             if d < 20 or (speed > 1 and d / speed < 1.6) then return false end
         end
         return true
     end
-    local function needs_capture()
+    local function needsCap()
         return ((S.autoparry or S.triggerbot) and S.parry_mode ~= "Keypress") or ((SP.manual or SP.auto) and SP.mode ~= "Keypress")
     end
-    local function prime_capture(now)
-        if Core.cap or not needs_capture() then return end
-        if capture_method() == "getgc" then pcall(gc_acquire); return end
-        if not (in_match() or in_lobby_training()) or not canParryNow() then Capture.since = nil; return end
+    local function primeCap(now)
+        if Core.cap or not needsCap() then return end
+        if capMethod() == "getgc" then pcall(Util.gcGet); return end
+        if not (Util.inMatch() or Util.inLobbyTrain()) or not canParryNow() then Capture.since = nil; return end
         Capture.since = Capture.since or now
-        -- Namecall method: the hook stays UP the whole time there's no capture
-        -- (re-armed every frame), so the first real parry you make is caught,
-        -- whatever started it -- it comes down the moment the capture is in, or
-        -- 0.5s after you leave the round. Namecall only (__namecall is
-        -- exploit-side; the FireServer methods are the detectable ones).
-        if capture_method() ~= "getgc" and Capture.mode == "Spam" then
-            -- Spam: the hook stays up and F goes out every 0.1s; the game takes
-            -- the first press its own block cooldown allows, and that's read
-            local was_up = (H.nc or H.fire) ~= nil
-            if arm(0.5) and not was_up then logp(("capture: spamming F until the remote is read (%s hook)"):format(capture_method())) end
+        if capMethod() ~= "getgc" and Capture.mode == "Spam" then
+            local wasUp = (H.nc or H.fire) ~= nil
+            if arm(0.5) and not wasUp then logp(("capture: spamming F until the remote is read (%s hook)"):format(capMethod())) end
             if now - Capture.last_press >= 0.1 then
                 Capture.last_press = now
                 pressBlockKey()
@@ -2957,56 +2235,39 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
             end
             return
         end
-        if capture_method() ~= "getgc" and Capture.mode ~= "Auto press" then
-            -- Your press / Auto parry: hook up until the first real parry --
-            -- yours, or (Auto parry) auto parry's own native press
-            local was_up = (H.nc or H.fire) ~= nil
-            if arm(0.5) and not was_up then
-                logp(("capture: %s hook up until %s"):format(capture_method(),
+        if capMethod() ~= "getgc" and Capture.mode ~= "Auto press" then
+            local wasUp = (H.nc or H.fire) ~= nil
+            if arm(0.5) and not wasUp then
+                logp(("capture: %s hook up until %s"):format(capMethod(),
                     Capture.mode == "Auto parry" and "auto parry's first press" or "your first real parry"))
             end
             return
         end
-        -- Synthetic-press bootstrap ("Auto press" capture mode): when no
-        -- ball is near, a VirtualInputManager Block press goes out and the hook
-        -- reads its packet. Off by default -- synthetic input can be flagged, and
-        -- a press that does not actually parry captures nothing.
         if Capture.mode == "Auto press" then
             if now - Capture.since < 1 or now - Capture.last_press < 1.4 then return end
             if Capture.dry >= 3 then
                 if now - Capture.last_press < 20 then return end
                 Capture.dry = 0
             end
-            if not gate_open() or not capture_safe() then return end
+            if not gateOpen() or not capSafe() then return end
             Capture.last_press = now
-            local window = capture_window()
+            local window = Util.capWin()
             if arm(window) then
-                pressBlockKey(); gate_start()
-                logp(("capture press (%s, %s, hook up <= %.0fms, no ball near)"):format(capture_method(), Core.ctx, window * 1000))
+                pressBlockKey(); gateStart()
+                logp(("capture press (%s, %s, hook up <= %.0fms, no ball near)"):format(capMethod(), Core.ctx, window * 1000))
             end
             return
         end
         if Capture.mode ~= "Incoming ball" then return end
-        -- "Incoming ball": capture the player's OWN real parry. Arm the hook ONLY when a
-        -- ball is actually targeting the player and arriving -- i.e. a real parry
-        -- is genuinely about to happen -- NOT on any nearby ball or screen tap.
-        -- capture_safe() was too loose (any ball within 20 studs, no targeting
-        -- check), so on mobile it armed on taps/passing balls that would never
-        -- parry. parry_imminent() requires target == me and an incoming path, so
-        -- the hook is up only for the fraction of a second the player blocks.
-        -- inspect still accepts only a genuine parry packet; nothing synthetic.
-        -- parry imminent = a ball targeting the player, point blank or arriving
-        -- within reach + the window (inlined; the outer scope is at its local cap)
         local imminent = false
         do
             local root = getRoot()
             if root then
-                local horizon = reach_time() + (parry_window() or 0.5)
-                for _, ball in ipairs(get_live_balls()) do
+                local horizon = reachT() + (parryWin() or 0.5)
+                for _, ball in ipairs(liveBalls()) do
                     if ball:GetAttribute('target') == me then
-                        local vel = ball_velocity(ball)
-                        local speed = vel.Magnitude
-                        local off = root.Position - ball.Position
+                        local vel = ballVel(ball)
+                        local speed, off = vel.Magnitude, root.Position - ball.Position
                         local d = off.Magnitude
                         if d <= 18 or (speed > 1 and d > 0.01 and (vel / speed):Dot(off / d) > 0 and d / speed <= horizon) then
                             imminent = true; break
@@ -3018,26 +2279,12 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         if not imminent then return end
         if now - Capture.last_press < 0.3 then return end
         Capture.last_press = now
-        -- short window = less time the hook is up; tune with getgenv().CaptureWindow
         if arm(math.clamp(tonumber(getgenv().CaptureWindow) or 0.4, 0.12, 1.5)) and now - (Capture.notified or 0) > 5 then
             Capture.notified = now
-            logp("capture: block this ball yourself -- the hook reads that one real parry, then auto-forge takes over (" .. capture_method() .. ")")
+            logp("capture: block this ball yourself -- the hook reads that one real parry, then auto-forge takes over (" .. capMethod() .. ")")
         end
     end
 
-    -- "Your press" capture (default). The hook goes up ONLY for an input the game
-    -- itself turns into a parry -- the same test its own handler uses
-    -- (SwordsController: `if not gameProcessed and UseBind(input, "Block") then
-    -- parry() end`, Bbs dump):
-    --   * keyboard / mouse / controller: one of your Block binds (game defaults
-    --     F, left click, R1; a rebound key is learned from your own real block
-    --     swings) and NOT swallowed by a GUI -- so opening a menu, clicking UI,
-    --     typing or emoting never puts it up;
-    --   * touch: only a press that lands on the game's Block button (tap-to-block
-    --     in the world is ignored). That button parries on release, so the hook
-    --     is already up when the packet goes.
-    -- And you must be able to parry right now (alive / training / lobby zone).
-    -- Nothing synthetic; inspect still only accepts a genuine parry packet.
     Capture.binds = { F = true, MouseButton1 = true, ButtonR1 = true }
     Capture.learn = {}
     function Capture.on_block_button(pos)
@@ -3055,12 +2302,11 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         return false
     end
     function Parry.onInput(input, processed)
-        if not is_live() then return end
+        if not isLive() then return end
         local t, k = input.UserInputType, input.KeyCode
-        local touch = t == Enum.UserInputType.Touch
-        local name = (k ~= Enum.KeyCode.Unknown) and k.Name or t.Name
+        local touch, name = t == Enum.UserInputType.Touch, (k ~= Enum.KeyCode.Unknown) and k.Name or t.Name
         if not touch and not processed then Capture.last_in, Capture.last_in_at = name, clock_() end
-        if Core.cap or Capture.mode ~= "Your press" or not needs_capture() then return end
+        if Core.cap or Capture.mode ~= "Your press" or not needsCap() then return end
         local block
         if touch then
             local ok, hit = pcall(Capture.on_block_button, input.Position)
@@ -3074,12 +2320,9 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         Capture.last_press = now
         if arm(touch and 0.8 or 0.3) and now - (Capture.notified or 0) > 5 then
             Capture.notified = now
-            logp("capture: reading your block press (" .. capture_method() .. ")")
+            logp("capture: reading your block press (" .. capMethod() .. ")")
         end
     end
-    -- A real block swing just played (seen on the animator, no hooks): the
-    -- unprocessed key pressed right before it is a Block bind. Learned after two
-    -- swings on the same key, so a stray key can't sneak in.
     function Parry.learnBind()
         local n, at = Capture.last_in, Capture.last_in_at or -math.huge
         if not n or Capture.binds[n] or clock_() - at > 0.2 then return end
@@ -3090,12 +2333,7 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         end
     end
 
-    -- Why a parry went unanswered. Our parry reaches the server about half a
-    -- round trip after we fire, and the server's ball is about half a round trip
-    -- ahead of the one we see, so (in what we see) the parry is up from about
-    -- `ping` after the fire for `W`. Where the ball's closest approach fell
-    -- against that says early / late / on time.
-    local function miss_verdict(w)
+    function Util.missVerdict(w)
         if not w then return "parry unanswered (no ball watched)" end
         local head = ("parry unanswered [%s]: fired at %.0f studs"):format(tostring(w.how), w.d0)
         if w.min_d == math.huge then return head .. " -- ball gone before it got near" end
@@ -3115,40 +2353,27 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
     end
 
     function Parry.frame(dt, point)
-        if not active or not is_live() then return end
+        if not active or not isLive() then return end
         local now = clock_()
         if point == 1 then
-            if dt then frame_dt = math.clamp(dt, 1 / 240, 0.1) end
+            if dt then frameDt = math.clamp(dt, 1 / 240, 0.1) end
             Core.fid = (Core.fid or 0) + 1
             Pump.frame = Pump.frame + 1
-            -- ONE capture serves lobby training and matches (0.5.100): both go
-            -- through the same PRY sender -- same remote, hash, uid and key, and
-            -- the same packet shape (training only changes the target list,
-            -- which packet_parts builds per parry). Until then each place kept
-            -- its own and you had to parry once in each. A capture that does go
-            -- stale is still caught by the hash check / miss counter in send.
-            local ctx = in_lobby_training() and "training" or "match"
+            local ctx = Util.inLobbyTrain() and "training" or "match"
             if ctx ~= Core.ctx then
-                -- dying in training ends it before the parry's answer deadline:
-                -- say why it missed first (until 0.5.11 it was dropped silently,
-                -- so no training death ever got a verdict)
-                if Core.pending then logp(miss_verdict(Core.watch) .. " [round ended]") end
+                if Core.pending then logp(Util.missVerdict(Core.watch) .. " [round ended]") end
                 Core.ctx = ctx
                 Core.misses, Core.pending, Core.watch = 0, nil, nil
             end
-            -- the server's answer to the last single remote parry (Parry.onAttempt)
             local aw = Core.await
             if aw then
                 local E = Core.echo
-                -- not checkable: answers never seen for remote parries, another
-                -- capture since, spam around it or a parry just before it (the
-                -- server may still be in its own cooldown and answer nothing)
                 local fair = E.forged_ok and aw.cap == Core.cap and aw.t - aw.spam_at > 1.5
                     and Core.last_spam_at <= aw.spam_at and (aw.gap or math.huge) > 1.45
                 if not fair then
                     if now - aw.t > 1 then Core.await = nil end
                 else
-                    local limit = math.max((E.rtt or ping_s()) * 2 + 0.03, ping_s() * 1.5 + jitter() * 2 + frame_dt * 2 + 0.06)
+                    local limit = math.max((E.rtt or pingS()) * 2 + 0.03, pingS() * 1.5 + jitter() * 2 + frameDt * 2 + 0.06)
                     if now - aw.t > limit then
                         Core.await = nil
                         Core.refused(aw, now, now - aw.t)
@@ -3166,23 +2391,18 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
             if Core.pending and now > Core.pending then
                 Core.pending, Core.misses = nil, Core.misses + 1
                 Core.verdict = nil
-                logp(miss_verdict(Core.watch))
-                do -- timing diagnostics: which way it missed
+                logp(Util.missVerdict(Core.watch))
+                do
                     local D = Core.diag
                     if Core.verdict then
                         if Core.verdict > 0 then D.late = D.late + 1 else D.early = D.early + 1 end
                     elseif Core.watch and Core.watch.min_d <= 15 then D.ontime = D.ontime + 1 end
                 end
-                -- a capture carried onto a new hash that the server won't answer
                 if Core.cap and Core.cap.adopted and Core.misses >= 2 then
                     Core.cap = nil
                     logp("capture: two parries unanswered on the carried-over hash -- dropped, parry once to recapture")
                 end
-                if DBG.on then DBG.ev("MISS: " .. miss_verdict(Core.watch):gsub("\n.*", "")) end
-                -- Self-tune (toggle): an EARLY / LATE miss moves the fire time a
-                -- little the other way -- half the miss, at most 15ms a step,
-                -- capped at +/-40ms; landed parries ease it back toward 0. Two-way
-                -- and bounded, unlike the 0.5.8 drift (one-way, uncapped).
+                if DBG.on then DBG.ev("MISS: " .. Util.missVerdict(Core.watch):gsub("\n.*", "")) end
                 if S.self_tune and Core.verdict then
                     Core.tune = math.clamp(Core.tune + math.clamp(Core.verdict * 0.5, -0.015, 0.015), -0.04, 0.04)
                     logp(("  self-tune: now firing %+.0fms"):format(Core.tune * 1000))
@@ -3197,22 +2417,18 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
                     logp("  the next parry is a native press that refreshes the capture")
                 end
             end
-            if not Core.cap then prime_capture(now) end
-            auto_spam_evaluate(now)
+            if not Core.cap then primeCap(now) end
+            spamEval(now)
             local act = now < AutoSpam.active_until
-            if act and not AutoSpam.was_active and not SP.manual then spam_instant() end
+            if act and not AutoSpam.was_active and not SP.manual then spamInstant() end
             AutoSpam.was_active = act
         end
         if S.autoparry or S.triggerbot then
-            local root = ap_root()
+            local root = apRoot()
             if root then
-                -- SEVERAL BALLS (0.5.115): the ones on us are taken soonest
-                -- first (straight time to us), not in folder order -- one parry
-                -- at a time can go out, and it went to whichever ball the
-                -- folder listed first, even when another was about to land.
                 local mine
-                for _, ball in ipairs(get_live_balls()) do
-                    local st = get_ball_state(ball)
+                for _, ball in ipairs(liveBalls()) do
+                    local st = ballState(ball)
                     if st.target == me then
                         if not mine then mine = { ball, st }
                         else
@@ -3220,7 +2436,7 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
                             mine.list[#mine.list + 1] = { ball = ball, st = st }
                         end
                     else
-                        try_preparry(ball, st, root, now)
+                        tryPreparry(ball, st, root, now)
                     end
                 end
                 if mine and not mine.list then
@@ -3228,7 +2444,7 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
                 elseif mine then
                     local rp = root.Position
                     for _, e in ipairs(mine.list) do
-                        e.eta = (Core.ball_now(e.ball) - rp).Magnitude / math.max(ball_velocity(e.ball).Magnitude, 1)
+                        e.eta = (Core.ball_now(e.ball) - rp).Magnitude / math.max(ballVel(e.ball).Magnitude, 1)
                     end
                     table.sort(mine.list, function(x, y) return x.eta < y.eta end)
                     for _, e in ipairs(mine.list) do
@@ -3237,19 +2453,11 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
                 end
             end
         elseif SP.auto or SP.manual then
-            for _, ball in ipairs(get_live_balls()) do get_ball_state(ball) end
+            for _, ball in ipairs(liveBalls()) do ballState(ball) end
         end
-        spam_tick(now, point)
+        spamTick(now, point)
     end
 
-    -- The game's BallReplicationHandler (Bbs dump) listens on an unreliable
-    -- remote, net "ReplicateBallPosition" (hashed name), that carries
-    -- (ball, server position) straight from the server -- no Roblox physics
-    -- interpolation buffer in between, which is what Core.interp pays for.
-    -- Measured in a live match (0.5.77): ~17 msgs/s with Lag-Ball OFF, 76-97ms
-    -- ahead of the physics ball. decide() parries on it: the latest server
-    -- position carried forward by the ball's velocity since it arrived, with
-    -- that measured lead taken off Core.interp (see feed_view). Logged every 30s.
     function Parry.onBallFeed(ball, p)
         if typeof(ball) ~= "Instance" or not ball:IsA("BasePart") then return end
         if typeof(p) == "CFrame" then p = p.Position end
@@ -3259,21 +2467,20 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         F.n, F.total = F.n + 1, F.total + 1
         DBG.counts.feed = DBG.counts.feed + 1
         F.pos[ball], F.at[ball] = p, now
-        local v = ball_velocity(ball)
+        local v = ballVel(ball)
         local sp = v.Magnitude
         if sp > 20 then
             local ahead = (p - ball.Position):Dot(v / sp) / sp
             if math.abs(ahead) < 0.5 then F.ahead = F.ahead and (F.ahead * 0.9 + ahead * 0.1) or ahead end
         end
-        -- new server data on a ball coming at us: decide now, not at the next frame point
         if active and SP.method == "On ball" then
             local st = tracked[ball]
-            if st and st.target == me then spam_instant() end
+            if st and st.target == me then spamInstant() end
         end
         if active and (S.autoparry or S.triggerbot) then
             local st = tracked[ball]
             if st and st.target == me then
-                local root = ap_root()
+                local root = apRoot()
                 if root then
                     if S.triggerbot then trigger(ball, st, now) else decide(ball, st, root, now, "feed") end
                 end
@@ -3293,8 +2500,8 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
     function Parry.onBallAdded(ball)
         task.defer(function()
             if not active or not ball.Parent or not ball:GetAttribute('realBall') then return end
-            local st = get_ball_state(ball)
-            if st.target == me then on_retarget(ball, st, me, clock_()) end
+            local st = ballState(ball)
+            if st.target == me then onRetarget(ball, st, me, clock_()) end
         end)
     end
     function Parry.ballFolders()
@@ -3305,17 +2512,6 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         end
         return list
     end
-    -- THE SERVER'S ATTEMPT ANSWER (0.5.115). For every parry attempt it takes,
-    -- the server sends ParryAttempt to that player and ParryAttemptAll(part,
-    -- character) to everyone (ClientFX welds the swing effect to the torso,
-    -- Bbs/Training dump). A forged parry the server REFUSES -- a bad key, a
-    -- dead uid -- gets no answer. So after each single remote parry we wait
-    -- about one round trip for it (Parry.frame): no answer = the capture is bad,
-    -- known one parry in instead of after two deaths.
-    --   * Only trusted once an answer to a REMOTE parry has been seen at all
-    --     (remembered in BladeBall/echo.txt): if the server ever stops
-    --     answering forged parries, nothing here changes how it plays.
-    --   * It also gives the real round trip of our parries (Lag.echo).
     pcall(function()
         if isfile and isfile("BladeBall/echo.txt") and readfile("BladeBall/echo.txt") == "1" then Core.echo.forged_ok = true end
     end)
@@ -3327,8 +2523,7 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         if not aw then return end
         Core.await = nil
         local rtt = now - aw.t
-        -- only an answer inside a plausible round trip is THIS parry's
-        if rtt < 0 or rtt > ping_s() * 2.5 + 0.12 then return end
+        if rtt < 0 or rtt > pingS() * 2.5 + 0.12 then return end
         E.rtt = E.rtt and (E.rtt * 0.7 + rtt * 0.3) or rtt
         Lag.echo = E.rtt
         if aw.cap then aw.cap.taken, aw.cap.refused_row = (aw.cap.taken or 0) + 1, 0 end
@@ -3341,14 +2536,6 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
             end)
         end
     end
-    -- A single remote parry the server didn't answer. In order:
-    --   1. the capture's SECOND KEY, once (see learn)
-    --   2. two unanswered in a row: the capture is dropped -- the hook goes back
-    --      up for your next real parry (or the auto capture mode takes one)
-    -- and, either way, THIS pass is reopened (the server never saw that parry,
-    -- so it started no cooldown) and with Rescue press on it's parried by a
-    -- native F press at its normal moment -- a real parry, which also takes
-    -- the fresh capture when the old one was dropped.
     function Core.refused(aw, now, waited)
         local cap, D = aw.cap, Core.diag
         D.refused = D.refused + 1
@@ -3360,11 +2547,9 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
             if Core.cap == cap then
                 local never = (cap.taken or 0) == 0 and (cap.landed or 0) == 0
                 if never and cap.alt_key and not cap.alt_tried then
-                    -- never taken: its key may be the off-by-a-tick one
                     cap.key, cap.alt_key, cap.alt_tried, cap.refused_row = cap.alt_key, cap.key, true, 0
                     logp("  trying this capture's second key (the sender's clock ticked before the hook read it)")
                 elseif never or cap.refused_row >= 2 then
-                    -- never worked on either key, or a working one refused twice running
                     Core.cap, Core.misses = nil, 0
                     logp("  capture dropped: the server isn't taking it -- parry once to take a fresh one")
                     if Parry.onCaptureBad then task.defer(pcall, Parry.onCaptureBad) end
@@ -3376,11 +2561,10 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
             st.parried, st.parry_until = false, 0
             G.until_t, Core.pending, Core.watch = 0, nil, nil
             if S.rescue_press then st.rescue = true end
-            local root = ap_root()
+            local root = apRoot()
             if root and S.autoparry and not S.triggerbot then decide(ball, st, root, now, "not taken") end
         end
     end
-    -- Timing diagnostics (Debug tab / overlay / log)
     function Parry.timingLines()
         local D, E, L = Core.diag, Core.echo, {}
         L[#L + 1] = ("parries: %d fired, %d landed, %d early, %d late, %d on time but not counted, %d not taken, %d rescued"):format(
@@ -3393,7 +2577,7 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
             L[#L + 1] = "prediction: no landed parries measured yet"
         end
         L[#L + 1] = ("latency: ping %.0fms (median of 3s), jitter %.0fms, reach %.0fms, parry round trip %s"):format(
-            (Lag.avg or 0) * 1000, jitter() * 1000, reach_time() * 1000, E.rtt and ("%.0fms"):format(E.rtt * 1000) or "not measured")
+            (Lag.avg or 0) * 1000, jitter() * 1000, reachT() * 1000, E.rtt and ("%.0fms"):format(E.rtt * 1000) or "not measured")
         local cap = Core.cap
         L[#L + 1] = cap and ("capture #%d: %d taken, %d refused%s%s"):format(cap.id or 0, cap.taken or 0, cap.refused or 0,
                 cap.alt_tried and ", on its second key" or "", E.forged_ok and "" or " (server answers not seen yet: can't be checked)")
@@ -3407,16 +2591,12 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         if not (char and char:IsDescendantOf(Workspace)) then return end
         G.until_t = 0
         local w = Core.watch
-        Core.await = nil -- landed: it was taken
+        Core.await = nil
         local D = Core.diag
         D.landed = D.landed + 1
         if Core.pending and w then
             if w.cap then w.cap.landed = (w.cap.landed or 0) + 1 end
-            local took = clock_() - w.t
-            local note = ""
-            -- prediction check: this message leaves the server at contact and
-            -- takes half a round trip back, so the ball landed (took - ping/2)
-            -- after the fire; predicted was eta. + = it came later than predicted.
+            local took, note = clock_() - w.t, ""
             if w.eta and w.eta < 5 then
                 local err = took - w.ping * 0.5 - w.eta
                 if math.abs(err) < 0.5 then
@@ -3429,49 +2609,30 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
             logp(("  -> landed %.2fs after the parry (fired at %.0f studs%s)"):format(took, w.d0, note))
             if D.landed % 10 == 0 then for _, l in ipairs(Parry.timingLines()) do logp("  [timing] " .. l) end end
         end
-        local fired_ball = w and w.ball
+        local firedBall = w and w.ball
         Core.watch = nil
-        -- Core.interp stays fixed. Until 0.5.8 every landed remote parry nudged it
-        -- by (predicted eta - time until this event). The event comes back about
-        -- one round trip after the send, not at contact, so each hit pushed it up
-        -- (0.14 -> 0.30 in ~5 hits), and a missed parry never pulled it back down.
-        -- Every parry fired a little earlier than the one before; once the ball
-        -- was fast, it went ~75 studs early: "animation, no parry after a few
-        -- hits", on every mode.
         Core.pending, Core.misses = nil, 0
         Core.tune = Core.tune * 0.9
-        -- only a pass WE fired on is landed. Until 0.5.85 this marked any pass on
-        -- us -- and in a fast exchange the ball is already back on us when our
-        -- ParrySuccess arrives, so the NEW incoming pass was marked landed and
-        -- auto parry never fired on it: "ball hit back to me from close, no parry".
-        -- 0.5.115, several balls: the pass that landed is the one we fired on
-        -- (it marked EVERY fired pass on us, so with two balls the second
-        -- read as landed too and was left to hit) -- and the others on us are
-        -- decided right now: the lockout just reset, no waiting for a frame.
-        local fst = fired_ball and tracked[fired_ball]
+        local fst = firedBall and tracked[firedBall]
         if fst and fst.target == me and fst.pass_open and fst.parried then
             fst.landed = true
         else
             for _, st in pairs(tracked) do if st.target == me and st.pass_open and st.parried then st.landed = true end end
         end
-        spam_instant()
+        spamInstant()
         if S.autoparry and not S.triggerbot then
-            local root = ap_root()
+            local root = apRoot()
             if root then
                 local now = clock_()
                 for ball, st in pairs(tracked) do
-                    if ball ~= fired_ball and st.target == me and ball.Parent and not st.landed then
+                    if ball ~= firedBall and st.target == me and ball.Parent and not st.landed then
                         decide(ball, st, root, now, "after a landed parry")
                     end
                 end
             end
         end
     end
-    -- ParrySuccessAll(fxName, fxParent, sword, player, ...) (Bbs dump,
-    -- parrySuccessAll). Until 0.5.87 "who" was the first Instance -- fxParent,
-    -- a part -- so it was never the player. Now: the Player argument, else the
-    -- player whose character holds an Instance argument.
-    local function parry_all_who(...)
+    function Util.parryAllWho(...)
         local n = select('#', ...)
         for i = 1, n do
             local a = select(i, ...)
@@ -3489,61 +2650,38 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         return nil
     end
     function Parry.onParryAll(...)
-        local who = parry_all_who(...)
-        local now = clock_()
-        parry_all[#parry_all + 1] = { t = now, who = who }
-        if #parry_all > 16 then table.remove(parry_all, 1) end
-        -- SOMEONE ELSE parried. In a fast exchange the server sends the ball to
-        -- them and back to us inside one replication step, so the target
-        -- attribute we see never leaves us -- our pass stayed "parried / landed"
-        -- and auto parry + triggerbot sat out the game's 1.3s lockout on the
-        -- return. Their parry is proof the last pass ended: open a new one and
-        -- decide on it right now.
+        local who, now = Util.parryAllWho(...), clock_()
+        parryAll[#parryAll + 1] = { t = now, who = who }
+        if #parryAll > 16 then table.remove(parryAll, 1) end
         if who and who ~= me and active then
-            local reopened = false
-            local r = getRoot()
-            local their = character_root(who)
+            local reopened, r, their = false, getRoot(), charRoot(who)
             for ball, st in pairs(tracked) do
-                -- only THIS ball's exchange counts (0.5.100): our parry has
-                -- landed, or the one who parried is right at the ball. Before,
-                -- ANY player's parry anywhere on the map reopened a pass we'd
-                -- fired on but that hadn't landed yet -- a ball still on its way
-                -- in -- and auto parry fired on it a second time: the double
-                -- parry. (Their hit back lands inside clash range, plus the
-                -- ball's travel while the message was on its way.)
                 local near = false
                 if their and ball.Parent then
-                    local spd = ball_velocity(ball).Magnitude
-                    near = (their.Position - Core.ball_now(ball)).Magnitude <= clash_range(spd) + spd * (ping_s() + 0.1)
+                    local spd = ballVel(ball).Magnitude
+                    near = (their.Position - Core.ball_now(ball)).Magnitude <= Util.clashRange(spd) + spd * (pingS() + 0.1)
                 end
-                -- only a ball coming back at us (multi-ball: one we just sent
-                -- away, still flying off, stays as it is)
                 if r and st.target == me and (st.landed or (st.parried and near)) and ball.Parent then
-                    if ball_velocity(ball):Dot(r.Position - Core.ball_now(ball)) > 0 then
-                        open_pass(st); reopened = true
+                    if ballVel(ball):Dot(r.Position - Core.ball_now(ball)) > 0 then
+                        Util.openPass(st); reopened = true
                     else
-                        -- its new velocity isn't in yet: reopen on the update
                         st.reopen_until = now + 0.5
                     end
                 end
             end
             if reopened then G.until_t = 0 end
             DBG.ev(("parry by %s%s"):format(who, reopened and "  -> ball coming back: new pass opened" or ""))
-            -- Fast retarget, 1v1: with only us and them alive, THEIR parry means
-            -- the ball is coming to us -- known now, not when the target
-            -- attribute lands. Treated as the retarget (same fire-only-if-it-
-            -- should rules); the attribute arriving later finds the pass open.
-            if S.fast_retarget and S.autoparry and not S.triggerbot and in_match() then
+            if S.fast_retarget and S.autoparry and not S.triggerbot and Util.inMatch() then
                 local alive = 0
                 for _, m in ipairs(Alive:GetChildren()) do
                     if m:FindFirstChildOfClass("Humanoid") then alive = alive + 1 end
                 end
                 if alive == 2 then
-                    local root = ap_root()
+                    local root = apRoot()
                     if root then
                         for ball, st in pairs(tracked) do
                             if st.target == who and ball.Parent then
-                                if not st.pass_open then open_pass(st) end
+                                if not st.pass_open then Util.openPass(st) end
                                 DBG.ev(("1v1: %s parried -- taken as the retarget to you"):format(who))
                                 Core.fast_retarget(ball, st, root, now)
                             end
@@ -3552,7 +2690,7 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
                 end
             end
             if S.autoparry or S.triggerbot then
-                local root = ap_root()
+                local root = apRoot()
                 if root then
                     for ball, st in pairs(tracked) do
                         if st.target == me and ball.Parent then
@@ -3562,7 +2700,7 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
                 end
             end
         end
-        if AutoSpam.ball or SP.manual then spam_instant() end
+        if AutoSpam.ball or SP.manual then spamInstant() end
     end
     function Parry.onNoobParry() task.wait(0.11); G.until_t = 0 end
     function Parry.onM1Stop(v) G.m1, G.m1_at = v and true or false, clock_() end
@@ -3574,20 +2712,20 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         if span >= 1 then R.vel, R.feed = c.vel / span, c.feed / span; c.vel, c.feed, c.since = 0, 0, now end
         local L = {}
         L[#L + 1] = ("ping %.0fms (avg %.0f)  jitter %.0fms  reach %.0fms"):format(pingMs(), (Lag.avg or 0) * 1000,
-            jitter() * 1000, reach_time() * 1000)
+            jitter() * 1000, reachT() * 1000)
         local F = Core.feed
         L[#L + 1] = ("server feed %.0f/s (ahead %s)  velocity updates %.0f/s"):format(R.feed,
             F.ahead and ("%.0fms"):format(F.ahead * 1000) or "-", R.vel)
         local cap = Core.cap
         L[#L + 1] = cap and ("capture: yes, %s"):format(cap.verified and "real hash confirmed" or "hash not confirmed")
             or ("capture: none (hook %s)"):format(Parry.hookState())
-        L[#L + 1] = gate_open() and "parry gate: open" or ("parry gate: locked %.2fs"):format(math.max(G.until_t - now, 0))
-        local on_me
-        for _, b in ipairs(get_live_balls()) do
+        L[#L + 1] = gateOpen() and "parry gate: open" or ("parry gate: locked %.2fs"):format(math.max(G.until_t - now, 0))
+        local onMe
+        for _, b in ipairs(liveBalls()) do
             local st = tracked[b]
-            if st and st.target == me then on_me = st; break end
+            if st and st.target == me then onMe = st; break end
         end
-        L[#L + 1] = on_me and ("ball ON YOU, pass: %s"):format(on_me.landed and "landed" or (on_me.parried and "fired" or "open"))
+        L[#L + 1] = onMe and ("ball ON YOU, pass: %s"):format(onMe.landed and "landed" or (onMe.parried and "fired" or "open"))
             or "no ball on you"
         local e = DBG.eval
         if e.t and now - e.t < 1.5 then
@@ -3603,8 +2741,7 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         return L
     end
     function Parry.status()
-        local lp = Core.last_parry
-        local last = "none"
+        local lp, last = Core.last_parry, "none"
         if lp then
             last = ("%s, %.1fs ago"):format(lp.via or "?", clock_() - lp.t)
             if lp.info and lp.info.eta then last = last .. (" (eta %.2fs / lead %.2fs)"):format(math.min(lp.info.eta, 9.99), lp.info.lead or 0) end
@@ -3621,12 +2758,11 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
                 or (Capture.mode == "Your press" and "NO -- parry once yourself" or "NO -- taking one at the next chance"),
             last = last, clash = clash, manual = manual, rate = SpamMeter.rate, ping = pingMs(),
             target = SP.rate_now(clock_()), speed_mode = SP.speed_mode,
-            curve = S.random_curve and "Random each parry" or (CURVE_NAMES[S.curve_mode] or "?"),
-            detect = blocked_by_detection() and "PAUSED (ability detected)" or "clear",
+            curve = S.random_curve and "Random each parry" or (Util.CURVE_NAMES[S.curve_mode] or "?"),
+            detect = blocked() and "PAUSED (ability detected)" or "clear",
         }
     end
 
-    -- ---------- resolve / activate / deactivate ----------
     function Parry.resolve()
         Alive = Alive or Workspace:FindFirstChild("Alive") or Workspace:WaitForChild("Alive", 5)
         Remotes = Remotes or ReplicatedStorage:FindFirstChild("Remotes") or ReplicatedStorage:WaitForChild("Remotes", 5)
@@ -3649,65 +2785,42 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
     function Parry.deactivate()
         active = false
         pcall(unhook)
-        for _, c in ipairs(ball_conns) do pcall(function() c:Disconnect() end) end
-        ball_conns = {}
+        for _, c in ipairs(ballConns) do pcall(function() c:Disconnect() end) end
+        ballConns = {}
         for k in pairs(tracked) do tracked[k] = nil end
-        end_clash("engine off")
+        Util.endClash("engine off")
         Pump.credit, Pump.on, Pump.waiting = 0, false, false
-        if Core.pending then pcall(function() logp(miss_verdict(Core.watch) .. " [engine stopped]") end) end
+        if Core.pending then pcall(function() logp(Util.missVerdict(Core.watch) .. " [engine stopped]") end) end
         Core.pending, Core.misses, Core.watch = nil, 0, nil
         G.until_t, Capture.dry, Capture.since = 0, 0, nil
     end
-    -- one parry outside the engine (Slashes of Fury): remote if armed, else a
-    -- native press that also captures
     function Parry.spamParry()
         if not Parry.resolve() then return false end
-        -- both modes on Keypress: a plain press, never a hook
         if S.parry_mode == "Keypress" and SP.mode == "Keypress" then return pressBlockKey() end
         if Core.cap and send(true) == "sent" then Anim.spamBlock(); return true end
-        return key_parry(Core.cap == nil)
+        return keyParry(Core.cap == nil)
     end
-    -- REHOOK: throw the capture away (this place's and the other's) and take a
-    -- fresh one at the next safe moment -- no 1s settle, no 1.4s spacing, no dry
-    -- backoff -- with the hook picked in Capture hook (or on the next parry, if a
-    -- ball comes first).
     function Parry.rehook()
         pcall(unhook)
         Core.cap, Core.pending, Core.misses = nil, nil, 0
-        tok_cache.cap = nil
+        tokCache.cap = nil
         Capture.dry, Capture.last_press = 0, -math.huge
         Capture.since = canParryNow() and (clock_() - 1) or nil
-        logp("rehook: capture dropped -- taking a fresh one at the next safe moment (" .. capture_method() .. ")")
+        logp("rehook: capture dropped -- taking a fresh one at the next safe moment (" .. capMethod() .. ")")
         return active
     end
-    -- The game started a block swing. If it came from a real press of yours, its
-    -- lockout is running and a remote parry now would only play the swing -- so
-    -- start our gate. Swings within 0.5s of a send of ours are the game showing
-    -- OUR parry (spam included) and are ignored: read as presses, they used to
-    -- close the gate for 1.4s after a clash and make auto parry fire late.
     function Parry.gameSwing()
         if clock_() - Core.last_send_at < 0.5 then return end
-        gate_start()
+        gateStart()
     end
     function Parry.remotes() return Remotes end
     function Parry.spamRate() return SpamMeter.rate end
     function Parry.isMe(name) return name == me end
 end
 
--- ===========================================================================
--- ENGINE: owner of every parry/spam connection.
--- ===========================================================================
 local Library
 local StatusHook, UiTick
 
--- Log file: workspace/BladeBall/rewrite_log.txt. Everything the parry log shows
--- plus engine wake/sleep, hook state and the kick message, so after a kick the
--- last lines say exactly what the script was doing. Written by the executor;
--- the game can't see it. Until 0.5.9 the kick listener only existed while a
--- parry/spam feature was on, so a kick with everything off (on load) wrote
--- nothing at all. Now it's there from load, and the kick line carries how long
--- after load it came, every feature that was on, and whether / how long ago the
--- capture hook was up -- one kick tells "detected by load" from "by the hook".
 local Flight = { path = "BladeBall/rewrite_log.txt", started = false }
 function Flight.write(line)
     pcall(function()
@@ -3720,12 +2833,12 @@ function Flight.write(line)
     end)
 end
 Parry.onLog = Flight.write
-feature_log = Flight.write
+featureLog = Flight.write
 
 local Engine = { users = {}, conns = {}, watch = {}, running = false, armed = false, status_at = 0, tick_at = 0, sleep_tok = nil }
 local function econnect(signal, fn)
     local c = signal:Connect(function(...)
-        if not is_live() then return end
+        if not isLive() then return end
         fn(...)
     end)
     Engine.conns[#Engine.conns + 1] = c
@@ -3735,19 +2848,16 @@ function Engine.start()
         if Library then Library:Notify({ Title = "Blade Ball", Description = "Couldn't find the game's Remotes / Alive.", Time = 4 }) end
         return false
     end
-    Engine.running = true -- before anything below that may run synchronously
+    Engine.running = true
     local R = Parry.remotes()
     pcall(function() econnect(R.ParrySuccess.OnClientEvent, Parry.onParrySuccess) end)
     pcall(function() econnect(R.ParrySuccessAll.OnClientEvent, Parry.onParryAll) end)
-    -- the server's answer to a parry attempt: ours alone, and everyone's with the character
     pcall(function() econnect(R.ParryAttempt.OnClientEvent, function() Parry.onAttempt(nil) end) end)
     pcall(function() econnect(R.ParryAttemptAll.OnClientEvent, function(_, char) if char ~= nil then Parry.onAttempt(char) end end) end)
     pcall(function() econnect(R.NoobParryHappened.OnClientEvent, Parry.onNoobParry) end)
     pcall(function() econnect(R.M1Stop.Event, Parry.onM1Stop) end)
     econnect(UserInputService.InputBegan, Parry.onInput)
     for _, folder in ipairs(Parry.ballFolders()) do econnect(folder.ChildAdded, Parry.onBallAdded) end
-    -- server ball feed probe (see Parry.onBallFeed): every unreliable remote in
-    -- the game's Net folder; the handler ignores anything that isn't (ball, pos)
     pcall(function()
         local idx = ReplicatedStorage:FindFirstChild("Packages") and ReplicatedStorage.Packages:FindFirstChild("_Index")
         local pkg = idx and idx:FindFirstChild("sleitnick_net@0.1.0")
@@ -3760,9 +2870,7 @@ function Engine.start()
         Parry.feedUrs(n)
         task.delay(20, function() if Engine.running then pcall(Parry.feedCheck) end end)
     end)
-    -- the game's own block swings (your presses, capture presses) start its
-    -- lockout; seen on the animator, no hooks
-    local function watch_animator(char)
+    local function watchAnimator(char)
         task.spawn(function()
             local hum = char:WaitForChild("Humanoid", 10)
             local animator = hum and hum:WaitForChild("Animator", 10)
@@ -3772,13 +2880,9 @@ function Engine.start()
             end)
         end)
     end
-    if LocalPlayer.Character then watch_animator(LocalPlayer.Character) end
-    econnect(LocalPlayer.CharacterAdded, function(char) Anim.reset(); watch_animator(char) end)
+    if LocalPlayer.Character then watchAnimator(LocalPlayer.Character) end
+    econnect(LocalPlayer.CharacterAdded, function(char) Anim.reset(); watchAnimator(char) end)
     econnect(RunService.PreSimulation, function(dt) Parry.frame(dt, 1) end)
-    -- decide at every phase of the frame: PreAnimation, PreSimulation
-    -- (replicated ball data has just landed), PostSimulation (after physics) and
-    -- PreRender (what's about to be drawn) -- four checks a frame, plus the
-    -- instant one on each velocity update
     pcall(function() econnect(RunService.PostSimulation, function() Parry.frame(nil, 2) end) end)
     pcall(function() econnect(RunService.PreAnimation, function() Parry.frame(nil, 4) end) end)
     econnect(RunService.Heartbeat, function()
@@ -3799,15 +2903,7 @@ function Engine.stop()
     if StatusHook then pcall(StatusHook, nil, Engine.armed) end
 end
 
--- SLEEP OUTSIDE A ROUND. With a parry/spam feature on, the engine above runs
--- only while there's something to parry: you're in a round (your character
--- under Workspace.Alive), in lobby training, or in lobby parry. Anywhere else --
--- just standing in the lobby -- it sleeps: no per-frame loops, no game-remote
--- listeners, no polling; only these event watchers, which wake it the moment
--- you join a round, start training or lobby parry. Before 0.5.6 it ran in the
--- lobby exactly as in a round (3 per-frame loops, 4 remote listeners, Stats
--- reads), which is the footprint the old script's idle kicks had.
-local function in_play()
+local function inPlay()
     local char = LocalPlayer.Character
     if not char or not char.Parent then return false end
     local alive = Workspace:FindFirstChild("Alive")
@@ -3819,16 +2915,12 @@ local function in_play()
     end
     return false
 end
-Stagger.round_check = in_play
+Stagger.round_check = inPlay
 do
-    -- Re-apply round-only features when you enter / leave a round. POLLED (a
-    -- plain loop, no game-signal listener): listeners on game signals attached
-    -- in the lobby are what BAC kicks on (reason 24) -- the original's fix was
-    -- to drive this from a poll too.
     task.spawn(function()
         local last = nil
-        while is_live() do
-            local inr = in_play()
+        while isLive() do
+            local inr = inPlay()
             if inr ~= last then
                 last = inr
                 for _, f in pairs(Features) do
@@ -3841,26 +2933,25 @@ do
 end
 local function wconnect(signal, fn)
     local c = signal:Connect(function(...)
-        if not is_live() then return end
+        if not isLive() then return end
         fn(...)
     end)
     Engine.watch[#Engine.watch + 1] = c
 end
 local function reevaluate()
     if not Engine.armed then return end
-    if in_play() then
+    if inPlay() then
         Engine.sleep_tok = nil
         if not Engine.running then
             if Engine.start() then Flight.write("engine AWAKE (in a round / training / lobby parry)") end
         end
     elseif Engine.running and not Engine.sleep_tok then
-        -- a short grace so a respawn or a quick hop doesn't flap it
         local tok = {}
         Engine.sleep_tok = tok
         task.delay(1.5, function()
             if Engine.sleep_tok ~= tok then return end
             Engine.sleep_tok = nil
-            if Engine.armed and Engine.running and not in_play() then
+            if Engine.armed and Engine.running and not inPlay() then
                 Engine.stop()
                 Flight.write("engine ASLEEP (lobby) -- no loops, no remote listeners; hook: " .. Parry.hookState())
             end
@@ -3870,17 +2961,15 @@ end
 function Engine.arm()
     if Engine.armed then return end
     Engine.armed = true
-    -- wake / sleep is POLLED (no CharacterAdded / AncestryChanged / attribute
-    -- listeners in the lobby -- those are what BAC kicks on, reason 24)
     local tok = {}
     Engine.poll_tok = tok
     task.spawn(function()
-        while Engine.armed and Engine.poll_tok == tok and is_live() do
+        while Engine.armed and Engine.poll_tok == tok and isLive() do
             pcall(reevaluate)
             task.wait(0.4)
         end
     end)
-    Flight.write("parry/spam feature on -- engine " .. (in_play() and "waking" or "asleep until a round"))
+    Flight.write("parry/spam feature on -- engine " .. (inPlay() and "waking" or "asleep until a round"))
     reevaluate()
     if not Engine.running and StatusHook then pcall(StatusHook, nil, true) end
 end
@@ -3908,7 +2997,6 @@ function Engine.want_now(name, on)
     if next(Engine.users) ~= nil then Engine.arm() else Engine.disarm() end
 end
 
--- From load: a load line, then (only if it happens) the kick with full context.
 do
     local exec = "?"
     pcall(function() exec = table.concat({ identifyexecutor() }, " ") end)
@@ -3919,7 +3007,7 @@ do
     pcall(function()
         local GuiService = cloneref(game:GetService("GuiService"))
         Flight.kick_conn = GuiService.ErrorMessageChanged:Connect(function(msg)
-            if not is_live() then return end
+            if not isLive() then return end
             local on = {}
             for name, f in pairs(Features) do if f.on then on[#on + 1] = name end end
             for name in pairs(Engine.users) do on[#on + 1] = name end
@@ -3933,16 +3021,9 @@ end
 
 if getgenv().BBStop == 1 then Flight.write("BBStop 1: stopped after the core (no UI)"); return end
 
--- ===========================================================================
--- MOBILE MANUAL-SPAM SWITCH (touch devices only; no on-screen UI on PC).
--- A capsule switch: tap to turn spam on/off, drag to move it. The thumb slides
--- across, the track fills with a green->cyan gradient that shimmers while it
--- spams, dims while Smart stop is waiting for a threat, and shows the live rate.
--- ===========================================================================
 local Orb = {}
 do
-    local SP = Parry.SP
-    local TweenService = cloneref(game:GetService("TweenService"))
+    local SP, TweenService = Parry.SP, cloneref(game:GetService("TweenService"))
     local W, H, PAD = 172, 58, 6
     local THUMB = H - PAD * 2
     local C = {
@@ -3955,20 +3036,20 @@ do
     }
     local gui, root, track, fill, grad, thumb, ring, bar, notch, textbox, title, sub
     local pressing, dragging = false, false
-    local press_input, press_pos, start_abs = nil, nil, nil
-    local press_conns, painted, last_rate = {}, nil, 0
+    local pressInput, pressPos, startAbs = nil, nil, nil
+    local pressConns, painted, lastRate = {}, nil, 0
     local function tween(obj, props, t)
         TweenService:Create(obj, TweenInfo.new(t or 0.22, Enum.EasingStyle.Quint, Enum.EasingDirection.Out), props):Play()
     end
     local function corner(obj, r) local c = Instance.new("UICorner"); c.CornerRadius = r or UDim.new(1, 0); c.Parent = obj; return c end
-    local function set_spam(on) SP.manual = on and true or false end
-    local function drop_press_conns()
-        for _, c in ipairs(press_conns) do pcall(function() c:Disconnect() end) end
-        press_conns = {}
+    local function setSpam(on) SP.manual = on and true or false end
+    local function dropPress()
+        for _, c in ipairs(pressConns) do pcall(function() c:Disconnect() end) end
+        pressConns = {}
     end
     local function paint(rate)
         if not track then return end
-        if rate then last_rate = rate end
+        if rate then lastRate = rate end
         local on = SP.manual
         local state = not on and "off" or (Parry.spamWaiting() and "wait" or "on")
         if state ~= painted then
@@ -3986,19 +3067,16 @@ do
         end
         if state == "off" then sub.Text, sub.TextColor3 = "tap to start", C.dim
         elseif state == "wait" then sub.Text, sub.TextColor3 = "ready", C.dim
-        else sub.Text, sub.TextColor3 = (math.floor(last_rate + 0.5) .. "/s"), C.g1 end
-        -- shimmer while spamming
+        else sub.Text, sub.TextColor3 = (math.floor(lastRate + 0.5) .. "/s"), C.g1 end
         if state == "on" then grad.Offset = Vector2.new(math.sin(clock_() * 3) * 0.3, 0) end
     end
     function Orb.tick(rate) paint(rate) end
-    -- a press that didn't turn into a drag toggles spam
-    local function release_press()
+    local function releasePress()
         pressing = false
-        drop_press_conns()
+        dropPress()
         if dragging then dragging = false
         else
-            set_spam(not SP.manual)
-            -- a little squish so the tap feels physical
+            setSpam(not SP.manual)
             root.Size = UDim2.fromOffset(W * 0.96, H * 0.96)
             tween(root, { Size = UDim2.fromOffset(W, H) }, 0.25)
         end
@@ -4013,7 +3091,6 @@ do
         root.Size = UDim2.fromOffset(W, H); root.AnchorPoint = Vector2.new(0.5, 0.5)
         root.Position = UDim2.new(1, -(W / 2 + 18), 0.62, 0); root.BackgroundTransparency = 1
         root.Parent = gui
-        -- soft drop shadow (two stacked translucent capsules)
         for i, a in ipairs({ 0.82, 0.9 }) do
             local sh = Instance.new("Frame")
             sh.Size = UDim2.new(1, i * 6, 1, i * 6); sh.AnchorPoint = Vector2.new(0.5, 0.5)
@@ -4044,7 +3121,6 @@ do
         thumb = Instance.new("Frame")
         thumb.Size = UDim2.fromOffset(THUMB, THUMB); thumb.Position = UDim2.fromOffset(PAD, PAD)
         thumb.BackgroundColor3 = C.thumb_off; thumb.ZIndex = 4; thumb.Active = false; thumb.Parent = track; corner(thumb)
-        -- power icon: an open ring with a bar through the gap
         local icon = Instance.new("Frame")
         icon.Size = UDim2.fromOffset(18, 18); icon.AnchorPoint = Vector2.new(0.5, 0.5); icon.Position = UDim2.fromScale(0.5, 0.52)
         icon.BackgroundTransparency = 1; icon.ZIndex = 5; icon.Parent = thumb; corner(icon)
@@ -4060,19 +3136,18 @@ do
             if t ~= Enum.UserInputType.Touch and t ~= Enum.UserInputType.MouseButton1 then return end
             if pressing then return end
             pressing, dragging = true, false
-            press_input, press_pos = input, input.Position
-            start_abs = root.AbsolutePosition + root.AbsoluteSize * 0.5
-            -- move / release are tracked only while a press is live
-            press_conns[#press_conns + 1] = UserInputService.InputChanged:Connect(function(i)
+            pressInput, pressPos = input, input.Position
+            startAbs = root.AbsolutePosition + root.AbsoluteSize * 0.5
+            pressConns[#pressConns + 1] = UserInputService.InputChanged:Connect(function(i)
                 if not pressing then return end
-                if i ~= press_input and i.UserInputType ~= Enum.UserInputType.MouseMovement then return end
-                local d = i.Position - press_pos
+                if i ~= pressInput and i.UserInputType ~= Enum.UserInputType.MouseMovement then return end
+                local d = i.Position - pressPos
                 if not dragging and Vector2.new(d.X, d.Y).Magnitude > 14 then dragging = true end
-                if dragging then root.Position = UDim2.fromOffset(start_abs.X + d.X, start_abs.Y + d.Y) end
+                if dragging then root.Position = UDim2.fromOffset(startAbs.X + d.X, startAbs.Y + d.Y) end
             end)
-            press_conns[#press_conns + 1] = UserInputService.InputEnded:Connect(function(i)
+            pressConns[#pressConns + 1] = UserInputService.InputEnded:Connect(function(i)
                 if not pressing then return end
-                if i == press_input or i.UserInputType == Enum.UserInputType.MouseButton1 then release_press() end
+                if i == pressInput or i.UserInputType == Enum.UserInputType.MouseButton1 then releasePress() end
             end)
         end)
         hideGui(gui)
@@ -4080,25 +3155,16 @@ do
         paint()
     end
     function Orb.hide()
-        drop_press_conns()
+        dropPress()
         pressing, dragging = false, false
-        set_spam(false)
+        setSpam(false)
         if gui then pcall(function() gui:Destroy() end) end
         gui, root, track = nil, nil, nil
         painted = nil
     end
 end
 
--- ===========================================================================
--- UI
--- ===========================================================================
 do
-    -- The game's own scripts can read the output console (LogService). Ui3
-    -- warn()s "[Ui3] Failed to load '<setting>' ..." when a saved config value
-    -- can't be applied (an old value for a setting that has since changed) and
-    -- "[Ui3] Callback error ..." when a callback errors -- a script-loaded tell
-    -- sitting in the console from the first second, with nothing switched on.
-    -- Run Ui3 with its print / warn going to our log file instead.
     local fn = loadstring(game:HttpGet("https://raw.githubusercontent.com/iamdookie1/Ui3/main/Ui.lua"))
     local function quiet(...)
         local t = {}
@@ -4113,7 +3179,7 @@ local Options, Toggles = Library.Options, Library.Toggles
 local S, SP, Det = Parry.S, Parry.SP, Parry.Det
 local function Notify(title, text, time) pcall(function() Library:Notify({ Title = title, Description = text, Time = time or 3 }) end) end
 
-local Window = Library:CreateWindow({
+Gui.Window = Library:CreateWindow({
     Title = "Blade Ball",
     Footer = "version: " .. SCRIPT_VERSION,
     Icon = "swords",
@@ -4123,43 +3189,39 @@ local Window = Library:CreateWindow({
     ToggleKeybind = Enum.KeyCode.LeftControl,
 })
 
-local Tabs = {
-    Parry = Window:AddTab("Auto Parry", "swords", "Auto parry, triggerbot, curves, abilities"),
-    Detection = Window:AddTab("Detection", "shield-alert", "Pause parrying during enemy abilities"),
-    Spam = Window:AddTab("Spam", "zap", "Manual and auto spam"),
-    Player = Window:AddTab("Player", "user", "Avatar, cosmetics, movement"),
-    Visuals = Window:AddTab("Visuals", "eye", "Overlays and ESP"),
-    Orbit = Window:AddTab("Orbit", "orbit", "Circle a point you can walk, or the ball"),
-    Misc = Window:AddTab("Misc", "wrench", "Skin changer and extras"),
-    Debug = Window:AddTab("Debug", "bug", "On-screen debug overlay"),
+Gui.Tabs = {
+    Parry = Gui.Window:AddTab("Auto Parry", "swords", "Auto parry, triggerbot, curves, abilities"),
+    Detection = Gui.Window:AddTab("Detection", "shield-alert", "Pause parrying during enemy abilities"),
+    Spam = Gui.Window:AddTab("Spam", "zap", "Manual and auto spam"),
+    Player = Gui.Window:AddTab("Player", "user", "Avatar, cosmetics, movement"),
+    Visuals = Gui.Window:AddTab("Visuals", "eye", "Overlays and ESP"),
+    Orbit = Gui.Window:AddTab("Orbit", "orbit", "Circle a point you can walk, or the ball"),
+    Misc = Gui.Window:AddTab("Misc", "wrench", "Skin changer and extras"),
+    Debug = Gui.Window:AddTab("Debug", "bug", "On-screen debug overlay"),
 }
 
--- ----- Auto Parry tab (rewritten 0.5.85) -----
--- Same option ids as before, so saved configs carry over. Removed: Timing,
--- Extra distance, Retry delay (the game's own lockout is used) and Ping
--- compensation (full-ping lead made high ping worse).
-local AP = Tabs.Parry:AddLeftGroupbox("Auto Parry", "swords")
-AP:AddToggle("AutoParry", {
+Gui.AP = Gui.Tabs.Parry:AddLeftGroupbox("Auto Parry", "swords")
+Gui.AP:AddToggle("AutoParry", {
     Text = "Auto parry", Default = false,
     Tooltip = "Parries every ball sent at you, curves included, at the Accuracy you set.",
     Callback = function(v) S.autoparry = v; Engine.want("autoparry", v) end,
 }):AddKeyPicker("AutoParryKey", { Default = "None", Mode = "Toggle", SyncToggleState = true, Text = "Auto parry" })
-AP:AddToggle("Triggerbot", {
+Gui.AP:AddToggle("Triggerbot", {
     Text = "Triggerbot", Default = false,
     Tooltip = "Parries the instant the ball turns to you, at any distance. Overrides auto parry's timing while on.",
     Callback = function(v) S.triggerbot = v; Engine.want("triggerbot", v) end,
 }):AddKeyPicker("TriggerbotKey", { Default = "None", Mode = "Toggle", SyncToggleState = true, Text = "Triggerbot" })
-AP:AddDropdown("ParryMode", {
+Gui.AP:AddDropdown("ParryMode", {
     Values = { "Remote", "Keypress" }, Default = "Remote", Text = "Parry mode",
     Tooltip = "Remote: the captured parry, forged (curve and target options work). Keypress: presses block.",
     Callback = function(v) S.parry_mode = v end,
 })
-AP:AddToggle("ParryAnimation", {
+Gui.AP:AddToggle("ParryAnimation", {
     Text = "Parry animation", Default = true,
     Tooltip = "Plays your sword's block swing on remote parries.",
     Callback = function(v) Anim.enabled = v end,
 })
-AP:AddToggle("UnlockFPS", {
+Gui.AP:AddToggle("UnlockFPS", {
     Text = "Unlock FPS", Default = true,
     Tooltip = "Frame cap 240: auto parry checks the ball 4 times a frame, so more frames = more checks.",
     Callback = function(v)
@@ -4168,76 +3230,75 @@ AP:AddToggle("UnlockFPS", {
     end,
 })
 
-local APS = Tabs.Parry:AddRightGroupbox("Timing", "sliders-horizontal")
-APS:AddSlider("Accuracy", {
+Gui.APS = Gui.Tabs.Parry:AddRightGroupbox("Timing", "sliders-horizontal")
+Gui.APS:AddSlider("Accuracy", {
     Text = "Accuracy", Default = 50, Min = 1, Max = 100, Rounding = 0,
     Tooltip = "How close the ball gets before the parry: 100 = ~5 studs ahead, 1 = ~35 studs ahead, straight in between (50 = ~20 studs), and never less than a little time on fast balls (up to 0.12s at 1) so fast balls don't become perfect parries. Never past the parry window. Curves follow it too.",
     Callback = function(v) S.accuracy_base = v; Parry.roll() end,
 })
-APS:AddToggle("RandomAccuracy", { Text = "Randomize accuracy", Default = false, Callback = function(v) S.random_accuracy = v end })
-APS:AddSlider("RandomAccuracyAmount", {
+Gui.APS:AddToggle("RandomAccuracy", { Text = "Randomize accuracy", Default = false, Callback = function(v) S.random_accuracy = v end })
+Gui.APS:AddSlider("RandomAccuracyAmount", {
     Text = "Randomize amount", Default = 10, Min = 0, Max = 50, Rounding = 0, Suffix = " +/-",
     Callback = function(v) S.random_accuracy_amount = v end,
 })
-APS:AddToggle("HardCurveGuard", {
+Gui.APS:AddToggle("HardCurveGuard", {
     Text = "Hard curve guard", Default = false,
     Tooltip = "Treats every curve as the hardest turn possible for the must-fire check. Saves sudden whip-ins; downside: can parry curve-bait balls early.",
     Callback = function(v) S.hard_curve = v end,
 })
-APS:AddToggle("SelfTune", {
+Gui.APS:AddToggle("SelfTune", {
     Text = "Self-tune timing", Default = false,
     Tooltip = "Each EARLY / LATE miss nudges the fire time the other way (max 15ms a step, +/-40ms total); landed parries ease it back. Downside: a few odd misses can pull it off for a while.",
     Callback = function(v) S.self_tune = v; if not v then Parry.resetTune() end end,
 })
 
-local AIM = Tabs.Parry:AddRightGroupbox("Aim & Curve", "spline")
-AIM:AddDropdown("TargetMode", {
+Gui.AIM = Gui.Tabs.Parry:AddRightGroupbox("Aim & Curve", "spline")
+Gui.AIM:AddDropdown("TargetMode", {
     Values = Parry.targetNames, Default = "Cursor", Text = "Target mode",
     Callback = function(v) Parry.setTargetMode(v) end,
 })
-AIM:AddDropdown("TargetMethod", {
+Gui.AIM:AddDropdown("TargetMethod", {
     Values = { "Angle", "Ray distance", "Weighted", "Screen" }, Default = "Angle", Text = "Aim method (Camera / Cursor)",
     Tooltip = "How Camera and Cursor pick who you're aiming at. Angle: smallest angle off your view (best all-round). Ray distance: whoever your aim line passes closest to, in studs. Weighted: angle, leaning toward nearer players (crowds). Screen: pixel distance on screen (the old way).",
     Callback = function(v) S.target_method = v end,
 })
-AIM:AddDropdown("CurveMode", {
+Gui.AIM:AddDropdown("CurveMode", {
     Values = Parry.curveNames, Default = "Camera", Text = "Curve mode", Searchable = true,
     Tooltip = "The direction sent with every parry (auto parry, triggerbot and spam).",
     Callback = function(v) Parry.setCurveMode(v) end,
 })
-AIM:AddToggle("RandomCurve", { Text = "Random curve each parry", Default = false, Callback = function(v) S.random_curve = v end })
-local function cycle_curve(dir)
+Gui.AIM:AddToggle("RandomCurve", { Text = "Random curve each parry", Default = false, Callback = function(v) S.random_curve = v end })
+function Mods.cycleCurve(dir)
     local names = Parry.curveNames
     local idx = (S.curve_mode - 1 + dir) % #names + 1
     pcall(function() Options.CurveMode:SetValue(names[idx]) end)
     Notify("Curve", names[idx], 1)
 end
-AIM:AddLabel("Next curve"):AddKeyPicker("NextCurveKey", {
-    Default = "None", Mode = "Toggle", Text = "Next curve", Callback = function() cycle_curve(1) end,
+Gui.AIM:AddLabel("Next curve"):AddKeyPicker("NextCurveKey", {
+    Default = "None", Mode = "Toggle", Text = "Next curve", Callback = function() Mods.cycleCurve(1) end,
 })
-AIM:AddLabel("Previous curve"):AddKeyPicker("PrevCurveKey", {
-    Default = "None", Mode = "Toggle", Text = "Previous curve", Callback = function() cycle_curve(-1) end,
+Gui.AIM:AddLabel("Previous curve"):AddKeyPicker("PrevCurveKey", {
+    Default = "None", Mode = "Toggle", Text = "Previous curve", Callback = function() Mods.cycleCurve(-1) end,
 })
 
-
-local CAP = Tabs.Parry:AddLeftGroupbox("Capture", "key-round")
-local CapLabel = CAP:AddLabel("Capture: off (turn on auto parry or spam)", true)
-CAP:AddLabel("Parry once yourself: the hook reads that real parry (the real hash only, never the game's decoys) and auto parry takes over. A notification says when it has it.", true)
-CAP:AddToggle("OneParryCapture", {
+Gui.CAP = Gui.Tabs.Parry:AddLeftGroupbox("Capture", "key-round")
+Gui.CapLabel = Gui.CAP:AddLabel("Capture: off (turn on auto parry or spam)", true)
+Gui.CAP:AddLabel("Parry once yourself: the hook reads that real parry (the real hash only, never the game's decoys) and auto parry takes over. A notification says when it has it.", true)
+Gui.CAP:AddToggle("OneParryCapture", {
     Text = "One-parry capture", Default = true,
     Tooltip = "Catches your first parry every time: also hooks FireServer while there's no capture (the game sends half its parries that way). That path only takes the game's real hash. Off = namecall only, which can take a few parries.",
     Callback = function(v) S.one_parry_capture = v end,
 })
-CAP:AddToggle("RescuePress", {
+Gui.CAP:AddToggle("RescuePress", {
     Text = "Rescue press", Default = true,
     Tooltip = "When the server doesn't answer a remote parry (a bad capture: the swing plays, nothing is parried), that ball is parried with a real F press instead, and a dropped capture is retaken on that press.",
     Callback = function(v) S.rescue_press = v end,
 })
-local CAPTURE_MODES = { ["Your press"] = "Your press", ["Auto parry"] = "Auto parry", ["Spam"] = "Spam", ["Safe press"] = "Auto press" }
-CAP:AddDropdown("AutoCaptureMode", {
+Gui.CAPTURE_MODES = { ["Your press"] = "Your press", ["Auto parry"] = "Auto parry", ["Spam"] = "Spam", ["Safe press"] = "Auto press" }
+Gui.CAP:AddDropdown("AutoCaptureMode", {
     Values = { "Your press", "Auto parry", "Spam", "Safe press" }, Default = "Your press", Text = "Auto capture",
     Tooltip = "Your press: parry once yourself. Auto parry: auto parry presses F itself (a real parry) until the remote is read. Spam: presses F every 0.1s in a round / training until it's read. Safe press: one press when no ball is near. Presses use keypress (F), only while Roblox is focused.",
-    Callback = function(v) Parry.Capture.mode = CAPTURE_MODES[v] or "Your press" end,
+    Callback = function(v) Parry.Capture.mode = Gui.CAPTURE_MODES[v] or "Your press" end,
 })
 Parry.onCaptureBad = function()
     Notify("Capture dropped", "The server wasn't taking its parries. Parry once to take a fresh one.", 5)
@@ -4246,7 +3307,7 @@ Parry.onCapture = function(cap)
     Notify("Parry remote captured", cap.verified and "Real parry hash confirmed -- auto parry is armed."
         or "Captured (couldn't read the game's real hash to confirm it).", 4)
 end
-CAP:AddButton({
+Gui.CAP:AddButton({
     Text = "Rehook",
     Tooltip = "Drop the capture and take a fresh one. Use it if parries stop landing.",
     Func = function()
@@ -4258,124 +3319,112 @@ CAP:AddButton({
     end,
 })
 
-local PP = Tabs.Parry:AddLeftGroupbox("Pre-parry", "fast-forward")
-PP:AddToggle("PreParry", {
+Gui.PP = Gui.Tabs.Parry:AddLeftGroupbox("Pre-parry", "fast-forward")
+Gui.PP:AddToggle("PreParry", {
     Text = "Pre-parry", Default = false,
     Tooltip = "Ball on a player right next to you whose return would beat your reaction: parry ahead of it.",
     Callback = function(v) S.preparry = v end,
 })
-PP:AddSlider("PreParryRange", {
+Gui.PP:AddSlider("PreParryRange", {
     Text = "Pre-parry range", Default = 20, Min = 8, Max = 45, Rounding = 0, Suffix = " studs",
     Callback = function(v) S.preparry_range = v end,
 })
-PP:AddToggle("HighPingPreParry", {
+Gui.PP:AddToggle("HighPingPreParry", {
     Text = "Auto pre-parry at high ping", Default = false,
     Tooltip = "Pre-parry turns itself on while your ping is 80ms or more.",
     Callback = function(v) S.hp_preparry = v end,
 })
 
-local AB = Tabs.Parry:AddLeftGroupbox("Abilities", "sparkles")
-AB:AddToggle("AutoAbility", {
+Gui.AB = Gui.Tabs.Parry:AddLeftGroupbox("Abilities", "sparkles")
+Gui.AB:AddToggle("AutoAbility", {
     Text = "Auto ability", Default = false,
     Tooltip = "Parry with your ability when it's ready and is a parry ability (Raging/Calming Deflection, Rapture, Aerodynamic Slash, Fracture, Death Slash).",
     Callback = function(v) S.auto_ability = v end,
 })
-AB:AddToggle("CooldownProtection", {
+Gui.AB:AddToggle("CooldownProtection", {
     Text = "Cooldown protection", Default = false,
     Tooltip = "Use Raging/Calming Deflection or Rapture as the parry when they're ready.",
     Callback = function(v) S.cooldown_protection = v end,
 })
 
--- ----- Detection tab -----
--- Each detection owns its listeners; they exist only while its toggle is on.
-local function get_remotes() return ReplicatedStorage:FindFirstChild("Remotes") end
+local function getRemotes() return ReplicatedStorage:FindFirstChild("Remotes") end
 
-local DetInfinity = Feature("DetInfinity")
-DetInfinity.round_only = true -- game-signal listeners: rounds only (lobby kick)
-function DetInfinity.start()
-    local R = get_remotes()
+Mods.DetInfinity = Feature("DetInfinity")
+Mods.DetInfinity.round_only = true
+function Mods.DetInfinity.start()
+    local R = getRemotes()
     if R and R:FindFirstChild("InfinityBall") then
-        -- (ball, on, fx): the ball locked in place by an Infinity aura
-        DetInfinity:connect(R.InfinityBall.OnClientEvent, function(ball, on)
+        Mods.DetInfinity:connect(R.InfinityBall.OnClientEvent, function(ball, on)
             if typeof(ball) == "Instance" then Det.inf[ball] = on and (clock_() + 15) or nil end
         end)
     end
 end
-function DetInfinity.stop() table.clear(Det.inf) end
+function Mods.DetInfinity.stop() table.clear(Det.inf) end
 
-local DetDeathSlash = Feature("DetDeathSlash")
-DetDeathSlash.round_only = true -- game-signal listeners: rounds only (lobby kick)
-function DetDeathSlash.start()
-    local R = get_remotes()
+Mods.DetDeathSlash = Feature("DetDeathSlash")
+Mods.DetDeathSlash.round_only = true
+function Mods.DetDeathSlash.start()
+    local R = getRemotes()
     if R and R:FindFirstChild("DeathBall") then
-        DetDeathSlash:connect(R.DeathBall.OnClientEvent, function(ball, on)
+        Mods.DetDeathSlash:connect(R.DeathBall.OnClientEvent, function(ball, on)
             if typeof(ball) == "Instance" then Det.death[ball] = on and (clock_() + 8) or nil end
         end)
     end
 end
-function DetDeathSlash.stop() table.clear(Det.death) end
+function Mods.DetDeathSlash.stop() table.clear(Det.death) end
 
-local DetTimeHole = Feature("DetTimeHole")
-DetTimeHole.round_only = true -- game-signal listeners: rounds only (lobby kick)
-function DetTimeHole.start()
-    -- the ball's IsInTimeHoleAOE attribute is read per check (no listener);
-    -- TimeHoleHoldBall is a plain Remotes event, not a hashed Net one
+Mods.DetTimeHole = Feature("DetTimeHole")
+Mods.DetTimeHole.round_only = true
+function Mods.DetTimeHole.start()
     Det.timehole_on = true
-    local R = get_remotes()
+    local R = getRemotes()
     if R and R:FindFirstChild("TimeHoleHoldBall") then
-        DetTimeHole:connect(R.TimeHoleHoldBall.OnClientEvent, function(ball, on)
+        Mods.DetTimeHole:connect(R.TimeHoleHoldBall.OnClientEvent, function(ball, on)
             if typeof(ball) == "Instance" then Det.th_hold[ball] = on and (clock_() + 15) or nil end
         end)
     end
 end
-function DetTimeHole.stop() Det.timehole_on = false; table.clear(Det.th_hold) end
+function Mods.DetTimeHole.stop() Det.timehole_on = false; table.clear(Det.th_hold) end
 
--- Slashes of Fury (yours): while the server has your character in the fury
--- (its FuryCatch attribute -- what the game's own SoF script watches), parry
--- the slashes out (spam path), paced, up to 36 (the game's combo counter
--- tops out around 35). Until 0.5.113 this listened on the readable Net
--- names, which are decoys and never fire.
-local Slashes = { delay = 0.05, max = 36, count = 0, looping = false }
-local DetSlashes = Feature("DetSlashes")
-DetSlashes.round_only = true -- game-signal listeners: rounds only (lobby kick)
-local function run_slashes()
-    if Slashes.looping or not Det.slashes then return end
-    Slashes.looping = true
-    local token = DetSlashes._token
+Mods.Slashes = { delay = 0.05, max = 36, count = 0, looping = false }
+Mods.DetSlashes = Feature("DetSlashes")
+Mods.DetSlashes.round_only = true
+function Mods.runSlashes()
+    if Mods.Slashes.looping or not Det.slashes then return end
+    Mods.Slashes.looping = true
+    local token = Mods.DetSlashes._token
     task.spawn(function()
         local sent = 0
-        while DetSlashes:alive(token) and Det.slashes and sent < Slashes.max and LocalPlayer.Character do
+        while Mods.DetSlashes:alive(token) and Det.slashes and sent < Mods.Slashes.max and LocalPlayer.Character do
             Parry.spamParry()
             sent = sent + 1
-            task.wait(Slashes.delay)
+            task.wait(Mods.Slashes.delay)
         end
-        Slashes.looping = false
+        Mods.Slashes.looping = false
     end)
 end
-local function watch_fury(char)
+function Mods.watchFury(char)
     if not char then return end
     local function update()
         local on = char:GetAttribute("FuryCatch") and true or false
-        if on and not Det.slashes then Det.slashes, Slashes.count = true, 0; run_slashes()
+        if on and not Det.slashes then Det.slashes, Mods.Slashes.count = true, 0; Mods.runSlashes()
         elseif not on then Det.slashes = false end
     end
-    DetSlashes:connect(char:GetAttributeChangedSignal("FuryCatch"), update)
+    Mods.DetSlashes:connect(char:GetAttributeChangedSignal("FuryCatch"), update)
     update()
 end
-function DetSlashes.start()
-    watch_fury(LocalPlayer.Character)
-    DetSlashes:connect(LocalPlayer.CharacterAdded, function(char) Det.slashes = false; watch_fury(char) end)
+function Mods.DetSlashes.start()
+    Mods.watchFury(LocalPlayer.Character)
+    Mods.DetSlashes:connect(LocalPlayer.CharacterAdded, function(char) Det.slashes = false; Mods.watchFury(char) end)
 end
-function DetSlashes.stop() Det.slashes, Slashes.count, Slashes.looping = false, 0, false end
+function Mods.DetSlashes.stop() Det.slashes, Mods.Slashes.count, Mods.Slashes.looping = false, 0, false end
 
--- Anti-Phantom: when Phantom's transmission part gets welded to you, cut the
--- weld and fire your ability the moment the ball is highlighted on you.
-local DetPhantom = Feature("DetPhantom")
-DetPhantom.round_only = true -- game-signal listeners: rounds only (lobby kick)
-function DetPhantom.start()
+Mods.DetPhantom = Feature("DetPhantom")
+Mods.DetPhantom.round_only = true
+function Mods.DetPhantom.start()
     local runtime = Workspace:FindFirstChild("Runtime")
     if not runtime then return end
-    DetPhantom:connect(runtime.ChildAdded, function(obj)
+    Mods.DetPhantom:connect(runtime.ChildAdded, function(obj)
         if obj.Name ~= "maxTransmission" and obj.Name ~= "transmissionpart" then return end
         local weld = obj:FindFirstChildWhichIsA("WeldConstraint")
         local root = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
@@ -4396,27 +3445,25 @@ function DetPhantom.start()
         task.delay(3, function() if watch and watch.Connected then watch:Disconnect() end end)
     end)
 end
-function DetPhantom.stop() Det.phantom_until = 0 end
+function Mods.DetPhantom.stop() Det.phantom_until = 0 end
 
-local DL = Tabs.Detection:AddLeftGroupbox("Abilities", "shield-alert")
-DL:AddToggle("DetInfinity", { Text = "Infinity detection", Default = false, Callback = function(v) DetInfinity:setEnabled(v) end })
-DL:AddToggle("DetDeathSlash", { Text = "Death Slash detection", Default = false, Callback = function(v) DetDeathSlash:setEnabled(v) end })
-DL:AddToggle("DetTimeHole", { Text = "Time Hole detection", Default = false, Callback = function(v) DetTimeHole:setEnabled(v) end })
-DL:AddToggle("DetPhantom", { Text = "Anti-Phantom [BETA]", Default = false, Callback = function(v) DetPhantom:setEnabled(v) end })
-local DR = Tabs.Detection:AddRightGroupbox("Slashes Of Fury", "swords")
-DR:AddToggle("DetSlashes", { Text = "Slashes detection", Default = false, Callback = function(v) DetSlashes:setEnabled(v) end })
-DR:AddSlider("SlashesDelay", { Text = "Parry delay", Default = 0.05, Min = 0.05, Max = 0.25, Rounding = 2, Suffix = "s", Callback = function(v) Slashes.delay = v end })
-DR:AddSlider("SlashesMax", { Text = "Max parry count", Default = 36, Min = 1, Max = 100, Rounding = 0, Callback = function(v) Slashes.max = v end })
+local DL = Gui.Tabs.Detection:AddLeftGroupbox("Abilities", "shield-alert")
+DL:AddToggle("DetInfinity", { Text = "Infinity detection", Default = false, Callback = function(v) Mods.DetInfinity:setEnabled(v) end })
+DL:AddToggle("DetDeathSlash", { Text = "Death Slash detection", Default = false, Callback = function(v) Mods.DetDeathSlash:setEnabled(v) end })
+DL:AddToggle("DetTimeHole", { Text = "Time Hole detection", Default = false, Callback = function(v) Mods.DetTimeHole:setEnabled(v) end })
+DL:AddToggle("DetPhantom", { Text = "Anti-Phantom [BETA]", Default = false, Callback = function(v) Mods.DetPhantom:setEnabled(v) end })
+Gui.DR = Gui.Tabs.Detection:AddRightGroupbox("Slashes Of Fury", "swords")
+Gui.DR:AddToggle("DetSlashes", { Text = "Slashes detection", Default = false, Callback = function(v) Mods.DetSlashes:setEnabled(v) end })
+Gui.DR:AddSlider("SlashesDelay", { Text = "Parry delay", Default = 0.05, Min = 0.05, Max = 0.25, Rounding = 2, Suffix = "s", Callback = function(v) Mods.Slashes.delay = v end })
+Gui.DR:AddSlider("SlashesMax", { Text = "Max parry count", Default = 36, Min = 1, Max = 100, Rounding = 0, Callback = function(v) Mods.Slashes.max = v end })
 
--- ----- Spam tab -----
-local MS = Tabs.Spam:AddLeftGroupbox("Manual Spam", "zap")
-MS:AddToggle("ManualSpam", {
+Gui.MS = Gui.Tabs.Spam:AddLeftGroupbox("Manual Spam", "zap")
+Gui.MS:AddToggle("ManualSpam", {
     Text = touchUI and "Manual spam (show switch)" or "Manual spam", Default = false,
     Tooltip = touchUI and "Shows the spam switch: tap it to turn spam on/off, drag to move it."
         or "Press the key (E by default) to turn spam on, press again to turn it off.",
     Callback = function(v)
         if touchUI then
-            -- the toggle shows the switch; the switch decides when to actually spam
             if v then Orb.show() else Orb.hide() end
         else
             SP.manual = v
@@ -4424,48 +3471,48 @@ MS:AddToggle("ManualSpam", {
         Engine.want("manualspam", v)
     end,
 }):AddKeyPicker("ManualSpamKey", { Default = "E", Mode = "Toggle", SyncToggleState = not touchUI, Text = "Manual spam" })
-MS:AddToggle("SpamAnimation", {
+Gui.MS:AddToggle("SpamAnimation", {
     Text = "Spam animation", Default = true,
     Tooltip = "Plays the block swing with spam the way a real held key looks: block, success swing, block -- never restarted every parry.",
     Callback = function(v) Anim.spam = v end,
 })
-MS:AddToggle("SmartStop", {
+Gui.MS:AddToggle("SmartStop", {
     Text = "Smart stop", Default = true,
     Tooltip = "Only spams while a ball is on you, close to you, or heading at you -- stops by itself the rest of the time.",
     Callback = function(v) SP.smart = v end,
 })
-MS:AddDropdown("SpamMode", {
+Gui.MS:AddDropdown("SpamMode", {
     Values = { "Remote", "Keypress" }, Default = "Remote", Text = "Mode",
     Callback = function(v) SP.mode = v end,
 })
-MS:AddDropdown("SpamMethod", {
+Gui.MS:AddDropdown("SpamMethod", {
     Values = { "Fixed rate", "Per frame", "Ping adaptive", "On ball" }, Default = "Fixed rate", Text = "Method",
     Tooltip = "Fixed rate: exactly the Speed. Per frame: one a frame (your FPS). Ping adaptive: the Speed, capped at 12 per round trip so high ping doesn't clog. On ball: the Speed only while a ball is on you, plus one instantly on each server update of it.",
     Callback = function(v) SP.method = v end,
 })
-local SPAM_SPEEDS = {}
-for r = 50, 1000, 50 do SPAM_SPEEDS[#SPAM_SPEEDS + 1] = r .. "/s" end
-MS:AddDropdown("SpamSpeed", {
-    Values = SPAM_SPEEDS, Default = "700/s", Text = "Speed",
+Gui.SPAM_SPEEDS = {}
+for r = 50, 1000, 50 do Gui.SPAM_SPEEDS[#Gui.SPAM_SPEEDS + 1] = r .. "/s" end
+Gui.MS:AddDropdown("SpamSpeed", {
+    Values = Gui.SPAM_SPEEDS, Default = "700/s", Text = "Speed",
     Tooltip = "Parries a second for manual and auto spam, held exactly at this rate at any FPS.",
     Callback = function(v) SP.speed_mode = v end,
 })
-MS:AddToggle("SpamPerFrame", {
+Gui.MS:AddToggle("SpamPerFrame", {
     Text = "Per frame", Default = false,
     Tooltip = "Fire a set number of parries every frame (your FPS x Count a second) instead of the timing below.",
     Callback = function(v) SP.per_frame = v end,
 })
-MS:AddSlider("SpamPerFrameCount", {
+Gui.MS:AddSlider("SpamPerFrameCount", {
     Text = "Per frame count", Default = 1, Min = 1, Max = 20, Rounding = 0,
     Tooltip = "Parries each frame while Per frame is on.",
     Callback = function(v) SP.per_frame_count = v end,
 })
-MS:AddDropdown("SpamTiming", {
+Gui.MS:AddDropdown("SpamTiming", {
     Values = { "Per second", "Every X ms" }, Default = "Per second", Text = "Timing",
     Tooltip = "Per second: the Speed above. Every X ms: one parry every Interval ms. Ignored while Per frame is on.",
     Callback = function(v) SP.timing = v end,
 })
-MS:AddInput("SpamIntervalMs", {
+Gui.MS:AddInput("SpamIntervalMs", {
     Text = "Interval (ms)", Default = "2", Numeric = true, Finished = true, Placeholder = "e.g. 2",
     Tooltip = "Milliseconds between parries for Every X ms (0.5 - 1000). 2 ms = 500/s, 1 ms = 1000/s.",
     Callback = function(v)
@@ -4473,54 +3520,51 @@ MS:AddInput("SpamIntervalMs", {
         if n then SP.interval_ms = math.clamp(n, 0.5, 1000) end
     end,
 })
-MS:AddToggle("SpamHighSpeedFix", {
+Gui.MS:AddToggle("SpamHighSpeedFix", {
     Text = "High speed fix", Default = false,
     Tooltip = "Very fast balls are decided in server ticks (~60 a second): more than a couple of parries per tick just queue. While the ball is at least High speed at, every spam mode is paced to Sends per tick x 60/s, evenly, so every tick still gets one.",
     Callback = function(v) SP.hs_fix = v end,
 })
-MS:AddSlider("SpamHighSpeedAt", {
+Gui.MS:AddSlider("SpamHighSpeedAt", {
     Text = "High speed at", Default = 400, Min = 150, Max = 1500, Rounding = 0, Suffix = " sps",
     Callback = function(v) SP.hs_speed = v end,
 })
-MS:AddSlider("SpamHighSpeedPerTick", {
+Gui.MS:AddSlider("SpamHighSpeedPerTick", {
     Text = "Sends per tick", Default = 2, Min = 1, Max = 6, Rounding = 0,
     Tooltip = "Parries per server tick while the high speed fix is pacing (2 = 120/s).",
     Callback = function(v) SP.hs_per_tick = v end,
 })
-local SpamRateLabel = MS:AddLabel("Actual: 0/s", true)
+Gui.SpamRateLabel = Gui.MS:AddLabel("Actual: 0/s", true)
 
-local AS = Tabs.Spam:AddRightGroupbox("Auto Spam", "activity")
-AS:AddToggle("AutoSpam", {
+Gui.AS = Gui.Tabs.Spam:AddRightGroupbox("Auto Spam", "activity")
+Gui.AS:AddToggle("AutoSpam", {
     Text = "Auto spam", Default = false,
     Tooltip = "Spams through clashes and stops the moment the exchange is over.",
     Callback = function(v) SP.auto = v; Engine.want("autospam", v) end,
 }):AddKeyPicker("AutoSpamKey", { Default = "None", Mode = "Toggle", SyncToggleState = true, Text = "Auto spam" })
-AS:AddToggle("PredictiveClash", {
+Gui.AS:AddToggle("PredictiveClash", {
     Text = "Predictive start", Default = true,
     Tooltip = "Start as you send the ball to a close player whose return would be too fast to react to.",
     Callback = function(v) SP.predictive = v end,
 })
-AS:AddSlider("ClashSensitivity", {
+Gui.AS:AddSlider("ClashSensitivity", {
     Text = "Sensitivity", Default = 1.3, Min = 0.6, Max = 2.5, Rounding = 2,
     Tooltip = "Higher = calls a clash sooner. Lower = only very fast exchanges.",
     Callback = function(v) SP.sensitivity = v end,
 })
-AS:AddSlider("ClashRangeBonus", {
+Gui.AS:AddSlider("ClashRangeBonus", {
     Text = "Clash range", Default = 0, Min = -10, Max = 30, Rounding = 0, Suffix = " studs",
     Callback = function(v) SP.range_bonus = v end,
 })
-AS:AddSlider("ClashHold", {
+Gui.AS:AddSlider("ClashHold", {
     Text = "Hold", Default = 0.15, Min = 0, Max = 0.5, Rounding = 2, Suffix = "s",
     Tooltip = "Keeps spamming this long once the clash fades (hard stops still end it at once).",
     Callback = function(v) SP.hold = v end,
 })
-local ClashLabel = AS:AddLabel("Status: off", true)
+Gui.ClashLabel = Gui.AS:AddLabel("Status: off", true)
 
--- ----- Player tab -----
--- Avatar changer
-local Avatar = { target = "", original = nil }
-local AvatarChanger = Feature("AvatarChanger")
--- AvatarChanger works in the lobby too (0.5.100): it only touches your own character
+Mods.Avatar = { target = "", original = nil }
+Mods.AvatarChanger = Feature("AvatarChanger")
 do
     local function strip(char)
         for _, obj in ipairs(char:GetChildren()) do
@@ -4528,11 +3572,10 @@ do
                 or obj:IsA("BodyColors") or obj:IsA("CharacterMesh") or obj:IsA("ShirtGraphic") then obj:Destroy() end
         end
     end
-    local function save_original()
-        if Avatar.original then return end
+    local function saveOrig()
+        if Mods.Avatar.original then return end
         local char = LocalPlayer.Character; if not char then return end
-        local o = { Accessories = {}, CharacterMeshes = {} }
-        local head = char:FindFirstChild("Head")
+        local o, head = { Accessories = {}, CharacterMeshes = {} }, char:FindFirstChild("Head")
         if head then
             local face = head:FindFirstChildOfClass("Decal"); if face then o.Face = face.Texture end
             local hm = head:FindFirstChildOfClass("SpecialMesh"); if hm then o.HeadMesh = hm:Clone() end
@@ -4548,10 +3591,10 @@ do
             if obj:IsA("Accessory") or obj:IsA("Accoutrement") then o.Accessories[#o.Accessories + 1] = obj:Clone()
             elseif obj:IsA("CharacterMesh") then o.CharacterMeshes[#o.CharacterMeshes + 1] = obj:Clone() end
         end
-        Avatar.original = o
+        Mods.Avatar.original = o
     end
     local function restore()
-        local char, o = LocalPlayer.Character, Avatar.original
+        local char, o = LocalPlayer.Character, Mods.Avatar.original
         if not char or not o then return end
         pcall(function()
             strip(char)
@@ -4618,96 +3661,87 @@ do
         end)
         return true
     end
-    local function resolve_id(value)
+    local function resolveId(value)
         if value == nil or value == "" then return nil end
         local id = tonumber(value); if id then return id end
         local ok, r = pcall(function() return Players:GetUserIdFromNameAsync(value) end)
         return ok and r or nil
     end
-    function AvatarChanger.start()
-        local token = AvatarChanger._token
+    function Mods.AvatarChanger.start()
+        local token = Mods.AvatarChanger._token
         task.spawn(function()
-            local id = resolve_id(Avatar.target)
-            if not AvatarChanger:alive(token) then return end
+            local id = resolveId(Mods.Avatar.target)
+            if not Mods.AvatarChanger:alive(token) then return end
             if not id then Notify("Avatar Changer", "Invalid username or id", 3); return end
-            save_original()
+            saveOrig()
             if apply(id) then Notify("Avatar Changer", "Appearance changed", 3) end
-            -- keep it after a respawn
-            AvatarChanger:connect(LocalPlayer.CharacterAdded, function()
+            Mods.AvatarChanger:connect(LocalPlayer.CharacterAdded, function()
                 task.wait(1)
-                if AvatarChanger:alive(token) then apply(id) end
+                if Mods.AvatarChanger:alive(token) then apply(id) end
             end)
         end)
     end
-    function AvatarChanger.stop() restore() end
+    function Mods.AvatarChanger.stop() restore() end
 end
 
-local AVC = Tabs.Player:AddLeftGroupbox("Avatar Changer", "user")
-AVC:AddInput("AvatarTarget", { Text = "Target", Placeholder = "Username or user id", Default = "", Finished = true,
-    Callback = function(t) Avatar.target = t end })
-AVC:AddToggle("AvatarChanger", { Text = "Avatar changer", Default = false, Callback = function(v) AvatarChanger:setEnabled(v) end })
+Gui.AVC = Gui.Tabs.Player:AddLeftGroupbox("Avatar Changer", "user")
+Gui.AVC:AddInput("AvatarTarget", { Text = "Target", Placeholder = "Username or user id", Default = "", Finished = true,
+    Callback = function(t) Mods.Avatar.target = t end })
+Gui.AVC:AddToggle("AvatarChanger", { Text = "Avatar changer", Default = false, Callback = function(v) Mods.AvatarChanger:setEnabled(v) end })
 
--- Headless / Korblox
--- originals kept in a local weak table: an "OriginalScale" attribute on the
--- head mesh was a foreign attribute any game script could see
-local headless_orig = setmetatable({}, { __mode = "k" })
-local function apply_headless(char, on)
+Mods.headlessOrig = setmetatable({}, { __mode = "k" })
+function Mods.setHeadless(char, on)
     local head = char and char:FindFirstChild("Head"); if not head then return end
     head.Transparency = on and 1 or 0
     for _, child in head:GetChildren() do
         if child:IsA("Decal") or child.Name == "face" then child.Transparency = on and 1 or 0
         elseif child:IsA("SpecialMesh") or child:IsA("DataModelMesh") then
-            if on and headless_orig[child] == nil then
-                headless_orig[child] = child.Scale; child.Scale = Vector3.new(0, 0, 0)
-            elseif not on and headless_orig[child] ~= nil then
-                child.Scale = headless_orig[child]; headless_orig[child] = nil
+            if on and Mods.headlessOrig[child] == nil then
+                Mods.headlessOrig[child] = child.Scale; child.Scale = Vector3.new(0, 0, 0)
+            elseif not on and Mods.headlessOrig[child] ~= nil then
+                child.Scale = Mods.headlessOrig[child]; Mods.headlessOrig[child] = nil
             end
         end
     end
 end
--- our mesh is tracked locally; it carries the default "Mesh" name, not a
--- "KorbloxMesh" tell any game script could look for
-local korblox_mesh = setmetatable({}, { __mode = "k" })
-local function apply_korblox(char, on)
+Mods.korbloxMesh = setmetatable({}, { __mode = "k" })
+function Mods.setKorblox(char, on)
     local leg = char and char:FindFirstChild("Right Leg"); if not leg then return end
     if on then
-        local mine = korblox_mesh[leg]
+        local mine = Mods.korbloxMesh[leg]
         if mine and mine.Parent == leg then return end
         for _, v in leg:GetChildren() do if v:IsA("SpecialMesh") then v:Destroy() end end
-        local m = Instance.new("SpecialMesh"); m.Name = "Mesh"; korblox_mesh[leg] = m
+        local m = Instance.new("SpecialMesh"); m.Name = "Mesh"; Mods.korbloxMesh[leg] = m
         m.MeshId = "rbxassetid://902942096"; m.TextureId = "rbxassetid://902843398"
         m.Offset = Vector3.new(0, 0.7, 0); m.Parent = leg
     else
         for _, v in leg:GetChildren() do if v:IsA("SpecialMesh") then v:Destroy() end end
     end
 end
-local Headless = Feature("Headless")
--- Headless works in the lobby too (0.5.100): it only touches your own character
-function Headless.start()
-    pcall(apply_headless, LocalPlayer.Character, true)
-    Headless:connect(LocalPlayer.CharacterAdded, function(c) task.wait(0.5); if Headless.on then pcall(apply_headless, c, true) end end)
+Mods.Headless = Feature("Headless")
+function Mods.Headless.start()
+    pcall(Mods.setHeadless, LocalPlayer.Character, true)
+    Mods.Headless:connect(LocalPlayer.CharacterAdded, function(c) task.wait(0.5); if Mods.Headless.on then pcall(Mods.setHeadless, c, true) end end)
 end
-function Headless.stop() pcall(apply_headless, LocalPlayer.Character, false) end
-local Korblox = Feature("Korblox")
--- Korblox works in the lobby too (0.5.100): it only touches your own character
-function Korblox.start()
-    pcall(apply_korblox, LocalPlayer.Character, true)
-    Korblox:connect(LocalPlayer.CharacterAdded, function(c) task.wait(0.5); if Korblox.on then pcall(apply_korblox, c, true) end end)
+function Mods.Headless.stop() pcall(Mods.setHeadless, LocalPlayer.Character, false) end
+Mods.Korblox = Feature("Korblox")
+function Mods.Korblox.start()
+    pcall(Mods.setKorblox, LocalPlayer.Character, true)
+    Mods.Korblox:connect(LocalPlayer.CharacterAdded, function(c) task.wait(0.5); if Mods.Korblox.on then pcall(Mods.setKorblox, c, true) end end)
 end
-function Korblox.stop() pcall(apply_korblox, LocalPlayer.Character, false) end
+function Mods.Korblox.stop() pcall(Mods.setKorblox, LocalPlayer.Character, false) end
 
-local HK = Tabs.Player:AddRightGroupbox("Cosmetics", "shirt")
-HK:AddToggle("Headless", { Text = "Headless", Default = false, Callback = function(v) Headless:setEnabled(v) end })
-HK:AddToggle("Korblox", { Text = "Korblox", Default = false, Callback = function(v) Korblox:setEnabled(v) end })
+Gui.HK = Gui.Tabs.Player:AddRightGroupbox("Cosmetics", "shirt")
+Gui.HK:AddToggle("Headless", { Text = "Headless", Default = false, Callback = function(v) Mods.Headless:setEnabled(v) end })
+Gui.HK:AddToggle("Korblox", { Text = "Korblox", Default = false, Callback = function(v) Mods.Korblox:setEnabled(v) end })
 
--- Auto jump
-local AutoJump = Feature("AutoJump")
-AutoJump.round_only = true -- touches your character / game state: rounds only (lobby detection)
+Mods.AutoJump = Feature("AutoJump")
+Mods.AutoJump.round_only = true
 do
     local lastGrounded = false
-    function AutoJump.start()
+    function Mods.AutoJump.start()
         lastGrounded = false
-        AutoJump:connect(RunService.Heartbeat, function()
+        Mods.AutoJump:connect(RunService.Heartbeat, function()
             local char = LocalPlayer.Character
             local hum = char and char:FindFirstChildOfClass("Humanoid")
             if not hum then return end
@@ -4717,36 +3751,15 @@ do
         end)
     end
 end
-local MV = Tabs.Player:AddRightGroupbox("Movement", "footprints")
-MV:AddToggle("AutoJump", {
+Gui.MV = Gui.Tabs.Player:AddRightGroupbox("Movement", "footprints")
+Gui.MV:AddToggle("AutoJump", {
     Text = "Auto jump", Default = false,
-    Callback = function(v) AutoJump:setEnabled(v) end,
+    Callback = function(v) Mods.AutoJump:setEnabled(v) end,
 }):AddKeyPicker("AutoJumpKey", { Default = "J", Mode = "Toggle", SyncToggleState = true, Text = "Auto jump" })
 
--- ----- Orbit tab -----
--- Circles (or traces a shape around) a centre every frame.
---   Yourself: the centre is where you stood when you turned it on, and it is
---     WALKABLE -- your movement input (WASD / joystick / gamepad, read from
---     Humanoid.MoveDirection) moves it at your walk speed. The CAMERA stays on
---     that centre (Humanoid.CameraOffset pins the focus there), so it behaves as
---     if you were standing on it instead of swinging with the orbit, and
---     AutoRotate is off while orbiting so Roblox stops turning you / the camera.
---   Ball: the centre is the ball -- in a match only the real match ball
---     (Workspace.Balls), in lobby training only your training ball
---     (Workspace.TrainingBalls), never mixed up.
---   Avoid ball: a walkable centre like Yourself, but instead of tracing a shape
---     you stand on the point within Radius of it that is farthest from the ball
---     and from where the ball will be over the next 0.3 s.
---   In the plain lobby it does nothing at all.
--- Semi immortal: every other frame you're moved off your spot and back (the
--- camera ignores it). Flip = straight up by Flip height. Range = the point
--- within Range farthest off the line of a ball coming at you; the distance
--- grows with ball speed (a 1000+ studs/s ball moves 16+ studs a frame), and once
--- the ball is a frame or two away you stay off the line every frame instead of
--- every other. Works with or without orbit. Plain task loops, no listeners.
-local OrbitCfg = { Center = "Yourself", Shape = "Circle", Radius = 8, Speed = 0.5, Clockwise = false, Height = 0,
+Mods.OrbitCfg = { Center = "Yourself", Shape = "Circle", Radius = 8, Speed = 0.5, Clockwise = false, Height = 0,
     Walk = 1, Face = false, Bob = false, BobAmp = 25, BobMode = "Range", BobRange = 30 }
-local function orbit_ctx()
+function Mods.orbitCtx()
     local char = LocalPlayer.Character
     if not char or not char.Parent then return nil end
     local alive = Workspace:FindFirstChild("Alive")
@@ -4755,9 +3768,9 @@ local function orbit_ctx()
         local dead = Workspace:FindFirstChild("Dead")
         if dead and char.Parent == dead then return "training" end
     end
-    return nil -- lobby: nothing
+    return nil
 end
-local function orbit_ball(ctx)
+function Mods.orbitBall(ctx)
     local folder = Workspace:FindFirstChild(ctx == "training" and "TrainingBalls" or "Balls")
     if not folder then return nil end
     local first
@@ -4769,8 +3782,7 @@ local function orbit_ball(ctx)
     end
     return first
 end
--- unit offset (x, z) of a shape at parameter t (radians, one lap = 2pi)
-local function shape_point(shape, t)
+function Mods.shapePt(shape, t)
     if shape == "Ellipse" then return math.cos(t), math.sin(t) * 0.5 end
     if shape == "Figure 8" then return math.sin(t), math.sin(t) * math.cos(t) end
     if shape == "Flower" then local r = math.cos(3 * t); return r * math.cos(t), r * math.sin(t) end
@@ -4781,59 +3793,49 @@ local function shape_point(shape, t)
     local i0 = math.floor(u)
     local f = u - i0
     local function vert(k)
-        local a = 2 * math.pi * (k % n) / n - math.pi / 2
-        local r = (inner and k % 2 == 1) and inner or 1
+        local a, r = 2 * math.pi * (k % n) / n - math.pi / 2, (inner and k % 2 == 1) and inner or 1
         return math.cos(a) * r, math.sin(a) * r
     end
     local x1, z1 = vert(i0)
     local x2, z2 = vert(i0 + 1)
     return x1 + (x2 - x1) * f, z1 + (z2 - z1) * f
 end
--- Bob.last = the offset applied last frame, so the next frame can find home again
-local Bob = { flip = false, base = nil, last = nil, avoid_p = nil }
--- the game drives the ball with a LinearVelocity named zoomies
-function Bob.vel(b)
+Mods.Bob = { flip = false, base = nil, last = nil, avoid_p = nil }
+function Mods.Bob.vel(b)
     local z = b:FindFirstChild("zoomies")
     return z and z.VectorVelocity or b.AssemblyLinearVelocity
 end
--- Range mode: offset from home to the point within range farthest off the line
--- of a ball coming at you (nil while none is), and whether it's about to land
-function Bob.dodge(ctx, home, dt)
-    local b = orbit_ball(ctx)
+function Mods.Bob.dodge(ctx, home, dt)
+    local b = Mods.orbitBall(ctx)
     if not b or b:GetAttribute("target") ~= LocalPlayer.Name then return nil end
-    local v = Bob.vel(b)
-    local speed = v.Magnitude
-    local to = home - b.Position
-    local dist = to.Magnitude
-    local step = speed * math.max(dt, 1 / 60)
+    local v = Mods.Bob.vel(b)
+    local speed, to = v.Magnitude, home - b.Position
+    local dist, step = to.Magnitude, speed * math.max(dt, 1 / 60)
     if dist > 15 + speed * 0.35 then return nil end
-    local range = math.max(OrbitCfg.BobRange, step * 1.5 + 6)
+    local range = math.max(Mods.OrbitCfg.BobRange, step * 1.5 + 6)
     local dir = speed > 1 and v / speed or (dist > 0.01 and -to / dist or Vector3.yAxis)
-    local off = to - dir * to:Dot(dir) -- your side of the ball's line
+    local off = to - dir * to:Dot(dir)
     if off.Magnitude < 0.5 then
         off = dir:Cross(Vector3.yAxis)
         if off.Magnitude < 0.5 then off = Vector3.xAxis end
     end
     local n = off.Unit
-    if n.Y < 0 then n = Vector3.new(n.X, -n.Y, n.Z) end -- never into the floor
+    if n.Y < 0 then n = Vector3.new(n.X, -n.Y, n.Z) end
     if dist > 0.01 then n = (n + (to / dist) * 0.25).Unit end
     return n * range, dist <= step * 3 + 10
 end
--- offset for this frame, alternating home / away every call
-function Bob.delta(ctx, home, dt)
-    if not OrbitCfg.Bob then Bob.flip = false; return Vector3.zero end
-    Bob.flip = not Bob.flip
-    if OrbitCfg.BobMode ~= "Range" then return Bob.flip and Vector3.new(0, OrbitCfg.BobAmp, 0) or Vector3.zero end
-    local d, close = Bob.dodge(ctx, home, dt)
-    if not d then return Bob.flip and Vector3.new(0, OrbitCfg.BobRange, 0) or Vector3.zero end
-    return (Bob.flip or close) and d or Vector3.zero
+function Mods.Bob.delta(ctx, home, dt)
+    if not Mods.OrbitCfg.Bob then Mods.Bob.flip = false; return Vector3.zero end
+    Mods.Bob.flip = not Mods.Bob.flip
+    if Mods.OrbitCfg.BobMode ~= "Range" then return Mods.Bob.flip and Vector3.new(0, Mods.OrbitCfg.BobAmp, 0) or Vector3.zero end
+    local d, close = Mods.Bob.dodge(ctx, home, dt)
+    if not d then return Mods.Bob.flip and Vector3.new(0, Mods.OrbitCfg.BobRange, 0) or Vector3.zero end
+    return (Mods.Bob.flip or close) and d or Vector3.zero
 end
--- Avoid ball: the point within r of anchor (flat) farthest from the ball now
--- and over its next 0.3 s; keeps the last pick unless a new one is 2+ studs better
-function Bob.avoid(ctx, anchor, r)
-    local b = orbit_ball(ctx)
-    if not b then Bob.avoid_p = nil; return anchor end
-    local bp, v = b.Position, Bob.vel(b)
+function Mods.Bob.avoid(ctx, anchor, r)
+    local b = Mods.orbitBall(ctx)
+    if not b then Mods.Bob.avoid_p = nil; return anchor end
+    local bp, v = b.Position, Mods.Bob.vel(b)
     local function score(p)
         local s = math.huge
         for i = 0, 3 do
@@ -4842,102 +3844,99 @@ function Bob.avoid(ctx, anchor, r)
         end
         return s
     end
-    local best, best_s = anchor, score(anchor)
+    local best, bestS = anchor, score(anchor)
     for i = 0, 23 do
         local a = i * math.pi / 12
         local p = anchor + Vector3.new(math.cos(a) * r, 0, math.sin(a) * r)
         local sc = score(p)
-        if sc > best_s then best, best_s = p, sc end
+        if sc > bestS then best, bestS = p, sc end
     end
-    local old = Bob.avoid_p
-    if old and (Vector3.new(old.X - anchor.X, 0, old.Z - anchor.Z)).Magnitude <= r + 0.01 and score(old) >= best_s - 2 then
+    local old = Mods.Bob.avoid_p
+    if old and (Vector3.new(old.X - anchor.X, 0, old.Z - anchor.Z)).Magnitude <= r + 0.01 and score(old) >= bestS - 2 then
         best = old
     end
-    Bob.avoid_p = best
+    Mods.Bob.avoid_p = best
     return best
 end
-local Orbit = Feature("Orbit")
-local SemiImmortal = Feature("SemiImmortal")
-local orbit_saved = { hum = nil, autorotate = nil }
-local function cam_reset()
-    local h = orbit_saved.hum
+Mods.Orbit = Feature("Orbit")
+Mods.SemiImmortal = Feature("SemiImmortal")
+Mods.orbitSaved = { hum = nil, autorotate = nil }
+function Mods.camReset()
+    local h = Mods.orbitSaved.hum
     if h then
         pcall(function() h.CameraOffset = Vector3.zero end)
-        if orbit_saved.autorotate ~= nil then pcall(function() h.AutoRotate = orbit_saved.autorotate end) end
+        if Mods.orbitSaved.autorotate ~= nil then pcall(function() h.AutoRotate = Mods.orbitSaved.autorotate end) end
     end
-    orbit_saved.hum, orbit_saved.autorotate = nil, nil
+    Mods.orbitSaved.hum, Mods.orbitSaved.autorotate = nil, nil
 end
-local function cam_hold(hum)
-    if orbit_saved.hum ~= hum then
-        cam_reset()
-        orbit_saved.hum, orbit_saved.autorotate = hum, hum.AutoRotate
+function Mods.camHold(hum)
+    if Mods.orbitSaved.hum ~= hum then
+        Mods.camReset()
+        Mods.orbitSaved.hum, Mods.orbitSaved.autorotate = hum, hum.AutoRotate
         hum.AutoRotate = false
     end
 end
 do
-    local anchor, angle, char_seen = nil, 0, nil
+    local anchor, angle, charSeen = nil, 0, nil
     local function step(dt)
-        local ctx = orbit_ctx()
-        local char = LocalPlayer.Character
-        local hrp = char and char:FindFirstChild("HumanoidRootPart")
-        local hum = char and char:FindFirstChildOfClass("Humanoid")
-        if not ctx or not hrp or not hum or hum.Health <= 0 then anchor, Bob.base, Bob.last = nil, nil, nil; cam_reset(); return end
-        if char ~= char_seen then char_seen, anchor, Bob.base, Bob.last = char, nil, nil, nil end
-        local r = OrbitCfg.Radius
-        local center, self_mode
-        if OrbitCfg.Center == "Ball" then
-            local b = orbit_ball(ctx)
-            if not b then anchor = nil; cam_reset(); return end -- no ball: leave you alone
+        local ctx, char = Mods.orbitCtx(), LocalPlayer.Character
+        local hrp, hum = char and char:FindFirstChild("HumanoidRootPart"), char and char:FindFirstChildOfClass("Humanoid")
+        if not ctx or not hrp or not hum or hum.Health <= 0 then anchor, Mods.Bob.base, Mods.Bob.last = nil, nil, nil; Mods.camReset(); return end
+        if char ~= charSeen then charSeen, anchor, Mods.Bob.base, Mods.Bob.last = char, nil, nil, nil end
+        local r = Mods.OrbitCfg.Radius
+        local center, selfMode
+        if Mods.OrbitCfg.Center == "Ball" then
+            local b = Mods.orbitBall(ctx)
+            if not b then anchor = nil; Mods.camReset(); return end
             center, anchor = b.Position, nil
         else
-            self_mode = true
+            selfMode = true
             if not anchor or (Vector3.new(anchor.X, 0, anchor.Z) - Vector3.new(hrp.Position.X, 0, hrp.Position.Z)).Magnitude > r * 2 + 40 then
-                anchor = hrp.Position -- start / respawn / teleport: orbit where you stand
+                anchor = hrp.Position
             end
             local md = hum.MoveDirection
             if md.Magnitude > 0.01 then
-                anchor = anchor + Vector3.new(md.X, 0, md.Z).Unit * hum.WalkSpeed * OrbitCfg.Walk * dt
+                anchor = anchor + Vector3.new(md.X, 0, md.Z).Unit * hum.WalkSpeed * Mods.OrbitCfg.Walk * dt
             end
             center = anchor
         end
-        angle = (angle + OrbitCfg.Speed * 2 * math.pi * (OrbitCfg.Clockwise and -1 or 1) * dt) % (2 * math.pi)
-        local ox, oz = shape_point(OrbitCfg.Shape, angle)
-        local hover = OrbitCfg.Height ~= 0
-        local base_y
+        angle = (angle + Mods.OrbitCfg.Speed * 2 * math.pi * (Mods.OrbitCfg.Clockwise and -1 or 1) * dt) % (2 * math.pi)
+        local ox, oz = Mods.shapePt(Mods.OrbitCfg.Shape, angle)
+        local hover = Mods.OrbitCfg.Height ~= 0
+        local baseY
         if hover then
-            base_y = center.Y + OrbitCfg.Height
-        elseif OrbitCfg.Bob then
-            Bob.base = Bob.base or hrp.Position.Y
-            base_y = Bob.base
+            baseY = center.Y + Mods.OrbitCfg.Height
+        elseif Mods.OrbitCfg.Bob then
+            Mods.Bob.base = Mods.Bob.base or hrp.Position.Y
+            baseY = Mods.Bob.base
         else
-            Bob.base = nil
-            base_y = hrp.Position.Y
+            Mods.Bob.base = nil
+            baseY = hrp.Position.Y
         end
         local home
-        if OrbitCfg.Center == "Avoid ball" then
-            local a = Bob.avoid(ctx, center, r)
-            home = Vector3.new(a.X, base_y, a.Z)
+        if Mods.OrbitCfg.Center == "Avoid ball" then
+            local a = Mods.Bob.avoid(ctx, center, r)
+            home = Vector3.new(a.X, baseY, a.Z)
         else
-            home = Vector3.new(center.X + ox * r, base_y, center.Z + oz * r)
+            home = Vector3.new(center.X + ox * r, baseY, center.Z + oz * r)
         end
-        local off = Bob.delta(ctx, home, dt)
-        Bob.last = off
+        local off = Mods.Bob.delta(ctx, home, dt)
+        Mods.Bob.last = off
         local pos = home + off
-        local rot = OrbitCfg.Face and CFrame.lookAt(pos, Vector3.new(center.X, pos.Y, center.Z)).Rotation or hrp.CFrame.Rotation
-        cam_hold(hum)
+        local rot = Mods.OrbitCfg.Face and CFrame.lookAt(pos, Vector3.new(center.X, pos.Y, center.Z)).Rotation or hrp.CFrame.Rotation
+        Mods.camHold(hum)
         hrp.CFrame = CFrame.new(pos) * rot
         local v = hrp.AssemblyLinearVelocity
-        hrp.AssemblyLinearVelocity = Vector3.new(0, (hover or OrbitCfg.Bob) and 0 or v.Y, 0)
-        -- camera: as if you stood on the centre (self) / ignoring the bob (ball)
-        local focus = self_mode and Vector3.new(center.X, base_y, center.Z) or home
+        hrp.AssemblyLinearVelocity = Vector3.new(0, (hover or Mods.OrbitCfg.Bob) and 0 or v.Y, 0)
+        local focus = selfMode and Vector3.new(center.X, baseY, center.Z) or home
         hum.CameraOffset = hrp.CFrame:VectorToObjectSpace(focus - hrp.Position)
     end
-    function Orbit.start()
-        anchor, char_seen, Bob.base = nil, nil, nil
-        local tok = Orbit._token
+    function Mods.Orbit.start()
+        anchor, charSeen, Mods.Bob.base = nil, nil, nil
+        local tok = Mods.Orbit._token
         task.spawn(function()
             local last = os.clock()
-            while Orbit:alive(tok) do
+            while Mods.Orbit:alive(tok) do
                 local now = os.clock()
                 local dt = math.min(now - last, 0.1)
                 last = now
@@ -4946,32 +3945,30 @@ do
             end
         end)
     end
-    function Orbit.stop() anchor, Bob.base, Bob.avoid_p = nil, nil, nil; cam_reset() end
+    function Mods.Orbit.stop() anchor, Mods.Bob.base, Mods.Bob.avoid_p = nil, nil, nil; Mods.camReset() end
 end
--- semi immortal on its own (orbit off): off your spot and back every frame
-function SemiImmortal.start()
-    local tok = SemiImmortal._token
-    Bob.base, Bob.last = nil, nil
+function Mods.SemiImmortal.start()
+    local tok = Mods.SemiImmortal._token
+    Mods.Bob.base, Mods.Bob.last = nil, nil
     task.spawn(function()
-        local last_t = os.clock()
-        while SemiImmortal:alive(tok) do
+        local lastT = os.clock()
+        while Mods.SemiImmortal:alive(tok) do
             local now = os.clock()
-            local dt = math.min(now - last_t, 0.1)
-            last_t = now
+            local dt = math.min(now - lastT, 0.1)
+            lastT = now
             pcall(function()
-                if Orbit.on then return end -- orbit applies it itself
+                if Mods.Orbit.on then return end
                 local char = LocalPlayer.Character
-                local hrp = char and char:FindFirstChild("HumanoidRootPart")
-                local hum = char and char:FindFirstChildOfClass("Humanoid")
-                local ctx = orbit_ctx()
-                if not ctx or not hrp or not hum or hum.Health <= 0 then Bob.base, Bob.last = nil, nil; cam_reset(); return end
-                local p = hrp.Position - (Bob.last or Vector3.zero) -- where you really are
-                Bob.base = Bob.base or p.Y
-                local home = Vector3.new(p.X, Bob.base, p.Z)
-                local off = Bob.delta(ctx, home, dt)
-                cam_hold(hum)
+                local hrp, hum = char and char:FindFirstChild("HumanoidRootPart"), char and char:FindFirstChildOfClass("Humanoid")
+                local ctx = Mods.orbitCtx()
+                if not ctx or not hrp or not hum or hum.Health <= 0 then Mods.Bob.base, Mods.Bob.last = nil, nil; Mods.camReset(); return end
+                local p = hrp.Position - (Mods.Bob.last or Vector3.zero)
+                Mods.Bob.base = Mods.Bob.base or p.Y
+                local home = Vector3.new(p.X, Mods.Bob.base, p.Z)
+                local off = Mods.Bob.delta(ctx, home, dt)
+                Mods.camHold(hum)
                 hrp.CFrame = CFrame.new(home + off) * hrp.CFrame.Rotation
-                Bob.last = off
+                Mods.Bob.last = off
                 local v = hrp.AssemblyLinearVelocity
                 hrp.AssemblyLinearVelocity = Vector3.new(v.X, 0, v.Z)
                 hum.CameraOffset = hrp.CFrame:VectorToObjectSpace(-off)
@@ -4980,58 +3977,57 @@ function SemiImmortal.start()
         end
     end)
 end
-function SemiImmortal.stop() Bob.base, Bob.last = nil, nil; if not Orbit.on then cam_reset() end end
+function Mods.SemiImmortal.stop() Mods.Bob.base, Mods.Bob.last = nil, nil; if not Mods.Orbit.on then Mods.camReset() end end
 
-local OB = Tabs.Orbit:AddLeftGroupbox("Orbit", "orbit")
-OB:AddToggle("Orbit", {
+Gui.OB = Gui.Tabs.Orbit:AddLeftGroupbox("Orbit", "orbit")
+Gui.OB:AddToggle("Orbit", {
     Text = "Orbit", Default = false,
     Tooltip = "Works in a match and in lobby training; does nothing in the lobby. Fast orbits move you faster than walking.",
-    Callback = function(v) Orbit:setEnabled(v) end,
+    Callback = function(v) Mods.Orbit:setEnabled(v) end,
 }):AddKeyPicker("OrbitKey", { Default = "O", Mode = "Toggle", SyncToggleState = true, Text = "Orbit" })
-OB:AddDropdown("OrbitCenter", {
+Gui.OB:AddDropdown("OrbitCenter", {
     Values = { "Yourself", "Ball", "Avoid ball" }, Default = "Yourself", Text = "Orbit around",
     Tooltip = "Yourself: the spot you were standing on -- walking moves that spot and the camera stays on it. Ball: the match ball in a match, your training ball in training. Avoid ball: walkable like Yourself, but you stand on the point within Radius farthest from the ball and its path.",
-    Callback = function(v) OrbitCfg.Center = v end,
+    Callback = function(v) Mods.OrbitCfg.Center = v end,
 })
-OB:AddDropdown("OrbitShape", {
+Gui.OB:AddDropdown("OrbitShape", {
     Values = { "Circle", "Ellipse", "Triangle", "Square", "Hexagon", "Star", "Figure 8", "Flower" }, Default = "Circle", Text = "Shape",
-    Callback = function(v) OrbitCfg.Shape = v end,
+    Callback = function(v) Mods.OrbitCfg.Shape = v end,
 })
-OB:AddSlider("OrbitRadius", { Text = "Radius", Default = 8, Min = 2, Max = 80, Rounding = 1, Suffix = " studs",
-    Callback = function(v) OrbitCfg.Radius = v end })
-OB:AddSlider("OrbitSpeed", { Text = "Speed", Default = 0.5, Min = 0.05, Max = 20, Rounding = 2, Suffix = " laps/s",
-    Callback = function(v) OrbitCfg.Speed = v end })
-OB:AddDropdown("OrbitDirection", { Values = { "Counter-clockwise", "Clockwise" }, Default = "Counter-clockwise", Text = "Direction",
-    Callback = function(v) OrbitCfg.Clockwise = v == "Clockwise" end })
-OB:AddSlider("OrbitHeight", { Text = "Height", Default = 0, Min = -10, Max = 40, Rounding = 1, Suffix = " studs",
+Gui.OB:AddSlider("OrbitRadius", { Text = "Radius", Default = 8, Min = 2, Max = 80, Rounding = 1, Suffix = " studs",
+    Callback = function(v) Mods.OrbitCfg.Radius = v end })
+Gui.OB:AddSlider("OrbitSpeed", { Text = "Speed", Default = 0.5, Min = 0.05, Max = 20, Rounding = 2, Suffix = " laps/s",
+    Callback = function(v) Mods.OrbitCfg.Speed = v end })
+Gui.OB:AddDropdown("OrbitDirection", { Values = { "Counter-clockwise", "Clockwise" }, Default = "Counter-clockwise", Text = "Direction",
+    Callback = function(v) Mods.OrbitCfg.Clockwise = v == "Clockwise" end })
+Gui.OB:AddSlider("OrbitHeight", { Text = "Height", Default = 0, Min = -10, Max = 40, Rounding = 1, Suffix = " studs",
     Tooltip = "0 = stay on the ground (gravity and jumping still work). Anything else holds you that high above the centre.",
-    Callback = function(v) OrbitCfg.Height = v end })
-OB:AddSlider("OrbitWalk", { Text = "Walk speed", Default = 1, Min = 0, Max = 3, Rounding = 2, Suffix = "x",
+    Callback = function(v) Mods.OrbitCfg.Height = v end })
+Gui.OB:AddSlider("OrbitWalk", { Text = "Walk speed", Default = 1, Min = 0, Max = 3, Rounding = 2, Suffix = "x",
     Tooltip = "How fast your movement input moves the centre (x your walk speed). 0 = the centre stays put.",
-    Callback = function(v) OrbitCfg.Walk = v end })
-OB:AddToggle("OrbitFace", { Text = "Face the centre", Default = false,
-    Callback = function(v) OrbitCfg.Face = v end })
-local SI = Tabs.Orbit:AddRightGroupbox("Semi immortal", "shield")
-SI:AddToggle("SemiImmortal", { Text = "Semi immortal", Default = false,
+    Callback = function(v) Mods.OrbitCfg.Walk = v end })
+Gui.OB:AddToggle("OrbitFace", { Text = "Face the centre", Default = false,
+    Callback = function(v) Mods.OrbitCfg.Face = v end })
+Gui.SI = Gui.Tabs.Orbit:AddRightGroupbox("Semi immortal", "shield")
+Gui.SI:AddToggle("SemiImmortal", { Text = "Semi immortal", Default = false,
     Tooltip = "Moves you off your spot and back every frame, so the ball can't settle on you. Works with or without orbit; the camera ignores it. In a match / training only.",
-    Callback = function(v) OrbitCfg.Bob = v; SemiImmortal:setEnabled(v) end })
-SI:AddDropdown("SemiImmortalMode", { Values = { "Range", "Flip" }, Default = "Range", Text = "Mode",
+    Callback = function(v) Mods.OrbitCfg.Bob = v; Mods.SemiImmortal:setEnabled(v) end })
+Gui.SI:AddDropdown("SemiImmortalMode", { Values = { "Range", "Flip" }, Default = "Range", Text = "Mode",
     Tooltip = "Range: to the point within Range farthest off the incoming ball's line, farther for faster balls (1000+ speed), and every frame once it's about to land. Flip: straight up by Flip height.",
-    Callback = function(v) OrbitCfg.BobMode = v end })
-SI:AddSlider("SemiImmortalRange", { Text = "Range", Default = 30, Min = 5, Max = 120, Rounding = 0, Suffix = " studs",
+    Callback = function(v) Mods.OrbitCfg.BobMode = v end })
+Gui.SI:AddSlider("SemiImmortalRange", { Text = "Range", Default = 30, Min = 5, Max = 120, Rounding = 0, Suffix = " studs",
     Tooltip = "Minimum distance for Range mode; fast balls push it further automatically.",
-    Callback = function(v) OrbitCfg.BobRange = v end })
-SI:AddSlider("SemiImmortalAmp", { Text = "Flip height", Default = 25, Min = 5, Max = 120, Rounding = 0, Suffix = " studs",
-    Callback = function(v) OrbitCfg.BobAmp = v end })
+    Callback = function(v) Mods.OrbitCfg.BobRange = v end })
+Gui.SI:AddSlider("SemiImmortalAmp", { Text = "Flip height", Default = 25, Min = 5, Max = 120, Rounding = 0, Suffix = " studs",
+    Callback = function(v) Mods.OrbitCfg.BobAmp = v end })
 
--- ----- Visuals tab -----
-local function hexc(c) return ("%02x%02x%02x"):format(math.floor(c.R * 255), math.floor(c.G * 255), math.floor(c.B * 255)) end
-local function speed_color(s)
+function Mods.hexc(c) return ("%02x%02x%02x"):format(math.floor(c.R * 255), math.floor(c.G * 255), math.floor(c.B * 255)) end
+function Mods.speedColor(s)
     if s > 2000 then return Color3.fromRGB(255, 0, 0) elseif s > 1500 then return Color3.fromRGB(255, 165, 0)
     elseif s > 1000 then return Color3.fromRGB(255, 215, 0) end
     return Color3.fromRGB(255, 255, 0)
 end
-local function panel(name, size, pos, title_text)
+function Mods.panel(name, size, pos, titleText)
     local gui = Instance.new("ScreenGui"); gui.Name = randName(); gui.ResetOnSpawn = false
     gui.IgnoreGuiInset = true; gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling; gui.DisplayOrder = 999
     local frame = Instance.new("Frame"); frame.Size = size; frame.Position = pos
@@ -5039,9 +4035,9 @@ local function panel(name, size, pos, title_text)
     frame.BorderSizePixel = 0; frame.Active = true; frame.Draggable = true; frame.Parent = gui
     Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 8)
     local stroke = Instance.new("UIStroke", frame); stroke.Color = Color3.fromRGB(60, 60, 70)
-    if title_text then
+    if titleText then
         local t = Instance.new("TextLabel", frame); t.Size = UDim2.new(1, 0, 0, 18); t.Position = UDim2.new(0, 0, 0, 4)
-        t.BackgroundTransparency = 1; t.Text = title_text; t.TextColor3 = Color3.fromRGB(255, 255, 255)
+        t.BackgroundTransparency = 1; t.Text = titleText; t.TextColor3 = Color3.fromRGB(255, 255, 255)
         t.Font = Enum.Font.GothamBold; t.TextSize = 13
     end
     local function line(y)
@@ -5054,54 +4050,42 @@ local function panel(name, size, pos, title_text)
     return gui, line
 end
 
-local BallVelocity = Feature("BallVelocity")
-BallVelocity.round_only = true -- touches your character / game state: rounds only (lobby detection)
-function BallVelocity.start()
-    local gui, line = panel("BB_BallVelocity", UDim2.new(0, 200, 0, 70), UDim2.new(0, 10, 0.78, 0), "Ball Status")
-    BallVelocity:own(gui)
+Mods.BallVelocity = Feature("BallVelocity")
+Mods.BallVelocity.round_only = true
+function Mods.BallVelocity.start()
+    local gui, line = Mods.panel("BB_BallVelocity", UDim2.new(0, 200, 0, 70), UDim2.new(0, 10, 0.78, 0), "Ball Status")
+    Mods.BallVelocity:own(gui)
     local cur, peakl = line(24), line(44)
-    local peak, last_ball = 0, nil
+    local peak, lastBall = 0, nil
     pcall(Parry.resolve)
-    BallVelocity:connect(RunService.RenderStepped, function()
+    Mods.BallVelocity:connect(RunService.RenderStepped, function()
         local ball = Parry.mainBall()
         if not ball then cur.Text = "Current: 0"; return end
-        if ball ~= last_ball then peak, last_ball = 0, ball end
+        if ball ~= lastBall then peak, lastBall = 0, ball end
         local s = Parry.ballVelocity(ball).Magnitude
         if s > peak then peak = s end
-        cur.Text = ("Current: <font color='#%s'>%.1f</font>"):format(hexc(speed_color(s)), s)
-        peakl.Text = ("Peak: <font color='#%s'>%.1f</font>"):format(hexc(speed_color(peak)), peak)
+        cur.Text = ("Current: <font color='#%s'>%.1f</font>"):format(Mods.hexc(Mods.speedColor(s)), s)
+        peakl.Text = ("Peak: <font color='#%s'>%.1f</font>"):format(Mods.hexc(Mods.speedColor(peak)), peak)
     end)
 end
 
-local PingOverlay = Feature("PingOverlay")
-function PingOverlay.start()
-    local gui, line = panel("BB_Ping", UDim2.new(0, 110, 0, 32), UDim2.new(0, 15, 0.9, 0), nil)
-    PingOverlay:own(gui)
+Mods.PingOverlay = Feature("PingOverlay")
+function Mods.PingOverlay.start()
+    local gui, line = Mods.panel("BB_Ping", UDim2.new(0, 110, 0, 32), UDim2.new(0, 15, 0.9, 0), nil)
+    Mods.PingOverlay:own(gui)
     local l = line(6)
     l.TextXAlignment = Enum.TextXAlignment.Center
-    PingOverlay:loop(0.5, function()
+    Mods.PingOverlay:loop(0.5, function()
         local p = Parry.pingMs()
         local c = p < 80 and Color3.fromRGB(0, 255, 0) or (p < 150 and Color3.fromRGB(255, 220, 0) or Color3.fromRGB(255, 60, 60))
-        l.Text = ("Ping: <font color='#%s'>%dms</font>"):format(hexc(c), math.floor(p + 0.5))
+        l.Text = ("Ping: <font color='#%s'>%dms</font>"):format(Mods.hexc(c), math.floor(p + 0.5))
     end)
 end
 
--- Ability ESP
-local EspCfg = { Color = Color3.fromRGB(255, 255, 255), TextSize = 14, Height = 3.5, ShowName = true, ShowDistance = false,
+Mods.EspCfg = { Color = Color3.fromRGB(255, 255, 255), TextSize = 14, Height = 3.5, ShowName = true, ShowDistance = false,
     OnlyWithAbility = false, MaxDistance = 0, ShowActive = true, ShowCooldown = true, ShowSelf = true }
-local AbilityESP = Feature("AbilityESP")
+Mods.AbilityESP = Feature("AbilityESP")
 do
-    -- A 2D overlay: ONE ScreenGui in gethui -- the same kind of GUI in the same
-    -- place as the menu, which renders on Delta and has never kicked -- with a
-    -- label per player placed over their head every frame from the camera
-    -- projection. (BillboardGuis in Delta's gethui folder never draw -- the
-    -- self-label test showed it -- and Drawing text came out tiny / glitchy on
-    -- mobile.) No game-signal listeners at all: players are scanned by a 0.1s
-    -- loop and labels placed by a per-frame task.wait() loop, because listeners
-    -- attached in the lobby are what BAC kicks on (reason 24).
-    -- Line 1: name / [ability] / distance; line 2: READY or cooldown left
-    -- (character CooldownExpiration). Ability: EquippedAbility attribute, else
-    -- the Enabled script under character.Abilities.
     local gui, entries = nil, {}
     local function esc(t) return (tostring(t):gsub('&', '&amp;'):gsub('<', '&lt;'):gsub('>', '&gt;')) end
     local function equipped(player, character)
@@ -5115,7 +4099,7 @@ do
         end
         return nil
     end
-    local function make_gui()
+    local function mkGui()
         local g = Instance.new("ScreenGui")
         g.Name = randName(); g.IgnoreGuiInset = true; g.ResetOnSpawn = false; g.DisplayOrder = 2
         pcall(function() if protectgui then protectgui(g) elseif syn and syn.protect_gui then syn.protect_gui(g) end end)
@@ -5127,11 +4111,11 @@ do
         if e then pcall(function() e.label:Destroy() end) end
         entries[player] = nil
     end
-    local function clear_all()
+    local function clearAll()
         for p in pairs(entries) do remove(p) end
         if gui then pcall(function() gui:Destroy() end); gui = nil end
     end
-    local function new_label()
+    local function newLabel()
         local l = Instance.new("TextLabel")
         l.AnchorPoint = Vector2.new(0.5, 1)
         l.Size = UDim2.fromOffset(320, 44)
@@ -5144,26 +4128,22 @@ do
         l.Parent = gui
         return l
     end
-    -- 10x a second: who to show, and what each label says
     local function refresh()
-        local my = getRoot()
-        local now = Workspace:GetServerTimeNow()
-        local clock = os.clock()
-        local seen = {}
+        local my, now, clock, seen = getRoot(), Workspace:GetServerTimeNow(), os.clock(), {}
         for _, player in ipairs(Players:GetPlayers()) do
-            if player ~= LocalPlayer or EspCfg.ShowSelf then
+            if player ~= LocalPlayer or Mods.EspCfg.ShowSelf then
                 local character = player.Character
                 local head = character and character.Parent and (character:FindFirstChild('Head') or character.PrimaryPart)
                 if head then
                     seen[player] = true
                     local e = entries[player]
-                    if not e then e = { label = new_label() }; entries[player] = e end
+                    if not e then e = { label = newLabel() }; entries[player] = e end
                     if e.char ~= character then e.char, e.ab_at = character, 0 end
                     e.head = head
                     if clock - e.ab_at > 1 then e.ab_at, e.ability = clock, equipped(player, character) end
                     local dist = my and player ~= LocalPlayer and (my.Position - head.Position).Magnitude or nil
-                    e.show = not (EspCfg.MaxDistance > 0 and dist and dist > EspCfg.MaxDistance)
-                        and not (EspCfg.OnlyWithAbility and not e.ability)
+                    e.show = not (Mods.EspCfg.MaxDistance > 0 and dist and dist > Mods.EspCfg.MaxDistance)
+                        and not (Mods.EspCfg.OnlyWithAbility and not e.ability)
                     if e.show then
                         local name = e.ability
                         if name then
@@ -5172,12 +4152,12 @@ do
                             if lv and type(lv.Value) == 'number' and lv.Value > 0 then name = name .. ' V' .. lv.Value end
                         end
                         local parts = {}
-                        if EspCfg.ShowName then parts[#parts + 1] = esc(player.DisplayName) end
+                        if Mods.EspCfg.ShowName then parts[#parts + 1] = esc(player.DisplayName) end
                         if name then parts[#parts + 1] = '[' .. esc(name) .. ']' end
-                        if EspCfg.ShowDistance and dist then parts[#parts + 1] = ('%.0fm'):format(dist) end
+                        if Mods.EspCfg.ShowDistance and dist then parts[#parts + 1] = ('%.0fm'):format(dist) end
                         if #parts == 0 then parts[1] = esc(player.DisplayName) end
                         local text = '<b>' .. table.concat(parts, ' ') .. '</b>'
-                        if EspCfg.ShowCooldown then
+                        if Mods.EspCfg.ShowCooldown then
                             local exp = character:GetAttribute('CooldownExpiration') or player:GetAttribute('CooldownExpiration')
                             if type(exp) == 'number' then
                                 local left = exp - now
@@ -5186,22 +4166,20 @@ do
                             end
                         end
                         if text ~= e.text then e.text = text; e.label.Text = text end
-                        if e.size ~= EspCfg.TextSize then e.size = EspCfg.TextSize; e.label.TextSize = EspCfg.TextSize end
-                        if e.color ~= EspCfg.Color then e.color = EspCfg.Color; e.label.TextColor3 = EspCfg.Color end
+                        if e.size ~= Mods.EspCfg.TextSize then e.size = Mods.EspCfg.TextSize; e.label.TextSize = Mods.EspCfg.TextSize end
+                        if e.color ~= Mods.EspCfg.Color then e.color = Mods.EspCfg.Color; e.label.TextColor3 = Mods.EspCfg.Color end
                     end
                 end
             end
         end
         for player in pairs(entries) do if not seen[player] then remove(player) end end
     end
-    -- every frame: put each label over its head
     local function place()
         local cam = Workspace.CurrentCamera
         if not cam then return end
-        local up = Vector3.new(0, EspCfg.Height, 0)
+        local up = Vector3.new(0, Mods.EspCfg.Height, 0)
         for _, e in pairs(entries) do
-            local head = e.head
-            local vis = false
+            local head, vis = e.head, false
             if e.show and head and head.Parent then
                 local p, on = cam:WorldToViewportPoint(head.Position + up)
                 if on and p.Z > 0 then
@@ -5212,65 +4190,61 @@ do
             if e.label.Visible ~= vis then e.label.Visible = vis end
         end
     end
-    function AbilityESP.start()
-        local tok = AbilityESP._token
-        gui = make_gui()
+    function Mods.AbilityESP.start()
+        local tok = Mods.AbilityESP._token
+        gui = mkGui()
         pcall(function() Parry.logp(("ability esp ON: %d other player(s)%s, overlay in %s"):format(
-            #Players:GetPlayers() - 1, EspCfg.ShowSelf and " + you" or "", tostring(gui.Parent and gui.Parent.ClassName))) end)
+            #Players:GetPlayers() - 1, Mods.EspCfg.ShowSelf and " + you" or "", tostring(gui.Parent and gui.Parent.ClassName))) end)
         task.spawn(function()
-            while AbilityESP:alive(tok) do pcall(refresh); task.wait(0.1) end
+            while Mods.AbilityESP:alive(tok) do pcall(refresh); task.wait(0.1) end
         end)
         task.spawn(function()
-            while AbilityESP:alive(tok) do pcall(place); task.wait() end
+            while Mods.AbilityESP:alive(tok) do pcall(place); task.wait() end
         end)
     end
-    function AbilityESP.stop() clear_all() end
+    function Mods.AbilityESP.stop() clearAll() end
 end
 
-local VS = Tabs.Visuals:AddLeftGroupbox("Overlays", "monitor")
-VS:AddToggle("BallVelocity", { Text = "Ball velocity overlay", Default = false, Callback = function(v) BallVelocity:setEnabled(v) end })
-VS:AddToggle("ShowPing", { Text = "Ping overlay", Default = false, Callback = function(v) PingOverlay:setEnabled(v) end })
+Gui.VS = Gui.Tabs.Visuals:AddLeftGroupbox("Overlays", "monitor")
+Gui.VS:AddToggle("BallVelocity", { Text = "Ball velocity overlay", Default = false, Callback = function(v) Mods.BallVelocity:setEnabled(v) end })
+Gui.VS:AddToggle("ShowPing", { Text = "Ping overlay", Default = false, Callback = function(v) Mods.PingOverlay:setEnabled(v) end })
 
-local AE = Tabs.Visuals:AddRightGroupbox("Ability ESP", "eye")
-AE:AddToggle("AbilityESP", { Text = "Ability ESP", Default = false, Callback = function(v) AbilityESP:setEnabled(v) end })
-AE:AddToggle("AbilityESPSelf", { Text = "Show on yourself", Default = true,
-    Callback = function(v) EspCfg.ShowSelf = v; if AbilityESP.on then AbilityESP:setEnabled(false); AbilityESP:setEnabled(true) end end })
-AE:AddToggle("AbilityESPName", { Text = "Show name", Default = true, Callback = function(v) EspCfg.ShowName = v end })
-AE:AddToggle("AbilityESPDistance", { Text = "Show distance", Default = false, Callback = function(v) EspCfg.ShowDistance = v end })
-AE:AddToggle("AbilityESPOnlyWith", { Text = "Only players with an ability", Default = false, Callback = function(v) EspCfg.OnlyWithAbility = v end })
-AE:AddToggle("AbilityESPCooldown", { Text = "Show ready / cooldown", Default = true, Callback = function(v) EspCfg.ShowCooldown = v end })
-AE:AddSlider("AbilityESPTextSize", { Text = "Text size", Default = 14, Min = 8, Max = 30, Rounding = 0, Callback = function(v) EspCfg.TextSize = v end })
-AE:AddSlider("AbilityESPHeight", { Text = "Height offset", Default = 3.5, Min = 0, Max = 15, Rounding = 1, Suffix = " studs", Callback = function(v) EspCfg.Height = v end })
-AE:AddSlider("AbilityESPMaxDistance", { Text = "Max distance", Default = 0, Min = 0, Max = 2000, Rounding = 0, Suffix = " studs",
-    Tooltip = "0 = unlimited.", Callback = function(v) EspCfg.MaxDistance = v end })
-AE:AddLabel("Text color"):AddColorPicker("AbilityESPColor", { Default = Color3.fromRGB(255, 255, 255), Title = "Ability ESP color",
-    Callback = function(v) EspCfg.Color = v end })
+Gui.AE = Gui.Tabs.Visuals:AddRightGroupbox("Ability ESP", "eye")
+Gui.AE:AddToggle("AbilityESP", { Text = "Ability ESP", Default = false, Callback = function(v) Mods.AbilityESP:setEnabled(v) end })
+Gui.AE:AddToggle("AbilityESPSelf", { Text = "Show on yourself", Default = true,
+    Callback = function(v) Mods.EspCfg.ShowSelf = v; if Mods.AbilityESP.on then Mods.AbilityESP:setEnabled(false); Mods.AbilityESP:setEnabled(true) end end })
+Gui.AE:AddToggle("AbilityESPName", { Text = "Show name", Default = true, Callback = function(v) Mods.EspCfg.ShowName = v end })
+Gui.AE:AddToggle("AbilityESPDistance", { Text = "Show distance", Default = false, Callback = function(v) Mods.EspCfg.ShowDistance = v end })
+Gui.AE:AddToggle("AbilityESPOnlyWith", { Text = "Only players with an ability", Default = false, Callback = function(v) Mods.EspCfg.OnlyWithAbility = v end })
+Gui.AE:AddToggle("AbilityESPCooldown", { Text = "Show ready / cooldown", Default = true, Callback = function(v) Mods.EspCfg.ShowCooldown = v end })
+Gui.AE:AddSlider("AbilityESPTextSize", { Text = "Text size", Default = 14, Min = 8, Max = 30, Rounding = 0, Callback = function(v) Mods.EspCfg.TextSize = v end })
+Gui.AE:AddSlider("AbilityESPHeight", { Text = "Height offset", Default = 3.5, Min = 0, Max = 15, Rounding = 1, Suffix = " studs", Callback = function(v) Mods.EspCfg.Height = v end })
+Gui.AE:AddSlider("AbilityESPMaxDistance", { Text = "Max distance", Default = 0, Min = 0, Max = 2000, Rounding = 0, Suffix = " studs",
+    Tooltip = "0 = unlimited.", Callback = function(v) Mods.EspCfg.MaxDistance = v end })
+Gui.AE:AddLabel("Text color"):AddColorPicker("AbilityESPColor", { Default = Color3.fromRGB(255, 255, 255), Title = "Ability ESP color",
+    Callback = function(v) Mods.EspCfg.Color = v end })
 
--- ----- Misc tab -----
--- Skin changer: everything (module require, controller lookup, resolver remap,
--- upkeep loop, respawn hook) happens only while it's on.
-local Skin = { name = "", file = "BladeBall/skin.json" }
+Mods.Skin = { name = "", file = "BladeBall/skin.json" }
 pcall(function()
-    if isfile and isfile(Skin.file) then
-        local d = HttpService:JSONDecode(readfile(Skin.file))
-        if type(d) == "table" and type(d.swordModel) == "string" then Skin.name = d.swordModel end
+    if isfile and isfile(Mods.Skin.file) then
+        local d = HttpService:JSONDecode(readfile(Mods.Skin.file))
+        if type(d) == "table" and type(d.swordModel) == "string" then Mods.Skin.name = d.swordModel end
     end
 end)
-local function save_skin()
+function Mods.saveSkin()
     pcall(function()
         if makefolder and isfolder and not isfolder("BladeBall") then makefolder("BladeBall") end
-        if writefile then writefile(Skin.file, HttpService:JSONEncode({ swordModel = Skin.name })) end
+        if writefile then writefile(Mods.Skin.file, HttpService:JSONEncode({ swordModel = Mods.Skin.name })) end
     end)
 end
-local SkinChanger = Feature("SkinChanger")
--- SkinChanger works in the lobby too (0.5.100): it only touches your own character
+Mods.SkinChanger = Feature("SkinChanger")
 do
     local swords, controller, realGetSword
-    local function our_sword(name)
-        return type(name) == "string" and name ~= "" and (name == LocalPlayer:GetAttribute("CurrentlyEquippedSword") or name == Skin.name)
+    local function ourSword(name)
+        return type(name) == "string" and name ~= "" and (name == LocalPlayer:GetAttribute("CurrentlyEquippedSword") or name == Mods.Skin.name)
     end
-    local function set_sword()
-        if not SkinChanger.on or Skin.name == "" or not swords or not LocalPlayer.Character then return end
+    local function setSword()
+        if not Mods.SkinChanger.on or Mods.Skin.name == "" or not swords or not LocalPlayer.Character then return end
         pcall(function()
             local f = rawget(swords, "EquipSwordTo")
             if type(f) == "function" and getupvalues and setupvalue then
@@ -5278,65 +4252,50 @@ do
                 for i = 1, #ups do if type(ups[i]) == "boolean" then setupvalue(f, i, false); break end end
             end
         end)
-        pcall(function() swords:EquipSwordTo(LocalPlayer.Character, Skin.name) end)
+        pcall(function() swords:EquipSwordTo(LocalPlayer.Character, Mods.Skin.name) end)
         if controller then
-            pcall(function() if controller.SetSword then controller:SetSword(Skin.name) end end)
+            pcall(function() if controller.SetSword then controller:SetSword(Mods.Skin.name) end end)
             pcall(function()
-                local R = get_remotes()
-                if R and R:FindFirstChild("FireSwordInfo") then R.FireSwordInfo:FireServer(Skin.name) end
-                if controller.currentSword ~= nil then controller.currentSword = Skin.name end
-                if controller.SwordFX ~= nil then controller.SwordFX = Skin.name end
+                local R = getRemotes()
+                if R and R:FindFirstChild("FireSwordInfo") then R.FireSwordInfo:FireServer(Mods.Skin.name) end
+                if controller.currentSword ~= nil then controller.currentSword = Mods.Skin.name end
+                if controller.SwordFX ~= nil then controller.SwordFX = Mods.Skin.name end
             end)
         end
     end
-    -- Parry effect. ClientFX plays it from ParrySuccessAll(fxName, fxParent,
-    -- sword, player, ...) (Bbs dump, parrySuccessAll) -- fxName is the slash the
-    -- SERVER picked from the sword you really own, and it goes straight to
-    -- SwordFX:GetInstance, so the GetSword remap never touches it: the skin
-    -- was on but the effect stayed your real sword's. The game's handler is
-    -- paused and called through us; for YOUR parries only, fxName and sword are
-    -- swapped for the skin's. Everyone else's pass through untouched, and the
-    -- handler is put back when the skin changer goes off -- and whenever you're
-    -- out of a round: the skin itself works in the lobby too (0.5.100), but a
-    -- listener on a game remote attached in the lobby is what BAC kicks on.
-    local fx_paused, fx_wraps = {}, {}
-    local function skin_slash()
-        local ok, data = pcall(realGetSword, swords, Skin.name)
+    local fxPaused, fxWraps = {}, {}
+    local function skinSlash()
+        local ok, data = pcall(realGetSword, swords, Mods.Skin.name)
         return (ok and type(data) == "table" and type(data.SlashName) == "string") and data.SlashName or "SlashEffect"
     end
-    local function prefetch_slash()
-        -- the game only fetches the slashes of swords people own: fetch the skin's
+    local function prefetch()
         task.spawn(function()
-            pcall(function() ReplicatedStorage.Shared.ReplicatedInstances.SwordFX.GetInstance:Invoke(skin_slash()) end)
+            pcall(function() ReplicatedStorage.Shared.ReplicatedInstances.SwordFX.GetInstance:Invoke(skinSlash()) end)
         end)
     end
-    local function c_fx_script()
+    local function fxScript()
         local ok, s = pcall(function() return LocalPlayer.PlayerScripts.EffectScripts.ClientFX end)
         return ok and s or nil
     end
-    local function swap_parry_fx()
-        local R = get_remotes()
+    local function swapFx()
+        local R = getRemotes()
         if not (R and getconnections) then return false end
-        local isours = isexecutorclosure or is_synapse_function or isourclosure
-        local found = false
+        local isours, found = isexecutorclosure or is_synapse_function or isourclosure, false
         for _, sig in ipairs({ R:FindFirstChild("ParrySuccessAll") and R.ParrySuccessAll.OnClientEvent,
                 R:FindFirstChild("ParrySuccessClient") and R.ParrySuccessClient.Event }) do
             for _, c in ipairs(sig and getconnections(sig) or {}) do
                 local f = c.Function
-                if type(f) == "function" and not fx_paused[c] and (not isours or not isours(f))
+                if type(f) == "function" and not fxPaused[c] and (not isours or not isours(f))
                     and (not islclosure or islclosure(f)) then
-                    fx_paused[c] = true
+                    fxPaused[c] = true
                     found = true
                     c:Disable()
-                    -- connected raw (not SkinChanger:connect): if this instance
-                    -- dies it must keep passing parries through, not drop them
-                    fx_wraps[#fx_wraps + 1] = sig:Connect(function(...)
-                        -- No render switched ClientFX off: its effects stay off
-                        local cfx = c_fx_script()
+                    fxWraps[#fxWraps + 1] = sig:Connect(function(...)
+                        local cfx = fxScript()
                         if cfx and cfx.Disabled then return end
                         local args = table.pack(...)
-                        if is_live() and SkinChanger.on and Skin.name ~= "" and args[4] == LocalPlayer then
-                            pcall(function() args[1], args[3] = skin_slash(), Skin.name end)
+                        if isLive() and Mods.SkinChanger.on and Mods.Skin.name ~= "" and args[4] == LocalPlayer then
+                            pcall(function() args[1], args[3] = skinSlash(), Mods.Skin.name end)
                         end
                         f(table.unpack(args, 1, args.n))
                     end)
@@ -5345,41 +4304,38 @@ do
         end
         return found
     end
-    local function unswap_parry_fx()
-        for c in pairs(fx_paused) do pcall(function() c:Enable() end) end
-        for _, c in ipairs(fx_wraps) do pcall(function() c:Disconnect() end) end
-        fx_paused, fx_wraps = {}, {}
+    local function unswapFx()
+        for c in pairs(fxPaused) do pcall(function() c:Enable() end) end
+        for _, c in ipairs(fxWraps) do pcall(function() c:Disconnect() end) end
+        fxPaused, fxWraps = {}, {}
     end
-    function SkinChanger.apply() if SkinChanger.on then save_skin(); set_sword(); if swords then prefetch_slash() end end end
-    function SkinChanger.start()
-        local token = SkinChanger._token
+    function Mods.SkinChanger.apply() if Mods.SkinChanger.on then Mods.saveSkin(); setSword(); if swords then prefetch() end end end
+    function Mods.SkinChanger.start()
+        local token = Mods.SkinChanger._token
         task.spawn(function()
             local ok = pcall(function()
                 swords = swords or require(ReplicatedStorage:WaitForChild("Shared", 10):WaitForChild("ReplicatedInstances", 10):WaitForChild("Swords", 10))
             end)
-            if not ok or not swords or not SkinChanger:alive(token) then
-                if SkinChanger:alive(token) then Notify("Skin Changer", "Couldn't load the game's sword list.", 4) end
+            if not ok or not swords or not Mods.SkinChanger:alive(token) then
+                if Mods.SkinChanger:alive(token) then Notify("Skin Changer", "Couldn't load the game's sword list.", 4) end
                 return
             end
-            -- the game's effects resolve sword names through Swords:GetSword; hand
-            -- back the skin's real data for the sword we have equipped
             pcall(function()
                 realGetSword = realGetSword or swords.GetSword
                 if type(realGetSword) == "function" then
                     rawset(swords, "GetSword", function(self, name, ...)
-                        if SkinChanger.on and Skin.name ~= "" and Skin.name ~= name and our_sword(name) then
-                            local ok2, data = pcall(realGetSword, self, Skin.name, ...)
+                        if Mods.SkinChanger.on and Mods.Skin.name ~= "" and Mods.Skin.name ~= name and ourSword(name) then
+                            local ok2, data = pcall(realGetSword, self, Mods.Skin.name, ...)
                             if ok2 and type(data) == "table" then return data end
                         end
                         return realGetSword(self, name, ...)
                     end)
                 end
             end)
-            -- find the swords controller (bounded: ~10s, only while on)
             local tries = 0
-            while not controller and tries < 40 and SkinChanger:alive(token) do
+            while not controller and tries < 40 and Mods.SkinChanger:alive(token) do
                 pcall(function()
-                    local R = get_remotes()
+                    local R = getRemotes()
                     local conns = R and getconnections and getconnections(R.FireSwordInfo.OnClientEvent)
                     for _, c in ipairs(conns or {}) do
                         if c.Function and islclosure and islclosure(c.Function) then
@@ -5391,24 +4347,23 @@ do
                 tries = tries + 1
                 if not controller then task.wait(0.25) end
             end
-            if not SkinChanger:alive(token) then return end
-            set_sword()
-            prefetch_slash()
-            SkinChanger:connect(LocalPlayer.CharacterAdded, function()
+            if not Mods.SkinChanger:alive(token) then return end
+            setSword()
+            prefetch()
+            Mods.SkinChanger:connect(LocalPlayer.CharacterAdded, function()
                 task.wait(2.5)
-                if SkinChanger:alive(token) then set_sword() end
+                if Mods.SkinChanger:alive(token) then setSword() end
             end)
-            SkinChanger:loop(1, function()
-                -- the parry effect swap: in a round / training only (see above)
+            Mods.SkinChanger:loop(1, function()
                 local inr = Stagger.round_check and Stagger.round_check()
-                if inr and Skin.name ~= "" and next(fx_paused) == nil then swap_parry_fx()
-                elseif not inr and next(fx_paused) ~= nil then unswap_parry_fx() end
-                if Skin.name == "" then return end
+                if inr and Mods.Skin.name ~= "" and next(fxPaused) == nil then swapFx()
+                elseif not inr and next(fxPaused) ~= nil then unswapFx() end
+                if Mods.Skin.name == "" then return end
                 local char = LocalPlayer.Character
                 if not char then return end
-                if LocalPlayer:GetAttribute("CurrentlyEquippedSword") ~= Skin.name or not char:FindFirstChild(Skin.name) then set_sword() end
+                if LocalPlayer:GetAttribute("CurrentlyEquippedSword") ~= Mods.Skin.name or not char:FindFirstChild(Mods.Skin.name) then setSword() end
                 for _, v in ipairs(char:GetChildren()) do
-                    if v:IsA("Model") and v.Name ~= Skin.name and swords and pcall(function() return realGetSword(swords, v.Name) end) then
+                    if v:IsA("Model") and v.Name ~= Mods.Skin.name and swords and pcall(function() return realGetSword(swords, v.Name) end) then
                         local ok3, data = pcall(realGetSword, swords, v.Name)
                         if ok3 and type(data) == "table" then v:Destroy() end
                     end
@@ -5416,105 +4371,85 @@ do
             end)
         end)
     end
-    function SkinChanger.stop()
-        -- put the game's own resolver back
+    function Mods.SkinChanger.stop()
         if swords and realGetSword then pcall(function() rawset(swords, "GetSword", realGetSword) end) end
-        -- and the game's parry effect handler
-        unswap_parry_fx()
+        unswapFx()
     end
 end
 
-local SC = Tabs.Misc:AddLeftGroupbox("Skin Changer", "palette")
-SC:AddInput("SkinName", { Text = "Sword name", Placeholder = "e.g. DualPrince", Default = Skin.name, Finished = true,
-    Callback = function(t) Skin.name = t; save_skin(); SkinChanger.apply() end })
-SC:AddToggle("SkinChanger", { Text = "Skin changer", Default = false, Callback = function(v) SkinChanger:setEnabled(v) end })
--- parry swings use the skin's animation set while the skin changer is on
-Anim.skin = function() return (SkinChanger.on and Skin.name ~= "") and Skin.name or nil end
+Gui.SC = Gui.Tabs.Misc:AddLeftGroupbox("Skin Changer", "palette")
+Gui.SC:AddInput("SkinName", { Text = "Sword name", Placeholder = "e.g. DualPrince", Default = Mods.Skin.name, Finished = true,
+    Callback = function(t) Mods.Skin.name = t; Mods.saveSkin(); Mods.SkinChanger.apply() end })
+Gui.SC:AddToggle("SkinChanger", { Text = "Skin changer", Default = false, Callback = function(v) Mods.SkinChanger:setEnabled(v) end })
+Anim.skin = function() return (Mods.SkinChanger.on and Mods.Skin.name ~= "") and Mods.Skin.name or nil end
 
--- No render: turn off the game's ability / parry effects
-local NoRender = Feature("NoRender")
-NoRender.round_only = true -- game-signal listeners: rounds only (lobby kick)
--- What "No render" removes is picked in the dropdown below. Everything it turns
--- off is remembered and put back exactly when it's turned off or the pick changes.
-local NR_SEL = { ["Ability effects"] = true, ["Parry effects"] = true }
-local NR_FX = { ParticleEmitter = true, Trail = true, Beam = true, Smoke = true, Fire = true, Sparkles = true }
-local NR_POST = { BloomEffect = true, BlurEffect = true, ColorCorrectionEffect = true, SunRaysEffect = true, DepthOfFieldEffect = true }
-local nr_saved = {}
-local function nr_set(inst, prop, val)
+Mods.NoRender = Feature("NoRender")
+Mods.NoRender.round_only = true
+Mods.NR_SEL = { ["Ability effects"] = true, ["Parry effects"] = true }
+Mods.NR_FX = { ParticleEmitter = true, Trail = true, Beam = true, Smoke = true, Fire = true, Sparkles = true }
+Mods.NR_POST = { BloomEffect = true, BlurEffect = true, ColorCorrectionEffect = true, SunRaysEffect = true, DepthOfFieldEffect = true }
+Mods.nrSaved = {}
+function Mods.nrSet(inst, prop, val)
     local ok, old = pcall(function() return inst[prop] end)
     if not ok or old == val then return end
-    nr_saved[inst] = nr_saved[inst] or {}
-    if nr_saved[inst][prop] == nil then nr_saved[inst][prop] = old end
+    Mods.nrSaved[inst] = Mods.nrSaved[inst] or {}
+    if Mods.nrSaved[inst][prop] == nil then Mods.nrSaved[inst][prop] = old end
     pcall(function() inst[prop] = val end)
 end
-local function nr_fx(inst) if NR_FX[inst.ClassName] then nr_set(inst, "Enabled", false) end end
--- turn off every effect under root now and as it appears (big trees in slices)
-local function nr_tree(root, token)
+function Mods.nrFx(inst) if Mods.NR_FX[inst.ClassName] then Mods.nrSet(inst, "Enabled", false) end end
+function Mods.nrTree(root, token)
     if not root then return end
-    NoRender:connect(root.DescendantAdded, nr_fx)
+    Mods.NoRender:connect(root.DescendantAdded, Mods.nrFx)
     task.spawn(function()
         local list = root:GetDescendants()
         for k = 1, #list do
-            if not NoRender:alive(token) then return end
-            nr_fx(list[k])
+            if not Mods.NoRender:alive(token) then return end
+            Mods.nrFx(list[k])
             if k % 2000 == 0 then task.wait() end
         end
     end)
 end
-function NoRender.start()
-    local token, sel = NoRender._token, NR_SEL
+function Mods.NoRender.start()
+    local token, sel = Mods.NoRender._token, Mods.NR_SEL
     if sel["Parry effects"] then
-        pcall(function() nr_set(LocalPlayer.PlayerScripts.EffectScripts.ClientFX, "Disabled", true) end)
+        pcall(function() Mods.nrSet(LocalPlayer.PlayerScripts.EffectScripts.ClientFX, "Disabled", true) end)
     end
     if sel["Ability effects"] then
         local runtime = Workspace:FindFirstChild("Runtime")
-        if runtime then NoRender:connect(runtime.ChildAdded, function(v) task.defer(pcall, v.Destroy, v) end) end
+        if runtime then Mods.NoRender:connect(runtime.ChildAdded, function(v) task.defer(pcall, v.Destroy, v) end) end
     end
     if sel["All particles"] then
-        nr_tree(Workspace, token)
+        Mods.nrTree(Workspace, token)
     else
         if sel["Ball trails"] then
-            for _, name in ipairs({ "Balls", "TrainingBalls" }) do nr_tree(Workspace:FindFirstChild(name), token) end
+            for _, name in ipairs({ "Balls", "TrainingBalls" }) do Mods.nrTree(Workspace:FindFirstChild(name), token) end
         end
         if sel["Character effects"] then
-            for _, name in ipairs({ "Alive", "Dead" }) do nr_tree(Workspace:FindFirstChild(name), token) end
+            for _, name in ipairs({ "Alive", "Dead" }) do Mods.nrTree(Workspace:FindFirstChild(name), token) end
         end
     end
     if sel["Post effects"] or sel["Shadows"] then
         local Lighting = game:GetService("Lighting")
-        if sel["Shadows"] then nr_set(Lighting, "GlobalShadows", false) end
+        if sel["Shadows"] then Mods.nrSet(Lighting, "GlobalShadows", false) end
         if sel["Post effects"] then
-            for _, v in ipairs(Lighting:GetDescendants()) do if NR_POST[v.ClassName] then nr_set(v, "Enabled", false) end end
+            for _, v in ipairs(Lighting:GetDescendants()) do if Mods.NR_POST[v.ClassName] then Mods.nrSet(v, "Enabled", false) end end
             pcall(function()
-                for _, v in ipairs(Workspace.CurrentCamera:GetChildren()) do if NR_POST[v.ClassName] then nr_set(v, "Enabled", false) end end
+                for _, v in ipairs(Workspace.CurrentCamera:GetChildren()) do if Mods.NR_POST[v.ClassName] then Mods.nrSet(v, "Enabled", false) end end
             end)
-            NoRender:connect(Lighting.DescendantAdded, function(v) if NR_POST[v.ClassName] then nr_set(v, "Enabled", false) end end)
+            Mods.NoRender:connect(Lighting.DescendantAdded, function(v) if Mods.NR_POST[v.ClassName] then Mods.nrSet(v, "Enabled", false) end end)
         end
     end
 end
-function NoRender.stop()
-    local saved = nr_saved
-    nr_saved = {}
+function Mods.NoRender.stop()
+    local saved = Mods.nrSaved
+    Mods.nrSaved = {}
     for inst, props in pairs(saved) do
         for prop, old in pairs(props) do pcall(function() inst[prop] = old end) end
     end
 end
--- ----- Device spoofer -----
--- The game decides PC / Phone / Tablet / Console in
--- ClientGameModules.DeviceListener (Bbs dump): Gamepad last input -> Console,
--- Mouse + Keyboard -> PC, touch with a viewport height <= 500 -> Phone, else
--- Tablet. It reads UserInputService through ReplicatedStorage.UserInputService,
--- a wrapper that indexes the real service -- so ONE __index hook (in the game's
--- locked metatable, like the capture hook) answers those reads with the picked
--- device. It answers only the game's own scripts: our script reads the real
--- values (checkcaller), and Roblox's PlayerModule (your thumbstick / camera)
--- and CoreGui keep the real device, so movement never breaks. The listener's
--- current device is set straight away too (require'd -- already loaded, so
--- that only returns its table). Off = the hook answers nothing (it stays in,
--- inert) and the real device is put back.
-local DeviceSpoof = { on = false, device = "PC", hooked = false, real = nil, p = nil, lastfn = nil,
+Mods.DeviceSpoof = { on = false, device = "PC", hooked = false, real = nil, p = nil, lastfn = nil,
     skip = setmetatable({}, { __mode = "k" }), dl = setmetatable({}, { __mode = "k" }) }
-local function device_profiles()
+function Mods.deviceProfiles()
     local PI = {}
     pcall(function() PI.kbm, PI.touch, PI.pad = Enum.PreferredInput.KeyboardAndMouse, Enum.PreferredInput.Touch, Enum.PreferredInput.Gamepad end)
     return {
@@ -5528,58 +4463,52 @@ local function device_profiles()
             PreferredInput = PI.pad, last = Enum.UserInputType.Gamepad1 },
     }
 end
-function DeviceSpoof.install()
-    if DeviceSpoof.hooked then return true end
+function Mods.DeviceSpoof.install()
+    if Mods.DeviceSpoof.hooked then return true end
     if type(hookmetamethod) ~= "function" or type(checkcaller) ~= "function" then return false end
-    local RealUIS = game:GetService("UserInputService")
-    local RealGui = game:GetService("GuiService")
-    local RealCore = game:GetService("CoreGui")
+    local RealUIS, RealGui, RealCore = game:GetService("UserInputService"), game:GetService("GuiService"), game:GetService("CoreGui")
     local getcs = getcallingscript
     local UIS_KEYS = { TouchEnabled = true, KeyboardEnabled = true, MouseEnabled = true, GamepadEnabled = true,
         PreferredInput = true, GetLastInputType = true }
-    -- the calling script is one of the game's own (not PlayerModule / CoreGui)
-    local function game_script()
+    local function gameScript()
         if type(getcs) ~= "function" then return false end
         local ok, sc = pcall(getcs)
         if not ok or typeof(sc) ~= "Instance" then return false end
-        local c = DeviceSpoof.skip[sc]
+        local c = Mods.DeviceSpoof.skip[sc]
         if c == nil then
-            local ok2, keep_real = pcall(function()
+            local ok2, keepReal = pcall(function()
                 return sc:FindFirstAncestor("PlayerModule") ~= nil or sc:IsDescendantOf(RealCore)
             end)
-            c = ok2 and not keep_real
-            DeviceSpoof.skip[sc] = c
+            c = ok2 and not keepReal
+            Mods.DeviceSpoof.skip[sc] = c
         end
         return c, sc
     end
-    DeviceSpoof.lastfn = newcclosure(function() return DeviceSpoof.p and DeviceSpoof.p.last end)
+    Mods.DeviceSpoof.lastfn = newcclosure(function() return Mods.DeviceSpoof.p and Mods.DeviceSpoof.p.last end)
     local old
     local ok = pcall(function()
         old = hookmetamethod(game, "__index", newcclosure(function(self, k)
-            if DeviceSpoof.on and type(k) == "string" and not checkcaller() then
-                local p = DeviceSpoof.p
+            if Mods.DeviceSpoof.on and type(k) == "string" and not checkcaller() then
+                local p = Mods.DeviceSpoof.p
                 if p then
                     if UIS_KEYS[k] and rawequal(self, RealUIS) then
-                        if game_script() then
-                            if k == "GetLastInputType" then return DeviceSpoof.lastfn end
+                        if gameScript() then
+                            if k == "GetLastInputType" then return Mods.DeviceSpoof.lastfn end
                             local v = p[k]
                             if v ~= nil then return v end
                         end
                     elseif k == "TouchControlsEnabled" and rawequal(self, RealGui) then
-                        if game_script() then return p.TouchEnabled end
+                        if gameScript() then return p.TouchEnabled end
                     elseif k == "ViewportSize" and p.vpY then
-                        -- Phone / Tablet are told apart by the viewport height:
-                        -- answered for DeviceListener only (the rest of the UI
-                        -- keeps the real screen size)
-                        local gs, sc = game_script()
+                        local gs, sc = gameScript()
                         if gs then
-                            local is_dl = DeviceSpoof.dl[sc]
-                            if is_dl == nil then
+                            local isDl = Mods.DeviceSpoof.dl[sc]
+                            if isDl == nil then
                                 local okn, n = pcall(function() return sc.Name end)
-                                is_dl = okn and n == "DeviceListener"
-                                DeviceSpoof.dl[sc] = is_dl
+                                isDl = okn and n == "DeviceListener"
+                                Mods.DeviceSpoof.dl[sc] = isDl
                             end
-                            if is_dl then
+                            if isDl then
                                 local real = old(self, k)
                                 return Vector2.new(real.X, p.vpY)
                             end
@@ -5590,15 +4519,14 @@ function DeviceSpoof.install()
             return old(self, k)
         end))
     end)
-    DeviceSpoof.hooked = ok and type(old) == "function"
-    return DeviceSpoof.hooked
+    Mods.DeviceSpoof.hooked = ok and type(old) == "function"
+    return Mods.DeviceSpoof.hooked
 end
--- put the picked (or, when off, the real) device into the game's listener now
-function DeviceSpoof.apply()
+function Mods.DeviceSpoof.apply()
     pcall(function()
         local DL = require(ReplicatedStorage.ClientGameModules.DeviceListener)
-        if DeviceSpoof.real == nil then DeviceSpoof.real = DL.Device end
-        local dev = DeviceSpoof.on and DeviceSpoof.device or DeviceSpoof.real
+        if Mods.DeviceSpoof.real == nil then Mods.DeviceSpoof.real = DL.Device end
+        local dev = Mods.DeviceSpoof.on and Mods.DeviceSpoof.device or Mods.DeviceSpoof.real
         if dev and DL.Device ~= dev then
             DL.Device = dev
             pcall(function() DL.State:Set(dev) end)
@@ -5606,84 +4534,62 @@ function DeviceSpoof.apply()
         end
     end)
 end
-local DeviceSpoofF = Feature("DeviceSpoof")
-function DeviceSpoofF.start()
-    DeviceSpoof.p = device_profiles()[DeviceSpoof.device] or device_profiles().PC
-    if not DeviceSpoof.install() then
+Mods.DeviceSpoofF = Feature("DeviceSpoof")
+function Mods.DeviceSpoofF.start()
+    Mods.DeviceSpoof.p = Mods.deviceProfiles()[Mods.DeviceSpoof.device] or Mods.deviceProfiles().PC
+    if not Mods.DeviceSpoof.install() then
         Notify("Device spoofer", "Your executor is missing hookmetamethod / checkcaller.", 4)
         return
     end
-    DeviceSpoof.apply() -- reads the real device first, before anything is spoofed
-    DeviceSpoof.on = true
-    DeviceSpoof.apply()
-    -- keep it: the listener re-checks on input-type / screen changes
-    DeviceSpoofF:loop(2, function() DeviceSpoof.apply() end)
+    Mods.DeviceSpoof.apply()
+    Mods.DeviceSpoof.on = true
+    Mods.DeviceSpoof.apply()
+    Mods.DeviceSpoofF:loop(2, function() Mods.DeviceSpoof.apply() end)
 end
-function DeviceSpoofF.stop()
-    DeviceSpoof.on = false
-    DeviceSpoof.apply()
+function Mods.DeviceSpoofF.stop()
+    Mods.DeviceSpoof.on = false
+    Mods.DeviceSpoof.apply()
 end
 
-local DS = Tabs.Misc:AddLeftGroupbox("Device spoofer", "smartphone")
-DS:AddToggle("DeviceSpoof", {
+Gui.DS = Gui.Tabs.Misc:AddLeftGroupbox("Device spoofer", "smartphone")
+Gui.DS:AddToggle("DeviceSpoof", {
     Text = "Device spoofer", Default = false,
     Tooltip = "The game treats you as the device below (its mobile buttons, layouts and anything it decides by device). Your real thumbstick and camera keep working. Off puts your real device back.",
-    Callback = function(v) DeviceSpoofF:setEnabled(v) end,
+    Callback = function(v) Mods.DeviceSpoofF:setEnabled(v) end,
 })
-DS:AddDropdown("DeviceSpoofType", {
+Gui.DS:AddDropdown("DeviceSpoofType", {
     Values = { "PC", "Phone", "Tablet", "Console" }, Default = "PC", Text = "Device",
     Callback = function(v)
-        DeviceSpoof.device = v
-        DeviceSpoof.p = device_profiles()[v]
-        if DeviceSpoof.on then DeviceSpoof.apply() end
+        Mods.DeviceSpoof.device = v
+        Mods.DeviceSpoof.p = Mods.deviceProfiles()[v]
+        if Mods.DeviceSpoof.on then Mods.DeviceSpoof.apply() end
     end,
 })
 
--- Infinite movement abilities (0.5.106; Dash + fixes 0.5.108). Blink, Thunder
--- Dash and Dash keep their charges / cooldown in their own LocalScript's
--- locals (Bbs dump: Blink 3 charges + 5.5s each, the others a
--- getAbilityCooldown delay) and move you ON YOUR CLIENT -- the server only
--- gets a remote for the effect. So this does exactly what the game's script
--- does, with no charge count or cooldown:
---   Blink / Thunder Dash  remote (start position + limb CFrames), then a wall
---                         raycast and the teleport: 16 + 5 x upgrade / 22 +
---                         10 x upgrade studs
---   Dash                  PlrDashed, the FOV kick, the script's own Dash
---                         animation, a one-frame LinearVelocity push (160 / 180
---                         / 200 x scale) with the body massless and the Pin
---                         constraint off for 0.3s, then the velocity zeroed
--- The equipped ability is read the game's way: the player's AbilityOverride,
--- else CurrentlyEquippedAbility (0.5.106-107 looked for the script in your
--- character's Abilities folder -- but that folder holds EVERY ability's script,
--- so Blink was always "equipped"). The game's refusals stay (in a round,
--- ability not red, not frozen); Direction "Camera" works standing still.
--- Server-side abilities (Time Hole, Infinity...) only send a request and the
--- server decides: nothing to skip.
-local InfAbility = { on = false, last = -math.huge, direction = "Move", gap = 0.2, fov_base = nil, fov_until = 0, tracks = setmetatable({}, { __mode = 'k' }) }
-local INF_ABILITIES = {
+Mods.InfAbility = { on = false, last = -math.huge, direction = "Move", gap = 0.2, fov_base = nil, fov_until = 0, tracks = setmetatable({}, { __mode = 'k' }) }
+Mods.INF_ABILITIES = {
     ["Blink"] = { kind = "tp", remote = "Blinked", dist = function(up) return 16 + 5 * up end },
     ["Thunder Dash"] = { kind = "tp", remote = "ThunderDash", dist = function(up) return 22 + 10 * up end },
     ["Dash"] = { kind = "dash" },
 }
-local function inf_equipped(char)
+function Mods.infEquipped(char)
     local name = LocalPlayer:GetAttribute("AbilityOverride") or LocalPlayer:GetAttribute("CurrentlyEquippedAbility")
         or LocalPlayer:GetAttribute("EquippedAbility")
     local folder = char:FindFirstChild("Abilities")
     if type(name) == "string" then
-        if INF_ABILITIES[name] and (not folder or folder:FindFirstChild(name)) then return name, INF_ABILITIES[name] end
+        if Mods.INF_ABILITIES[name] and (not folder or folder:FindFirstChild(name)) then return name, Mods.INF_ABILITIES[name] end
         return nil
     end
-    -- no attribute: the one ability script that's running
     if folder then
-        for n, def in pairs(INF_ABILITIES) do
+        for n, def in pairs(Mods.INF_ABILITIES) do
             local sc = folder:FindFirstChild(n)
             if sc and sc:IsA("LocalScript") and sc.Enabled then return n, def end
         end
     end
     return nil
 end
-local function inf_dir(hum)
-    if InfAbility.direction == "Camera" then
+function Mods.infDir(hum)
+    if Mods.InfAbility.direction == "Camera" then
         local look = Workspace.CurrentCamera.CFrame.LookVector
         local flat = Vector3.new(look.X, 0, look.Z)
         if flat.Magnitude > 1e-3 then return flat.Unit end
@@ -5692,9 +4598,8 @@ local function inf_dir(hum)
     if md.Magnitude > 1e-3 then return md.Unit end
     return nil
 end
-local function inf_tp(char, hrp, def, up, dir)
-    local dist = def.dist(up)
-    local pos = hrp.Position
+function Mods.infTp(char, hrp, def, up, dir)
+    local dist, pos = def.dist(up), hrp.Position
     pcall(function()
         ReplicatedStorage.Remotes[def.remote]:FireServer(pos, { char.Head.CFrame, char["Left Arm"].CFrame,
             char["Right Arm"].CFrame, char["Right Leg"].CFrame, char["Left Leg"].CFrame, char.Torso.CFrame })
@@ -5711,30 +4616,26 @@ local function inf_tp(char, hrp, def, up, dir)
     if hit and hit.Instance then hrp.CFrame = CFrame.new(hit.Position)
     else hrp.CFrame = hrp.CFrame + dir * dist end
 end
-local function inf_dash(char, hum, hrp, up, dir)
+function Mods.infDash(char, hum, hrp, up, dir)
     local now = clock_()
     pcall(function() ReplicatedStorage.Remotes.PlrDashed:FireServer() end)
-    -- the FOV kick, from your real FOV (back-to-back dashes don't ratchet it up)
     pcall(function()
         local cam = Workspace.CurrentCamera
-        if now >= InfAbility.fov_until or not InfAbility.fov_base then InfAbility.fov_base = cam.FieldOfView end
-        InfAbility.fov_until = now + 0.5
-        cam.FieldOfView = InfAbility.fov_base
+        if now >= Mods.InfAbility.fov_until or not Mods.InfAbility.fov_base then Mods.InfAbility.fov_base = cam.FieldOfView end
+        Mods.InfAbility.fov_until = now + 0.5
+        cam.FieldOfView = Mods.InfAbility.fov_base
         game:GetService("TweenService"):Create(cam, TweenInfo.new(0.25, Enum.EasingStyle.Linear, Enum.EasingDirection.Out, 0, true, 0),
-            { FieldOfView = InfAbility.fov_base * 1.25 }):Play()
+            { FieldOfView = Mods.InfAbility.fov_base * 1.25 }):Play()
     end)
-    -- the script's own animation, loaded once per animator
     pcall(function()
-        local anim = char.Abilities.Dash:FindFirstChild("Dash")
-        local animator = hum:FindFirstChildOfClass("Animator")
+        local anim, animator = char.Abilities.Dash:FindFirstChild("Dash"), hum:FindFirstChildOfClass("Animator")
         if anim and animator then
-            local t = InfAbility.tracks[animator]
-            if not t then t = animator:LoadAnimation(anim); InfAbility.tracks[animator] = t end
+            local t = Mods.InfAbility.tracks[animator]
+            if not t then t = animator:LoadAnimation(anim); Mods.InfAbility.tracks[animator] = t end
             t:Play()
         end
     end)
-    local power = (up == 1 and 180) or (up == 2 and 200) or 160
-    local scale = 1
+    local power, scale = (up == 1 and 180) or (up == 2 and 200) or 160, 1
     pcall(function() scale = char:GetScale() end)
     if scale > 1 then power = power * scale end
     local cf = hrp.CFrame
@@ -5765,125 +4666,97 @@ local function inf_dash(char, hum, hrp, up, dir)
         if pp then pp.AssemblyLinearVelocity, pp.AssemblyAngularVelocity = Vector3.zero, Vector3.zero end
     end)
 end
-function InfAbility.use()
-    if not InfAbility.on or not is_live() then return end
+function Mods.InfAbility.use()
+    if not Mods.InfAbility.on or not isLive() then return end
     local now = clock_()
-    if now - InfAbility.last < InfAbility.gap then return end
+    if now - Mods.InfAbility.last < Mods.InfAbility.gap then return end
     local char = LocalPlayer.Character
-    local hum = char and char:FindFirstChildOfClass("Humanoid")
-    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    local hum, hrp = char and char:FindFirstChildOfClass("Humanoid"), char and char:FindFirstChild("HumanoidRootPart")
     if not (hum and hrp) or hum.Health <= 0 or char.Parent ~= Workspace:FindFirstChild("Alive") then return end
     local okr, red = pcall(function() return LocalPlayer.PlayerGui.Hotbar.Ability.Red.Visible end)
     if okr and red ~= false then return end
     if char.PrimaryPart and char.PrimaryPart:FindFirstChild("FREEZER") then return end
-    local name, def = inf_equipped(char)
+    local name, def = Mods.infEquipped(char)
     if not name then Notify("Infinite ability", "Equip Blink, Thunder Dash or Dash.", 3); return end
-    local dir = inf_dir(hum)
-    if not dir then return end -- standing still with Direction "Move": the game refuses too
-    InfAbility.last = now
+    local dir = Mods.infDir(hum)
+    if not dir then return end
+    Mods.InfAbility.last = now
     local up = 0
     pcall(function() up = LocalPlayer.Upgrades[name].Value end)
-    if def.kind == "dash" then inf_dash(char, hum, hrp, up, dir) else inf_tp(char, hrp, def, up, dir) end
+    if def.kind == "dash" then Mods.infDash(char, hum, hrp, up, dir) else Mods.infTp(char, hrp, def, up, dir) end
 end
--- The ability BUTTON (phone / tablet, and the game's RequestAbilityUse) fires
--- Remotes.AbilityButtonPress, a BindableEvent each ability's LocalScript
--- listens to. While this is on and Blink / Thunder Dash is equipped, in a
--- round: THAT script's listener (found by its source, ...Abilities.<name>) is
--- paused and the button calls ours instead -- one blink per tap, no double
--- with the game's own. Every other listener (the game's "ability blocked"
--- notice etc.) is left alone. Re-checked every 0.5s (a respawn brings a new
--- script); everything is put back when it goes off or you leave the round.
-InfAbility.paused, InfAbility.conn = {}, nil
-local function inf_unroute()
-    for c in pairs(InfAbility.paused) do pcall(function() c:Enable() end) end
-    InfAbility.paused = {}
-    if InfAbility.conn then pcall(function() InfAbility.conn:Disconnect() end); InfAbility.conn = nil end
+Mods.InfAbility.paused, Mods.InfAbility.conn = {}, nil
+function Mods.infUnroute()
+    for c in pairs(Mods.InfAbility.paused) do pcall(function() c:Enable() end) end
+    Mods.InfAbility.paused = {}
+    if Mods.InfAbility.conn then pcall(function() Mods.InfAbility.conn:Disconnect() end); Mods.InfAbility.conn = nil end
 end
-local function inf_route(char, name)
+function Mods.infRoute(char, name)
     local ev = ReplicatedStorage:FindFirstChild("Remotes") and ReplicatedStorage.Remotes:FindFirstChild("AbilityButtonPress")
     if not (ev and getconnections) then return end
     local tail = "Abilities." .. name
     for _, c in ipairs(getconnections(ev.Event)) do
         local f = c.Function
-        if type(f) == "function" and not InfAbility.paused[c] then
+        if type(f) == "function" and not Mods.InfAbility.paused[c] then
             local ok, src = pcall(debug.info, f, "s")
             if ok and type(src) == "string" and src:sub(-#tail) == tail then
-                InfAbility.paused[c] = true
+                Mods.InfAbility.paused[c] = true
                 pcall(function() c:Disable() end)
             end
         end
     end
-    if not InfAbility.conn then
-        InfAbility.conn = ev.Event:Connect(function()
-            if InfAbility.on and is_live() then InfAbility.use() end
+    if not Mods.InfAbility.conn then
+        Mods.InfAbility.conn = ev.Event:Connect(function()
+            if Mods.InfAbility.on and isLive() then Mods.InfAbility.use() end
         end)
     end
 end
-function InfAbility.watch()
-    if InfAbility.watching then return end
-    InfAbility.watching = true
+function Mods.InfAbility.watch()
+    if Mods.InfAbility.watching then return end
+    Mods.InfAbility.watching = true
     task.spawn(function()
-        while InfAbility.on and is_live() do
+        while Mods.InfAbility.on and isLive() do
             local char = LocalPlayer.Character
-            local name = char and char.Parent == Workspace:FindFirstChild("Alive") and inf_equipped(char)
-            if name then pcall(inf_route, char, name) elseif next(InfAbility.paused) or InfAbility.conn then inf_unroute() end
+            local name = char and char.Parent == Workspace:FindFirstChild("Alive") and Mods.infEquipped(char)
+            if name then pcall(Mods.infRoute, char, name) elseif next(Mods.InfAbility.paused) or Mods.InfAbility.conn then Mods.infUnroute() end
             task.wait(0.5)
         end
-        inf_unroute()
-        InfAbility.watching = false
+        Mods.infUnroute()
+        Mods.InfAbility.watching = false
     end)
 end
-local IA = Tabs.Misc:AddRightGroupbox("Abilities", "zap")
-IA:AddToggle("InfAbility", {
+Gui.IA = Gui.Tabs.Misc:AddRightGroupbox("Abilities", "zap")
+Gui.IA:AddToggle("InfAbility", {
     Text = "Infinite Blink / Thunder Dash / Dash", Default = false,
     Tooltip = "Uses your equipped Blink, Thunder Dash or Dash like the game does, with no charges or cooldown (the game keeps those on your side). PC: the key below. Phone: your normal ability button does it while this is on. Experimental: the server sees every use -- if it kicks, turn it off.",
-    Callback = function(v) InfAbility.on = v; if v then InfAbility.watch() end end,
+    Callback = function(v) Mods.InfAbility.on = v; if v then Mods.InfAbility.watch() end end,
 })
-IA:AddDropdown("InfAbilityDir", {
+Gui.IA:AddDropdown("InfAbilityDir", {
     Values = { "Move", "Camera" }, Default = "Move", Text = "Direction",
     Tooltip = "Move: the way you're walking (the game's way). Camera: where you're looking, flat -- works standing still.",
-    Callback = function(v) InfAbility.direction = v end,
+    Callback = function(v) Mods.InfAbility.direction = v end,
 })
-IA:AddSlider("InfAbilityGap", {
+Gui.IA:AddSlider("InfAbilityGap", {
     Text = "Min time between uses", Default = 0.2, Min = 0.05, Max = 2, Rounding = 2, Suffix = "s",
-    Callback = function(v) InfAbility.gap = v end,
+    Callback = function(v) Mods.InfAbility.gap = v end,
 })
-IA:AddLabel("Ability key"):AddKeyPicker("InfAbilityKey", {
-    Default = "None", Mode = "Toggle", Text = "Infinite ability", Callback = function() InfAbility.use() end,
+Gui.IA:AddLabel("Ability key"):AddKeyPicker("InfAbilityKey", {
+    Default = "None", Mode = "Toggle", Text = "Infinite ability", Callback = function() Mods.InfAbility.use() end,
 })
 
--- ----- Panel tab: the Training Mode server panel (0.5.110; 0.5.111) -----
--- 0.5.110 fired the Net remotes by their readable names (RE/CustomModeReset
--- Player...) and was KICKED on the first reset. Those are decoys: in the
--- Training dump the Net folder has 551 readable-named remotes with 0
--- listeners and 485 SHA-like hashed ones carrying all 138 listeners; the
--- game reaches the real ones through Net:RemoteEvent(name), and the hashes
--- share nothing between servers (3 dumps: 0 in common). So this never names
--- a remote: it PRESSES THE GAME'S OWN PANEL BUTTONS (firesignal on their
--- Activated, else each connection's :Fire()) -- TrainingModeController's
--- handler then sends the real remote exactly as a click does:
---   Start / End match   Frame.Server.StartRound / EndRound
---   bots                Frame.Bots.BotIncrease / BotDecrease (Counter.Count "n/10")
---   difficulty / mode   Frame.Bots.Difficulties.<name> / Frame.Game.Modes.<name>
---   checkboxes          Frame.<group>.<box>.CheckFrame
---   a player            PlayerPanel.Playing / NotPlaying row (Username "@name")
---                       .Reset / .Toggle
--- OWNER ONLY, as before: the game's ServerAdminAccess / HasEditPermissions.
--- Every action is a button, so a loaded config never presses anything.
-local Panel = { sel = {}, spam = false, spam_for = 10, spam_every = 0.25, token = nil }
-local PANEL_PLACE = 15234596844
-function Panel.gui() return LocalPlayer.PlayerGui:FindFirstChild("TrainingModeServerPanel") end
-function Panel.owner()
+Mods.Panel = { sel = {}, spam = false, spam_for = 10, spam_every = 0.25, token = nil }
+Mods.PANEL_PLACE = 15234596844
+function Mods.Panel.gui() return LocalPlayer.PlayerGui:FindFirstChild("TrainingModeServerPanel") end
+function Mods.Panel.owner()
     if LocalPlayer:GetAttribute("ServerAdminAccess") == true then return true end
-    local training = game.PlaceId == PANEL_PLACE or Panel.gui() ~= nil
+    local training = game.PlaceId == Mods.PANEL_PLACE or Mods.Panel.gui() ~= nil
     if not training then return false end
     local info = ReplicatedStorage:FindFirstChild("ServerInfo")
     local so = info and info:FindFirstChild("serverOwner")
     if so then return so.Value == LocalPlayer.UserId end
     return game.PrivateServerId ~= "" and game.PrivateServerOwnerId == LocalPlayer.UserId
 end
--- press a game button: its Activated handlers run as for a click
-function Panel.press(btn)
+function Mods.Panel.press(btn)
     if typeof(btn) ~= "Instance" or not btn:IsA("GuiButton") then return false end
     if type(firesignal) == "function" and pcall(firesignal, btn.Activated) then return true end
     local ok, conns = pcall(getconnections, btn.Activated)
@@ -5891,10 +4764,9 @@ function Panel.press(btn)
     for _, c in ipairs(conns) do pcall(function() c:Fire() end) end
     return true
 end
--- the panel button at a path under the panel GUI, owner-checked
-function Panel.button(path)
-    if not Panel.owner() then Notify("Panel", "You're not the owner of this training server.", 3); return nil end
-    local gui = Panel.gui()
+function Mods.Panel.button(path)
+    if not Mods.Panel.owner() then Notify("Panel", "You're not the owner of this training server.", 3); return nil end
+    local gui = Mods.Panel.gui()
     if not gui then Notify("Panel", "No training server panel here.", 3); return nil end
     local node = gui
     for _, part in ipairs(path) do
@@ -5903,25 +4775,23 @@ function Panel.button(path)
     if not node then Notify("Panel", "Couldn't find " .. table.concat(path, ".") .. " in the game's panel.", 3) end
     return node
 end
-function Panel.click(path) local b = Panel.button(path); return b ~= nil and Panel.press(b) end
--- the selected players still in the server
-function Panel.selected()
+function Mods.Panel.click(path) local b = Mods.Panel.button(path); return b ~= nil and Mods.Panel.press(b) end
+function Mods.Panel.selected()
     local list = {}
-    for name, on in pairs(Panel.sel) do
+    for name, on in pairs(Mods.Panel.sel) do
         local plr = on and Players:FindFirstChild(name)
         if plr and plr:IsA("Player") then list[#list + 1] = plr end
     end
     return list
 end
-function Panel.names()
+function Mods.Panel.names()
     local list = {}
     for _, plr in ipairs(Players:GetPlayers()) do list[#list + 1] = plr.Name end
     table.sort(list, function(a, b) return a:lower() < b:lower() end)
     return list
 end
--- a player's row in the game's player panel (by its "@username" label)
-function Panel.row(plr)
-    local gui = Panel.gui()
+function Mods.Panel.row(plr)
+    local gui = Mods.Panel.gui()
     local pp = gui and gui:FindFirstChild("PlayerPanel")
     if not pp then return nil end
     local want = "@" .. plr.Name
@@ -5933,250 +4803,330 @@ function Panel.row(plr)
     end
     return nil
 end
-function Panel.player_action(plr, which)
-    if not Panel.owner() then Notify("Panel", "You're not the owner of this training server.", 3); return false end
-    local row = Panel.row(plr)
+function Mods.Panel.player_action(plr, which)
+    if not Mods.Panel.owner() then Notify("Panel", "You're not the owner of this training server.", 3); return false end
+    local row = Mods.Panel.row(plr)
     local btn = row and row:FindFirstChild(which)
     if not btn then return false end
-    return Panel.press(btn)
+    return Mods.Panel.press(btn)
 end
--- a panel checkbox's current state, read off the game's own panel UI
-function Panel.checked(path)
+function Mods.Panel.checked(path)
     local ok, v = pcall(function()
-        local f = Panel.gui().Frame
+        local f = Mods.Panel.gui().Frame
         for _, part in ipairs(path) do f = f[part] end
         return f.CheckFrame.CheckIcon.Visible
     end)
     if ok then return v end
     return nil
 end
-function Panel.options(group, list)
+function Mods.Panel.options(group, list)
     local names = {}
     pcall(function()
-        for _, c in ipairs(Panel.gui().Frame[group][list]:GetChildren()) do
+        for _, c in ipairs(Mods.Panel.gui().Frame[group][list]:GetChildren()) do
             if c:IsA("GuiButton") and c.Name ~= "Custom" then names[#names + 1] = c.Name end
         end
     end)
     table.sort(names)
     return names
 end
-function Panel.bot_count()
-    local ok, n = pcall(function() return tonumber(Panel.gui().Frame.Bots.Counter.Count.Text:match("^(%d+)")) end)
+function Mods.Panel.bot_count()
+    local ok, n = pcall(function() return tonumber(Mods.Panel.gui().Frame.Bots.Counter.Count.Text:match("^(%d+)")) end)
     return ok and n or nil
 end
--- step the game's +/- buttons to the wanted count (each press is one of its sends)
-function Panel.set_bots(want)
+function Mods.Panel.set_bots(want)
     task.spawn(function()
         for _ = 1, 12 do
-            local n = Panel.bot_count()
+            local n = Mods.Panel.bot_count()
             if not n or n == want then return end
-            if not Panel.click({ "Frame", "Bots", n < want and "BotIncrease" or "BotDecrease" }) then return end
+            if not Mods.Panel.click({ "Frame", "Bots", n < want and "BotIncrease" or "BotDecrease" }) then return end
             task.wait(0.15)
         end
     end)
 end
-function Panel.reset_selected()
+function Mods.Panel.reset_selected()
     local n = 0
-    for _, plr in ipairs(Panel.selected()) do
-        if Panel.player_action(plr, "Reset") then n = n + 1 end
+    for _, plr in ipairs(Mods.Panel.selected()) do
+        if Mods.Panel.player_action(plr, "Reset") then n = n + 1 end
     end
     return n
 end
-function Panel.spam_start()
+function Mods.Panel.spam_start()
     local token = {}
-    Panel.token = token
+    Mods.Panel.token = token
     task.spawn(function()
         local t0 = clock_()
-        while Panel.spam and Panel.token == token and is_live() do
-            if not Panel.owner() then Notify("Panel", "Spam reset stopped: you're not the owner.", 3); break end
-            if Panel.spam_for > 0 and clock_() - t0 >= Panel.spam_for then break end
-            Panel.reset_selected()
-            task.wait(Panel.spam_every)
+        while Mods.Panel.spam and Mods.Panel.token == token and isLive() do
+            if not Mods.Panel.owner() then Notify("Panel", "Spam reset stopped: you're not the owner.", 3); break end
+            if Mods.Panel.spam_for > 0 and clock_() - t0 >= Mods.Panel.spam_for then break end
+            Mods.Panel.reset_selected()
+            task.wait(Mods.Panel.spam_every)
         end
-        if Panel.token == token then
-            Panel.spam, Panel.token = false, nil
+        if Mods.Panel.token == token then
+            Mods.Panel.spam, Mods.Panel.token = false, nil
             pcall(function() Toggles.PanelSpamReset:SetValue(false) end)
         end
     end)
 end
 
--- The tab exists ONLY for the owner of a training server (0.5.115): it is
--- built the moment the game marks you ServerAdminAccess (its own
--- HasEditPermissions: a training server and you own it) -- checked at load
--- and every 3s after, since ownership can arrive late. Anyone else never
--- sees a Panel tab.
-local function build_panel_ui()
-local PO = Tabs.Panel:AddLeftGroupbox("Server", "crown")
+function Mods.mkPanel()
+local PO = Gui.Tabs.Panel:AddLeftGroupbox("Server", "crown")
 local PanelStatus = PO:AddLabel("Owner: checking...", true)
-local function panel_status()
+local function panelStatus()
     pcall(function()
-        PanelStatus:SetText(Panel.owner() and "Owner: yes -- panel actions work here."
+        PanelStatus:SetText(Mods.Panel.owner() and "Owner: yes -- panel actions work here."
             or "Owner: no -- the server only takes these from its owner.")
     end)
 end
-PO:AddButton({ Text = "Start match", Func = function() Panel.click({ "Frame", "Server", "StartRound" }) end })
-PO:AddButton({ Text = "End match", Func = function() Panel.click({ "Frame", "Server", "EndRound" }) end })
+PO:AddButton({ Text = "Start match", Func = function() Mods.Panel.click({ "Frame", "Server", "StartRound" }) end })
+PO:AddButton({ Text = "End match", Func = function() Mods.Panel.click({ "Frame", "Server", "EndRound" }) end })
 PO:AddSlider("PanelBots", { Text = "Bots", Default = 1, Min = 0, Max = 10, Rounding = 0,
-    Callback = function(v) Panel.bots = v end })
-PO:AddButton({ Text = "Set bots", Func = function() Panel.set_bots(Panel.bots or 1) end })
+    Callback = function(v) Mods.Panel.bots = v end })
+PO:AddButton({ Text = "Set bots", Func = function() Mods.Panel.set_bots(Mods.Panel.bots or 1) end })
 local PanelDiff = PO:AddDropdown("PanelDifficulty", { Values = {}, Text = "Difficulty",
     Tooltip = "Filled from the game's panel -- press Refresh options if it's empty.",
-    Callback = function(v) Panel.difficulty = v end })
+    Callback = function(v) Mods.Panel.difficulty = v end })
 PO:AddButton({ Text = "Set difficulty", Func = function()
-    if Panel.difficulty then Panel.click({ "Frame", "Bots", "Difficulties", Panel.difficulty }) end
+    if Mods.Panel.difficulty then Mods.Panel.click({ "Frame", "Bots", "Difficulties", Mods.Panel.difficulty }) end
 end })
 local PanelMode = PO:AddDropdown("PanelMode", { Values = {}, Text = "Game mode",
-    Callback = function(v) Panel.mode = v end })
+    Callback = function(v) Mods.Panel.mode = v end })
 PO:AddButton({ Text = "Set game mode", Func = function()
-    if Panel.mode then Panel.click({ "Frame", "Game", "Modes", Panel.mode }) end
+    if Mods.Panel.mode then Mods.Panel.click({ "Frame", "Game", "Modes", Mods.Panel.mode }) end
 end })
--- the panel's checkboxes: pressing one flips it, as in the game's panel
 for _, cb in ipairs({ { "Respawn", { "Bots", "Respawn" } }, { "BotsMove", { "Bots", "Move" } },
         { "AutoStart", { "Server", "AutoStart" } }, { "ChangeAbilitiesMiddleRound", { "Game", "Abilitymidround" } } }) do
     PO:AddButton({ Text = "Toggle " .. cb[1], Func = function()
-        Panel.click({ "Frame", cb[2][1], cb[2][2], "CheckFrame" })
+        Mods.Panel.click({ "Frame", cb[2][1], cb[2][2], "CheckFrame" })
     end })
 end
 PO:AddButton({ Text = "Refresh options", Func = function()
-    pcall(function() PanelDiff:SetValues(Panel.options("Bots", "Difficulties")) end)
-    pcall(function() PanelMode:SetValues(Panel.options("Game", "Modes")) end)
-    panel_status()
+    pcall(function() PanelDiff:SetValues(Mods.Panel.options("Bots", "Difficulties")) end)
+    pcall(function() PanelMode:SetValues(Mods.Panel.options("Game", "Modes")) end)
+    panelStatus()
 end })
 
-local PP2 = Tabs.Panel:AddRightGroupbox("Players", "users")
-local PanelPlayers = PP2:AddDropdown("PanelPlayers", { Values = Panel.names(), Default = {}, Multi = true, Text = "Players",
+local PP2 = Gui.Tabs.Panel:AddRightGroupbox("Players", "users")
+local PanelPlayers = PP2:AddDropdown("PanelPlayers", { Values = Mods.Panel.names(), Default = {}, Multi = true, Text = "Players",
     Searchable = true,
     Callback = function(v)
-        Panel.sel = {}
-        for name, on in pairs(type(v) == "table" and v or {}) do if on then Panel.sel[name] = true end end
+        Mods.Panel.sel = {}
+        for name, on in pairs(type(v) == "table" and v or {}) do if on then Mods.Panel.sel[name] = true end end
     end })
 PP2:AddButton({ Text = "Refresh players", Func = function()
-    pcall(function() PanelPlayers:SetValues(Panel.names()) end)
-    panel_status()
+    pcall(function() PanelPlayers:SetValues(Mods.Panel.names()) end)
+    panelStatus()
 end })
 PP2:AddButton({ Text = "Reset selected", Func = function()
-    local n = Panel.reset_selected()
-    if n == 0 and #Panel.selected() == 0 then Notify("Panel", "No players selected.", 2) end
+    local n = Mods.Panel.reset_selected()
+    if n == 0 and #Mods.Panel.selected() == 0 then Notify("Panel", "No players selected.", 2) end
 end })
 PP2:AddButton({ Text = "Add / remove selected", Tooltip = "Adds or removes them from the round queue (the game won't toggle you).",
     Func = function()
-        for _, plr in ipairs(Panel.selected()) do
-            if plr ~= LocalPlayer then Panel.player_action(plr, "Toggle") end
+        for _, plr in ipairs(Mods.Panel.selected()) do
+            if plr ~= LocalPlayer then Mods.Panel.player_action(plr, "Toggle") end
         end
     end })
 PP2:AddToggle("PanelSpamReset", { Text = "Spam reset selected", Default = false,
     Tooltip = "Keeps resetting the selected players for the time below, at the speed below. Owner only; stops by itself.",
     Callback = function(v)
-        Panel.spam = v
+        Mods.Panel.spam = v
         if v then
-            if #Panel.selected() == 0 then Notify("Panel", "Select players first.", 2) end
-            Panel.spam_start()
-        else Panel.token = nil end
+            if #Mods.Panel.selected() == 0 then Notify("Panel", "Select players first.", 2) end
+            Mods.Panel.spam_start()
+        else Mods.Panel.token = nil end
     end })
 local PANEL_FOR = { ["5s"] = 5, ["10s"] = 10, ["30s"] = 30, ["1 min"] = 60, ["5 min"] = 300, ["Until off"] = 0 }
 PP2:AddDropdown("PanelSpamFor", { Values = { "5s", "10s", "30s", "1 min", "5 min", "Until off" }, Default = "10s", Text = "For",
-    Callback = function(v) Panel.spam_for = PANEL_FOR[v] or 10 end })
+    Callback = function(v) Mods.Panel.spam_for = PANEL_FOR[v] or 10 end })
 local PANEL_EVERY = { ["0.1s"] = 0.1, ["0.25s"] = 0.25, ["0.5s"] = 0.5, ["1s"] = 1, ["2s"] = 2, ["5s"] = 5 }
 PP2:AddDropdown("PanelSpamEvery", { Values = { "0.1s", "0.25s", "0.5s", "1s", "2s", "5s" }, Default = "0.25s", Text = "Every",
-    Callback = function(v) Panel.spam_every = PANEL_EVERY[v] or 0.25 end })
-task.defer(panel_status)
+    Callback = function(v) Mods.Panel.spam_every = PANEL_EVERY[v] or 0.25 end })
+task.defer(panelStatus)
 end
-local function panel_try()
-    if Panel.built or not is_live() then return end
+function Mods.panelTry()
+    if Mods.Panel.built or not isLive() then return end
     local admin = LocalPlayer:GetAttribute("ServerAdminAccess") == true
-    if not admin and not (game.PlaceId == PANEL_PLACE and Panel.owner()) then return end
-    Panel.built = true
-    Tabs.Panel = Window:AddTab("Panel", "crown", "Training server owner panel")
-    build_panel_ui()
+    if not admin and not (game.PlaceId == Mods.PANEL_PLACE and Mods.Panel.owner()) then return end
+    Mods.Panel.built = true
+    Gui.Tabs.Panel = Gui.Window:AddTab("Panel", "crown", "Training server owner panel")
+    Mods.mkPanel()
 end
-pcall(panel_try)
-if not Panel.built then
+pcall(Mods.panelTry)
+if not Mods.Panel.built then
     task.spawn(function()
-        while is_live() and not Panel.built do
+        while isLive() and not Mods.Panel.built do
             task.wait(3)
-            pcall(panel_try)
+            pcall(Mods.panelTry)
         end
     end)
 end
 
-local NR = Tabs.Misc:AddRightGroupbox("Performance", "cpu")
-NR:AddToggle("NoRender", { Text = "No render", Default = false, Tooltip = "Turns off what's picked below.",
-    Callback = function(v) NoRender:setEnabled(v) end })
-NR:AddDropdown("NoRenderWhat", {
+Gui.NR = Gui.Tabs.Misc:AddRightGroupbox("Performance", "cpu")
+Gui.NR:AddToggle("NoRender", { Text = "No render", Default = false, Tooltip = "Turns off what's picked below.",
+    Callback = function(v) Mods.NoRender:setEnabled(v) end })
+Gui.NR:AddDropdown("NoRenderWhat", {
     Values = { "Ability effects", "Parry effects", "Ball trails", "Character effects", "All particles", "Post effects", "Shadows" },
     Default = { "Ability effects", "Parry effects" }, Multi = true, Text = "Removes",
     Tooltip = "Ability effects: spawned ability visuals. Parry effects: the game's hit/parry FX script. Ball trails / Character effects: particles, trails and beams on balls / players. All particles: every particle, trail and beam in the map. Post effects: bloom, blur, color correction, sun rays, depth of field. Shadows: global shadows.",
     Callback = function(v)
-        NR_SEL = {}
-        for name, on in pairs(type(v) == "table" and v or {}) do if on then NR_SEL[name] = true end end
-        if NoRender.on then NoRender:setEnabled(false); NoRender:setEnabled(true) end
+        Mods.NR_SEL = {}
+        for name, on in pairs(type(v) == "table" and v or {}) do if on then Mods.NR_SEL[name] = true end end
+        if Mods.NoRender.on then Mods.NoRender:setEnabled(false); Mods.NoRender:setEnabled(true) end
     end,
 })
 
-local UA = Tabs.Misc:AddRightGroupbox("Unlock All", "unlock")
-UA:AddButton({ Text = "Load unlock all", Risky = true, DoubleClick = true,
-    Tooltip = "Runs a third-party script from flowauth.net (double-click). Its code is not part of this repo.",
-    Func = function()
-        Notify("Unlock All", "Loading script...", 3)
-        local ok, err = pcall(function() loadstring(game:HttpGet("https://flowauth.net/v1/loaders/5d423493a8f0aa8432cda8455a5f8906.lua"))() end)
-        Notify("Unlock All", ok and "Script loaded" or ("Error: " .. tostring(err)), ok and 3 or 5)
-    end })
-UA:AddButton({ Text = "Remove unlock UI", Func = function()
-    task.spawn(function()
-        local n = 0
-        local keys = { "unlock", "unlocksuite", "flowauth", "flow", "authui", "hubui", "keyui", "keysystem", "key", "loader" }
-        local function sweep(parent)
-            if not parent then return end
-            for _, g in ipairs(parent:GetChildren()) do
-                if g:IsA("ScreenGui") then
-                    local nm = tostring(g.Name):lower()
-                    for _, k in ipairs(keys) do
-                        if nm:find(k, 1, true) and not nm:find("bb_", 1, true) then
-                            if pcall(function() g:Destroy() end) then n = n + 1 end
-                            break
-                        end
+Mods.Unlock = Feature("UnlockAll")
+do
+    local U = { bypass = false }
+    local function ups(f)
+        local g = getupvalues or (debug and debug.getupvalues)
+        if type(g) ~= "function" or type(f) ~= "function" then return {} end
+        local ok, t = pcall(g, f)
+        return ok and type(t) == "table" and t or {}
+    end
+    local function owned(name)
+        U.bypass = true
+        local ok, ids = pcall(function() return U.inv.Client:FindItems("Sword", name) end)
+        U.bypass = false
+        return ok and type(ids) == "table" and ids[1] or nil
+    end
+    local function nameOf(arg)
+        local n = arg:match("^virtual_%d+_Sword_(.+)$")
+        if n then return n end
+        local ok, it = pcall(function() return U.inv.Client:GetItem("Sword", arg) end)
+        return ok and type(it) == "table" and type(it.Name) == "string" and it.Name or arg
+    end
+    local function equipState()
+        if not U.api then return nil end
+        for _, v in pairs(ups(rawget(U.api, "GetSwordData") or U.api.GetSwordData)) do
+            local st = type(v) == "table" and rawget(v, "Sword")
+            if type(st) == "table" and rawget(v, "Booth") ~= nil and type(st.Set) == "function" and type(st.Get) == "function" then return st end
+        end
+    end
+    local function refresh()
+        if not (U.api and U.inv) then return end
+        local C = U.inv.Client
+        for kind, fn in pairs({ Sword = "GetSwordData", Explosion = "GetExplosionData", Ability = "GetAbilityData", Emote = "GetEmoteData", Booth = "GetBoothData" }) do
+            for _, cache in pairs(ups(rawget(U.api, fn) or U.api[fn])) do
+                local e = type(cache) == "table" and select(2, next(cache)) or nil
+                if type(e) == "table" and rawget(e, "OwnedCopies") and rawget(e, "ParsedItemKey") then
+                    for key, d in pairs(cache) do
+                        pcall(function()
+                            local n = #C:FindItemsWithKey(kind, key)
+                            d.OwnedCopies:Set(n)
+                            U.api:GetItemBaseOwnedState(kind, C:KeyToItem(key).Name):SetTag(key, n > 0)
+                        end)
                     end
                 end
             end
         end
-        sweep(LocalPlayer:FindFirstChildOfClass("PlayerGui"))
-        pcall(sweep, CoreGui)
-        pcall(function() if gethui then sweep(gethui()) end end)
-        Notify("Unlock All", n > 0 and ("Removed " .. n .. " UI") or "No UI found", 3)
-    end)
-end })
+    end
+    local function pick(name)
+        if not Mods.Unlock.on or name == "" then return end
+        Mods.Skin.name = name
+        Mods.saveSkin()
+        pcall(function() Options.SkinName:SetValue(name) end)
+        if not Mods.SkinChanger.on then pcall(function() Toggles.SkinChanger:SetValue(true) end) end
+        if not Mods.SkinChanger.on then Mods.SkinChanger:setEnabled(true) end
+        Mods.SkinChanger.apply()
+        pcall(function() equipState():Set({ Name = name, Id = ("virtual_%d_Sword_%s"):format(LocalPlayer.UserId, name) }) end)
+        Notify("Unlock All", "Sword: " .. name, 2)
+    end
+    local function route(remote, arg)
+        if type(arg) ~= "string" then return nil end
+        local kind = remote:match("RequestEquip(%a+)$")
+        if kind == "Sword" or kind == "SwordSkin" then
+            local name = nameOf(arg)
+            local real = owned(name)
+            task.spawn(pick, name)
+            if real then return "pass", real end
+            return "stop", true
+        end
+        if kind and arg:sub(1, 8) == "virtual_" then return "stop", false end
+        return nil
+    end
+    local function body(self, ...)
+        if Mods.Unlock.on and getnamecallmethod() == "InvokeServer" and typeof(self) == "Instance" and self.ClassName == "RemoteFunction" then
+            local ok, act, v = pcall(route, self.Name, ...)
+            if ok and act == "stop" then return v end
+            if ok and act == "pass" then return U.old(self, v, select(2, ...)) end
+        end
+        return U.old(self, ...)
+    end
+    local function current()
+        local ok, mt = pcall(getrawmetatable, game)
+        return ok and type(mt) == "table" and rawget(mt, "__namecall") or nil
+    end
+    local function hook()
+        if not (hookmetamethod and getnamecallmethod) then return false end
+        if U.fn and current() == U.fn then return true end
+        local f = newcclosure and newcclosure(body) or body
+        local ok, old = pcall(hookmetamethod, game, "__namecall", f)
+        if ok and type(old) == "function" then U.old, U.fn = old, f; return true end
+        return false
+    end
+    local function unhook()
+        if U.fn and U.old and current() == U.fn then pcall(hookmetamethod, game, "__namecall", U.old) end
+        U.fn = nil
+    end
+    function Mods.Unlock.start()
+        local token = Mods.Unlock._token
+        task.spawn(function()
+            local ok = pcall(function()
+                local sh = ReplicatedStorage:WaitForChild("Shared", 10)
+                U.inv = U.inv or require(sh:WaitForChild("Inventory", 10))
+                U.vi = U.vi or require(sh.Inventory:WaitForChild("Internal", 10):WaitForChild("VirtualInventory", 10))
+            end)
+            if not ok or not U.vi or not U.inv or not Mods.Unlock:alive(token) then
+                if Mods.Unlock:alive(token) then Notify("Unlock All", "Couldn't load the game's inventory.", 4) end
+                return
+            end
+            pcall(function() U.api = U.api or require(ReplicatedStorage.Controllers.UI.ShopControllerAPI) end)
+            U.real = U.real or U.vi.IsEnabledFor
+            local set = pcall(rawset, U.vi, "IsEnabledFor", function(self, p, ...)
+                if Mods.Unlock.on and not U.bypass and (p == nil or p == LocalPlayer) then return true end
+                return U.real(self, p, ...)
+            end)
+            if not set then Notify("Unlock All", "Couldn't patch the inventory.", 4); return end
+            if not hook() then Notify("Unlock All", "No namecall hook: equips won't switch the skin.", 4) end
+            refresh()
+            Mods.Unlock:loop(1, function() if Parry.hookState() == "down" then hook() end end)
+        end)
+    end
+    function Mods.Unlock.stop()
+        if U.vi and U.real then pcall(rawset, U.vi, "IsEnabledFor", U.real) end
+        unhook()
+        task.spawn(function()
+            refresh()
+            pcall(function() equipState():Set(U.api:GetEquippedItem("Sword")) end)
+        end)
+    end
+end
 
--- ----- live labels (the Status tab is gone since 0.5.115) -----
--- Capture state is on the Auto Parry tab (Capture box), spam rate / clash on
--- the Spam tab, timing diagnostics on the Debug tab; the parry log is the
--- file BladeBall/rewrite_log.txt and the debug overlay's event list.
-local TimingLabel -- set by the Debug tab below
+Gui.UA = Gui.Tabs.Misc:AddRightGroupbox("Unlock All", "unlock")
+Gui.UA:AddToggle("UnlockAll", { Text = "Unlock all", Default = false,
+    Tooltip = "Shows every item as owned in your inventory (only you see it). Equipping a sword puts it on with the skin changer; other items stay visual.",
+    Callback = function(v) Mods.Unlock:setEnabled(v) end })
+
 local function set(label, text) if label then pcall(function() label:SetText(text) end) end end
 StatusHook = function(s, armed)
     if not s then
-        set(CapLabel, armed and "Capture: asleep in the lobby -- wakes when you join a round" or "Capture: off (turn on auto parry or spam)")
-        set(SpamRateLabel, "Actual: 0/s"); set(ClashLabel, "Status: off")
+        set(Gui.CapLabel, armed and "Capture: asleep in the lobby -- wakes when you join a round" or "Capture: off (turn on auto parry or spam)")
+        set(Gui.SpamRateLabel, "Actual: 0/s"); set(Gui.ClashLabel, "Status: off")
         return
     end
     Parry.drainLog()
     if not Library.Toggled then return end
-    set(CapLabel, "Capture: " .. s.armed)
-    set(SpamRateLabel, ("Actual: %d/s of %d (%s, %s)"):format(math.floor(s.rate + 0.5), math.floor((s.target or 0) + 0.5), tostring(s.speed_mode), s.manual))
-    set(ClashLabel, "Status: " .. s.clash)
-    if TimingLabel then set(TimingLabel, table.concat(Parry.timingLines(), "\n")) end
+    set(Gui.CapLabel, "Capture: " .. s.armed)
+    set(Gui.SpamRateLabel, ("Actual: %d/s of %d (%s, %s)"):format(math.floor(s.rate + 0.5), math.floor((s.target or 0) + 0.5), tostring(s.speed_mode), s.manual))
+    set(Gui.ClashLabel, "Status: " .. s.clash)
+    if Gui.TimingLabel then set(Gui.TimingLabel, table.concat(Parry.timingLines(), "\n")) end
 end
 UiTick = function(rate) Orb.tick(rate) end
 
--- ----- Debug tab -----
--- One on-screen panel: live numbers on top (ping / reach, server feed, capture,
--- parry gate, the ball on you, the last decision's numbers and why it held),
--- the newest events under it (retargets, fires, landed / missed, their
--- parries, captures, tornado holds). Drag it by any part; it is clamped to the
--- screen every update -- and shrunk if the Size would make it bigger than the
--- screen -- so it can never end up off screen. Collection runs only while on.
-local DebugCfg = { Size = 1 }
-local DebugUI = Feature("DebugUI")
-function DebugUI.start()
+Mods.DebugCfg = { Size = 1 }
+Mods.DebugUI = Feature("DebugUI")
+function Mods.DebugUI.start()
     Parry.DBG.on = true
     local W0, H0 = 360, 330
     local gui = Instance.new("ScreenGui"); gui.Name = randName(); gui.ResetOnSpawn = false
@@ -6203,19 +5153,17 @@ function DebugUI.start()
     local events = label(160, H0 - 166)
     events.ClipsDescendants = true
     hideGui(gui)
-    DebugUI:own(gui)
+    Mods.DebugUI:own(gui)
 
-    -- keep it on screen: shrink to fit, then clamp the corner
     local function fit()
         local cam = Workspace.CurrentCamera
         local vp = cam and cam.ViewportSize or Vector2.new(800, 600)
-        local s = math.min(DebugCfg.Size, (vp.X * 0.96) / W0, (vp.Y * 0.92) / H0)
+        local s = math.min(Mods.DebugCfg.Size, (vp.X * 0.96) / W0, (vp.Y * 0.92) / H0)
         scale.Scale = math.max(s, 0.3)
     end
     local function place(x, y)
         local cam = Workspace.CurrentCamera
-        local vp = cam and cam.ViewportSize or Vector2.new(800, 600)
-        local sz = frame.AbsoluteSize
+        local vp, sz = cam and cam.ViewportSize or Vector2.new(800, 600), frame.AbsoluteSize
         x = math.clamp(x, 0, math.max(vp.X - sz.X, 0))
         y = math.clamp(y, 0, math.max(vp.Y - sz.Y, 0))
         frame.Position = UDim2.fromOffset(x, y)
@@ -6227,12 +5175,11 @@ function DebugUI.start()
             drag = { at = i.Position, from = frame.AbsolutePosition, input = t }
         end
     end
-    -- grab from the background or any text on it
-    DebugUI:connect(frame.InputBegan, grab)
+    Mods.DebugUI:connect(frame.InputBegan, grab)
     for _, c in ipairs(frame:GetChildren()) do
-        if c:IsA("GuiObject") then DebugUI:connect(c.InputBegan, grab) end
+        if c:IsA("GuiObject") then Mods.DebugUI:connect(c.InputBegan, grab) end
     end
-    DebugUI:connect(UserInputService.InputChanged, function(i)
+    Mods.DebugUI:connect(UserInputService.InputChanged, function(i)
         if not drag then return end
         local t = i.UserInputType
         if t == Enum.UserInputType.MouseMovement or t == Enum.UserInputType.Touch then
@@ -6240,12 +5187,12 @@ function DebugUI.start()
             place(drag.from.X + d.X, drag.from.Y + d.Y)
         end
     end)
-    DebugUI:connect(UserInputService.InputEnded, function(i)
+    Mods.DebugUI:connect(UserInputService.InputEnded, function(i)
         local t = i.UserInputType
         if t == Enum.UserInputType.MouseButton1 or t == Enum.UserInputType.Touch then drag = nil end
     end)
 
-    DebugUI:loop(0.1, function()
+    Mods.DebugUI:loop(0.1, function()
         fit()
         if not drag then place(frame.AbsolutePosition.X, frame.AbsolutePosition.Y) end
         local ok, lines = pcall(Parry.debugLines)
@@ -6258,76 +5205,59 @@ function DebugUI.start()
         events.Text = #out > 0 and table.concat(out, "\n") or "(no events yet -- they show here as they happen)"
     end)
 end
-function DebugUI.stop() Parry.DBG.on = false end
+function Mods.DebugUI.stop() Parry.DBG.on = false end
 
--- Timing diagnostics (0.5.115): how the parries have gone and how well the
--- arrival was predicted -- live while the menu is open, also in the overlay
--- and written to the log file every 10 landed parries.
-local DBGTM = Tabs.Debug:AddRightGroupbox("Timing", "timer")
-TimingLabel = DBGTM:AddLabel("Timing: turn on auto parry and play a few parries.", true)
-DBGTM:AddLabel("Lands + = the ball came later than predicted (firing early); - = sooner (firing late). Not taken = the server ignored a remote parry (bad capture).", true)
-local DBGB = Tabs.Debug:AddLeftGroupbox("Debug overlay", "bug")
-DBGB:AddToggle("DebugUI", {
+Gui.DBGTM = Gui.Tabs.Debug:AddRightGroupbox("Timing", "timer")
+Gui.TimingLabel = Gui.DBGTM:AddLabel("Timing: turn on auto parry and play a few parries.", true)
+Gui.DBGTM:AddLabel("Lands + = the ball came later than predicted (firing early); - = sooner (firing late). Not taken = the server ignored a remote parry (bad capture).", true)
+Gui.DBGB = Gui.Tabs.Debug:AddLeftGroupbox("Debug overlay", "bug")
+Gui.DBGB:AddToggle("DebugUI", {
     Text = "Debug overlay", Default = false,
     Tooltip = "On-screen panel: live ping / reach / feed / capture / gate / the ball on you and the last decision, plus the newest events (retargets, fires, landed / missed, their parries, captures).",
-    Callback = function(v) DebugUI:setEnabled(v) end,
+    Callback = function(v) Mods.DebugUI:setEnabled(v) end,
 })
-DBGB:AddSlider("DebugUISize", {
+Gui.DBGB:AddSlider("DebugUISize", {
     Text = "Size", Default = 100, Min = 50, Max = 200, Rounding = 0, Suffix = "%",
     Tooltip = "It never gets bigger than the screen, whatever this says.",
-    Callback = function(v) DebugCfg.Size = v / 100 end,
+    Callback = function(v) Mods.DebugCfg.Size = v / 100 end,
 })
-DBGB:AddButton({ Text = "Clear events", Func = function() table.clear(Parry.DBG.list) end })
+Gui.DBGB:AddButton({ Text = "Clear events", Func = function() table.clear(Parry.DBG.list) end })
 
--- PC-style movement (for touch): the thumbstick is analog -- a part tilt walks
--- slower, and it goes any angle. On PC, WASD is always full walk speed in one
--- of 8 directions. Right after the game's control script sets the move each
--- frame (it binds at RenderPriority.Input), this re-issues the same direction
--- at full magnitude, optionally snapped to the nearest of 8 camera-relative
--- directions -- the same Humanoid:Move call the control script itself makes.
-local PcMoveCfg = { Snap = true, bind = nil, cur = nil }
-local PcMove = Feature("PcMove")
-function PcMove.start()
+Mods.PcMoveCfg = { Snap = true, bind = nil, cur = nil }
+Mods.PcMove = Feature("PcMove")
+function Mods.PcMove.start()
     local name = randName()
-    PcMoveCfg.bind = name
+    Mods.PcMoveCfg.bind = name
     pcall(function()
         RunService:BindToRenderStep(name, Enum.RenderPriority.Input.Value + 1, function()
-            if not is_live() then return end
+            if not isLive() then return end
             local char = LocalPlayer.Character
             local hum = char and char:FindFirstChildOfClass("Humanoid")
             if not hum or hum.Health <= 0 then return end
             local md = hum.MoveDirection
             local flat = Vector3.new(md.X, 0, md.Z)
-            if flat.Magnitude < 0.05 then PcMoveCfg.cur = nil; return end
+            if flat.Magnitude < 0.05 then Mods.PcMoveCfg.cur = nil; return end
             local dir = flat.Unit
-            if PcMoveCfg.Snap then
-                -- Sticky 8-way. Plain rounding (0.5.92) flipped between two
-                -- neighbours whenever the thumb sat near a 22.5 deg boundary --
-                -- the "weird" zig-zag. Now the direction you're on is kept until
-                -- the stick is clearly in the next one (15 deg past the line),
-                -- and the 4 main ones (W/A/S/D) are a little wider than the
-                -- diagonals, like a keyboard where one key is easier than two.
+            if Mods.PcMoveCfg.Snap then
                 local cam = Workspace.CurrentCamera
                 if cam then
                     local f = Vector3.new(cam.CFrame.LookVector.X, 0, cam.CFrame.LookVector.Z)
                     local r = Vector3.new(cam.CFrame.RightVector.X, 0, cam.CFrame.RightVector.Z)
                     if f.Magnitude > 0.01 and r.Magnitude > 0.01 then
                         f, r = f.Unit, r.Unit
-                        local a = math.atan2(dir:Dot(r), dir:Dot(f)) -- 0 = forward, + = right
-                        local step = math.pi / 4
-                        local function off(idx) -- angle from raw to direction idx, -pi..pi
+                        local a, step = math.atan2(dir:Dot(r), dir:Dot(f)), math.pi / 4
+                        local function off(idx)
                             local d = (a - idx * step + math.pi) % (2 * math.pi) - math.pi
                             return math.abs(d)
                         end
-                        -- nearest, with the main 4 weighted wider (+8 deg)
-                        local best, best_d
+                        local best, bestD
                         for idx = 0, 7 do
                             local d = off(idx) - (idx % 2 == 0 and math.rad(8) or 0)
-                            if not best_d or d < best_d then best, best_d = idx, d end
+                            if not bestD or d < bestD then best, bestD = idx, d end
                         end
-                        local cur = PcMoveCfg.cur
+                        local cur = Mods.PcMoveCfg.cur
                         if cur and cur ~= best and off(cur) < step / 2 + math.rad(15) then best = cur end
-                        PcMoveCfg.cur = best
+                        Mods.PcMoveCfg.cur = best
                         local sa = best * step
                         dir = f * math.cos(sa) + r * math.sin(sa)
                     end
@@ -6337,25 +5267,25 @@ function PcMove.start()
         end)
     end)
 end
-function PcMove.stop()
-    if PcMoveCfg.bind then pcall(function() RunService:UnbindFromRenderStep(PcMoveCfg.bind) end) end
-    PcMoveCfg.bind = nil
+function Mods.PcMove.stop()
+    if Mods.PcMoveCfg.bind then pcall(function() RunService:UnbindFromRenderStep(Mods.PcMoveCfg.bind) end) end
+    Mods.PcMoveCfg.bind = nil
 end
 
-local DBGM = Tabs.Debug:AddLeftGroupbox("Movement", "gamepad-2")
-DBGM:AddToggle("PcMovement", {
+Gui.DBGM = Gui.Tabs.Debug:AddLeftGroupbox("Movement", "gamepad-2")
+Gui.DBGM:AddToggle("PcMovement", {
     Text = "PC-style movement", Default = false,
     Tooltip = "Mobile thumbstick moves like WASD: any tilt is full walk speed (no slow part-tilt walking).",
-    Callback = function(v) PcMove:setEnabled(v) end,
+    Callback = function(v) Mods.PcMove:setEnabled(v) end,
 })
-DBGM:AddToggle("PcMovementSnap", {
+Gui.DBGM:AddToggle("PcMovementSnap", {
     Text = "Snap to 8 directions", Default = true,
     Tooltip = "Like W, A, S, D and the diagonals: the stick's direction rounds to the nearest of 8, relative to the camera.",
-    Callback = function(v) PcMoveCfg.Snap = v end,
+    Callback = function(v) Mods.PcMoveCfg.Snap = v end,
 })
 
-local DBGT = Tabs.Debug:AddRightGroupbox("Experimental", "flask-conical")
-DBGT:AddButton({
+Gui.DBGT = Gui.Tabs.Debug:AddRightGroupbox("Experimental", "flask-conical")
+Gui.DBGT:AddButton({
     Text = "Capture without parrying (this server)",
     Tooltip = "Arms auto parry with NO parry and NO hook: reads the game's parry sender (require + upvalue reads, raw only) and asks its own token function for the key on a game-env thread. For this server only. Experimental -- if it ever kicks, drop it.",
     Func = function()
@@ -6369,16 +5299,13 @@ DBGT:AddButton({
         end)
     end,
 })
-DBGT:AddToggle("FastRetarget", {
+Gui.DBGT:AddToggle("FastRetarget", {
     Text = "Fast retarget", Default = false,
     Tooltip = "Auto parry decides the instant the ball turns to you, before its new direction arrives -- but only fires when it should: it's due at your Accuracy, and even a curve twice as long would still land inside the parry (or it's fire-or-die close). Otherwise the normal checks take it a moment later. In a 1v1 the other player's parry counts as the retarget (it can only be coming to you).",
     Callback = function(v) Parry.S.fast_retarget = v end,
 })
-DBGB:AddLabel("Times in the event list are seconds ago. 'soonest' = the earliest the ball can land, 'lead' = when auto parry fires, 'reach' = your ping delay.", true)
+Gui.DBGB:AddLabel("Times in the event list are seconds ago. 'soonest' = the earliest the ball can land, 'lead' = when auto parry fires, 'reach' = your ping delay.", true)
 
--- ---------------------------------------------------------------------------
--- Unload.
--- ---------------------------------------------------------------------------
 Library:OnUnload(function()
     for _, f in pairs(Features) do pcall(function() f:setEnabled(false) end) end
     pcall(Orb.hide)
@@ -6404,3 +5331,4 @@ if getgenv().BBStop == 3 then Flight.write("BBStop 3: whole menu + config loaded
 Notify("Blade Ball", "Rewrite " .. SCRIPT_VERSION .. " loaded. " .. (touchUI and "Tap the menu button to open." or "LeftControl toggles the menu."), 5)
 
 end)
+
