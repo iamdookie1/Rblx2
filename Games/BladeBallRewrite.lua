@@ -1,6 +1,6 @@
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.118"
+local SCRIPT_VERSION = "rewrite-0.5.119"
 
 local genv = (getgenv and getgenv()) or _G
 if type(genv.__BladeBallShutdown) == 'function' then pcall(genv.__BladeBallShutdown) end
@@ -3200,6 +3200,7 @@ Gui.Tabs = {
     Visuals = Gui.Window:AddTab("Visuals", "eye", "Overlays and ESP"),
     Orbit = Gui.Window:AddTab("Orbit", "orbit", "Circle a point you can walk, or the ball"),
     Misc = Gui.Window:AddTab("Misc", "wrench", "Skin changer and extras"),
+    UI = Gui.Window:AddTab("UI", "layout-dashboard", "Restyle the game's own menus"),
     Debug = Gui.Window:AddTab("Debug", "bug", "On-screen debug overlay"),
 }
 
@@ -4251,148 +4252,184 @@ function Mods.saveSkin()
 end
 Mods.SkinChanger = Feature("SkinChanger")
 do
-    local swords, controller, realGetSword
-    local function ourSword(name)
-        return type(name) == "string" and name ~= "" and (name == LocalPlayer:GetAttribute("CurrentlyEquippedSword") or name == Mods.Skin.name)
+    local K = { real = nil, applied = nil, busy = false, again = false, paused = {}, wraps = {}, swords = nil, getSword = nil }
+    local ATTR = "CurrentlyEquippedSword"
+    local function folder()
+        local ok, f = pcall(function() return ReplicatedStorage.Shared.ReplicatedInstances.Swords end)
+        return ok and f or nil
     end
-    local function setSword()
-        if not Mods.SkinChanger.on or Mods.Skin.name == "" or not swords or not LocalPlayer.Character then return end
-        pcall(function()
-            local f = rawget(swords, "EquipSwordTo")
-            if type(f) == "function" and getupvalues and setupvalue then
-                local ups = getupvalues(f)
-                for i = 1, #ups do if type(ups[i]) == "boolean" then setupvalue(f, i, false); break end end
-            end
+    local function info(name)
+        local f = folder()
+        local ok, data = pcall(function() return f.GetSword:Invoke(name) end)
+        return ok and type(data) == "table" and data or nil
+    end
+    function Mods.Skin.valid(name) return type(name) == "string" and name ~= "" and info(name) ~= nil end
+    local function invRealName()
+        local ok, name = pcall(function()
+            local C = require(ReplicatedStorage.Shared.Inventory).Client
+            local eq = C:GetEquipped("Sword")
+            local id = type(eq) == "table" and (eq.Id or eq.Name) or eq
+            local it = type(id) == "string" and C:GetItem("Sword", id)
+            return (type(it) == "table" and it.Name) or (type(eq) == "table" and eq.Name) or nil
         end)
-        pcall(function() swords:EquipSwordTo(LocalPlayer.Character, Mods.Skin.name) end)
-        if controller then
-            pcall(function() if controller.SetSword then controller:SetSword(Mods.Skin.name) end end)
-            pcall(function()
-                local R = getRemotes()
-                if R and R:FindFirstChild("FireSwordInfo") then R.FireSwordInfo:FireServer(Mods.Skin.name) end
-                if controller.currentSword ~= nil then controller.currentSword = Mods.Skin.name end
-                if controller.SwordFX ~= nil then controller.SwordFX = Mods.Skin.name end
-            end)
+        return ok and type(name) == "string" and name ~= "" and name or nil
+    end
+    local function note(v)
+        if type(v) == "string" and v ~= "" and v ~= K.applied then K.real = v end
+    end
+    local function realName()
+        local n = invRealName()
+        if n then K.real = n end
+        return K.real
+    end
+    local function worn(char, name)
+        if char:GetAttribute(ATTR) ~= name then return false end
+        for _, m in ipairs(char:GetChildren()) do
+            if m:IsA("Model") and m:GetAttribute("_equippedSword") then return true end
+        end
+        return false
+    end
+    local function equip(name)
+        local char, f = LocalPlayer.Character, folder()
+        if not (char and f and type(name) == "string" and name ~= "") then return false end
+        if K.busy then K.again = name; return false end
+        K.busy = true
+        local ok = pcall(function() f.EquipSwordTo:Invoke(char, name) end)
+        if not ok and K.swords then ok = pcall(function() K.swords:EquipSwordTo(char, name) end) end
+        K.busy = false
+        local nxt = K.again
+        K.again = false
+        if nxt and nxt ~= name then return equip(nxt) end
+        return ok
+    end
+    local function want()
+        local n = Mods.Skin.name
+        return (Mods.SkinChanger.on and n ~= "") and n or nil
+    end
+    local function sync()
+        local char = LocalPlayer.Character
+        if not char then return end
+        note(char:GetAttribute(ATTR)); note(LocalPlayer:GetAttribute(ATTR))
+        local n = want()
+        if n then
+            if not worn(char, n) then
+                K.applied = n
+                if not equip(n) then return end
+                if not worn(char, n) and not info(n) then
+                    Notify("Skin Changer", "No sword called " .. n, 3)
+                    Mods.Skin.name = ""
+                end
+            end
+        elseif K.applied then
+            local real = realName() or "Base Sword"
+            K.applied = nil
+            if not worn(char, real) then equip(real) end
         end
     end
-    local fxPaused, fxWraps = {}, {}
-    local function skinSlash()
-        local ok, data = pcall(realGetSword, swords, Mods.Skin.name)
-        return (ok and type(data) == "table" and type(data.SlashName) == "string") and data.SlashName or "SlashEffect"
+    local function slash()
+        local d = info(Mods.Skin.name)
+        return (d and type(d.SlashName) == "string") and d.SlashName or "SlashEffect"
     end
     local function prefetch()
         task.spawn(function()
-            pcall(function() ReplicatedStorage.Shared.ReplicatedInstances.SwordFX.GetInstance:Invoke(skinSlash()) end)
+            pcall(function() ReplicatedStorage.Shared.ReplicatedInstances.SwordFX.GetInstance:Invoke(slash()) end)
         end)
     end
     local function fxScript()
-        local ok, s = pcall(function() return LocalPlayer.PlayerScripts.EffectScripts.ClientFX end)
-        return ok and s or nil
+        local ok, sc = pcall(function() return LocalPlayer.PlayerScripts.EffectScripts.ClientFX end)
+        return ok and sc or nil
     end
     local function swapFx()
         local R = getRemotes()
-        if not (R and getconnections) then return false end
-        local isours, found = isexecutorclosure or is_synapse_function or isourclosure, false
+        if not (R and getconnections) then return end
+        local isours = isexecutorclosure or is_synapse_function or isourclosure
         for _, sig in ipairs({ R:FindFirstChild("ParrySuccessAll") and R.ParrySuccessAll.OnClientEvent,
                 R:FindFirstChild("ParrySuccessClient") and R.ParrySuccessClient.Event }) do
             for _, c in ipairs(sig and getconnections(sig) or {}) do
                 local f = c.Function
-                if type(f) == "function" and not fxPaused[c] and (not isours or not isours(f))
-                    and (not islclosure or islclosure(f)) then
-                    fxPaused[c] = true
-                    found = true
+                if type(f) == "function" and not K.paused[c] and (not isours or not isours(f)) and (not islclosure or islclosure(f)) then
+                    K.paused[c] = true
                     c:Disable()
-                    fxWraps[#fxWraps + 1] = sig:Connect(function(...)
+                    K.wraps[#K.wraps + 1] = sig:Connect(function(...)
                         local cfx = fxScript()
                         if cfx and cfx.Disabled then return end
                         local args = table.pack(...)
-                        if isLive() and Mods.SkinChanger.on and Mods.Skin.name ~= "" and args[4] == LocalPlayer then
-                            pcall(function() args[1], args[3] = skinSlash(), Mods.Skin.name end)
+                        if isLive() and want() and args[4] == LocalPlayer then
+                            pcall(function() args[1], args[3] = slash(), Mods.Skin.name end)
                         end
                         f(table.unpack(args, 1, args.n))
                     end)
                 end
             end
         end
-        return found
     end
     local function unswapFx()
-        for c in pairs(fxPaused) do pcall(function() c:Enable() end) end
-        for _, c in ipairs(fxWraps) do pcall(function() c:Disconnect() end) end
-        fxPaused, fxWraps = {}, {}
+        for c in pairs(K.paused) do pcall(function() c:Enable() end) end
+        for _, c in ipairs(K.wraps) do pcall(function() c:Disconnect() end) end
+        K.paused, K.wraps = {}, {}
     end
-    function Mods.SkinChanger.apply() if Mods.SkinChanger.on then Mods.saveSkin(); setSword(); if swords then prefetch() end end end
+    local function remap(on)
+        if on then
+            if K.getSword then return end
+            pcall(function()
+                K.swords = K.swords or require(folder())
+                local real = K.swords.GetSword
+                if type(real) ~= "function" then return end
+                K.getSword = real
+                rawset(K.swords, "GetSword", function(self, name, ...)
+                    local n = want()
+                    if n and n ~= name and name == K.real then
+                        local ok, data = pcall(real, self, n, ...)
+                        if ok and type(data) == "table" then return data end
+                    end
+                    return real(self, name, ...)
+                end)
+            end)
+        elseif K.getSword then
+            pcall(rawset, K.swords, "GetSword", K.getSword)
+            K.getSword = nil
+        end
+    end
+    function Mods.SkinChanger.apply()
+        if not Mods.SkinChanger.on then return end
+        Mods.saveSkin()
+        task.spawn(function() pcall(sync); if want() then prefetch() end end)
+    end
+    function Mods.SkinChanger.realName() return realName() end
+    function Mods.SkinChanger.setReal(name) K.real = name end
     function Mods.SkinChanger.start()
         local token = Mods.SkinChanger._token
         task.spawn(function()
-            local ok = pcall(function()
-                swords = swords or require(ReplicatedStorage:WaitForChild("Shared", 10):WaitForChild("ReplicatedInstances", 10):WaitForChild("Swords", 10))
-            end)
-            if not ok or not swords or not Mods.SkinChanger:alive(token) then
-                if Mods.SkinChanger:alive(token) then Notify("Skin Changer", "Couldn't load the game's sword list.", 4) end
-                return
-            end
-            pcall(function()
-                realGetSword = realGetSword or swords.GetSword
-                if type(realGetSword) == "function" then
-                    rawset(swords, "GetSword", function(self, name, ...)
-                        if Mods.SkinChanger.on and Mods.Skin.name ~= "" and Mods.Skin.name ~= name and ourSword(name) then
-                            local ok2, data = pcall(realGetSword, self, Mods.Skin.name, ...)
-                            if ok2 and type(data) == "table" then return data end
-                        end
-                        return realGetSword(self, name, ...)
-                    end)
-                end
-            end)
-            local tries = 0
-            while not controller and tries < 40 and Mods.SkinChanger:alive(token) do
-                pcall(function()
-                    local R = getRemotes()
-                    local conns = R and getconnections and getconnections(R.FireSwordInfo.OnClientEvent)
-                    for _, c in ipairs(conns or {}) do
-                        if c.Function and islclosure and islclosure(c.Function) then
-                            local up = getupvalues(c.Function)
-                            if #up == 1 and type(up[1]) == "table" then controller = up[1]; break end
-                        end
-                    end
-                end)
-                tries = tries + 1
-                if not controller then task.wait(0.25) end
-            end
+            local t0 = clock_()
+            while not folder() and clock_() - t0 < 10 and Mods.SkinChanger:alive(token) do task.wait(0.25) end
             if not Mods.SkinChanger:alive(token) then return end
-            setSword()
-            prefetch()
-            Mods.SkinChanger:connect(LocalPlayer.CharacterAdded, function()
-                task.wait(2.5)
-                if Mods.SkinChanger:alive(token) then setSword() end
-            end)
-            Mods.SkinChanger:loop(1, function()
+            if not folder() then Notify("Skin Changer", "Couldn't find the game's sword list.", 4); return end
+            note(LocalPlayer:GetAttribute(ATTR))
+            realName()
+            remap(true)
+            Mods.SkinChanger:connect(LocalPlayer:GetAttributeChangedSignal(ATTR), function() note(LocalPlayer:GetAttribute(ATTR)) end)
+            Mods.SkinChanger:loop(0.5, function()
                 local inr = Stagger.round_check and Stagger.round_check()
-                if inr and Mods.Skin.name ~= "" and next(fxPaused) == nil then swapFx()
-                elseif not inr and next(fxPaused) ~= nil then unswapFx() end
-                if Mods.Skin.name == "" then return end
-                local char = LocalPlayer.Character
-                if not char then return end
-                if LocalPlayer:GetAttribute("CurrentlyEquippedSword") ~= Mods.Skin.name or not char:FindFirstChild(Mods.Skin.name) then setSword() end
-                for _, v in ipairs(char:GetChildren()) do
-                    if v:IsA("Model") and v.Name ~= Mods.Skin.name and swords and pcall(function() return realGetSword(swords, v.Name) end) then
-                        local ok3, data = pcall(realGetSword, swords, v.Name)
-                        if ok3 and type(data) == "table" then v:Destroy() end
-                    end
-                end
+                if inr and want() and next(K.paused) == nil then swapFx()
+                elseif not inr and next(K.paused) ~= nil then unswapFx() end
+                sync()
             end)
+            if want() then prefetch() end
         end)
     end
     function Mods.SkinChanger.stop()
-        if swords and realGetSword then pcall(function() rawset(swords, "GetSword", realGetSword) end) end
+        remap(false)
         unswapFx()
+        task.spawn(function() pcall(sync) end)
     end
 end
 
 Gui.SC = Gui.Tabs.Misc:AddLeftGroupbox("Skin Changer", "palette")
 Gui.SC:AddInput("SkinName", { Text = "Sword name", Placeholder = "e.g. DualPrince", Default = Mods.Skin.name, Finished = true,
     Callback = function(t) Mods.Skin.name = t; Mods.saveSkin(); Mods.SkinChanger.apply() end })
-Gui.SC:AddToggle("SkinChanger", { Text = "Skin changer", Default = false, Callback = function(v) Mods.SkinChanger:setEnabled(v) end })
+Gui.SC:AddToggle("SkinChanger", { Text = "Skin changer", Default = false,
+    Tooltip = "Wears the sword named above (only you see it). Turning it off puts your real sword back.",
+    Callback = function(v) Mods.SkinChanger:setEnabled(v) end })
 Anim.skin = function() return (Mods.SkinChanger.on and Mods.Skin.name ~= "") and Mods.Skin.name or nil end
 
 Mods.NoRender = Feature("NoRender")
@@ -5094,6 +5131,7 @@ do
     local function pick(name, real)
         if not Mods.Unlock.on or name == "" then return end
         if real then
+            Mods.SkinChanger.setReal(name)
             if Mods.SkinChanger.on then
                 pcall(function() Toggles.SkinChanger:SetValue(false) end)
                 if Mods.SkinChanger.on then Mods.SkinChanger:setEnabled(false) end
@@ -5110,7 +5148,7 @@ do
         Notify("Unlock All", "Sword: " .. name, 2)
     end
     local function route(remote, arg)
-        if type(arg) ~= "string" or not remote:find("RequestEquipSword", 1, true) then return nil end
+        if U.skip or type(arg) ~= "string" or not remote:find("RequestEquipSword", 1, true) then return nil end
         local name = nameOf(arg)
         local real = owned(name)
         task.spawn(pick, name, real)
@@ -5156,6 +5194,22 @@ do
             if not build() then Notify("Unlock All", "Couldn't read the sword list.", 4); return end
             if not patch() then unpatch(); Notify("Unlock All", "Couldn't patch the inventory.", 4); return end
             pcall(function() U.api = U.api or require(ReplicatedStorage.Controllers.UI.ShopControllerAPI) end)
+            if U.api and not U.setEq and type(U.api.SetEquipped) == "function" then
+                local orig = U.api.SetEquipped
+                local ok = pcall(rawset, U.api, "SetEquipped", function(self, kind, id, ...)
+                    if not (Mods.Unlock.on and kind == "Sword" and type(id) == "string") then return orig(self, kind, id, ...) end
+                    local name = nameOf(id)
+                    local real = owned(name)
+                    task.spawn(pick, name, real)
+                    if not real then return true end
+                    U.skip = true
+                    local r = table.pack(pcall(orig, self, kind, real, ...))
+                    U.skip = false
+                    if r[1] then return table.unpack(r, 2, r.n) end
+                    return false
+                end)
+                if ok then U.setEq = orig end
+            end
             refresh(true)
             for _ = 1, 50 do
                 if not Mods.Unlock:alive(token) then return end
@@ -5168,6 +5222,7 @@ do
     end
     function Mods.Unlock.stop()
         unpatch()
+        if U.api and U.setEq then pcall(rawset, U.api, "SetEquipped", U.setEq); U.setEq = nil end
         task.spawn(refresh, false)
     end
 end
@@ -5176,6 +5231,123 @@ Gui.UA = Gui.Tabs.Misc:AddRightGroupbox("Unlock All", "unlock")
 Gui.UA:AddToggle("UnlockAll", { Text = "Unlock all swords", Default = false,
     Tooltip = "Shows every sword as owned in your inventory (only you see it). Equipping one puts it on with the skin changer.",
     Callback = function(v) Mods.Unlock:setEnabled(v) end })
+
+Mods.BetterUI = Feature("BetterUI")
+do
+    local B = { font = "Gotham", radius = 8, fonts = true, corners = true, depth = true, outlines = true, scroll = true,
+        saved = {}, made = {}, queue = {} }
+    B.family = {
+        Gotham = "rbxasset://fonts/families/GothamSSm.json", Montserrat = "rbxasset://fonts/families/Montserrat.json",
+        ["Builder Sans"] = "rbxasset://fonts/families/BuilderSans.json", Nunito = "rbxasset://fonts/families/Nunito.json",
+        Ubuntu = "rbxasset://fonts/families/Ubuntu.json", ["Source Sans"] = "rbxasset://fonts/families/SourceSansPro.json",
+    }
+    Mods.BetterCfg = B
+    local function keep(o, prop)
+        local t = B.saved[o]
+        if not t then t = {}; B.saved[o] = t end
+        if t[prop] == nil then t[prop] = o[prop] end
+    end
+    local function make(class, parent)
+        local i = Instance.new(class)
+        i.Name = "BetterUI"
+        B.made[i] = true
+        i.Parent = parent
+        return i
+    end
+    local function style(o)
+        if B.made[o] or not o.Parent then return end
+        if o:IsA("ScrollingFrame") then
+            if B.scroll and o.ScrollBarThickness > 4 then
+                keep(o, "ScrollBarThickness"); keep(o, "ScrollBarImageTransparency")
+                o.ScrollBarThickness = 4
+                o.ScrollBarImageTransparency = math.max(o.ScrollBarImageTransparency, 0.35)
+            end
+            return
+        end
+        if not o:IsA("GuiObject") then return end
+        local text = o:IsA("TextLabel") or o:IsA("TextButton") or o:IsA("TextBox")
+        if text and B.fonts then
+            local f = o.FontFace
+            keep(o, "FontFace")
+            o.FontFace = Font.new(B.family[B.font] or B.family.Gotham,
+                f.Weight.Value >= 600 and Enum.FontWeight.Bold or Enum.FontWeight.Medium, f.Style)
+        end
+        if o.BackgroundTransparency >= 0.95 then return end
+        if not (text or o:IsA("Frame") or o:IsA("ImageButton") or o:IsA("ImageLabel")) then return end
+        local size, cam = o.AbsoluteSize, Workspace.CurrentCamera
+        local vp = cam and cam.ViewportSize or Vector2.new(1920, 1080)
+        if size.X > vp.X * 0.7 and size.Y > vp.Y * 0.7 then return end
+        if size.X > 0 and math.min(size.X, size.Y) < 6 then return end
+        if B.corners and B.radius > 0 and not o:FindFirstChildOfClass("UICorner") then
+            make("UICorner", o).CornerRadius = UDim.new(0, B.radius)
+        end
+        local gui = o:FindFirstAncestorOfClass("ScreenGui")
+        if gui and gui.Name == "Hotbar" then return end
+        if B.depth and not o:FindFirstChildOfClass("UIGradient") then
+            local g = make("UIGradient", o)
+            g.Rotation = 90
+            g.Color = ColorSequence.new(Color3.new(1, 1, 1), Color3.fromRGB(200, 202, 214))
+        end
+        if B.outlines and o:IsA("GuiButton") and not o:FindFirstChildOfClass("UIStroke") then
+            local st = make("UIStroke", o)
+            st.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+            st.Thickness, st.Color, st.Transparency = 1, Color3.new(1, 1, 1), 0.78
+        end
+    end
+    function Mods.BetterUI.start()
+        local token = Mods.BetterUI._token
+        local pg = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+        if not pg then return end
+        B.queue = pg:GetDescendants()
+        Mods.BetterUI:connect(pg.DescendantAdded, function(o) if not B.made[o] then B.queue[#B.queue + 1] = o end end)
+        Mods.BetterUI:connect(pg.DescendantRemoving, function(o) B.saved[o] = nil; B.made[o] = nil end)
+        task.spawn(function()
+            while Mods.BetterUI:alive(token) do
+                local q = B.queue
+                B.queue = {}
+                for i = 1, #q do
+                    pcall(style, q[i])
+                    if i % 200 == 0 then
+                        task.wait()
+                        if not Mods.BetterUI:alive(token) then return end
+                    end
+                end
+                task.wait(0.1)
+            end
+        end)
+    end
+    function Mods.BetterUI.stop()
+        local saved, made = B.saved, B.made
+        B.saved, B.made, B.queue = {}, {}, {}
+        for o, props in pairs(saved) do
+            for k, v in pairs(props) do pcall(function() o[k] = v end) end
+        end
+        for i in pairs(made) do pcall(function() i:Destroy() end) end
+    end
+    function Mods.BetterUI.redo()
+        if not Mods.BetterUI.on or B.pending then return end
+        B.pending = true
+        task.delay(0.3, function()
+            B.pending = false
+            if Mods.BetterUI.on and isLive() then Mods.BetterUI:setEnabled(false); Mods.BetterUI:setEnabled(true) end
+        end)
+    end
+end
+
+Gui.BU = Gui.Tabs.UI:AddLeftGroupbox("Better UI", "sparkles")
+Gui.BU:AddToggle("BetterUI", { Text = "Better UI", Default = false,
+    Tooltip = "Restyles Blade Ball's own menus: a clean font, rounded panels and buttons, soft shading, thin button outlines and slim scrollbars. Turning it off puts everything back exactly.",
+    Callback = function(v) Mods.BetterUI:setEnabled(v) end })
+Gui.BU:AddDropdown("BetterUIFont", { Values = { "Gotham", "Montserrat", "Builder Sans", "Nunito", "Ubuntu", "Source Sans" }, Default = "Gotham", Text = "Font",
+    Callback = function(v) Mods.BetterCfg.font = v; Mods.BetterUI.redo() end })
+Gui.BU:AddSlider("BetterUIRadius", { Text = "Corner roundness", Default = 8, Min = 0, Max = 20, Rounding = 0, Suffix = " px",
+    Callback = function(v) Mods.BetterCfg.radius = v; Mods.BetterUI.redo() end })
+Gui.BP = Gui.Tabs.UI:AddRightGroupbox("Parts", "list-checks")
+for _, e in ipairs({ { "BetterUIFonts", "Clean font", "fonts" }, { "BetterUICorners", "Rounded corners", "corners" },
+        { "BetterUIDepth", "Soft shading", "depth" }, { "BetterUIOutlines", "Button outlines", "outlines" },
+        { "BetterUIScroll", "Slim scrollbars", "scroll" } }) do
+    Gui.BP:AddToggle(e[1], { Text = e[2], Default = true, Callback = function(v) Mods.BetterCfg[e[3]] = v; Mods.BetterUI.redo() end })
+end
 
 local function set(label, text) if label then pcall(function() label:SetText(text) end) end end
 StatusHook = function(s, armed)
