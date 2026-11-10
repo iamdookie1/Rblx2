@@ -1,6 +1,6 @@
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.117"
+local SCRIPT_VERSION = "rewrite-0.5.118"
 
 local genv = (getgenv and getgenv()) or _G
 if type(genv.__BladeBallShutdown) == 'function' then pcall(genv.__BladeBallShutdown) end
@@ -257,7 +257,7 @@ do
 
     local S = {
         autoparry = false, triggerbot = false, parry_mode = "Remote",
-        one_parry_capture = true, rescue_press = true, preparry = false, preparry_range = 20, hp_preparry = false, hard_curve = false, self_tune = false, fast_retarget = false,
+        one_parry_capture = true, rescue_press = true, preparry = false, preparry_range = 20, hp_preparry = false, hard_curve = false, self_tune = false, fast_retarget = true,
         anticurve = "Smart", dot_threshold = 0.5, curve_bias = 0.5, close_anticurve = true, close_range = 30, instant_retarget = true,
         accuracy = 50, accuracy_base = 50, divisor_multiplier = 1.1, timing_mult = 1,
         extra_distance = 0, ping_compensation = false, retry_delay = 1,
@@ -452,11 +452,12 @@ do
 
     local function safeMargin() return jitter() + frameDt + 0.01 end
     local function cushion(speed, W)
-        local a, sp = (math.clamp(S.accuracy or 50, 1, 100) - 1) / 99, math.max(speed or 1, 1)
-        local f, safe = 1 - a, math.max(safeMargin(), 5 / sp)
-        local cap, want = math.max(math.min(W or 0.5, 0.6) - (jitter() + frameDt + 0.03), safe), math.max((5 + 30 * f) / sp, 0.12 * f, safe)
-        return math.min(want, cap)
+        local a = (math.clamp(S.accuracy or 50, 1, 100) - 1) / 99
+        local lo = safeMargin()
+        local hi = math.max(math.min(W or 0.5, 0.6) - (jitter() + frameDt + 0.03), lo)
+        return lo + (1 - a) * (hi - lo)
     end
+    function Parry.cushionMs() return cushion(100, parryWin() or 0.5) * 1000 end
     local function fireLead(speed)
         return reachT() + cushion(speed, parryWin() or 0.5)
     end
@@ -1672,44 +1673,31 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         local partner = (target == me) and (owners[2] and owners[2].name) or target
         if not partner or partner == me then return nil end
         if held and AutoSpam.partner and partner ~= AutoSpam.partner then return nil end
+        if target ~= me and not held and not (owners[2] and owners[2].name == me) then return nil end
         local their = charRoot(partner)
         if not their then return nil end
-        local velocity = ballVel(ball)
-        local speed, gap = math.max(velocity.Magnitude, 1), (their.Position - root.Position).Magnitude
-        if gap > Util.clashRange(speed) * (held and 1.3 or 1) then return nil end
+        local speed = math.max(ballVel(ball).Magnitude, 1)
+        local gap = (their.Position - root.Position).Magnitude
+        if gap > Util.clashRange(speed) * (held and 1.4 or 1) then return nil end
         local bnow, adj = Core.ball_now(ball)
-        local react, sens, back = reachT() - adj, math.clamp(SP.sensitivity or 1.3, 0.6, 2.5), gap / (speed * 1.08)
-        local tooFast, tempo = back <= react * sens + 0.08, math.clamp(gap / speed * 2 + react * 2 + 0.15, 0.3, 0.9) * (held and 1.25 or 1)
-        local handoffs, trading = Util.quickHandoffs(owners, partner, tempo), Util.tradingFast(now, partner)
+        local react = math.max(reachT() - adj, 0.02) * math.clamp(SP.sensitivity or 1.3, 0.6, 2.5) + 0.06
+        local back = gap / speed
         if target == me then
-            local off = root.Position - bnow
-            local dist = off.Magnitude
-            local heading, eta = dist > 0.01 and (velocity / speed):Dot(off / dist) or 1, dist / speed
-            if heading < 0.97 then
-                local h = st.hm
-                if h and h.away then eta = math.huge
-                else
-                    local k = math.clamp((h and h.k) or st.k_mem or K_DEFAULT, K_MIN, K_MAX)
-                    eta = math.max(simProp(bnow, velocity, root.Position, Core.ap_gap(ball), k, 0, react * sens + 0.3) or math.huge, eta)
-                end
-            end
-            if eta <= react * sens + 0.08 + frameDt then return partner, ("lands in %.2fs, too fast to react"):format(eta), true end
-            if handoffs >= 1 and tooFast then return partner, "quick hand-off", true end
-            if trading and tooFast then return partner, "trading parries", false end
-            if held then return partner, "exchange on", false end
-            return nil
+            local eta = math.max((root.Position - bnow).Magnitude - Core.ap_gap(ball), 0) / speed
+            if eta <= react + frameDt then return partner, ("on you in %.2fs, faster than you react"):format(eta), true end
+            if back <= react then return partner, ("close exchange, return in %.2fs"):format(back), false end
+        else
+            local ret = (their.Position - bnow).Magnitude / speed + math.clamp(st.react or 0.05, 0, 0.3) + back
+            if SP.predictive and ret <= react + 0.05 then return partner, ("their return lands in %.2fs"):format(ret), true end
         end
-        if held and owners[1] and now - owners[1].t <= tempo then return partner, "exchange on", false end
-        if not (owners[2] and owners[2].name == me) then return nil end
-        local toThem = their.Position - bnow
-        local dThem = toThem.Magnitude
-        if not (dThem < 6 or velocity:Dot(toThem / dThem) > speed * 0.3) then return nil end
-        if handoffs >= 2 then return partner, ("%d quick hand-offs"):format(handoffs), true end
-        if trading and tooFast then return partner, "trading parries", false end
-        local fromMe = owners[2] and owners[2].name == me
-        if SP.predictive and fromMe and tooFast and Util.returnsToUs(their, root, partner, gap) then
-            return partner, ("predicted: return in %.2fs, you need %.2fs"):format(back, react), false
+        if held then
+            local o = owners[1]
+            if o and now - o.t <= math.max(back * 4 + react * 2, 0.5) then return partner, "exchange on", false end
         end
+        if Util.quickHandoffs(owners, partner, math.clamp(back * 2 + react * 2 + 0.15, 0.3, 0.9)) >= 2 then
+            return partner, "quick hand-offs", true
+        end
+        if Util.tradingFast(now, partner) and back <= react * 1.5 then return partner, "trading parries", false end
         return nil
     end
     local function clashStop(ball, root, now)
@@ -1890,6 +1878,12 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         if span >= 1 then SpamMeter.rate, SpamMeter.count, SpamMeter.since = SpamMeter.count / span, 0, now end
         local source = curSource(now)
         if not source or not LocalPlayer.Character then Pump.on, Pump.waiting = false, false; return end
+        if source == "auto" and SP.auto_rate ~= "Spam speed" then
+            Pump.on, Pump.waiting = true, false
+            if fireOne() and Pump.remote_sent then Anim.spamBlock() end
+            Pump.remote_sent = false
+            return
+        end
         local focus = spamFocus()
         if source == "manual" and SP.smart and not focus then Pump.on, Pump.waiting = false, true; return end
         Pump.waiting = false
@@ -1920,6 +1914,11 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
     local function spamInstant()
         local source = curSource(clock_())
         if not source or not LocalPlayer.Character then return end
+        if source == "auto" and SP.auto_rate ~= "Spam speed" then
+            if fireOne() and Pump.remote_sent then Anim.spamBlock() end
+            Pump.remote_sent = false
+            return
+        end
         if source == "manual" and SP.smart and not spamFocus() then return end
         if SP.per_frame_on() then
             if Pump.fired_frame ~= Pump.frame then Pump.fired_frame, Pump.frame_fires = Pump.frame, 0 end
@@ -2175,6 +2174,8 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
             if SP.auto then clashCheck(ball, now) end
             if Util.hasClash(ball, now) then spamInstant() end
             if S.autoparry and not S.triggerbot then
+                local root = apRoot()
+                if root then decide(ball, st, root, now, "retarget") end
                 task.defer(function()
                     if not active or not isLive() or st.target ~= me then return end
                     local root = apRoot()
@@ -2191,6 +2192,7 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
                 Util.endClash("ball went to " .. new, true)
             else
                 clashCheck(ball, now)
+                if Util.hasClash(ball, now) and not SP.manual then spamInstant() end
             end
         end
     end
@@ -2473,6 +2475,7 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
             local ahead = (p - ball.Position):Dot(v / sp) / sp
             if math.abs(ahead) < 0.5 then F.ahead = F.ahead and (F.ahead * 0.9 + ahead * 0.1) or ahead end
         end
+        if active and SP.auto and not SP.manual and Util.hasClash(ball, now) then spamInstant() end
         if active and SP.method == "On ball" then
             local st = tracked[ball]
             if st and st.target == me then spamInstant() end
@@ -3233,9 +3236,13 @@ Gui.AP:AddToggle("UnlockFPS", {
 Gui.APS = Gui.Tabs.Parry:AddRightGroupbox("Timing", "sliders-horizontal")
 Gui.APS:AddSlider("Accuracy", {
     Text = "Accuracy", Default = 50, Min = 1, Max = 100, Rounding = 0,
-    Tooltip = "How close the ball gets before the parry: 100 = ~5 studs ahead, 1 = ~35 studs ahead, straight in between (50 = ~20 studs), and never less than a little time on fast balls (up to 0.12s at 1) so fast balls don't become perfect parries. Never past the parry window. Curves follow it too.",
-    Callback = function(v) S.accuracy_base = v; Parry.roll() end,
+    Tooltip = "Where in the parry window the ball lands, in time, the same at every ball speed: 100 = the parry goes up just before the ball arrives (latest that's still safe on your ping), 1 = as early as the window still covers it, a straight line in between. Curves follow it too.",
+    Callback = function(v)
+        S.accuracy_base = v; Parry.roll()
+        if Gui.AccLabel then pcall(function() Gui.AccLabel:SetText(("Parry up ~%d ms before the ball lands"):format(math.floor(Parry.cushionMs() + 0.5))) end) end
+    end,
 })
+Gui.AccLabel = Gui.APS:AddLabel("Parry up ~240 ms before the ball lands", true)
 Gui.APS:AddToggle("RandomAccuracy", { Text = "Randomize accuracy", Default = false, Callback = function(v) S.random_accuracy = v end })
 Gui.APS:AddSlider("RandomAccuracyAmount", {
     Text = "Randomize amount", Default = 10, Min = 0, Max = 50, Rounding = 0, Suffix = " +/-",
@@ -3542,6 +3549,11 @@ Gui.AS:AddToggle("AutoSpam", {
     Tooltip = "Spams through clashes and stops the moment the exchange is over.",
     Callback = function(v) SP.auto = v; Engine.want("autospam", v) end,
 }):AddKeyPicker("AutoSpamKey", { Default = "None", Mode = "Toggle", SyncToggleState = true, Text = "Auto spam" })
+Gui.AS:AddDropdown("AutoSpamRate", {
+    Values = { "Smart", "Spam speed" }, Default = "Smart", Text = "Rate",
+    Tooltip = "Smart: one parry on every ball update and every frame step (about 4 a frame) plus one the instant the ball is hit either way -- as fast as the ball data comes in, without flooding your connection. Spam speed: the manual spam Speed.",
+    Callback = function(v) SP.auto_rate = v end,
+})
 Gui.AS:AddToggle("PredictiveClash", {
     Text = "Predictive start", Default = true,
     Tooltip = "Start as you send the ball to a close player whose return would be too fast to react to.",
@@ -5079,8 +5091,16 @@ do
             end
         end
     end
-    local function pick(name)
+    local function pick(name, real)
         if not Mods.Unlock.on or name == "" then return end
+        if real then
+            if Mods.SkinChanger.on then
+                pcall(function() Toggles.SkinChanger:SetValue(false) end)
+                if Mods.SkinChanger.on then Mods.SkinChanger:setEnabled(false) end
+            end
+            Notify("Unlock All", "Equipped your " .. name, 2)
+            return
+        end
         Mods.Skin.name = name
         Mods.saveSkin()
         pcall(function() Options.SkinName:SetValue(name) end)
@@ -5093,11 +5113,12 @@ do
         if type(arg) ~= "string" or not remote:find("RequestEquipSword", 1, true) then return nil end
         local name = nameOf(arg)
         local real = owned(name)
-        task.spawn(pick, name)
+        task.spawn(pick, name, real)
         if real then return "pass", real end
         return "stop", true
     end
     local function body(self, ...)
+        if self == U.probe then U.seen = true end
         if Mods.Unlock.on and not (checkcaller and checkcaller()) and getnamecallmethod() == "InvokeServer" and typeof(self) == "Instance" and self.ClassName == "RemoteFunction" then
             local ok, a, v = pcall(route, self.Name, ...)
             if ok and a == "stop" then return v end
@@ -5105,8 +5126,15 @@ do
         end
         return U.old(self, ...)
     end
+    local function alive()
+        if not U.old then return false end
+        U.seen = false
+        pcall(function() U.probe:GetAttribute("x") end)
+        return U.seen
+    end
     local function hook()
-        if U.old then return true end
+        U.probe = U.probe or Instance.new("Folder")
+        if alive() then return true end
         if not (hookmetamethod and getnamecallmethod) then return false end
         local ok, old = pcall(hookmetamethod, game, "__namecall", newcclosure and newcclosure(body) or body)
         if ok and type(old) == "function" then U.old = old; return true end
@@ -5134,7 +5162,8 @@ do
                 if Parry.hookState() == "down" then break end
                 task.wait(0.1)
             end
-            if not hook() then Notify("Unlock All", "No namecall hook: equips won't switch the sword.", 4) end
+            if not hook() then Notify("Unlock All", "No namecall hook: equips won't switch the sword.", 4); return end
+            Mods.Unlock:loop(1, function() if Parry.hookState() == "down" then hook() end end)
         end)
     end
     function Mods.Unlock.stop()
@@ -5340,7 +5369,7 @@ Gui.DBGT:AddButton({
     end,
 })
 Gui.DBGT:AddToggle("FastRetarget", {
-    Text = "Fast retarget", Default = false,
+    Text = "Fast retarget", Default = true,
     Tooltip = "Auto parry decides the instant the ball turns to you, before its new direction arrives -- but only fires when it should: it's due at your Accuracy, and even a curve twice as long would still land inside the parry (or it's fire-or-die close). Otherwise the normal checks take it a moment later. In a 1v1 the other player's parry counts as the retarget (it can only be coming to you).",
     Callback = function(v) Parry.S.fast_retarget = v end,
 })
