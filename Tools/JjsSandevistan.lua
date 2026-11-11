@@ -11,17 +11,18 @@
 --   2  Sandevistan Punch  needs a target. Blinks straight to them, whatever
 --                         the distance, and lands a heavy punch. Ends
 --                         Sandevistan. Costs 3 HP.
---   3  Kiroshi Blitz      four strikes from four sides, each matched to its
---                         own animation, then a launching kick.
---   4  Overclock Uppercut a quick step in and an uppercut that launches.
+--   3  Kiroshi Blitz      needs a target. Four strikes from four sides, each
+--                         on its own animation, then a launching kick.
+--   4  Overclock Uppercut needs a target. Blinks in and launches them.
 -- Awakening: Cyberskeleton (near death, the skeleton takes over)
 --   1  Sandevistan        the same, but longer reach, faster, harder. Still
 --                         costs 10 HP.
---   2  Cyberskeleton Slam up into the air and down, hitting everything where
---                         you land.
+--   2  Cyberskeleton Slam drops onto whoever you face from above (or straight
+--                         up and down), a crater that throws everyone up.
 --   3  Gorilla Barrage    heavy hooks into a ground pound.
---   4  Overdrive Charge   a charge through everyone in a line.
--- Front dash (both)       instant, afterimages, costs 6 HP. Custom characters
+--   4  Overdrive Charge   charges forward, stops on the first person it hits
+--                         with a heavy blow that throws them.
+-- Front dash (both)       instant, normal dash distance, afterimages, 6 HP. Custom characters
 --                         can only replace the front dash (the game's rule).
 --
 -- AFTERIMAGES: a skill only makes afterimages while it is running, and while a
@@ -50,6 +51,7 @@ local CONFIG = {
     PunchDamage = 18,
     PunchCost = 3,
     DashCost = 6,
+    DashForce = 160,       -- lower = shorter dash
     DashCooldown = 3,
     AwakeningTime = 60,
     ColorA = "0, 255, 230",   -- cyan
@@ -291,6 +293,7 @@ add(punchGo, {
     node("VISUAL", { EFFECT = "Shake Medium" }),
     node("VISUAL", { EFFECT = "Black Flash" }),
     hurtSelf(CONFIG.PunchCost),
+    wait(0.35),
 })
 add(punchGo, cleanup())
 local punchSkill = skill(punch, {
@@ -299,127 +302,206 @@ local punchSkill = skill(punch, {
 })
 
 --// 3 Kiroshi Blitz \\--
--- Each strike: blink to a side of the target, its animation, the hit on the
--- animation's contact frame, an afterimage where you were.
+-- Needs a target. Each strike: blink to a side of them, its animation at full
+-- speed, the hit on its contact frame, and time for the swing to finish (a
+-- skill's animation stops the moment the skill ends, which is what cut them
+-- off before).
+local TARGET = { node("AIM", {}) } -- HAS TARGET
+local function faceAim()
+    return node("LOOK", { TIME = 0.08, ["CAMERA DIRECTION"] = true, ["HORIZONTAL ONLY"] = true, SMOOTHNESS = 200 })
+end
 local function strike(animName, offset, rotation, damage, stun)
     return {
         afterimage(CONFIG.ColorB, 0.5),
         node("TELEPORT", { POSITION = offset, ROTATION = rotation, ["LAST HIT"] = 2 }),
         look(0.12),
-        anim(animName, 1.4),
-        wait(0.12),
+        anim(animName, 1),
+        wait(0.15),
         hitbox({ POSITION = "0, 0, 3.5", SIZE = "6, 6, 6", DAMAGE = damage, STUN = stun, ["SINGLE TARGET"] = true }),
         afterimage(CONFIG.ColorA, 0.5),
-        wait(0.14),
+        wait(0.25),
     }
 end
 local blitz = {}
 add(blitz, {
+    faceAim(),
     afterimage(CONFIG.ColorA),
-    reach(40, "Combo"),
+    reach(60, "Combo"),
     wait(0.05),
-    anim("Jab1", 1.2),
+    -- nobody in reach: a jab where you stand
+    anim("Jab1", 1),
     node("VELO", { FORCE = "0, 0, 60", TIME = 0.15, FADE = true }),
+    wait(0.15),
+    hitbox({ POSITION = "0, 0, 3.5", SIZE = "6, 6, 6", DAMAGE = 3, STUN = 0.8 }),
+    wait(0.3),
 })
 local blitzCombo = {}
-add(blitzCombo, strike("Jab1", "0, 0, 3.5", "0, 180, 0", 3, 0.8))
-add(blitzCombo, strike("Jab2", "3.5, 0, 0", "0, 90, 0", 3, 0.8))
-add(blitzCombo, strike("Jab3", "0, 0, -3.5", "0, 0, 0", 3, 0.8))
-add(blitzCombo, strike("Jab4", "-3.5, 0, 0", "0, -90, 0", 3, 0.8))
+add(blitzCombo, strike("Jab1", "0, 0, 3.5", "0, 180, 0", 3, 1))
+add(blitzCombo, strike("Jab2", "3.5, 0, 0", "0, 90, 0", 3, 1))
+add(blitzCombo, strike("Jab3", "0, 0, -3.5", "0, 0, 0", 3, 1))
+add(blitzCombo, strike("Jab4", "-3.5, 0, 0", "0, -90, 0", 3, 1))
 add(blitzCombo, {
+    afterimage(CONFIG.ColorB),
     node("TELEPORT", { POSITION = "0, 0, 4", ROTATION = "0, 180, 0", ["LAST HIT"] = 2 }),
     look(0.12),
-    anim("Kick", 1.3),
-    wait(0.15),
+    anim("Kick", 1),
+    wait(0.2),
     hitbox({ POSITION = "0, 0, 4", SIZE = "7, 7, 7", DAMAGE = 7, STUN = 1, ["STUN ANIM"] = true,
         ["SINGLE TARGET"] = true, ["BRANCH TARGET"] = "Launched" }),
     node("VISUAL", { EFFECT = "Shake Light" }),
+    afterimage(CONFIG.ColorA),
+    wait(0.45),
 })
 local launched = { node("VELO", { FORCE = "0, 30, -70", TIME = 0.3, FADE = true, RAGDOLL = 1.2 }) }
-local blitzSkill = skill(blitz, { Branch = { Combo = blitzCombo, Launched = launched } })
+local blitzSkill = skill(blitz, { Req = TARGET, Branch = { Combo = blitzCombo, Launched = launched } })
 
 --// 4 Overclock Uppercut \\--
+-- Needs a target: blinks in front of them and launches them.
+local function uppercut()
+    return {
+        anim("Up", 1),
+        wait(0.18),
+        hitbox({ POSITION = "0, 1, 4", SIZE = "7, 8, 7", DAMAGE = 9, STUN = 1.1, ["STUN ANIM"] = true,
+            ["SINGLE TARGET"] = true, ["BRANCH TARGET"] = "Up" }),
+        afterimage(CONFIG.ColorB),
+        node("VISUAL", { EFFECT = "Shake Light" }),
+        wait(0.45),
+    }
+end
 local upper = {}
 add(upper, {
+    faceAim(),
     afterimage(CONFIG.ColorB),
+    reach(40, "Go"),
+    wait(0.05),
     node("VELO", { FORCE = "0, 0, 90", TIME = 0.15, FADE = true }),
-    afterimage(CONFIG.ColorA),
-    anim("Up", 1.2),
-    wait(0.15),
-    hitbox({ POSITION = "0, 1, 4", SIZE = "7, 8, 7", DAMAGE = 9, STUN = 1.1, ["STUN ANIM"] = true,
-        ["SINGLE TARGET"] = true, ["BRANCH TARGET"] = "Up" }),
-    afterimage(CONFIG.ColorB),
 })
-local upSkill = skill(upper, { Branch = { Up = { node("VELO", { FORCE = "0, 85, 0", TIME = 0.3, FADE = true, RAGDOLL = 1.4 }) } } })
+add(upper, uppercut())
+local upperGo = {}
+add(upperGo, burst(2, 0.03))
+add(upperGo, blinkTo(3.5))
+add(upperGo, uppercut())
+local upSkill = skill(upper, { Req = TARGET, Branch = {
+    Go = upperGo,
+    Up = { node("VELO", { FORCE = "0, 85, 0", TIME = 0.3, FADE = true, RAGDOLL = 1.4 }) },
+} })
 
 --// Awakening moves \\--
 local SK = CONFIG.SkeletonColor
+
+-- 2 Cyberskeleton Slam: onto whoever you're facing from above, or straight
+-- up and down where you are. A crater that throws everyone up.
+local function impact()
+    return {
+        hitbox({ POSITION = "0, -2, 0", SIZE = "30, 10, 30", DAMAGE = 18, STUN = 1.5, ["STUN ANIM"] = true,
+            ["SINGLE TARGET"] = false, DEBREE = 4, BLOCKABLE = false, ["BRANCH TARGET"] = "Crater" }),
+        node("VISUAL", { EFFECT = "Shake Heavy" }),
+        node("VISUAL", { EFFECT = "Wind Expand", SIZE = 2 }),
+        node("VISUAL", { EFFECT = "Ring", COLOR = SK, SIZE = 3, TIME = 0.6 }),
+        node("VISUAL", { EFFECT = "Mass Hit" }),
+        node("VISUAL", { EFFECT = "Screen Color", COLOR = "255, 120, 120", AMOUNT = 0.15, TIME = 0.4 }),
+        afterimage(SK),
+        wait(0.5),
+    }
+end
 local slam = {}
 add(slam, {
+    faceAim(),
+    reach(80, "Leap"),
+    wait(0.05),
     anim("Slam", 1),
     afterimage(SK),
-    node("VELO", { FORCE = "0, 90, 35", TIME = 0.3, FADE = true }),
+    node("VELO", { FORCE = "0, 100, 20", TIME = 0.3, FADE = true }),
     wait(0.15), afterimage(CONFIG.ColorA),
     wait(0.25), afterimage(SK),
-    node("VELO", { FORCE = "0, -160, 10", TIME = 0.2 }),
-    wait(0.2), afterimage(CONFIG.ColorA),
-    hitbox({ POSITION = "0, -2, 0", SIZE = "24, 8, 24", DAMAGE = 14, STUN = 1.3, ["STUN ANIM"] = true,
-        ["SINGLE TARGET"] = false, DEBREE = 3 }),
-    node("VISUAL", { EFFECT = "Shake Heavy" }),
-    node("VISUAL", { EFFECT = "Wind Expand" }),
+    node("VELO", { FORCE = "0, -220, 0", TIME = 0.15 }),
+    wait(0.15),
 })
+add(slam, impact())
+local slamLeap = {}
+add(slamLeap, {
+    afterimage(SK),
+    node("TELEPORT", { POSITION = "0, 18, 0", ["LAST HIT"] = 1 }),
+    anim("Slam", 1),
+    afterimage(CONFIG.ColorA),
+    wait(0.2),
+    afterimage(SK),
+    node("VELO", { FORCE = "0, -240, 0", TIME = 0.12 }),
+    wait(0.12),
+})
+add(slamLeap, impact())
+local slamSkill = skill(slam, { Branch = {
+    Leap = slamLeap,
+    Crater = { node("VELO", { FORCE = "0, 70, 0", TIME = 0.3, FADE = true, RAGDOLL = 1.5 }) },
+} })
 
+-- 3 Gorilla Barrage
 local barrage = {}
 local function hook(animName, damage, stun)
     return {
-        anim(animName, 1.1),
+        anim(animName, 1),
         node("VELO", { FORCE = "0, 0, 25", TIME = 0.1, FADE = true }),
         wait(0.16),
         hitbox({ POSITION = "0, 0, 4", SIZE = "8, 7, 8", DAMAGE = damage, STUN = stun, ["SINGLE TARGET"] = false, DEBREE = 1 }),
         afterimage(SK, 0.5),
         node("VISUAL", { EFFECT = "Shake Light" }),
-        wait(0.16),
+        wait(0.2),
     }
 end
-add(barrage, hook("Hook1", 5, 0.9))
-add(barrage, hook("Hook2", 5, 0.9))
-add(barrage, hook("Hook3", 6, 1))
+add(barrage, hook("Hook1", 5, 1))
+add(barrage, hook("Hook2", 5, 1))
+add(barrage, hook("Hook3", 6, 1.1))
 add(barrage, {
     anim("Slam", 1.2),
     wait(0.25),
     hitbox({ POSITION = "0, -1, 4", SIZE = "12, 8, 12", DAMAGE = 10, STUN = 1.3, ["STUN ANIM"] = true,
         ["SINGLE TARGET"] = false, DEBREE = 3 }),
     node("VISUAL", { EFFECT = "Shake Heavy" }),
+    wait(0.45),
 })
 
+-- 4 Overdrive Charge: charges forward and stops on the first person it hits,
+-- with one heavy blow that throws them.
 local charge = {}
 add(charge, {
-    anim("Charge", 1.2),
-    look(0.1),
+    faceAim(),
+    anim("Charge", 1),
     afterimage(SK),
 })
-for i = 1, 5 do
+for i = 1, 6 do
     add(charge, {
         node("VELO", { FORCE = "0, 0, 130", TIME = 0.08 }),
-        hitbox({ POSITION = "0, 0, 3", SIZE = "8, 8, 8", DAMAGE = 3, STUN = 0.8, ["SINGLE TARGET"] = false,
-            ["CLEAR KNOCKBACK"] = true }),
+        hitbox({ POSITION = "0, 0, 3", SIZE = "8, 8, 8", DAMAGE = 0, STUN = -1, BLOCKABLE = false,
+            ["SINGLE TARGET"] = true, BRANCH = "Impact" }),
         afterimage(colorFor(i, SK, CONFIG.ColorA), 0.4),
         wait(0.07),
     })
 end
-add(charge, {
-    hitbox({ POSITION = "0, 0, 4", SIZE = "10, 8, 10", DAMAGE = 8, STUN = 1.2, ["STUN ANIM"] = true,
-        ["SINGLE TARGET"] = false, DEBREE = 3, ["BRANCH TARGET"] = "Thrown" }),
+add(charge, { wait(0.3) })
+local chargeImpact = {
+    node("VELO", { FORCE = "0, 0, 0", TIME = 0.05 }),
+    look(0.1),
+    anim("Hook3", 1),
+    wait(0.15),
+    hitbox({ POSITION = "0, 0, 4", SIZE = "8, 8, 8", DAMAGE = 16, STUN = 1.3, ["STUN ANIM"] = true,
+        ["SINGLE TARGET"] = true, DEBREE = 3, ["BRANCH TARGET"] = "Thrown" }),
     node("VISUAL", { EFFECT = "Shake Heavy" }),
-})
-local chargeSkill = skill(charge, { Branch = { Thrown = { node("VELO", { FORCE = "0, 40, -90", TIME = 0.35, FADE = true, RAGDOLL = 1.5 }) } } })
+    node("VISUAL", { EFFECT = "Mass Hit" }),
+    afterimage(SK),
+    wait(0.45),
+}
+local chargeSkill = skill(charge, { Branch = {
+    Impact = chargeImpact,
+    Thrown = { node("VELO", { FORCE = "0, 40, -90", TIME = 0.35, FADE = true, RAGDOLL = 1.5 }) },
+} })
 
 --// Front dash \\--
+-- About the distance of a normal front dash, just instant.
 local dash = {}
 add(dash, {
     hurtSelf(CONFIG.DashCost),
     afterimage(CONFIG.ColorA),
-    node("VELO", { FORCE = "0, 0, 320", TIME = 0.1 }),
+    node("VELO", { FORCE = ("0, 0, %d"):format(CONFIG.DashForce), TIME = 0.1 }),
     wait(0.03), afterimage(CONFIG.ColorB),
     wait(0.03), afterimage(CONFIG.ColorA),
     wait(0.03), afterimage(CONFIG.ColorB),
@@ -453,12 +535,12 @@ local cost = ("Costs %d HP"):format(CONFIG.SandeCost)
 local dict = encode({
     slot("Sandevistan", 1, CONFIG.Cooldown, cost, sandevistan(CONFIG.FreezeRange, CONFIG.SpeedBoost, CONFIG.DamageBoost, "170, 255, 240")),
     slot("Sandevistan Punch", 2, 4, "Needs a target. Ends Sandevistan", punchSkill),
-    slot("Kiroshi Blitz", 3, 12, "", blitzSkill),
-    slot("Overclock Uppercut", 4, 9, "", upSkill),
+    slot("Kiroshi Blitz", 3, 12, "Needs a target", blitzSkill),
+    slot("Overclock Uppercut", 4, 9, "Needs a target", upSkill),
     slot("Sandevistan", 1, CONFIG.Cooldown, cost, sandevistan(CONFIG.AwakeRange, CONFIG.AwakeSpeed, CONFIG.AwakeDamage, "255, 190, 200"), true),
-    slot("Cyberskeleton Slam", 2, 14, "", skill(slam), true),
+    slot("Cyberskeleton Slam", 2, 14, "", slamSkill, true),
     slot("Gorilla Barrage", 3, 12, "", skill(barrage), true),
-    slot("Overdrive Charge", 4, 16, "", chargeSkill, true),
+    slot("Overdrive Charge", 4, 16, "Stops on the first hit", chargeSkill, true),
     { K_NAME = "AWAKENING", NAME = "Cyberskeleton", DURATION = CONFIG.AwakeningTime, DELAY = 1,
         COLOR = "255,60,60 0,255,230", DATA = encode(skill(awaken)) },
     { K_NAME = "CHASE", NAME = "Sandevistan Dash", COOLDOWN = CONFIG.DashCooldown, DATA = encode(skill(dash)) },
