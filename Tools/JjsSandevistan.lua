@@ -1,53 +1,61 @@
---// JJS Sandevistan builder ---------------------------------------------------
--- Builds a David Martinez (Cyberpunk: Edgerunners) custom character and puts it
--- on your Character block. Run it in your own private server with build mode
--- on and a Character block placed.
+--// JJS David builder -----------------------------------------------------------
+-- Builds David Martinez (Cyberpunk: Edgerunners) as a custom character and puts
+-- him on a Character block. Run it in a private server you own or have build
+-- permission in. If there's no Character block yet, it makes one: invisible,
+-- not solid, right where you stand, named David.
 --
---   1  Sandevistan        costs 10 HP. A burst of afterimages, slow-motion
---                         look, faster and stronger for the duration,
---                         everyone in range frozen, a trail behind you. The
---                         skill itself is over in under a second, so M1 and
---                         your other moves work while it lasts.
---   2  Sandevistan Punch  a long lunge into a heavy punch. Ends Sandevistan:
---                         visuals go, the freeze lifts. Costs 3 HP.
---   3  Overclock Rush     a burst of punches with afterimages, then a heavy
---                         last hit.
---   4  Cyberskeleton Slam up into the air and down into the ground, hitting
---                         everything around where you land.
---   Front dash            instant, leaves afterimages, costs 6 HP. Custom
---                         characters can only replace the front dash (that's
---                         the game's rule); side and back dashes stay normal.
+-- Base (normal David)
+--   1  Sandevistan        costs 10 HP. Slow-motion look, faster and stronger
+--                         for the duration, everyone in range frozen, a trail
+--                         behind you and afterimages (see AFTERIMAGES below).
+--   2  Sandevistan Punch  needs a target. Blinks straight to them, whatever
+--                         the distance, and lands a heavy punch. Ends
+--                         Sandevistan. Costs 3 HP.
+--   3  Kiroshi Blitz      four strikes from four sides, each matched to its
+--                         own animation, then a launching kick.
+--   4  Overclock Uppercut a quick step in and an uppercut that launches.
+-- Awakening: Cyberskeleton (near death, the skeleton takes over)
+--   1  Sandevistan        the same, but longer reach, faster, harder. Still
+--                         costs 10 HP.
+--   2  Cyberskeleton Slam up into the air and down, hitting everything where
+--                         you land.
+--   3  Gorilla Barrage    heavy hooks into a ground pound.
+--   4  Overdrive Charge   a charge through everyone in a line.
+-- Front dash (both)       instant, afterimages, costs 6 HP. Custom characters
+--                         can only replace the front dash (the game's rule).
 --
--- Every afterimage here is the builder's own Afterimage effect, which the game
--- shows to everyone. The trail between them is a particle emitter, also seen
--- by everyone.
+-- AFTERIMAGES: a skill only makes afterimages while it is running, and while a
+-- skill is running the game won't take your M1. So with FullAfterimages off
+-- (the default) Sandevistan leaves a long burst of afterimages, then a trail
+-- for the rest, and every move and dash leaves its own, while M1 stays free.
+-- With FullAfterimages on, Sandevistan keeps making afterimages for the whole
+-- duration, but you can't M1 or use moves until it ends.
 --
--- Animations are looked up live in the game's own list, so they stay right
--- when the game adds characters. If one can't be found that node is left out.
---
--- Built only from the builder's own nodes (ReplicatedStorage.Modules.SkillDefault),
--- in the same format its Export button gives. The code is also copied and
--- saved to jjs_movesets/, so you can paste it into the Character block's
--- Import box yourself if applying it doesn't work.
+-- Animations are looked up live in the game's own list, so updates don't move
+-- them. Built only from the builder's own nodes (Modules.SkillDefault), in the
+-- format its Export button gives. Also saved to jjs_movesets/David.txt.
 
 local CONFIG = {
-    Duration = 10,         -- Sandevistan, seconds
+    Name = "David",
+    FullAfterimages = false,
+    Duration = 10,
     Cooldown = 25,
-    SandeCost = 10,        -- HP every time Sandevistan is used
-    FreezeRange = 40,      -- studs across
+    SandeCost = 10,        -- HP, every time Sandevistan is used
+    FreezeRange = 40,
     SpeedBoost = 1.8,
-    DamageBoost = 1.6,     -- M1s included
-    PunchDamage = 18,      -- before the boost
+    DamageBoost = 1.6,
+    AwakeRange = 60,       -- the awakened Sandevistan
+    AwakeSpeed = 2.2,
+    AwakeDamage = 1.9,
+    PunchDamage = 18,
     PunchCost = 3,
-    PunchCooldown = 4,
-    RushCooldown = 12,
-    SlamCooldown = 15,
     DashCost = 6,
     DashCooldown = 3,
+    AwakeningTime = 60,
     ColorA = "0, 255, 230",   -- cyan
     ColorB = "255, 40, 200",  -- magenta
-    TrailTexture = 0,      -- a decal id for the trail particles, 0 = the default
-    Apply = true,          -- put it on your Character block straight away
+    SkeletonColor = "255, 60, 60",
+    TrailTexture = 0,
 }
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -58,14 +66,13 @@ local LocalPlayer = Players.LocalPlayer
 
 local Genv = (typeof(getgenv) == "function" and getgenv()) or _G
 if Genv.__SandevistanStop then
-    -- the older version kept a loop running for local afterimages
     pcall(Genv.__SandevistanStop)
     Genv.__SandevistanStop = nil
 end
 
 local function note(text)
-    print("[sandevistan] " .. text)
-    pcall(StarterGui.SetCore, StarterGui, "SendNotification", { Title = "Sandevistan", Text = text, Duration = 8 })
+    print("[david] " .. text)
+    pcall(StarterGui.SetCore, StarterGui, "SendNotification", { Title = "David", Text = text, Duration = 8 })
 end
 
 local Modules = ReplicatedStorage:WaitForChild("Modules")
@@ -75,7 +82,6 @@ if not okModule then
     return
 end
 
--- The game's slow-motion sound (Toji's Flourish), read live.
 local function soundId(path)
     local ok, id = pcall(function()
         local s = ReplicatedStorage.Sounds
@@ -93,9 +99,9 @@ do
     local ok, list = pcall(require, Modules:WaitForChild("ListData"))
     AnimList = ok and type(list) == "table" and list.AnimList or {}
 end
-local function animOf(...)
+local function animOf(path)
     local inst = ReplicatedStorage:FindFirstChild("Animations")
-    for _, name in { ... } do
+    for name in path:gmatch("[^%.]+") do
         inst = inst and inst:FindFirstChild(name)
     end
     if not inst then
@@ -111,18 +117,26 @@ local function animOf(...)
     return nil
 end
 local ANIMS = {
-    Punch = animOf("Itadori", "Variants", "DivergentFist1"),
-    Rush = animOf("Gojo", "RapidPunches"),
-    RushEnd = animOf("Itadori", "Melee", "Melee4"),
-    Slam = animOf("Itadori", "CrushingBlow"),
-    Activate = animOf("Gojo", "Teleport"),
+    Activate = animOf("Gojo.Teleport"),
+    Punch = animOf("Itadori.Variants.DivergentFist1"),
+    Jab1 = animOf("Gojo.Melee.Melee1"),
+    Jab2 = animOf("Gojo.Melee.Melee2"),
+    Jab3 = animOf("Gojo.Melee.Melee3"),
+    Jab4 = animOf("Gojo.Melee.Melee4"),
+    Up = animOf("Gojo.Melee.Up"),
+    Kick = animOf("Gojo.TwofoldKick"),
+    Slam = animOf("Itadori.CrushingBlow"),
+    Hook1 = animOf("Itadori.Melee.Melee1"),
+    Hook2 = animOf("Itadori.Melee.Melee2"),
+    Hook3 = animOf("Itadori.Melee.Melee3"),
+    Charge = animOf("Itadori.Rush"),
 }
 
---// Nodes \\--
+--// Node helpers \\--
 local TAG, FREEZE, TRAIL = "SANDE", "SANDE_FREEZE", "SANDE_TRAIL"
 
--- In order, skipping the nodes left out (nil holes), so not ipairs or pairs.
-local function append(list, nodes)
+-- Appends in order, skipping nodes left out (nil holes).
+local function add(list, nodes)
     local last = 0
     for k in nodes do
         if type(k) == "number" and k > last then
@@ -136,216 +150,411 @@ local function append(list, nodes)
     end
     return list
 end
+local function node(kind, props)
+    local n = { K_NAME = kind }
+    for k, v in props or {} do
+        n[k] = v
+    end
+    return n
+end
 local function anim(which, speed)
     local use = ANIMS[which]
-    return use and { K_NAME = "ANIM", ANIM_USE = use, SPEED = speed or 1 } or nil
-end
-local function afterimage(color, opacity)
-    return {
-        K_NAME = "VISUAL", EFFECT = "Afterimage", COLOR = color, ["ALT COLOR"] = color,
-        OPACITY = opacity or 0.35, ["ALT OPACITY"] = 1, TIME = 0.5,
-    }
+    return use and node("ANIM", { ANIM_USE = use, SPEED = speed or 1 }) or nil
 end
 local function wait(t)
-    return { K_NAME = "WAIT", TIME = t }
+    return node("WAIT", { TIME = t })
 end
 local function hurtSelf(amount)
-    return { K_NAME = "HPGIB", AMOUNT = -amount }
+    return node("HPGIB", { AMOUNT = -amount })
 end
--- A run of afterimages, alternating colours, `gap` seconds apart.
-local function burst(count, gap)
+local function afterimage(color, opacity, tag)
+    return node("VISUAL", {
+        EFFECT = "Afterimage", COLOR = color, ["ALT COLOR"] = color,
+        OPACITY = opacity or 0.35, ["ALT OPACITY"] = 1, TIME = 0.5, ["VISUAL TAG"] = tag,
+    })
+end
+local function colorFor(i, a, b)
+    return i % 2 == 1 and (a or CONFIG.ColorA) or (b or CONFIG.ColorB)
+end
+local function burst(count, gap, a, b)
     local out = {}
     for i = 1, count do
-        table.insert(out, afterimage(i % 2 == 1 and CONFIG.ColorA or CONFIG.ColorB))
+        table.insert(out, afterimage(colorFor(i, a, b)))
         if i < count then
             table.insert(out, wait(gap))
         end
     end
     return out
 end
+local function hitbox(props)
+    return node("HITBOX", props)
+end
+local function look(time)
+    return node("LOOK", { TIME = time, ["HORIZONTAL ONLY"] = true, ["LAST HIT"] = 1, SMOOTHNESS = 200 })
+end
+-- Puts you right next to whoever you last hit, facing them.
+local function blinkTo(distance)
+    return {
+        node("TELEPORT", { POSITION = ("0, 0, %s"):format(distance), ROTATION = "0, 180, 0", ["LAST HIT"] = 1 }),
+        look(0.15),
+    }
+end
+-- Marks whoever is in front of you (0 damage) and goes to `branch` if found.
+local function reach(length, branch)
+    return hitbox({ POSITION = ("0, 0, %d"):format(length / 2), SIZE = ("8, 10, %d"):format(length),
+        DAMAGE = 0, STUN = -1, BLOCKABLE = false, ["SINGLE TARGET"] = true, BRANCH = branch })
+end
 local function trail(part, color)
     local c = color:gsub(" ", "")
-    return {
-        K_NAME = "PARTICLE", ["BODY PART"] = part, TEXTURE = CONFIG.TrailTexture,
+    return node("PARTICLE", {
+        ["BODY PART"] = part, TEXTURE = CONFIG.TrailTexture,
         DURATION = CONFIG.Duration, RATE = 22, LIFETIME = "0.35, 0.45", SPEED = "0, 0",
         SIZE = "4.5, 4", TRANSPARENCY = "0.45, 1", COLOR = c .. " " .. c,
         ["LIGHT EMISSION"] = 1, ["LIGHT INFLUENCE"] = 0, ["LOCK TO PART"] = false,
         ["CANCEL TAG"] = TRAIL,
-    }
+    })
 end
 local function cleanup()
     return {
-        { K_NAME = "VISUAL", EFFECT = "Cancel", ["VISUAL TAG"] = TAG },
-        { K_NAME = "PARTICLE", CANCEL = true, ["CANCEL TAG"] = TRAIL },
-        { K_NAME = "STATE", STATE = "Cancel", ["STATE TAG"] = TAG },
-        { K_NAME = "STATE", STATE = "Cancel", ["STATE TAG"] = FREEZE, ["LAST HIT"] = CONFIG.Duration + 1 },
-        { K_NAME = "VISUAL", EFFECT = "Field of View", AMOUNT = 1, TIME = 0.3 },
+        node("VISUAL", { EFFECT = "Cancel", ["VISUAL TAG"] = TAG }),
+        node("PARTICLE", { CANCEL = true, ["CANCEL TAG"] = TRAIL }),
+        node("STATE", { STATE = "Cancel", ["STATE TAG"] = TAG }),
+        node("STATE", { STATE = "Cancel", ["STATE TAG"] = FREEZE, ["LAST HIT"] = CONFIG.Duration + 1 }),
+        node("VISUAL", { EFFECT = "Field of View", AMOUNT = 1, TIME = 0.3 }),
     }
 end
-local function hitbox(props)
-    local h = { K_NAME = "HITBOX" }
-    for k, v in props do
-        h[k] = v
+local function skill(line, extra)
+    local d = { Line = line, Req = {}, Prop = {} }
+    for k, v in extra or {} do
+        d[k] = v
     end
-    return h
+    return d
 end
 
---// 1 Sandevistan \\--
-local sande = {}
+--// Sandevistan (base and awakened) \\--
 local slowmo = soundId({ "Toji", "SSK", "Flourish", "SlowMo" })
-append(sande, {
-    slowmo and { K_NAME = "SFX", ID = slowmo, VOLUME = 1 } or nil,
-    anim("Activate", 1.5),
-    hurtSelf(CONFIG.SandeCost),
-    { K_NAME = "VISUAL", EFFECT = "Screen Color", COLOR = "170, 255, 240", AMOUNT = 0.05, OPACITY = -0.4,
-        SIZE = 0.2, TIME = CONFIG.Duration, ["VISUAL TAG"] = TAG },
-    { K_NAME = "VISUAL", EFFECT = "Field of View", AMOUNT = 25, TIME = 0.4, ["EASING STYLE"] = "Quad", ["EASING DIRECTION"] = "Out" },
-    { K_NAME = "VISUAL", EFFECT = "Distortion", SIZE = 3, TIME = 0.6 },
-    { K_NAME = "STATE", STATE = "SpeedMultiplier", VALUE = CONFIG.SpeedBoost, TIME = CONFIG.Duration, ["STATE TAG"] = TAG },
-    { K_NAME = "STATE", STATE = "DamageMultiplier", VALUE = CONFIG.DamageBoost, TIME = CONFIG.Duration, ["STATE TAG"] = TAG },
-    -- everyone around you frozen: a 0 damage hitbox marks them, then the
-    -- stun goes on with its own tag so the punch can lift it
-    hitbox({ POSITION = "0, 0, 0", SIZE = ("%d, 20, %d"):format(CONFIG.FreezeRange, CONFIG.FreezeRange),
-        STUN = -1, DAMAGE = 0, BLOCKABLE = false, ["SINGLE TARGET"] = false, ["CLEAR KNOCKBACK"] = true, ["CAN KILL"] = false }),
-    { K_NAME = "STATE", STATE = "Stun", TIME = CONFIG.Duration, ["LAST HIT"] = 0.5, ["STATE TAG"] = FREEZE },
-    trail("Torso", CONFIG.ColorA),
-    trail("HumanoidRootPart", CONFIG.ColorB),
-})
--- the burst everyone sees, about 0.7 s before you're free to move again
-append(sande, burst(8, 0.09))
+local function sandevistan(range, speed, damage, tint)
+    local line = {}
+    add(line, {
+        slowmo and node("SFX", { ID = slowmo, VOLUME = 1 }) or nil,
+        anim("Activate", 1.5),
+        hurtSelf(CONFIG.SandeCost),
+        node("VISUAL", { EFFECT = "Screen Color", COLOR = tint, AMOUNT = 0.05, OPACITY = -0.4,
+            SIZE = 0.2, TIME = CONFIG.Duration, ["VISUAL TAG"] = TAG }),
+        node("VISUAL", { EFFECT = "Field of View", AMOUNT = 25, TIME = 0.4, ["EASING STYLE"] = "Quad", ["EASING DIRECTION"] = "Out" }),
+        node("VISUAL", { EFFECT = "Distortion", SIZE = 3, TIME = 0.6 }),
+        node("STATE", { STATE = "SpeedMultiplier", VALUE = speed, TIME = CONFIG.Duration, ["STATE TAG"] = TAG }),
+        node("STATE", { STATE = "DamageMultiplier", VALUE = damage, TIME = CONFIG.Duration, ["STATE TAG"] = TAG }),
+        -- everyone in range frozen: a 0 damage hitbox marks them, then a
+        -- tagged stun so the punch can lift it
+        hitbox({ POSITION = "0, 0, 0", SIZE = ("%d, 20, %d"):format(range, range),
+            STUN = -1, DAMAGE = 0, BLOCKABLE = false, ["SINGLE TARGET"] = false, ["CLEAR KNOCKBACK"] = true, ["CAN KILL"] = false }),
+        node("STATE", { STATE = "Stun", TIME = CONFIG.Duration, ["LAST HIT"] = 0.5, ["STATE TAG"] = FREEZE }),
+        trail("Torso", CONFIG.ColorA),
+        trail("HumanoidRootPart", CONFIG.ColorB),
+    })
+    if CONFIG.FullAfterimages then
+        -- one afterimage every 0.1 s for the whole duration
+        add(line, burst(math.floor(CONFIG.Duration / 0.1), 0.1))
+        add(line, cleanup())
+    else
+        -- a long burst (about 1.2 s), then the trail carries on
+        add(line, burst(13, 0.09))
+    end
+    return skill(line)
+end
 
 --// 2 Sandevistan Punch \\--
 local punch = {}
-append(punch, {
-    anim("Punch", 1.2),
-    { K_NAME = "LOOK", TIME = 0.35, ["HORIZONTAL ONLY"] = true },
+add(punch, {
     afterimage(CONFIG.ColorB),
-    { K_NAME = "VELO", FORCE = "0, 0, 170", TIME = 0.28, FADE = true, TRACK = true },
-    wait(0.07), afterimage(CONFIG.ColorA),
-    wait(0.07), afterimage(CONFIG.ColorB),
-    wait(0.07), afterimage(CONFIG.ColorA),
+    reach(120, "Go"),
+    wait(0.05),
+    -- nobody in front: a short lunge into the punch anyway
+    node("VELO", { FORCE = "0, 0, 120", TIME = 0.2, FADE = true }),
+    anim("Punch", 1.2),
+    wait(0.18),
     hitbox({ POSITION = "0, 0, 4", SIZE = "7, 7, 8", DAMAGE = CONFIG.PunchDamage, STUN = 1.2,
-        ["STUN ANIM"] = true, ["SINGLE TARGET"] = true, DEBREE = 2, ["CLEAR KNOCKBACK"] = true }),
-    { K_NAME = "VISUAL", EFFECT = "Shake Medium" },
-    { K_NAME = "VISUAL", EFFECT = "Black Flash" },
+        ["STUN ANIM"] = true, DEBREE = 2 }),
     hurtSelf(CONFIG.PunchCost),
 })
-append(punch, cleanup())
-
---// 3 Overclock Rush \\--
-local rush = {}
-append(rush, {
-    anim("Rush", 1.3),
-    { K_NAME = "LOOK", TIME = 1.2, ["HORIZONTAL ONLY"] = true },
-    { K_NAME = "VELO", FORCE = "0, 0, 60", TIME = 0.15, FADE = true },
+add(punch, cleanup())
+local punchGo = {}
+add(punchGo, burst(3, 0.03))
+add(punchGo, blinkTo(4))
+add(punchGo, {
+    afterimage(CONFIG.ColorA),
+    anim("Punch", 1.2),
+    wait(0.18),
+    hitbox({ POSITION = "0, 0, 4", SIZE = "7, 7, 8", DAMAGE = CONFIG.PunchDamage, STUN = 1.2,
+        ["STUN ANIM"] = true, ["SINGLE TARGET"] = true, DEBREE = 2, ["CLEAR KNOCKBACK"] = true }),
+    node("VISUAL", { EFFECT = "Shake Medium" }),
+    node("VISUAL", { EFFECT = "Black Flash" }),
+    hurtSelf(CONFIG.PunchCost),
 })
-for i = 1, 8 do
-    append(rush, {
-        afterimage(i % 2 == 1 and CONFIG.ColorA or CONFIG.ColorB, 0.5),
-        hitbox({ POSITION = "0, 0, 4", SIZE = "7, 7, 7", DAMAGE = 2, STUN = 0.5, ["SINGLE TARGET"] = false }),
-        wait(0.11),
+add(punchGo, cleanup())
+local punchSkill = skill(punch, {
+    Req = { node("AIM", {}) },      -- HAS TARGET
+    Branch = { Go = punchGo },
+})
+
+--// 3 Kiroshi Blitz \\--
+-- Each strike: blink to a side of the target, its animation, the hit on the
+-- animation's contact frame, an afterimage where you were.
+local function strike(animName, offset, rotation, damage, stun)
+    return {
+        afterimage(CONFIG.ColorB, 0.5),
+        node("TELEPORT", { POSITION = offset, ROTATION = rotation, ["LAST HIT"] = 2 }),
+        look(0.12),
+        anim(animName, 1.4),
+        wait(0.12),
+        hitbox({ POSITION = "0, 0, 3.5", SIZE = "6, 6, 6", DAMAGE = damage, STUN = stun, ["SINGLE TARGET"] = true }),
+        afterimage(CONFIG.ColorA, 0.5),
+        wait(0.14),
+    }
+end
+local blitz = {}
+add(blitz, {
+    afterimage(CONFIG.ColorA),
+    reach(40, "Combo"),
+    wait(0.05),
+    anim("Jab1", 1.2),
+    node("VELO", { FORCE = "0, 0, 60", TIME = 0.15, FADE = true }),
+})
+local blitzCombo = {}
+add(blitzCombo, strike("Jab1", "0, 0, 3.5", "0, 180, 0", 3, 0.8))
+add(blitzCombo, strike("Jab2", "3.5, 0, 0", "0, 90, 0", 3, 0.8))
+add(blitzCombo, strike("Jab3", "0, 0, -3.5", "0, 0, 0", 3, 0.8))
+add(blitzCombo, strike("Jab4", "-3.5, 0, 0", "0, -90, 0", 3, 0.8))
+add(blitzCombo, {
+    node("TELEPORT", { POSITION = "0, 0, 4", ROTATION = "0, 180, 0", ["LAST HIT"] = 2 }),
+    look(0.12),
+    anim("Kick", 1.3),
+    wait(0.15),
+    hitbox({ POSITION = "0, 0, 4", SIZE = "7, 7, 7", DAMAGE = 7, STUN = 1, ["STUN ANIM"] = true,
+        ["SINGLE TARGET"] = true, ["BRANCH TARGET"] = "Launched" }),
+    node("VISUAL", { EFFECT = "Shake Light" }),
+})
+local launched = { node("VELO", { FORCE = "0, 30, -70", TIME = 0.3, FADE = true, RAGDOLL = 1.2 }) }
+local blitzSkill = skill(blitz, { Branch = { Combo = blitzCombo, Launched = launched } })
+
+--// 4 Overclock Uppercut \\--
+local upper = {}
+add(upper, {
+    afterimage(CONFIG.ColorB),
+    node("VELO", { FORCE = "0, 0, 90", TIME = 0.15, FADE = true }),
+    afterimage(CONFIG.ColorA),
+    anim("Up", 1.2),
+    wait(0.15),
+    hitbox({ POSITION = "0, 1, 4", SIZE = "7, 8, 7", DAMAGE = 9, STUN = 1.1, ["STUN ANIM"] = true,
+        ["SINGLE TARGET"] = true, ["BRANCH TARGET"] = "Up" }),
+    afterimage(CONFIG.ColorB),
+})
+local upSkill = skill(upper, { Branch = { Up = { node("VELO", { FORCE = "0, 85, 0", TIME = 0.3, FADE = true, RAGDOLL = 1.4 }) } } })
+
+--// Awakening moves \\--
+local SK = CONFIG.SkeletonColor
+local slam = {}
+add(slam, {
+    anim("Slam", 1),
+    afterimage(SK),
+    node("VELO", { FORCE = "0, 90, 35", TIME = 0.3, FADE = true }),
+    wait(0.15), afterimage(CONFIG.ColorA),
+    wait(0.25), afterimage(SK),
+    node("VELO", { FORCE = "0, -160, 10", TIME = 0.2 }),
+    wait(0.2), afterimage(CONFIG.ColorA),
+    hitbox({ POSITION = "0, -2, 0", SIZE = "24, 8, 24", DAMAGE = 14, STUN = 1.3, ["STUN ANIM"] = true,
+        ["SINGLE TARGET"] = false, DEBREE = 3 }),
+    node("VISUAL", { EFFECT = "Shake Heavy" }),
+    node("VISUAL", { EFFECT = "Wind Expand" }),
+})
+
+local barrage = {}
+local function hook(animName, damage, stun)
+    return {
+        anim(animName, 1.1),
+        node("VELO", { FORCE = "0, 0, 25", TIME = 0.1, FADE = true }),
+        wait(0.16),
+        hitbox({ POSITION = "0, 0, 4", SIZE = "8, 7, 8", DAMAGE = damage, STUN = stun, ["SINGLE TARGET"] = false, DEBREE = 1 }),
+        afterimage(SK, 0.5),
+        node("VISUAL", { EFFECT = "Shake Light" }),
+        wait(0.16),
+    }
+end
+add(barrage, hook("Hook1", 5, 0.9))
+add(barrage, hook("Hook2", 5, 0.9))
+add(barrage, hook("Hook3", 6, 1))
+add(barrage, {
+    anim("Slam", 1.2),
+    wait(0.25),
+    hitbox({ POSITION = "0, -1, 4", SIZE = "12, 8, 12", DAMAGE = 10, STUN = 1.3, ["STUN ANIM"] = true,
+        ["SINGLE TARGET"] = false, DEBREE = 3 }),
+    node("VISUAL", { EFFECT = "Shake Heavy" }),
+})
+
+local charge = {}
+add(charge, {
+    anim("Charge", 1.2),
+    look(0.1),
+    afterimage(SK),
+})
+for i = 1, 5 do
+    add(charge, {
+        node("VELO", { FORCE = "0, 0, 130", TIME = 0.08 }),
+        hitbox({ POSITION = "0, 0, 3", SIZE = "8, 8, 8", DAMAGE = 3, STUN = 0.8, ["SINGLE TARGET"] = false,
+            ["CLEAR KNOCKBACK"] = true }),
+        afterimage(colorFor(i, SK, CONFIG.ColorA), 0.4),
+        wait(0.07),
     })
 end
-append(rush, {
-    anim("RushEnd", 1.2),
-    wait(0.15),
-    afterimage(CONFIG.ColorA),
-    hitbox({ POSITION = "0, 0, 4", SIZE = "8, 7, 8", DAMAGE = 6, STUN = 1, ["STUN ANIM"] = true,
-        ["SINGLE TARGET"] = false, DEBREE = 2 }),
-    { K_NAME = "VISUAL", EFFECT = "Shake Light" },
+add(charge, {
+    hitbox({ POSITION = "0, 0, 4", SIZE = "10, 8, 10", DAMAGE = 8, STUN = 1.2, ["STUN ANIM"] = true,
+        ["SINGLE TARGET"] = false, DEBREE = 3, ["BRANCH TARGET"] = "Thrown" }),
+    node("VISUAL", { EFFECT = "Shake Heavy" }),
 })
-
---// 4 Cyberskeleton Slam \\--
-local slam = {}
-append(slam, {
-    anim("Slam", 1),
-    afterimage(CONFIG.ColorA),
-    { K_NAME = "VELO", FORCE = "0, 90, 35", TIME = 0.3, FADE = true },
-    wait(0.15), afterimage(CONFIG.ColorB),
-    wait(0.25), afterimage(CONFIG.ColorA),
-    { K_NAME = "VELO", FORCE = "0, -160, 10", TIME = 0.2 },
-    wait(0.2), afterimage(CONFIG.ColorB),
-    hitbox({ POSITION = "0, -2, 0", SIZE = "22, 8, 22", DAMAGE = 12, STUN = 1.2, ["STUN ANIM"] = true,
-        ["SINGLE TARGET"] = false, DEBREE = 3, BLOCKABLE = true }),
-    { K_NAME = "VISUAL", EFFECT = "Shake Heavy" },
-    { K_NAME = "VISUAL", EFFECT = "Wind Expand" },
-})
+local chargeSkill = skill(charge, { Branch = { Thrown = { node("VELO", { FORCE = "0, 40, -90", TIME = 0.35, FADE = true, RAGDOLL = 1.5 }) } } })
 
 --// Front dash \\--
--- Instant: a very short, very strong push, with afterimages along the way.
 local dash = {}
-append(dash, {
+add(dash, {
     hurtSelf(CONFIG.DashCost),
     afterimage(CONFIG.ColorA),
-    { K_NAME = "VELO", FORCE = "0, 0, 320", TIME = 0.1 },
+    node("VELO", { FORCE = "0, 0, 320", TIME = 0.1 }),
     wait(0.03), afterimage(CONFIG.ColorB),
     wait(0.03), afterimage(CONFIG.ColorA),
     wait(0.03), afterimage(CONFIG.ColorB),
 })
 
---// The character \\--
-local function data(line)
-    return HttpService:JSONEncode({ Line = line, Req = {}, Prop = {} })
-end
-local function slot(name, key, cooldown, tip, line)
-    return { K_NAME = "SKILL", NAME = name, KEY = key, COOLDOWN = cooldown, ADD = false, ["TOOL TIP"] = tip, DATA = data(line) }
-end
-local dict = HttpService:JSONEncode({
-    slot("Sandevistan", 1, CONFIG.Cooldown, ("Costs %d HP"):format(CONFIG.SandeCost), sande),
-    slot("Sandevistan Punch", 2, CONFIG.PunchCooldown, "Ends Sandevistan", punch),
-    slot("Overclock Rush", 3, CONFIG.RushCooldown, "", rush),
-    slot("Cyberskeleton Slam", 4, CONFIG.SlamCooldown, "", slam),
-    { K_NAME = "CHASE", NAME = "Sandevistan Dash", COOLDOWN = CONFIG.DashCooldown, DATA = data(dash) },
+--// Awakening itself \\--
+local awaken = {}
+add(awaken, {
+    anim("Activate", 1),
+    node("STATE", { STATE = "IFrame", TIME = 1.5 }),
+    node("VISUAL", { EFFECT = "Screen Color", COLOR = "255, 150, 150", AMOUNT = 0.1, OPACITY = -0.2, SIZE = 0.3, TIME = 1.5 }),
+    node("VISUAL", { EFFECT = "Shake Heavy" }),
 })
+add(awaken, burst(6, 0.1, SK, CONFIG.ColorA))
 
---// Save, copy, apply \\--
+--// The character \\--
+local function encode(d)
+    return HttpService:JSONEncode(d)
+end
+-- Base moves hide in the awakening, awakened ones hide in base.
+local function slot(name, key, cooldown, tip, data, awakened)
+    data.Prop = data.Prop or {}
+    if awakened then
+        data.Prop.AWK2 = true
+    else
+        data.Prop.AWK = true
+    end
+    return { K_NAME = "SKILL", NAME = name, KEY = key, COOLDOWN = cooldown, ADD = false, ["TOOL TIP"] = tip, DATA = encode(data) }
+end
+local cost = ("Costs %d HP"):format(CONFIG.SandeCost)
+local dict = encode({
+    slot("Sandevistan", 1, CONFIG.Cooldown, cost, sandevistan(CONFIG.FreezeRange, CONFIG.SpeedBoost, CONFIG.DamageBoost, "170, 255, 240")),
+    slot("Sandevistan Punch", 2, 4, "Needs a target. Ends Sandevistan", punchSkill),
+    slot("Kiroshi Blitz", 3, 12, "", blitzSkill),
+    slot("Overclock Uppercut", 4, 9, "", upSkill),
+    slot("Sandevistan", 1, CONFIG.Cooldown, cost, sandevistan(CONFIG.AwakeRange, CONFIG.AwakeSpeed, CONFIG.AwakeDamage, "255, 190, 200"), true),
+    slot("Cyberskeleton Slam", 2, 14, "", skill(slam), true),
+    slot("Gorilla Barrage", 3, 12, "", skill(barrage), true),
+    slot("Overdrive Charge", 4, 16, "", chargeSkill, true),
+    { K_NAME = "AWAKENING", NAME = "Cyberskeleton", DURATION = CONFIG.AwakeningTime, DELAY = 1,
+        COLOR = "255,60,60 0,255,230", DATA = encode(skill(awaken)) },
+    { K_NAME = "CHASE", NAME = "Sandevistan Dash", COOLDOWN = CONFIG.DashCooldown, DATA = encode(skill(dash)) },
+})
 local code = Base64.to_base64(dict)
+
+--// Save \\--
 if typeof(makefolder) == "function" and not (typeof(isfolder) == "function" and isfolder("jjs_movesets")) then
     pcall(makefolder, "jjs_movesets")
 end
-local saved = typeof(writefile) == "function" and pcall(writefile, "jjs_movesets/Sandevistan.txt", code)
+local saved = typeof(writefile) == "function" and pcall(writefile, "jjs_movesets/David.txt", code)
 if typeof(writefile) == "function" then
-    pcall(writefile, "jjs_movesets/Sandevistan.json", dict)
-end
-local copied = false
-for _, fn in { setclipboard, toclipboard } do
-    if typeof(fn) == "function" and pcall(fn, code) then
-        copied = true
-        break
-    end
+    pcall(writefile, "jjs_movesets/David.json", dict)
 end
 
-local applied = false
-if CONFIG.Apply then
-    local logic = workspace:FindFirstChild("Logic")
-    local remotes = ReplicatedStorage:FindFirstChild("Remotes")
-    local build = remotes and remotes:FindFirstChild("BuildEvent")
-    local root = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
-    local best, bestD
-    for _, block in logic and logic:GetChildren() or {} do
-        if block.Name == "Character" and block:IsA("BasePart") then
-            local d = root and (block.Position - root.Position).Magnitude or 0
+--// Find or make the Character block, then put David on it \\--
+local remotes = ReplicatedStorage:FindFirstChild("Remotes")
+local build = remotes and remotes:FindFirstChild("BuildEvent")
+local logic = workspace:FindFirstChild("Logic")
+local canBuild = LocalPlayer:GetAttribute("PS_Owner") or LocalPlayer:GetAttribute("PS_Perms")
+    or LocalPlayer:FindFirstChildOfClass("PlayerGui"):FindFirstChild("BuildTools") ~= nil
+if not build or not logic then
+    note("This server has no builder. Saved the code to jjs_movesets/David.txt.")
+    return
+end
+if not canBuild then
+    note("You need to own this server or have build permission. Saved the code to jjs_movesets/David.txt.")
+    return
+end
+
+local function root()
+    local c = LocalPlayer.Character
+    return c and c:FindFirstChild("HumanoidRootPart")
+end
+local function fire(...)
+    return pcall(build.FireServer, build, ...)
+end
+
+-- One already named David first, then the nearest Character block.
+local block, made = nil, false
+do
+    local r, bestD = root(), nil
+    for _, b in logic:GetChildren() do
+        if b.Name == "Character" and b:IsA("BasePart") then
+            if b:GetAttribute("MoveNameFt") == CONFIG.Name then
+                block = b
+                break
+            end
+            local d = r and (b.Position - r.Position).Magnitude or 0
             if not bestD or d < bestD then
-                best, bestD = block, d
+                block, bestD = b, d
             end
         end
     end
-    if best and build then
-        applied = pcall(build.FireServer, build, "LogicProp", { best }, "Dict", Base64.to_zstd(dict))
+end
+if not block then
+    local r = root()
+    local at = r and r.Position or Vector3.zero
+    at = Vector3.new(math.round(at.X), math.round(at.Y), math.round(at.Z))
+    local before = {}
+    for _, b in logic:GetChildren() do
+        before[b] = true
     end
+    fire("Create", "Character", at)
+    local t0 = os.clock()
+    repeat
+        task.wait(0.1)
+        for _, b in logic:GetChildren() do
+            if not before[b] and b.Name == "Character" then
+                block = b
+            end
+        end
+    until block or os.clock() - t0 > 5
+    if not block then
+        note("Couldn't make a Character block (is build mode on?). Saved the code to jjs_movesets/David.txt.")
+        return
+    end
+    made = true
+    -- hidden: see-through and not solid
+    fire("Transparency", { block }, "1")
+    fire("Collide", { block }, nil, false)
+    fire("Collide", { block }, true, false)
 end
 
+fire("LogicProp", { block }, "MoveNameFt", CONFIG.Name)
+local applied = fire("LogicProp", { block }, "Dict", Base64.to_zstd(dict))
+
 local missing = {}
-for name, use in { Punch = ANIMS.Punch, Rush = ANIMS.Rush, Slam = ANIMS.Slam } do
+for name, use in ANIMS do
     if not use then
         table.insert(missing, name)
     end
 end
-note(("David built (%d characters).%s%s%s%s"):format(#code,
-    applied and " Put on your nearest Character block." or " No Character block found to put it on.",
-    copied and " Code copied." or "",
-    saved and " Saved to jjs_movesets/Sandevistan.txt." or "",
-    #missing > 0 and (" No animation found for: " .. table.concat(missing, ", ")) or ""))
-if not applied then
-    note("Place a Character block in build mode and run this again, or paste the code into the block's Import box.")
-end
+note(("David %s (%d characters)%s%s%s"):format(
+    applied and "is on your Character block" or "couldn't be put on the block",
+    #code,
+    made and ", on a new hidden block where you stood" or "",
+    saved and ". Saved to jjs_movesets/David.txt" or "",
+    #missing > 0 and (". No animation found for: " .. table.concat(missing, ", ")) or ""))
