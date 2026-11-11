@@ -1,31 +1,29 @@
 --// JJS Sandevistan builder ---------------------------------------------------
--- Builds a Sandevistan (David Martinez, Cyberpunk: Edgerunners) for a custom
--- character and puts it on your Character block. Run it in your own private
--- server with build mode on and a Character block placed.
+-- Builds a David Martinez (Cyberpunk: Edgerunners) custom character and puts it
+-- on your Character block. Run it in your own private server with build mode
+-- on and a Character block placed.
 --
--- Two skills:
---   Sandevistan (key 1)   the skill itself is over in under half a second, so
---                         your M1 and other moves work straight away. What it
---                         starts runs on its own timers for the duration:
---                           * slow-motion tint, wider field of view, distortion;
---                           * you move faster and hit harder;
---                           * everyone in range is frozen in place (0 damage);
---                           * a cyan / magenta trail behind you that everyone
---                             sees, plus true afterimages of your pose (see
---                             below).
---   Sandevistan Punch (key 2)  the finisher: a lunge into a heavy punch. It
---                         ends everything, the visuals go, the freeze lifts,
---                         and it costs you a little health.
---   Left alone it all ends by itself after the duration.
+--   1  Sandevistan        costs 10 HP. A burst of afterimages, slow-motion
+--                         look, faster and stronger for the duration,
+--                         everyone in range frozen, a trail behind you. The
+--                         skill itself is over in under a second, so M1 and
+--                         your other moves work while it lasts.
+--   2  Sandevistan Punch  a long lunge into a heavy punch. Ends Sandevistan:
+--                         visuals go, the freeze lifts. Costs 3 HP.
+--   3  Overclock Rush     a burst of punches with afterimages, then a heavy
+--                         last hit.
+--   4  Cyberskeleton Slam up into the air and down into the ground, hitting
+--                         everything around where you land.
+--   Front dash            instant, leaves afterimages, costs 6 HP. Custom
+--                         characters can only replace the front dash (that's
+--                         the game's rule); side and back dashes stay normal.
 --
--- Why two skills: while a skill is running the game won't let you M1, so a
--- skill that lasted 10 seconds locked you out of punching. A skill can't see
--- your M1 either, so the punch that ends it is its own key.
+-- Every afterimage here is the builder's own Afterimage effect, which the game
+-- shows to everyone. The trail between them is a particle emitter, also seen
+-- by everyone.
 --
--- Afterimages: the builder's Afterimage effect is one snapshot per node, and
--- only a running skill can keep making them. So for the whole duration this
--- script keeps running and draws real afterimages of your pose, every 0.08 s.
--- Those are only on your screen; everyone else sees the particle trail.
+-- Animations are looked up live in the game's own list, so they stay right
+-- when the game adds characters. If one can't be found that node is left out.
 --
 -- Built only from the builder's own nodes (ReplicatedStorage.Modules.SkillDefault),
 -- in the same format its Export button gives. The code is also copied and
@@ -33,19 +31,22 @@
 -- Import box yourself if applying it doesn't work.
 
 local CONFIG = {
-    Key = 1,               -- Sandevistan's slot; the punch goes on Key + 1
+    Duration = 10,         -- Sandevistan, seconds
     Cooldown = 25,
-    PunchCooldown = 4,
-    Duration = 10,         -- seconds
+    SandeCost = 10,        -- HP every time Sandevistan is used
     FreezeRange = 40,      -- studs across
-    SpeedBoost = 1.8,      -- walk speed multiplier while it runs
-    DamageBoost = 1.6,     -- damage multiplier while it runs, M1s included
+    SpeedBoost = 1.8,
+    DamageBoost = 1.6,     -- M1s included
     PunchDamage = 18,      -- before the boost
-    SelfDamage = 3,        -- what the punch costs you
+    PunchCost = 3,
+    PunchCooldown = 4,
+    RushCooldown = 12,
+    SlamCooldown = 15,
+    DashCost = 6,
+    DashCooldown = 3,
     ColorA = "0, 255, 230",   -- cyan
     ColorB = "255, 40, 200",  -- magenta
     TrailTexture = 0,      -- a decal id for the trail particles, 0 = the default
-    LocalAfterimages = true,
     Apply = true,          -- put it on your Character block straight away
 }
 
@@ -53,12 +54,13 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local HttpService = game:GetService("HttpService")
 local StarterGui = game:GetService("StarterGui")
 local Players = game:GetService("Players")
-local TweenService = game:GetService("TweenService")
 local LocalPlayer = Players.LocalPlayer
 
 local Genv = (typeof(getgenv) == "function" and getgenv()) or _G
 if Genv.__SandevistanStop then
+    -- the older version kept a loop running for local afterimages
     pcall(Genv.__SandevistanStop)
+    Genv.__SandevistanStop = nil
 end
 
 local function note(text)
@@ -66,13 +68,14 @@ local function note(text)
     pcall(StarterGui.SetCore, StarterGui, "SendNotification", { Title = "Sandevistan", Text = text, Duration = 8 })
 end
 
-local okModule, Base64 = pcall(require, ReplicatedStorage:WaitForChild("Modules"):WaitForChild("Base64"))
+local Modules = ReplicatedStorage:WaitForChild("Modules")
+local okModule, Base64 = pcall(require, Modules:WaitForChild("Base64"))
 if not okModule then
     note("couldn't load the game's Base64 module: " .. tostring(Base64))
     return
 end
 
--- The game's own slow-motion sound (Toji's Flourish), read live.
+-- The game's slow-motion sound (Toji's Flourish), read live.
 local function soundId(path)
     local ok, id = pcall(function()
         local s = ReplicatedStorage.Sounds
@@ -84,34 +87,92 @@ local function soundId(path)
     return ok and tonumber(tostring(id):match("%d+")) or nil
 end
 
---// The skills \\--
+-- ANIM nodes name an animation by its place in ListData.AnimList: { group, index }.
+local AnimList
+do
+    local ok, list = pcall(require, Modules:WaitForChild("ListData"))
+    AnimList = ok and type(list) == "table" and list.AnimList or {}
+end
+local function animOf(...)
+    local inst = ReplicatedStorage:FindFirstChild("Animations")
+    for _, name in { ... } do
+        inst = inst and inst:FindFirstChild(name)
+    end
+    if not inst then
+        return nil
+    end
+    for g, group in AnimList do
+        for i, a in group do
+            if a == inst then
+                return { g, i }
+            end
+        end
+    end
+    return nil
+end
+local ANIMS = {
+    Punch = animOf("Itadori", "Variants", "DivergentFist1"),
+    Rush = animOf("Gojo", "RapidPunches"),
+    RushEnd = animOf("Itadori", "Melee", "Melee4"),
+    Slam = animOf("Itadori", "CrushingBlow"),
+    Activate = animOf("Gojo", "Teleport"),
+}
+
+--// Nodes \\--
 local TAG, FREEZE, TRAIL = "SANDE", "SANDE_FREEZE", "SANDE_TRAIL"
 
+-- In order, skipping the nodes left out (nil holes), so not ipairs or pairs.
 local function append(list, nodes)
-    for _, n in nodes do
-        table.insert(list, n)
+    local last = 0
+    for k in nodes do
+        if type(k) == "number" and k > last then
+            last = k
+        end
+    end
+    for i = 1, last do
+        if nodes[i] then
+            table.insert(list, nodes[i])
+        end
     end
     return list
 end
-
-local function afterimage(color)
+local function anim(which, speed)
+    local use = ANIMS[which]
+    return use and { K_NAME = "ANIM", ANIM_USE = use, SPEED = speed or 1 } or nil
+end
+local function afterimage(color, opacity)
     return {
         K_NAME = "VISUAL", EFFECT = "Afterimage", COLOR = color, ["ALT COLOR"] = color,
-        OPACITY = 0.35, ["ALT OPACITY"] = 1, TIME = 0.5,
+        OPACITY = opacity or 0.35, ["ALT OPACITY"] = 1, TIME = 0.5,
     }
 end
-
+local function wait(t)
+    return { K_NAME = "WAIT", TIME = t }
+end
+local function hurtSelf(amount)
+    return { K_NAME = "HPGIB", AMOUNT = -amount }
+end
+-- A run of afterimages, alternating colours, `gap` seconds apart.
+local function burst(count, gap)
+    local out = {}
+    for i = 1, count do
+        table.insert(out, afterimage(i % 2 == 1 and CONFIG.ColorA or CONFIG.ColorB))
+        if i < count then
+            table.insert(out, wait(gap))
+        end
+    end
+    return out
+end
 local function trail(part, color)
+    local c = color:gsub(" ", "")
     return {
         K_NAME = "PARTICLE", ["BODY PART"] = part, TEXTURE = CONFIG.TrailTexture,
         DURATION = CONFIG.Duration, RATE = 22, LIFETIME = "0.35, 0.45", SPEED = "0, 0",
-        SIZE = "4.5, 4", TRANSPARENCY = "0.45, 1", COLOR = color:gsub(" ", "") .. " " .. color:gsub(" ", ""),
+        SIZE = "4.5, 4", TRANSPARENCY = "0.45, 1", COLOR = c .. " " .. c,
         ["LIGHT EMISSION"] = 1, ["LIGHT INFLUENCE"] = 0, ["LOCK TO PART"] = false,
         ["CANCEL TAG"] = TRAIL,
     }
 end
-
--- Everything that has to stop at the end.
 local function cleanup()
     return {
         { K_NAME = "VISUAL", EFFECT = "Cancel", ["VISUAL TAG"] = TAG },
@@ -121,14 +182,21 @@ local function cleanup()
         { K_NAME = "VISUAL", EFFECT = "Field of View", AMOUNT = 1, TIME = 0.3 },
     }
 end
-
--- Sandevistan: everything here starts and the skill is done in about 0.3 s.
-local startLine = {}
-local slowmo = soundId({ "Toji", "SSK", "Flourish", "SlowMo" })
-if slowmo then
-    table.insert(startLine, { K_NAME = "SFX", ID = slowmo, VOLUME = 1 })
+local function hitbox(props)
+    local h = { K_NAME = "HITBOX" }
+    for k, v in props do
+        h[k] = v
+    end
+    return h
 end
-append(startLine, {
+
+--// 1 Sandevistan \\--
+local sande = {}
+local slowmo = soundId({ "Toji", "SSK", "Flourish", "SlowMo" })
+append(sande, {
+    slowmo and { K_NAME = "SFX", ID = slowmo, VOLUME = 1 } or nil,
+    anim("Activate", 1.5),
+    hurtSelf(CONFIG.SandeCost),
     { K_NAME = "VISUAL", EFFECT = "Screen Color", COLOR = "170, 255, 240", AMOUNT = 0.05, OPACITY = -0.4,
         SIZE = 0.2, TIME = CONFIG.Duration, ["VISUAL TAG"] = TAG },
     { K_NAME = "VISUAL", EFFECT = "Field of View", AMOUNT = 25, TIME = 0.4, ["EASING STYLE"] = "Quad", ["EASING DIRECTION"] = "Out" },
@@ -137,42 +205,97 @@ append(startLine, {
     { K_NAME = "STATE", STATE = "DamageMultiplier", VALUE = CONFIG.DamageBoost, TIME = CONFIG.Duration, ["STATE TAG"] = TAG },
     -- everyone around you frozen: a 0 damage hitbox marks them, then the
     -- stun goes on with its own tag so the punch can lift it
-    { K_NAME = "HITBOX", POSITION = "0, 0, 0", SIZE = ("%d, 20, %d"):format(CONFIG.FreezeRange, CONFIG.FreezeRange),
-        STUN = -1, DAMAGE = 0, BLOCKABLE = false, ["SINGLE TARGET"] = false, ["CLEAR KNOCKBACK"] = true, ["CAN KILL"] = false },
+    hitbox({ POSITION = "0, 0, 0", SIZE = ("%d, 20, %d"):format(CONFIG.FreezeRange, CONFIG.FreezeRange),
+        STUN = -1, DAMAGE = 0, BLOCKABLE = false, ["SINGLE TARGET"] = false, ["CLEAR KNOCKBACK"] = true, ["CAN KILL"] = false }),
     { K_NAME = "STATE", STATE = "Stun", TIME = CONFIG.Duration, ["LAST HIT"] = 0.5, ["STATE TAG"] = FREEZE },
-    -- the trail everyone sees, behind your torso and your legs
     trail("Torso", CONFIG.ColorA),
     trail("HumanoidRootPart", CONFIG.ColorB),
-    afterimage(CONFIG.ColorA),
-    { K_NAME = "WAIT", TIME = 0.1 },
+})
+-- the burst everyone sees, about 0.7 s before you're free to move again
+append(sande, burst(8, 0.09))
+
+--// 2 Sandevistan Punch \\--
+local punch = {}
+append(punch, {
+    anim("Punch", 1.2),
+    { K_NAME = "LOOK", TIME = 0.35, ["HORIZONTAL ONLY"] = true },
     afterimage(CONFIG.ColorB),
-    { K_NAME = "WAIT", TIME = 0.1 },
+    { K_NAME = "VELO", FORCE = "0, 0, 170", TIME = 0.28, FADE = true, TRACK = true },
+    wait(0.07), afterimage(CONFIG.ColorA),
+    wait(0.07), afterimage(CONFIG.ColorB),
+    wait(0.07), afterimage(CONFIG.ColorA),
+    hitbox({ POSITION = "0, 0, 4", SIZE = "7, 7, 8", DAMAGE = CONFIG.PunchDamage, STUN = 1.2,
+        ["STUN ANIM"] = true, ["SINGLE TARGET"] = true, DEBREE = 2, ["CLEAR KNOCKBACK"] = true }),
+    { K_NAME = "VISUAL", EFFECT = "Shake Medium" },
+    { K_NAME = "VISUAL", EFFECT = "Black Flash" },
+    hurtSelf(CONFIG.PunchCost),
+})
+append(punch, cleanup())
+
+--// 3 Overclock Rush \\--
+local rush = {}
+append(rush, {
+    anim("Rush", 1.3),
+    { K_NAME = "LOOK", TIME = 1.2, ["HORIZONTAL ONLY"] = true },
+    { K_NAME = "VELO", FORCE = "0, 0, 60", TIME = 0.15, FADE = true },
+})
+for i = 1, 8 do
+    append(rush, {
+        afterimage(i % 2 == 1 and CONFIG.ColorA or CONFIG.ColorB, 0.5),
+        hitbox({ POSITION = "0, 0, 4", SIZE = "7, 7, 7", DAMAGE = 2, STUN = 0.5, ["SINGLE TARGET"] = false }),
+        wait(0.11),
+    })
+end
+append(rush, {
+    anim("RushEnd", 1.2),
+    wait(0.15),
     afterimage(CONFIG.ColorA),
+    hitbox({ POSITION = "0, 0, 4", SIZE = "8, 7, 8", DAMAGE = 6, STUN = 1, ["STUN ANIM"] = true,
+        ["SINGLE TARGET"] = false, DEBREE = 2 }),
+    { K_NAME = "VISUAL", EFFECT = "Shake Light" },
 })
 
--- Sandevistan Punch: lunge, heavy punch, end it all.
-local punchLine = {
-    afterimage(CONFIG.ColorB),
-    { K_NAME = "VELO", FORCE = "0, 0, 70", TIME = 0.15, FADE = true },
-    { K_NAME = "WAIT", TIME = 0.1 },
+--// 4 Cyberskeleton Slam \\--
+local slam = {}
+append(slam, {
+    anim("Slam", 1),
     afterimage(CONFIG.ColorA),
-    { K_NAME = "HITBOX", POSITION = "0, 0, 4", SIZE = "6, 6, 7", DAMAGE = CONFIG.PunchDamage, STUN = 1.2,
-        ["STUN ANIM"] = true, ["SINGLE TARGET"] = true, DEBREE = 2, ["CLEAR KNOCKBACK"] = true },
-    { K_NAME = "VISUAL", EFFECT = "Shake Medium" },
-    { K_NAME = "HPGIB", AMOUNT = -CONFIG.SelfDamage },
-}
-append(punchLine, cleanup())
+    { K_NAME = "VELO", FORCE = "0, 90, 35", TIME = 0.3, FADE = true },
+    wait(0.15), afterimage(CONFIG.ColorB),
+    wait(0.25), afterimage(CONFIG.ColorA),
+    { K_NAME = "VELO", FORCE = "0, -160, 10", TIME = 0.2 },
+    wait(0.2), afterimage(CONFIG.ColorB),
+    hitbox({ POSITION = "0, -2, 0", SIZE = "22, 8, 22", DAMAGE = 12, STUN = 1.2, ["STUN ANIM"] = true,
+        ["SINGLE TARGET"] = false, DEBREE = 3, BLOCKABLE = true }),
+    { K_NAME = "VISUAL", EFFECT = "Shake Heavy" },
+    { K_NAME = "VISUAL", EFFECT = "Wind Expand" },
+})
 
-local function slot(name, key, cooldown, tip, line)
-    return {
-        K_NAME = "SKILL", NAME = name, KEY = key, COOLDOWN = cooldown, ADD = false, ["TOOL TIP"] = tip,
-        DATA = HttpService:JSONEncode({ Line = line, Req = {}, Prop = {} }),
-    }
+--// Front dash \\--
+-- Instant: a very short, very strong push, with afterimages along the way.
+local dash = {}
+append(dash, {
+    hurtSelf(CONFIG.DashCost),
+    afterimage(CONFIG.ColorA),
+    { K_NAME = "VELO", FORCE = "0, 0, 320", TIME = 0.1 },
+    wait(0.03), afterimage(CONFIG.ColorB),
+    wait(0.03), afterimage(CONFIG.ColorA),
+    wait(0.03), afterimage(CONFIG.ColorB),
+})
+
+--// The character \\--
+local function data(line)
+    return HttpService:JSONEncode({ Line = line, Req = {}, Prop = {} })
 end
-
+local function slot(name, key, cooldown, tip, line)
+    return { K_NAME = "SKILL", NAME = name, KEY = key, COOLDOWN = cooldown, ADD = false, ["TOOL TIP"] = tip, DATA = data(line) }
+end
 local dict = HttpService:JSONEncode({
-    slot("Sandevistan", CONFIG.Key, CONFIG.Cooldown, "Freezes everyone around you", startLine),
-    slot("Sandevistan Punch", CONFIG.Key + 1, CONFIG.PunchCooldown, "Ends Sandevistan", punchLine),
+    slot("Sandevistan", 1, CONFIG.Cooldown, ("Costs %d HP"):format(CONFIG.SandeCost), sande),
+    slot("Sandevistan Punch", 2, CONFIG.PunchCooldown, "Ends Sandevistan", punch),
+    slot("Overclock Rush", 3, CONFIG.RushCooldown, "", rush),
+    slot("Cyberskeleton Slam", 4, CONFIG.SlamCooldown, "", slam),
+    { K_NAME = "CHASE", NAME = "Sandevistan Dash", COOLDOWN = CONFIG.DashCooldown, DATA = data(dash) },
 })
 
 --// Save, copy, apply \\--
@@ -212,120 +335,17 @@ if CONFIG.Apply then
     end
 end
 
-note(("Sandevistan built (%d characters).%s%s%s"):format(#code,
+local missing = {}
+for name, use in { Punch = ANIMS.Punch, Rush = ANIMS.Rush, Slam = ANIMS.Slam } do
+    if not use then
+        table.insert(missing, name)
+    end
+end
+note(("David built (%d characters).%s%s%s%s"):format(#code,
     applied and " Put on your nearest Character block." or " No Character block found to put it on.",
     copied and " Code copied." or "",
-    saved and " Saved to jjs_movesets/Sandevistan.txt." or ""))
+    saved and " Saved to jjs_movesets/Sandevistan.txt." or "",
+    #missing > 0 and (" No animation found for: " .. table.concat(missing, ", ")) or ""))
 if not applied then
     note("Place a Character block in build mode and run this again, or paste the code into the block's Import box.")
 end
-
---// Afterimages for the whole duration (on your screen) \\--
-local running = true
-local connections = {}
-Genv.__SandevistanStop = function()
-    running = false
-    for _, c in connections do
-        pcall(c.Disconnect, c)
-    end
-end
-if not CONFIG.LocalAfterimages then
-    return
-end
-
-local activeUntil = 0
-local function color3(text)
-    local r, g, b = text:match("(%d+)%s*,%s*(%d+)%s*,%s*(%d+)")
-    return Color3.fromRGB(tonumber(r) or 255, tonumber(g) or 255, tonumber(b) or 255)
-end
-local COLORS = { color3(CONFIG.ColorA), color3(CONFIG.ColorB) }
-
-local holder = Instance.new("Folder")
-holder.Name = "SandevistanAfterimages"
-holder.Parent = workspace.CurrentCamera
-table.insert(connections, { Disconnect = function()
-    holder:Destroy()
-end })
-
-local function snapshot(character, color)
-    for _, part in character:GetDescendants() do
-        if part:IsA("BasePart") and part.Name ~= "HumanoidRootPart" and part.Transparency < 1 then
-            local ok, copy = pcall(function()
-                local c = part:Clone()
-                c:ClearAllChildren()
-                return c
-            end)
-            if ok and copy then
-                local mesh = part:FindFirstChildOfClass("SpecialMesh")
-                if mesh then
-                    mesh:Clone().Parent = copy
-                end
-                copy.Anchored, copy.CanCollide, copy.CanQuery, copy.CanTouch = true, false, false, false
-                copy.CastShadow = false
-                copy.Material = Enum.Material.Neon
-                copy.Color = color
-                copy.Transparency = 0.45
-                copy.CFrame = part.CFrame
-                if copy:IsA("MeshPart") then
-                    pcall(function()
-                        copy.TextureID = ""
-                    end)
-                end
-                copy.Parent = holder
-                TweenService:Create(copy, TweenInfo.new(0.45, Enum.EasingStyle.Linear), { Transparency = 1 }):Play()
-                task.delay(0.5, function()
-                    copy:Destroy()
-                end)
-            end
-        end
-    end
-end
-
--- Your moves carry LastUse, which the game sets the moment you use one.
-local function watchMoves(character)
-    local moveset = character:WaitForChild("Moveset", 10)
-    if not moveset then
-        return
-    end
-    local function hook(move)
-        if not move:IsA("NumberValue") then
-            return
-        end
-        table.insert(connections, move:GetAttributeChangedSignal("LastUse"):Connect(function()
-            local tag = move:GetAttribute("Tag")
-            if tag == "Sandevistan" then
-                activeUntil = os.clock() + CONFIG.Duration
-            elseif tag == "Sandevistan Punch" then
-                activeUntil = os.clock() + 0.25
-            end
-        end))
-    end
-    for _, move in moveset:GetChildren() do
-        hook(move)
-    end
-    table.insert(connections, moveset.ChildAdded:Connect(hook))
-end
-local characters = workspace:FindFirstChild("Characters")
-local function current()
-    return (characters and characters:FindFirstChild(LocalPlayer.Name)) or LocalPlayer.Character
-end
-if current() then
-    task.spawn(watchMoves, current())
-end
-table.insert(connections, LocalPlayer.CharacterAdded:Connect(function()
-    activeUntil = 0
-    task.wait(1)
-    watchMoves(current())
-end))
-
-task.spawn(function()
-    local flip = 1
-    while running do
-        local character = current()
-        if os.clock() < activeUntil and character then
-            flip = 3 - flip
-            snapshot(character, COLORS[flip])
-        end
-        task.wait(0.08)
-    end
-end)
