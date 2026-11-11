@@ -1,6 +1,6 @@
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.121"
+local SCRIPT_VERSION = "rewrite-0.6.0"
 
 local genv = (getgenv and getgenv()) or _G
 if type(genv.__BladeBallShutdown) == 'function' then pcall(genv.__BladeBallShutdown) end
@@ -241,7 +241,7 @@ end
 do
     local me = LocalPlayer.Name
     local Core = { cap = nil, pending = nil, misses = 0, interp = 0.14, last_parry = nil,
-        ctx = "match", gen = 0, last_send_at = -math.huge, tune = 0, verdict = nil,
+        ctx = "match", gen = 0, last_send_at = -math.huge, sends = 0, verdict = nil,
         echo = { at = -math.huge, forged_ok = false, rtt = nil, seen = 0 }, await = nil,
         last_spam_at = -math.huge, cap_n = 0,
         diag = { fired = 0, landed = 0, early = 0, late = 0, ontime = 0, refused = 0, rescued = 0, bias = nil, spread = 0, n = 0 },
@@ -257,9 +257,9 @@ do
 
     local S = {
         autoparry = false, triggerbot = false, parry_mode = "Remote",
-        one_parry_capture = true, rescue_press = true, preparry = false, preparry_range = 20, hp_preparry = false, hard_curve = false, self_tune = false, fast_retarget = true,
+        one_parry_capture = true, rescue_press = true, preparry = false, preparry_range = 30, hp_preparry = true, timing = 0, timing_now = 0,
         anticurve = "Smart", dot_threshold = 0.5, curve_bias = 0.5, close_anticurve = true, close_range = 30, instant_retarget = true,
-        accuracy = 50, accuracy_base = 50, divisor_multiplier = 1.1, timing_mult = 1,
+        accuracy = 50, accuracy_base = 50,
         extra_distance = 0, ping_compensation = false, retry_delay = 1,
         random_accuracy = false, random_accuracy_amount = 10,
         target_mode = 1, target_method = "Angle", curve_mode = 1, random_curve = false,
@@ -302,18 +302,14 @@ do
         return out
     end
 
-    function Util.updDivisor() S.divisor_multiplier = 0.7 + (S.accuracy - 1) * (0.9 / 99) end
     function Util.rollAcc()
-        local acc = S.accuracy_base
+        local t = S.timing or 0
         if S.random_accuracy and S.random_accuracy_amount > 0 then
-            acc = acc + math.random(-S.random_accuracy_amount, S.random_accuracy_amount)
+            t = t + math.random(-S.random_accuracy_amount, S.random_accuracy_amount)
         end
-        S.accuracy = math.clamp(acc, 1, 100)
-        Util.updDivisor()
+        S.timing_now = math.clamp(t, 0, 100)
     end
     Parry.roll = Util.rollAcc
-    function Parry.resetTune() Core.tune = 0 end
-    Util.updDivisor()
     function Util.indexOf(list, name)
         for i, n in ipairs(list) do if n == name then return i end end
     end
@@ -450,17 +446,6 @@ do
         return clock_() >= G.until_t
     end
 
-    local function safeMargin() return jitter() + frameDt + 0.01 end
-    local function cushion(speed, W)
-        local a = (math.clamp(S.accuracy or 50, 1, 100) - 1) / 99
-        local lo = safeMargin() + 0.025
-        local hi = math.max(math.min(0.2, math.min(W or 0.5, 0.6) - (jitter() + frameDt + 0.03)), lo)
-        return lo + (1 - a) * (hi - lo)
-    end
-    function Parry.cushionMs() return cushion(100, parryWin() or 0.5) * 1000 end
-    local function fireLead(speed)
-        return reachT() + cushion(speed, parryWin() or 0.5)
-    end
 
     local function screenPts(cam)
         local points, others = {}, {}
@@ -837,7 +822,7 @@ end]]
     function Util.capWin() return 0.2 end
     local function pressBlockKey()
         if not isLive() then return false end
-        Core.last_send_at = clock_()
+        Core.last_send_at, Core.sends = clock_(), (Core.sends or 0) + 1
         if type(keypress) == "function" and type(keyrelease) == "function" then
             if type(isrbxactive) == "function" then
                 local okA, active = pcall(isrbxactive)
@@ -1272,7 +1257,7 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         if not canParryNow() then return "blocked" end
         if not spam and not gateOpen() then return "blocked" end
         if not spam then gateStart() end
-        Core.last_send_at = clock_()
+        Core.last_send_at, Core.sends = clock_(), (Core.sends or 0) + 1
         local job = GC.job
         if GC.kind == "handler" then
             job.n = 0
@@ -1295,7 +1280,7 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
             end
         end
         task.spawn(GC.dispatcher)
-        if not spam then Core.pending = clock_() + (parryWin() or 0.5) + pingS() + 0.25 end
+        if not spam then Core.pending = clock_() + (parryWin() or 0.5) + math.max(pingMs(), 1) / 1000 + 0.25 end
         return "sent"
     end
 
@@ -1343,7 +1328,7 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         local cf, look = cam.CFrame, curveLookC(cam)
         if look then local o = cf.Position; cf = CFrame.lookAt(o, o + look) end
         if not spam then gateStart() end
-        Core.last_send_at = clock_()
+        Core.last_send_at, Core.sends = clock_(), (Core.sends or 0) + 1
         local r = cap.remote
         if cap.ball2 then
             local ray = cam:ScreenPointToRay(aim[1], aim[2], 0)
@@ -1351,7 +1336,7 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         else
             r:FireServer(cap.hash, cap.uid, tok, window, cf, points, aim, false)
         end
-        if not spam then Core.pending = clock_() + window + pingS() + 0.25; cap.sent = (cap.sent or 0) + 1
+        if not spam then Core.pending = clock_() + window + math.max(pingMs(), 1) / 1000 + 0.25; cap.sent = (cap.sent or 0) + 1
         else Core.last_spam_at = Core.last_send_at end
         return "sent"
     end
@@ -1404,150 +1389,315 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         return math.max(size.X, size.Y, size.Z) * 0.5 + 1.5
     end
     function Core.ap_gap(ball) return contactGap(ball) + 1.5 end
-    local function ttc(path, gap, speed, accel)
-        local d = math.max(path - gap, 0)
-        if accel > 1 then return (math.sqrt(speed * speed + 2 * accel * d) - speed) / accel end
-        return d / speed
-    end
-    local function speedGain(st, speed, now)
-        local s = st.spd
-        if not s then st.spd = { t = now, v = speed, a = 0 }; return 0 end
-        local dt = now - s.t
-        if dt >= 0.08 then
-            if speed > s.v * 1.25 or speed < s.v * 0.75 then s.a = 0
-            else s.a = s.a * 0.5 + ((speed - s.v) / dt) * 0.5 end
-            s.t, s.v = now, speed
-        end
-        return math.clamp(s.a, 0, speed * 4)
-    end
-
-    local K_DEFAULT, K_MIN, K_MAX = 5, 0.8, 40
+    local Pred, AP = { prior = {}, buf = 0.08, buf_n = 0, hist = setmetatable({}, { __mode = 'k' }) }, {}
     Util.SIM_DT = 1 / 120
-    local function trackHoming(st, dir, want, dist, now)
-        local h = st.hm
-        if not h then
-            h = { t = now, dir = dir, want = want, k = nil, w = nil, away = false, n = 0, samples = { { t = now, d = dist } } }
-            st.hm = h
-            return h
-        end
-        local dt = now - h.t
-        if dt > 0.2 then
-            h.t, h.dir, h.want, h.samples = now, dir, want, { { t = now, d = dist } }
-            return h
-        end
-        if dt >= 0.03 then
-            local turned = math.acos(math.clamp(h.dir:Dot(dir), -1, 1))
-            local omega = turned / dt
-            local th = (math.acos(math.clamp(h.dir:Dot(h.want), -1, 1)) + math.acos(math.clamp(dir:Dot(want), -1, 1))) * 0.5
-            local perp = h.want - h.dir * h.dir:Dot(h.want)
-            local toward, expect = perp.Magnitude < 1e-4 or (dir - h.dir):Dot(perp) >= 0, (h.k or K_DEFAULT) * math.max(math.sin(th), 0.15)
-            local snap = turned > 0.35 and (not toward or omega > expect * 3 + 4)
-            if snap then
-                h.k, h.kn, h.kspread, h.w, h.away = nil, 0, nil, nil, false
-                h.samples, h.snap_at = {}, now
-                st.k_mem = nil
-                if DBG.on then DBG.ev(("sudden turn: %.0f deg in %.0fms -- curve tracking restarted"):format(math.deg(turned), dt * 1000)) end
-            end
-            if turned > 2e-3 and not snap then
-                if toward then
-                    h.away = false
-                    h.w = h.w and math.max(h.w * 0.5 + omega * 0.5, omega * 0.85) or omega
-                    if th > 0.06 then
-                        local ks = math.min(omega / math.max(math.sin(th), 0.15), K_MAX * 1.5)
-                        local wgt = (h.k and ks > h.k * 2.5) and 0.25 or 0.6
-                        if h.k then
-                            local rel = math.abs(ks - h.k) / math.max(h.k, K_MIN)
-                            h.kspread = h.kspread and (h.kspread * 0.6 + rel * 0.4) or rel
-                        end
-                        h.k = h.k and (h.k * (1 - wgt) + ks * wgt) or ks
-                        h.kn = (h.kn or 0) + 1
-                    end
-                elseif omega > 0.5 then
-                    h.away = true
+    function Pred.priorK(speed)
+        local p = Pred.prior
+        if #p < 4 then return 6, 2.5, math.max(16, speed * 0.05) end
+        local ks, rs = {}, {}
+        for i, e in ipairs(p) do ks[i], rs[i] = e.k, e.k / e.sp end
+        table.sort(ks)
+        table.sort(rs)
+        local n = #ks
+        local i50, i15, i90 = math.ceil(n * 0.5), math.max(math.floor(n * 0.15), 1), math.min(math.ceil(n * 0.9), n)
+        local med = math.sqrt(ks[i50] * rs[i50] * speed)
+        return med, math.min(ks[i15], rs[i15] * speed), math.max(ks[i90], rs[i90] * speed) * 1.15
+    end
+    function Pred.addPrior(k, sp)
+        if type(k) ~= "number" or k ~= k or k <= 0 or not sp or sp < 1 then return end
+        local p = Pred.prior
+        p[#p + 1] = { k = math.clamp(k, 0.5, 150), sp = sp }
+        if #p > 32 then table.remove(p, 1) end
+    end
+    Pred.tick, Pred.gaps = 1 / 60, {}
+    function Pred.noteZoom(ball, v, now)
+        local h = Pred.hist[ball]
+        if not h then h = {}; Pred.hist[ball] = h end
+        local sp = v.Magnitude
+        if sp < 1 then return end
+        local last = h[#h]
+        if last then
+            local g = now - last.t
+            if g > 0.004 and g < 0.05 then
+                local G = Pred.gaps
+                G[#G + 1] = g
+                if #G > 40 then table.remove(G, 1) end
+                if #G >= 8 and #G % 4 == 0 then
+                    local o = table.clone(G)
+                    table.sort(o)
+                    Pred.tick = math.clamp(o[math.ceil(#o * 0.5)], 1 / 120, 1 / 20)
                 end
             end
-            h.t, h.dir, h.want, h.n = now, dir, want, h.n + 1
-            local s = h.samples
-            s[#s + 1] = { t = now, d = dist }
-            if #s > 4 then table.remove(s, 1) end
         end
-        return h
+        h[#h + 1] = { t = now, d = v / sp }
+        if #h > 40 then table.remove(h, 1) end
+        Pred.zat[ball] = now
     end
-    local function radialEta(h, rem, speed)
-        local s = h.samples
-        local n = #s
-        if n < 3 then return nil end
-        local a, b, c = s[n - 2], s[n - 1], s[n]
-        local dt1, dt2 = b.t - a.t, c.t - b.t
-        if dt1 <= 0 or dt2 <= 0 then return nil end
-        local c1, c2 = (a.d - b.d) / dt1, (b.d - c.d) / dt2
-        if c2 <= 1 then return nil end
-        c2 = math.min(c2, speed)
-        local acc = (c2 - c1) / ((dt1 + dt2) * 0.5)
-        if acc > 1 then
-            local t1 = (speed - c2) / acc
-            local d1 = c2 * t1 + 0.5 * acc * t1 * t1
-            if d1 >= rem then return (math.sqrt(c2 * c2 + 2 * acc * rem) - c2) / acc end
-            return t1 + (rem - d1) / speed
-        end
-        return rem / c2
-    end
-    local function simProp(pos, vel, target, gap, k, accel, horizon, tvel)
-        local speed = vel.Magnitude
-        if speed < 1 then return nil end
-        local dir, t = vel / speed, 0
-        local a, tstep = math.clamp(k * Util.SIM_DT, 0, 1), tvel and tvel * Util.SIM_DT or nil
-        while t < horizon do
-            if tstep then target = target + tstep end
-            local to = target - pos
-            local dist = to.Magnitude
-            if dist <= gap then return t end
-            local want = to / dist
-            local mixed = dir + (want - dir) * a
-            if mixed.Magnitude < 1e-3 then
-                mixed = dir:Cross(Vector3.yAxis)
-                if mixed.Magnitude < 1e-3 then mixed = want end
+    Pred.zat = setmetatable({}, { __mode = 'k' })
+    function Pred.measureBuf(ball, now)
+        local h = Pred.hist[ball]
+        if not h or #h < 6 then return end
+        local st = Pred.rp[ball]
+        local p = ball.Position
+        if not st then Pred.rp[ball] = { p = p, t = now }; return end
+        local dt = now - st.t
+        if dt < 0.012 then return end
+        local mv = p - st.p
+        st.p, st.t = p, now
+        local m = mv.Magnitude
+        if m < 0.05 or dt > 0.1 then return end
+        local rd = mv / m
+        local first, last = h[1], h[#h]
+        if math.acos(math.clamp(first.d:Dot(last.d), -1, 1)) < 0.25 or now - last.t > 0.3 then return end
+        local best, bestT = math.huge, nil
+        for i = 2, #h do
+            local a, b = h[i - 1], h[i]
+            for f = 0, 1, 0.25 do
+                local d = a.d:Lerp(b.d, f)
+                local e = 1 - rd:Dot(d.Unit)
+                if e < best then best, bestT = e, a.t + (b.t - a.t) * f end
             end
-            dir = mixed.Unit
-            speed = speed + accel * Util.SIM_DT
-            local move = speed * Util.SIM_DT
-            if dir:Dot(want) > 0 and move >= dist - gap then return t + (dist - gap) / speed end
-            pos = pos + dir * move
-            t = t + Util.SIM_DT
         end
-        return nil
+        if not bestT or best > 0.002 then return end
+        local lag = now - dt * 0.5 - bestT
+        if lag < 0 or lag > 0.35 then return end
+        Pred.buf_n = Pred.buf_n + 1
+        local L = Pred.lags
+        L[#L + 1] = lag
+        if #L > 41 then table.remove(L, 1) end
+        if #L >= 5 then
+            local o = table.clone(L)
+            table.sort(o)
+            Pred.buf = o[math.ceil(#o * 0.5)]
+        end
     end
-
-    function Util.simTurn(pos, vel, target, gap, w, accel, horizon, tvel)
-        local speed = vel.Magnitude
+    Pred.lags = {}
+    Pred.rp = setmetatable({}, { __mode = 'k' })
+    function Pred.statePos(ball, v)
+        local F, now = Core.feed, clock_()
+        local fp, ft = F.pos[ball], F.at[ball]
+        if fp and ft and now - ft < 0.1 then return fp + v * (now - ft), true end
+        local r = ball.Position
+        local ok, rv = pcall(function() return ball.AssemblyLinearVelocity end)
+        if not ok or typeof(rv) ~= "Vector3" or rv.Magnitude < 1 then rv = v end
+        local b = math.clamp(Pred.buf, 0, 0.3)
+        return r + (rv + v) * (0.5 * b), false
+    end
+    function Pred.sample(ball, st, now)
+        local v = ballVel(ball)
+        local sp = v.Magnitude
+        if sp < 1 then return end
+        local T = st.trk
+        if not T or T.pass ~= st.pass_n then
+            if T and T.fit and T.fit.m == 1 and (T.fit.n or 0) >= 4 then Pred.addPrior(T.fit.a, T.fit.sp) end
+            T = { pass = st.pass_n, t0 = now, s = {} }
+            st.trk = T
+        end
+        local d = v / sp
+        local s = T.s
+        local last = s[#s]
+        if last and last.d:Dot(d) > 0.9999999 and math.abs(last.sp - sp) < 0.01 then return end
+        local tp = Pred.targetPos(st)
+        if not tp then return end
+        local p = Pred.statePos(ball, v)
+        local to = tp - p
+        local dist = to.Magnitude
+        if dist < 0.5 then return end
+        local th = math.acos(math.clamp(d:Dot(to / dist), -1, 1))
+        if last then
+            local turn = math.acos(math.clamp(last.d:Dot(d), -1, 1))
+            if turn > 0.6 and now - last.t < 0.06 and (last.th - th) < turn * 0.6 then
+                T.s, T.snap, T.fit = {}, now, nil
+                s = T.s
+                if DBG.on then DBG.ev(("sudden turn %.0f deg: curve tracking restarted"):format(math.deg(turn))) end
+            elseif th > last.th + 0.02 and turn > 0.01 then
+                T.away_at = now
+            end
+        end
+        s[#s + 1] = { t = now, d = d, th = th, sp = sp }
+        if #s > 16 then table.remove(s, 1) end
+        T.fit, T.ver = nil, (T.ver or 0) + 1
+    end
+    function Pred.targetPos(st)
+        local tg = st.target
+        if tg == me then local r = getRoot(); return r and r.Position end
+        local r = charRoot(tg)
+        return r and r.Position
+    end
+    function Pred.fit(T)
+        if T.fit ~= nil then return T.fit or nil end
+        local s, segs = T.s, {}
+        local n, j = #s, 1
+        local tk = Pred.tick
+        for i = 2, n do
+            while j < i - 1 and s[i].t - s[j + 1].t >= 0.05 do j = j + 1 end
+            local a, b = s[j], s[i]
+            local span = math.max(math.floor((b.t - a.t) / tk + 0.5), 1) * tk
+            if a.th > 0.03 then
+                local turn = math.acos(math.clamp(a.d:Dot(b.d), -1, 1))
+                local th = (a.th + b.th) * 0.5
+                segs[#segs + 1] = { w = turn / span, s = math.max(math.sin(th), 0.02), tau = (a.t + b.t) * 0.5 - T.t0 }
+            end
+        end
+        local m = #segs
+        if m < 1 then T.fit = false; return nil end
+        local sws, sss, sw, sw2 = 0, 0, 0, 0
+        for _, g in ipairs(segs) do sws, sss, sw, sw2 = sws + g.w * g.s, sss + g.s * g.s, sw + g.w, sw2 + g.w * g.w end
+        local k1 = sws / math.max(sss, 1e-6)
+        local wb = sw / m
+        local r1, r2 = 0, 0
+        for _, g in ipairs(segs) do
+            r1 = r1 + (g.w - k1 * g.s) ^ 2
+            r2 = r2 + (g.w - wb) ^ 2
+        end
+        r1, r2 = math.sqrt(r1 / m), math.sqrt(r2 / m)
+        local all = { { m = 1, a = k1, b = 0, r = r1 }, { m = 2, a = wb, b = 0, r = r2 } }
+        local best = all[1]
+        if r2 < r1 * 0.9 then best = all[2] end
+        if m >= 5 then
+            local a11, a12, a22, b1, b2 = 0, 0, 0, 0, 0
+            for _, g in ipairs(segs) do
+                local x1, x2 = g.s, g.s * g.tau
+                a11, a12, a22 = a11 + x1 * x1, a12 + x1 * x2, a22 + x2 * x2
+                b1, b2 = b1 + x1 * g.w, b2 + x2 * g.w
+            end
+            local det = a11 * a22 - a12 * a12
+            if math.abs(det) > 1e-9 then
+                local ka, kb = (b1 * a22 - b2 * a12) / det, (a11 * b2 - a12 * b1) / det
+                if kb > 0 and ka > -2 then
+                    local r3 = 0
+                    for _, g in ipairs(segs) do r3 = r3 + (g.w - g.s * (ka + kb * g.tau)) ^ 2 end
+                    r3 = math.sqrt(r3 / m)
+                    all[3] = { m = 3, a = ka, b = kb, r = r3 }
+                    if r3 < best.r * 0.8 then best = all[3] end
+                end
+            end
+        end
+        local scale = math.max(wb, 0.3)
+        best.u = math.clamp(best.r / scale, 0.04, 0.45) + 0.35 / m
+        best.n, best.sp = m, s[n].sp
+        best.alt = {}
+        for _, c in ipairs(all) do
+            if c ~= best and c.a > 0 and c.r <= math.max(best.r * 2.5, scale * 0.25) then best.alt[#best.alt + 1] = c end
+        end
+        T.fit = best
+        return best
+    end
+    function Pred.run(pos, dir, speed, accel, tp, tv, gap, horizon, mdl, a, b, tau0, cap)
         if speed < 1 then return nil end
-        local dir, t, dt = vel / speed, 0, Util.SIM_DT
-        local tstep = tvel and tvel * dt or nil
+        local t, best, bestT, prev = 0, math.huge, nil, math.huge
+        local dt = math.clamp(6 / speed, 1 / 240, 1 / 60)
+        local sin, cos, acos = math.sin, math.cos, math.acos
         while t < horizon do
-            if tstep then target = target + tstep end
-            local to = target - pos
+            local tg = tv and (tp + tv * t) or tp
+            local to = tg - pos
             local dist = to.Magnitude
             if dist <= gap then return t end
+            if cap then
+                if dist < best then best, bestT = dist, t end
+                if dist > prev and best <= gap + cap then return bestT end
+                prev = dist
+            end
             local want = to / dist
-            local ang = math.acos(math.clamp(dir:Dot(want), -1, 1))
-            if ang > 1e-3 then
-                local mixed = dir + (want - dir) * math.min(w * dt / ang, 1)
-                if mixed.Magnitude < 1e-3 then mixed = want end
-                dir = mixed.Unit
+            local c = math.clamp(dir:Dot(want), -1, 1)
+            local move = speed * dt
+            if c > 0.2 and move * c >= dist - gap then return t + (dist - gap) / (speed * c) end
+            local th = acos(c)
+            if th > 1e-4 then
+                local w
+                if mdl == 2 then w = a else w = (a + b * (tau0 + t)) * math.max(sin(th), 0.02) end
+                local r = math.min(math.max(w, 0) * dt, th)
+                local perp = want - dir * c
+                local pm = perp.Magnitude
+                if pm < 1e-6 then
+                    perp = dir:Cross(Vector3.yAxis)
+                    if perp.Magnitude < 1e-6 then perp = dir:Cross(Vector3.xAxis) end
+                    pm = perp.Magnitude
+                end
+                dir = dir * cos(r) + (perp / pm) * sin(r)
             end
             speed = speed + accel * dt
-            local move = speed * dt
-            if dir:Dot(want) > 0 and move >= dist - gap then return t + (dist - gap) / speed end
             pos = pos + dir * move
             t = t + dt
         end
         return nil
     end
-    function Util.median3(a, b, c)
-        if a > b then a, b = b, a end
-        if b > c then b, c = c, b end
-        if a > b then a, b = b, a end
-        return b
+    function Pred.arrival(ball, st, now, horizon)
+        local v = ballVel(ball)
+        local speed = v.Magnitude
+        if speed < 1 then return nil end
+        local tp = Pred.targetPos(st)
+        if not tp then return nil end
+        local p, fed = Pred.statePos(ball, v)
+        local gap = Core.ap_gap(ball)
+        local dir = v / speed
+        local tv
+        if st.target == me then
+            local r = getRoot()
+            local mv = r and r.AssemblyLinearVelocity
+            if mv then
+                mv = Vector3.new(mv.X, 0, mv.Z)
+                if mv.Magnitude > 1 then tv = mv; tp = tp - mv * AP.rtt() end
+            end
+        end
+        local to = tp - p
+        local dist = to.Magnitude
+        local straight = math.max(dist - gap, 0) / speed
+        local heading = dist > 1e-3 and dir:Dot(to / dist) or 1
+        local res = { dist = dist, speed = speed, heading = heading, straight = straight, fed = fed }
+        if dist - gap <= 0.5 then res.lo, res.mid, res.hi = 0, 0, 0; return res end
+        local T = st.trk
+        local f = T and T.pass == st.pass_n and Pred.fit(T)
+        local tau0 = T and (now - T.t0) or 0
+        local accel = 0
+        if T and #T.s >= 2 then
+            local a, b = T.s[1], T.s[#T.s]
+            if b.t - a.t > 0.08 then accel = math.max((b.sp - a.sp) / (b.t - a.t), 0) end
+        end
+        if heading >= 0.9995 then
+            local e = straight
+            res.lo, res.mid, res.hi = e * 0.97, e, e * 1.03 + 0.004
+            if tv then
+                local vm = tv.Magnitude
+                res.lo, res.hi = res.lo * speed / (speed + vm), res.hi * speed / math.max(speed - vm, speed * 0.4)
+            end
+            res.k, res.straight_in = f and f.a, true
+            return res
+        end
+        local mdl, a, b, u, alo, ahi
+        if f then
+            mdl, a, b, u = f.m, f.a, f.b, f.u
+            alo, ahi = a * (1 - u), a * (1 + u)
+            res.k, res.model, res.u = a, mdl, u
+        else
+            local km, klo, khi = Pred.priorK(speed)
+            mdl, a, b, alo, ahi = 1, km, 0, klo, khi
+            res.k, res.model, res.u = km, 0, 1
+        end
+        if T and T.away_at and now - T.away_at < 0.12 then alo = math.min(alo, a * 0.5) end
+        local hz = horizon or 3
+        local lo = Pred.run(p, dir, speed, accel * 1.5 + speed * 0.05, tp, tv, gap, hz, mdl, ahi, b * (ahi / math.max(a, 1e-3)), tau0, 12)
+        local alts = f and f.alt
+        local alo_t, ahi_t = math.huge, 0
+        if alts then
+            for _, c in ipairs(alts) do
+                local e = Pred.run(p, dir, speed, accel, tp, tv, gap, hz + 1, c.m, c.a, c.b, tau0, 3)
+                if e then alo_t, ahi_t = math.min(alo_t, e), math.max(ahi_t, e) else ahi_t = math.huge end
+            end
+        end
+        res.lo = math.max(math.min(lo or math.huge, alo_t), straight * 0.97)
+        if res.lo > hz then res.mid, res.hi = math.huge, math.huge; return res end
+        local mid = Pred.run(p, dir, speed, accel, tp, tv, gap, hz + 1, mdl, a, b, tau0, 3)
+        local hi = Pred.run(p, dir, speed, 0, tp, tv, gap, hz + 1.5, mdl, alo, b * (alo / math.max(a, 1e-3)), tau0)
+        res.mid = math.max(mid or (ahi_t > 0 and math.min(ahi_t, hz + 1)) or hz + 1, res.lo)
+        res.hi = math.max(hi or math.huge, ahi_t, res.mid)
+        if tv then
+            local vm = tv.Magnitude
+            res.lo = res.lo * speed / (speed + vm)
+            if res.hi < math.huge then res.hi = res.hi * speed / math.max(speed - vm, speed * 0.4) end
+        end
+        res.fresh = T and #T.s or 0
+        return res
     end
 
     local liveCache = { at = -1, list = {} }
@@ -1580,9 +1730,7 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
     local onRetarget, onVelocity
     function Util.openPass(st)
         st.pass_open, st.parried, st.landed, st.parry_until = true, false, false, 0
-        st.dbg_seen = nil
-        if st.hm and st.hm.k then st.k_mem = st.hm.k end
-        st.spd, st.hm = nil, nil
+        st.dbg_seen, st.pc = nil, nil
         if st.preparried then
             st.parried, st.parry_until, st.preparried = true, st.preparry_until, false
         end
@@ -1592,14 +1740,18 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         if st.zinst == z then return end
         st.zinst = z
         ballConns[#ballConns + 1] = z:GetPropertyChangedSignal('VectorVelocity'):Connect(function()
-            if active and isLive() and st.target == me then onVelocity(ball, st) end
+            if not active or not isLive() then return end
+            local now = clock_()
+            Pred.noteZoom(ball, z.VectorVelocity, now)
+            Pred.sample(ball, st, now)
+            if st.target == me then onVelocity(ball, st) end
         end)
     end
     local function ballState(ball)
         local st = tracked[ball]
         if st then return st end
         st = { target = ball:GetAttribute('target'), swaps = {}, pass_open = false, parried = false,
-            landed = false, parry_until = 0, preparried = false, preparry_until = 0 }
+            landed = false, parry_until = 0, preparried = false, preparry_until = 0, pass_n = 1 }
         tracked[ball] = st
         if st.target == me then Util.openPass(st) end
         ballConns[#ballConns + 1] = ball:GetAttributeChangedSignal('target'):Connect(function()
@@ -1622,8 +1774,7 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
                     st.react = st.react and (st.react * 0.5 + r * 0.5) or r
                 end
             end
-            st.target_at = now
-            st.target = new
+            st.target_at, st.target, st.pass_n, st.pc = now, new, (st.pass_n or 1) + 1, nil
             if type(new) == 'string' and new ~= '' and new ~= me then
                 st.pass_open, st.parried, st.landed = false, false, false
                 if wasMe then G.until_t = 0 end
@@ -1997,13 +2148,12 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
     end
     local function fire(st, now, via, info, ball)
         local how
-        if capMethod() == "getgc" and S.parry_mode ~= "Keypress" then
-            if not Core.cap then pcall(Util.gcGet) end
-            if not Core.cap then return false end
-        end
-        local hookmode = capMethod() ~= "getgc" and S.parry_mode ~= "Keypress"
+        local hookmode = S.parry_mode ~= "Keypress"
         local rescue = st.rescue and S.rescue_press and S.parry_mode ~= "Keypress"
-        if hookmode and not Capture.auto() and not Core.cap and not rescue then return false end
+        if hookmode and not Capture.auto() and not Core.cap and not rescue then
+            DBG.held("no capture yet: parry once yourself", now)
+            return false
+        end
         local fresh = hookmode and Capture.auto() and (not Core.cap or Core.misses >= 1)
         if Util.tryAbility() then how = "ability"
         elseif S.parry_mode == "Keypress" or fresh or rescue then
@@ -2019,25 +2169,26 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
             Core.await = { t = tSend, ball = ball, st = st, cap = Core.cap, spam_at = Core.last_spam_at,
                 gap = tSend - (Core.last_single_at or -math.huge) }
             Core.last_single_at = tSend
-            if capMethod() ~= "getgc" then Anim.block() end
+            Anim.block()
         end
         Core.last_parry = { t = now, via = via, info = info }
         Core.diag.fired = Core.diag.fired + 1
         if DBG.on then
-            DBG.ev(info and ("FIRE %s [%s] d %.0f spd %.0f eta %.2f lead %.2f"):format(via, how, info.dist or 0,
-                info.speed or 0, math.min(info.eta or 0, 9.99), info.lead or 0) or ("FIRE %s [%s]"):format(via, how))
+            DBG.ev(info and ("FIRE %s [%s] d %.0f spd %.0f lands %.2f-%.2fs after it's up"):format(via, how, info.dist or 0,
+                info.speed or 0, math.min(info.A_lo or 0, 9.99), math.min(info.A_hi or 0, 9.99)) or ("FIRE %s [%s]"):format(via, how))
         end
-        if how ~= "remote" and how ~= "ability" then Core.pending = clock_() + (parryWin() or 0.5) + pingS() + 0.3 end
+        if how ~= "remote" and how ~= "ability" then Core.pending = clock_() + (parryWin() or 0.5) + AP.rtt() + 0.3 end
         local root = getRoot()
         Core.watch = ball and root and { ball = ball, t = now, how = how, d0 = (ball.Position - root.Position).Magnitude,
-            min_d = math.huge, min_t = now, ping = pingS(), W = parryWin() or 0.5, lead = info and info.lead,
-            eta = info and info.eta,
+            min_d = math.huge, min_t = now, ping = (info and info.reach or AP.rtt()) + Pred.buf, W = parryWin() or 0.5,
+            lead = info and info.lead, eta = info and info.A_mid, spread = info and info.spread,
             cap = how == "remote" and Core.cap or nil } or nil
         markParried(st, now)
+        if how ~= "ability" then AP.recordShot(info, how, now, ball) end
         if info then
-            logp(("%s [%s] dist %.0f spd %.0f head %.2f eta %.2f lead %.2f%s"):format(via, how, info.dist or 0,
-                info.speed or 0, info.heading or 0, math.min(info.eta or 0, 9.99), info.lead or 0,
-                info.k and (" k %.1f"):format(info.k) or ""))
+            logp(("%s [%s] dist %.0f spd %.0f head %.2f lands %.2f/%.2f/%.2fs after it's up (fire at %.2f)%s"):format(via, how,
+                info.dist or 0, info.speed or 0, info.heading or 0, math.min(info.A_lo or 0, 9.99), math.min(info.A_mid or 0, 9.99),
+                math.min(info.A_hi or 0, 9.99), info.lead or 0, info.k and (" k %.1f"):format(info.k) or ""))
         else
             logp(("%s [%s]"):format(via, how))
         end
@@ -2064,159 +2215,277 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         end
         return Det.tor_list[ball.Name] == true
     end
-    local function decide(ball, st, root, now, via)
+
+    AP.net = { win = {}, at = -1, echo_rem = {}, echo_key = {} }
+    AP.cal = { res = {}, bias = 0, n = 0, uses = {} }
+    AP.MARGIN_EARLY, AP.MARGIN_LATE, AP.CLOSE = 0.02, 0.03, 0.045
+    function AP.netTick(now)
+        local N = AP.net
+        if now - N.at < 0.05 then return end
+        N.at = now
+        local p = pingMs() / 1000
+        if p <= 0 or p > 2.5 then return end
+        local w = N.win
+        w[#w + 1] = p
+        if #w > 60 then table.remove(w, 1) end
+        local s = table.clone(w)
+        table.sort(s)
+        local n = #s
+        N.med, N.lo, N.hi, N.last = s[math.ceil(n * 0.5)], s[math.max(math.floor(n * 0.1), 1)], s[math.min(math.ceil(n * 0.9), n)], p
+    end
+    function AP.rtt()
+        local N = AP.net
+        if not N.med then AP.netTick(clock_() + 1) end
+        return math.max((N.med or 0.1) + (N.off_rem or 0), 0.005)
+    end
+    function AP.kind()
+        if S.parry_mode == "Keypress" or (Capture.auto() and (not Core.cap or Core.misses >= 1)) then return "key" end
+        return "remote"
+    end
+    function AP.reach(kind)
+        local N = AP.net
+        if not N.med then AP.netTick(clock_() + 1) end
+        local med = N.med or 0.1
+        local lo, hi = N.lo or med, math.max(N.hi or med, N.last or med)
+        local off = (kind == "key") and N.off_key or N.off_rem
+        local add = off or (((kind == "key") and frameDt * 1.5 or frameDt * 0.5) + 0.008)
+        return math.max(lo + add, 0), math.max(med + add, 0), math.max(hi + add, 0)
+    end
+    function AP.closeness()
+        return math.clamp((S.timing_now or S.timing or 0) / 100, 0, 1)
+    end
+    function AP.plan(E, r_lo, r_mid, r_hi, W)
+        local b = AP.cal.bias
+        local A_lo, A_mid, A_hi = E.lo - r_hi + b, E.mid - r_mid + b, E.hi - r_lo + b
+        local me_, ml = AP.MARGIN_EARLY, AP.MARGIN_LATE
+        local step = frameDt * 0.5
+        local slack = W - (A_hi - A_lo) - me_ - ml
+        local c = AP.closeness()
+        local e = me_
+        if slack > 0 then e = me_ + slack * 0.5 * (1 - c) + math.min(slack * 0.5, AP.CLOSE) * c end
+        if A_lo <= me_ + step then return "must", A_lo, A_mid, A_hi, e end
+        if slack > 0 and A_lo <= e + step then return slack < 0.1 and "tight" or "planned", A_lo, A_mid, A_hi, e end
+        return nil, A_lo, A_mid, A_hi, e
+    end
+    function AP.predict(ball, st, now, hz)
+        local v = ballVel(ball)
+        local c = st.pc
+        if c and c.fid == Core.fid and c.pass == st.pass_n and c.ver == (st.trk and st.trk.ver) and c.v == v and c.hz >= hz then
+            local dt = now - c.now
+            if dt == 0 then return c.E end
+            local E = table.clone(c.E)
+            E.lo, E.mid, E.hi = E.lo - dt, E.mid - dt, E.hi - dt
+            return E
+        end
+        local E = Pred.arrival(ball, st, now, hz)
+        st.pc = E and { fid = Core.fid, pass = st.pass_n, ver = st.trk and st.trk.ver, v = v, hz = hz, now = now, E = E } or nil
+        return E
+    end
+    function AP.info(E, A_lo, A_mid, A_hi, e, r_mid)
+        return { speed = E.speed, dist = E.dist, heading = E.heading, eta = A_mid, lead = e, k = E.k,
+            A_lo = A_lo, A_mid = A_mid, A_hi = A_hi, reach = r_mid, spread = A_hi - A_lo }
+    end
+    function AP.evaluate(ball, st, root, now, via)
         if passBusy(st, now) then DBG.held(st.landed and "this pass landed" or "already fired on this pass", now); return end
         if blocked(ball) then DBG.held("ability detection: " .. (Det.ball_detected(ball) or "you"), now); return end
         if Det.tornado(ball, now) then DBG.held("aerodynamic slash tornado", now); return end
-        local vel = ballVel(ball)
-        local speed = vel.Magnitude
-        if speed < 1 then return end
-        local bpos, adj = Core.ball_now(ball)
-        local rpos = root.Position
-        local offset = rpos - bpos
-        local dist = offset.Magnitude
-        if dist < 0.01 then return end
-        local dir, want = vel / speed, offset / dist
-        local heading, W, reach, gap = dir:Dot(want), parryWin() or 0.5, reachT() - jitter() - adj, Core.ap_gap(ball)
-        local rem, accel, h = math.max(dist - gap, 0), speedGain(st, speed, now), trackHoming(st, dir, want, dist, now)
-        local tune = S.self_tune and Core.tune or 0
-        local mustBy = reach + safeMargin() + math.max(tune, 0)
-        local lead, half, mv = math.max(reach + cushion(speed, W) + tune, mustBy), frameDt * 0.5, root.AssemblyLinearVelocity
-        local closeSpd = math.clamp(speed - Vector3.new(mv.X, 0, mv.Z):Dot(want), speed * 0.5, speed * 1.5)
-        local tMin = ttc(dist, gap, closeSpd, accel)
-        local info = { speed = speed, dist = dist, heading = heading, lead = lead, eta = tMin }
+        if st.target_at and now - st.target_at < 0.06 and ball:FindFirstChild('zoomies') and (Pred.zat[ball] or -1) < st.target_at then
+            DBG.held("waiting for the ball's new direction", now)
+            return
+        end
+        local kind = AP.kind()
+        local r_lo, r_mid, r_hi = AP.reach(kind)
+        local W = parryWin() or 0.5
+        local E = AP.predict(ball, st, now, r_hi + W + 0.3)
+        if not E then return end
+        local verdict, A_lo, A_mid, A_hi, e = AP.plan(E, r_lo, r_mid, r_hi, W)
+        if verdict == "must" and A_lo < -0.01 and not E.straight_in and A_mid > W - AP.MARGIN_LATE then
+            local T = st.trk
+            local f = T and T.pass == st.pass_n and Pred.fit(T)
+            if not f and T and now - T.t0 < 0.07 then verdict = nil; DBG.held("must, but no turn measured yet", now)
+            elseif A_lo < 0 and A_mid > W * 0.85 then verdict = nil; DBG.held("fastest case already lost, aiming at the likely arrival", now) end
+        end
         if DBG.on then
-            local e = DBG.eval
-            e.t, e.via, e.speed, e.dist, e.heading, e.reach, e.lead, e.t_min, e.k, e.feed = now, via or "frame",
-                speed, dist, heading, reach, lead, tMin, h.k, adj > 0
-            e.fast, e.slow, e.radial = nil, nil, nil
-            info.dbg = e
+            local d = DBG.eval
+            d.t, d.via, d.speed, d.dist, d.heading, d.reach, d.lead, d.lo, d.mid, d.hi, d.k, d.model, d.feed =
+                now, via or "frame", E.speed, E.dist, E.heading, r_mid, e, A_lo, A_mid, A_hi, E.k, E.model, E.fed
             if not st.dbg_seen then
                 st.dbg_seen = true
-                if tMin < reach then
-                    DBG.ev(("LATE: first seen %.2fs from landing, reach %.2fs (%s) -- already too close when the data arrived"):format(
-                        tMin, reach, via or "frame"))
+                if A_lo < 0 then
+                    DBG.ev(("LATE: first seen when it lands %.2fs before a parry could be up (%s) -- too close when the data arrived"):format(
+                        -A_lo, via or "frame"))
                 end
             end
         end
-        local tag = (via and ("auto parry (" .. via .. ")") or "auto parry") .. ((adj > 0 and via ~= "feed") and " [feed]" or "")
-        if rem <= 3 then return fire(st, now, tag .. " (contact)", info, ball) end
-        if tMin > lead + half then return end
-        if heading >= 0.996 then return fire(st, now, tag, info, ball) end
-        local measured, guess = h.k and (h.kn or 0) >= 2, st.k_mem or K_DEFAULT
-        local km = math.clamp(h.k or guess, K_MIN, K_MAX)
-        local kmHi = measured and km or math.clamp(math.max(km, guess, K_DEFAULT), K_MIN, K_MAX)
-        local kmLo, v = measured and km or math.clamp(math.min(km, guess, K_DEFAULT), K_MIN, K_MAX), vel
-        if heading < -0.95 then
-            local side = dir:Cross(Vector3.yAxis)
-            if side.Magnitude < 1e-3 then side = dir:Cross(Vector3.xAxis) end
-            v = (dir + side.Unit * 0.08).Unit * speed
-        end
-        local rv = root.AssemblyLinearVelocity
-        local tvel = Vector3.new(rv.X, 0, rv.Z)
-        if tvel.Magnitude < 1 then tvel = nil end
-        local snapped = h.snap_at and now - h.snap_at < 0.15
-        local cover = reach + math.min(W, 0.6) - (jitter() + frameDt + 0.03)
-        local horizon = math.max(cover, lead) + 0.1
-        local kFast = (S.hard_curve or snapped) and K_MAX or math.min(kmHi * 1.25, K_MAX)
-        local fast = math.max(simProp(bpos, v, rpos, gap, kFast, accel, mustBy + 0.05, tvel) or math.huge, tMin)
-        info.fast = fast
-        if info.dbg then info.dbg.fast = fast end
-        if fast <= mustBy + half then
-            info.eta = fast
-            return fire(st, now, tag .. " (curve, must)", info, ball)
-        end
-        if h.away and heading < 0.97 then return end
-        local slowF = 0.75
-        if measured and (h.kn or 0) >= 3 and h.kspread and h.kspread < 0.4 then
-            slowF = math.clamp(1 - h.kspread * 0.5, 0.8, 0.95)
-        end
-        local slow = math.max(simProp(bpos, v, rpos, gap, math.max(kmLo * slowF, K_MIN), accel, horizon, tvel) or math.huge, tMin)
-        local mid = math.max(simProp(bpos, v, rpos, gap, km, accel, horizon, tvel) or math.huge, tMin)
-        local turn = mid
-        if h.w and h.w > 0.2 then
-            turn = math.max(Util.simTurn(bpos, v, rpos, gap, h.w, accel, horizon, tvel) or math.huge, tMin)
-        end
-        local radial = mid
-        local s = h.samples
-        local closing = #s >= 2 and (s[#s - 1].d - s[#s].d) / math.max(s[#s].t - s[#s - 1].t, 1e-3) or 0
-        if closing >= speed * 0.35 then
-            local r = radialEta(h, rem, speed)
-            if r then radial = math.max(r, tMin) end
-        end
-        local best = Util.median3(mid, turn, radial)
-        local latest = math.max(slow, best)
-        info.eta, info.slow, info.k = best, slow, km
-        if info.dbg then info.dbg.slow, info.dbg.radial = slow, radial end
-        if latest <= lead + half then return fire(st, now, tag .. " (curve)", info, ball) end
-        if best <= lead + half and latest <= cover then return fire(st, now, tag .. " (curve, covered)", info, ball) end
+        if not verdict then return end
+        local tag = (via and ("auto parry (" .. via .. ")") or "auto parry") .. " (" .. verdict .. ")"
+        return fire(st, now, tag, AP.info(E, A_lo, A_mid, A_hi, e, r_mid), ball)
     end
+    function AP.alive()
+        local n = 0
+        if Alive then for _, m in ipairs(Alive:GetChildren()) do if m:FindFirstChildOfClass("Humanoid") then n = n + 1 end end end
+        return n
+    end
+    function AP.likelyNext(X, st, root, their)
+        local mine, from = 0, 0
+        for i = #st.swaps, 1, -1 do
+            local s = st.swaps[i]
+            if s.from == X then
+                from = from + 1
+                if s.to == me then mine = mine + 1 end
+                if from >= 4 then break end
+            end
+        end
+        if from >= 2 and mine * 2 >= from then return true end
+        local to = root.Position - their.Position
+        local d = to.Magnitude
+        if d > 0.5 and their.CFrame.LookVector:Dot(to / d) > 0.9 then return true end
+        if not Alive then return false end
+        for _, m in ipairs(Alive:GetChildren()) do
+            if m.Name ~= X and m.Name ~= me then
+                local hrp = m:FindFirstChild('HumanoidRootPart')
+                if hrp and (hrp.Position - their.Position).Magnitude < d then return false end
+            end
+        end
+        return true
+    end
+    AP.ret, AP.retStart = {}, setmetatable({}, { __mode = 'k' })
+    function AP.noteReturnStart(ball, st, now)
+        local sw = st.swaps[#st.swaps]
+        local from = sw and sw.from
+        if type(from) ~= 'string' or from == '' or from == me then AP.retStart[ball] = nil; return end
+        local their, root = charRoot(from), getRoot()
+        local sp = ballVel(ball).Magnitude
+        if not (their and root) or sp < 1 then AP.retStart[ball] = nil; return end
+        AP.retStart[ball] = { from = from, t = now, straight = math.max((their.Position - root.Position).Magnitude - Core.ap_gap(ball), 0) / sp }
+    end
+    function AP.noteReturnEnd(ball, now)
+        local r = ball and AP.retStart[ball]
+        if not r then return end
+        AP.retStart[ball] = nil
+        local flight = now - r.t
+        if flight < 0 or flight > 4 then return end
+        local L = AP.ret[r.from] or {}
+        AP.ret[r.from] = L
+        L[#L + 1] = flight <= r.straight * 1.6 + 0.12
+        if #L > 6 then table.remove(L, 1) end
+    end
+    function AP.straightReturns(X)
+        local L = AP.ret[X]
+        if not L or #L < 2 then return false end
+        local fast = 0
+        for _, f in ipairs(L) do if f then fast = fast + 1 end end
+        return fast >= #L * 0.7
+    end
+    function AP.anticipate(ball, st, root, now)
+        local duel = AP.alive() == 2
+        if not (S.preparry or (S.hp_preparry and duel and AP.rtt() >= 0.08)) then return end
+        if st.preparried then
+            if now < st.preparry_until then return end
+            st.preparried = false
+        end
+        local X = st.target
+        if type(X) ~= 'string' or X == '' or X == me then return end
+        if not AP.straightReturns(X) then return end
+        if not Core.cap and S.parry_mode ~= "Keypress" then return end
+        if blocked(ball) or Util.hasClash(ball, now) or not gateOpen() then return end
+        local their = charRoot(X)
+        if not their then return end
+        local gap = (their.Position - root.Position).Magnitude
+        if not duel and (gap > (S.preparry_range or 30) or not AP.likelyNext(X, st, root, their)) then return end
+        local kind = AP.kind()
+        local r_lo, r_mid, r_hi = AP.reach(kind)
+        local W = parryWin() or 0.5
+        local E = AP.predict(ball, st, now, r_hi + W + 0.3)
+        if not E or E.lo == math.huge or E.hi == math.huge then return end
+        local speed = E.speed
+        local cg = Core.ap_gap(ball)
+        local back_lo = math.max(gap - cg, 0) / (speed * 1.25 + 15)
+        local back_hi = math.max(gap - cg, 0) / (speed * 0.95) + 0.04
+        if back_lo >= r_hi + AP.MARGIN_EARLY + 0.03 then return end
+        local R = { lo = math.max(E.lo - 8 / speed, 0) + back_lo, mid = E.mid + (back_lo + back_hi) * 0.5,
+            hi = E.hi + back_hi, speed = speed, dist = gap, heading = E.heading, k = E.k }
+        local verdict, A_lo, A_mid, A_hi, e = AP.plan(R, r_lo, r_mid, r_hi, W)
+        if not verdict or (verdict == "must" and A_mid < 0) then return end
+        local info = AP.info(R, A_lo, A_mid, A_hi, e, r_mid)
+        if fire(st, now, ("pre-parry (%s returns it)"):format(X), info, ball) then
+            st.preparried, st.preparry_until = true, now + r_hi + W + 0.15
+            Core.pending, Core.watch = nil, nil
+            if AP.shot then AP.shot.pre = true end
+        end
+    end
+    function AP.recordShot(info, how, now, ball)
+        AP.shot = { t = now, how = how, key = how ~= "remote", sends = Core.sends, ball = ball,
+            raw = info and info.A_mid and (info.A_mid - AP.cal.bias), spread = info and info.spread }
+    end
+    function AP.onEcho(now)
+        local s = AP.shot
+        if not s or s.echo or s.void or now - s.t > 1.5 then return end
+        if Core.sends ~= s.sends then s.void = true; return end
+        s.echo = now
+        local N = AP.net
+        if not N.med then return end
+        local list = s.key and N.echo_key or N.echo_rem
+        list[#list + 1] = now - s.t - frameDt * 0.5 - N.med
+        if #list > 12 then table.remove(list, 1) end
+        local o = table.clone(list)
+        table.sort(o)
+        local lim = #o >= 3 and 0.4 or 0.1
+        local off = math.clamp(o[math.ceil(#o * 0.5)], -lim, lim)
+        if s.key then N.off_key = off else N.off_rem = off end
+    end
+    function AP.addRes(r)
+        local C = AP.cal
+        C.res[#C.res + 1] = math.clamp(r, -0.3, 0.3)
+        if #C.res > 9 then table.remove(C.res, 1) end
+        local o = table.clone(C.res)
+        table.sort(o)
+        C.bias = math.clamp(o[math.ceil(#o * 0.5)] * (#o >= 3 and 0.8 or 0.4), -0.25, 0.08)
+        C.n = C.n + 1
+    end
+    function AP.onLanded(now)
+        local s = AP.shot
+        if not s or s.void or s.done or not s.echo or now - s.echo > 1.2 then return end
+        s.done = true
+        if Core.sends ~= s.sends then return end
+        local u = now - s.echo
+        local U = AP.cal.uses
+        U[#U + 1] = u
+        if #U > 20 then table.remove(U, 1) end
+        if not s.raw or s.pre then return end
+        local r = u - s.raw
+        if u < 0.018 then r = math.min(r, -0.03) end
+        AP.addRes(r)
+    end
+    function AP.onMiss(verdict)
+        local s = AP.shot
+        if not s or s.done or s.pre then return end
+        s.done = true
+        if not verdict or not s.spread or s.spread > 0.12 then return end
+        if verdict > 0 then AP.addRes(-math.min(verdict + 0.03, 0.15))
+        else AP.addRes(math.min(-verdict * 0.5, 0.06)) end
+    end
+    function Parry.timingMs()
+        local r_lo, r_mid, r_hi = AP.reach(AP.kind())
+        local W = parryWin() or 0.5
+        local spread = (r_hi - r_lo) + 0.01
+        local slack = W - spread - AP.MARGIN_EARLY - AP.MARGIN_LATE
+        local c = AP.closeness()
+        local e = AP.MARGIN_EARLY + math.max(slack, 0) * 0.5 * (1 - c) + math.min(math.max(slack, 0) * 0.5, AP.CLOSE) * c
+        return e * 1000
+    end
+    Parry.cushionMs = Parry.timingMs
+
+    local function decide(ball, st, root, now, via) return AP.evaluate(ball, st, root, now, via) end
 
     local function trigger(ball, st, now)
         if passBusy(st, now) or Util.hasClash(ball, now) or blocked(ball) then return end
         fire(st, now, "triggerbot", nil, ball)
     end
 
-    local function tryPreparry(ball, st, root, now)
-        if st.preparried then
-            if now < st.preparry_until then return end
-            st.preparried = false
-        end
-        if not (S.preparry or (S.hp_preparry and (Lag.avg or pingS()) >= 0.08)) then return end
-        if not Core.cap or blocked(ball) then return end
-        local target = st.target
-        if type(target) ~= 'string' or target == '' or target == me then return end
-        local their = charRoot(target)
-        if not their then return end
-        local vel = ballVel(ball)
-        local speed = vel.Magnitude
-        if speed < 1 then return end
-        local gap = (their.Position - root.Position).Magnitude
-        if gap > (S.preparry_range or 20) then return end
-        local toThem = their.Position - ball.Position
-        local dThem = toThem.Magnitude
-        if dThem > 3 and vel:Dot(toThem / dThem) < speed * 0.3 then return end
-        local back, reach = gap / (speed * 1.1), reachT()
-        if back > reach + frameDt * 2 then return end
-        local eta, lead = dThem / speed + math.clamp(st.react or 0.05, 0, 0.3) + back, fireLead(speed)
-        if eta > lead or Util.hasClash(ball, now) then return end
-        if send(false) == "sent" then
-            Anim.block()
-            local W, n2 = parryWin()
-            st.preparried = true
-            st.preparry_until = now + math.max((W or 0.5) + reach + 0.15, (n2 or 1.3) + 0.08)
-            Core.last_parry = { t = now, via = "pre-parry", info = { eta = eta, lead = lead } }
-            logp(("pre-parry: return in %.2fs, lead %.2fs, gap %.0f, spd %.0f"):format(eta, lead, gap, speed))
-        end
-    end
-
-    function Core.fast_retarget(ball, st, root, now)
-        if passBusy(st, now) or blocked(ball) or Det.tornado(ball, now) then return false end
-        local speed = ballVel(ball).Magnitude
-        if speed < 1 then return false end
-        local bpos, adj = Core.ball_now(ball)
-        local dist, gap = (root.Position - bpos).Magnitude, Core.ap_gap(ball)
-        local soonest, W, reach = math.max(dist - gap, 0) / speed, math.min(parryWin() or 0.5, 0.6), reachT() - jitter() - adj
-        local mustBy = reach + safeMargin()
-        local lead, holds = math.max(reach + cushion(speed, W), mustBy), reach + W - (jitter() + frameDt + 0.03)
-        local info = { speed = speed, dist = dist, heading = 0, lead = lead, eta = soonest }
-        if soonest <= mustBy then return fire(st, now, "fast retarget (must)", info, ball) end
-        if soonest > lead then
-            DBG.held(("fast retarget: not due (%.2fs > lead %.2fs)"):format(soonest, lead), now)
-            return false
-        end
-        if soonest * 2 > holds then
-            DBG.held(("fast retarget: a curve could outlast the parry (%.2fs x2 > %.2fs)"):format(soonest, holds), now)
-            return false
-        end
-        return fire(st, now, "fast retarget", info, ball)
-    end
     onRetarget = function(ball, st, new, now)
         if new == me then
-            if S.fast_retarget and S.autoparry and not S.triggerbot then
-                local root = apRoot()
-                if root then Core.fast_retarget(ball, st, root, now) end
-            end
+            AP.noteReturnStart(ball, st, now)
             if SP.auto then clashCheck(ball, now) end
             if Util.hasClash(ball, now) then spamInstant() end
             if S.autoparry and not S.triggerbot then
@@ -2406,6 +2675,7 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         if point == 1 then
             if dt then frameDt = math.clamp(dt, 1 / 240, 0.1) end
             Core.fid = (Core.fid or 0) + 1
+            AP.netTick(now)
             Pump.frame = Pump.frame + 1
             local ctx = Util.inLobbyTrain() and "training" or "match"
             if ctx ~= Core.ctx then
@@ -2421,7 +2691,8 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
                 if not fair then
                     if now - aw.t > 1 then Core.await = nil end
                 else
-                    local limit = math.max((E.rtt or pingS()) * 2 + 0.03, pingS() * 1.5 + jitter() * 2 + frameDt * 2 + 0.06)
+                    local r_lo, r_mid, r_hi = AP.reach("remote")
+                    local limit = math.max((E.rtt or r_mid) * 2 + 0.03, r_hi * 1.5 + frameDt * 2 + 0.06)
                     if now - aw.t > limit then
                         Core.await = nil
                         Core.refused(aw, now, now - aw.t)
@@ -2437,7 +2708,9 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
                 end
             end
             if Core.pending and now > Core.pending then
-                Core.pending, Core.misses = nil, Core.misses + 1
+                local sh = AP.shot
+                local echoed = sh ~= nil and sh.echo ~= nil and not sh.void
+                Core.pending, Core.misses = nil, Core.misses + (echoed and 0 or 1)
                 Core.verdict = nil
                 logp(Util.missVerdict(Core.watch))
                 do
@@ -2451,13 +2724,13 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
                     logp("capture: two parries unanswered on the carried-over hash -- dropped, parry once to recapture")
                 end
                 if DBG.on then DBG.ev("MISS: " .. Util.missVerdict(Core.watch):gsub("\n.*", "")) end
-                if S.self_tune and Core.verdict then
-                    Core.tune = math.clamp(Core.tune + math.clamp(Core.verdict * 0.5, -0.015, 0.015), -0.04, 0.04)
-                    logp(("  self-tune: now firing %+.0fms"):format(Core.tune * 1000))
-                end
+                AP.onMiss(Core.verdict)
+                if AP.cal.n > 0 then logp(("  timing correction now %+.0fms"):format(AP.cal.bias * 1000)) end
                 Core.watch = nil
                 if S.parry_mode == "Keypress" then
                     Core.misses = 0
+                elseif echoed then
+                    logp("  the server took the parry: a timing miss, the capture is fine")
                 elseif Core.misses >= 2 then
                     Core.cap, Core.misses = nil, 0
                     logp("  2 unanswered in a row: capture dropped, the next parry takes a fresh one")
@@ -2477,14 +2750,18 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
                 local mine
                 for _, ball in ipairs(liveBalls()) do
                     local st = ballState(ball)
+                    if point == 1 then
+                        Pred.measureBuf(ball, now)
+                        if not ball:FindFirstChild('zoomies') then Pred.sample(ball, st, now) end
+                    end
                     if st.target == me then
                         if not mine then mine = { ball, st }
                         else
                             if not mine.list then mine = { list = { { ball = mine[1], st = mine[2] } } } end
                             mine.list[#mine.list + 1] = { ball = ball, st = st }
                         end
-                    else
-                        tryPreparry(ball, st, root, now)
+                    elseif not S.triggerbot then
+                        AP.anticipate(ball, st, root, now)
                     end
                 end
                 if mine and not mine.list then
@@ -2568,11 +2845,12 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         if who ~= nil and who ~= LocalPlayer.Character then return end
         local E, now = Core.echo, clock_()
         E.at, E.seen = now, E.seen + 1
+        AP.onEcho(now)
         local aw = Core.await
         if not aw then return end
         Core.await = nil
         local rtt = now - aw.t
-        if rtt < 0 or rtt > pingS() * 2.5 + 0.12 then return end
+        if rtt < 0 or rtt > math.max(pingS(), AP.rtt()) * 2.5 + 0.12 then return end
         E.rtt = E.rtt and (E.rtt * 0.7 + rtt * 0.3) or rtt
         Lag.echo = E.rtt
         if aw.cap then aw.cap.taken, aw.cap.refused_row = (aw.cap.taken or 0) + 1, 0 end
@@ -2618,15 +2896,20 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         local D, E, L = Core.diag, Core.echo, {}
         L[#L + 1] = ("parries: %d fired, %d landed, %d early, %d late, %d on time but not counted, %d not taken, %d rescued"):format(
             D.fired, D.landed, D.early, D.late, D.ontime, D.refused, D.rescued)
-        if D.bias then
-            local b = D.bias * 1000
-            L[#L + 1] = ("prediction: the ball lands %+.0fms vs predicted (spread %.0fms, %d parries) -- %s"):format(b, D.spread * 1000, D.n,
-                math.abs(b) <= 15 and "on the mark" or (b > 0 and "firing a little early" or "firing a little late"))
+        local U, C = AP.cal.uses, AP.cal
+        if #U > 0 then
+            local o = table.clone(U)
+            table.sort(o)
+            L[#L + 1] = ("window: balls land %.0fms into the parry (median of %d, parry lasts %.0fms), correction %+.0fms"):format(
+                o[math.ceil(#o * 0.5)] * 1000, #o, (parryWin() or 0.5) * 1000, C.bias * 1000)
         else
-            L[#L + 1] = "prediction: no landed parries measured yet"
+            L[#L + 1] = ("window: no landed parries measured yet, correction %+.0fms"):format(C.bias * 1000)
         end
-        L[#L + 1] = ("latency: ping %.0fms (median of 3s), jitter %.0fms, reach %.0fms, parry round trip %s"):format(
-            (Lag.avg or 0) * 1000, jitter() * 1000, reachT() * 1000, E.rtt and ("%.0fms"):format(E.rtt * 1000) or "not measured")
+        local r_lo, r_mid, r_hi = AP.reach(AP.kind())
+        local N = AP.net
+        L[#L + 1] = ("latency: ping %.0fms (%.0f-%.0f), reach %.0fms, smoothing %.0fms, parry round trip %s"):format(
+            (N.med or 0) * 1000, (N.lo or 0) * 1000, (N.hi or 0) * 1000, r_mid * 1000, Pred.buf * 1000,
+            (N.off_rem or N.off_key) and ("%+.0fms vs ping"):format((N.off_rem or N.off_key) * 1000) or "not measured")
         local cap = Core.cap
         L[#L + 1] = cap and ("capture #%d: %d taken, %d refused%s%s"):format(cap.id or 0, cap.taken or 0, cap.refused or 0,
                 cap.alt_tried and ", on its second key" or "", E.forged_ok and "" or " (server answers not seen yet: can't be checked)")
@@ -2643,25 +2926,24 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         Core.await = nil
         local D = Core.diag
         D.landed = D.landed + 1
-        if Core.pending and w then
+        local now0 = clock_()
+        local sh = AP.shot
+        local use = sh and sh.echo and not sh.void and not sh.done and now0 - sh.echo or nil
+        AP.onLanded(now0)
+        if w then
             if w.cap then w.cap.landed = (w.cap.landed or 0) + 1 end
-            local took, note = clock_() - w.t, ""
-            if w.eta and w.eta < 5 then
-                local err = took - w.ping * 0.5 - w.eta
-                if math.abs(err) < 0.5 then
-                    D.bias = D.bias and (D.bias * 0.8 + err * 0.2) or err
-                    D.spread = D.spread * 0.8 + math.abs(err - D.bias) * 0.2
-                    D.n = D.n + 1
-                    note = (", ball %+.0fms vs predicted"):format(err * 1000)
-                end
+            local note = ""
+            if use and sh.raw then
+                note = (", %.0fms into the parry (planned %.0fms)"):format(use * 1000, (sh.raw + AP.cal.bias) * 1000)
+                D.n = D.n + 1
             end
-            logp(("  -> landed %.2fs after the parry (fired at %.0f studs%s)"):format(took, w.d0, note))
+            logp(("  -> landed %.2fs after the parry (fired at %.0f studs%s)"):format(now0 - w.t, w.d0, note))
             if D.landed % 10 == 0 then for _, l in ipairs(Parry.timingLines()) do logp("  [timing] " .. l) end end
         end
         local firedBall = w and w.ball
+        AP.noteReturnEnd(firedBall, now0)
         Core.watch = nil
         Core.pending, Core.misses = nil, 0
-        Core.tune = Core.tune * 0.9
         local fst = firedBall and tracked[firedBall]
         if fst and fst.target == me and fst.pass_open and fst.parried then
             fst.landed = true
@@ -2720,24 +3002,6 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
             end
             if reopened then G.until_t = 0 end
             DBG.ev(("parry by %s%s"):format(who, reopened and "  -> ball coming back: new pass opened" or ""))
-            if S.fast_retarget and S.autoparry and not S.triggerbot and Util.inMatch() then
-                local alive = 0
-                for _, m in ipairs(Alive:GetChildren()) do
-                    if m:FindFirstChildOfClass("Humanoid") then alive = alive + 1 end
-                end
-                if alive == 2 then
-                    local root = apRoot()
-                    if root then
-                        for ball, st in pairs(tracked) do
-                            if st.target == who and ball.Parent then
-                                if not st.pass_open then Util.openPass(st) end
-                                DBG.ev(("1v1: %s parried -- taken as the retarget to you"):format(who))
-                                Core.fast_retarget(ball, st, root, now)
-                            end
-                        end
-                    end
-                end
-            end
             if S.autoparry or S.triggerbot then
                 local root = apRoot()
                 if root then
@@ -2760,8 +3024,9 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         local span = now - c.since
         if span >= 1 then R.vel, R.feed = c.vel / span, c.feed / span; c.vel, c.feed, c.since = 0, 0, now end
         local L = {}
-        L[#L + 1] = ("ping %.0fms (avg %.0f)  jitter %.0fms  reach %.0fms"):format(pingMs(), (Lag.avg or 0) * 1000,
-            jitter() * 1000, reachT() * 1000)
+        local r_lo, r_mid, r_hi = AP.reach(AP.kind())
+        L[#L + 1] = ("ping %.0fms  reach %.0f-%.0fms  smoothing %.0fms  correction %+.0fms"):format(pingMs(), r_lo * 1000,
+            r_hi * 1000, Pred.buf * 1000, AP.cal.bias * 1000)
         local F = Core.feed
         L[#L + 1] = ("server feed %.0f/s (ahead %s)  velocity updates %.0f/s"):format(R.feed,
             F.ahead and ("%.0fms"):format(F.ahead * 1000) or "-", R.vel)
@@ -2779,11 +3044,9 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         local e = DBG.eval
         if e.t and now - e.t < 1.5 then
             L[#L + 1] = ("check (%s%s): spd %.0f  d %.0f  heading %.2f"):format(e.via, e.feed and ", feed" or "", e.speed, e.dist, e.heading)
-            L[#L + 1] = ("  soonest %.2fs  lead %.2fs  reach %.2fs%s%s%s%s"):format(math.min(e.t_min, 9.99), e.lead, e.reach,
-                e.fast and ("  curve fast %.2f"):format(math.min(e.fast, 9.99)) or "",
-                e.slow and (" slow %.2f"):format(math.min(e.slow, 9.99)) or "",
-                e.radial and (" closing %.2f"):format(math.min(e.radial, 9.99)) or "",
-                e.k and ("  k %.1f"):format(e.k) or "")
+            L[#L + 1] = ("  lands %.2f / %.2f / %.2fs after a parry now  fires at %.2fs%s"):format(math.min(e.lo or 0, 9.99),
+                math.min(e.mid or 0, 9.99), math.min(e.hi or 0, 9.99), e.lead or 0,
+                e.k and ("  turn %s %.1f"):format(({ [0] = "guess", "prop", "rate", "ramp" })[e.model or 0] or "?", e.k) or "")
         end
         if DBG.block and now - DBG.block_at < 2 then L[#L + 1] = ("held: %s (%.1fs ago)"):format(DBG.block, now - DBG.block_at) end
         for _, l in ipairs(Parry.timingLines()) do L[#L + 1] = l end
@@ -3253,7 +3516,7 @@ Gui.Tabs = {
 Gui.AP = Gui.Tabs.Parry:AddLeftGroupbox("Auto Parry", "swords")
 Gui.AP:AddToggle("AutoParry", {
     Text = "Auto parry", Default = false,
-    Tooltip = "Parries every ball sent at you, curves included, at the Accuracy you set.",
+    Tooltip = "Parries every ball sent at you, curves included. Predicts when the ball lands (your real ping, the ball's measured curve) and times the parry inside its window; it corrects itself from the server's answers.",
     Callback = function(v) S.autoparry = v; Engine.want("autoparry", v) end,
 }):AddKeyPicker("AutoParryKey", { Default = "None", Mode = "Toggle", SyncToggleState = true, Text = "Auto parry" })
 Gui.AP:AddToggle("Triggerbot", {
@@ -3281,30 +3544,26 @@ Gui.AP:AddToggle("UnlockFPS", {
 })
 
 Gui.APS = Gui.Tabs.Parry:AddRightGroupbox("Timing", "sliders-horizontal")
-Gui.APS:AddSlider("Accuracy", {
-    Text = "Accuracy", Default = 50, Min = 1, Max = 100, Rounding = 0,
-    Tooltip = "How long before the ball lands the parry goes up, in time, the same at every ball speed: 100 = close but with a safety margin for your ping (about 50-60 ms), 1 = about 200 ms early, a straight line in between. The label below shows the exact number. Curves follow it too.",
+function Gui.timingText()
+    local ok, ms = pcall(Parry.timingMs)
+    return ok and ("Straight balls: parry up ~%d ms before they land (at your ping now)"):format(math.floor(ms + 0.5))
+        or "Straight balls: parry up ~250 ms before they land"
+end
+Gui.APS:AddSlider("ParryTiming", {
+    Text = "Timing (0 = safe, 100 = close)", Default = 0, Min = 0, Max = 100, Rounding = 0,
+    Tooltip = "Where the ball lands inside your parry. 0 = the middle of the parry window: the most room for lag spikes and curves either way (best in tests). 100 = the parry goes up just before the ball: looks closer, less room for error. Curves always wait as long as they need to.",
     Callback = function(v)
-        S.accuracy_base = v; Parry.roll()
-        if Gui.AccLabel then pcall(function() Gui.AccLabel:SetText(("Parry up ~%d ms before the ball lands"):format(math.floor(Parry.cushionMs() + 0.5))) end) end
+        S.timing = v; Parry.roll()
+        if Gui.AccLabel then pcall(function() Gui.AccLabel:SetText(Gui.timingText()) end) end
     end,
 })
-Gui.AccLabel = Gui.APS:AddLabel("Parry up ~125 ms before the ball lands", true)
-Gui.APS:AddToggle("RandomAccuracy", { Text = "Randomize accuracy", Default = false, Callback = function(v) S.random_accuracy = v end })
+Gui.AccLabel = Gui.APS:AddLabel("Straight balls: parry up ~250 ms before they land", true)
+Gui.APS:AddToggle("RandomAccuracy", { Text = "Randomize timing", Default = false, Callback = function(v) S.random_accuracy = v; Parry.roll() end })
 Gui.APS:AddSlider("RandomAccuracyAmount", {
     Text = "Randomize amount", Default = 10, Min = 0, Max = 50, Rounding = 0, Suffix = " +/-",
-    Callback = function(v) S.random_accuracy_amount = v end,
+    Callback = function(v) S.random_accuracy_amount = v; Parry.roll() end,
 })
-Gui.APS:AddToggle("HardCurveGuard", {
-    Text = "Hard curve guard", Default = false,
-    Tooltip = "Treats every curve as the hardest turn possible for the must-fire check. Saves sudden whip-ins; downside: can parry curve-bait balls early.",
-    Callback = function(v) S.hard_curve = v end,
-})
-Gui.APS:AddToggle("SelfTune", {
-    Text = "Self-tune timing", Default = false,
-    Tooltip = "Each EARLY / LATE miss nudges the fire time the other way (max 15ms a step, +/-40ms total); landed parries ease it back. Downside: a few odd misses can pull it off for a while.",
-    Callback = function(v) S.self_tune = v; if not v then Parry.resetTune() end end,
-})
+Gui.APS:AddLabel("Timing corrects itself: every parry the server answers twice (taken, then landed), and the gap shows where the ball landed in your parry. Debug > Timing shows the correction.", true)
 
 Gui.AIM = Gui.Tabs.Parry:AddRightGroupbox("Aim & Curve", "spline")
 Gui.AIM:AddDropdown("TargetMode", {
@@ -3376,16 +3635,16 @@ Gui.CAP:AddButton({
 Gui.PP = Gui.Tabs.Parry:AddLeftGroupbox("Pre-parry", "fast-forward")
 Gui.PP:AddToggle("PreParry", {
     Text = "Pre-parry", Default = false,
-    Tooltip = "Ball on a player right next to you whose return would beat your reaction: parry ahead of it.",
+    Tooltip = "The ball is on a player near you and their return would land faster than your ping lets you react: parry ahead of it. Only when it really can't be reacted to, only against players whose last returns came straight back (it learns each player; curvers are left to the normal parry), and in a crowd only when you're their likely target. Can waste a parry in a crowd.",
     Callback = function(v) S.preparry = v end,
 })
 Gui.PP:AddSlider("PreParryRange", {
-    Text = "Pre-parry range", Default = 20, Min = 8, Max = 45, Rounding = 0, Suffix = " studs",
+    Text = "Pre-parry range", Default = 30, Min = 8, Max = 80, Rounding = 0, Suffix = " studs",
     Callback = function(v) S.preparry_range = v end,
 })
 Gui.PP:AddToggle("HighPingPreParry", {
-    Text = "Auto pre-parry at high ping", Default = false,
-    Tooltip = "Pre-parry turns itself on while your ping is 80ms or more.",
+    Text = "Auto pre-parry at high ping", Default = true,
+    Tooltip = "In a 1v1 at 80ms+ ping, pre-parry turns itself on: the ball can only come back to you, so a straight return your ping can't react to gets parried ahead of time (only against an opponent whose returns have been coming straight back). Off = only the Pre-parry toggle does it.",
     Callback = function(v) S.hp_preparry = v end,
 })
 
@@ -5531,7 +5790,7 @@ function Mods.DebugUI.stop() Parry.DBG.on = false end
 
 Gui.DBGTM = Gui.Tabs.Debug:AddRightGroupbox("Timing", "timer")
 Gui.TimingLabel = Gui.DBGTM:AddLabel("Timing: turn on auto parry and play a few parries.", true)
-Gui.DBGTM:AddLabel("Lands + = the ball came later than predicted (firing early); - = sooner (firing late). Not taken = the server ignored a remote parry (bad capture).", true)
+Gui.DBGTM:AddLabel("'into the parry' = how long after your parry was up the ball landed (half the window = perfectly centred). Correction - = firing earlier than planned because balls landed sooner. Not taken = the server ignored a remote parry (bad capture).", true)
 Gui.DBGB = Gui.Tabs.Debug:AddLeftGroupbox("Debug overlay", "bug")
 Gui.DBGB:AddToggle("DebugUI", {
     Text = "Debug overlay", Default = false,
@@ -5621,12 +5880,7 @@ Gui.DBGT:AddButton({
         end)
     end,
 })
-Gui.DBGT:AddToggle("FastRetarget", {
-    Text = "Fast retarget", Default = true,
-    Tooltip = "Auto parry decides the instant the ball turns to you, before its new direction arrives -- but only fires when it should: it's due at your Accuracy, and even a curve twice as long would still land inside the parry (or it's fire-or-die close). Otherwise the normal checks take it a moment later. In a 1v1 the other player's parry counts as the retarget (it can only be coming to you).",
-    Callback = function(v) Parry.S.fast_retarget = v end,
-})
-Gui.DBGB:AddLabel("Times in the event list are seconds ago. 'soonest' = the earliest the ball can land, 'lead' = when auto parry fires, 'reach' = your ping delay.", true)
+Gui.DBGB:AddLabel("Times in the event list are seconds ago. 'lands a / b / c' = earliest / likely / latest time the ball lands after a parry sent now would be up; 'fires at' = when auto parry sends it; 'reach' = your ping delay.", true)
 
 Library:OnUnload(function()
     for _, f in pairs(Features) do pcall(function() f:setEnabled(false) end) end
