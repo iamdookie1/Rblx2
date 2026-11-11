@@ -1,6 +1,6 @@
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.119"
+local SCRIPT_VERSION = "rewrite-0.5.120"
 
 local genv = (getgenv and getgenv()) or _G
 if type(genv.__BladeBallShutdown) == 'function' then pcall(genv.__BladeBallShutdown) end
@@ -453,8 +453,8 @@ do
     local function safeMargin() return jitter() + frameDt + 0.01 end
     local function cushion(speed, W)
         local a = (math.clamp(S.accuracy or 50, 1, 100) - 1) / 99
-        local lo = safeMargin()
-        local hi = math.max(math.min(W or 0.5, 0.6) - (jitter() + frameDt + 0.03), lo)
+        local lo = safeMargin() + 0.025
+        local hi = math.max(math.min(0.2, math.min(W or 0.5, 0.6) - (jitter() + frameDt + 0.03)), lo)
         return lo + (1 - a) * (hi - lo)
     end
     function Parry.cushionMs() return cushion(100, parryWin() or 0.5) * 1000 end
@@ -1336,6 +1336,9 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         local cam = Workspace.CurrentCamera
         local points, aim = packetParts(cam)
         local name, _, mode = pickTarget(cam)
+        if spam and Core.clash_partner and clock_() < (Core.clash_until or 0) and points[Core.clash_partner] then
+            name, mode = Core.clash_partner, "Clash"
+        end
         if name and mode ~= "Cursor" then
             local screen = points[name]
             if screen then aim = { screen.X, screen.Y } end
@@ -1518,6 +1521,38 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         return nil
     end
 
+    function Util.simTurn(pos, vel, target, gap, w, accel, horizon, tvel)
+        local speed = vel.Magnitude
+        if speed < 1 then return nil end
+        local dir, t, dt = vel / speed, 0, Util.SIM_DT
+        local tstep = tvel and tvel * dt or nil
+        while t < horizon do
+            if tstep then target = target + tstep end
+            local to = target - pos
+            local dist = to.Magnitude
+            if dist <= gap then return t end
+            local want = to / dist
+            local ang = math.acos(math.clamp(dir:Dot(want), -1, 1))
+            if ang > 1e-3 then
+                local mixed = dir + (want - dir) * math.min(w * dt / ang, 1)
+                if mixed.Magnitude < 1e-3 then mixed = want end
+                dir = mixed.Unit
+            end
+            speed = speed + accel * dt
+            local move = speed * dt
+            if dir:Dot(want) > 0 and move >= dist - gap then return t + (dist - gap) / speed end
+            pos = pos + dir * move
+            t = t + dt
+        end
+        return nil
+    end
+    function Util.median3(a, b, c)
+        if a > b then a, b = b, a end
+        if b > c then b, c = c, b end
+        if a > b then a, b = b, a end
+        return b
+    end
+
     local liveCache = { at = -1, list = {} }
     local function liveBalls()
         local now = clock_()
@@ -1685,9 +1720,9 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         if target == me then
             local eta = math.max((root.Position - bnow).Magnitude - Core.ap_gap(ball), 0) / speed
             if eta <= react + frameDt then return partner, ("on you in %.2fs, faster than you react"):format(eta), true end
-            if back <= react then return partner, ("close exchange, return in %.2fs"):format(back), false end
+            if back / 1.2 <= react then return partner, ("close exchange, next return in %.2fs"):format(back / 1.2), false end
         else
-            local ret = (their.Position - bnow).Magnitude / speed + math.clamp(st.react or 0.05, 0, 0.3) + back
+            local ret = (their.Position - bnow).Magnitude / speed + math.clamp(st.react or 0.05, 0, 0.3) + back / 1.1
             if SP.predictive and ret <= react + 0.05 then return partner, ("their return lands in %.2fs"):format(ret), true end
         end
         if held then
@@ -1739,6 +1774,7 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         AutoSpam.ball, AutoSpam.partner = ball, partner
         AutoSpam.active_until = now + math.clamp(SP.hold or 0.15, 0, 0.5) + 0.02
         AutoSpam.reason = ("vs %s (%s)"):format(partner, why)
+        Core.clash_partner, Core.clash_until = partner, AutoSpam.active_until
     end
     function Util.endClash(why, cool)
         if AutoSpam.ball then
@@ -1746,6 +1782,7 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
             if cool then AutoSpam.cool_ball, AutoSpam.cool_until = AutoSpam.ball, clock_() + 0.25 end
         end
         AutoSpam.active_until, AutoSpam.reason, AutoSpam.ball, AutoSpam.partner = 0, nil, nil, nil
+        Core.clash_partner, Core.clash_until = nil, 0
     end
     function Util.hasClash(ball, now) return AutoSpam.ball == ball and now < AutoSpam.active_until end
     local function cooling(ball, now) return ball == AutoSpam.cool_ball and now < AutoSpam.cool_until end
@@ -1780,6 +1817,15 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         end
     end
 
+    function Util.spamUseful()
+        local b, root, their = AutoSpam.ball, getRoot(), charRoot(AutoSpam.partner)
+        if not (b and b.Parent and root and their) then return true end
+        local st = tracked[b]
+        if not st or st.target == me then return true end
+        local speed = math.max(ballVel(b).Magnitude, 1)
+        local ret = ((their.Position - Core.ball_now(b)).Magnitude + (their.Position - root.Position).Magnitude) / (speed * 1.1)
+        return ret <= reachT() + math.min(parryWin() or 0.5, 0.6) * 0.8
+    end
     local Pump = { credit = 0, last = clock_(), on = false, frame = 0, frame_fires = 0, fired_frame = -1, waiting = false }
     local SpamMeter = { count = 0, since = clock_(), rate = 0 }
     local function curSource(now)
@@ -1880,6 +1926,7 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         if not source or not LocalPlayer.Character then Pump.on, Pump.waiting = false, false; return end
         if source == "auto" and SP.auto_rate ~= "Spam speed" then
             Pump.on, Pump.waiting = true, false
+            if not Util.spamUseful() then Pump.remote_sent = false; return end
             if fireOne() and Pump.remote_sent then Anim.spamBlock() end
             Pump.remote_sent = false
             return
@@ -2074,6 +2121,8 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         local tvel = Vector3.new(rv.X, 0, rv.Z)
         if tvel.Magnitude < 1 then tvel = nil end
         local snapped = h.snap_at and now - h.snap_at < 0.15
+        local cover = reach + math.min(W, 0.6) - (jitter() + frameDt + 0.03)
+        local horizon = math.max(cover, lead) + 0.1
         local kFast = (S.hard_curve or snapped) and K_MAX or math.min(kmHi * 1.25, K_MAX)
         local fast = math.max(simProp(bpos, v, rpos, gap, kFast, accel, mustBy + 0.05, tvel) or math.huge, tMin)
         info.fast = fast
@@ -2087,23 +2136,25 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         if measured and (h.kn or 0) >= 3 and h.kspread and h.kspread < 0.4 then
             slowF = math.clamp(1 - h.kspread * 0.5, 0.8, 0.95)
         end
-        local slow = math.max(simProp(bpos, v, rpos, gap, math.max(kmLo * slowF, K_MIN), accel, lead + 0.05, tvel) or math.huge, tMin)
-        info.eta, info.slow, info.k = slow, slow, km
-        if info.dbg then info.dbg.slow = slow end
-        if slow <= lead + half then return fire(st, now, tag .. " (curve)", info, ball) end
+        local slow = math.max(simProp(bpos, v, rpos, gap, math.max(kmLo * slowF, K_MIN), accel, horizon, tvel) or math.huge, tMin)
+        local mid = math.max(simProp(bpos, v, rpos, gap, km, accel, horizon, tvel) or math.huge, tMin)
+        local turn = mid
+        if h.w and h.w > 0.2 then
+            turn = math.max(Util.simTurn(bpos, v, rpos, gap, h.w, accel, horizon, tvel) or math.huge, tMin)
+        end
+        local radial = mid
         local s = h.samples
         local closing = #s >= 2 and (s[#s - 1].d - s[#s].d) / math.max(s[#s].t - s[#s - 1].t, 1e-3) or 0
         if closing >= speed * 0.35 then
-            local radial = radialEta(h, rem, speed)
-            if radial then
-                radial = math.max(radial, tMin)
-                if info.dbg then info.dbg.radial = radial end
-                if radial <= lead + half then
-                    info.eta = radial
-                    return fire(st, now, tag .. " (curve, closing)", info, ball)
-                end
-            end
+            local r = radialEta(h, rem, speed)
+            if r then radial = math.max(r, tMin) end
         end
+        local best = Util.median3(mid, turn, radial)
+        local latest = math.max(slow, best)
+        info.eta, info.slow, info.k = best, slow, km
+        if info.dbg then info.dbg.slow, info.dbg.radial = slow, radial end
+        if latest <= lead + half then return fire(st, now, tag .. " (curve)", info, ball) end
+        if best <= lead + half and latest <= cover then return fire(st, now, tag .. " (curve, covered)", info, ball) end
     end
 
     local function trigger(ball, st, now)
@@ -3237,13 +3288,13 @@ Gui.AP:AddToggle("UnlockFPS", {
 Gui.APS = Gui.Tabs.Parry:AddRightGroupbox("Timing", "sliders-horizontal")
 Gui.APS:AddSlider("Accuracy", {
     Text = "Accuracy", Default = 50, Min = 1, Max = 100, Rounding = 0,
-    Tooltip = "Where in the parry window the ball lands, in time, the same at every ball speed: 100 = the parry goes up just before the ball arrives (latest that's still safe on your ping), 1 = as early as the window still covers it, a straight line in between. Curves follow it too.",
+    Tooltip = "How long before the ball lands the parry goes up, in time, the same at every ball speed: 100 = close but with a safety margin for your ping (about 50-60 ms), 1 = about 200 ms early, a straight line in between. The label below shows the exact number. Curves follow it too.",
     Callback = function(v)
         S.accuracy_base = v; Parry.roll()
         if Gui.AccLabel then pcall(function() Gui.AccLabel:SetText(("Parry up ~%d ms before the ball lands"):format(math.floor(Parry.cushionMs() + 0.5))) end) end
     end,
 })
-Gui.AccLabel = Gui.APS:AddLabel("Parry up ~240 ms before the ball lands", true)
+Gui.AccLabel = Gui.APS:AddLabel("Parry up ~125 ms before the ball lands", true)
 Gui.APS:AddToggle("RandomAccuracy", { Text = "Randomize accuracy", Default = false, Callback = function(v) S.random_accuracy = v end })
 Gui.APS:AddSlider("RandomAccuracyAmount", {
     Text = "Randomize amount", Default = 10, Min = 0, Max = 50, Rounding = 0, Suffix = " +/-",
@@ -3552,7 +3603,7 @@ Gui.AS:AddToggle("AutoSpam", {
 }):AddKeyPicker("AutoSpamKey", { Default = "None", Mode = "Toggle", SyncToggleState = true, Text = "Auto spam" })
 Gui.AS:AddDropdown("AutoSpamRate", {
     Values = { "Smart", "Spam speed" }, Default = "Smart", Text = "Rate",
-    Tooltip = "Smart: one parry on every ball update and every frame step (about 4 a frame) plus one the instant the ball is hit either way -- as fast as the ball data comes in, without flooding your connection. Spam speed: the manual spam Speed.",
+    Tooltip = "Smart: one parry on every ball update and every frame step (about 4 a frame) plus one the instant the ball is hit either way, aimed back at the player you're clashing with, and only while a parry sent now could still be up when the ball returns. Spam speed: the manual spam Speed.",
     Callback = function(v) SP.auto_rate = v end,
 })
 Gui.AS:AddToggle("PredictiveClash", {
@@ -5234,13 +5285,8 @@ Gui.UA:AddToggle("UnlockAll", { Text = "Unlock all swords", Default = false,
 
 Mods.BetterUI = Feature("BetterUI")
 do
-    local B = { font = "Gotham", radius = 8, fonts = true, corners = true, depth = true, outlines = true, scroll = true,
-        saved = {}, made = {}, queue = {} }
-    B.family = {
-        Gotham = "rbxasset://fonts/families/GothamSSm.json", Montserrat = "rbxasset://fonts/families/Montserrat.json",
-        ["Builder Sans"] = "rbxasset://fonts/families/BuilderSans.json", Nunito = "rbxasset://fonts/families/Nunito.json",
-        Ubuntu = "rbxasset://fonts/families/Ubuntu.json", ["Source Sans"] = "rbxasset://fonts/families/SourceSansPro.json",
-    }
+    local B = { radius = 10, accent = Color3.fromRGB(110, 140, 255), recolor = true, art = true, corners = true, depth = true,
+        outlines = true, scroll = true, saved = {}, made = {}, dark = {}, queue = {} }
     Mods.BetterCfg = B
     local function keep(o, prop)
         local t = B.saved[o]
@@ -5254,44 +5300,84 @@ do
         i.Parent = parent
         return i
     end
+    local function surface(c)
+        local h, sat, v = c:ToHSV()
+        local ah = B.accent:ToHSV()
+        if sat < 0.28 then return Color3.fromHSV(ah, 0.38 - v * 0.12, 0.07 + v * 0.17), true end
+        return Color3.fromHSV(h, math.min(sat * 0.9, 0.82), math.clamp(v * 0.95, 0.25, 0.92)), false
+    end
+    local function onDark(o)
+        for _ = 1, 4 do
+            o = o.Parent
+            if not o then return false end
+            if B.dark[o] then return true end
+            if o:IsA("GuiObject") and o.BackgroundTransparency < 0.5 then return false end
+        end
+        return false
+    end
     local function style(o)
         if B.made[o] or not o.Parent then return end
         if o:IsA("ScrollingFrame") then
-            if B.scroll and o.ScrollBarThickness > 4 then
-                keep(o, "ScrollBarThickness"); keep(o, "ScrollBarImageTransparency")
-                o.ScrollBarThickness = 4
-                o.ScrollBarImageTransparency = math.max(o.ScrollBarImageTransparency, 0.35)
+            if B.scroll then
+                keep(o, "ScrollBarThickness"); keep(o, "ScrollBarImageColor3"); keep(o, "ScrollBarImageTransparency")
+                o.ScrollBarThickness = math.min(o.ScrollBarThickness, 4)
+                o.ScrollBarImageColor3, o.ScrollBarImageTransparency = B.accent, 0.2
             end
             return
         end
         if not o:IsA("GuiObject") then return end
+        local gui = o:FindFirstAncestorOfClass("ScreenGui")
+        local hotbar = gui ~= nil and gui.Name == "Hotbar"
         local text = o:IsA("TextLabel") or o:IsA("TextButton") or o:IsA("TextBox")
-        if text and B.fonts then
-            local f = o.FontFace
-            keep(o, "FontFace")
-            o.FontFace = Font.new(B.family[B.font] or B.family.Gotham,
-                f.Weight.Value >= 600 and Enum.FontWeight.Bold or Enum.FontWeight.Medium, f.Style)
-        end
-        if o.BackgroundTransparency >= 0.95 then return end
-        if not (text or o:IsA("Frame") or o:IsA("ImageButton") or o:IsA("ImageLabel")) then return end
+        local image = o:IsA("ImageLabel") or o:IsA("ImageButton")
         local size, cam = o.AbsoluteSize, Workspace.CurrentCamera
         local vp = cam and cam.ViewportSize or Vector2.new(1920, 1080)
-        if size.X > vp.X * 0.7 and size.Y > vp.Y * 0.7 then return end
-        if size.X > 0 and math.min(size.X, size.Y) < 6 then return end
+        local full = size.X > vp.X * 0.7 and size.Y > vp.Y * 0.7
+        local thin = size.X > 0 and math.min(size.X, size.Y) < 6
+        local solid = o.BackgroundTransparency < 0.95 and (text or image or o:IsA("Frame"))
+        if solid and B.recolor and not full and not hotbar then
+            local c, neutral = surface(o.BackgroundColor3)
+            keep(o, "BackgroundColor3")
+            o.BackgroundColor3 = c
+            if neutral then
+                B.dark[o] = true
+                if o.BackgroundTransparency < 0.1 and not thin then
+                    keep(o, "BackgroundTransparency")
+                    o.BackgroundTransparency = 0.1
+                end
+            end
+        end
+        if text and B.recolor and not hotbar then
+            local _, sat, v = o.TextColor3:ToHSV()
+            if v < 0.4 and sat < 0.4 and (B.dark[o] or onDark(o)) then
+                keep(o, "TextColor3")
+                o.TextColor3 = Color3.fromRGB(236, 239, 250)
+            end
+        end
+        if image and B.art and not hotbar and o.ScaleType == Enum.ScaleType.Slice and not full then
+            local _, sat, v = o.ImageColor3:ToHSV()
+            if sat < 0.2 and v > 0.5 then
+                local ah = B.accent:ToHSV()
+                keep(o, "ImageColor3")
+                o.ImageColor3 = Color3.fromHSV(ah, 0.3, v)
+            end
+        end
+        if not solid or full or thin then return end
         if B.corners and B.radius > 0 and not o:FindFirstChildOfClass("UICorner") then
             make("UICorner", o).CornerRadius = UDim.new(0, B.radius)
         end
-        local gui = o:FindFirstAncestorOfClass("ScreenGui")
-        if gui and gui.Name == "Hotbar" then return end
+        if hotbar then return end
         if B.depth and not o:FindFirstChildOfClass("UIGradient") then
             local g = make("UIGradient", o)
             g.Rotation = 90
-            g.Color = ColorSequence.new(Color3.new(1, 1, 1), Color3.fromRGB(200, 202, 214))
+            g.Color = ColorSequence.new(Color3.new(1, 1, 1), Color3.fromRGB(176, 180, 200))
         end
-        if B.outlines and o:IsA("GuiButton") and not o:FindFirstChildOfClass("UIStroke") then
+        local button = o:IsA("GuiButton")
+        local panel = o:IsA("Frame") and size.X >= 90 and size.Y >= 40
+        if B.outlines and (button or panel) and not o:FindFirstChildOfClass("UIStroke") then
             local st = make("UIStroke", o)
             st.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
-            st.Thickness, st.Color, st.Transparency = 1, Color3.new(1, 1, 1), 0.78
+            st.Thickness, st.Color, st.Transparency = button and 1.5 or 1, B.accent, button and 0.25 or 0.6
         end
     end
     function Mods.BetterUI.start()
@@ -5300,7 +5386,7 @@ do
         if not pg then return end
         B.queue = pg:GetDescendants()
         Mods.BetterUI:connect(pg.DescendantAdded, function(o) if not B.made[o] then B.queue[#B.queue + 1] = o end end)
-        Mods.BetterUI:connect(pg.DescendantRemoving, function(o) B.saved[o] = nil; B.made[o] = nil end)
+        Mods.BetterUI:connect(pg.DescendantRemoving, function(o) B.saved[o] = nil; B.made[o] = nil; B.dark[o] = nil end)
         task.spawn(function()
             while Mods.BetterUI:alive(token) do
                 local q = B.queue
@@ -5318,7 +5404,7 @@ do
     end
     function Mods.BetterUI.stop()
         local saved, made = B.saved, B.made
-        B.saved, B.made, B.queue = {}, {}, {}
+        B.saved, B.made, B.dark, B.queue = {}, {}, {}, {}
         for o, props in pairs(saved) do
             for k, v in pairs(props) do pcall(function() o[k] = v end) end
         end
@@ -5336,16 +5422,16 @@ end
 
 Gui.BU = Gui.Tabs.UI:AddLeftGroupbox("Better UI", "sparkles")
 Gui.BU:AddToggle("BetterUI", { Text = "Better UI", Default = false,
-    Tooltip = "Restyles Blade Ball's own menus: a clean font, rounded panels and buttons, soft shading, thin button outlines and slim scrollbars. Turning it off puts everything back exactly.",
+    Tooltip = "Gives Blade Ball's own menus a dark theme in your accent color: recolored panels, accent outlines, rounded corners, shading and slim scrollbars. Fonts are left alone. Turning it off puts everything back exactly.",
     Callback = function(v) Mods.BetterUI:setEnabled(v) end })
-Gui.BU:AddDropdown("BetterUIFont", { Values = { "Gotham", "Montserrat", "Builder Sans", "Nunito", "Ubuntu", "Source Sans" }, Default = "Gotham", Text = "Font",
-    Callback = function(v) Mods.BetterCfg.font = v; Mods.BetterUI.redo() end })
-Gui.BU:AddSlider("BetterUIRadius", { Text = "Corner roundness", Default = 8, Min = 0, Max = 20, Rounding = 0, Suffix = " px",
+Gui.BU:AddLabel("Accent color"):AddColorPicker("BetterUIAccent", { Default = Color3.fromRGB(110, 140, 255), Title = "Better UI accent",
+    Callback = function(v) Mods.BetterCfg.accent = v; Mods.BetterUI.redo() end })
+Gui.BU:AddSlider("BetterUIRadius", { Text = "Corner roundness", Default = 10, Min = 0, Max = 20, Rounding = 0, Suffix = " px",
     Callback = function(v) Mods.BetterCfg.radius = v; Mods.BetterUI.redo() end })
 Gui.BP = Gui.Tabs.UI:AddRightGroupbox("Parts", "list-checks")
-for _, e in ipairs({ { "BetterUIFonts", "Clean font", "fonts" }, { "BetterUICorners", "Rounded corners", "corners" },
-        { "BetterUIDepth", "Soft shading", "depth" }, { "BetterUIOutlines", "Button outlines", "outlines" },
-        { "BetterUIScroll", "Slim scrollbars", "scroll" } }) do
+for _, e in ipairs({ { "BetterUIRecolor", "Dark theme colors", "recolor" }, { "BetterUIArt", "Tint panel art", "art" },
+        { "BetterUIOutlines", "Accent outlines", "outlines" }, { "BetterUICorners", "Rounded corners", "corners" },
+        { "BetterUIDepth", "Shading", "depth" }, { "BetterUIScroll", "Slim scrollbars", "scroll" } }) do
     Gui.BP:AddToggle(e[1], { Text = e[2], Default = true, Callback = function(v) Mods.BetterCfg[e[3]] = v; Mods.BetterUI.redo() end })
 end
 
