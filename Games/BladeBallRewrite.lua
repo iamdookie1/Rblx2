@@ -1,6 +1,6 @@
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.5.120"
+local SCRIPT_VERSION = "rewrite-0.5.121"
 
 local genv = (getgenv and getgenv()) or _G
 if type(genv.__BladeBallShutdown) == 'function' then pcall(genv.__BladeBallShutdown) end
@@ -1336,9 +1336,6 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         local cam = Workspace.CurrentCamera
         local points, aim = packetParts(cam)
         local name, _, mode = pickTarget(cam)
-        if spam and Core.clash_partner and clock_() < (Core.clash_until or 0) and points[Core.clash_partner] then
-            name, mode = Core.clash_partner, "Clash"
-        end
         if name and mode ~= "Cursor" then
             local screen = points[name]
             if screen then aim = { screen.X, screen.Y } end
@@ -1774,7 +1771,6 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         AutoSpam.ball, AutoSpam.partner = ball, partner
         AutoSpam.active_until = now + math.clamp(SP.hold or 0.15, 0, 0.5) + 0.02
         AutoSpam.reason = ("vs %s (%s)"):format(partner, why)
-        Core.clash_partner, Core.clash_until = partner, AutoSpam.active_until
     end
     function Util.endClash(why, cool)
         if AutoSpam.ball then
@@ -1782,7 +1778,6 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
             if cool then AutoSpam.cool_ball, AutoSpam.cool_until = AutoSpam.ball, clock_() + 0.25 end
         end
         AutoSpam.active_until, AutoSpam.reason, AutoSpam.ball, AutoSpam.partner = 0, nil, nil, nil
-        Core.clash_partner, Core.clash_until = nil, 0
     end
     function Util.hasClash(ball, now) return AutoSpam.ball == ball and now < AutoSpam.active_until end
     local function cooling(ball, now) return ball == AutoSpam.cool_ball and now < AutoSpam.cool_until end
@@ -3603,7 +3598,7 @@ Gui.AS:AddToggle("AutoSpam", {
 }):AddKeyPicker("AutoSpamKey", { Default = "None", Mode = "Toggle", SyncToggleState = true, Text = "Auto spam" })
 Gui.AS:AddDropdown("AutoSpamRate", {
     Values = { "Smart", "Spam speed" }, Default = "Smart", Text = "Rate",
-    Tooltip = "Smart: one parry on every ball update and every frame step (about 4 a frame) plus one the instant the ball is hit either way, aimed back at the player you're clashing with, and only while a parry sent now could still be up when the ball returns. Spam speed: the manual spam Speed.",
+    Tooltip = "Smart: one parry on every ball update and every frame step (about 4 a frame) plus one the instant the ball is hit either way, and only while a parry sent now could still be up when the ball returns. Spam speed: the manual spam Speed.",
     Callback = function(v) SP.auto_rate = v end,
 })
 Gui.AS:AddToggle("PredictiveClash", {
