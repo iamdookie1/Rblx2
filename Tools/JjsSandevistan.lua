@@ -201,10 +201,12 @@ local function blinkTo(distance)
         look(0.15),
     }
 end
--- Marks whoever is in front of you (0 damage) and goes to `branch` if found.
+-- Finds whoever is in front of you and goes to `branch`. It deals 1 damage
+-- and a short stun: a 0 damage hitbox doesn't seem to count as a hit, which is
+-- why the moves built on it never found anyone.
 local function reach(length, branch)
-    return hitbox({ POSITION = ("0, 0, %d"):format(length / 2), SIZE = ("8, 10, %d"):format(length),
-        DAMAGE = 0, STUN = -1, BLOCKABLE = false, ["SINGLE TARGET"] = true, BRANCH = branch })
+    return hitbox({ POSITION = ("0, 0, %d"):format(length / 2), SIZE = ("12, 12, %d"):format(length),
+        DAMAGE = 1, STUN = 0.5, BLOCKABLE = false, ["SINGLE TARGET"] = true, ["IGNORE WAKEUP"] = true, BRANCH = branch })
 end
 local function trail(part, color)
     local c = color:gsub(" ", "")
@@ -250,7 +252,8 @@ local function sandevistan(range, speed, damage, tint)
         -- everyone in range frozen: a 0 damage hitbox marks them, then a
         -- tagged stun so the punch can lift it
         hitbox({ POSITION = "0, 0, 0", SIZE = ("%d, 20, %d"):format(range, range),
-            STUN = -1, DAMAGE = 0, BLOCKABLE = false, ["SINGLE TARGET"] = false, ["CLEAR KNOCKBACK"] = true, ["CAN KILL"] = false }),
+            STUN = CONFIG.Duration, DAMAGE = 1, BLOCKABLE = false, ["SINGLE TARGET"] = false, ["CLEAR KNOCKBACK"] = true,
+            ["CAN KILL"] = false, ["IGNORE WAKEUP"] = true }),
         node("STATE", { STATE = "Stun", TIME = CONFIG.Duration, ["LAST HIT"] = 0.5, ["STATE TAG"] = FREEZE }),
         trail("Torso", CONFIG.ColorA),
         trail("HumanoidRootPart", CONFIG.ColorB),
@@ -288,7 +291,7 @@ add(punchGo, {
     afterimage(CONFIG.ColorA),
     anim("Punch", 1.2),
     wait(0.18),
-    hitbox({ POSITION = "0, 0, 4", SIZE = "7, 7, 8", DAMAGE = CONFIG.PunchDamage, STUN = 1.2,
+    hitbox({ POSITION = "0, 0, 1", SIZE = "11, 9, 11", DAMAGE = CONFIG.PunchDamage, STUN = 1.2,
         ["STUN ANIM"] = true, ["SINGLE TARGET"] = true, DEBREE = 2, ["CLEAR KNOCKBACK"] = true }),
     node("VISUAL", { EFFECT = "Shake Medium" }),
     node("VISUAL", { EFFECT = "Black Flash" }),
@@ -317,7 +320,7 @@ local function strike(animName, offset, rotation, damage, stun)
         look(0.12),
         anim(animName, 1),
         wait(0.15),
-        hitbox({ POSITION = "0, 0, 3.5", SIZE = "6, 6, 6", DAMAGE = damage, STUN = stun, ["SINGLE TARGET"] = true }),
+        hitbox({ POSITION = "0, 0, 1", SIZE = "11, 9, 11", DAMAGE = damage, STUN = stun, ["SINGLE TARGET"] = true }),
         afterimage(CONFIG.ColorA, 0.5),
         wait(0.25),
     }
@@ -346,7 +349,7 @@ add(blitzCombo, {
     look(0.12),
     anim("Kick", 1),
     wait(0.2),
-    hitbox({ POSITION = "0, 0, 4", SIZE = "7, 7, 7", DAMAGE = 7, STUN = 1, ["STUN ANIM"] = true,
+    hitbox({ POSITION = "0, 0, 1", SIZE = "11, 9, 11", DAMAGE = 7, STUN = 1, ["STUN ANIM"] = true,
         ["SINGLE TARGET"] = true, ["BRANCH TARGET"] = "Launched" }),
     node("VISUAL", { EFFECT = "Shake Light" }),
     afterimage(CONFIG.ColorA),
@@ -361,7 +364,7 @@ local function uppercut()
     return {
         anim("Up", 1),
         wait(0.18),
-        hitbox({ POSITION = "0, 1, 4", SIZE = "7, 8, 7", DAMAGE = 9, STUN = 1.1, ["STUN ANIM"] = true,
+        hitbox({ POSITION = "0, 1, 2", SIZE = "10, 10, 10", DAMAGE = 9, STUN = 1.1, ["STUN ANIM"] = true,
             ["SINGLE TARGET"] = true, ["BRANCH TARGET"] = "Up" }),
         afterimage(CONFIG.ColorB),
         node("VISUAL", { EFFECT = "Shake Light" }),
@@ -471,7 +474,7 @@ add(charge, {
 for i = 1, 6 do
     add(charge, {
         node("VELO", { FORCE = "0, 0, 130", TIME = 0.08 }),
-        hitbox({ POSITION = "0, 0, 3", SIZE = "8, 8, 8", DAMAGE = 0, STUN = -1, BLOCKABLE = false,
+        hitbox({ POSITION = "0, 0, 3", SIZE = "9, 9, 9", DAMAGE = 1, STUN = 0.5, BLOCKABLE = false,
             ["SINGLE TARGET"] = true, BRANCH = "Impact" }),
         afterimage(colorFor(i, SK, CONFIG.ColorA), 0.4),
         wait(0.07),
@@ -483,7 +486,7 @@ local chargeImpact = {
     look(0.1),
     anim("Hook3", 1),
     wait(0.15),
-    hitbox({ POSITION = "0, 0, 4", SIZE = "8, 8, 8", DAMAGE = 16, STUN = 1.3, ["STUN ANIM"] = true,
+    hitbox({ POSITION = "0, 0, 2", SIZE = "10, 9, 10", DAMAGE = 16, STUN = 1.3, ["STUN ANIM"] = true,
         ["SINGLE TARGET"] = true, DEBREE = 3, ["BRANCH TARGET"] = "Thrown" }),
     node("VISUAL", { EFFECT = "Shake Heavy" }),
     node("VISUAL", { EFFECT = "Mass Hit" }),
