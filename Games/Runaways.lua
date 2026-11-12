@@ -73,7 +73,11 @@ local Settings = {
     SilentAim = false, AimNPC = true, AimPolice = true, AimPlayers = false, AimPart = "Head",
     FOV = 180, ShowFOV = true, VisibleCheck = true, HitChance = 100,
     NoRecoil = false, NoSpread = false,
-    MeleeAura = false, MeleeRange = 10, MeleeEvery = 0.45,
+    MeleeAura = false, MeleeRange = 10, MeleeEvery = 0.45, MeleeWeaponSpeed = true, MeleeCivilians = true,
+    MeleePolice = true, MeleeTargets = 3, MeleeBreak = false,
+    GunMods = false, RpmMult = 1.5, ForceAuto = true, InfAmmo = false, DamageMult = 1, ExtraPellets = 0,
+    Wallbang = false, GunAura = false, GunAuraRange = 120, GunAuraPolice = true, GunAuraCivilians = false,
+    Fly = false, FlySpeed = 80,
     EspNPC = false, EspPlayers = false, EspHealth = true,
     -- police
     PoliceEsp = true, PoliceAlert = true, AlertRange = 150, Quiet = false,
@@ -82,6 +86,9 @@ local Settings = {
     AutoPour = false, LowFuelAlert = true, LowFuelAt = 20, AutoFlip = false,
     -- loot
     AutoCash = false, CashRange = 30, AutoBreak = false, BreakRange = 12, BreakEvery = 0.5,
+    AutoSteal = false, StealMin = 100, StealRange = 10, BringMin = 0, BringRange = 300, BringCount = 10,
+    BringOnly = false, BringNames = {},
+    DragNoclip = false, DragPower = 50, DragForce = 1, DragDistance = 1,
     LootEsp = false, CashEsp = false,
     -- survival
     NoFall = false, AutoEat = false, EatAt = 40, AutoRevive = false, LowHpAlert = true, AntiAfk = false,
@@ -463,8 +470,34 @@ do
         end
         return out
     end
+    -- Who the melee aura and gun aura go for, nearest first.
+    function Hit.targets(range, civilians, police, limit)
+        local root = rootPart()
+        local out = {}
+        if not root then
+            return out
+        end
+        for _, m in People.npcs() do
+            local r = m:FindFirstChild("HumanoidRootPart")
+            if r then
+                local d = (r.Position - root.Position).Magnitude
+                local isCop = People.isPolice(m)
+                if d <= range and ((isCop and police) or (not isCop and civilians)) then
+                    table.insert(out, { m = m, d = d })
+                end
+            end
+        end
+        table.sort(out, function(a, b)
+            return a.d < b.d
+        end)
+        local models = {}
+        for i = 1, math.min(#out, limit or #out) do
+            models[i] = out[i].m
+        end
+        return models
+    end
     function Hit.meleePass()
-        if not Settings.MeleeAura or os.clock() - Hit.lastMelee < Settings.MeleeEvery then
+        if not Settings.MeleeAura then
             return
         end
         local tool, root = Hit.held(), rootPart()
@@ -475,12 +508,22 @@ do
         if not (cfg and type(cfg.damage) == "number") then
             return
         end
+        -- the weapon's own swing rate, or the slider
+        local every = Settings.MeleeEvery
+        if Settings.MeleeWeaponSpeed and type(cfg.hitsPerSecond) == "number" and cfg.hitsPerSecond > 0 then
+            every = 1 / cfg.hitsPerSecond
+        end
+        if os.clock() - Hit.lastMelee < every then
+            return
+        end
         Hit.lastMelee = os.clock()
-        local dmg = cfg.damage * Game.strength()
-        for _, m in People.npcs() do
-            local r = m:FindFirstChild("HumanoidRootPart")
-            if r and (r.Position - root.Position).Magnitude <= Settings.MeleeRange then
-                Game.call("NPCs", "Damage", m:FindFirstChildOfClass("Humanoid"), dmg)
+        local strength = Game.strength()
+        for _, m in Hit.targets(Settings.MeleeRange, Settings.MeleeCivilians, Settings.MeleePolice, Settings.MeleeTargets) do
+            Game.call("NPCs", "Damage", m:FindFirstChildOfClass("Humanoid"), cfg.damage * strength)
+        end
+        if Settings.MeleeBreak and type(cfg.destructibleDamage) == "number" then
+            for _, m in Hit.breakables(Settings.MeleeRange) do
+                Game.call("DamageToOpen", "Damage", m, cfg.destructibleDamage * strength, "melee")
             end
         end
     end
@@ -508,10 +551,384 @@ do
         end
     end
 end
-loop(0.1, function()
+loop(0.05, function()
     Hit.meleePass()
     Hit.breakPass()
 end)
+
+--// Gun mods \\--
+-- A gun reads its config (Data.Tools.Guns) when you equip it, and the damage
+-- on every shot, so these change the shared config and re-equip your gun.
+local Guns = { base = {}, lastShot = 0 }
+do
+    local FIELDS = { "maxRpm", "mode", "infiniteAmmo", "damage", "pellets", "collateral", "inaccuracy" }
+    local function gunConfigs()
+        local out = {}
+        local tools = Data.Tools
+        local list = {}
+        for _, where in { LocalPlayer:FindFirstChildOfClass("Backpack"), character() } do
+            for _, t in where and where:GetChildren() or {} do
+                if t:IsA("Tool") then
+                    table.insert(list, t)
+                end
+            end
+        end
+        for _, t in list do
+            local cfg = Game.toolConfig(t)
+            if cfg and cfg.category == "Guns" then
+                out[cfg] = true
+            end
+        end
+        return out
+    end
+    function Guns.restore()
+        for cfg, base in Guns.base do
+            for _, f in FIELDS do
+                cfg[f] = base[f]
+            end
+        end
+        table.clear(Guns.base)
+    end
+    table.insert(Cleanups, Guns.restore)
+    function Guns.apply()
+        if not Settings.GunMods then
+            Guns.restore()
+            return
+        end
+        for cfg in gunConfigs() do
+            local base = Guns.base[cfg]
+            if not base then
+                base = {}
+                for _, f in FIELDS do
+                    base[f] = cfg[f]
+                end
+                Guns.base[cfg] = base
+            end
+            if type(base.maxRpm) == "number" then
+                cfg.maxRpm = base.maxRpm * Settings.RpmMult
+            end
+            cfg.mode = Settings.ForceAuto and "auto" or base.mode
+            cfg.infiniteAmmo = Settings.InfAmmo or base.infiniteAmmo
+            if type(base.damage) == "number" then
+                cfg.damage = base.damage * Settings.DamageMult
+            end
+            cfg.pellets = (base.pellets or 1) + Settings.ExtraPellets
+            if Settings.Wallbang then
+                cfg.collateral = true
+            else
+                cfg.collateral = base.collateral
+            end
+            if Settings.NoSpread then
+                cfg.inaccuracy = 0
+            else
+                cfg.inaccuracy = base.inaccuracy
+            end
+        end
+    end
+    -- Picks the new numbers up straight away.
+    function Guns.reequip()
+        local h, tool = humanoid(), Hit.held()
+        if h and tool and Game.toolConfig(tool) and Game.toolConfig(tool).category == "Guns" then
+            task.spawn(function()
+                pcall(h.UnequipTools, h)
+                task.wait(0.15)
+                pcall(h.EquipTool, h, tool)
+            end)
+        end
+    end
+    -- Gun aura: shoots the nearest NPCs in range with the gun you hold, at
+    -- its own fire rate, through the game's own bullet code.
+    function Guns.auraPass()
+        if not Settings.GunAura then
+            return
+        end
+        local tool = Hit.held()
+        local cfg = tool and Game.toolConfig(tool)
+        if not (cfg and cfg.category == "Guns" and type(cfg.maxRpm) == "number") then
+            return
+        end
+        if os.clock() - Guns.lastShot < 60 / cfg.maxRpm then
+            return
+        end
+        local bullets = Game.module("BulletsClient")
+        local target = Hit.targets(Settings.GunAuraRange, Settings.GunAuraCivilians, Settings.GunAuraPolice, 1)[1]
+        local part = target and (target:FindFirstChild("Head") or target:FindFirstChild("HumanoidRootPart"))
+        if not (bullets and part) then
+            return
+        end
+        Guns.lastShot = os.clock()
+        local from = Workspace.CurrentCamera.CFrame.Position
+        pcall(bullets.shootProjectile, { from = from, direction = (part.Position - from).Unit * 1000, config = cfg })
+        local guns = Game.module("Guns")
+        if guns and guns.Gunshot then
+            pcall(guns.Gunshot, tool)
+        end
+    end
+end
+loop(1, Guns.apply)
+loop(0.03, Guns.auraPass)
+
+--// Loot: steal into your backpack, bring things to you \\--
+local Steal = { skip = {}, names = {} }
+do
+    function Steal.value(model)
+        local loot = Data.Loot
+        local name = model.Name
+        for _, fn in { loot and loot.GetItemValue, loot and loot.GetItemPrice } do
+            if fn then
+                local ok, v = pcall(fn, name)
+                if ok and type(v) == "number" then
+                    return v
+                end
+            end
+        end
+        local v = model:GetAttribute("Value") or model:GetAttribute("Price")
+        return type(v) == "number" and v or 0
+    end
+    local function partOf(model)
+        return model.PrimaryPart or model:FindFirstChildWhichIsA("BasePart")
+    end
+    local function eligible(model)
+        return model:IsA("Model") and inWorld(model) and not model:HasTag("BuyableLoot") and not model:HasTag("Vehicle")
+            and not model:HasTag("GasGun") and not Players:GetPlayerFromCharacter(model)
+    end
+    -- Small things go straight into the backpack, the way pressing equip does.
+    function Steal.pass()
+        if not Settings.AutoSteal then
+            return
+        end
+        local root = rootPart()
+        if not root then
+            return
+        end
+        for _, model in CollectionService:GetTagged("Equippable") do
+            if eligible(model) and (Steal.skip[model] or 0) < os.clock() then
+                local part = partOf(model)
+                if part and (part.Position - root.Position).Magnitude <= Settings.StealRange
+                    and Steal.value(model) >= Settings.StealMin then
+                    local ok, result = Game.call("Loot", "LootEquip", part)
+                    if not (ok and (result == "Success" or result == nil)) then
+                        Steal.skip[model] = os.clock() + 5 -- full backpack or refused
+                    else
+                        Steal.skip[model] = os.clock() + 1
+                    end
+                    task.wait(0.15)
+                end
+            end
+        end
+    end
+    -- Everything draggable around, for the bring list.
+    function Steal.draggables()
+        local out = {}
+        for _, model in CollectionService:GetTagged("Draggable") do
+            if eligible(model) and not model:HasTag("Turret") then
+                table.insert(out, model)
+            end
+        end
+        return out
+    end
+    function Steal.refreshNames()
+        local seen = {}
+        for _, m in Steal.draggables() do
+            seen[m.Name] = true
+        end
+        local names = {}
+        for n in seen do
+            table.insert(names, n)
+        end
+        table.sort(names)
+        Steal.names = names
+    end
+    -- Bring: the game hands you ownership of an item the same way it does
+    -- when you grab it, then it's moved next to you and let go.
+    function Steal.bring()
+        local root = rootPart()
+        if not root then
+            return 0
+        end
+        local list = {}
+        for _, m in Steal.draggables() do
+            local part = partOf(m)
+            if part then
+                local d = (part.Position - root.Position).Magnitude
+                local picked = not Settings.BringOnly or Settings.BringNames[m.Name]
+                if d > 6 and d <= Settings.BringRange and picked and Steal.value(m) >= Settings.BringMin then
+                    table.insert(list, { m = m, part = part, d = d })
+                end
+            end
+        end
+        table.sort(list, function(a, b)
+            return a.d < b.d
+        end)
+        local brought = 0
+        for i, e in list do
+            if i > Settings.BringCount or not alive() then
+                break
+            end
+            local ok, granted = Game.call("Loot", "OwnNetworkRequestAsync", e.part, true)
+            if ok and granted ~= false then
+                local row, col = (i - 1) // 4, (i - 1) % 4
+                local at = root.CFrame * CFrame.new((col - 1.5) * 3, 1, -5 - row * 3)
+                pcall(function()
+                    e.m:PivotTo(CFrame.new(at.Position))
+                    for _, bp in e.m:GetDescendants() do
+                        if bp:IsA("BasePart") then
+                            bp.AssemblyLinearVelocity = Vector3.zero
+                        end
+                    end
+                end)
+                brought += 1
+                task.delay(1.5, function()
+                    Game.call("Loot", "OwnNetworkRequest", e.part, nil)
+                end)
+            end
+            task.wait(0.1)
+        end
+        return brought
+    end
+end
+loop(0.4, Steal.pass)
+loop(3, Steal.refreshNames)
+
+--// Drag settings \\--
+-- While you drag something: how hard and how far it's held, and through walls
+-- but never through the floor.
+local Drag = { item = nil, parts = {}, holds = {} }
+do
+    local function cameraPart()
+        local m = Game.module("CameraPart")
+        local ok, part = pcall(function()
+            return m.GetCameraPart()
+        end)
+        return ok and part or nil
+    end
+    function Drag.release()
+        for part, was in Drag.parts do
+            pcall(function()
+                part.CanCollide = was
+            end)
+        end
+        table.clear(Drag.parts)
+        table.clear(Drag.holds)
+        Drag.item = nil
+    end
+    table.insert(Cleanups, Drag.release)
+    function Drag.step()
+        local item = Game.dragged()
+        if typeof(item) ~= "Instance" or not item.Parent then
+            if Drag.item then
+                Drag.release()
+            end
+            return
+        end
+        if item ~= Drag.item then
+            Drag.release()
+            Drag.item = item
+        end
+        local cam = cameraPart()
+        if not cam then
+            return
+        end
+        -- the game aims the gas gun, jerrycans and turrets itself every frame
+        local aimed = item:HasTag("GasGun") or item:HasTag("FuelContainer") or item:HasTag("Turret")
+        for _, att in cam:GetChildren() do
+            if att:IsA("Attachment") then
+                Drag.holds[att] = Drag.holds[att] or att.CFrame
+                local base = Drag.holds[att]
+                if not aimed and (Settings.DragDistance ~= 1 or Settings.DragNoclip) then
+                    att.CFrame = base + base.Position * (Settings.DragDistance - 1)
+                end
+                for _, c in att:GetChildren() do
+                    if c:IsA("AlignPosition") then
+                        c.Responsiveness, c.MaxForce = Settings.DragPower, 10000 * Settings.DragForce
+                    elseif c:IsA("AlignOrientation") then
+                        c.Responsiveness, c.MaxTorque = Settings.DragPower, 10000 * Settings.DragForce
+                    end
+                end
+                if Settings.DragNoclip and not aimed then
+                    -- keep the hold point above the ground under it
+                    local params = RaycastParams.new()
+                    params.FilterType = Enum.RaycastFilterType.Exclude
+                    params.FilterDescendantsInstances = { item, character() }
+                    local p = att.WorldPosition
+                    local hit = Workspace:Raycast(p + Vector3.new(0, 6, 0), Vector3.new(0, -60, 0), params)
+                    local ok, size = pcall(function()
+                        return item:GetExtentsSize()
+                    end)
+                    local half = ok and size and size.Y / 2 or 1
+                    if hit and p.Y < hit.Position.Y + half then
+                        att.WorldPosition = Vector3.new(p.X, hit.Position.Y + half, p.Z)
+                    end
+                end
+            end
+        end
+        for _, bp in item:GetDescendants() do
+            if bp:IsA("BasePart") then
+                if Settings.DragNoclip then
+                    if Drag.parts[bp] == nil then
+                        Drag.parts[bp] = bp.CanCollide
+                    end
+                    bp.CanCollide = false
+                elseif Drag.parts[bp] ~= nil then
+                    bp.CanCollide = Drag.parts[bp]
+                    Drag.parts[bp] = nil
+                end
+            end
+        end
+    end
+    bind(RunService.Heartbeat, function()
+        if alive() then
+            pcall(Drag.step)
+        end
+    end)
+end
+
+--// Fly \\--
+-- Stays under the game's 300 studs/s limit.
+local Fly = {}
+do
+    local controls
+    pcall(function()
+        controls = require(LocalPlayer:WaitForChild("PlayerScripts"):WaitForChild("PlayerModule")):GetControls()
+    end)
+    bind(RunService.Heartbeat, function()
+        if not alive() then
+            return
+        end
+        local root, h = rootPart(), humanoid()
+        if not (Settings.Fly and root and h) or h.SeatPart then
+            if Fly.on and h then
+                h.PlatformStand = false
+            end
+            Fly.on = false
+            return
+        end
+        Fly.on = true
+        h.PlatformStand = true
+        local cam = Workspace.CurrentCamera.CFrame
+        local move = Vector3.zero
+        if controls then
+            local ok, v = pcall(controls.GetMoveVector, controls)
+            if ok and typeof(v) == "Vector3" then
+                move = v
+            end
+        end
+        local dir = cam.RightVector * move.X + cam.LookVector * -move.Z
+        if UserInputService:IsKeyDown(Enum.KeyCode.Space) then
+            dir += Vector3.new(0, 1, 0)
+        elseif UserInputService:IsKeyDown(Enum.KeyCode.LeftControl) then
+            dir -= Vector3.new(0, 1, 0)
+        end
+        local speed = math.min(Settings.FlySpeed, 250)
+        root.AssemblyLinearVelocity = dir.Magnitude > 0 and dir.Unit * speed or Vector3.zero
+    end)
+    table.insert(Cleanups, function()
+        local h = humanoid()
+        if h then
+            h.PlatformStand = false
+        end
+    end)
+end
 
 --// Cash and Credz \\--
 local Collect = {}
@@ -1078,8 +1495,37 @@ do
 
     local MeleeBox = Tab:AddRightGroupbox("Melee aura", "swords")
     UI.toggle(MeleeBox, "MeleeAura", "Melee aura", "While you hold a melee weapon, hits NPCs around you with that weapon's damage")
-    UI.slider(MeleeBox, "MeleeRange", "Range", 4, 20, 0, " studs")
-    UI.slider(MeleeBox, "MeleeEvery", "Every", 0.2, 2, 2, " s")
+    UI.slider(MeleeBox, "MeleeRange", "Range", 1, 30, 0, " studs")
+    UI.toggle(MeleeBox, "MeleeWeaponSpeed", "Weapon's own speed", "Swings at the weapon's own hits per second. Off: the slider below")
+    UI.slider(MeleeBox, "MeleeEvery", "Every", 0.05, 2, 2, " s")
+    UI.slider(MeleeBox, "MeleeTargets", "Targets per swing", 1, 20, 0)
+    UI.toggle(MeleeBox, "MeleeCivilians", "Hit civilians")
+    UI.toggle(MeleeBox, "MeleePolice", "Hit police")
+    UI.toggle(MeleeBox, "MeleeBreak", "Also break things", "Each swing also hits breakables in range")
+
+    local ModBox = Tab:AddLeftGroupbox("Gun mods", "settings")
+    local function mods()
+        Guns.apply()
+        Guns.reequip()
+    end
+    UI.toggle(ModBox, "GunMods", "Gun mods", "Changes your guns' own numbers. Your gun is re-equipped so it takes effect", mods)
+    UI.slider(ModBox, "RpmMult", "Fire rate", 0.5, 5, 2, "x")
+    UI.toggle(ModBox, "ForceAuto", "Full auto", "Hold to fire with every gun", mods)
+    UI.toggle(ModBox, "InfAmmo", "Infinite ammo", "Your gun stops counting rounds. The server may still check", mods)
+    UI.slider(ModBox, "DamageMult", "Damage", 1, 5, 2, "x")
+    UI.slider(ModBox, "ExtraPellets", "Extra bullets per shot", 0, 10, 0)
+    UI.toggle(ModBox, "Wallbang", "Shoot through people", "Bullets carry on through NPCs into the ones behind", mods)
+    ModBox:AddButton({ Text = "Apply to my gun now", Func = mods })
+
+    local AuraBox = Tab:AddRightGroupbox("Gun aura", "target")
+    UI.toggle(AuraBox, "GunAura", "Gun aura", "While you hold a gun, it shoots the nearest NPC in range at the gun's own fire rate")
+    UI.slider(AuraBox, "GunAuraRange", "Range", 10, 400, 0, " studs")
+    UI.toggle(AuraBox, "GunAuraPolice", "Police")
+    UI.toggle(AuraBox, "GunAuraCivilians", "Civilians")
+
+    local MoveBox = Tab:AddRightGroupbox("Movement", "wind")
+    UI.toggle(MoveBox, "Fly", "Fly", "Move with your normal controls, Space up, Ctrl down. Off while seated")
+    UI.slider(MoveBox, "FlySpeed", "Speed", 10, 250, 0, " studs/s", "Capped under the game's 300 studs/s limit")
 
     local EspBox = Tab:AddLeftGroupbox("ESP", "eye")
     UI.toggle(EspBox, "EspNPC", "Civilians")
@@ -1115,11 +1561,11 @@ do
     local Tab = Window:AddTab("Driving", "car", "Your car and fuel")
     local TuneBox = Tab:AddLeftGroupbox("Tuning", "gauge")
     UI.toggle(TuneBox, "Tune", "Tune my car", "Multiplies your car's own top speed, acceleration and so on. Off puts them back")
-    UI.slider(TuneBox, "SpeedMult", "Top speed", 1, 2, 2, "x")
-    UI.slider(TuneBox, "AccelMult", "Acceleration", 1, 2.5, 2, "x")
-    UI.slider(TuneBox, "TorqueMult", "Torque", 1, 2, 2, "x")
-    UI.slider(TuneBox, "BrakeMult", "Brakes", 1, 2.5, 2, "x")
-    UI.slider(TuneBox, "TurnMult", "Steering", 1, 1.6, 2, "x")
+    UI.slider(TuneBox, "SpeedMult", "Top speed", 0.5, 5, 2, "x")
+    UI.slider(TuneBox, "AccelMult", "Acceleration", 0.5, 6, 2, "x")
+    UI.slider(TuneBox, "TorqueMult", "Torque", 0.5, 5, 2, "x")
+    UI.slider(TuneBox, "BrakeMult", "Brakes", 0.5, 6, 2, "x")
+    UI.slider(TuneBox, "TurnMult", "Steering", 0.5, 3, 2, "x")
     UI.toggle(TuneBox, "AutoFlip", "Auto flip", "Puts the car back on its wheels after 2 s upside down")
 
     local FuelBox = Tab:AddRightGroupbox("Fuel", "fuel")
@@ -1150,6 +1596,40 @@ do
     UI.slider(BreakBox, "BreakRange", "Range", 4, 40, 0, " studs")
     UI.slider(BreakBox, "BreakEvery", "Every", 0.2, 2, 2, " s")
     UI.toggle(BreakBox, "LootEsp", "Loot ESP", "Breakables and loose loot, with values where the game lists them")
+
+    local StealBox = Tab:AddLeftGroupbox("Auto steal", "shopping-bag")
+    UI.toggle(StealBox, "AutoSteal", "Auto steal", "Puts small items worth at least the amount below into your backpack, the way pressing equip does")
+    UI.slider(StealBox, "StealMin", "Worth at least", 0, 5000, 0, " $")
+    UI.slider(StealBox, "StealRange", "Range", 4, 20, 0, " studs")
+
+    local BringBox = Tab:AddRightGroupbox("Bring", "magnet")
+    UI.slider(BringBox, "BringMin", "Worth at least", 0, 5000, 0, " $")
+    UI.slider(BringBox, "BringRange", "From up to", 20, 1000, 0, " studs")
+    UI.slider(BringBox, "BringCount", "How many", 1, 40, 0)
+    local NameDrop = BringBox:AddDropdown("BringPick", {
+        Text = "Only these", Values = {}, Multi = true, Searchable = true,
+        Callback = function(v)
+            Settings.BringNames = type(v) == "table" and v or {}
+        end,
+    })
+    UI.toggle(BringBox, "BringOnly", "Only the ones picked above")
+    BringBox:AddButton({
+        Text = "Bring",
+        Func = function()
+            task.spawn(function()
+                notify(("Brought %d"):format(Steal.bring()), 3)
+            end)
+        end,
+    })
+    loop(3, function()
+        pcall(NameDrop.SetValues, NameDrop, Steal.names)
+    end)
+
+    local DragBox = Tab:AddLeftGroupbox("Dragging", "hand")
+    UI.toggle(DragBox, "DragNoclip", "Through walls", "What you drag passes through walls and things, but never sinks into the floor")
+    UI.slider(DragBox, "DragPower", "Snappiness", 5, 200, 0, nil, "How quickly it follows you (the game uses 50)")
+    UI.slider(DragBox, "DragForce", "Strength", 0.2, 10, 2, "x", "How heavy a thing you can swing around")
+    UI.slider(DragBox, "DragDistance", "Hold distance", 0.5, 2, 2, "x", "The game lets go of anything more than 20 studs from you")
 end
 
 -- Survival
