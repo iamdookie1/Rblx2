@@ -351,32 +351,60 @@ do
         end
         return UserInputService:GetMouseLocation()
     end
-    local function visible(part, model)
-        if not Settings.VisibleCheck then
-            return true
-        end
-        local params = RaycastParams.new()
-        params.FilterType = Enum.RaycastFilterType.Exclude
-        local ignore = { model }
-        if character() then
-            table.insert(ignore, character())
+    -- Would a bullet from here reach this model? The same ray the game's
+    -- bullets use: they pass through Effects, you, your car and anything
+    -- tagged NPCCollider, MetalFence or NoBulletImpact. Those invisible NPC
+    -- colliders are what made the old check call nearly everyone hidden.
+    local PASS_THROUGH = { "NPCCollider", "MetalFence", "NoBulletImpact" }
+    local function reaches(from, part, model)
+        local ignore = {}
+        local c = character()
+        if c then
+            table.insert(ignore, c)
+            local h = c:FindFirstChildOfClass("Humanoid")
+            local p = h and h.SeatPart
+            while p and p ~= Workspace do
+                if p:IsA("Model") and p:HasTag("Vehicle") then
+                    table.insert(ignore, p)
+                    break
+                end
+                p = p.Parent
+            end
         end
         local effects = Workspace:FindFirstChild("Effects")
         if effects then
             table.insert(ignore, effects)
         end
-        params.FilterDescendantsInstances = ignore
-        local from = camera.CFrame.Position
-        return Workspace:Raycast(from, part.Position - from, params) == nil
-    end
-    local function partOf(model)
-        if Settings.AimPart == "Head" then
-            return model:FindFirstChild("Head") or model:FindFirstChild("HumanoidRootPart")
+        for _, tag in PASS_THROUGH do
+            for _, inst in CollectionService:GetTagged(tag) do
+                table.insert(ignore, inst)
+            end
         end
-        return model:FindFirstChild("UpperTorso") or model:FindFirstChild("Torso") or model:FindFirstChild("HumanoidRootPart")
+        local params = RaycastParams.new()
+        params.FilterType = Enum.RaycastFilterType.Exclude
+        params.RespectCanCollide = false
+        params.FilterDescendantsInstances = ignore
+        local hit = Workspace:Raycast(from, part.Position - from, params)
+        return hit == nil or hit.Instance:IsDescendantOf(model)
     end
-    function Aim.find()
+    -- The part you asked for first, then the rest of the body.
+    local function partsOf(model)
+        local order = Settings.AimPart == "Head"
+            and { "Head", "UpperTorso", "Torso", "HumanoidRootPart" }
+            or { "UpperTorso", "Torso", "HumanoidRootPart", "Head" }
+        local out = {}
+        for _, name in order do
+            local p = model:FindFirstChild(name)
+            if p and p:IsA("BasePart") then
+                table.insert(out, p)
+            end
+        end
+        return out
+    end
+    Aim.status = "off"
+    function Aim.find(from)
         camera = Workspace.CurrentCamera
+        from = from or camera.CFrame.Position
         local pool = {}
         for _, m in People.npcs() do
             local police = People.isPolice(m)
@@ -390,38 +418,92 @@ do
             end
         end
         local center = screenPoint()
-        local best, bestPart, bestD
+        local candidates = {}
         for _, m in pool do
-            local part = partOf(m)
-            if part then
-                local pos, onScreen = camera:WorldToViewportPoint(part.Position)
+            local parts = partsOf(m)
+            local first = parts[1]
+            if first then
+                local pos, onScreen = camera:WorldToViewportPoint(first.Position)
                 if onScreen and pos.Z > 0 then
                     local d = (Vector2.new(pos.X, pos.Y) - center).Magnitude
-                    if d <= Settings.FOV and (not bestD or d < bestD) and visible(part, m) then
-                        best, bestPart, bestD = m, part, d
+                    if d <= Settings.FOV then
+                        table.insert(candidates, { m = m, parts = parts, d = d })
                     end
                 end
             end
         end
-        Aim.target, Aim.part = best, bestPart
-        return bestPart
-    end
-
-    Game.wrap("BulletsClient", "shootProjectile", function(old)
-        return function(args, who, ...)
-            if alive() and type(args) == "table" and typeof(args.from) == "Vector3" then
-                local part = Settings.SilentAim and Aim.find() or nil
-                if part and math.random(1, 100) <= Settings.HitChance then
-                    args.direction = (part.Position - args.from).Unit * 1000
-                elseif Settings.NoSpread then
-                    local cf = Workspace.CurrentCamera.CFrame
-                    args.from = cf.Position
-                    args.direction = cf.LookVector * 1000
+        table.sort(candidates, function(a, b)
+            return a.d < b.d
+        end)
+        local blocked = 0
+        for _, c in candidates do
+            for _, part in c.parts do
+                if not Settings.VisibleCheck or reaches(from, part, c.m) then
+                    Aim.target, Aim.part = c.m, part
+                    Aim.status = ("aiming at %s (%s)"):format(c.m.Name, part.Name)
+                    return part
                 end
             end
+            blocked += 1
+        end
+        Aim.target, Aim.part = nil, nil
+        Aim.status = #candidates == 0 and "nobody inside the circle"
+            or ("%d in the circle, all behind walls"):format(blocked)
+        return nil
+    end
+
+    -- What a shot does: point it at the target (or straight, for no spread).
+    local function steer(args)
+        if not (alive() and type(args) == "table" and typeof(args.from) == "Vector3") then
+            return
+        end
+        local part = Settings.SilentAim and Aim.find(args.from) or nil
+        if part and math.random(1, 100) <= Settings.HitChance then
+            args.direction = (part.Position - args.from).Unit * 1000
+            Aim.shots = (Aim.shots or 0) + 1
+        elseif Settings.NoSpread then
+            local cf = Workspace.CurrentCamera.CFrame
+            args.from = cf.Position
+            args.direction = cf.LookVector * 1000
+        end
+    end
+    -- Through the shared table the guns call into; if that can't be reached,
+    -- by hooking the game's own shootProjectile function itself.
+    Aim.hook = "none"
+    if Game.wrap("BulletsClient", "shootProjectile", function(old)
+        return function(args, who, ...)
+            steer(args)
             return old(args, who, ...)
         end
-    end)
+    end) then
+        Aim.hook = "game table"
+    elseif typeof(hookfunction) == "function" and typeof(getgc) == "function" then
+        pcall(function()
+            local target
+            for _, fn in getgc() do
+                if type(fn) == "function" and typeof(debug.info) == "function" then
+                    local okN, name = pcall(debug.info, fn, "n")
+                    local okS, src = pcall(debug.info, fn, "s")
+                    if okN and name == "shootProjectile" and okS and tostring(src):find("BulletsClient", 1, true) then
+                        target = fn
+                        break
+                    end
+                end
+            end
+            if target then
+                local old
+                local wrapper = function(args, who, ...)
+                    steer(args)
+                    return old(args, who, ...)
+                end
+                old = hookfunction(target, typeof(newcclosure) == "function" and newcclosure(wrapper) or wrapper)
+                Aim.hook = "hooked the function"
+                table.insert(Cleanups, function()
+                    pcall(hookfunction, target, old)
+                end)
+            end
+        end)
+    end
     for _, mod in { "Camera", "Viewmodel" } do
         Game.wrap(mod, "Recoil", function(old)
             return function(...)
@@ -1606,6 +1688,14 @@ do
     UI.toggle(AimBox, "ShowFOV", "Show circle")
     UI.toggle(AimBox, "VisibleCheck", "Only visible targets")
     UI.slider(AimBox, "HitChance", "Hit chance", 1, 100, 0, "%")
+    local AimLabel = AimBox:AddLabel("...", true)
+    loop(0.3, function()
+        if Settings.SilentAim then
+            Aim.find()
+        end
+        AimLabel:SetText(("%s · shots steered %d\nHooked: %s"):format(Settings.SilentAim and Aim.status or "off",
+            Aim.shots or 0, Aim.hook))
+    end)
 
     local GunBox = Tab:AddRightGroupbox("Guns", "zap")
     UI.toggle(GunBox, "NoRecoil", "No recoil")
