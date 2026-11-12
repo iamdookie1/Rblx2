@@ -84,6 +84,7 @@ local Settings = {
     -- driving
     Tune = false, SpeedMult = 1.3, AccelMult = 1.3, TorqueMult = 1.2, BrakeMult = 1.3, TurnMult = 1.1,
     AutoPour = false, LowFuelAlert = true, LowFuelAt = 20, AutoFlip = false,
+    CarFly = false, CarFlySpeed = 220, CarBoost = false, BoostSpeed = 300, BoostAccel = 120,
     -- loot
     AutoCash = false, CashRange = 30, AutoBreak = false, BreakRange = 12, BreakEvery = 0.5,
     AutoSteal = false, StealMin = 100, StealRange = 10, BringMin = 0, BringRange = 300, BringCount = 10,
@@ -1195,6 +1196,69 @@ loop(0.25, function()
     Car.pourPass()
 end)
 
+--// Car fly and boost \\--
+-- You drive your own car's physics, so its velocity can be set directly.
+-- Throttle (W/S) and steer (A/D) are read off the driver's seat; car fly goes
+-- where the camera points.
+local CarMove = { flying = false }
+do
+    local function driving()
+        local h = humanoid()
+        local seat = h and h.SeatPart
+        if not (seat and seat:IsA("VehicleSeat")) then
+            return nil
+        end
+        local model = Car.current()
+        local system = model and model:FindFirstChild("system")
+        local chassis = system and system:FindFirstChild("chassis")
+        if not (chassis and chassis:IsA("BasePart")) then
+            return nil
+        end
+        return model, chassis, seat
+    end
+    bind(RunService.Heartbeat, function(dt)
+        if not alive() then
+            return
+        end
+        dt = type(dt) == "number" and dt or 1 / 60
+        local model, chassis, seat = driving()
+        if not model then
+            CarMove.flying = false
+            return
+        end
+        local throttle, steer = seat.ThrottleFloat or 0, seat.SteerFloat or 0
+        if Settings.CarFly then
+            CarMove.flying = true
+            local cam = Workspace.CurrentCamera.CFrame
+            local dir = cam.LookVector * throttle + cam.RightVector * steer
+            chassis.AssemblyLinearVelocity = dir.Magnitude > 0.05 and dir.Unit * Settings.CarFlySpeed or Vector3.zero
+            chassis.AssemblyAngularVelocity = Vector3.zero
+            -- level, facing where the camera looks
+            local flat = cam.LookVector * Vector3.new(1, 0, 1)
+            if flat.Magnitude > 0.1 then
+                local pos = model:GetPivot().Position
+                pcall(function()
+                    model:PivotTo(CFrame.lookAt(pos, pos + flat.Unit))
+                end)
+            end
+            return
+        end
+        CarMove.flying = false
+        -- Boost: on the throttle, the car speeds up past its own top speed,
+        -- the way it's already heading.
+        if Settings.CarBoost and throttle > 0.1 then
+            local v = chassis.AssemblyLinearVelocity
+            local flatV = Vector3.new(v.X, 0, v.Z)
+            local speed = flatV.Magnitude
+            if speed > 8 and speed < Settings.BoostSpeed then
+                local new = math.min(speed + Settings.BoostAccel * dt * throttle, Settings.BoostSpeed)
+                local out = flatV.Unit * new
+                chassis.AssemblyLinearVelocity = Vector3.new(out.X, v.Y, out.Z)
+            end
+        end
+    end)
+end
+
 --// Survival \\--
 local Survive = { lastEat = 0, revivedFor = nil, lowWarned = false }
 do
@@ -1618,12 +1682,19 @@ do
     local Tab = Window:AddTab("Driving", "car", "Your car and fuel")
     local TuneBox = Tab:AddLeftGroupbox("Tuning", "gauge")
     UI.toggle(TuneBox, "Tune", "Tune my car", "Multiplies your car's own top speed, acceleration and so on. Off puts them back")
-    UI.slider(TuneBox, "SpeedMult", "Top speed", 0.5, 5, 2, "x")
-    UI.slider(TuneBox, "AccelMult", "Acceleration", 0.5, 6, 2, "x")
-    UI.slider(TuneBox, "TorqueMult", "Torque", 0.5, 5, 2, "x")
+    UI.slider(TuneBox, "SpeedMult", "Top speed", 0.5, 10, 2, "x")
+    UI.slider(TuneBox, "AccelMult", "Acceleration", 0.5, 12, 2, "x")
+    UI.slider(TuneBox, "TorqueMult", "Torque", 0.5, 10, 2, "x")
     UI.slider(TuneBox, "BrakeMult", "Brakes", 0.5, 6, 2, "x")
     UI.slider(TuneBox, "TurnMult", "Steering", 0.5, 3, 2, "x")
     UI.toggle(TuneBox, "AutoFlip", "Auto flip", "Puts the car back on its wheels after 2 s upside down")
+
+    local FastBox = Tab:AddLeftGroupbox("Go fast", "rocket")
+    UI.toggle(FastBox, "CarBoost", "Speed boost", "Hold the throttle and the car keeps speeding up past its own top speed, up to the speed below")
+    UI.slider(FastBox, "BoostSpeed", "Boost up to", 50, 1000, 0, " studs/s")
+    UI.slider(FastBox, "BoostAccel", "Boost pick-up", 20, 600, 0, " studs/s²")
+    UI.toggle(FastBox, "CarFly", "Car fly", "While you drive: W/S go where the camera points, A/D sideways. Let go to hover")
+    UI.slider(FastBox, "CarFlySpeed", "Fly speed", 20, 1000, 0, " studs/s")
 
     local FuelBox = Tab:AddRightGroupbox("Fuel", "fuel")
     local FuelLabel = FuelBox:AddLabel("...", true)
