@@ -87,7 +87,7 @@ local Settings = {
     -- loot
     AutoCash = false, CashRange = 30, AutoBreak = false, BreakRange = 12, BreakEvery = 0.5,
     AutoSteal = false, StealMin = 100, StealRange = 10, BringMin = 0, BringRange = 300, BringCount = 10,
-    BringOnly = false, BringNames = {},
+    BringOnly = false, BringNames = {}, TakeUnlisted = true,
     DragNoclip = false, DragPower = 50, DragForce = 1, DragDistance = 1,
     LootEsp = false, CashEsp = false,
     -- survival
@@ -153,6 +153,7 @@ end
 local FlowFolder = ReplicatedStorage:WaitForChild("FlowClient")
 local Runner = FlowFolder:WaitForChild("ClientRunner")
 local RunnerEvent = Runner:WaitForChild("Event")
+local RunnerFunction = Runner:WaitForChild("Function")
 
 -- The game's merged Flow table. require() normally hands back the same table
 -- the game uses; if this executor gives a fresh one, the table is found in
@@ -197,6 +198,17 @@ do
             return pcall(fn, ...)
         end
         return pcall(RunnerEvent.FireServer, RunnerEvent, module, method, ...)
+    end
+    -- A server call that answers (an invoke). Without the shared table it
+    -- goes straight to the runner's RemoteFunction; sending one of these
+    -- through the event, as before, got no answer and did nothing.
+    function Game.invoke(module, method, ...)
+        local m = Game.module(module)
+        local fn = m and m[method]
+        if type(fn) == "function" then
+            return pcall(fn, ...)
+        end
+        return pcall(RunnerFunction.InvokeServer, RunnerFunction, module, method, ...)
     end
     -- Wraps one of the game's functions; undone on unload.
     function Game.wrap(module, method, make)
@@ -671,9 +683,11 @@ loop(0.03, Guns.auraPass)
 --// Loot: steal into your backpack, bring things to you \\--
 local Steal = { skip = {}, names = {} }
 do
+    -- The game's own value for an item, or nil when it doesn't list one
+    -- (the tutorial's watch, tiara and trophy, for one).
     function Steal.value(model)
         local loot = Data.Loot
-        local name = model.Name
+        local name = model.Name:gsub("%[%d+%]$", "")
         for _, fn in { loot and loot.GetItemValue, loot and loot.GetItemPrice } do
             if fn then
                 local ok, v = pcall(fn, name)
@@ -683,15 +697,54 @@ do
             end
         end
         local v = model:GetAttribute("Value") or model:GetAttribute("Price")
-        return type(v) == "number" and v or 0
+        return type(v) == "number" and v or nil
     end
+    function Steal.worth(model, min)
+        local v = Steal.value(model)
+        if v == nil then
+            return Settings.TakeUnlisted
+        end
+        return v >= min
+    end
+    -- The part you'd point at to take it: its Handle.
     local function partOf(model)
+        local h = model:FindFirstChild("Handle")
+        if h and h:IsA("BasePart") then
+            return h
+        end
         return model.PrimaryPart or model:FindFirstChildWhichIsA("BasePart")
     end
+    Steal.partOf = partOf
+    -- Not what you're holding or dragging, not inside a character or a car,
+    -- not stuck onto a car.
     local function eligible(model)
-        return model:IsA("Model") and inWorld(model) and not model:HasTag("BuyableLoot") and not model:HasTag("Vehicle")
-            and not model:HasTag("GasGun") and not Players:GetPlayerFromCharacter(model)
+        if not (model:IsA("Model") and inWorld(model)) then
+            return false
+        end
+        if model:HasTag("BuyableLoot") or model:HasTag("Vehicle") or model:HasTag("GasGun") or model:HasTag("Turret") then
+            return false
+        end
+        if model == Game.dragged() then
+            return false
+        end
+        local c = character()
+        if c and model:IsDescendantOf(c) then
+            return false
+        end
+        local p = model.Parent
+        while p and p ~= Workspace do
+            if p:IsA("Model") and (p:HasTag("Vehicle") or Players:GetPlayerFromCharacter(p)) then
+                return false
+            end
+            p = p.Parent
+        end
+        if model:FindFirstChild("AttachableWeld", true) then
+            return false
+        end
+        return true
     end
+    Steal.eligible = eligible
+    Steal.status = "idle"
     -- Small things go straight into the backpack, the way pressing equip does.
     function Steal.pass()
         if not Settings.AutoSteal then
@@ -701,27 +754,30 @@ do
         if not root then
             return
         end
+        local near = 0
         for _, model in CollectionService:GetTagged("Equippable") do
             if eligible(model) and (Steal.skip[model] or 0) < os.clock() then
                 local part = partOf(model)
-                if part and (part.Position - root.Position).Magnitude <= Settings.StealRange
-                    and Steal.value(model) >= Settings.StealMin then
-                    local ok, result = Game.call("Loot", "LootEquip", part)
-                    if not (ok and (result == "Success" or result == nil)) then
-                        Steal.skip[model] = os.clock() + 5 -- full backpack or refused
-                    else
-                        Steal.skip[model] = os.clock() + 1
+                if part and (part.Position - root.Position).Magnitude <= Settings.StealRange then
+                    near += 1
+                    if Steal.worth(model, Settings.StealMin) then
+                        local ok, result = Game.invoke("Loot", "LootEquip", part)
+                        Steal.status = ("%s: %s"):format(model.Name, ok and tostring(result) or ("error " .. tostring(result)))
+                        Steal.skip[model] = os.clock() + ((ok and result == "Success") and 1 or 5)
+                        task.wait(0.15)
                     end
-                    task.wait(0.15)
                 end
             end
+        end
+        if near == 0 then
+            Steal.status = "nothing to take within range"
         end
     end
     -- Everything draggable around, for the bring list.
     function Steal.draggables()
         local out = {}
         for _, model in CollectionService:GetTagged("Draggable") do
-            if eligible(model) and not model:HasTag("Turret") then
+            if eligible(model) then
                 table.insert(out, model)
             end
         end
@@ -752,7 +808,7 @@ do
             if part then
                 local d = (part.Position - root.Position).Magnitude
                 local picked = not Settings.BringOnly or Settings.BringNames[m.Name]
-                if d > 6 and d <= Settings.BringRange and picked and Steal.value(m) >= Settings.BringMin then
+                if d > 6 and d <= Settings.BringRange and picked and Steal.worth(m, Settings.BringMin) then
                     table.insert(list, { m = m, part = part, d = d })
                 end
             end
@@ -765,8 +821,9 @@ do
             if i > Settings.BringCount or not alive() then
                 break
             end
-            local ok, granted = Game.call("Loot", "OwnNetworkRequestAsync", e.part, true)
-            if ok and granted ~= false then
+            local ok, granted = Game.invoke("Loot", "OwnNetworkRequestAsync", e.part, true)
+            Steal.status = ("bring %s: %s"):format(e.m.Name, ok and tostring(granted) or ("error " .. tostring(granted)))
+            if ok and granted then
                 local row, col = (i - 1) // 4, (i - 1) % 4
                 local at = root.CFrame * CFrame.new((col - 1.5) * 3, 1, -5 - row * 3)
                 pcall(function()
@@ -1601,6 +1658,11 @@ do
     UI.toggle(StealBox, "AutoSteal", "Auto steal", "Puts small items worth at least the amount below into your backpack, the way pressing equip does")
     UI.slider(StealBox, "StealMin", "Worth at least", 0, 5000, 0, " $")
     UI.slider(StealBox, "StealRange", "Range", 4, 20, 0, " studs")
+    UI.toggle(StealBox, "TakeUnlisted", "Take unlisted items", "Items the game gives no value (like the tutorial's watch and trophy) count as worth enough, for stealing and bringing")
+    local StealLabel = StealBox:AddLabel("...", true)
+    loop(0.5, function()
+        StealLabel:SetText(("Last: %s%s"):format(Steal.status, Flow and "" or "\n(game table not found: using the remotes directly)"))
+    end)
 
     local BringBox = Tab:AddRightGroupbox("Bring", "magnet")
     UI.slider(BringBox, "BringMin", "Worth at least", 0, 5000, 0, " $")
