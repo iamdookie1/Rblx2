@@ -2,27 +2,32 @@
 -- place 137470666387963. Built on Ui3.
 --
 -- How the game works (as the client sees it):
---   Shot    Remotes.Soundwave:FireServer(origin, aimLook, serverTime, castId,
---           ballCenter) (and the same on SoundwaveU, sent twice for safety).
---           It connects when the ball is inside a cone (Config.Soundwave:
---           Range 22, HalfAngleDegrees 55, Cooldown 0.7).
+--   Shot    Client.WeaponController.soundwave() takes the aim from
+--           Client.CameraController.getAimLook(origin) and sends
+--           Remotes.Soundwave:FireServer(origin, aim, serverTime, castId,
+--           ballCenter). It connects when the ball is inside a cone
+--           (Config.Soundwave: Range 22, HalfAngleDegrees 55, Cooldown 0.7).
 --   Launch  Shared.BallMath.boopVelocity: the ball leaves at
---             aimLook * LaunchSpeed * falloff(distance)
+--             aim * LaunchSpeed * (1 - 0.4 * gap / Range)
 --             + yourVelocity * InheritCasterVelocity (0.5)
 --             + ballVelocity * KeepBallVelocity (0.15)
---           so it flies along your aim, not along the line through it.
+--           where gap is the distance from you to the ball's surface. A hit
+--           from right next to the ball is 125, one from the edge of range 75.
 --   Flight  Client.BallView: exponential air drag (Config.Ball.AirDrag 0.08)
 --           with workspace gravity, sphere-cast bounces against the arena's
 --           Geometry, Goals, Walls and Barriers that keep 82% of a hard hit
 --           and slide on a soft one, speed capped at Config.Ball.MaxSpeed.
 --   Goals   Arena.Goals.<Team>Goal, attribute Team, with a Trigger box.
---   Checks  Config.Validation: the server checks where a shot comes from,
---           its timing and the cooldown, not its aim.
+--
+-- The helpers wrap the game's own getAimLook and soundwave functions, so the
+-- game's own hit prediction, effects and remote all see the same shot. Nothing
+-- hooks the remotes.
 --
 -- Everything here is LOCAL PLAYER ONLY.
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
 local Workspace = workspace
 local LocalPlayer = Players.LocalPlayer
 
@@ -55,19 +60,17 @@ end
 
 local Settings = {
     -- prediction
-    ShowPath = true, PathSeconds = 3, ShowShot = true, ShowLanding = true, ShowGoal = true,
-    PathColor = Color3.fromRGB(240, 240, 255), ShotColor = Color3.fromRGB(255, 200, 60),
-    -- speed helper
+    ShowPath = true, PathSeconds = 3, ShowShot = true, ShowLanding = true, ThroughWalls = true, ShotLabel = true,
+    PathColor = Color3.fromRGB(240, 240, 255), ShotColor = Color3.fromRGB(255, 190, 40),
+    GoalColor = Color3.fromRGB(70, 255, 120),
+    -- aim helper
     SpeedHelp = false, MaxNudge = 12, MinGain = 1,
+    -- timing helper
+    Timing = false, SweetGap = 2, MaxHold = 0.35,
 }
 
 --// Plumbing \\--
 local Connections, Cleanups = {}, {}
-local function bind(signal, fn)
-    local c = signal:Connect(fn)
-    table.insert(Connections, c)
-    return c
-end
 local function loop(every, fn)
     task.spawn(function()
         while alive() do
@@ -87,7 +90,7 @@ local function rootPart()
     return c and c:FindFirstChild("HumanoidRootPart")
 end
 
---// The game's numbers \\--
+--// The game's modules and numbers \\--
 local Config = {}
 do
     local ok, c = pcall(require, ReplicatedStorage:WaitForChild("Shared"):WaitForChild("Config"))
@@ -95,36 +98,56 @@ do
         Config = c
     end
 end
-local WAVE = Config.Soundwave or {}
 local BALL = Config.Ball or {}
-local function wave(key, default)
-    local v = WAVE[key]
-    return type(v) == "number" and v or default
-end
 local DRAG = type(BALL.AirDrag) == "number" and BALL.AirDrag or 0.08
 local MAX_SPEED = type(BALL.MaxSpeed) == "number" and BALL.MaxSpeed or 180
 
--- The game's smoothed ball (BallView), else the ball part itself.
-local BallView
-pcall(function()
-    local client = LocalPlayer:WaitForChild("PlayerScripts", 5):WaitForChild("Client", 5)
-    local mod = client and client:FindFirstChild("BallView")
-    if mod then
-        local ok, t = pcall(require, mod)
-        if ok and type(t) == "table" and t.getPosition then
-            BallView = t
+local Mods = {}
+do
+    local client
+    pcall(function()
+        client = LocalPlayer:WaitForChild("PlayerScripts", 5):WaitForChild("Client", 5)
+    end)
+    for key, name in { BallView = "BallView", Camera = "CameraController", Weapon = "WeaponController",
+        Abilities = "AbilityController", Movement = "MovementController" } do
+        local mod = client and client:FindFirstChild(name)
+        if mod then
+            local ok, t = pcall(require, mod)
+            if ok and type(t) == "table" then
+                Mods[key] = t
+            end
         end
     end
-end)
+end
+
+-- The current wave numbers: the ability controller's (which knows about Amp
+-- and the like), else the config's.
+local function waveParams()
+    local a = Mods.Abilities
+    if a and type(a.waveParams) == "function" then
+        local ok, p = pcall(a.waveParams)
+        if ok and type(p) == "table" and type(p.LaunchSpeed) == "number" then
+            return p
+        end
+    end
+    return Config.Soundwave or {}
+end
+local function num(p, key, default)
+    local v = p[key]
+    return type(v) == "number" and v or default
+end
+
+-- The game's smoothed ball (BallView), else the ball part itself.
 local Ball = {}
 function Ball.part()
     local b = Workspace:FindFirstChild("Ball")
     return (b and b:IsA("BasePart")) and b or nil
 end
 function Ball.state()
-    if BallView then
+    local view = Mods.BallView
+    if view and view.getPosition then
         local ok, p, v, r = pcall(function()
-            return BallView.getPosition(), BallView.getVelocity(), BallView.getRadius()
+            return view.getPosition(), view.getVelocity(), view.getRadius()
         end)
         if ok and typeof(p) == "Vector3" then
             return p, typeof(v) == "Vector3" and v or Vector3.zero, type(r) == "number" and r or 3.5
@@ -239,60 +262,68 @@ do
 end
 
 --// Shots \\--
-local Shot = { last = "no shots yet", cache = {} }
+local Shot = { last = "no shots yet", timing = "no shots yet" }
 do
-    local function inCone(origin, look, center, radius)
+    local function inCone(origin, look, center, radius, p)
+        p = p or waveParams()
         local to = center - origin
         local d = to.Magnitude
-        if wave("Range", 22) < d - radius then
+        if num(p, "Range", 22) < d - radius then
             return false
         end
         if d <= radius + 0.5 then
             return true
         end
         local angle = math.acos(math.clamp(to.Unit:Dot(look), -1, 1))
-        return angle <= math.rad(wave("HalfAngleDegrees", 55)) + math.asin(math.clamp(radius / d, 0, 1))
+        return angle <= math.rad(num(p, "HalfAngleDegrees", 55)) + math.asin(math.clamp(radius / d, 0, 1))
     end
     Shot.inCone = inCone
     function Shot.myVelocity()
+        local m = Mods.Movement
+        if m and type(m.getVelocity) == "function" then
+            local ok, v = pcall(m.getVelocity)
+            if ok and typeof(v) == "Vector3" then
+                return v
+            end
+        end
         local r = rootPart()
         return r and r.AssemblyLinearVelocity or Vector3.zero
     end
-    -- The ball's velocity right after a hit with this aim (BallMath.boopVelocity).
-    function Shot.launch(origin, look, center, radius, ballVel, myVel)
-        local d = math.max(0, (center - origin).Magnitude - radius)
-        local t = math.clamp(d / wave("Range", 22), 0, 1)
-        local speed = wave("LaunchSpeed", 125) * (1 - (1 - wave("FarLaunchFraction", 0.6)) * t)
-        return look * speed + myVel * wave("InheritCasterVelocity", 0.5) + ballVel * wave("KeepBallVelocity", 0.15)
+    function Shot.gap(origin, center, radius)
+        return math.max(0, (center - origin).Magnitude - radius)
     end
-    -- The speed helper: turns your aim a little (never more than MaxNudge
-    -- degrees) toward the way you and the ball are already moving, which is
-    -- where the inherited speed adds the most. Where the shot goes barely
-    -- changes; it just comes off faster. If the ball would leave the cone,
-    -- the turn is made smaller.
+    -- The ball's velocity right after a hit with this aim (BallMath.boopVelocity).
+    function Shot.launch(origin, look, center, radius, ballVel, myVel, p)
+        p = p or waveParams()
+        local t = math.clamp(Shot.gap(origin, center, radius) / num(p, "Range", 22), 0, 1)
+        local speed = num(p, "LaunchSpeed", 125) * (1 - (1 - num(p, "FarLaunchFraction", 0.6)) * t)
+        return look * speed + myVel * num(p, "InheritCasterVelocity", 0.5) + ballVel * num(p, "KeepBallVelocity", 0.15)
+    end
+    -- The aim helper: turns your aim a little (never more than MaxNudge
+    -- degrees) toward the way you and the ball are already moving, where the
+    -- inherited speed adds the most. If the ball would leave the cone, the
+    -- turn is made smaller.
     function Shot.nudge(origin, look, center, radius, ballVel, myVel)
-        local carry = myVel * wave("InheritCasterVelocity", 0.5) + ballVel * wave("KeepBallVelocity", 0.15)
+        local p = waveParams()
+        local carry = myVel * num(p, "InheritCasterVelocity", 0.5) + ballVel * num(p, "KeepBallVelocity", 0.15)
         if carry.Magnitude < 1 or look.Magnitude < 0.5 then
             return look, 0, 0
         end
         look = look.Unit
         local want = carry.Unit
         local between = math.acos(math.clamp(look:Dot(want), -1, 1))
-        if between < 1e-3 then
-            return look, 0, 0
-        end
-        local base = Shot.launch(origin, look, center, radius, ballVel, myVel).Magnitude
         local axis = look:Cross(want)
-        if axis.Magnitude < 1e-6 then
+        if between < 1e-3 or axis.Magnitude < 1e-6 then
             return look, 0, 0
         end
         axis = axis.Unit
+        local base = Shot.launch(origin, look, center, radius, ballVel, myVel, p).Magnitude
         local maxTurn = math.min(between, math.rad(Settings.MaxNudge))
         for _, frac in { 1, 0.75, 0.5, 0.25 } do
             local turn = maxTurn * frac
             local newLook = (CFrame.fromAxisAngle(axis, turn) * look).Unit
-            if inCone(origin, newLook, center, radius) then
-                local gain = Shot.launch(origin, newLook, center, radius, ballVel, myVel).Magnitude - base
+            if inCone(origin, newLook, center, radius, p) then
+                local gain = Shot.launch(origin, newLook, center, radius, ballVel, myVel, p).Magnitude - base
                 if gain >= Settings.MinGain then
                     return newLook, gain, math.deg(turn)
                 end
@@ -301,91 +332,187 @@ do
         end
         return look, 0, 0
     end
+end
 
-    -- Every shot passes through here on its way to the server. The redundant
-    -- copies of the same shot (same time stamp) get the same aim.
-    function Shot.adjust(origin, look, stamp)
-        if not (Settings.SpeedHelp and typeof(origin) == "Vector3" and typeof(look) == "Vector3") then
+--// Wrapping the game's shot \\--
+-- getAimLook is only changed while the game is inside soundwave(), so the
+-- aim line and anything else that asks for the aim stay as they are.
+local Hook = { status = "game modules not found", shooting = false }
+do
+    local Camera, Weapon = Mods.Camera, Mods.Weapon
+    -- A rerun first puts back what the last run replaced.
+    local saved = Genv.__BlastSoccerOriginals
+    if saved then
+        if Camera and saved.aim then
+            Camera.getAimLook = saved.aim
+        end
+        if Weapon and saved.wave then
+            Weapon.soundwave = saved.wave
+        end
+    end
+    if Camera and Weapon and type(Camera.getAimLook) == "function" and type(Weapon.soundwave) == "function" then
+        local origAim, origWave = Camera.getAimLook, Weapon.soundwave
+        Genv.__BlastSoccerOriginals = { aim = origAim, wave = origWave }
+        Hook.aim = origAim
+
+        Camera.getAimLook = function(origin, ...)
+            local look = origAim(origin, ...)
+            if Hook.shooting and alive() and Settings.SpeedHelp and typeof(origin) == "Vector3" and typeof(look) == "Vector3" then
+                local ok, newLook = pcall(function()
+                    local center, ballVel, radius = Ball.state()
+                    if not (center and Shot.inCone(origin, look, center, radius)) then
+                        return nil
+                    end
+                    local out, gain, deg = Shot.nudge(origin, look, center, radius, ballVel, Shot.myVelocity())
+                    if gain > 0 then
+                        Shot.last = ("+%d speed, turned %.1f°"):format(math.floor(gain + 0.5), deg)
+                        return out
+                    end
+                    Shot.last = "already at its best"
+                    return nil
+                end)
+                if ok and newLook then
+                    return newLook
+                end
+            end
             return look
         end
-        local key = type(stamp) == "number" and stamp or nil
-        if key and Shot.cache[key] then
-            return Shot.cache[key]
-        end
-        local center, ballVel, radius = Ball.state()
-        local out = look
-        if center and inCone(origin, look, center, radius) then
-            local newLook, gain, deg = Shot.nudge(origin, look, center, radius, ballVel, Shot.myVelocity())
-            if gain > 0 then
-                out = newLook
-                Shot.last = ("+%d speed, turned %.1f°"):format(math.floor(gain + 0.5), deg)
-            else
-                Shot.last = "already at its best"
+
+        -- The real shot, with the aim helper switched on around it.
+        function Hook.fire(...)
+            Hook.shooting = true
+            local res = table.pack(pcall(origWave, ...))
+            Hook.shooting = false
+            if not res[1] then
+                error(res[2], 0)
             end
+            return table.unpack(res, 2, res.n)
         end
-        if key then
-            Shot.cache[key] = out
-            task.delay(2, function()
-                Shot.cache[key] = nil
-            end)
+
+        Weapon.soundwave = function(...)
+            if not alive() then
+                return origWave(...)
+            end
+            if Settings.Timing then
+                return Hook.timed(...)
+            end
+            return Hook.fire(...)
         end
-        return out
+        Hook.status = "ready"
+        table.insert(Cleanups, function()
+            Camera.getAimLook, Weapon.soundwave = origAim, origWave
+            Genv.__BlastSoccerOriginals = nil
+        end)
     end
 end
 
--- Hook the two shot remotes. Installed once per session.
-local Hook = { status = "not hooked" }
-do
-    local remotes = ReplicatedStorage:WaitForChild("Remotes", 10)
-    local sw = remotes and remotes:FindFirstChild("Soundwave")
-    local swu = remotes and remotes:FindFirstChild("SoundwaveU")
-    Genv.__BlastSoccerRemotes = { sw, swu }
-    Genv.__BlastSoccerAdjust = function(origin, look, stamp)
-        if alive() then
-            return Shot.adjust(origin, look, stamp)
-        end
-        return look
+-- The aim the game would use right now (with the aim helper, if on).
+local function currentAim(origin)
+    local look
+    if Hook.aim then
+        local ok, l = pcall(Hook.aim, origin)
+        look = ok and typeof(l) == "Vector3" and l or nil
     end
-    if Genv.__BlastSoccerHooked then
-        Hook.status = "hooked"
-    elseif typeof(hookmetamethod) == "function" and typeof(getnamecallmethod) == "function" then
-        local old
-        local function handler(self, ...)
-            local list = Genv.__BlastSoccerRemotes
-            if list and (self == list[1] or self == list[2]) and getnamecallmethod() == "FireServer" then
-                local adjust = Genv.__BlastSoccerAdjust
-                if adjust then
-                    local args = table.pack(...)
-                    local ok, newLook = pcall(adjust, args[1], args[2], args[3])
-                    if ok and typeof(newLook) == "Vector3" then
-                        args[2] = newLook
-                    end
-                    return old(self, table.unpack(args, 1, args.n))
+    local cam = Workspace.CurrentCamera
+    look = look or (cam and cam.CFrame.LookVector)
+    if not look then
+        return nil
+    end
+    if Settings.SpeedHelp then
+        local center, ballVel, radius = Ball.state()
+        if center and Shot.inCone(origin, look, center, radius) then
+            look = Shot.nudge(origin, look, center, radius, ballVel, Shot.myVelocity())
+        end
+    end
+    return look
+end
+
+--// Timing helper \\--
+-- A hit from right next to the ball is far faster than one from range
+-- (125 against 75). When you shoot while the ball is still coming toward
+-- you, this holds the shot for a moment (never longer than MaxHold) and
+-- fires it the instant the ball is as close as it is going to get, or right
+-- before it would slip out of your cone.
+local Timing = { holding = false }
+do
+    local LOOK_AHEAD = 1 / 20
+    -- "fire" now, or "wait" for a closer hit. Also the speed a hit now gives.
+    function Timing.verdict()
+        local root = rootPart()
+        local center, ballVel, radius = Ball.state()
+        if not (root and center) then
+            return "fire"
+        end
+        local origin = root.Position + Vector3.new(0, 1.5, 0)
+        local look = currentAim(origin)
+        if not look then
+            return "fire"
+        end
+        local myVel = Shot.myVelocity()
+        local gap = Shot.gap(origin, center, radius)
+        local o2, c2 = origin + myVel * LOOK_AHEAD, center + ballVel * LOOK_AHEAD
+        local gap2 = Shot.gap(o2, c2, radius)
+        local closing = gap2 < gap - 0.05
+        local speed = Shot.launch(origin, look, center, radius, ballVel, myVel).Magnitude
+        if Shot.inCone(origin, look, center, radius) then
+            if gap <= Settings.SweetGap or not closing or not Shot.inCone(o2, look, c2, radius) then
+                return "fire", speed, true
+            end
+            return "wait", speed, true
+        end
+        -- Not in reach yet: wait only if it's on its way in.
+        if closing and gap < num(waveParams(), "Range", 22) + 25 then
+            return "wait", nil, false
+        end
+        return "fire", nil, false
+    end
+
+    function Hook.timed(...)
+        if Timing.holding then
+            return false
+        end
+        local verdict, speedNow = Timing.verdict()
+        if verdict == "fire" then
+            Shot.timing = "fired right away"
+            return Hook.fire(...)
+        end
+        Timing.holding = true
+        local args = table.pack(...)
+        local started = os.clock()
+        local conn
+        conn = RunService.Heartbeat:Connect(function()
+            local v, speed, inReach = Timing.verdict()
+            local waited = os.clock() - started
+            if v == "fire" or waited >= Settings.MaxHold or not alive() then
+                conn:Disconnect()
+                Timing.conn = nil
+                Timing.holding = false
+                if speedNow and speed then
+                    Shot.timing = ("held %.2fs: %d -> %d speed"):format(waited, math.floor(speedNow), math.floor(speed))
+                elseif inReach then
+                    Shot.timing = ("held %.2fs, hit at %d speed"):format(waited, math.floor(speed or 0))
+                else
+                    Shot.timing = ("held %.2fs, ball never came in reach"):format(waited)
+                end
+                local ok, err = pcall(Hook.fire, table.unpack(args, 1, args.n))
+                if not ok then
+                    warn("[BlastSoccer] " .. tostring(err))
                 end
             end
-            return old(self, ...)
-        end
-        local wrap = typeof(newcclosure) == "function" and newcclosure or function(f)
-            return f
-        end
-        local ok = pcall(function()
-            old = hookmetamethod(game, "__namecall", wrap(handler))
         end)
-        if ok and old then
-            Genv.__BlastSoccerHooked = true
-            Hook.status = "hooked"
-        else
-            Hook.status = "this executor can't hook remotes"
-        end
-    else
-        Hook.status = "this executor can't hook remotes"
+        Timing.conn = conn
+        return true
     end
     table.insert(Cleanups, function()
-        Genv.__BlastSoccerAdjust = nil
+        if Timing.conn then
+            Timing.conn:Disconnect()
+        end
     end)
 end
 
---// Drawing the paths \\--
+--// Drawing \\--
+-- Thin boxes drawn on top of everything (handle adornments), so the lines
+-- show through walls, players and the ball.
 local Draw = { folder = Instance.new("Folder"), pools = {} }
 Draw.folder.Name = "BlastSoccerPrediction"
 Draw.folder.Parent = Workspace.CurrentCamera or Workspace
@@ -393,17 +520,19 @@ table.insert(Cleanups, function()
     Draw.folder:Destroy()
 end)
 do
-    local function part(color, size)
-        local p = Instance.new("Part")
-        p.Anchored, p.CanCollide, p.CanQuery, p.CanTouch, p.CastShadow = true, false, false, false, false
-        p.Material = Enum.Material.Neon
-        p.Color = color
-        p.Size = size
-        p.Parent = Draw.folder
-        return p
+    local function adornee()
+        return Workspace:FindFirstChildOfClass("Terrain") or Workspace.Terrain
     end
-    -- A line made of thin segments, reused between frames.
-    function Draw.line(name, pts, color, width)
+    local function make(class, color)
+        local a = Instance.new(class)
+        a.Adornee = adornee()
+        a.Color3 = color
+        a.ZIndex = 5
+        a.Parent = Draw.folder
+        return a
+    end
+    -- A line made of boxes, reused between frames.
+    function Draw.line(name, pts, color, width, transparency)
         local pool = Draw.pools[name] or {}
         Draw.pools[name] = pool
         local used = 0
@@ -414,88 +543,123 @@ do
                 used += 1
                 local seg = pool[used]
                 if not seg then
-                    seg = part(color, Vector3.new(width, width, 1))
+                    seg = make("BoxHandleAdornment", color)
                     pool[used] = seg
                 end
-                seg.Color = color
-                seg.Size = Vector3.new(width, width, len)
+                seg.AlwaysOnTop = Settings.ThroughWalls
+                seg.Color3 = color
+                seg.Size = Vector3.new(width, width, len + width * 0.5)
                 seg.CFrame = CFrame.lookAt((a + b) / 2, b)
-                seg.Transparency = 0.25
+                seg.Transparency = transparency
+                seg.Visible = true
             end
         end
         for i = used + 1, #pool do
-            pool[i].Transparency = 1
+            pool[i].Visible = false
         end
     end
     function Draw.hide(name)
         for _, seg in Draw.pools[name] or {} do
-            seg.Transparency = 1
+            seg.Visible = false
         end
     end
-    -- A flat ring where the ball first comes down.
-    local ring
-    function Draw.landing(pos, color)
-        if not ring then
-            ring = part(color, Vector3.new(0.2, 7, 7))
-            ring.Shape = Enum.PartType.Cylinder
+    -- A ball marker at a point (landing spot, end of the shot).
+    local dots = {}
+    function Draw.dot(name, pos, color, radius)
+        local d = dots[name]
+        if not d then
+            d = make("SphereHandleAdornment", color)
+            dots[name] = d
         end
         if pos then
-            ring.Color = color
-            ring.CFrame = CFrame.new(pos + Vector3.new(0, 0.15, 0)) * CFrame.Angles(0, 0, math.rad(90))
-            ring.Transparency = 0.35
+            d.AlwaysOnTop = Settings.ThroughWalls
+            d.Color3 = color
+            d.Radius = radius
+            d.CFrame = CFrame.new(pos)
+            d.Transparency = 0.2
+            d.Visible = true
         else
-            ring.Transparency = 1
+            d.Visible = false
+        end
+    end
+    -- A big label over the ball: what your shot would do right now.
+    local gui, text
+    function Draw.label(part, line, color)
+        if not gui then
+            gui = Instance.new("BillboardGui")
+            gui.Name = "BlastSoccerShot"
+            gui.AlwaysOnTop = true
+            gui.Size = UDim2.fromOffset(220, 54)
+            gui.StudsOffsetWorldSpace = Vector3.new(0, 7, 0)
+            gui.LightInfluence = 0
+            text = Instance.new("TextLabel")
+            text.BackgroundTransparency = 1
+            text.Size = UDim2.fromScale(1, 1)
+            text.Font = Enum.Font.GothamBlack
+            text.TextScaled = true
+            text.TextStrokeTransparency = 0.2
+            text.Parent = gui
+            gui.Parent = Draw.folder
+        end
+        if part and line then
+            gui.Adornee = part
+            text.Text = line
+            text.TextColor3 = color
+            gui.Enabled = true
+        else
+            gui.Enabled = false
         end
     end
 end
 
-local Predict = { goal = nil, shotGoal = nil }
+local Predict = {}
 do
-    local camera = Workspace.CurrentCamera
     function Predict.step()
         local center, vel, radius = Ball.state()
         if not center then
             Draw.hide("path")
             Draw.hide("shot")
-            Draw.landing(nil)
-            Predict.goal, Predict.shotGoal = nil, nil
+            Draw.dot("landing", nil)
+            Draw.dot("shotEnd", nil)
+            Draw.label(nil)
+            Predict.goal, Predict.shotGoal, Predict.shotSpeed = nil, nil, nil
             return
         end
         -- where the ball is going now
         if Settings.ShowPath then
             local pts, landing, goal = Sim.path(center, vel, radius, Settings.PathSeconds)
-            Draw.line("path", pts, Settings.PathColor, 0.35)
-            Draw.landing(Settings.ShowLanding and landing or nil, Settings.PathColor)
+            Draw.line("path", pts, goal and Settings.GoalColor or Settings.PathColor, 0.3, 0.45)
+            Draw.dot("landing", Settings.ShowLanding and landing or nil, Settings.PathColor, 1.6)
             Predict.goal = goal
         else
             Draw.hide("path")
-            Draw.landing(nil)
+            Draw.dot("landing", nil)
             Predict.goal = nil
         end
         -- where it would go if you shot right now
         local root = rootPart()
-        camera = Workspace.CurrentCamera
-        if Settings.ShowShot and root and camera then
+        if Settings.ShowShot and root then
             local origin = root.Position + Vector3.new(0, 1.5, 0)
-            local look = camera.CFrame.LookVector
-            if Shot.inCone(origin, look, center, radius) then
-                local myVel = Shot.myVelocity()
-                if Settings.SpeedHelp then
-                    look = Shot.nudge(origin, look, center, radius, vel, myVel)
-                end
-                local launch = Shot.launch(origin, look, center, radius, vel, myVel)
+            local look = currentAim(origin)
+            if look and Shot.inCone(origin, look, center, radius) then
+                local launch = Shot.launch(origin, look, center, radius, vel, Shot.myVelocity())
                 local pts, _, goal = Sim.path(center, launch, radius, Settings.PathSeconds)
-                Draw.line("shot", pts, Settings.ShotColor, 0.3)
-                Predict.shotGoal = goal
-                Predict.shotSpeed = launch.Magnitude
+                local color = goal and Settings.GoalColor or Settings.ShotColor
+                Draw.line("shot", pts, color, 0.9, 0)
+                Draw.dot("shotEnd", pts[#pts], color, 2.4)
+                Predict.shotGoal, Predict.shotSpeed = goal, launch.Magnitude
+                Draw.label(Settings.ShotLabel and Ball.part() or nil,
+                    ("%d%s"):format(math.floor(launch.Magnitude), goal and "  GOAL" or ""), color)
                 return
             end
         end
         Draw.hide("shot")
+        Draw.dot("shotEnd", nil)
+        Draw.label(nil)
         Predict.shotGoal, Predict.shotSpeed = nil, nil
     end
 end
-loop(1 / 20, Predict.step)
+loop(1 / 30, Predict.step)
 
 --// UI \\--
 local Window = Library:CreateWindow({
@@ -534,8 +698,10 @@ do
     local Tab = Window:AddTab("Prediction", "spline", "Where the ball is going")
     local PathBox = Tab:AddLeftGroupbox("Ball path", "spline")
     color(toggle(PathBox, "ShowPath", "Ball path", "Where the ball is going, with the game's own drag, gravity and bounces"), "PathColor", "Path colour")
-    toggle(PathBox, "ShowLanding", "Landing ring", "Where it first comes down")
-    color(toggle(PathBox, "ShowShot", "Your shot", "When the ball is in your cone: where it would go if you shot now"), "ShotColor", "Shot colour")
+    toggle(PathBox, "ShowLanding", "Landing marker", "Where it first comes down")
+    color(toggle(PathBox, "ShowShot", "Your shot", "When the ball is in reach: a thick line of where it would go if you shot now"), "ShotColor", "Shot colour")
+    toggle(PathBox, "ShotLabel", "Shot speed over the ball", "Big number over the ball: your shot's speed, and GOAL if it would go in")
+    color(toggle(PathBox, "ThroughWalls", "Show through walls"), "GoalColor", "Colour when it goes in")
     slider(PathBox, "PathSeconds", "Look ahead", 0.5, 6, 1, " s")
     local InfoBox = Tab:AddRightGroupbox("Now", "info")
     local InfoLabel = InfoBox:AddLabel("...", true)
@@ -551,15 +717,22 @@ end
 
 do
     local Tab = Window:AddTab("Shooting", "zap", "Shot helpers")
-    local HelpBox = Tab:AddLeftGroupbox("Speed helper", "gauge")
-    toggle(HelpBox, "SpeedHelp", "Speed helper",
-        "Turns your aim a little toward the way you and the ball are already moving, so the shot comes off faster. It never turns more than the slider, and never so far the ball leaves your cone")
-    slider(HelpBox, "MaxNudge", "Most it turns", 1, 30, 0, "°", "Small is subtle, large is faster")
-    slider(HelpBox, "MinGain", "Only if it adds at least", 0, 10, 0, " speed")
-    HelpBox:AddLabel("How it works: a shot's speed is your aim x 125, plus half your own speed and 15% of the ball's, so lining your aim up with where you're running adds the most", true)
-    local StatusLabel = HelpBox:AddLabel("...", true)
+    local TimeBox = Tab:AddLeftGroupbox("Timing helper (big)", "timer")
+    toggle(TimeBox, "Timing", "Timing helper",
+        "When you shoot while the ball is still coming at you, it waits a moment and fires as the ball gets closest. Close hits are much faster (125 point blank against 75 at the edge of range)")
+    slider(TimeBox, "SweetGap", "Fire once the ball is within", 0, 10, 1, " studs")
+    slider(TimeBox, "MaxHold", "Longest it waits", 0.05, 0.8, 2, " s")
+    local TimingLabel = TimeBox:AddLabel("...", true)
+
+    local AimBox = Tab:AddRightGroupbox("Aim helper (small)", "gauge")
+    toggle(AimBox, "SpeedHelp", "Aim helper",
+        "Turns your aim a little toward the way you and the ball are already moving, so the shot comes off a bit faster. Never more than the slider, and never so far the ball leaves your cone")
+    slider(AimBox, "MaxNudge", "Most it turns", 1, 30, 0, "°", "Small is subtle, large is faster")
+    slider(AimBox, "MinGain", "Only if it adds at least", 0, 10, 0, " speed")
+    local AimLabel = AimBox:AddLabel("...", true)
     loop(0.3, function()
-        StatusLabel:SetText(("Last shot: %s\nRemotes: %s"):format(Shot.last, Hook.status))
+        TimingLabel:SetText(("Last shot: %s"):format(Shot.timing))
+        AimLabel:SetText(("Last shot: %s\nHook: %s"):format(Shot.last, Hook.status))
     end)
 end
 
@@ -582,4 +755,4 @@ Genv.__BlastSoccerUnload = function()
     pcall(Library.Unload, Library)
 end
 
-notify("Loaded" .. (Hook.status == "hooked" and "" or (" (speed helper off: " .. Hook.status .. ")")), 4)
+notify("Loaded" .. (Hook.status == "ready" and "" or (" (shot helpers off: " .. Hook.status .. ")")), 4)
