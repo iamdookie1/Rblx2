@@ -67,6 +67,8 @@ local Settings = {
     SpeedHelp = false, MaxNudge = 12, MinGain = 1,
     -- timing helper
     Timing = false, SweetGap = 2, MaxHold = 0.35,
+    -- lunge on shoot
+    Lunge = false, LungeSpeed = 60, LungeTime = 0.15,
 }
 
 --// Plumbing \\--
@@ -380,6 +382,9 @@ do
 
         -- The real shot, with the aim helper switched on around it.
         function Hook.fire(...)
+            if Settings.Lunge and Hook.lunge then
+                pcall(Hook.lunge)
+            end
             Hook.shooting = true
             local res = table.pack(pcall(origWave, ...))
             Hook.shooting = false
@@ -506,6 +511,72 @@ do
     table.insert(Cleanups, function()
         if Timing.conn then
             Timing.conn:Disconnect()
+        end
+    end)
+end
+
+--// Lunge on shoot \\--
+-- Half your speed carries into the shot, so a short push toward where you're
+-- shooting makes it faster. The push goes through the game's own
+-- Movement.applyImpulse (what its dash uses), which also caps it at the
+-- game's horizontal speed limit. It is topped up for LungeTime seconds so the
+-- server sees it when it handles the shot. Only when the ball is in reach.
+local Lunge = { info = "no shots yet" }
+do
+    local MAX = 150
+    function Hook.lunge()
+        local move = Mods.Movement
+        if not (move and type(move.applyImpulse) == "function") then
+            Lunge.info = "movement controller not found"
+            return
+        end
+        local root = rootPart()
+        local center, ballVel, radius = Ball.state()
+        if not (root and center) then
+            return
+        end
+        local origin = root.Position + Vector3.new(0, 1.5, 0)
+        local look = currentAim(origin)
+        if not (look and Shot.inCone(origin, look, center, radius)) then
+            Lunge.info = "ball not in reach, no lunge"
+            return
+        end
+        local flat = Vector3.new(look.X, 0, look.Z)
+        if flat.Magnitude < 0.2 then
+            Lunge.info = "aiming too steeply, no lunge"
+            return
+        end
+        flat = flat.Unit
+        local target = math.min(Settings.LungeSpeed, MAX)
+        local before = Shot.myVelocity()
+        local function topUp()
+            local along = Shot.myVelocity():Dot(flat)
+            if along < target - 0.5 then
+                move.applyImpulse(flat * (target - along))
+            end
+        end
+        topUp()
+        local p = waveParams()
+        local beforeShot = Shot.launch(origin, look, center, radius, ballVel, before, p).Magnitude
+        local afterShot = Shot.launch(origin, look, center, radius, ballVel, Shot.myVelocity(), p).Magnitude
+        Lunge.info = ("you %d -> %d, shot %d -> %d"):format(math.floor(before:Dot(flat)), math.floor(target),
+            math.floor(math.min(beforeShot, MAX_SPEED)), math.floor(math.min(afterShot, MAX_SPEED)))
+        if Lunge.conn then
+            Lunge.conn:Disconnect()
+        end
+        local started = os.clock()
+        Lunge.conn = RunService.Heartbeat:Connect(function()
+            if os.clock() - started >= Settings.LungeTime or not alive() then
+                Lunge.conn:Disconnect()
+                Lunge.conn = nil
+                return
+            end
+            pcall(topUp)
+        end)
+    end
+    table.insert(Cleanups, function()
+        if Lunge.conn then
+            Lunge.conn:Disconnect()
         end
     end)
 end
@@ -647,9 +718,10 @@ do
                 local color = goal and Settings.GoalColor or Settings.ShotColor
                 Draw.line("shot", pts, color, 0.9, 0)
                 Draw.dot("shotEnd", pts[#pts], color, 2.4)
-                Predict.shotGoal, Predict.shotSpeed = goal, launch.Magnitude
+                local speed = math.min(launch.Magnitude, MAX_SPEED)
+                Predict.shotGoal, Predict.shotSpeed = goal, speed
                 Draw.label(Settings.ShotLabel and Ball.part() or nil,
-                    ("%d%s"):format(math.floor(launch.Magnitude), goal and "  GOAL" or ""), color)
+                    ("%d%s"):format(math.floor(speed), goal and "  GOAL" or ""), color)
                 return
             end
         end
@@ -724,6 +796,13 @@ do
     slider(TimeBox, "MaxHold", "Longest it waits", 0.05, 0.8, 2, " s")
     local TimingLabel = TimeBox:AddLabel("...", true)
 
+    local LungeBox = Tab:AddLeftGroupbox("Lunge on shoot", "move-right")
+    toggle(LungeBox, "Lunge", "Lunge on shoot",
+        "When you shoot with the ball in reach, a short push toward where you're shooting. Half your speed goes into the shot. Uses the game's own dash push")
+    slider(LungeBox, "LungeSpeed", "Lunge speed", 35, 150, 0, "", "60 is a quick step (about +15 shot speed), 110 is an obvious lunge (near the ball's 180 cap)")
+    slider(LungeBox, "LungeTime", "Lunge length", 0.05, 0.4, 2, " s", "Long enough for the server to see it; 0.15-0.25 is about right")
+    local LungeLabel = LungeBox:AddLabel("...", true)
+
     local AimBox = Tab:AddRightGroupbox("Aim helper (small)", "gauge")
     toggle(AimBox, "SpeedHelp", "Aim helper",
         "Turns your aim a little toward the way you and the ball are already moving, so the shot comes off a bit faster. Never more than the slider, and never so far the ball leaves your cone")
@@ -732,6 +811,7 @@ do
     local AimLabel = AimBox:AddLabel("...", true)
     loop(0.3, function()
         TimingLabel:SetText(("Last shot: %s"):format(Shot.timing))
+        LungeLabel:SetText(("Last shot: %s"):format(Lunge.info))
         AimLabel:SetText(("Last shot: %s\nHook: %s"):format(Shot.last, Hook.status))
     end)
 end
