@@ -19,6 +19,11 @@ local Games = {
     [445664957] = { Name = 'PARKOUR Legacy', Script = 'Games/Parkour.lua' },
     [119789365111500] = { Name = 'Tanks', Script = 'Games/Tanks.lua' },
     [7871169780] = { Name = 'Minesweeper', Script = 'Games/Minesweeper.lua' },
+    -- Runaways match places, from the game's own Data.PlaceIds (liveGame):
+    -- normal, express and hard. The lobby (118418618261207) has no match to play.
+    [117311404196294] = { Name = 'Runaways', Script = 'Games/Runaways.lua' },
+    [99088826116845] = { Name = 'Runaways (express)', Script = 'Games/Runaways.lua' },
+    [129415455370018] = { Name = 'Runaways (hard)', Script = 'Games/Runaways.lua' },
     [662417684] = { Name = 'Lucky Blocks', Script = 'Games/LuckyBlocks.lua' },
     [129363360542125] = { Name = 'Doodle Drop', Script = 'Games/DoodleDrop.lua' },
     -- Doodle Drop's level creator, from UGC_PLACE_ID in the game's own Config.
