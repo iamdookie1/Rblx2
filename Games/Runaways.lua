@@ -84,7 +84,10 @@ local Settings = {
     -- driving
     Tune = false, SpeedMult = 1.3, AccelMult = 1.3, TorqueMult = 1.2, BrakeMult = 1.3, TurnMult = 1.1,
     AutoPour = false, LowFuelAlert = true, LowFuelAt = 20, AutoFlip = false,
-    CarFly = false, CarFlySpeed = 220, CarBoost = false, BoostSpeed = 300, BoostAccel = 120,
+    CarFly = false, CarFlySpeed = 220, CarFlyTurn = 2.2, CarBoost = false, BoostSpeed = 300, BoostAccel = 120,
+    AntiDrift = false, Grip = 0.35, DriftFrom = 30, SteerAssist = false, SteerPower = 1.6, Stabilize = false,
+    BrakeAssist = false, BrakePower = 150,
+    AutoShoot = false,
     -- loot
     AutoCash = false, CashRange = 30, AutoBreak = false, BreakRange = 12, BreakEvery = 0.5,
     AutoSteal = false, StealMin = 100, StealRange = 10, BringMin = 0, BringRange = 300, BringCount = 10,
@@ -299,8 +302,15 @@ do
         return false
     end
     -- Living NPCs in the world.
+    -- Rebuilt at most 4 times a second: aim, ESP and the auras all ask.
+    local npcCache, npcAt = {}, -1
     function People.npcs()
+        if os.clock() - npcAt < 0.25 then
+            return npcCache
+        end
+        npcAt = os.clock()
         local out = {}
+        npcCache = out
         for _, m in CollectionService:GetTagged("NPC") do
             if m:IsA("Model") and inWorld(m) then
                 local h = m:FindFirstChildOfClass("Humanoid")
@@ -356,8 +366,18 @@ do
     -- tagged NPCCollider, MetalFence or NoBulletImpact. Those invisible NPC
     -- colliders are what made the old check call nearly everyone hidden.
     local PASS_THROUGH = { "NPCCollider", "MetalFence", "NoBulletImpact" }
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.RespectCanCollide = false
+    local ignoreAt, ignoreList = -1, {}
     local function reaches(from, part, model)
+        if os.clock() - ignoreAt < 2 then
+            local hit = Workspace:Raycast(from, part.Position - from, params)
+            return hit == nil or hit.Instance:IsDescendantOf(model)
+        end
+        ignoreAt = os.clock()
         local ignore = {}
+        ignoreList = ignore
         local c = character()
         if c then
             table.insert(ignore, c)
@@ -380,9 +400,6 @@ do
                 table.insert(ignore, inst)
             end
         end
-        local params = RaycastParams.new()
-        params.FilterType = Enum.RaycastFilterType.Exclude
-        params.RespectCanCollide = false
         params.FilterDescendantsInstances = ignore
         local hit = Workspace:Raycast(from, part.Position - from, params)
         return hit == nil or hit.Instance:IsDescendantOf(model)
@@ -402,7 +419,17 @@ do
         return out
     end
     Aim.status = "off"
+    local cacheAt, cachePart = -1, nil
     function Aim.find(from)
+        -- full-auto and shotguns ask many times a frame: one answer per frame
+        if os.clock() - cacheAt < 0.03 then
+            return cachePart
+        end
+        cacheAt = os.clock()
+        cachePart = Aim.findNow(from)
+        return cachePart
+    end
+    function Aim.findNow(from)
         camera = Workspace.CurrentCamera
         from = from or camera.CFrame.Position
         local pool = {}
@@ -454,7 +481,7 @@ do
 
     -- What a shot does: point it at the target (or straight, for no spread).
     local function steer(args)
-        if not (alive() and type(args) == "table" and typeof(args.from) == "Vector3") then
+        if not (alive() and type(args) == "table" and typeof(args.from) == "Vector3") or args.__aimed then
             return
         end
         local part = Settings.SilentAim and Aim.find(args.from) or nil
@@ -733,35 +760,76 @@ do
     end
     -- Gun aura: shoots the nearest NPCs in range with the gun you hold, at
     -- its own fire rate, through the game's own bullet code.
-    function Guns.auraPass()
-        if not Settings.GunAura then
-            return
-        end
-        local tool = Hit.held()
-        local cfg = tool and Game.toolConfig(tool)
-        if not (cfg and cfg.category == "Guns" and type(cfg.maxRpm) == "number") then
-            return
-        end
-        if os.clock() - Guns.lastShot < 60 / cfg.maxRpm then
-            return
-        end
+    -- One shot of the gun you hold at a part, the way the gun fires: its
+    -- live config (so fire rate, pellets, damage and infinite ammo from the
+    -- gun mods all count), its ammo, its sound and tracer.
+    function Guns.shootAt(tool, cfg, part)
         local bullets = Game.module("BulletsClient")
-        local target = Hit.targets(Settings.GunAuraRange, Settings.GunAuraCivilians, Settings.GunAuraPolice, 1)[1]
-        local part = target and (target:FindFirstChild("Head") or target:FindFirstChild("HumanoidRootPart"))
         if not (bullets and part) then
-            return
+            return false
+        end
+        if not cfg.infiniteAmmo then
+            local ammo = tool:GetAttribute("Ammo")
+            if type(ammo) == "number" then
+                if ammo <= 0 then
+                    return false
+                end
+                Game.call("Ammo", "setAmmo", tool, ammo - 1)
+            end
         end
         Guns.lastShot = os.clock()
         local from = Workspace.CurrentCamera.CFrame.Position
-        pcall(bullets.shootProjectile, { from = from, direction = (part.Position - from).Unit * 1000, config = cfg })
         local guns = Game.module("Guns")
+        for _ = 1, math.max(1, cfg.pellets or 1) do
+            local ok, result = pcall(bullets.shootProjectile, {
+                from = from, direction = (part.Position - from).Unit * 1000, config = cfg, __aimed = true,
+            })
+            if guns and guns.Traceshot and ok and type(result) == "table" then
+                pcall(guns.Traceshot, tool, result.intersectionPoint or part.Position)
+            end
+        end
         if guns and guns.Gunshot then
             pcall(guns.Gunshot, tool)
+        end
+        return true
+    end
+    function Guns.held()
+        local tool = Hit.held()
+        local cfg = tool and Game.toolConfig(tool)
+        if cfg and cfg.category == "Guns" and type(cfg.maxRpm) == "number" and cfg.maxRpm > 0 then
+            return tool, cfg
+        end
+        return nil
+    end
+    -- Gun aura: the nearest NPC in range. Auto shoot: whoever silent aim has
+    -- in the circle. Both at the gun's own (modded) fire rate.
+    function Guns.auraPass()
+        if not (Settings.GunAura or Settings.AutoShoot) then
+            return
+        end
+        local tool, cfg = Guns.held()
+        if not tool or os.clock() - Guns.lastShot < 60 / cfg.maxRpm then
+            return
+        end
+        local part
+        if Settings.AutoShoot then
+            part = Aim.find()
+        end
+        if not part and Settings.GunAura then
+            local target = Hit.targets(Settings.GunAuraRange, Settings.GunAuraCivilians, Settings.GunAuraPolice, 1)[1]
+            part = target and (target:FindFirstChild("Head") or target:FindFirstChild("HumanoidRootPart"))
+        end
+        if part then
+            Guns.shootAt(tool, cfg, part)
         end
     end
 end
 loop(1, Guns.apply)
-loop(0.03, Guns.auraPass)
+bind(RunService.Heartbeat, function()
+    if alive() then
+        pcall(Guns.auraPass)
+    end
+end)
 
 --// Loot: steal into your backpack, bring things to you \\--
 local Steal = { skip = {}, names = {} }
@@ -798,6 +866,24 @@ do
         return model.PrimaryPart or model:FindFirstChildWhichIsA("BasePart")
     end
     Steal.partOf = partOf
+    -- Things put on a pawn counter (its Volume box) are being sold: hands off.
+    function Steal.onCounter(model)
+        local part = partOf(model)
+        if not part then
+            return false
+        end
+        for _, counter in CollectionService:GetTagged("PawnCounter") do
+            local vol = counter:FindFirstChild("Volume")
+            if vol and vol:IsA("BasePart") then
+                local rel = vol.CFrame:PointToObjectSpace(part.Position)
+                local half = vol.Size / 2 + Vector3.new(2, 3, 2)
+                if math.abs(rel.X) <= half.X and math.abs(rel.Y) <= half.Y and math.abs(rel.Z) <= half.Z then
+                    return true
+                end
+            end
+        end
+        return false
+    end
     -- Not what you're holding or dragging, not inside a character or a car,
     -- not stuck onto a car.
     local function eligible(model)
@@ -822,6 +908,9 @@ do
             p = p.Parent
         end
         if model:FindFirstChild("AttachableWeld", true) then
+            return false
+        end
+        if Steal.onCounter(model) then
             return false
         end
         return true
@@ -1278,12 +1367,46 @@ loop(0.25, function()
     Car.pourPass()
 end)
 
---// Car fly and boost \\--
+--// Car fly, boost and handling \\--
 -- You drive your own car's physics, so its velocity can be set directly.
--- Throttle (W/S) and steer (A/D) are read off the driver's seat; car fly goes
--- where the camera points.
+-- Input comes from the keys, the driver's seat and the movement stick, so it
+-- works the same on PC and phone. Forward is the way the driver's seat faces.
 local CarMove = { flying = false }
 do
+    local controls
+    pcall(function()
+        controls = require(LocalPlayer:WaitForChild("PlayerScripts"):WaitForChild("PlayerModule")):GetControls()
+    end)
+    local function key(...)
+        for _, k in { ... } do
+            if UserInputService:IsKeyDown(k) then
+                return true
+            end
+        end
+        return false
+    end
+    -- throttle: +1 forward, -1 back; steer: +1 right
+    function CarMove.input(seat)
+        local K = Enum.KeyCode
+        local throttle = (key(K.W, K.Up) and 1 or 0) - (key(K.S, K.Down) and 1 or 0)
+        local steer = (key(K.D, K.Right) and 1 or 0) - (key(K.A, K.Left) and 1 or 0)
+        local function take(t, st)
+            if math.abs(t) > math.abs(throttle) then
+                throttle = t
+            end
+            if math.abs(st) > math.abs(steer) then
+                steer = st
+            end
+        end
+        take(seat.ThrottleFloat or 0, seat.SteerFloat or 0)
+        if controls then
+            local ok, v = pcall(controls.GetMoveVector, controls)
+            if ok and typeof(v) == "Vector3" then
+                take(-v.Z, v.X)
+            end
+        end
+        return math.clamp(throttle, -1, 1), math.clamp(steer, -1, 1)
+    end
     local function driving()
         local h = humanoid()
         local seat = h and h.SeatPart
@@ -1298,6 +1421,11 @@ do
         end
         return model, chassis, seat
     end
+    CarMove.driving = driving
+    local function flat(v)
+        local f = Vector3.new(v.X, 0, v.Z)
+        return f.Magnitude > 1e-3 and f.Unit or nil
+    end
     bind(RunService.Heartbeat, function(dt)
         if not alive() then
             return
@@ -1308,36 +1436,64 @@ do
             CarMove.flying = false
             return
         end
-        local throttle, steer = seat.ThrottleFloat or 0, seat.SteerFloat or 0
+        local throttle, steer = CarMove.input(seat)
+        local fwd = flat(seat.CFrame.LookVector) or Vector3.new(0, 0, -1)
+        local right = flat(seat.CFrame.RightVector) or Vector3.new(1, 0, 0)
         if Settings.CarFly then
+            -- The car keeps its own heading and steering turns it, so a
+            -- camera that follows the car (phones) can't spin it round.
+            -- Look up or down with the camera to climb or dive.
             CarMove.flying = true
-            local cam = Workspace.CurrentCamera.CFrame
-            local dir = cam.LookVector * throttle + cam.RightVector * steer
-            chassis.AssemblyLinearVelocity = dir.Magnitude > 0.05 and dir.Unit * Settings.CarFlySpeed or Vector3.zero
+            local camY = Workspace.CurrentCamera.CFrame.LookVector.Y
+            local dir = (fwd + Vector3.new(0, camY, 0)) * throttle
+            chassis.AssemblyLinearVelocity = dir.Magnitude > 0.05 and dir.Unit * Settings.CarFlySpeed * math.abs(throttle) or Vector3.zero
             chassis.AssemblyAngularVelocity = Vector3.zero
-            -- level, facing where the camera looks
-            local flat = cam.LookVector * Vector3.new(1, 0, 1)
-            if flat.Magnitude > 0.1 then
-                local pos = model:GetPivot().Position
+            local pivot = model:GetPivot()
+            local yaw = -steer * Settings.CarFlyTurn * dt
+            local look = flat(pivot.LookVector)
+            if look then
                 pcall(function()
-                    model:PivotTo(CFrame.lookAt(pos, pos + flat.Unit))
+                    model:PivotTo(CFrame.lookAt(pivot.Position, pivot.Position + look) * CFrame.Angles(0, yaw, 0))
                 end)
             end
             return
         end
         CarMove.flying = false
-        -- Boost: on the throttle, the car speeds up past its own top speed,
-        -- the way it's already heading.
-        if Settings.CarBoost and throttle > 0.1 then
-            local v = chassis.AssemblyLinearVelocity
-            local flatV = Vector3.new(v.X, 0, v.Z)
-            local speed = flatV.Magnitude
-            if speed > 8 and speed < Settings.BoostSpeed then
-                local new = math.min(speed + Settings.BoostAccel * dt * throttle, Settings.BoostSpeed)
-                local out = flatV.Unit * new
-                chassis.AssemblyLinearVelocity = Vector3.new(out.X, v.Y, out.Z)
-            end
+        if not (Settings.CarBoost or Settings.BrakeAssist or Settings.AntiDrift or Settings.SteerAssist or Settings.Stabilize) then
+            return
         end
+        local v = chassis.AssemblyLinearVelocity
+        local flatV = Vector3.new(v.X, 0, v.Z)
+        local speed = flatV.Magnitude
+        local along = flatV:Dot(fwd)
+        -- Boost: on the throttle, speeds up past the car's own top speed.
+        if Settings.CarBoost and throttle > 0.1 and speed > 8 and speed < Settings.BoostSpeed then
+            local new = math.min(speed + Settings.BoostAccel * dt * throttle, Settings.BoostSpeed)
+            flatV = flatV.Unit * new
+        end
+        -- Brake assist: braking (throttle back while rolling forward) bites harder.
+        if Settings.BrakeAssist and throttle < -0.1 and along > 5 then
+            local new = math.max(speed - Settings.BrakePower * dt * -throttle, 0)
+            flatV = speed > 0 and flatV.Unit * new or flatV
+        end
+        -- Anti drift: the sideways slide is taken out, so the car goes where
+        -- it points instead of sliding off at speed.
+        if Settings.AntiDrift and speed > Settings.DriftFrom then
+            local side = flatV:Dot(right)
+            flatV -= right * side * Settings.Grip
+        end
+        chassis.AssemblyLinearVelocity = Vector3.new(flatV.X, v.Y, flatV.Z)
+        local av = chassis.AssemblyAngularVelocity
+        -- Steering assist: at speed, the car turns at a steady rate.
+        if Settings.SteerAssist and speed > Settings.DriftFrom and math.abs(steer) > 0.05 then
+            local dirSign = along >= 0 and 1 or -1
+            av = Vector3.new(av.X, -steer * Settings.SteerPower * dirSign, av.Z)
+        end
+        -- Stabilize: damps the rolling and pitching that flips cars at speed.
+        if Settings.Stabilize then
+            av = Vector3.new(av.X * 0.6, av.Y, av.Z * 0.6)
+        end
+        chassis.AssemblyAngularVelocity = av
     end)
 end
 
@@ -1720,7 +1876,7 @@ do
         Guns.reequip()
     end
     UI.toggle(ModBox, "GunMods", "Gun mods", "Changes your guns' own numbers. Your gun is re-equipped so it takes effect", mods)
-    UI.slider(ModBox, "RpmMult", "Fire rate", 0.5, 5, 2, "x")
+    UI.slider(ModBox, "RpmMult", "Fire rate", 0.5, 20, 2, "x")
     UI.toggle(ModBox, "ForceAuto", "Full auto", "Hold to fire with every gun", mods)
     UI.toggle(ModBox, "InfAmmo", "Infinite ammo", "Your gun stops counting rounds. The server may still check", mods)
     UI.slider(ModBox, "DamageMult", "Damage", 1, 5, 2, "x")
@@ -1733,6 +1889,8 @@ do
     UI.slider(AuraBox, "GunAuraRange", "Range", 10, 400, 0, " studs")
     UI.toggle(AuraBox, "GunAuraPolice", "Police")
     UI.toggle(AuraBox, "GunAuraCivilians", "Civilians")
+    UI.toggle(AuraBox, "AutoShoot", "Auto shoot",
+        "Shoots whoever silent aim has in the circle, at your gun's fire rate with your gun mods. Uses the silent aim settings for who to aim at")
 
     local MoveBox = Tab:AddRightGroupbox("Movement", "wind")
     UI.toggle(MoveBox, "Fly", "Fly", "Move with your normal controls, Space up, Ctrl down. Off while seated")
@@ -1775,7 +1933,7 @@ do
     UI.slider(TuneBox, "SpeedMult", "Top speed", 0.5, 10, 2, "x")
     UI.slider(TuneBox, "AccelMult", "Acceleration", 0.5, 12, 2, "x")
     UI.slider(TuneBox, "TorqueMult", "Torque", 0.5, 10, 2, "x")
-    UI.slider(TuneBox, "BrakeMult", "Brakes", 0.5, 6, 2, "x")
+    UI.slider(TuneBox, "BrakeMult", "Brakes", 0.5, 25, 2, "x")
     UI.slider(TuneBox, "TurnMult", "Steering", 0.5, 3, 2, "x")
     UI.toggle(TuneBox, "AutoFlip", "Auto flip", "Puts the car back on its wheels after 2 s upside down")
 
@@ -1783,8 +1941,19 @@ do
     UI.toggle(FastBox, "CarBoost", "Speed boost", "Hold the throttle and the car keeps speeding up past its own top speed, up to the speed below")
     UI.slider(FastBox, "BoostSpeed", "Boost up to", 50, 1000, 0, " studs/s")
     UI.slider(FastBox, "BoostAccel", "Boost pick-up", 20, 600, 0, " studs/s²")
-    UI.toggle(FastBox, "CarFly", "Car fly", "While you drive: W/S go where the camera points, A/D sideways. Let go to hover")
+    UI.toggle(FastBox, "CarFly", "Car fly", "While you drive: gas and reverse go forward and back, steering turns. Look up or down to climb or dive. Let go to hover")
     UI.slider(FastBox, "CarFlySpeed", "Fly speed", 20, 1000, 0, " studs/s")
+    UI.slider(FastBox, "CarFlyTurn", "Fly turning", 0.5, 6, 1)
+
+    local HandleBox = Tab:AddRightGroupbox("Handling", "steering-wheel")
+    UI.toggle(HandleBox, "AntiDrift", "No drifting", "Takes out the sideways slide, so the car goes where it points at speed")
+    UI.slider(HandleBox, "Grip", "Grip", 0.05, 1, 2, nil, "How much of the slide is taken out each frame")
+    UI.slider(HandleBox, "DriftFrom", "From speed", 0, 200, 0, " studs/s", "Handling help only starts above this speed")
+    UI.toggle(HandleBox, "SteerAssist", "Steering assist", "Turns at a steady rate at speed, even when the tyres would slip")
+    UI.slider(HandleBox, "SteerPower", "Turn rate", 0.3, 5, 1)
+    UI.toggle(HandleBox, "Stabilize", "Stabilize", "Damps the rolling and tipping that flips cars at speed")
+    UI.toggle(HandleBox, "BrakeAssist", "Brake assist", "Braking takes off speed this fast, on top of the car's own brakes")
+    UI.slider(HandleBox, "BrakePower", "Brake power", 20, 800, 0, " studs/s²")
 
     local FuelBox = Tab:AddRightGroupbox("Fuel", "fuel")
     local FuelLabel = FuelBox:AddLabel("...", true)
