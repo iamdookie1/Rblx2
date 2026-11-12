@@ -87,7 +87,7 @@ local Settings = {
     CarFly = false, CarFlySpeed = 220, CarFlyTurn = 2.2, CarBoost = false, BoostSpeed = 300, BoostAccel = 120,
     AntiDrift = false, Grip = 0.35, DriftFrom = 30, SteerAssist = false, SteerPower = 1.6, Stabilize = false,
     BrakeAssist = false, BrakePower = 150,
-    AutoShoot = false,
+    AutoShoot = false, ShootCops = false, CopShootRange = 250, StealAtOnce = 6, CarFlyHeading = false,
     -- loot
     AutoCash = false, CashRange = 30, AutoBreak = false, BreakRange = 12, BreakEvery = 0.5,
     AutoSteal = false, StealMin = 100, StealRange = 10, BringMin = 0, BringRange = 300, BringCount = 10,
@@ -793,6 +793,28 @@ do
         end
         return true
     end
+    -- The nearest police car or helicopter in range: a point in the middle
+    -- of it, which the bullet's own ray then hits whatever it meets first.
+    function Guns.copVehicle()
+        local root = rootPart()
+        if not root then
+            return nil
+        end
+        local best, bestD
+        for _, v in People.policeVehicles() do
+            local ok, cf = pcall(function()
+                return (v:GetBoundingBox())
+            end)
+            local pos = ok and cf and cf.Position or pivotOf(v)
+            if pos then
+                local d = (pos - root.Position).Magnitude
+                if d <= Settings.CopShootRange and (not bestD or d < bestD) then
+                    best, bestD = pos, d
+                end
+            end
+        end
+        return best and { Position = best } or nil
+    end
     function Guns.held()
         local tool = Hit.held()
         local cfg = tool and Game.toolConfig(tool)
@@ -804,7 +826,7 @@ do
     -- Gun aura: the nearest NPC in range. Auto shoot: whoever silent aim has
     -- in the circle. Both at the gun's own (modded) fire rate.
     function Guns.auraPass()
-        if not (Settings.GunAura or Settings.AutoShoot) then
+        if not (Settings.GunAura or Settings.AutoShoot or Settings.ShootCops) then
             return
         end
         local tool, cfg = Guns.held()
@@ -818,6 +840,9 @@ do
         if not part and Settings.GunAura then
             local target = Hit.targets(Settings.GunAuraRange, Settings.GunAuraCivilians, Settings.GunAuraPolice, 1)[1]
             part = target and (target:FindFirstChild("Head") or target:FindFirstChild("HumanoidRootPart"))
+        end
+        if not part and Settings.ShootCops then
+            part = Guns.copVehicle()
         end
         if part then
             Guns.shootAt(tool, cfg, part)
@@ -928,15 +953,26 @@ do
         end
         local near = 0
         for _, model in CollectionService:GetTagged("Equippable") do
-            if eligible(model) and (Steal.skip[model] or 0) < os.clock() then
+            if (Steal.inFlight or 0) >= Settings.StealAtOnce then
+                break
+            end
+            if (Steal.skip[model] or 0) < os.clock() and eligible(model) then
                 local part = partOf(model)
                 if part and (part.Position - root.Position).Magnitude <= Settings.StealRange then
                     near += 1
                     if Steal.worth(model, Settings.StealMin) then
-                        local ok, result = Game.invoke("Loot", "LootEquip", part)
-                        Steal.status = ("%s: %s"):format(model.Name, ok and tostring(result) or ("error " .. tostring(result)))
-                        Steal.skip[model] = os.clock() + ((ok and result == "Success") and 1 or 5)
-                        task.wait(0.15)
+                        -- each request waits on the server's answer, so several
+                        -- go at once instead of one after another
+                        Steal.skip[model] = os.clock() + 0.6
+                        Steal.inFlight = (Steal.inFlight or 0) + 1
+                        task.spawn(function()
+                            local ok, result = Game.invoke("Loot", "LootEquip", part)
+                            Steal.inFlight -= 1
+                            Steal.status = ("%s: %s"):format(model.Name, ok and tostring(result) or ("error " .. tostring(result)))
+                            if not (ok and result == "Success") then
+                                Steal.skip[model] = os.clock() + 4
+                            end
+                        end)
                     end
                 end
             end
@@ -988,11 +1024,13 @@ do
         table.sort(list, function(a, b)
             return a.d < b.d
         end)
-        local brought = 0
+        local brought, pending = 0, 0
         for i, e in list do
             if i > Settings.BringCount or not alive() then
                 break
             end
+            pending += 1
+            task.spawn(function()
             local ok, granted = Game.invoke("Loot", "OwnNetworkRequestAsync", e.part, true)
             Steal.status = ("bring %s: %s"):format(e.m.Name, ok and tostring(granted) or ("error " .. tostring(granted)))
             if ok and granted then
@@ -1011,12 +1049,18 @@ do
                     Game.call("Loot", "OwnNetworkRequest", e.part, nil)
                 end)
             end
-            task.wait(0.1)
+            pending -= 1
+            end)
+            task.wait(0.02)
+        end
+        local t0 = os.clock()
+        while pending > 0 and os.clock() - t0 < 5 do
+            task.wait(0.05)
         end
         return brought
     end
 end
-loop(0.4, Steal.pass)
+loop(0.05, Steal.pass)
 loop(3, Steal.refreshNames)
 
 --// Drag settings \\--
@@ -1120,10 +1164,11 @@ do
     pcall(function()
         controls = require(LocalPlayer:WaitForChild("PlayerScripts"):WaitForChild("PlayerModule")):GetControls()
     end)
-    bind(RunService.Heartbeat, function()
+    bind(RunService.Heartbeat, function(dt)
         if not alive() then
             return
         end
+        dt = type(dt) == "number" and dt or 1 / 60
         local root, h = rootPart(), humanoid()
         if not (Settings.Fly and root and h) or h.SeatPart then
             if Fly.on and h then
@@ -1148,8 +1193,13 @@ do
         elseif UserInputService:IsKeyDown(Enum.KeyCode.LeftControl) then
             dir -= Vector3.new(0, 1, 0)
         end
+        -- moved by exactly speed x time each frame, held still otherwise, so
+        -- the slider is the real speed
         local speed = math.min(Settings.FlySpeed, 250)
-        root.AssemblyLinearVelocity = dir.Magnitude > 0 and dir.Unit * speed or Vector3.zero
+        root.AssemblyLinearVelocity = Vector3.zero
+        if dir.Magnitude > 0 then
+            root.CFrame = root.CFrame + dir.Unit * speed * dt
+        end
     end)
     table.insert(Cleanups, function()
         local h = humanoid()
@@ -1440,20 +1490,47 @@ do
         local fwd = flat(seat.CFrame.LookVector) or Vector3.new(0, 0, -1)
         local right = flat(seat.CFrame.RightVector) or Vector3.new(1, 0, 0)
         if Settings.CarFly then
-            -- The car keeps its own heading and steering turns it, so a
-            -- camera that follows the car (phones) can't spin it round.
-            -- Look up or down with the camera to climb or dive.
             CarMove.flying = true
-            local camY = Workspace.CurrentCamera.CFrame.LookVector.Y
-            local dir = (fwd + Vector3.new(0, camY, 0)) * throttle
-            chassis.AssemblyLinearVelocity = dir.Magnitude > 0.05 and dir.Unit * Settings.CarFlySpeed * math.abs(throttle) or Vector3.zero
-            chassis.AssemblyAngularVelocity = Vector3.zero
+            local cam = Workspace.CurrentCamera.CFrame
             local pivot = model:GetPivot()
-            local yaw = -steer * Settings.CarFlyTurn * dt
-            local look = flat(pivot.LookVector)
-            if look then
+            local level = flat(pivot.LookVector)
+            local dir
+            local yaw = 0
+            if Settings.CarFlyHeading then
+                -- the car's own heading, steering turns it
+                local camY = cam.LookVector.Y
+                dir = (fwd + Vector3.new(0, camY, 0)) * throttle
+                yaw = -steer * Settings.CarFlyTurn * dt
+            else
+                -- where the camera looks; A/D slide sideways. The car turns
+                -- toward the camera at a capped rate rather than snapping to
+                -- it, so a camera that follows the car can't whip it round.
+                dir = cam.LookVector * throttle + (flat(cam.RightVector) or right) * steer
+                local want = flat(cam.LookVector)
+                if want and math.abs(throttle) > 0.05 then
+                    local cross = fwd:Cross(want).Y
+                    local angle = math.atan2(cross, fwd:Dot(want))
+                    local maxStep = Settings.CarFlyTurn * dt
+                    yaw = math.clamp(angle, -maxStep, maxStep)
+                end
+            end
+            -- moved by exactly speed x time each frame and held still in
+            -- between, so the slider is the real speed (velocity let the
+            -- car's own wheel torque add on top)
+            local step = Vector3.zero
+            if dir.Magnitude > 0.05 then
+                step = dir.Unit * Settings.CarFlySpeed * math.min(dir.Magnitude, 1) * dt
+            end
+            for _, part in model:GetDescendants() do
+                if part:IsA("BasePart") and part.AssemblyRootPart == part then
+                    part.AssemblyLinearVelocity = Vector3.zero
+                    part.AssemblyAngularVelocity = Vector3.zero
+                end
+            end
+            if level then
                 pcall(function()
-                    model:PivotTo(CFrame.lookAt(pivot.Position, pivot.Position + look) * CFrame.Angles(0, yaw, 0))
+                    local pos = pivot.Position + step
+                    model:PivotTo(CFrame.lookAt(pos, pos + level) * CFrame.Angles(0, yaw, 0))
                 end)
             end
             return
@@ -1889,12 +1966,14 @@ do
     UI.slider(AuraBox, "GunAuraRange", "Range", 10, 400, 0, " studs")
     UI.toggle(AuraBox, "GunAuraPolice", "Police")
     UI.toggle(AuraBox, "GunAuraCivilians", "Civilians")
+    UI.toggle(AuraBox, "ShootCops", "Shoot police cars and helicopters", "While you hold a gun, shoots the nearest police car or helicopter in range")
+    UI.slider(AuraBox, "CopShootRange", "Police vehicle range", 20, 600, 0, " studs")
     UI.toggle(AuraBox, "AutoShoot", "Auto shoot",
         "Shoots whoever silent aim has in the circle, at your gun's fire rate with your gun mods. Uses the silent aim settings for who to aim at")
 
     local MoveBox = Tab:AddRightGroupbox("Movement", "wind")
     UI.toggle(MoveBox, "Fly", "Fly", "Move with your normal controls, Space up, Ctrl down. Off while seated")
-    UI.slider(MoveBox, "FlySpeed", "Speed", 10, 250, 0, " studs/s", "Capped under the game's 300 studs/s limit")
+    UI.slider(MoveBox, "FlySpeed", "Speed", 2, 250, 0, " studs/s", "The real speed. Capped under the game's 300 studs/s limit")
 
     local EspBox = Tab:AddLeftGroupbox("ESP", "eye")
     UI.toggle(EspBox, "EspNPC", "Civilians")
@@ -1941,9 +2020,10 @@ do
     UI.toggle(FastBox, "CarBoost", "Speed boost", "Hold the throttle and the car keeps speeding up past its own top speed, up to the speed below")
     UI.slider(FastBox, "BoostSpeed", "Boost up to", 50, 1000, 0, " studs/s")
     UI.slider(FastBox, "BoostAccel", "Boost pick-up", 20, 600, 0, " studs/s²")
-    UI.toggle(FastBox, "CarFly", "Car fly", "While you drive: gas and reverse go forward and back, steering turns. Look up or down to climb or dive. Let go to hover")
-    UI.slider(FastBox, "CarFlySpeed", "Fly speed", 20, 1000, 0, " studs/s")
-    UI.slider(FastBox, "CarFlyTurn", "Fly turning", 0.5, 6, 1)
+    UI.toggle(FastBox, "CarFly", "Car fly", "While you drive: gas flies where the camera looks, steering slides sideways. Let go to hover")
+    UI.slider(FastBox, "CarFlySpeed", "Fly speed", 5, 1000, 0, " studs/s", "The real speed")
+    UI.slider(FastBox, "CarFlyTurn", "Fly turning", 0.5, 6, 1, nil, "How fast the car turns to follow the camera")
+    UI.toggle(FastBox, "CarFlyHeading", "Steer instead of camera", "The car keeps its heading and steering turns it. Try this if the camera fights the car on phone")
 
     local HandleBox = Tab:AddRightGroupbox("Handling", "steering-wheel")
     UI.toggle(HandleBox, "AntiDrift", "No drifting", "Takes out the sideways slide, so the car goes where it points at speed")
@@ -1988,6 +2068,7 @@ do
     UI.toggle(StealBox, "AutoSteal", "Auto steal", "Puts small items worth at least the amount below into your backpack, the way pressing equip does")
     UI.slider(StealBox, "StealMin", "Worth at least", 0, 5000, 0, " $")
     UI.slider(StealBox, "StealRange", "Range", 4, 20, 0, " studs")
+    UI.slider(StealBox, "StealAtOnce", "At once", 1, 15, 0, nil, "How many items it asks for at the same time")
     UI.toggle(StealBox, "TakeUnlisted", "Take unlisted items", "Items the game gives no value (like the tutorial's watch and trophy) count as worth enough, for stealing and bringing")
     local StealLabel = StealBox:AddLabel("...", true)
     loop(0.5, function()
