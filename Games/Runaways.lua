@@ -84,7 +84,8 @@ local Settings = {
     -- driving
     Tune = false, SpeedMult = 1.3, AccelMult = 1.3, TorqueMult = 1.2, BrakeMult = 1.3, TurnMult = 1.1,
     AutoPour = false, LowFuelAlert = true, LowFuelAt = 20, AutoFlip = false,
-    CarFly = false, CarFlySpeed = 220, CarFlyTurn = 2.2, CarBoost = false, BoostSpeed = 300, BoostAccel = 120,
+    CarFly = false, CarFlySpeed = 220, CarFlyTurn = 2.2, CarFlyResponse = 5,
+    BoostGrip = 0.3, BoostTurn = 1.5, BoostDownforce = 80, CarBoost = false, BoostSpeed = 300, BoostAccel = 120,
     AntiDrift = false, Grip = 0.35, DriftFrom = 30, SteerAssist = false, SteerPower = 1.6, Stabilize = false,
     BrakeAssist = false, BrakePower = 150,
     AutoShoot = false, ShootCops = false, CopShootRange = 250, StealAtOnce = 6, CarFlyHeading = false,
@@ -1452,7 +1453,8 @@ do
         if controls then
             local ok, v = pcall(controls.GetMoveVector, controls)
             if ok and typeof(v) == "Vector3" then
-                take(-v.Z, v.X)
+                -- the game doubles the stick, so half a push is full throttle
+                take(math.clamp(-v.Z * 2, -1, 1), math.clamp(v.X * 2, -1, 1))
             end
         end
         return math.clamp(throttle, -1, 1), math.clamp(steer, -1, 1)
@@ -1493,48 +1495,55 @@ do
             CarMove.flying = true
             local cam = Workspace.CurrentCamera.CFrame
             local pivot = model:GetPivot()
-            local level = flat(pivot.LookVector)
-            local dir
-            local yaw = 0
+            -- how the driver's seat sits in the car, so "forward" is the
+            -- way you face when the car is turned
+            local seatRel = pivot:ToObjectSpace(seat.CFrame).Rotation
+            local face, side
             if Settings.CarFlyHeading then
-                -- the car's own heading, steering turns it
-                local camY = cam.LookVector.Y
-                dir = (fwd + Vector3.new(0, camY, 0)) * throttle
-                yaw = -steer * Settings.CarFlyTurn * dt
+                -- the car's own heading; steering turns it
+                local yawed = CFrame.lookAt(Vector3.zero, fwd) * CFrame.Angles(0, -steer * Settings.CarFlyTurn * dt, 0)
+                face = yawed.LookVector + Vector3.new(0, cam.LookVector.Y, 0)
+                side = Vector3.zero
             else
-                -- where the camera looks; A/D slide sideways. The car turns
-                -- toward the camera at a capped rate rather than snapping to
-                -- it, so a camera that follows the car can't whip it round.
-                dir = cam.LookVector * throttle + (flat(cam.RightVector) or right) * steer
-                local want = flat(cam.LookVector)
-                if want and math.abs(throttle) > 0.05 then
-                    local cross = fwd:Cross(want).Y
-                    local angle = math.atan2(cross, fwd:Dot(want))
-                    local maxStep = Settings.CarFlyTurn * dt
-                    yaw = math.clamp(angle, -maxStep, maxStep)
-                end
+                -- where the camera looks, A/D slide sideways
+                face = cam.LookVector
+                side = (flat(cam.RightVector) or right) * steer
             end
-            -- moved by exactly speed x time each frame and held still in
-            -- between, so the slider is the real speed (velocity let the
-            -- car's own wheel torque add on top)
-            local step = Vector3.zero
-            if dir.Magnitude > 0.05 then
-                step = dir.Unit * Settings.CarFlySpeed * math.min(dir.Magnitude, 1) * dt
+            face = face.Magnitude > 1e-3 and face.Unit or fwd
+            -- never straight up or down (the car would flip over the top)
+            if math.abs(face.Y) > 0.9 then
+                local f = flat(face) or fwd
+                face = (f * 0.436 + Vector3.new(0, face.Y > 0 and 0.9 or -0.9, 0)).Unit
             end
+            -- speeds up and slows down smoothly toward the target speed
+            local want = face * throttle + side
+            if want.Magnitude > 1 then
+                want = want.Unit
+            end
+            want *= Settings.CarFlySpeed
+            local blend = 1 - math.exp(-Settings.CarFlyResponse * dt)
+            CarMove.vel = (CarMove.vel or Vector3.zero):Lerp(want, blend)
+            if CarMove.vel.Magnitude < 0.05 and want.Magnitude == 0 then
+                CarMove.vel = Vector3.zero
+            end
+            -- the car turns to face the same way, quickly but not in a snap
+            local target = CFrame.lookAt(Vector3.zero, face) * seatRel:Inverse()
+            local turn = 1 - math.exp(-10 * dt)
+            local rot = pivot.Rotation:Lerp(target, turn)
+            -- moved by velocity x time and held still in between, so the
+            -- speed is exact and the car's own engine can't add to it
             for _, part in model:GetDescendants() do
                 if part:IsA("BasePart") and part.AssemblyRootPart == part then
                     part.AssemblyLinearVelocity = Vector3.zero
                     part.AssemblyAngularVelocity = Vector3.zero
                 end
             end
-            if level then
-                pcall(function()
-                    local pos = pivot.Position + step
-                    model:PivotTo(CFrame.lookAt(pos, pos + level) * CFrame.Angles(0, yaw, 0))
-                end)
-            end
+            pcall(function()
+                model:PivotTo(CFrame.new(pivot.Position + CarMove.vel * dt) * rot)
+            end)
             return
         end
+        CarMove.vel = nil
         CarMove.flying = false
         if not (Settings.CarBoost or Settings.BrakeAssist or Settings.AntiDrift or Settings.SteerAssist or Settings.Stabilize) then
             return
@@ -1543,10 +1552,20 @@ do
         local flatV = Vector3.new(v.X, 0, v.Z)
         local speed = flatV.Magnitude
         local along = flatV:Dot(fwd)
-        -- Boost: on the throttle, speeds up past the car's own top speed.
-        if Settings.CarBoost and throttle > 0.1 and speed > 8 and speed < Settings.BoostSpeed then
-            local new = math.min(speed + Settings.BoostAccel * dt * throttle, Settings.BoostSpeed)
-            flatV = flatV.Unit * new
+        local boosting = false
+        -- Boost: on the throttle, speeds up past the car's own top speed
+        -- along the way the car faces (not the way it's sliding), and keeps
+        -- it drivable: the slide is taken out, steering turns at a steady
+        -- rate, tipping is damped and it's pressed onto the road.
+        if Settings.CarBoost and throttle > 0.1 and along > 5 then
+            boosting = true
+            local newAlong = along
+            if along < Settings.BoostSpeed then
+                newAlong = math.min(along + Settings.BoostAccel * dt * throttle, Settings.BoostSpeed)
+            end
+            local slide = flatV:Dot(right)
+            flatV = fwd * newAlong + right * slide * (1 - Settings.BoostGrip)
+            v = Vector3.new(v.X, math.min(v.Y, 15) - Settings.BoostDownforce * dt, v.Z)
         end
         -- Brake assist: braking (throttle back while rolling forward) bites harder.
         if Settings.BrakeAssist and throttle < -0.1 and along > 5 then
@@ -1561,6 +1580,9 @@ do
         end
         chassis.AssemblyLinearVelocity = Vector3.new(flatV.X, v.Y, flatV.Z)
         local av = chassis.AssemblyAngularVelocity
+        if boosting then
+            av = Vector3.new(av.X * 0.5, -steer * Settings.BoostTurn, av.Z * 0.5)
+        end
         -- Steering assist: at speed, the car turns at a steady rate.
         if Settings.SteerAssist and speed > Settings.DriftFrom and math.abs(steer) > 0.05 then
             local dirSign = along >= 0 and 1 or -1
@@ -2020,9 +2042,13 @@ do
     UI.toggle(FastBox, "CarBoost", "Speed boost", "Hold the throttle and the car keeps speeding up past its own top speed, up to the speed below")
     UI.slider(FastBox, "BoostSpeed", "Boost up to", 50, 1000, 0, " studs/s")
     UI.slider(FastBox, "BoostAccel", "Boost pick-up", 20, 600, 0, " studs/s²")
+    UI.slider(FastBox, "BoostGrip", "Boost grip", 0, 1, 2, nil, "How much sliding it takes out while boosting")
+    UI.slider(FastBox, "BoostTurn", "Boost turning", 0.3, 4, 1, nil, "How fast you turn while boosting")
+    UI.slider(FastBox, "BoostDownforce", "Boost downforce", 0, 300, 0, nil, "Keeps the car on the road over bumps at speed")
     UI.toggle(FastBox, "CarFly", "Car fly", "While you drive: gas flies where the camera looks, steering slides sideways. Let go to hover")
     UI.slider(FastBox, "CarFlySpeed", "Fly speed", 5, 1000, 0, " studs/s", "The real speed")
-    UI.slider(FastBox, "CarFlyTurn", "Fly turning", 0.5, 6, 1, nil, "How fast the car turns to follow the camera")
+    UI.slider(FastBox, "CarFlyResponse", "Fly response", 1, 15, 1, nil, "How quickly it gets up to speed and stops. Higher is snappier")
+    UI.slider(FastBox, "CarFlyTurn", "Steering turn rate", 0.5, 6, 1, nil, "Only for \"Steer instead of camera\"")
     UI.toggle(FastBox, "CarFlyHeading", "Steer instead of camera", "The car keeps its heading and steering turns it. Try this if the camera fights the car on phone")
 
     local HandleBox = Tab:AddRightGroupbox("Handling", "steering-wheel")
