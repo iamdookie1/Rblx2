@@ -92,7 +92,7 @@ local Settings = {
     AutoShoot = false, ShootCops = false, CopShootRange = 250, StealAtOnce = 6, CarFlyHeading = false,
     -- loot
     AutoCash = false, CashRange = 30, AutoBreak = false, BreakRange = 12, BreakEvery = 0.5,
-    AutoSteal = false, StealMin = 100, StealRange = 10, BringMin = 0, BringRange = 300, BringCount = 10,
+    AutoSteal = false, StealMin = 100, StealRange = 8, BringMin = 0, BringRange = 300, BringCount = 10,
     BringOnly = false, BringNames = {}, TakeUnlisted = true,
     DragNoclip = false, DragPower = 50, DragForce = 1, DragDistance = 1,
     LootEsp = false, CashEsp = false,
@@ -972,7 +972,9 @@ do
                             Steal.inFlight -= 1
                             Steal.status = ("%s: %s"):format(model.Name, ok and tostring(result) or ("error " .. tostring(result)))
                             if not (ok and result == "Success") then
-                                Steal.skip[model] = os.clock() + 4
+                                -- refused (usually just out of reach): try again soon,
+                                -- not after 4 s, which is what made it feel slow
+                                Steal.skip[model] = os.clock() + 0.3
                             end
                         end)
                     end
@@ -1606,11 +1608,24 @@ end
 --// Travel: flying to places (auto sell, checkpoints) \\--
 local Travel = { busy = false, status = "idle" }
 do
-    local function groundBelow(pos, ignore)
+    -- The ground under a point, looked for from just above `fromY` (your own
+    -- height) downward. Casting from far above could start inside a hill
+    -- or the map and find the underside of something, which is how the
+    -- checkpoint flight put you under the map.
+    local function groundBelow(pos, ignore, fromY, depth)
         local params = RaycastParams.new()
         params.FilterType = Enum.RaycastFilterType.Exclude
-        params.FilterDescendantsInstances = ignore
-        local hit = Workspace:Raycast(pos + Vector3.new(0, 300, 0), Vector3.new(0, -800, 0), params)
+        params.IgnoreWater = true
+        local list = table.clone(ignore)
+        for _, name in { "Effects", "Vehicles" } do
+            local f = Workspace:FindFirstChild(name)
+            if f then
+                table.insert(list, f)
+            end
+        end
+        params.FilterDescendantsInstances = list
+        local start = Vector3.new(pos.X, (fromY or pos.Y) + 40, pos.Z)
+        local hit = Workspace:Raycast(start, Vector3.new(0, -(depth or 400), 0), params)
         return hit and hit.Position or nil
     end
     Travel.groundBelow = groundBelow
@@ -1742,8 +1757,17 @@ do
             along = math.min(along + Settings.CheckpointSpeed * dt, target)
             local p = Travel.pointAt(road, along, x0)
             local ahead = Travel.pointAt(road, along + 10, x0)
-            local ground = groundBelow(p, ignore)
-            local y = (ground and ground.Y or model:GetPivot().Position.Y) + Settings.CheckpointHeight
+            -- follow the ground at a set height, but only ground found near
+            -- your own height; anything else and you keep your height
+            local curY = model:GetPivot().Position.Y
+            local ground = groundBelow(p, ignore, curY, 250)
+            local y = curY
+            if ground then
+                local want = ground.Y + Settings.CheckpointHeight
+                local rate = 120 * dt
+                y = math.clamp(want, curY - rate, curY + rate)
+                y = math.max(y, ground.Y + 3)
+            end
             local pos = Vector3.new(p.X, y, p.Z)
             local look = Vector3.new(ahead.X - p.X, 0, ahead.Z - p.Z)
             for _, part in model:GetDescendants() do
@@ -1758,15 +1782,16 @@ do
                 model:PivotTo(CFrame.lookAt(pos, pos + (look.Magnitude > 0.01 and look.Unit or Vector3.new(0, 0, -1))) * seatRel:Inverse())
             end)
         end
-        -- down onto the road
+        -- down onto the road right below you; if there's nothing below,
+        -- you're left hovering rather than dropped
         local pivot = model:GetPivot()
-        local ground = groundBelow(pivot.Position, ignore)
+        local ground = groundBelow(pivot.Position, ignore, pivot.Position.Y, 120)
         if ground then
             pcall(function()
                 model:PivotTo(CFrame.new(Vector3.new(pivot.Position.X, ground.Y + 4, pivot.Position.Z)) * pivot.Rotation)
             end)
         end
-        Travel.status = along >= target and "at the checkpoint" or "stopped"
+        Travel.status = (along >= target and "at the checkpoint" or "stopped") .. (ground and "" or " (no ground below, left hovering)")
         Travel.busy = false
     end
 end
@@ -1887,18 +1912,23 @@ do
         if Travel.footTo(stand, Settings.SellSpeed) then
             local items = Sell.items()
             Sell.status = ("selling %d items"):format(#items)
-            for _, tool in items do
+            -- the counter takes what's dropped onto it: each item is dropped
+            -- through the game's own drop, placed over the counter's Volume
+            local vol = spot.counter:FindFirstChild("Volume")
+            for i, tool in items do
                 if not alive() then
                     break
                 end
                 pcall(h.EquipTool, h, tool)
+                task.wait(0.2)
+                pcall(h.UnequipTools, h)
+                local at = (vol and vol:IsA("BasePart")) and vol.Position or spot.bell.Position
+                local spread = Vector3.new(((i - 1) % 3 - 1) * 0.8, 1.5, (((i - 1) // 3) % 3 - 1) * 0.8)
+                Game.call("Loot", "LootUnequip", tool, false, false, CFrame.new(at + spread))
                 task.wait(0.25)
-                press(spot.prompt)
-                task.wait(0.35)
             end
-            pcall(h.UnequipTools, h)
-            task.wait(0.2)
-            press(spot.prompt) -- with nothing in hand: in case the bell is what sells
+            task.wait(0.3)
+            press(spot.prompt) -- the bell
             -- only go back once the money has actually come in
             local t0 = os.clock()
             while alive() and cash() <= startCash and os.clock() - t0 < 8 do
