@@ -85,7 +85,8 @@ local Settings = {
     Tune = false, SpeedMult = 1.3, AccelMult = 1.3, TorqueMult = 1.2, BrakeMult = 1.3, TurnMult = 1.1,
     AutoPour = false, LowFuelAlert = true, LowFuelAt = 20, AutoFlip = false,
     CarFly = false, CarFlySpeed = 220, CarFlyTurn = 2.2, CarFlyResponse = 5,
-    BoostGrip = 0.3, BoostTurn = 1.5, BoostDownforce = 80, CarBoost = false, BoostSpeed = 300, BoostAccel = 120,
+    BoostGrip = 0.3, BoostTurn = 1.5, BoostDownforce = 80,
+    AutoSell = false, SellAt = 0, SellRange = 500, SellSpeed = 200, CheckpointSpeed = 700, CheckpointHeight = 12, CarBoost = false, BoostSpeed = 300, BoostAccel = 120,
     AntiDrift = false, Grip = 0.35, DriftFrom = 30, SteerAssist = false, SteerPower = 1.6, Stabilize = false,
     BrakeAssist = false, BrakePower = 150,
     AutoShoot = false, ShootCops = false, CopShootRange = 250, StealAtOnce = 6, CarFlyHeading = false,
@@ -1505,9 +1506,10 @@ do
                 face = yawed.LookVector + Vector3.new(0, cam.LookVector.Y, 0)
                 side = Vector3.zero
             else
-                -- where the camera looks, A/D slide sideways
+                -- where the camera looks. A/D do nothing here: the camera is
+                -- the steering, and sliding sideways read as moving on its own.
                 face = cam.LookVector
-                side = (flat(cam.RightVector) or right) * steer
+                side = Vector3.zero
             end
             face = face.Magnitude > 1e-3 and face.Unit or fwd
             -- never straight up or down (the car would flip over the top)
@@ -1521,15 +1523,20 @@ do
                 want = want.Unit
             end
             want *= Settings.CarFlySpeed
-            local blend = 1 - math.exp(-Settings.CarFlyResponse * dt)
+            -- stopping is quicker than speeding up, so letting go stops it
+            local blend = 1 - math.exp(-Settings.CarFlyResponse * (want.Magnitude == 0 and 2.5 or 1) * dt)
             CarMove.vel = (CarMove.vel or Vector3.zero):Lerp(want, blend)
             if CarMove.vel.Magnitude < 0.05 and want.Magnitude == 0 then
                 CarMove.vel = Vector3.zero
             end
             -- the car turns to face the same way, quickly but not in a snap
-            local target = CFrame.lookAt(Vector3.zero, face) * seatRel:Inverse()
-            local turn = 1 - math.exp(-10 * dt)
-            local rot = pivot.Rotation:Lerp(target, turn)
+            -- turns only while you're flying somewhere, so a camera that
+            -- drifts on its own (phones) can't turn a parked car
+            local rot = pivot.Rotation
+            if math.abs(throttle) > 0.05 or Settings.CarFlyHeading then
+                local target = CFrame.lookAt(Vector3.zero, face) * seatRel:Inverse()
+                rot = rot:Lerp(target, 1 - math.exp(-10 * dt))
+            end
             -- moved by velocity x time and held still in between, so the
             -- speed is exact and the car's own engine can't add to it
             for _, part in model:GetDescendants() do
@@ -1595,6 +1602,326 @@ do
         chassis.AssemblyAngularVelocity = av
     end)
 end
+
+--// Travel: flying to places (auto sell, checkpoints) \\--
+local Travel = { busy = false, status = "idle" }
+do
+    local function groundBelow(pos, ignore)
+        local params = RaycastParams.new()
+        params.FilterType = Enum.RaycastFilterType.Exclude
+        params.FilterDescendantsInstances = ignore
+        local hit = Workspace:Raycast(pos + Vector3.new(0, 300, 0), Vector3.new(0, -800, 0), params)
+        return hit and hit.Position or nil
+    end
+    Travel.groundBelow = groundBelow
+    -- On foot to a point at a set speed (kept under the game's 300 limit),
+    -- moved by position each frame so walls don't stop it.
+    function Travel.footTo(target, speed)
+        local root, h = rootPart(), humanoid()
+        if not (root and h) then
+            return false
+        end
+        speed = math.min(speed, 250)
+        h.PlatformStand = true
+        local t0 = os.clock()
+        while alive() and root.Parent and os.clock() - t0 < 30 do
+            local dt = RunService.Heartbeat:Wait()
+            local diff = target - root.Position
+            if diff.Magnitude < 1.5 then
+                break
+            end
+            local step = math.min(diff.Magnitude, speed * dt)
+            root.AssemblyLinearVelocity = Vector3.zero
+            root.CFrame = CFrame.new(root.Position + diff.Unit * step) * root.CFrame.Rotation
+        end
+        root.AssemblyLinearVelocity = Vector3.zero
+        h.PlatformStand = false
+        return (target - root.Position).Magnitude < 3
+    end
+
+    -- The road, from the game's own road tracker: its path points (or a
+    -- straight road along Z) and where the borders (checkpoints) are.
+    function Travel.road()
+        local rp = Game.module("RoadProgressClient")
+        if not (rp and rp.Along and typeof(debug) == "table" and debug.getupvalues) then
+            return nil
+        end
+        local ok, ups = pcall(debug.getupvalues, rp.Along)
+        if not ok or type(ups) ~= "table" then
+            return nil
+        end
+        local road = { straight = false, points = {}, offset = 0 }
+        for _, up in ups do
+            if type(up) == "boolean" then
+                road.straight = up
+            elseif type(up) == "number" then
+                road.offset = up
+            elseif type(up) == "table" and type(up[1]) == "table" and up[1].along then
+                road.points = up
+            end
+        end
+        local okB, borders = pcall(rp.Borders)
+        road.borders = {}
+        for _, b in okB and type(borders) == "table" and borders or {} do
+            local a = type(b) == "number" and b or (type(b) == "table" and (b.along or b.Along or b.distance or b[1])) or nil
+            if type(a) == "number" then
+                table.insert(road.borders, a)
+            end
+        end
+        table.sort(road.borders)
+        road.along = function(pos)
+            local okA, a = pcall(rp.Along, pos)
+            return okA and a or nil
+        end
+        return road
+    end
+    -- A world point (x, z) at a distance along the road.
+    function Travel.pointAt(road, along, nearX)
+        local pts = road.points
+        if road.straight or #pts < 2 then
+            return Vector3.new(nearX or 0, 0, along + road.offset)
+        end
+        if along <= pts[1].along then
+            return Vector3.new(pts[1].x, 0, pts[1].z)
+        end
+        for i = 1, #pts - 1 do
+            local a, b = pts[i], pts[i + 1]
+            if along <= b.along then
+                local t = (along - a.along) / math.max(b.along - a.along, 1e-6)
+                return Vector3.new(a.x + (b.x - a.x) * t, 0, a.z + (b.z - a.z) * t)
+            end
+        end
+        local last = pts[#pts]
+        return Vector3.new(last.x, 0, last.z)
+    end
+    function Travel.nextCheckpoint()
+        local road = Travel.road()
+        local root = rootPart()
+        if not (road and root) then
+            return nil, "couldn't read the road"
+        end
+        local here = road.along(root.Position)
+        if not here then
+            return nil, "couldn't place you on the road"
+        end
+        for _, b in road.borders do
+            if b > here + 10 then
+                return road, here, b
+            end
+        end
+        return nil, "no checkpoint ahead"
+    end
+    -- Flies the car along the road to just past the next checkpoint, a
+    -- little above it, then sets it down on the road.
+    function Travel.toCheckpoint()
+        if Travel.busy then
+            return
+        end
+        local model, chassis = CarMove.driving()
+        if not model then
+            notify("Get in the driver's seat first", 3)
+            return
+        end
+        local road, here, goal = Travel.nextCheckpoint()
+        if not road then
+            notify("Checkpoint: " .. tostring(here), 4)
+            return
+        end
+        Travel.busy = true
+        local target = goal + 25
+        local along = here
+        local root = rootPart()
+        local x0 = root and root.Position.X or 0
+        local ignore = { model, character() }
+        Travel.status = ("flying %d studs to the checkpoint"):format(math.floor(target - here))
+        while alive() and along < target do
+            local dt = RunService.Heartbeat:Wait()
+            if not CarMove.driving() then
+                break
+            end
+            along = math.min(along + Settings.CheckpointSpeed * dt, target)
+            local p = Travel.pointAt(road, along, x0)
+            local ahead = Travel.pointAt(road, along + 10, x0)
+            local ground = groundBelow(p, ignore)
+            local y = (ground and ground.Y or model:GetPivot().Position.Y) + Settings.CheckpointHeight
+            local pos = Vector3.new(p.X, y, p.Z)
+            local look = Vector3.new(ahead.X - p.X, 0, ahead.Z - p.Z)
+            for _, part in model:GetDescendants() do
+                if part:IsA("BasePart") and part.AssemblyRootPart == part then
+                    part.AssemblyLinearVelocity = Vector3.zero
+                    part.AssemblyAngularVelocity = Vector3.zero
+                end
+            end
+            pcall(function()
+                local seat = humanoid().SeatPart
+                local seatRel = model:GetPivot():ToObjectSpace(seat.CFrame).Rotation
+                model:PivotTo(CFrame.lookAt(pos, pos + (look.Magnitude > 0.01 and look.Unit or Vector3.new(0, 0, -1))) * seatRel:Inverse())
+            end)
+        end
+        -- down onto the road
+        local pivot = model:GetPivot()
+        local ground = groundBelow(pivot.Position, ignore)
+        if ground then
+            pcall(function()
+                model:PivotTo(CFrame.new(Vector3.new(pivot.Position.X, ground.Y + 4, pivot.Position.Z)) * pivot.Rotation)
+            end)
+        end
+        Travel.status = along >= target and "at the checkpoint" or "stopped"
+        Travel.busy = false
+    end
+end
+
+--// Auto sell \\--
+-- When your backpack is full: on foot to the nearest pawn counter within
+-- range, each piece of loot put up through the counter's own "Add item to
+-- sell" prompt, wait until the cash actually comes in, then back.
+local Sell = { busy = false, status = "idle", lastTry = -math.huge }
+do
+    local function cash()
+        local ls = LocalPlayer:FindFirstChild("leaderstats")
+        for _, v in ls and ls:GetChildren() or {} do
+            if v.Name:sub(1, 4) == "Cash" and v:IsA("ValueBase") then
+                return v.Value
+            end
+        end
+        return 0
+    end
+    Sell.cash = cash
+    local function isLoot(tool)
+        if not tool:IsA("Tool") or tool:HasTag("Undroppable") then
+            return false
+        end
+        if Game.toolConfig(tool) then
+            return false -- weapons and tools aren't sold here
+        end
+        local loot = Data.Loot
+        local ok, data = pcall(function()
+            return loot.GetItemData(tool.Name)
+        end)
+        return (ok and data ~= nil) or tool:HasTag("Equippable")
+    end
+    function Sell.items()
+        local out = {}
+        for _, where in { LocalPlayer:FindFirstChildOfClass("Backpack"), character() } do
+            for _, t in where and where:GetChildren() or {} do
+                if isLoot(t) then
+                    table.insert(out, t)
+                end
+            end
+        end
+        return out
+    end
+    function Sell.limit()
+        local m = Game.module("BackpackCapacity")
+        local ok, n = pcall(function()
+            return m.GetSlotLimit()
+        end)
+        return ok and type(n) == "number" and n or (Game.balance("MaxTools") or 10)
+    end
+    function Sell.full()
+        local count = 0
+        for _, where in { LocalPlayer:FindFirstChildOfClass("Backpack"), character() } do
+            for _, t in where and where:GetChildren() or {} do
+                if t:IsA("Tool") then
+                    count += 1
+                end
+            end
+        end
+        local at = Settings.SellAt > 0 and Settings.SellAt or Sell.limit()
+        return #Sell.items() > 0 and count >= at
+    end
+    function Sell.counter()
+        local root = rootPart()
+        if not root then
+            return nil
+        end
+        local best, bestD
+        for _, counter in CollectionService:GetTagged("PawnCounter") do
+            local bell = counter:FindFirstChild("CallBell")
+            local prompt = bell and bell:FindFirstChildWhichIsA("ProximityPrompt", true)
+            if prompt and inWorld(counter) then
+                local d = (bell.Position - root.Position).Magnitude
+                if d <= Settings.SellRange and (not bestD or d < bestD) then
+                    best, bestD = { bell = bell, prompt = prompt, counter = counter }, d
+                end
+            end
+        end
+        return best, bestD
+    end
+    local function press(prompt)
+        local hold = prompt.HoldDuration
+        prompt.HoldDuration = 0
+        if typeof(fireproximityprompt) == "function" then
+            pcall(fireproximityprompt, prompt)
+        else
+            pcall(function()
+                prompt:InputHoldBegin()
+                task.wait()
+                prompt:InputHoldEnd()
+            end)
+        end
+        prompt.HoldDuration = hold
+    end
+    function Sell.run()
+        if Sell.busy or Travel.busy then
+            return
+        end
+        local h, root = humanoid(), rootPart()
+        if not (h and root) or h.SeatPart then
+            Sell.status = "get out of the car to sell"
+            return
+        end
+        local spot, dist = Sell.counter()
+        if not spot then
+            Sell.status = ("no pawn counter within %d studs"):format(Settings.SellRange)
+            return
+        end
+        Sell.busy = true
+        local home = root.CFrame
+        local startCash = cash()
+        -- stand by the bell, on the side you came from
+        local away = Vector3.new(root.Position.X - spot.bell.Position.X, 0, root.Position.Z - spot.bell.Position.Z)
+        away = away.Magnitude > 0.1 and away.Unit or Vector3.new(0, 0, 1)
+        local stand = spot.bell.Position + away * 3.5 + Vector3.new(0, 1.5, 0)
+        Sell.status = ("flying %d studs to the pawn counter"):format(math.floor(dist))
+        if Travel.footTo(stand, Settings.SellSpeed) then
+            local items = Sell.items()
+            Sell.status = ("selling %d items"):format(#items)
+            for _, tool in items do
+                if not alive() then
+                    break
+                end
+                pcall(h.EquipTool, h, tool)
+                task.wait(0.25)
+                press(spot.prompt)
+                task.wait(0.35)
+            end
+            pcall(h.UnequipTools, h)
+            task.wait(0.2)
+            press(spot.prompt) -- with nothing in hand: in case the bell is what sells
+            -- only go back once the money has actually come in
+            local t0 = os.clock()
+            while alive() and cash() <= startCash and os.clock() - t0 < 8 do
+                task.wait(0.2)
+            end
+            local gained = cash() - startCash
+            Sell.status = gained > 0 and ("sold for $%d"):format(gained) or "no cash came in (the counter may need you to do something)"
+            Travel.footTo(home.Position, Settings.SellSpeed)
+            pcall(function()
+                root.CFrame = home
+            end)
+        else
+            Sell.status = "couldn't reach the pawn counter"
+        end
+        Sell.lastTry = os.clock()
+        Sell.busy = false
+    end
+end
+loop(1, function()
+    if Settings.AutoSell and not Sell.busy and os.clock() - Sell.lastTry > 10 and Sell.full() then
+        Sell.run()
+    end
+end)
 
 --// Survival \\--
 local Survive = { lastEat = 0, revivedFor = nil, lowWarned = false }
@@ -2051,6 +2378,22 @@ do
     UI.slider(FastBox, "CarFlyTurn", "Steering turn rate", 0.5, 6, 1, nil, "Only for \"Steer instead of camera\"")
     UI.toggle(FastBox, "CarFlyHeading", "Steer instead of camera", "The car keeps its heading and steering turns it. Try this if the camera fights the car on phone")
 
+    local CheckBox = Tab:AddLeftGroupbox("Checkpoints", "flag")
+    UI.slider(CheckBox, "CheckpointSpeed", "Speed", 100, 3000, 0, " studs/s")
+    UI.slider(CheckBox, "CheckpointHeight", "Height above the road", 4, 60, 0, " studs")
+    CheckBox:AddButton({
+        Text = "Fly to the next checkpoint",
+        Func = function()
+            task.spawn(Travel.toCheckpoint)
+        end,
+    })
+    local CheckLabel = CheckBox:AddLabel("...", true)
+    loop(1, function()
+        local road, here, goal = Travel.nextCheckpoint()
+        CheckLabel:SetText(road and ("Next checkpoint in %d studs · %s"):format(math.floor(goal - here), Travel.status)
+            or ("Checkpoint: %s"):format(tostring(here)))
+    end)
+
     local HandleBox = Tab:AddRightGroupbox("Handling", "steering-wheel")
     UI.toggle(HandleBox, "AntiDrift", "No drifting", "Takes out the sideways slide, so the car goes where it points at speed")
     UI.slider(HandleBox, "Grip", "Grip", 0.05, 1, 2, nil, "How much of the slide is taken out each frame")
@@ -2122,6 +2465,22 @@ do
     })
     loop(3, function()
         pcall(NameDrop.SetValues, NameDrop, Steal.names)
+    end)
+
+    local SellBox = Tab:AddRightGroupbox("Auto sell", "store")
+    UI.toggle(SellBox, "AutoSell", "Auto sell when full", "When your backpack is full, flies you to the nearest pawn counter, sells your loot, waits for the money, and flies you back. On foot only")
+    UI.slider(SellBox, "SellAt", "Sell at", 0, 30, 0, " items", "0 = when the backpack is full")
+    UI.slider(SellBox, "SellRange", "Counter within", 50, 500, 0, " studs")
+    UI.slider(SellBox, "SellSpeed", "Flight speed", 20, 250, 0, " studs/s")
+    SellBox:AddButton({
+        Text = "Sell now",
+        Func = function()
+            task.spawn(Sell.run)
+        end,
+    })
+    local SellLabel = SellBox:AddLabel("...", true)
+    loop(0.5, function()
+        SellLabel:SetText(("Auto sell: %s · cash $%s"):format(Sell.status, tostring(Sell.cash())))
     end)
 
     local DragBox = Tab:AddLeftGroupbox("Dragging", "hand")
