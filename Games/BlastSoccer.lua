@@ -69,6 +69,8 @@ local Settings = {
     Timing = false, SweetGap = 2, MaxHold = 0.35,
     -- lunge on shoot
     Lunge = false, LungeSpeed = 60, LungeTime = 0.15,
+    -- auto hit
+    AutoHit = false, AutoMode = "Toward their goal", AutoMinSpeed = 0,
 }
 
 --// Plumbing \\--
@@ -581,6 +583,97 @@ do
     end)
 end
 
+--// Auto hit \\--
+-- Shoots for you, with your own aim, the moment the ball is at its best spot
+-- in your reach (the same moment the timing helper waits for). It goes
+-- through the game's own soundwave, so the cooldown and every other rule
+-- are the game's.
+local Auto = { info = "off" }
+do
+    -- The goal you attack: the one whose Team is the other team.
+    local function enemyGoal()
+        local team = LocalPlayer.Team and LocalPlayer.Team.Name
+        if team ~= "Blue" and team ~= "Orange" then
+            return nil, nil
+        end
+        local enemy = team == "Blue" and "Orange" or "Blue"
+        local arena = Workspace:FindFirstChild("Arena")
+        local goals = arena and arena:FindFirstChild("Goals")
+        for _, g in goals and goals:GetChildren() or {} do
+            local trig = g:FindFirstChild("Trigger")
+            if g:GetAttribute("Team") == enemy and trig and trig:IsA("BasePart") then
+                return trig.Position, enemy
+            end
+        end
+        return nil, enemy
+    end
+    Auto.enemyGoal = enemyGoal
+    local function cooling()
+        local w = Mods.Weapon
+        if w and type(w.getSoundwaveCooldown) == "function" then
+            local ok, left = pcall(w.getSoundwaveCooldown)
+            return ok and type(left) == "number" and left > 0
+        end
+        return false
+    end
+    local lastTry = -math.huge
+    function Auto.step()
+        if not Settings.AutoHit then
+            Auto.info = "off"
+            return
+        end
+        if Timing.holding or os.clock() - lastTry < 0.12 or cooling() then
+            return
+        end
+        local verdict, speed, inReach = Timing.verdict()
+        if not (inReach and verdict == "fire") then
+            Auto.info = "waiting for the ball"
+            return
+        end
+        if speed and speed < Settings.AutoMinSpeed then
+            Auto.info = ("in reach, but only %d speed"):format(math.floor(speed))
+            return
+        end
+        if Settings.AutoMode ~= "Any time" then
+            local root = rootPart()
+            local center, ballVel, radius = Ball.state()
+            if not (root and center) then
+                return
+            end
+            local origin = root.Position + Vector3.new(0, 1.5, 0)
+            local look = currentAim(origin)
+            local launch = Shot.launch(origin, look, center, radius, ballVel, Shot.myVelocity())
+            local goalPos, enemy = enemyGoal()
+            if Settings.AutoMode == "Only if it scores" then
+                local _, _, goal = Sim.path(center, launch, radius, 4)
+                if not (goal and goal == enemy) then
+                    Auto.info = "in reach, but that shot doesn't score"
+                    return
+                end
+            elseif goalPos then
+                local to = goalPos - center
+                if launch.Unit:Dot(to.Unit) < 0.35 then
+                    Auto.info = "in reach, but you're aiming away from their goal"
+                    return
+                end
+            end
+        end
+        lastTry = os.clock()
+        Auto.info = ("hit at %d speed"):format(math.floor(math.min(speed or 0, MAX_SPEED)))
+        local ok, err = pcall(function()
+            if Hook.fire then
+                Hook.fire()
+            elseif Mods.Weapon then
+                Mods.Weapon.soundwave()
+            end
+        end)
+        if not ok then
+            warn("[BlastSoccer] " .. tostring(err))
+        end
+    end
+end
+loop(1 / 30, Auto.step)
+
 --// Drawing \\--
 -- Thin boxes drawn on top of everything (handle adornments), so the lines
 -- show through walls, players and the ball.
@@ -803,6 +896,18 @@ do
     slider(LungeBox, "LungeTime", "Lunge length", 0.05, 0.4, 2, " s", "Long enough for the server to see it; 0.15-0.25 is about right")
     local LungeLabel = LungeBox:AddLabel("...", true)
 
+    local AutoBox = Tab:AddRightGroupbox("Auto hit", "crosshair")
+    toggle(AutoBox, "AutoHit", "Auto hit",
+        "Shoots for you, with your aim, the moment the ball is at its best spot in reach. Uses the game's own shot and cooldown")
+    AutoBox:AddDropdown("AutoMode", {
+        Text = "When", Values = { "Toward their goal", "Only if it scores", "Any time" }, Default = Settings.AutoMode,
+        Callback = function(v)
+            Settings.AutoMode = v
+        end,
+    })
+    slider(AutoBox, "AutoMinSpeed", "Only if the shot is at least", 0, 180, 0, " speed")
+    local AutoLabel = AutoBox:AddLabel("...", true)
+
     local AimBox = Tab:AddRightGroupbox("Aim helper (small)", "gauge")
     toggle(AimBox, "SpeedHelp", "Aim helper",
         "Turns your aim a little toward the way you and the ball are already moving, so the shot comes off a bit faster. Never more than the slider, and never so far the ball leaves your cone")
@@ -812,6 +917,7 @@ do
     loop(0.3, function()
         TimingLabel:SetText(("Last shot: %s"):format(Shot.timing))
         LungeLabel:SetText(("Last shot: %s"):format(Lunge.info))
+        AutoLabel:SetText(("Now: %s"):format(Auto.info))
         AimLabel:SetText(("Last shot: %s\nHook: %s"):format(Shot.last, Hook.status))
     end)
 end
