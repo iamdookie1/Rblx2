@@ -15,8 +15,9 @@
 --           cursor inside TargetZone lands the fish.
 --   Speed   Shared.WalkSpeedManager.SetMultiplier(name, x) stacks on 16.
 --
--- Everything goes through the game's own aim, input and prompts, from where
--- you really are. Nothing fakes a hit, a position or a result.
+-- Everything goes through the game's own aim, buttons and prompts, from where
+-- you really are. Nothing fakes a hit, a position or a result, and nothing
+-- simulates mouse or touch input (that broke mobile).
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -56,7 +57,8 @@ end
 local Settings = {
     -- combat
     SilentAim = false, AimPart = "Head", FOV = 180, ShowFOV = true, AimRange = 500, VisibleOnly = true,
-    AutoShoot = false, AutoMelee = false, FaceTarget = true,
+    AutoShoot = false, AutoMelee = false, FaceTarget = true, AutoReload = false, NoRecoil = false,
+    AutoHeal = false, HealAt = 50,
     -- loot
     AutoOpen = false, AutoPickup = false, PickupFilter = "",
     -- fishing
@@ -123,18 +125,84 @@ end
 local InputManager = clientModule("Shared.InputManager")
 local WalkSpeedManager = clientModule("Shared.WalkSpeedManager")
 
--- A real click, so the game's own input handlers run.
-local VIM = game:GetService("VirtualInputManager")
-local function click()
-    if typeof(mouse1click) == "function" then
-        return pcall(mouse1click)
+local MobileButtons = clientModule("Shared.MobileButtonManager")
+local GunAmmoState = clientModule("Shared.GunAmmoState")
+local GunConfig
+pcall(function()
+    GunConfig = require(game:GetService("ReplicatedStorage"):WaitForChild("Shared", 5):WaitForChild("GunConfig", 5))
+end)
+
+--// Buttons: the game's own action handlers, no fake input \\--
+-- Every tool registers its action with MobileButtonManager:CreateButton(name,
+-- { OnInputBegan, OnInputEnded }) on equip, on PC too (only the on-screen
+-- button is mobile-only). Calling those handlers is exactly what tapping the
+-- Shoot / Swing / Cast / Heal / Reload button does, so nothing touches the
+-- mouse, the touch screen or the camera. (VirtualInputManager clicks landed on
+-- the mobile UI and dragged the camera.)
+local Buttons = { seen = {} }
+do
+    local registry
+    if MobileButtons then
+        -- HasButton's only upvalue is the name -> options table.
+        pcall(function()
+            if debug.getupvalues then
+                local ups = debug.getupvalues(MobileButtons.HasButton)
+                registry = type(ups) == "table" and type(ups[1]) == "table" and ups[1] or nil
+            end
+            if not registry and debug.getupvalue then
+                local up = debug.getupvalue(MobileButtons.HasButton, 1)
+                registry = type(up) == "table" and up or nil
+            end
+        end)
+        -- Also record new registrations ourselves, in case upvalues aren't readable.
+        local saved = Genv.__NmlButtonOriginals
+        if saved then
+            MobileButtons.CreateButton, MobileButtons.RemoveButton = saved.create, saved.remove
+        end
+        local origCreate, origRemove = MobileButtons.CreateButton, MobileButtons.RemoveButton
+        if type(origCreate) == "function" and type(origRemove) == "function" then
+            Genv.__NmlButtonOriginals = { create = origCreate, remove = origRemove }
+            MobileButtons.CreateButton = function(self, name, opts, ...)
+                Buttons.seen[name] = opts
+                return origCreate(self, name, opts, ...)
+            end
+            MobileButtons.RemoveButton = function(self, name, ...)
+                Buttons.seen[name] = nil
+                return origRemove(self, name, ...)
+            end
+            table.insert(Cleanups, function()
+                MobileButtons.CreateButton, MobileButtons.RemoveButton = origCreate, origRemove
+                Genv.__NmlButtonOriginals = nil
+            end)
+        end
     end
-    local cam = Workspace.CurrentCamera
-    local size = cam and cam.ViewportSize or Vector2.new(800, 600)
-    local x, y = size.X / 2, size.Y * 0.4
-    pcall(VIM.SendMouseButtonEvent, VIM, x, y, 0, true, game, 0)
-    task.wait(0.02)
-    pcall(VIM.SendMouseButtonEvent, VIM, x, y, 0, false, game, 0)
+    function Buttons.get(name)
+        local opts = (registry and registry[name]) or Buttons.seen[name]
+        return type(opts) == "table" and opts or nil
+    end
+    function Buttons.begin(name)
+        local opts = Buttons.get(name)
+        if opts and type(opts.OnInputBegan) == "function" then
+            task.spawn(opts.OnInputBegan)
+            return true
+        end
+        return false
+    end
+    function Buttons.finish(name)
+        local opts = Buttons.get(name)
+        if opts and type(opts.OnInputEnded) == "function" then
+            task.spawn(opts.OnInputEnded)
+        end
+    end
+    -- A quick tap: press and let go.
+    function Buttons.tap(name)
+        if Buttons.begin(name) then
+            task.delay(0.03, Buttons.finish, name)
+            return true
+        end
+        return false
+    end
+    Buttons.status = registry and "ready" or (MobileButtons and "ready (hooked)" or "button manager not found")
 end
 
 --// Mobs \\--
@@ -256,7 +324,10 @@ do
             return ray
         end
         InputManager.aimRaycast = function(maxDist, params, ...)
-            local at = aimPoint()
+            -- maxDist 100 is the game's own mobile "fire when the crosshair is on
+            -- a mob" check. Leave it alone unless auto shoot is on, or silent aim
+            -- would make your gun fire by itself on mobile.
+            local at = (maxDist ~= 100 or Settings.AutoShoot) and aimPoint() or nil
             if at then
                 local cam = Workspace.CurrentCamera
                 local from = cam and cam.CFrame.Position or at
@@ -299,27 +370,54 @@ do
 end
 
 --// Auto shoot and auto melee \\--
+-- Holds the game's own Shoot / Swing button while there's a target, so the
+-- gun fires at its real fire rate (minigun spin-up included) and lets go after.
+local function isGun(tool)
+    return tool and (CollectionService:HasTag(tool, "Gun") or CollectionService:HasTag(tool, "Shotgun")
+        or CollectionService:HasTag(tool, "Sniper") or CollectionService:HasTag(tool, "Bazooka")
+        or CollectionService:HasTag(tool, "Minigun"))
+end
 do
-    loop(0.06, function()
-        if not Settings.AutoShoot then
-            return
+    local function holder(button)
+        local h = { tool = nil }
+        function h.set(tool, on)
+            if on and h.tool ~= tool then
+                if h.tool then
+                    Buttons.finish(button)
+                end
+                h.tool = Buttons.begin(button) and tool or nil
+            elseif not on and h.tool then
+                h.tool = nil
+                Buttons.finish(button)
+            end
         end
+        table.insert(Cleanups, function()
+            h.set(nil, false)
+        end)
+        return h
+    end
+    local Trigger, Swing = holder("GunShoot"), holder("MeleeSwing")
+
+    loop(0.05, function()
         local tool = equipped()
-        if not (tool and CollectionService:HasTag(tool, "Gun")) then
+        local want = Settings.AutoShoot and Settings.SilentAim and isGun(tool) and Target.model ~= nil
+            and not (character() and character():GetAttribute("IsReloading"))
+        -- Bazooka and sniper fire once per press, so press again each tick
+        -- (the game's own fire rate check spaces the shots).
+        if want and (CollectionService:HasTag(tool, "Bazooka") or CollectionService:HasTag(tool, "Sniper")) then
+            Trigger.set(nil, false)
+            Buttons.tap("GunShoot")
             return
         end
-        if Target.model and Settings.SilentAim then
-            click()
-        end
+        Trigger.set(tool, want)
     end)
+
     -- Melee: the swing checks a sphere MeleeRange/2 wide, 3 studs in front.
     loop(0.1, function()
-        if not Settings.AutoMelee then
-            return
-        end
         local tool = equipped()
         local root = rootPart()
-        if not (tool and root and CollectionService:HasTag(tool, "Melee")) then
+        if not (Settings.AutoMelee and tool and root and CollectionService:HasTag(tool, "Melee")) then
+            Swing.set(nil, false)
             return
         end
         local range = tool:GetAttribute("MeleeRange") or 10
@@ -336,9 +434,118 @@ do
                 root.CFrame = CFrame.lookAt(root.Position, Vector3.new(at.X, root.Position.Y, at.Z))
             end
             Target.model, Target.part = best, best.HumanoidRootPart
-            click()
+        end
+        Swing.set(tool, best ~= nil)
+    end)
+
+    -- Auto reload: the Reload button once the magazine is empty.
+    loop(0.3, function()
+        if not (Settings.AutoReload and GunAmmoState and GunAmmoState.currentGun) then
+            return
+        end
+        local c = character()
+        if GunAmmoState.ammoSynced and GunAmmoState.currentAmmo <= 0 and not (c and c:GetAttribute("IsReloading")) then
+            Buttons.tap("GunReload")
         end
     end)
+end
+
+--// No recoil: guns read KickbackIntensity from GunConfig.GetGunData \\--
+do
+    local saved = Genv.__NmlGunDataOriginal
+    if GunConfig and saved then
+        GunConfig.GetGunData = saved
+    end
+    if GunConfig and type(GunConfig.GetGunData) == "function" then
+        local orig = GunConfig.GetGunData
+        Genv.__NmlGunDataOriginal = orig
+        GunConfig.GetGunData = function(...)
+            local data = orig(...)
+            if alive() and Settings.NoRecoil and type(data) == "table" then
+                data.KickbackIntensity = 0
+            end
+            return data
+        end
+        table.insert(Cleanups, function()
+            GunConfig.GetGunData = orig
+            Genv.__NmlGunDataOriginal = nil
+        end)
+    end
+end
+
+--// Auto heal: equip a bandage, hold Heal, switch back \\--
+local Heal = { info = "idle" }
+do
+    local busy = false
+    local function findBandage()
+        local c = character()
+        local bp = LocalPlayer:FindFirstChildOfClass("Backpack")
+        for _, holder in { c, bp } do
+            if holder then
+                for _, t in holder:GetChildren() do
+                    if t:IsA("Tool") and CollectionService:HasTag(t, "Bandage") then
+                        return t
+                    end
+                end
+            end
+        end
+        return nil
+    end
+    local function progressVisible()
+        local gui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+        local hud = gui and gui:FindFirstChild("HUD")
+        local bar = hud and hud:FindFirstChild("BandageProgress")
+        return bar and bar.Visible
+    end
+    loop(0.5, function()
+        if busy or not Settings.AutoHeal then
+            return
+        end
+        local hum, c = humanoid(), character()
+        if not (hum and c and hum.Health > 0 and hum.Health / hum.MaxHealth * 100 < Settings.HealAt) then
+            return
+        end
+        local bandage = findBandage()
+        if not bandage then
+            Heal.info = "no bandages"
+            return
+        end
+        busy = true
+        Heal.info = "healing"
+        local ok, err = pcall(Heal.run, bandage, hum, c)
+        if not ok then
+            warn("[NoMansLand] heal: " .. tostring(err))
+        end
+        Heal.info = "idle"
+        task.wait(1)
+        busy = false
+    end)
+    function Heal.run(bandage, hum, c)
+        local before = equipped()
+        if bandage.Parent ~= c then
+            hum:EquipTool(bandage)
+        end
+        -- Wait for BandageTool to register its Heal button.
+        local t0 = os.clock()
+        while alive() and not Buttons.get("BandageHeal") and os.clock() - t0 < 2 do
+            task.wait(0.1)
+        end
+        if Buttons.begin("BandageHeal") then
+            task.wait(0.4)
+            t0 = os.clock()
+            while alive() and progressVisible() and bandage.Parent == c and os.clock() - t0 < 10 do
+                task.wait(0.1)
+            end
+            Buttons.finish("BandageHeal")
+        end
+        if before and before ~= bandage and before.Parent == LocalPlayer:FindFirstChildOfClass("Backpack") then
+            task.wait(0.2)
+            local h = humanoid()
+            if h then
+                h:EquipTool(before)
+            end
+        end
+    end
 end
 
 --// Loot \\--
@@ -438,11 +645,67 @@ do
         if os.clock() - lastCast > 3 then
             lastCast = os.clock()
             Fish.info = "casting"
-            pcall(tool.Activate, tool)
+            -- The Cast button's handler. tool:Activate() is ignored on mobile.
+            if not Buttons.tap("FishingRodCast") then
+                pcall(tool.Activate, tool)
+            end
         end
     end)
-    -- The bar sweeps back and forth; click while the cursor is in the zone.
+
+    -- The minigame's own click handler (onPlayerClick in UI.FishingMinigame):
+    -- it checks the cursor against the zone and sends the result itself.
+    local reelFn, searchedAt = nil, -math.huge
+    local function fromMinigame(f)
+        local ok, src = pcall(debug.info, f, "s")
+        return ok and type(src) == "string" and src:find("FishingMinigame", 1, true) ~= nil
+    end
+    local function findReel()
+        if reelFn or os.clock() - searchedAt < 5 or typeof(getgc) ~= "function" then
+            return reelFn
+        end
+        searchedAt = os.clock()
+        pcall(function()
+            for _, f in getgc() do
+                if type(f) == "function" and (typeof(islclosure) ~= "function" or islclosure(f)) then
+                    local okN, name = pcall(debug.info, f, "n")
+                    if okN and name == "onPlayerClick" and fromMinigame(f) then
+                        reelFn = f
+                        break
+                    end
+                end
+            end
+        end)
+        return reelFn
+    end
+    -- Backup: the InputBegan connection the minigame opens while it runs, fed a tap.
+    local FAKE_TAP = { UserInputType = Enum.UserInputType.Touch, KeyCode = Enum.KeyCode.Unknown,
+        UserInputState = Enum.UserInputState.Begin, Position = Vector3.zero }
+    local function tapMinigame()
+        local fn = findReel()
+        if fn then
+            return pcall(fn)
+        end
+        if typeof(getconnections) ~= "function" then
+            return false
+        end
+        local hit = false
+        for _, conn in getconnections(UserInputService.InputBegan) do
+            local f = conn.Function
+            if type(f) == "function" and fromMinigame(f) then
+                hit = pcall(f, FAKE_TAP, false) or hit
+            end
+        end
+        return hit
+    end
+    task.spawn(findReel)
+
+    -- The bar sweeps back and forth; reel while the cursor is in the zone.
     local clickedAt = -math.huge
+    local function click()
+        if not tapMinigame() then
+            Fish.info = "couldn't reach the minigame (needs getgc or getconnections)"
+        end
+    end
     bind(RunService.RenderStepped, function()
         if not (alive() and Settings.AutoReel) then
             return
@@ -708,10 +971,18 @@ do
     toggle(AutoBox, "AutoShoot", "Auto shoot", "Fires your gun while silent aim has a mob. Your gun's own fire rate and ammo")
     toggle(AutoBox, "AutoMelee", "Auto melee", "Swings when a mob is in your weapon's reach")
     toggle(AutoBox, "FaceTarget", "Turn to face it", "Melee hits in front of you, so this turns you toward the mob first")
+    toggle(AutoBox, "AutoReload", "Auto reload", "Reloads when the magazine is empty, if you have ammo")
+    toggle(AutoBox, "NoRecoil", "No recoil", "Your camera doesn't kick up when you shoot")
+
+    local HealBox = Tab:AddRightGroupbox("Healing", "heart")
+    toggle(HealBox, "AutoHeal", "Auto bandage", "Below the health you set, takes out a bandage, heals, then switches back to what you held")
+    slider(HealBox, "HealAt", "Heal below", 10, 95, 0, "%")
+    local HealLabel = HealBox:AddLabel("...", true)
     loop(0.3, function()
         local t = Target.model
-        AimLabel:SetText(("Aim: %s\nTarget: %s"):format(Aim.status,
+        AimLabel:SetText(("Aim: %s\nButtons: %s\nTarget: %s"):format(Aim.status, Buttons.status,
             t and ((t:GetAttribute("ObjectName") or t.Name) .. (Mobs.alive(t) and "" or " (dead)")) or "none"))
+        HealLabel:SetText("Bandage: " .. Heal.info)
     end)
 end
 
@@ -730,7 +1001,7 @@ do
 
     local FishBox = Tab:AddRightGroupbox("Fishing", "fish")
     toggle(FishBox, "AutoCast", "Auto cast", "Casts your rod whenever it's out of the water. Hold the rod")
-    toggle(FishBox, "AutoReel", "Auto reel", "Clicks when the bar is in the green zone")
+    toggle(FishBox, "AutoReel", "Auto reel", "Reels in when the bar is in the zone. Works on mobile")
     local FishLabel = FishBox:AddLabel("...", true)
     loop(0.4, function()
         LootLabel:SetText(("Opened %d, picked up %d"):format(Loot.opened, Loot.picked))
