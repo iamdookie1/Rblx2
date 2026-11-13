@@ -26,6 +26,8 @@ local Games = {
     [129415455370018] = { Name = 'Runaways (hard)', Script = 'Games/Runaways.lua' },
     [137470666387963] = { Name = 'Blast Soccer', Script = 'Games/BlastSoccer.lua' },
     [117090155680637] = { Name = "No Man's Land", Script = 'Games/NoMansLand.lua' },
+    -- Throw Food For Baddies (game 10773616048), from its dump's own place id.
+    [89727004942007] = { Name = 'Throw Food For Baddies', Script = 'Games/ThrowFoodForBaddies.lua' },
     -- RIVALS (game 6035872082), from its dump's own place id.
     [17625359962] = { Name = 'RIVALS', Script = 'Games/Rivals.lua' },
     -- Fight in a Streamer University (game 7761516673): the fight servers from
