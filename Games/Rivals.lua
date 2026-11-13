@@ -61,10 +61,17 @@ local Settings = {
     -- aimbot
     Aimbot = false, AimMethod = IsTouch and "Camera" or "Mouse", AimWhen = IsTouch and "Always" or "While aiming (right click)",
     AimPart = "Head", AimFOV = 120, ShowFOV = true, FOVColor = Color3.fromRGB(255, 255, 255),
-    Smoothness = 6, AimMaxDistance = 400, VisibleOnly = true, StickyTarget = true, Prediction = true,
+    Smoothness = 6, AimMaxDistance = 400, VisibleOnly = true, StickyTarget = true,
+    -- prediction
+    Prediction = true, PredictionScale = 100, HitscanLead = 0, LeadPing = true, ShowPredicted = false,
     AimJitter = 0, AimReaction = 0,
     -- triggerbot
-    Triggerbot = false, TriggerDelay = 60, TriggerHold = 0.08, TriggerOnlyAiming = false, TriggerHeadOnly = false,
+    Triggerbot = false, TriggerMode = "Tap", TriggerDelayMin = 40, TriggerDelayMax = 90, TriggerHold = 0.06,
+    TriggerRadius = 6, TriggerOnlyAiming = false, TriggerHeadOnly = false, TriggerUsePrediction = true,
+    TriggerOnlyAimbotTarget = false,
+    -- katana
+    AutoDeflect = false, DeflectProjectiles = true, DeflectHitscan = true, DeflectWhenAimed = false,
+    DeflectRange = 120, DeflectAimAngle = 4, DeflectAimRange = 40, DeflectTiming = 0.35,
     -- recoil
     RecoilOn = false, RecoilScale = 50,
     -- esp
@@ -201,27 +208,43 @@ do
     end
 end
 
---// Projectile lead \\--
+--// Prediction \\--
+-- Projectile weapons: where to aim so a shot of the weapon's own speed and
+-- drop meets the target, scaled by the strength slider. Hitscan weapons: a
+-- small lead by your ping plus the extra you set, because the server traces
+-- the shot from where you were looking when it arrives.
 local Lead = {}
 do
-    -- Where to aim so a projectile of this speed and gravity meets the target.
+    function Lead.time()
+        local t = Settings.HitscanLead / 1000
+        if Settings.LeadPing then
+            local ok, ping = pcall(LocalPlayer.GetNetworkPing, LocalPlayer)
+            t += ok and type(ping) == "number" and ping or 0
+        end
+        return t
+    end
     function Lead.point(part, root)
-        local info = Game.info()
         local cam = camera()
-        if not (Settings.Prediction and info and cam and not info.IsRaycast) then
-            return part.Position
+        if not (Settings.Prediction and cam and part) then
+            return part and part.Position
+        end
+        local info = Game.info()
+        local scale = Settings.PredictionScale / 100
+        local vel = root and root.AssemblyLinearVelocity or Vector3.zero
+        if not info or info.IsRaycast then
+            return part.Position + vel * Lead.time() * scale
         end
         local speed = tonumber(info.ProjectileSpeed) or 300
-        local grav = tonumber(info.ProjectileGravity) or 0
+        local grav = math.abs(tonumber(info.ProjectileGravity) or 0)
         if speed <= 0 then
             return part.Position
         end
-        local vel = root and root.AssemblyLinearVelocity or Vector3.zero
         local from = cam.CFrame.Position
         local at = part.Position
-        for _ = 1, 3 do
+        for _ = 1, 4 do
             local t = (at - from).Magnitude / speed
-            at = part.Position + vel * t + Vector3.new(0, 0.5 * math.abs(grav) * t * t, 0)
+            local tt = t * scale
+            at = part.Position + vel * tt + Vector3.new(0, 0.5 * grav * tt * tt, 0)
         end
         return at
     end
@@ -259,6 +282,21 @@ end
 local Aim = { target = nil, info = "off" }
 do
     local fov = Draw.new("Circle", { Thickness = 1.5, NumSides = 64, Filled = false, Transparency = 0.8, Visible = false })
+    local dot = Draw.new("Circle", { Thickness = 2, NumSides = 16, Radius = 4, Filled = true, Visible = false })
+    function Aim.showPredicted(point)
+        if not dot then
+            return
+        end
+        local cam = camera()
+        if not (point and cam and Settings.ShowPredicted) then
+            dot.Visible = false
+            return
+        end
+        local sp, on = cam:WorldToViewportPoint(point)
+        dot.Visible = on
+        dot.Position = Vector2.new(sp.X, sp.Y)
+        dot.Color = Settings.ArcColor
+    end
     local wantSince = nil
     local function active()
         local when = Settings.AimWhen
@@ -333,6 +371,13 @@ do
                 fov.Color = Aim.target and Settings.EnemyColor or Settings.FOVColor
             end
         end
+        -- The predicted point, shown whether or not the aimbot is turning you.
+        if Settings.ShowPredicted then
+            local shown = Aim.target or Aim.pick()
+            Aim.showPredicted(shown and Lead.point(shown.part, shown.root))
+        else
+            Aim.showPredicted(nil)
+        end
         if not (alive() and Settings.Aimbot and cam and active()) then
             Aim.target, wantSince = nil, nil
             Aim.info = Settings.Aimbot and "waiting (not active)" or "off"
@@ -387,23 +432,26 @@ do
 end
 
 --// Triggerbot \\--
+-- Fires through fighter:Input("StartShooting"/"FinishShooting"), the same
+-- calls the game makes. "On target" is either the crosshair ray touching
+-- them, or (with prediction) the predicted point being within a few pixels
+-- of the crosshair, so moving targets count. It waits a random reaction
+-- time, skips when you're out of ammo or reloading, and fires again as soon
+-- as the gun's own cooldown allows. Hold mode keeps the trigger down while
+-- you stay on them (for automatic guns).
 local Trigger = { info = "off", shots = 0 }
 do
     local params = RaycastParams.new()
     params.FilterType = Enum.RaycastFilterType.Exclude
-    local onSince, firing = nil, false
-    local function onTarget()
-        local cam = camera()
-        if not cam then
-            return nil
-        end
+    local onSince, needDelay, holding, busy = nil, 0, false, false
+    local function rayTarget(cam)
         local ignore = { cam }
         local me = myChar()
         if me then
             table.insert(ignore, me)
         end
         params.FilterDescendantsInstances = ignore
-        local hit = Workspace:Raycast(cam.CFrame.Position, cam.CFrame.LookVector * 1500, params)
+        local hit = Workspace:Raycast(cam.CFrame.Position, cam.CFrame.LookVector * 2000, params)
         if not hit then
             return nil
         end
@@ -417,41 +465,259 @@ do
         end
         return nil
     end
+    local function predictedTarget(cam)
+        local centre = cam.ViewportSize / 2
+        for _, t in Targets.list(false) do
+            local part = Settings.TriggerHeadOnly and t.char:FindFirstChild("Head") or Targets.part(t.char, "Closest to crosshair")
+            if part and Targets.visible(part, t.char) then
+                local point = Lead.point(part, t.root)
+                local sp, on = cam:WorldToViewportPoint(point)
+                if on and (Vector2.new(sp.X, sp.Y) - centre).Magnitude <= Settings.TriggerRadius then
+                    return t
+                end
+            end
+        end
+        return nil
+    end
+    local function gunReady(item)
+        if not item then
+            return false, "no weapon"
+        end
+        local info = item.Info
+        if type(info) ~= "table" or info.ShootCooldown == nil then
+            return false, "not a gun"
+        end
+        local okA, ammo = pcall(item.Get, item, "Ammo")
+        if okA and type(ammo) == "number" and ammo <= 0 then
+            return false, "out of ammo"
+        end
+        if type(item._reload_cooldown) == "number" and tick() < item._reload_cooldown then
+            return false, "reloading"
+        end
+        return true
+    end
+    local function release(f)
+        if holding then
+            holding = false
+            pcall(f.Input, f, "FinishShooting")
+        end
+    end
     bind(RunService.Heartbeat, function()
+        local f = Game.fighter()
         if not (alive() and Settings.Triggerbot) then
+            if f and holding then
+                release(f)
+            end
             onSince = nil
             Trigger.info = "off"
             return
         end
-        if Settings.TriggerOnlyAiming and not Game.aiming() then
-            onSince = nil
-            Trigger.info = "waiting (not aiming)"
-            return
-        end
-        local t = onTarget()
-        if not t then
-            onSince = nil
-            Trigger.info = "crosshair not on anyone"
-            return
-        end
-        onSince = onSince or os.clock()
-        if firing or os.clock() - onSince < Settings.TriggerDelay / 1000 then
-            return
-        end
-        local f = Game.fighter()
         if not (f and type(f.Input) == "function") then
             Trigger.info = "your fighter isn't loaded"
             return
         end
-        firing = true
-        Trigger.shots += 1
+        local cam = camera()
+        if not cam or (Settings.TriggerOnlyAiming and not Game.aiming()) then
+            release(f)
+            onSince = nil
+            Trigger.info = cam and "waiting (not aiming)" or "no camera"
+            return
+        end
+        local t = rayTarget(cam) or (Settings.TriggerUsePrediction and Settings.Prediction and predictedTarget(cam))
+        if t and Settings.TriggerOnlyAimbotTarget and not (Aim.target and Aim.target.player == t.player) then
+            t = nil
+        end
+        local item = Game.item()
+        local ready, why = gunReady(item)
+        if not t or not ready then
+            release(f)
+            onSince = nil
+            Trigger.info = not t and "crosshair not on anyone" or why
+            return
+        end
+        if not onSince then
+            onSince = os.clock()
+            local lo, hi = math.min(Settings.TriggerDelayMin, Settings.TriggerDelayMax), math.max(Settings.TriggerDelayMin, Settings.TriggerDelayMax)
+            needDelay = (lo + math.random() * (hi - lo)) / 1000
+        end
+        if os.clock() - onSince < needDelay then
+            Trigger.info = "reacting..."
+            return
+        end
         Trigger.info = "shooting " .. t.player.DisplayName
+        if Settings.TriggerMode == "Hold" then
+            if not holding then
+                holding = true
+                Trigger.shots += 1
+                pcall(f.Input, f, "StartShooting")
+            end
+            return
+        end
+        -- Tap: press again whenever the gun's own cooldown has run out.
+        if busy or (type(item._shoot_cooldown) == "number" and tick() < item._shoot_cooldown) then
+            return
+        end
+        busy = true
+        Trigger.shots += 1
         task.spawn(function()
             pcall(f.Input, f, "StartShooting")
             task.wait(Settings.TriggerHold)
             pcall(f.Input, f, "FinishShooting")
-            firing = false
+            busy = false
         end)
+    end)
+end
+
+--// Auto deflect (katana) \\--
+-- The katana's right click is a deflect: Info.DeflectDuration (1s) then
+-- Info.DeflectCooldown (4s), sent as fighter:Input("StartAiming"). Enemy
+-- shots reach your client as Gun.ReplicateFromServer("ShootEffect" /
+-- "ProjectileEffect") on their gun, so the moment one fires at you:
+--   projectiles  the deflect is timed to the projectile's flight time, so the
+--                window is up when it arrives
+--   hitscan      the first bullet is already decided on the server, but the
+--                deflect is up for the rest of an automatic spray
+--   aimed at     (optional) deflects early when someone close by is aiming
+--                right at you
+local Deflect = { info = "off", count = 0 }
+do
+    local pending = false
+    local function myKatana()
+        local item = Game.item()
+        local info = item and item.Info
+        if type(info) == "table" and info.DeflectDuration then
+            return item, info
+        end
+        return nil
+    end
+    local function ready(item)
+        return type(item._deflect_cooldown) ~= "number" or tick() >= item._deflect_cooldown
+    end
+    local function deflect(reason)
+        local f = Game.fighter()
+        local item = myKatana()
+        if not (f and item and ready(item)) then
+            return false
+        end
+        Deflect.count += 1
+        Deflect.info = "deflected " .. reason
+        task.spawn(function()
+            pcall(f.Input, f, "StartAiming")
+            task.wait(0.08)
+            pcall(f.Input, f, "FinishAiming")
+        end)
+        return true
+    end
+    -- Is this shooter pointed at me, within the range?
+    local function aimedAtMe(fromPos, lookDir, maxAngle, range)
+        local me = myChar()
+        local root = me and me:FindFirstChild("HumanoidRootPart")
+        if not (root and fromPos and lookDir) then
+            return false
+        end
+        local to = root.Position - fromPos
+        if to.Magnitude > range or lookDir.Magnitude < 0.01 then
+            return false
+        end
+        local angle = math.deg(math.acos(math.clamp(lookDir.Unit:Dot(to.Unit), -1, 1)))
+        return angle <= maxAngle, to.Magnitude
+    end
+    local function shooterOf(item)
+        local cf = type(item) == "table" and item.ClientFighter
+        if type(cf) ~= "table" or cf.IsLocalPlayer then
+            return nil
+        end
+        local entity = cf.Entity
+        local root = type(entity) == "table" and entity.RootPart
+        if typeof(root) ~= "Instance" then
+            return nil
+        end
+        local p = Players:GetPlayerFromCharacter(root.Parent)
+        if p and (Targets.teammate(p) or not Targets.sameMatch(p)) then
+            return nil
+        end
+        return root, p
+    end
+    local function lookOf(root)
+        local head = root.Parent and root.Parent:FindFirstChild("Head")
+        return (head or root).CFrame.LookVector, (head or root).Position
+    end
+
+    local ok, Gun = pcall(function()
+        return require(LocalPlayer.PlayerScripts:WaitForChild("Modules"):WaitForChild("ItemTypes"):WaitForChild("Gun", 10))
+    end)
+    if ok and type(Gun) == "table" and type(Gun.ReplicateFromServer) == "function" then
+        local saved = Genv.__RivalsGunReplicateOriginal
+        if saved then
+            Gun.ReplicateFromServer = saved
+        end
+        local orig = Gun.ReplicateFromServer
+        Genv.__RivalsGunReplicateOriginal = orig
+        Gun.ReplicateFromServer = function(self, kind, ...)
+            if alive() and Settings.AutoDeflect and (kind == "ShootEffect" or kind == "ProjectileEffect") then
+                pcall(function()
+                    local root = shooterOf(self)
+                    local katana = root and myKatana()
+                    if not katana then
+                        return
+                    end
+                    local look, from = lookOf(root)
+                    -- Generous angle: they only need to be shooting roughly at you.
+                    local at, dist = aimedAtMe(from, look, 25, Settings.DeflectRange)
+                    if not at then
+                        return
+                    end
+                    if kind == "ShootEffect" and Settings.DeflectHitscan then
+                        deflect("a shot")
+                    elseif kind == "ProjectileEffect" and Settings.DeflectProjectiles and not pending then
+                        local info = type(self.Info) == "table" and self.Info or {}
+                        local speed = math.max(tonumber(info.ProjectileSpeed) or 300, 1)
+                        local wait = math.max(0, dist / speed - Settings.DeflectTiming)
+                        pending = true
+                        task.delay(wait, function()
+                            pending = false
+                            deflect("a projectile")
+                        end)
+                    end
+                end)
+            end
+            return orig(self, kind, ...)
+        end
+        table.insert(Cleanups, function()
+            Gun.ReplicateFromServer = orig
+            Genv.__RivalsGunReplicateOriginal = nil
+        end)
+        Deflect.status = "ready"
+    else
+        Deflect.status = "gun module not found"
+    end
+
+    -- Early deflect when someone close is lined up on you.
+    bind(RunService.Heartbeat, function()
+        if not (alive() and Settings.AutoDeflect) then
+            Deflect.info = "off"
+            return
+        end
+        local item = myKatana()
+        if not item then
+            Deflect.info = "hold a katana"
+            return
+        end
+        if not ready(item) then
+            Deflect.info = ("cooldown %.1fs"):format(item._deflect_cooldown - tick())
+            return
+        end
+        Deflect.info = "ready"
+        if not Settings.DeflectWhenAimed then
+            return
+        end
+        for _, t in Targets.list(false) do
+            local look, from = lookOf(t.root)
+            if aimedAtMe(from, look, Settings.DeflectAimAngle, Settings.DeflectAimRange) and Targets.visible(t.root, t.char) then
+                deflect(t.player.DisplayName .. " aiming at you")
+                return
+            end
+        end
     end)
 end
 
@@ -716,19 +982,43 @@ do
     slider(Box, "AimMaxDistance", "Max distance", 25, 1500, 0, " studs")
     toggle(Box, "VisibleOnly", "Only visible targets", "Skips anyone behind a wall")
     toggle(Box, "StickyTarget", "Stick to target", "Keeps the same target while they stay in the circle")
-    toggle(Box, "Prediction", "Lead projectiles", "For rockets, bows and other projectile weapons: aims where they'll be, with the weapon's own speed and drop")
     slider(Box, "AimReaction", "Reaction time", 0, 400, 0, " ms", "Wait this long after a new target appears before moving")
     slider(Box, "AimJitter", "Humanize jitter", 0, 20, 0, "", "A little random offset so it isn't pixel perfect")
     local AimLabel = Box:AddLabel("...", true)
 
+    local Pred = Tab:AddLeftGroupbox("Prediction", "move-right")
+    toggle(Pred, "Prediction", "Prediction",
+        "Aims where the target will be: projectile guns use the weapon's own speed and drop, hitscan guns lead by your ping and the extra below")
+    slider(Pred, "PredictionScale", "Strength", 0, 200, 0, "%", "100 is the physics answer. Raise it if you hit behind moving targets, lower it if you hit ahead")
+    slider(Pred, "HitscanLead", "Hitscan extra lead", 0, 300, 0, " ms", "Extra lead for hitscan guns, on top of ping")
+    toggle(Pred, "LeadPing", "Lead by ping", "Adds your ping to the hitscan lead")
+    toggle(Pred, "ShowPredicted", "Show predicted point", "A dot where the prediction aims, on the target nearest your crosshair")
+
     local Trig = Tab:AddRightGroupbox("Triggerbot", "zap")
     toggle(Trig, "Triggerbot", "Triggerbot",
-        "Shoots when your crosshair is on an enemy, through the game's own shoot input (no clicks)")
-    slider(Trig, "TriggerDelay", "Delay", 0, 400, 0, " ms", "How long the crosshair has to be on them first")
-    slider(Trig, "TriggerHold", "Hold", 0.03, 0.6, 2, " s", "How long the trigger is held per shot (longer for automatic guns)")
+        "Shoots when you're on an enemy, through the game's own shoot input (no clicks). Waits for the gun's own cooldown, skips while reloading or empty")
+    dropdown(Trig, "TriggerMode", "Mode", { "Tap", "Hold" }, "Tap: one press per shot, as fast as the gun allows. Hold: trigger down while you stay on them (automatic guns)")
+    slider(Trig, "TriggerDelayMin", "Reaction min", 0, 400, 0, " ms")
+    slider(Trig, "TriggerDelayMax", "Reaction max", 0, 600, 0, " ms", "A random reaction between min and max each time you get on a target")
+    slider(Trig, "TriggerHold", "Tap length", 0.02, 0.4, 2, " s")
+    toggle(Trig, "TriggerUsePrediction", "Use prediction", "Also counts as on target when the predicted point is near your crosshair")
+    slider(Trig, "TriggerRadius", "Prediction radius", 1, 30, 0, " px")
     toggle(Trig, "TriggerOnlyAiming", "Only while aiming")
     toggle(Trig, "TriggerHeadOnly", "Only on the head")
+    toggle(Trig, "TriggerOnlyAimbotTarget", "Only the aimbot's target")
     local TrigLabel = Trig:AddLabel("...", true)
+
+    local Kat = Tab:AddRightGroupbox("Katana", "swords")
+    toggle(Kat, "AutoDeflect", "Auto deflect",
+        "Holding a katana, deflects (1s window, 4s cooldown) when an enemy shoots at you: timed to a projectile's flight, or at once for hitscan sprays")
+    toggle(Kat, "DeflectProjectiles", "Projectiles", "Rockets, arrows, grenades... timed so the deflect is up when it arrives")
+    toggle(Kat, "DeflectHitscan", "Hitscan shots", "The first bullet is already decided by the server, but the rest of a spray gets deflected")
+    slider(Kat, "DeflectTiming", "Projectile timing", 0.1, 0.9, 2, " s", "How long before a projectile arrives the deflect goes up")
+    slider(Kat, "DeflectRange", "Range", 20, 400, 0, " studs")
+    toggle(Kat, "DeflectWhenAimed", "Deflect when aimed at", "Deflects early when someone close is aiming right at you")
+    slider(Kat, "DeflectAimAngle", "Aimed within", 1, 15, 0, "°")
+    slider(Kat, "DeflectAimRange", "Aimed within distance", 5, 150, 0, " studs")
+    local KatLabel = Kat:AddLabel("...", true)
 
     local Rec = Tab:AddRightGroupbox("Recoil", "move")
     toggle(Rec, "RecoilOn", "Change recoil", "Scales the game's own camera kick when you shoot")
@@ -741,6 +1031,7 @@ do
                 AimLabel:SetText(("Now: %s\nCamera controller: %s"):format(Aim.info, Game.Camera and "found" or "not found"))
                 TrigLabel:SetText(("Now: %s\nShots: %d"):format(Trigger.info, Trigger.shots))
                 RecLabel:SetText("Recoil: " .. Recoil.status)
+                KatLabel:SetText(("Deflect: %s\nHooked: %s\nDeflects: %d"):format(Deflect.info, Deflect.status or "?", Deflect.count))
             end)
             task.wait(0.3)
         end
