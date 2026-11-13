@@ -75,6 +75,8 @@ local Settings = {
     SpeedOn = false, SpeedMult = 1.2, JumpOn = false, JumpMult = 1.15, DiveOn = false, DiveMult = 1.3,
     -- esp / misc
     EspPlayers = false, AntiAfk = true, AutoLevelRewards = false,
+    -- rewards
+    InstaRoll = false, DupeMode = "Race the next reward", DupeBurst = 4,
 }
 
 --// Plumbing \\--
@@ -156,6 +158,8 @@ local SpecialController = controller("SpecialController")
 local BallService = service("BallService")
 local GameService = service("GameService")
 local LevelService = service("LevelService")
+local DataService = service("DataService")
+local LevelContent = req(ReplicatedStorage:FindFirstChild("Content") and ReplicatedStorage.Content:FindFirstChild("Level"))
 
 local AERIAL = { Spike = true, JumpSet = true, Block = true, Bump = false, Set = false, Dive = false }
 
@@ -652,6 +656,10 @@ do
         Moves.orig = orig
         State.get = function(owner, id, key, default, ...)
             local v = orig(owner, id, key, default, ...)
+            -- Insta roll: no rarity cutscene after a roll (the game's own setting).
+            if owner == LocalPlayer and id == "Settings" and key == "RarityCutscene" and Settings.InstaRoll and alive() then
+                return false
+            end
             if owner == LocalPlayer and id == "Multiplier" and type(v) == "number" and alive() then
                 if key == "Speed" and Settings.SpeedOn then
                     return v * Settings.SpeedMult
@@ -876,6 +884,211 @@ do
     end)
 end
 
+--// Insta roll \\--
+-- StyleController:Spin / AbilityController:Spin call StyleService:Roll(lucky)
+-- and the server picks the result right then. Afterwards the client waits for
+-- the reel (WaitUntilSpinFinishedAync) and plays a cutscene. Insta roll keeps
+-- the game's own Spin (so a normal spin is normal and a lucky one is lucky)
+-- and only drops the wait; the cutscene goes through the RarityCutscene
+-- setting (see State.get above). Ultra rolls still play theirs.
+local Rolls = { status = "roll controllers not found", count = 0 }
+do
+    local patched = {}
+    for _, name in { "StyleController", "AbilityController" } do
+        local ctrl = controller(name)
+        if ctrl and type(ctrl.WaitUntilSpinFinishedAync) == "function" then
+            local saved = Genv["__VblWait_" .. name]
+            if saved then
+                ctrl.WaitUntilSpinFinishedAync = saved
+            end
+            local orig = ctrl.WaitUntilSpinFinishedAync
+            Genv["__VblWait_" .. name] = orig
+            ctrl.WaitUntilSpinFinishedAync = function(self, ...)
+                if alive() and Settings.InstaRoll then
+                    Rolls.count += 1
+                    local ok = pcall(function()
+                        local n = #self.SpinArray:get()
+                        self.SpinIndexIntValue.Value = n
+                        self.SpinIndex:set(n)
+                    end)
+                    if ok then
+                        return
+                    end
+                end
+                return orig(self, ...)
+            end
+            table.insert(patched, { ctrl = ctrl, orig = orig, name = name })
+        end
+    end
+    if #patched > 0 then
+        Rolls.status = ("ready (%d rollers)"):format(#patched)
+    end
+    table.insert(Cleanups, function()
+        for _, p in patched do
+            p.ctrl.WaitUntilSpinFinishedAync = p.orig
+            Genv["__VblWait_" .. p.name] = nil
+        end
+    end)
+end
+
+--// Level reward dupe test \\--
+-- Level rewards are one server counter, Statistics.LevelRewardsClaimed. The
+-- Claim button sends LevelService:ClaimLevelRewards(level); the client guards
+-- in front of it (a 1 second debounce and a LevelClaimed attribute that makes
+-- the row look claimed until you rejoin) are client only. The test skips those
+-- guards and sends the claim a few times at once, then compares your profile
+-- to see whether the reward paid out once or more. Server code isn't in the
+-- dump, so only this can tell whether the old dupe still works.
+local Dupe = { info = "not run yet", running = false }
+do
+    local function flatten(t, prefix, out, depth)
+        out = out or {}
+        if depth > 3 or type(t) ~= "table" then
+            return out
+        end
+        for k, v in t do
+            local key = prefix .. tostring(k)
+            if type(v) == "number" then
+                out[key] = v
+            elseif type(v) == "table" then
+                flatten(v, key .. ".", out, depth + 1)
+            end
+        end
+        return out
+    end
+    local function snapshot()
+        local out = {}
+        if not DataService then
+            return out
+        end
+        for _, section in { "Statistics", "Spins", "Seasonal" } do
+            local ok, data = pcall(function()
+                return DataService:Get(section):expect()
+            end)
+            if ok and type(data) == "table" then
+                flatten(data, section .. ".", out, 0)
+            end
+        end
+        return out
+    end
+    -- Statistics, kept up to date the way the game's own menus do it.
+    local stats = {}
+    if DataService then
+        task.spawn(function()
+            pcall(function()
+                stats = DataService:Get("Statistics"):expect() or stats
+            end)
+        end)
+        pcall(function()
+            table.insert(Connections, DataService.ProfileUpdated:Connect(function(section, data)
+                if section == "Statistics" and type(data) == "table" then
+                    stats = data
+                end
+            end))
+        end)
+    end
+    function Dupe.levels()
+        local level = LocalPlayer:GetAttribute("User_Level") or 0
+        local claimed = type(stats.LevelRewardsClaimed) == "number" and stats.LevelRewardsClaimed or 0
+        local cap = LevelContent and LevelContent.Amount or 300
+        return math.min(level, cap), claimed
+    end
+    local function rewardText(n)
+        if not (LevelContent and LevelContent.getReward) then
+            return "?", nil
+        end
+        local ok, r = pcall(LevelContent.getReward, n)
+        if ok and type(r) == "table" then
+            return ("%s %s"):format(tostring(r.Value), tostring(r.Type)), r
+        end
+        return "?", nil
+    end
+
+    function Dupe.run()
+        if Dupe.running then
+            return
+        end
+        if not (LevelService and LevelService.ClaimLevelRewards) then
+            Dupe.info = "LevelService not found"
+            return
+        end
+        local level, claimed = Dupe.levels()
+        local target
+        if Settings.DupeMode == "Race the next reward" then
+            if level <= claimed then
+                Dupe.info = ("No unclaimed reward (level %d, claimed %d). Level up once and run it again"):format(level, claimed)
+                return
+            end
+            target = claimed + 1
+        else
+            if claimed < 1 then
+                Dupe.info = "Nothing claimed yet to re-claim"
+                return
+            end
+            target = claimed
+        end
+        Dupe.running = true
+        local expected, reward = rewardText(target)
+        Dupe.info = ("Testing level %d (%s) x%d..."):format(target, expected, Settings.DupeBurst)
+        task.spawn(function()
+            local before = snapshot()
+            -- All in the same frame, so they reach the server together.
+            local done = 0
+            for _ = 1, Settings.DupeBurst do
+                task.spawn(function()
+                    pcall(function()
+                        local res = LevelService:ClaimLevelRewards(target)
+                        if type(res) == "table" and res.await then
+                            res:await()
+                        end
+                    end)
+                    done += 1
+                end)
+            end
+            local t0 = os.clock()
+            while done < Settings.DupeBurst and os.clock() - t0 < 8 do
+                task.wait(0.1)
+            end
+            task.wait(2)
+            local after = snapshot()
+            pcall(function()
+                stats = DataService:Get("Statistics"):expect() or stats
+            end)
+            local _, claimedNow = Dupe.levels()
+            local changes = {}
+            for k, v in after do
+                local d = v - (before[k] or 0)
+                if d ~= 0 and not k:find("Timestamp") and not k:find("Time$") then
+                    table.insert(changes, ("%s %+g"):format(k, d))
+                end
+            end
+            table.sort(changes)
+            local value = reward and type(reward.Value) == "number" and reward.Value or nil
+            local verdict = "check the changes below"
+            if value then
+                local best = 0
+                for k, v in after do
+                    local d = v - (before[k] or 0)
+                    if d > 0 and d % value == 0 and (k:lower():find(tostring(reward.Type):lower(), 1, true)
+                        or (reward.Type == "Currency" and (k:find("Yen") or k:find("Currency")))) then
+                        best = math.max(best, d / value)
+                    end
+                end
+                if best >= 2 then
+                    verdict = ("DUPED: paid %dx. Rejoin and check it stayed"):format(best)
+                elseif best == 1 then
+                    verdict = Settings.DupeMode == "Race the next reward" and "Paid once: no dupe" or "Paid again on a claimed level: DUPE"
+                else
+                    verdict = Settings.DupeMode == "Race the next reward" and "Nothing paid out (claim refused?)" or "Refused: no dupe"
+                end
+            end
+            Dupe.info = ("Level %d, %s each\nClaimed counter %d -> %d\n%s\n%s"):format(target, expected, claimed, claimedNow,
+                verdict, #changes > 0 and table.concat(changes, "\n", 1, math.min(#changes, 8)) or "no profile numbers changed")
+            Dupe.running = false
+        end)
+    end
+end
+
 --// Anti-AFK and level rewards \\--
 do
     local idled = {}
@@ -1019,6 +1232,34 @@ do
     toggle(Misc, "AutoLevelRewards", "Auto claim level rewards", "Claims level rewards every minute through the game's own claim")
     loop(0.5, function()
         MoveLabel:SetText(("Movement: %s"):format(Moves.status))
+    end)
+end
+
+do
+    local Tab = Window:AddTab("Rewards", "gift", "Rolls and level rewards")
+    local RollBox = Tab:AddLeftGroupbox("Rolls", "dice-5")
+    toggle(RollBox, "InstaRoll", "Insta roll",
+        "Your Spin buttons work as normal (normal spin = normal, lucky = lucky) but skip the reel and the rarity cutscene. The server picks the style the moment you press, so nothing about the odds changes")
+    local RollLabel = RollBox:AddLabel("...", true)
+
+    local DupeBox = Tab:AddRightGroupbox("Level reward dupe test", "copy")
+    dropdown(DupeBox, "DupeMode", "Test", { "Race the next reward", "Re-claim a claimed reward" },
+        "Race: sends the claim for your next unclaimed level several times at once. Re-claim: sends the claim again for a level you already claimed (the old 'unclaimable, spam and rejoin' trick)")
+    slider(DupeBox, "DupeBurst", "Claims at once", 2, 8, 0, "")
+    DupeBox:AddButton({ Text = "Run test", Func = Dupe.run,
+        Tooltip = "Fires once per press. The game has its own ban system and this is what it would look for: use an alt" })
+    DupeBox:AddButton({ Text = "Rejoin", Func = function()
+        pcall(function()
+            game:GetService("TeleportService"):Teleport(game.PlaceId, LocalPlayer)
+        end)
+    end, Tooltip = "Rejoin to see whether a duped reward stayed after saving" })
+    local LevelLabel = DupeBox:AddLabel("...", true)
+    local DupeLabel = DupeBox:AddLabel("...", true)
+    loop(0.5, function()
+        RollLabel:SetText(("Insta roll: %s\nRolls sped up: %d"):format(Rolls.status, Rolls.count))
+        local level, claimed = Dupe.levels()
+        LevelLabel:SetText(("Level %d, rewards claimed up to %d (%d unclaimed)"):format(level, claimed, math.max(0, level - claimed)))
+        DupeLabel:SetText(Dupe.info)
     end)
 end
 
