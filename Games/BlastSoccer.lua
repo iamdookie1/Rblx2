@@ -19,9 +19,14 @@
 --           and slide on a soft one, speed capped at Config.Ball.MaxSpeed.
 --   Goals   Arena.Goals.<Team>Goal, attribute Team, with a Trigger box.
 --
+--   Moving  Client.MovementController moves you on your side and reads
+--           Config.Movement every step (GroundSpeed 32, LandCarryDecel,
+--           AirDragRate, Slide.HopCap). The server flags speeds over 260.
+--
 -- The helpers wrap the game's own getAimLook and soundwave functions, so the
 -- game's own hit prediction, effects and remote all see the same shot. Nothing
--- hooks the remotes.
+-- hooks the remotes. Reach moves your origin closer to the ball only for the
+-- instant soundwave() reads it.
 --
 -- Everything here is LOCAL PLAYER ONLY.
 
@@ -71,6 +76,11 @@ local Settings = {
     Lunge = false, LungeSpeed = 60, LungeTime = 0.15,
     -- auto hit
     AutoHit = false, AutoMode = "Toward their goal", AutoMinSpeed = 0,
+    -- reach
+    Reach = false, ReachStuds = 8,
+    -- movement
+    Bhop = false, HopCap = 2.2, LessAirDrag = false, AirDragPct = 30,
+    RunOn = false, RunSpeed = 40, JumpOn = false, JumpPower = 26, SpeedGuard = true,
 }
 
 --// Plumbing \\--
@@ -338,6 +348,58 @@ do
     end
 end
 
+--// Reach \\--
+-- The server takes the shot's origin from you, and accepts it within
+-- Config.Validation.OriginTolerance (14 studs) of where it thinks you are,
+-- a margin that also has to cover your lag. When the ball is just out of
+-- range, the shot is fired from up to ReachStuds closer to it: only as much
+-- as is needed, and only for the instant the game builds the shot (the game's
+-- own prediction and the remote both see the same origin). The game tells us
+-- when a shot is refused (Remotes.SoundwaveReject); a refused reach shot
+-- lowers the limit by 2 studs.
+local Reach = { limit = math.huge, rejects = 0, used = 0, usedAt = -math.huge, info = "off" }
+do
+    function Reach.max()
+        return Settings.Reach and math.min(Settings.ReachStuds, Reach.limit) or 0
+    end
+    -- How far to move the shot's origin toward the ball (a Vector3, maybe zero).
+    function Reach.shift(rootPos)
+        local extra = Reach.max()
+        if extra <= 0 then
+            return Vector3.zero
+        end
+        local center, _, radius = Ball.state()
+        if not center then
+            return Vector3.zero
+        end
+        local origin = rootPos + Vector3.new(0, 1.5, 0)
+        local to = center - origin
+        local need = to.Magnitude - radius - (num(waveParams(), "Range", 22) - 1)
+        if need <= 0 or need > extra or to.Magnitude < 1e-3 then
+            return Vector3.zero
+        end
+        return to.Unit * need
+    end
+    -- The origin a shot fired now would use.
+    function Reach.origin(root)
+        local base = root.Position
+        return base + Vector3.new(0, 1.5, 0) + Reach.shift(base)
+    end
+    local remotes = ReplicatedStorage:FindFirstChild("Remotes")
+    local reject = remotes and remotes:FindFirstChild("SoundwaveReject")
+    if reject and reject:IsA("RemoteEvent") then
+        table.insert(Connections, reject.OnClientEvent:Connect(function()
+            if not alive() or os.clock() - Reach.usedAt > 1.5 then
+                return
+            end
+            Reach.rejects += 1
+            local now = math.min(Settings.ReachStuds, Reach.limit)
+            Reach.limit = math.max(2, now - 2)
+            notify(("Reach shot refused, reach lowered to %d studs"):format(Reach.limit), 3)
+        end))
+    end
+end
+
 --// Wrapping the game's shot \\--
 -- getAimLook is only changed while the game is inside soundwave(), so the
 -- aim line and anything else that asks for the aim stay as they are.
@@ -387,9 +449,24 @@ do
             if Settings.Lunge and Hook.lunge then
                 pcall(Hook.lunge)
             end
+            -- Reach: move your root toward the ball for the instant soundwave()
+            -- reads it, then straight back (no physics step runs in between).
+            local root = rootPart()
+            local shift = root and Reach.shift(root.Position) or Vector3.zero
+            local savedCf
+            if shift.Magnitude > 0.05 then
+                savedCf = root.CFrame
+                root.CFrame = savedCf + shift
+                Reach.usedAt = os.clock()
+                Reach.used += 1
+                Reach.info = ("last reach shot: +%.1f studs"):format(shift.Magnitude)
+            end
             Hook.shooting = true
             local res = table.pack(pcall(origWave, ...))
             Hook.shooting = false
+            if savedCf and root.Parent then
+                root.CFrame = savedCf
+            end
             if not res[1] then
                 error(res[2], 0)
             end
@@ -450,7 +527,7 @@ do
         if not (root and center) then
             return "fire"
         end
-        local origin = root.Position + Vector3.new(0, 1.5, 0)
+        local origin = Reach.origin(root)
         local look = currentAim(origin)
         if not look then
             return "fire"
@@ -537,7 +614,7 @@ do
         if not (root and center) then
             return
         end
-        local origin = root.Position + Vector3.new(0, 1.5, 0)
+        local origin = Reach.origin(root)
         local look = currentAim(origin)
         if not (look and Shot.inCone(origin, look, center, radius)) then
             Lunge.info = "ball not in reach, no lunge"
@@ -640,7 +717,7 @@ do
             if not (root and center) then
                 return
             end
-            local origin = root.Position + Vector3.new(0, 1.5, 0)
+            local origin = Reach.origin(root)
             local look = currentAim(origin)
             local launch = Shot.launch(origin, look, center, radius, ballVel, Shot.myVelocity())
             local goalPos, enemy = enemyGoal()
@@ -673,6 +750,84 @@ do
     end
 end
 loop(1 / 30, Auto.step)
+
+--// Movement mods \\--
+-- MovementController moves you on your side and reads Config.Movement live
+-- every step, so changing those numbers changes how you move:
+--   Bhop      landing speed loss (LandCarryDecel 50/s) goes to 0, and slide
+--             hops are allowed more speed (Slide.HopCap 1.5x) with less drag.
+--   Air drag  speed over 2x run speed fades at AirDragRate 1.2; lowered.
+--   Run/Jump  GroundSpeed 32 and JumpVelocity 20.4.
+-- The server flags anyone over Config.Validation.MaxPlayerSpeed (260), so the
+-- speed guard trims you back under 230 if momentum ever stacks that high.
+local Moves = { info = "" }
+do
+    local MOVE = Config.Movement
+    local SLIDE = MOVE and MOVE.Slide
+    local orig = Genv.__BlastSoccerMoveOriginal
+    if type(MOVE) == "table" then
+        if not orig then
+            orig = {
+                GroundSpeed = MOVE.GroundSpeed, JumpVelocity = MOVE.JumpVelocity, LandCarryDecel = MOVE.LandCarryDecel,
+                AirDragStartMultiplier = MOVE.AirDragStartMultiplier, AirDragRate = MOVE.AirDragRate,
+                HopCap = SLIDE and SLIDE.HopCap, HopDrag = SLIDE and SLIDE.HopDrag,
+            }
+            Genv.__BlastSoccerMoveOriginal = orig
+        end
+        local function restore()
+            MOVE.GroundSpeed, MOVE.JumpVelocity, MOVE.LandCarryDecel = orig.GroundSpeed, orig.JumpVelocity, orig.LandCarryDecel
+            MOVE.AirDragStartMultiplier, MOVE.AirDragRate = orig.AirDragStartMultiplier, orig.AirDragRate
+            if SLIDE then
+                SLIDE.HopCap, SLIDE.HopDrag = orig.HopCap, orig.HopDrag
+            end
+        end
+        loop(0.25, function()
+            MOVE.GroundSpeed = Settings.RunOn and Settings.RunSpeed or orig.GroundSpeed
+            MOVE.JumpVelocity = Settings.JumpOn and Settings.JumpPower or orig.JumpVelocity
+            MOVE.LandCarryDecel = Settings.Bhop and 0 or orig.LandCarryDecel
+            if SLIDE then
+                SLIDE.HopCap = Settings.Bhop and Settings.HopCap or orig.HopCap
+                SLIDE.HopDrag = Settings.Bhop and 0.3 or orig.HopDrag
+            end
+            if Settings.LessAirDrag and type(orig.AirDragRate) == "number" then
+                local f = Settings.AirDragPct / 100
+                MOVE.AirDragRate = orig.AirDragRate * f
+                -- Fading also starts later: 2x run speed at 100%, 3x at 0%.
+                MOVE.AirDragStartMultiplier = (orig.AirDragStartMultiplier or 2) * (1.5 - 0.5 * f)
+            else
+                MOVE.AirDragRate, MOVE.AirDragStartMultiplier = orig.AirDragRate, orig.AirDragStartMultiplier
+            end
+        end)
+        table.insert(Cleanups, function()
+            restore()
+            Genv.__BlastSoccerMoveOriginal = nil
+        end)
+        Moves.info = "ready"
+    else
+        Moves.info = "Config.Movement not found"
+    end
+
+    -- Speed guard, through the game's own applyImpulse.
+    local GUARD = 230
+    table.insert(Connections, RunService.Heartbeat:Connect(function()
+        if not (alive() and Settings.SpeedGuard and (Settings.Bhop or Settings.LessAirDrag or Settings.RunOn)) then
+            return
+        end
+        local move = Mods.Movement
+        if not (move and type(move.applyImpulse) == "function") then
+            return
+        end
+        local v = Shot.myVelocity()
+        local flat = Vector3.new(v.X, 0, v.Z)
+        if flat.Magnitude > GUARD then
+            pcall(move.applyImpulse, -flat.Unit * (flat.Magnitude - GUARD))
+        end
+    end))
+    loop(0.2, function()
+        local v = Shot.myVelocity()
+        Moves.speed = Vector3.new(v.X, 0, v.Z).Magnitude
+    end)
+end
 
 --// Drawing \\--
 -- Thin boxes drawn on top of everything (handle adornments), so the lines
@@ -803,7 +958,7 @@ do
         -- where it would go if you shot right now
         local root = rootPart()
         if Settings.ShowShot and root then
-            local origin = root.Position + Vector3.new(0, 1.5, 0)
+            local origin = Reach.origin(root)
             local look = currentAim(origin)
             if look and Shot.inCone(origin, look, center, radius) then
                 local launch = Shot.launch(origin, look, center, radius, vel, Shot.myVelocity())
@@ -908,6 +1063,23 @@ do
     slider(AutoBox, "AutoMinSpeed", "Only if the shot is at least", 0, 180, 0, " speed")
     local AutoLabel = AutoBox:AddLabel("...", true)
 
+    local ReachBox = Tab:AddLeftGroupbox("Reach", "expand")
+    toggle(ReachBox, "Reach", "Reach expander",
+        "When the ball is just out of range, the shot is fired from up to this many studs closer to it. The server allows 14 studs (that also covers your lag), so if it refuses a shot the reach lowers itself")
+    ReachBox:AddSlider("ReachStuds", {
+        Text = "Extra reach", Default = Settings.ReachStuds, Min = 1, Max = 12, Rounding = 0, Suffix = " studs",
+        Tooltip = "Normal range is 22. 6-8 is safe on a good connection; above 10 gets refused on high ping",
+        Callback = function(v)
+            Settings.ReachStuds = v
+            Reach.limit = math.huge
+        end,
+    })
+    local ReachLabel = ReachBox:AddLabel("...", true)
+    loop(0.3, function()
+        ReachLabel:SetText(("Reach now: %s\nUsed %d times, refused %d\n%s"):format(
+            Settings.Reach and ("+%d studs"):format(Reach.max()) or "off", Reach.used, Reach.rejects, Reach.info))
+    end)
+
     local AimBox = Tab:AddRightGroupbox("Aim helper (small)", "gauge")
     toggle(AimBox, "SpeedHelp", "Aim helper",
         "Turns your aim a little toward the way you and the ball are already moving, so the shot comes off a bit faster. Never more than the slider, and never so far the ball leaves your cone")
@@ -919,6 +1091,28 @@ do
         LungeLabel:SetText(("Last shot: %s"):format(Lunge.info))
         AutoLabel:SetText(("Now: %s"):format(Auto.info))
         AimLabel:SetText(("Last shot: %s\nHook: %s"):format(Shot.last, Hook.status))
+    end)
+end
+
+do
+    local Tab = Window:AddTab("Movement", "wind", "Bhops, air drag, speed")
+    local Hop = Tab:AddLeftGroupbox("Momentum", "wind")
+    toggle(Hop, "Bhop", "Stronger bhops",
+        "Landing doesn't cost speed (normally 50 a second while on the ground), and slide hops keep more speed. Jump right as you land and hold the direction you're going")
+    slider(Hop, "HopCap", "Slide hop limit", 1.5, 3, 1, "x run speed", "The game's is 1.5x")
+    toggle(Hop, "LessAirDrag", "Less air drag", "Fast speed in the air fades slower, and only above a higher speed")
+    slider(Hop, "AirDragPct", "Air drag", 0, 100, 0, "%", "100% is the game's normal drag")
+    toggle(Hop, "SpeedGuard", "Speed guard",
+        "Keeps you under 230. The server flags anyone moving over 260, and no drag means speed can stack up")
+
+    local Run = Tab:AddRightGroupbox("Run and jump", "move")
+    toggle(Run, "RunOn", "Run speed")
+    slider(Run, "RunSpeed", "Run speed", 32, 60, 0, "", "The game's is 32. Slides and dashes scale with it")
+    toggle(Run, "JumpOn", "Jump height")
+    slider(Run, "JumpPower", "Jump power", 20, 45, 1, "", "The game's is 20.4")
+    local MoveLabel = Run:AddLabel("...", true)
+    loop(0.2, function()
+        MoveLabel:SetText(("Your speed: %d\nMods: %s"):format(math.floor(Moves.speed or 0), Moves.info))
     end)
 end
 
