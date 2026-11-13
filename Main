@@ -26,6 +26,18 @@ local Games = {
     [129415455370018] = { Name = 'Runaways (hard)', Script = 'Games/Runaways.lua' },
     [137470666387963] = { Name = 'Blast Soccer', Script = 'Games/BlastSoccer.lua' },
     [117090155680637] = { Name = "No Man's Land", Script = 'Games/NoMansLand.lua' },
+    -- Volleyball Legends (game 6931042565): every production match place from
+    -- the game's own Configuration.Place. The lobby (Default, 73956553001240)
+    -- and the idle server (86789627188240) have no court, so they're left out.
+    [74691681039273] = { Name = 'Volleyball Legends (Starter)', Script = 'Games/VolleyballLegends.lua' },
+    [102580589030177] = { Name = 'Volleyball Legends (Intermediate)', Script = 'Games/VolleyballLegends.lua' },
+    [134314141048307] = { Name = 'Volleyball Legends (Pro)', Script = 'Games/VolleyballLegends.lua' },
+    [109684591839194] = { Name = 'Volleyball Legends (Classic Pro)', Script = 'Games/VolleyballLegends.lua' },
+    [79136731857959] = { Name = 'Volleyball Legends (Seasonal)', Script = 'Games/VolleyballLegends.lua' },
+    [103521881639626] = { Name = 'Volleyball Legends (Hardcore)', Script = 'Games/VolleyballLegends.lua' },
+    [96802054849934] = { Name = 'Volleyball Legends (Training)', Script = 'Games/VolleyballLegends.lua' },
+    [117134837736236] = { Name = 'Volleyball Legends (Sandbox)', Script = 'Games/VolleyballLegends.lua' },
+    [85395484560711] = { Name = 'Volleyball Legends (Tutorial)', Script = 'Games/VolleyballLegends.lua' },
     [662417684] = { Name = 'Lucky Blocks', Script = 'Games/LuckyBlocks.lua' },
     [129363360542125] = { Name = 'Doodle Drop', Script = 'Games/DoodleDrop.lua' },
     -- Doodle Drop's level creator, from UGC_PLACE_ID in the game's own Config.
