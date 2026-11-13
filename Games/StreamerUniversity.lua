@@ -54,7 +54,7 @@ end
 
 local Settings = {
     -- combat
-    Reach = false, ReachStuds = 8, ReachSkills = true, FaceTarget = false, FaceRange = 12,
+    Reach = false, ReachExtra = 2, ReachSkills = false, FaceTarget = false, FaceRange = 12, CalmCamera = true,
     AutoM1 = false, AutoM1Range = 8, TargetMode = "Closest", IgnoreParty = true, IgnoreClan = true,
     AutoWeave = false, WeaveRange = 11, WeaveHold = 0.35,
     AutoStomp = false, StompRange = 7, AutoTakedown = false,
@@ -260,12 +260,17 @@ do
     end
 end
 
---// Reach: the combat script's own box, made longer \\--
--- When Core.Combat asks workspace for the parts in its swing box, the box it
--- gets answered for runs from you out to the reach you set (never past the
--- server's 10 x combat scale). The script then checks those parts and sends
--- the hit itself.
-local Reach = { status = "off", hooked = false }
+--// Reach: the combat script's own box, grown a little \\--
+-- The combat script boxes your arm every frame (GetPartBoundsInBox) and the
+-- takedown / shove / special checks use a circle (GetPartBoundsInRadius).
+-- Reach keeps the game's own box where it is (on your arm) and only grows it
+-- by a few studs, so a hit is still a hit near your arm. The parts it finds
+-- are also filtered down to players a hit could really count on (within the
+-- server's 10 x combat scale and 120 degrees of your facing): the takedown /
+-- shove check gives up on the whole attack at the first part that fails, so
+-- extra parts must never reach it. Anything unexpected falls back to the
+-- game's own query untouched.
+local Reach = { status = "off", hooked = false, grew = 0 }
 do
     local function fromCombat()
         if typeof(getcallingscript) ~= "function" then
@@ -274,30 +279,75 @@ do
         local ok, s = pcall(getcallingscript)
         return ok and typeof(s) == "Instance" and s.Name == "Combat"
     end
-    local function maxReach()
-        return math.min(Settings.ReachStuds, 9.5 * combatScale(character()))
+    -- Would Combat.Main.validate (client side) accept this model?
+    local function hittable(model, me, myPivot)
+        local scale = math.max(combatScale(me), combatScale(model))
+        local at = model:GetPivot().Position
+        local to = at - myPivot.Position
+        if to.Magnitude > scale * 10 - 0.5 then
+            return false
+        end
+        if to.Magnitude < 0.01 then
+            return true
+        end
+        return math.deg(math.acos(math.clamp(myPivot.LookVector:Dot(to.Unit), -1, 1))) <= 115
+    end
+    local function filter(parts)
+        local me = character()
+        if not me then
+            return parts
+        end
+        local myPivot = me:GetPivot()
+        local out, verdict = {}, {}
+        for _, part in parts do
+            local model = part:FindFirstAncestorWhichIsA("Model")
+            local isChar = model and model ~= me and model:FindFirstChildWhichIsA("Humanoid") and model:FindFirstChild("CombatInfo")
+            if not isChar then
+                table.insert(out, part)
+            else
+                if verdict[model] == nil then
+                    verdict[model] = hittable(model, me, myPivot)
+                end
+                if verdict[model] then
+                    table.insert(out, part)
+                end
+            end
+        end
+        return out
+    end
+    local function grownBox(cf, size)
+        local e = math.clamp(Settings.ReachExtra, 0, 5)
+        -- The box's Z runs along the arm toward the hand: push it forward by
+        -- half the extra and make it e longer and e wider.
+        local box = cf * CFrame.new(0, 0, -e / 2)
+        return box, size + Vector3.new(e, e, e)
     end
     if typeof(hookmetamethod) == "function" and typeof(getnamecallmethod) == "function" then
         local old
         local handler = function(self, ...)
-            if Settings.Reach and self == Workspace and alive() and not (checkcaller and checkcaller()) then
+            if Settings.Reach and self == Workspace and not (checkcaller and checkcaller()) and alive() then
                 local method = getnamecallmethod()
-                if method == "GetPartBoundsInBox" and fromCombat() then
-                    local cf, size, params = ...
-                    local root = rootPart()
-                    if root and typeof(cf) == "CFrame" and typeof(size) == "Vector3" then
-                        local len = maxReach()
-                        local look = flat(root.CFrame.LookVector)
-                        look = look.Magnitude > 0.1 and look.Unit or root.CFrame.LookVector
-                        local centre = root.Position + look * (len / 2)
-                        local box = CFrame.lookAt(centre, centre + look)
-                        local width = math.max(size.X, len * 0.9)
-                        return old(self, box, Vector3.new(width, math.max(size.Y, 7), len + 2), params)
-                    end
-                elseif method == "GetPartBoundsInRadius" and Settings.ReachSkills and fromCombat() then
-                    local pos, radius, params = ...
-                    if typeof(pos) == "Vector3" and type(radius) == "number" then
-                        return old(self, pos, math.max(radius, math.min(radius * 1.8, maxReach())), params)
+                if method == "GetPartBoundsInBox" or (method == "GetPartBoundsInRadius" and Settings.ReachSkills) then
+                    if fromCombat() then
+                        local a1, a2, a3 = ...
+                        local ok, result = pcall(function()
+                            if method == "GetPartBoundsInBox" then
+                                -- Only the small arm / tool boxes, not other queries.
+                                if typeof(a1) ~= "CFrame" or typeof(a2) ~= "Vector3" or a2.Magnitude > 12 then
+                                    return nil
+                                end
+                                local box, size = grownBox(a1, a2)
+                                return filter(old(self, box, size, a3))
+                            end
+                            if typeof(a1) ~= "Vector3" or type(a2) ~= "number" or a2 > 12 then
+                                return nil
+                            end
+                            return filter(old(self, a1, a2 + math.clamp(Settings.ReachExtra, 0, 5), a3))
+                        end)
+                        if ok and type(result) == "table" then
+                            Reach.grew += 1
+                            return result
+                        end
                     end
                 end
             end
@@ -323,12 +373,23 @@ end
 --// Auto face, auto M1, auto stomp / takedown \\--
 local Fight = { info = "off" }
 do
+    -- Turns you toward them, but only when you're well off (over 50 degrees),
+    -- so the camera isn't yanked every tick.
     local function face(r)
         local root = rootPart()
-        if root and r then
-            local at = r.Position
-            root.CFrame = CFrame.lookAt(root.Position, Vector3.new(at.X, root.Position.Y, at.Z))
+        if not (Settings.FaceTarget and root and r) then
+            return
         end
+        local to = flat(r.Position - root.Position)
+        local look = flat(root.CFrame.LookVector)
+        if to.Magnitude < 0.5 or look.Magnitude < 0.1 then
+            return
+        end
+        if look.Unit:Dot(to.Unit) > math.cos(math.rad(50)) then
+            return
+        end
+        local at = r.Position
+        root.CFrame = CFrame.lookAt(root.Position, Vector3.new(at.X, root.Position.Y, at.Z))
     end
     local function holdingStyle()
         local c = character()
@@ -386,9 +447,6 @@ do
             local rag = info:FindFirstChild("Ragdolled")
             -- M1 doesn't hit someone who's ragdolled (the game skips them).
             if not (rag and rag.Value) then
-                if not Settings.FaceTarget then
-                    face(r)
-                end
                 if Game.call("onM1") then
                     Fight.info = ("hitting %s (%d studs)"):format(p.DisplayName, math.floor(d))
                 else
@@ -397,6 +455,45 @@ do
             end
         end
     end)
+end
+
+--// Calm camera while auto fighting \\--
+-- Every punch the game shakes the camera and pulses the FOV
+-- (Framework.shakeCam / Framework.zoom). With auto M1 that's nonstop, so
+-- while auto M1 is on those are skipped. Hits still show.
+do
+    local ok, Framework = pcall(function()
+        return require(game:GetService("ReplicatedStorage"):WaitForChild("Framework", 5))
+    end)
+    if ok and type(Framework) == "table" then
+        local saved = Genv.__SuFrameworkOriginals
+        if saved then
+            Framework.shakeCam, Framework.zoom = saved.shake, saved.zoom
+        end
+        local origShake, origZoom = Framework.shakeCam, Framework.zoom
+        if type(origShake) == "function" and type(origZoom) == "function" then
+            Genv.__SuFrameworkOriginals = { shake = origShake, zoom = origZoom }
+            local function calm()
+                return alive() and Settings.CalmCamera and Settings.AutoM1
+            end
+            Framework.shakeCam = function(kind, ...)
+                if calm() and (kind == "Punch" or kind == "Hit") then
+                    return
+                end
+                return origShake(kind, ...)
+            end
+            Framework.zoom = function(...)
+                if calm() then
+                    return
+                end
+                return origZoom(...)
+            end
+            table.insert(Cleanups, function()
+                Framework.shakeCam, Framework.zoom = origShake, origZoom
+                Genv.__SuFrameworkOriginals = nil
+            end)
+        end
+    end
 end
 
 --// Auto weave (parry) \\--
@@ -779,9 +876,10 @@ do
     local ReachBox = Tab:AddLeftGroupbox("Reach", "expand")
     toggle(ReachBox, "Reach", "Reach expander",
         "Your punches' hit box reaches this far in front of you. The game's own combat script still checks and sends each hit, and the server's limit is 10 studs (more if you're tall), so it never goes past that")
-    slider(ReachBox, "ReachStuds", "Reach", 4, 10, 1, " studs", "Normal punches reach about 3-4 studs")
-    toggle(ReachBox, "ReachSkills", "Also takedown / shove", "Widens the takedown, shove and special hit circles too, within the same limit")
-    toggle(ReachBox, "FaceTarget", "Face target", "Turns you toward the nearest enemy while holding a style (hits must be within 120 degrees of where you face)")
+    slider(ReachBox, "ReachExtra", "Extra reach", 0.5, 5, 1, " studs",
+        "Added around your arm's own hit box. Start at 2: if hits stop counting, the server is stricter than its shared check, so go lower")
+    toggle(ReachBox, "ReachSkills", "Also takedown / shove", "Grows the takedown, shove and special circles by the same amount")
+    toggle(ReachBox, "FaceTarget", "Face target", "Turns you toward the nearest enemy while holding a style, only when you're well off to the side (hits must be within 120 degrees of where you face). Off: nothing ever turns you")
     slider(ReachBox, "FaceRange", "Face within", 4, 30, 0, " studs")
     local ReachLabel = ReachBox:AddLabel("...", true)
 
@@ -795,6 +893,7 @@ do
             Settings.TargetMode = v
         end,
     })
+    toggle(AutoBox, "CalmCamera", "Calm camera", "While auto M1 is on, skips the camera shake and FOV pulse the game adds to every punch")
     toggle(AutoBox, "IgnoreParty", "Skip party members")
     toggle(AutoBox, "IgnoreClan", "Skip clan members")
     toggle(AutoBox, "AutoStomp", "Auto stomp", "Stomps anyone knocked down near you")
@@ -809,7 +908,8 @@ do
     slider(WeaveBox, "WeaveHold", "Weave for", 0.15, 0.8, 2, " s")
     local WeaveLabel = WeaveBox:AddLabel("...", true)
     loop(0.3, function()
-        ReachLabel:SetText(("Reach: %s\nServer limit for you: %.1f studs"):format(Reach.status, 10 * combatScale(character())))
+        ReachLabel:SetText(("Reach: %s (%d hit checks grown)\nServer limit for you: %.1f studs"):format(Reach.status, Reach.grew,
+            10 * combatScale(character())))
         AutoLabel:SetText(("Combat functions: %s\nNow: %s"):format(Game.status, Fight.info))
         WeaveLabel:SetText(("%s\nWeaves: %d"):format(Weave.info, Weave.count))
     end)
