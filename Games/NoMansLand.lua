@@ -70,6 +70,8 @@ local Settings = {
     EspHealth = true, EspDistance = true, EspMax = 600,
     -- movement / world
     SpeedOn = false, Speed = 1.4, InfJump = false, Fullbright = false, NoFog = false,
+    -- raft
+    AutoRepair = false, RepairFace = true, RaftAlerts = true, EspRaftDamage = false,
     Fly = false, FlySpeed = 50, Noclip = false, WaterWalk = false, FastSwim = false, AntiAfk = true,
 }
 
@@ -131,6 +133,7 @@ local WalkSpeedManager = clientModule("Shared.WalkSpeedManager")
 local MobileButtons = clientModule("Shared.MobileButtonManager")
 local GunAmmoState = clientModule("Shared.GunAmmoState")
 local GunMods = {}
+local Raft -- filled in by the raft section below
 local function sharedModule(name)
     local ok, mod = pcall(function()
         return require(game:GetService("ReplicatedStorage"):WaitForChild("Shared", 5):WaitForChild(name, 5))
@@ -140,6 +143,7 @@ end
 local GunConfig = sharedModule("GunConfig")
 local GameConfig = sharedModule("GameConfig")
 local OceanWaveAPI = sharedModule("OceanWaveAPI")
+local NetworkConfig = sharedModule("NetworkConfig")
 
 --// Buttons: the game's own action handlers, no fake input \\--
 -- Every tool registers its action with MobileButtonManager:CreateButton(name,
@@ -833,6 +837,7 @@ do
     local COLORS = {
         Mob = Color3.fromRGB(255, 70, 70), Player = Color3.fromRGB(80, 160, 255), Loot = Color3.fromRGB(255, 200, 60),
         Item = Color3.fromRGB(90, 255, 120), Drift = Color3.fromRGB(80, 230, 230), Trader = Color3.fromRGB(220, 120, 255),
+        RaftDamage = Color3.fromRGB(255, 140, 40),
     }
     local function entry(obj, kind)
         local e = Esp.items[obj]
@@ -898,6 +903,14 @@ do
         addTag("PickupableTool", "Item", Settings.EspItems)
         addTag("DriftingLoot", "Drift", Settings.EspDrift)
         addTag("Trader", "Trader", Settings.EspTraders)
+        if Settings.EspRaftDamage and Raft then
+            for _, o in Raft.parts() do
+                local c, m = Raft.hp(o)
+                if c < m then
+                    list[o] = "RaftDamage"
+                end
+            end
+        end
         if Settings.EspPlayers then
             for _, p in Players:GetPlayers() do
                 if p ~= LocalPlayer and p.Character then
@@ -932,6 +945,9 @@ do
                 local line = name
                 if Settings.EspHealth and hum then
                     line ..= ("  %d/%d"):format(math.floor(hum.Health), math.floor(hum.MaxHealth))
+                elseif kind == "RaftDamage" then
+                    local c, m = Raft.hp(obj)
+                    line ..= ("  %d/%d"):format(math.floor(c), math.floor(m))
                 end
                 if Settings.EspDistance then
                     line ..= ("  [%dm]"):format(math.floor(dist))
@@ -1166,6 +1182,174 @@ do
     end)
 end
 
+--// Raft: health, damage alerts, auto repair \\--
+-- Raft parts carry the Damageable tag. Their max health is the Health
+-- attribute; the server sends the current health with DamageableHealthChanged
+-- (what the game's own health bars listen to). The repair hammer just sends
+-- "swung" and the server mends what's in reach, so auto repair holds the
+-- Repair button while a damaged raft part is close.
+Raft = { health = {}, info = "no raft found", repairs = 0 }
+do
+    -- Your raft is the WeldedGroup model holding PlayerRaftMassCenter.
+    local function myRaft()
+        local centre = CollectionService:GetTagged("PlayerRaftMassCenter")[1]
+        if not centre then
+            return nil, nil
+        end
+        local model = centre.Parent
+        while model and model ~= Workspace do
+            if CollectionService:HasTag(model, "WeldedGroup") then
+                return model, centre
+            end
+            model = model.Parent
+        end
+        return centre:FindFirstAncestorWhichIsA("Model"), centre
+    end
+    Raft.model = myRaft
+    function Raft.parts()
+        local model = myRaft()
+        local out = {}
+        if model then
+            for _, o in CollectionService:GetTagged("Damageable") do
+                if o:IsDescendantOf(model) and (o:GetAttribute("Health") or 0) > 0 then
+                    table.insert(out, o)
+                end
+            end
+        end
+        return out
+    end
+    function Raft.hp(o)
+        local maxHp = o:GetAttribute("Health") or 0
+        local known = Raft.health[o]
+        return known and known.cur or maxHp, known and known.max or maxHp
+    end
+    local function where(o)
+        if o:IsA("BasePart") then
+            return o.Position, math.max(o.Size.X, o.Size.Z) / 2
+        end
+        local ok, cf, size = pcall(o.GetBoundingBox, o)
+        if ok then
+            return cf.Position, math.max(size.X, size.Z) / 2
+        end
+        return nil
+    end
+    Raft.where = where
+
+    if NetworkConfig and NetworkConfig.DamageableHealthChanged then
+        local ok, conn = pcall(function()
+            return NetworkConfig.DamageableHealthChanged:Connect(function(data)
+                if not (alive() and type(data) == "table" and typeof(data.object) == "Instance") then
+                    return
+                end
+                local o = data.object
+                local prev = Raft.health[o]
+                Raft.health[o] = { cur = data.currentHealth, max = data.maxHealth }
+                if Settings.RaftAlerts and prev and type(data.currentHealth) == "number"
+                    and data.currentHealth < prev.cur then
+                    local model = myRaft()
+                    if model and o:IsDescendantOf(model) then
+                        local now = os.clock()
+                        if now - (Raft.alertedAt or 0) > 4 then
+                            Raft.alertedAt = now
+                            notify(("Your raft is taking damage: %s %d/%d"):format(
+                                o:GetAttribute("ObjectName") or o.Name, data.currentHealth, data.maxHealth or 0), 3)
+                        end
+                    end
+                end
+            end)
+        end)
+        if ok and conn then
+            table.insert(Cleanups, function()
+                pcall(function()
+                    conn:Disconnect()
+                end)
+            end)
+        end
+        -- Ask once for the parts' real health, like the game's health bars do.
+        task.spawn(function()
+            if NetworkConfig.GetDamageableHealth then
+                for _, o in Raft.parts() do
+                    pcall(function()
+                        NetworkConfig.GetDamageableHealth:Fire(o)
+                    end)
+                    task.wait(0.05)
+                end
+            end
+        end)
+    end
+    setmetatable(Raft.health, { __mode = "k" })
+
+    -- Summary for the UI.
+    loop(0.5, function()
+        local parts = Raft.parts()
+        if #parts == 0 then
+            Raft.info = "no raft found"
+            return
+        end
+        local cur, max, damaged, worst, worstPct = 0, 0, 0, nil, 2
+        for _, o in parts do
+            local c, m = Raft.hp(o)
+            cur += c
+            max += m
+            if m > 0 and c < m then
+                damaged += 1
+                if c / m < worstPct then
+                    worst, worstPct = o, c / m
+                end
+            end
+        end
+        local root = rootPart()
+        local _, centre = myRaft()
+        local dist = (root and centre) and (root.Position - centre.Position).Magnitude or 0
+        Raft.info = ("Raft: %d/%d HP (%d%%)\nDamaged parts: %d%s\nYou are %dm from it"):format(cur, max,
+            max > 0 and math.floor(cur / max * 100) or 0, damaged,
+            worst and ("\nWorst: %s %d%%"):format(worst:GetAttribute("ObjectName") or worst.Name, math.floor(worstPct * 100)) or "",
+            math.floor(dist))
+    end)
+
+    -- Auto repair.
+    local holding = false
+    local function release()
+        if holding then
+            holding = false
+            Buttons.finish("RepairHammerRepair")
+        end
+    end
+    table.insert(Cleanups, release)
+    loop(0.15, function()
+        local tool, root = equipped(), rootPart()
+        if not (Settings.AutoRepair and tool and root and CollectionService:HasTag(tool, "RepairHammer")) then
+            release()
+            return
+        end
+        local range = tool:GetAttribute("Range") or tool:GetAttribute("MeleeRange") or 10
+        local best, bestD, bestPos
+        for _, o in Raft.parts() do
+            local c, m = Raft.hp(o)
+            if c < m then
+                local pos, radius = where(o)
+                if pos then
+                    local d = (pos - root.Position).Magnitude - radius
+                    if d <= range and (not bestD or d < bestD) then
+                        best, bestD, bestPos = o, d, pos
+                    end
+                end
+            end
+        end
+        if not best then
+            release()
+            return
+        end
+        if Settings.RepairFace then
+            root.CFrame = CFrame.lookAt(root.Position, Vector3.new(bestPos.X, root.Position.Y, bestPos.Z))
+        end
+        if not holding and Buttons.begin("RepairHammerRepair") then
+            holding = true
+            Raft.repairs += 1
+        end
+    end)
+end
+
 -- Back to your raft: the raft's mass centre, a little above it.
 local function toRaft()
     local root = rootPart()
@@ -1285,6 +1469,23 @@ do
     toggle(Opt, "EspHealth", "Health")
     toggle(Opt, "EspDistance", "Distance")
     slider(Opt, "EspMax", "Max distance", 50, 3000, 0, " studs")
+end
+
+do
+    local Tab = Window:AddTab("Raft", "sailboat", "Raft health and repairs")
+    local Box = Tab:AddLeftGroupbox("Raft", "sailboat")
+    local RaftLabel = Box:AddLabel("...", true)
+    toggle(Box, "RaftAlerts", "Damage alerts", "A notification when part of your raft gets hit, so you know you're under attack")
+    toggle(Box, "EspRaftDamage", "Highlight damaged parts", "Orange outline and HP on every damaged part of your raft, through walls")
+    Box:AddButton({ Text = "Back to my raft", Func = toRaft, Tooltip = "Puts you on your raft if you fell off" })
+    local Fix = Tab:AddRightGroupbox("Repair", "hammer")
+    toggle(Fix, "AutoRepair", "Auto repair", "Hold a repair hammer: it swings whenever a damaged raft part is in reach. Walk along the raft and it fixes as you go")
+    toggle(Fix, "RepairFace", "Turn to face it", "Turns you toward the part you're fixing")
+    local FixLabel = Fix:AddLabel("...", true)
+    loop(0.5, function()
+        RaftLabel:SetText(Raft.info)
+        FixLabel:SetText(("Repair runs started: %d"):format(Raft.repairs))
+    end)
 end
 
 do
