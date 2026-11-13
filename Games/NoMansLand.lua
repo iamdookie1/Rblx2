@@ -59,6 +59,8 @@ local Settings = {
     SilentAim = false, AimPart = "Head", FOV = 180, ShowFOV = true, AimRange = 500, VisibleOnly = true,
     AutoShoot = false, AutoMelee = false, FaceTarget = true, AutoReload = false, NoRecoil = false,
     AutoHeal = false, HealAt = 50,
+    -- gun mods
+    FastBullets = false, BulletSpeed = 2500, NoDrop = false, NoBounce = false, InstantSpin = false, NoMinigunSlow = false,
     -- loot
     AutoOpen = false, AutoPickup = false, PickupFilter = "",
     -- fishing
@@ -68,6 +70,7 @@ local Settings = {
     EspHealth = true, EspDistance = true, EspMax = 600,
     -- movement / world
     SpeedOn = false, Speed = 1.4, InfJump = false, Fullbright = false, NoFog = false,
+    Fly = false, FlySpeed = 50, Noclip = false, WaterWalk = false, FastSwim = false, AntiAfk = true,
 }
 
 --// Plumbing \\--
@@ -127,10 +130,16 @@ local WalkSpeedManager = clientModule("Shared.WalkSpeedManager")
 
 local MobileButtons = clientModule("Shared.MobileButtonManager")
 local GunAmmoState = clientModule("Shared.GunAmmoState")
-local GunConfig
-pcall(function()
-    GunConfig = require(game:GetService("ReplicatedStorage"):WaitForChild("Shared", 5):WaitForChild("GunConfig", 5))
-end)
+local GunMods = {}
+local function sharedModule(name)
+    local ok, mod = pcall(function()
+        return require(game:GetService("ReplicatedStorage"):WaitForChild("Shared", 5):WaitForChild(name, 5))
+    end)
+    return ok and type(mod) == "table" and mod or nil
+end
+local GunConfig = sharedModule("GunConfig")
+local GameConfig = sharedModule("GameConfig")
+local OceanWaveAPI = sharedModule("OceanWaveAPI")
 
 --// Buttons: the game's own action handlers, no fake input \\--
 -- Every tool registers its action with MobileButtonManager:CreateButton(name,
@@ -302,8 +311,13 @@ do
         local origCast, origRay = InputManager.aimRaycast, InputManager.getAimRay
         Genv.__NmlAimOriginals = { cast = origCast, ray = origRay }
         local function weaponOut()
-            local tool = equipped()
-            return tool and (CollectionService:HasTag(tool, "Gun") or CollectionService:HasTag(tool, "Melee"))
+            local tool, c = equipped(), character()
+            if c and c:GetAttribute("InMountedGun") then
+                return true
+            end
+            return tool and (CollectionService:HasTag(tool, "Gun") or CollectionService:HasTag(tool, "Shotgun")
+                or CollectionService:HasTag(tool, "Sniper") or CollectionService:HasTag(tool, "Bazooka")
+                or CollectionService:HasTag(tool, "Minigun") or CollectionService:HasTag(tool, "Melee"))
         end
         local function aimPoint()
             if not (alive() and Settings.SilentAim and weaponOut()) then
@@ -396,12 +410,16 @@ do
         end)
         return h
     end
-    local Trigger, Swing = holder("GunShoot"), holder("MeleeSwing")
+    local Trigger, Swing, Mounted = holder("GunShoot"), holder("MeleeSwing"), holder("MountedGunFire")
 
     loop(0.05, function()
-        local tool = equipped()
-        local want = Settings.AutoShoot and Settings.SilentAim and isGun(tool) and Target.model ~= nil
-            and not (character() and character():GetAttribute("IsReloading"))
+        local tool, c = equipped(), character()
+        local firing = Settings.AutoShoot and Settings.SilentAim and Target.model ~= nil
+            and not (c and c:GetAttribute("IsReloading"))
+        -- Mounted guns on rafts: the same aim, their own Fire button.
+        local mounted = c and c:GetAttribute("InMountedGun")
+        Mounted.set("mounted", firing and mounted)
+        local want = firing and not mounted and isGun(tool)
         -- Bazooka and sniper fire once per press, so press again each tick
         -- (the game's own fire rate check spaces the shots).
         if want and (CollectionService:HasTag(tool, "Bazooka") or CollectionService:HasTag(tool, "Sniper")) then
@@ -469,6 +487,79 @@ do
         table.insert(Cleanups, function()
             GunConfig.GetGunData = orig
             Genv.__NmlGunDataOriginal = nil
+        end)
+    end
+end
+
+--// Gun mods \\--
+-- The bullet is simulated on your side (GunController + FastCast) and reads
+-- these GunConfig numbers on every shot, so changing them changes your bullets.
+do
+    local KEYS = { "TracerSpeed", "BulletGravityDistance", "MinigunSpinupTime" }
+    local orig = Genv.__NmlGunConfigOriginal or {}
+    if GunConfig then
+        for _, k in KEYS do
+            if orig[k] == nil then
+                orig[k] = GunConfig[k]
+            end
+        end
+        Genv.__NmlGunConfigOriginal = orig
+        loop(0.3, function()
+            GunConfig.TracerSpeed = Settings.FastBullets and Settings.BulletSpeed or orig.TracerSpeed
+            GunConfig.BulletGravityDistance = Settings.NoDrop and 1e6 or orig.BulletGravityDistance
+            GunConfig.MinigunSpinupTime = Settings.InstantSpin and 0 or orig.MinigunSpinupTime
+        end)
+        table.insert(Cleanups, function()
+            for _, k in KEYS do
+                GunConfig[k] = orig[k]
+            end
+            Genv.__NmlGunConfigOriginal = nil
+        end)
+    end
+
+    -- No water skip: bullets check OceanWaveAPI:GetHeight to bounce off waves.
+    -- Only GunController's calls get a sea that's out of reach.
+    local savedHeight = Genv.__NmlGetHeightOriginal
+    if OceanWaveAPI and savedHeight then
+        OceanWaveAPI.GetHeight = savedHeight
+    end
+    if OceanWaveAPI and type(OceanWaveAPI.GetHeight) == "function" then
+        local origHeight = OceanWaveAPI.GetHeight
+        Genv.__NmlGetHeightOriginal = origHeight
+        OceanWaveAPI.GetHeight = function(self, ...)
+            if Settings.NoBounce and alive() then
+                -- Level 2 is whoever called GetHeight (no pcall here: it would add a frame).
+                local src = debug.info(2, "s")
+                if type(src) == "string" and src:find("GunController", 1, true) then
+                    return -1e9
+                end
+            end
+            return origHeight(self, ...)
+        end
+        GunMods = { height = origHeight }
+        table.insert(Cleanups, function()
+            OceanWaveAPI.GetHeight = origHeight
+            Genv.__NmlGetHeightOriginal = nil
+        end)
+    end
+
+    -- No minigun slowdown: the minigun sets a 0.5 "Minigun" walk speed multiplier.
+    local savedSet = Genv.__NmlSetMultiplierOriginal
+    if WalkSpeedManager and savedSet then
+        WalkSpeedManager.SetMultiplier = savedSet
+    end
+    if WalkSpeedManager and type(WalkSpeedManager.SetMultiplier) == "function" then
+        local origSet = WalkSpeedManager.SetMultiplier
+        Genv.__NmlSetMultiplierOriginal = origSet
+        WalkSpeedManager.SetMultiplier = function(name, ...)
+            if name == "Minigun" and Settings.NoMinigunSlow and alive() then
+                return WalkSpeedManager.ClearMultiplier(name)
+            end
+            return origSet(name, ...)
+        end
+        table.insert(Cleanups, function()
+            WalkSpeedManager.SetMultiplier = origSet
+            Genv.__NmlSetMultiplierOriginal = nil
         end)
     end
 end
@@ -911,6 +1002,170 @@ do
     table.insert(Cleanups, Settings.restoreLighting)
 end
 
+--// Fly, noclip, water walk, fast swim, anti-AFK \\--
+do
+    -- Fly: a LinearVelocity on you, steered by your normal move input (the
+    -- thumbstick on mobile) toward where the camera looks. Jump goes up.
+    local fly = {}
+    local function stopFly()
+        if fly.lv then
+            fly.lv:Destroy()
+            fly.att:Destroy()
+            fly.lv, fly.att = nil, nil
+        end
+    end
+    bind(RunService.Heartbeat, function()
+        local root, hum, cam = rootPart(), humanoid(), Workspace.CurrentCamera
+        if not (alive() and Settings.Fly and root and hum and cam and hum.Health > 0) then
+            stopFly()
+            return
+        end
+        if not (fly.lv and fly.lv.Parent and fly.att.Parent == root) then
+            stopFly()
+            fly.att = Instance.new("Attachment")
+            fly.att.Name = "NmlFly"
+            fly.att.Parent = root
+            fly.lv = Instance.new("LinearVelocity")
+            fly.lv.Attachment0 = fly.att
+            fly.lv.RelativeTo = Enum.ActuatorRelativeTo.World
+            fly.lv.MaxForce = math.huge
+            fly.lv.Parent = root
+        end
+        local move = hum.MoveDirection
+        local look, right = cam.CFrame.LookVector, cam.CFrame.RightVector
+        local flatLook = Vector3.new(look.X, 0, look.Z)
+        local flatRight = Vector3.new(right.X, 0, right.Z)
+        local vel = Vector3.zero
+        if move.Magnitude > 0.05 and flatLook.Magnitude > 0.01 then
+            vel = look * move:Dot(flatLook.Unit) + right * move:Dot(flatRight.Unit)
+        end
+        if hum.Jump or UserInputService:IsKeyDown(Enum.KeyCode.Space) then
+            vel += Vector3.yAxis
+        elseif UserInputService:IsKeyDown(Enum.KeyCode.LeftControl) then
+            vel -= Vector3.yAxis
+        end
+        fly.lv.VectorVelocity = vel.Magnitude > 0 and vel.Unit * Settings.FlySpeed or Vector3.zero
+    end)
+    table.insert(Cleanups, stopFly)
+
+    -- Noclip: your own parts stop colliding while it's on.
+    local collided = setmetatable({}, { __mode = "k" })
+    local function restoreCollide()
+        for part, was in collided do
+            if part.Parent then
+                part.CanCollide = was
+            end
+        end
+        table.clear(collided)
+    end
+    bind(RunService.Stepped, function()
+        local c = character()
+        if not (alive() and Settings.Noclip and c) then
+            if next(collided) then
+                restoreCollide()
+            end
+            return
+        end
+        for _, part in c:GetDescendants() do
+            if part:IsA("BasePart") and part.CanCollide then
+                if collided[part] == nil then
+                    collided[part] = true
+                end
+                part.CanCollide = false
+            end
+        end
+    end)
+    table.insert(Cleanups, restoreCollide)
+
+    -- Water walk: a hidden platform at the wave height under you, only when
+    -- nothing else (your raft, a ship) is under your feet.
+    local pad = Instance.new("Part")
+    pad.Name = "NmlWaterWalk"
+    pad.Size = Vector3.new(6, 1, 6)
+    pad.Anchored = true
+    pad.CanCollide = false
+    pad.CanQuery = false
+    pad.CanTouch = false
+    pad.Transparency = 1
+    pad.Parent = Workspace
+    table.insert(Cleanups, function()
+        pad:Destroy()
+    end)
+    local downParams = RaycastParams.new()
+    downParams.FilterType = Enum.RaycastFilterType.Exclude
+    local getHeight = function(pos)
+        local fn = GunMods.height or (OceanWaveAPI and OceanWaveAPI.GetHeight)
+        return fn(OceanWaveAPI, pos)
+    end
+    bind(RunService.Heartbeat, function()
+        local root, c = rootPart(), character()
+        if not (alive() and Settings.WaterWalk and not Settings.Fly and root and c and OceanWaveAPI) then
+            pad.CanCollide = false
+            return
+        end
+        local ok, h = pcall(getHeight, root.Position)
+        if not ok or type(h) ~= "number" then
+            pad.CanCollide = false
+            return
+        end
+        -- Swimming: pop up onto the surface first.
+        if c:GetAttribute("IsSwimming") and root.Position.Y < h + 2 then
+            root.CFrame = root.CFrame + Vector3.new(0, h + 3.5 - root.Position.Y, 0)
+            root.AssemblyLinearVelocity = Vector3.new(root.AssemblyLinearVelocity.X, 0, root.AssemblyLinearVelocity.Z)
+        end
+        downParams.FilterDescendantsInstances = { c, pad }
+        local below = Workspace:Raycast(root.Position, Vector3.new(0, -(root.Position.Y - h) - 0.5, 0), downParams)
+        local onSomething = below and below.Position.Y > h - 0.2
+        pad.CanCollide = not onSomething and root.Position.Y > h - 0.5
+        pad.CFrame = CFrame.new(root.Position.X, h - 0.5, root.Position.Z)
+    end)
+
+    -- Fast swim: the game's own dev switch (30 instead of 10 swim speed).
+    local savedDev = Genv.__NmlDevAttributeOriginal
+    if GameConfig and savedDev then
+        GameConfig.GetDevAttribute = savedDev
+    end
+    if GameConfig and type(GameConfig.GetDevAttribute) == "function" then
+        local origDev = GameConfig.GetDevAttribute
+        Genv.__NmlDevAttributeOriginal = origDev
+        GameConfig.GetDevAttribute = function(name, ...)
+            if name == "FastSwim" and Settings.FastSwim and alive() then
+                return true
+            end
+            return origDev(name, ...)
+        end
+        table.insert(Cleanups, function()
+            GameConfig.GetDevAttribute = origDev
+            Genv.__NmlDevAttributeOriginal = nil
+        end)
+    end
+
+    -- Anti-AFK: switch off the 20 minute idle kick (LocalPlayer.Idled).
+    local idled = {}
+    loop(2, function()
+        if typeof(getconnections) ~= "function" then
+            return
+        end
+        if Settings.AntiAfk then
+            for _, conn in getconnections(LocalPlayer.Idled) do
+                if not idled[conn] and pcall(conn.Disable, conn) then
+                    idled[conn] = true
+                end
+            end
+        elseif next(idled) then
+            for conn in idled do
+                pcall(conn.Enable, conn)
+            end
+            table.clear(idled)
+        end
+    end)
+    table.insert(Cleanups, function()
+        for conn in idled do
+            pcall(conn.Enable, conn)
+        end
+    end)
+end
+
 -- Back to your raft: the raft's mass centre, a little above it.
 local function toRaft()
     local root = rootPart()
@@ -968,11 +1223,19 @@ do
     local AimLabel = AimBox:AddLabel("...", true)
 
     local AutoBox = Tab:AddRightGroupbox("Auto", "zap")
-    toggle(AutoBox, "AutoShoot", "Auto shoot", "Fires your gun while silent aim has a mob. Your gun's own fire rate and ammo")
+    toggle(AutoBox, "AutoShoot", "Auto shoot", "Fires your gun, or the mounted gun you're on, while silent aim has a mob. Your gun's own fire rate and ammo")
     toggle(AutoBox, "AutoMelee", "Auto melee", "Swings when a mob is in your weapon's reach")
     toggle(AutoBox, "FaceTarget", "Turn to face it", "Melee hits in front of you, so this turns you toward the mob first")
     toggle(AutoBox, "AutoReload", "Auto reload", "Reloads when the magazine is empty, if you have ammo")
     toggle(AutoBox, "NoRecoil", "No recoil", "Your camera doesn't kick up when you shoot")
+
+    local GunBox = Tab:AddLeftGroupbox("Gun mods", "zap")
+    toggle(GunBox, "FastBullets", "Fast bullets", "Your bullets fly faster, so moving mobs are easier to hit")
+    slider(GunBox, "BulletSpeed", "Bullet speed", 500, 5000, 0, " studs/s", "The game's default is 500")
+    toggle(GunBox, "NoDrop", "No bullet drop", "Bullets stay straight past 800 studs")
+    toggle(GunBox, "NoBounce", "No water skip", "Bullets go into the water instead of skipping off waves")
+    toggle(GunBox, "InstantSpin", "Instant minigun spin-up", "No 3 second wind-up before the minigun fires")
+    toggle(GunBox, "NoMinigunSlow", "No minigun slowdown", "Walk at full speed while the minigun fires")
 
     local HealBox = Tab:AddRightGroupbox("Healing", "heart")
     toggle(HealBox, "AutoHeal", "Auto bandage", "Below the health you set, takes out a bandage, heals, then switches back to what you held")
@@ -1030,6 +1293,11 @@ do
     toggle(Move, "SpeedOn", "Speed boost", "Through the game's own walk speed system, on top of armor and potions")
     slider(Move, "Speed", "Speed", 1, 2.5, 2, "x")
     toggle(Move, "InfJump", "Jump in the air")
+    toggle(Move, "Fly", "Fly", "Move where the camera looks. Jump (or Space) goes up, Ctrl goes down. Works with the mobile thumbstick")
+    slider(Move, "FlySpeed", "Fly speed", 10, 150, 0, " studs/s")
+    toggle(Move, "Noclip", "Noclip", "Walk through walls")
+    toggle(Move, "WaterWalk", "Walk on water", "Stand on the sea like a floor. Off your raft only")
+    toggle(Move, "FastSwim", "Fast swim", "The game's own fast swim (3x)")
     Move:AddButton({ Text = "Back to my raft", Func = toRaft, Tooltip = "Puts you on your raft if you fell off" })
     local World = Tab:AddRightGroupbox("World", "sun")
     toggle(World, "Fullbright", "Fullbright", nil, function(v)
@@ -1042,6 +1310,7 @@ do
             Settings.restoreLighting()
         end
     end)
+    toggle(World, "AntiAfk", "Anti-AFK", "Stops Roblox kicking you after 20 minutes idle")
 end
 
 --// Unload \\--
