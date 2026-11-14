@@ -14,6 +14,16 @@
 --   Buy     Remotes.Buy:FireServer(upgradeId); Config.UPGRADES, Config.level,
 --           Config.cost and Config.unlocked say what you can afford.
 --   Other   Remotes.Unstuck and Remotes.GoToExit are the game's own buttons.
+--   Tunnel  The exit is a hidden tunnel {side, l0, l1, depth} the server keeps to
+--           itself until someone digs into it (then Wall "Hit" sends it). Before
+--           that the only clue the client gets is DuelMap.W "TunnelHeat" (0..1),
+--           the cold / warm / hot bar. The tunnel finder pokes each wall and
+--           watches that number to point at the right spot.
+--   Speed   The server times punches on its side, so punching faster than your
+--           Speed stat just gets ignored. Auto tune listens for the Wall "Hit"
+--           that answers each punch and settles on the fastest rate that lands.
+--   Drill   Remotes.UseDrill(i, j, k, axis) once DrillReadyAt has passed.
+--   Gems    Remotes.Nugget "Show" sends each gem's cell box {i0,j0,k0,i1,j1,k1}.
 --
 -- Auto dig calls DigClient's own swing(). The nuker and the buy / sell helpers
 -- send the same remotes the game does. The server may still check punch rate
@@ -53,7 +63,9 @@ end
 
 local Settings = {
     -- dig
-    AutoDig = false, DigSpeed = 100, ReachOn = false, Reach = 12,
+    AutoDig = false, DigSpeed = 100, DigAutoTune = true, ReachOn = false, Reach = 12,
+    -- escape
+    HeatTrail = true, ProbeSpots = 6, AutoDrill = false, DrillAt = "Where I look", EspGems = false,
     -- nuker
     Nuker = false, NukeMode = "Where I look", NukeReach = 10, NukeRays = 12, NukeSpread = 35, NukeEvery = 0.25,
     -- money
@@ -96,6 +108,19 @@ local function mod(name)
     return ok and type(m) == "table" and m or nil
 end
 local Config, Grid, Shapes = mod("Config"), mod("Grid"), mod("Shapes")
+local DuelMap, WallView = mod("DuelMap"), mod("WallView")
+-- Match attributes (TunnelHeat, DrillReadyAt...) live on DuelMap.W, which is
+-- workspace outside duels.
+local function wattr(name)
+    local w = DuelMap and DuelMap.W
+    local ok, v = pcall(function()
+        return w and w:GetAttribute(name)
+    end)
+    if ok and w then
+        return v
+    end
+    return Workspace:GetAttribute(name)
+end
 local Remotes = GameFolder and GameFolder:WaitForChild("Remotes", 5)
 local function remote(name)
     return Remotes and Remotes:FindFirstChild(name)
@@ -189,13 +214,90 @@ do
         end
     end)
 
-    local function interval()
+    local function baseSpeed()
         local base = 0.4
         if Config and Config.stat then
             local ok, v = pcall(Config.stat, LocalPlayer, "Speed")
             base = ok and type(v) == "number" and v or base
         end
-        return math.max(0.05, base * 100 / math.max(Settings.DigSpeed, 10))
+        return base
+    end
+
+    -- Auto tune. Every punch that lands comes back as Wall "Hit" with the cells it
+    -- broke or damaged. A punch with no Hit near its cell was thrown away by the
+    -- server (too soon), so slow down; a run of landed punches, speed up a bit.
+    Dig.tuned, Dig.landed, Dig.missed = nil, 0, 0
+    local pending = {} -- punches waiting for their Hit: { i, j, k, t }
+    local okRun = 0
+    local function owner(idx)
+        if not (Grid and Grid.coords) then
+            return nil
+        end
+        local ok, i, j, k = pcall(Grid.coords, idx)
+        if not ok then
+            return nil
+        end
+        -- The oldest punch near this cell (a punch breaks a small shape, not one cube).
+        for n, p in pending do
+            if not p.landed and math.abs(i - p.i) <= 8 and math.abs(j - p.j) <= 8 and math.abs(k - p.k) <= 8 then
+                return n
+            end
+        end
+        return nil
+    end
+    local function claim(buf, dmg)
+        if typeof(buf) ~= "buffer" then
+            return false
+        end
+        local bits = dmg and (Grid.DMG_BITS or 2097152) or nil
+        for o = 0, buffer.len(buf) - 4, 4 do
+            local v = buffer.readu32(buf, o)
+            local n = owner(bits and v % bits or v)
+            if n then
+                pending[n].landed = true
+                return true
+            end
+        end
+        return false
+    end
+    local WallRemote = remote("Wall")
+    if WallRemote then
+        table.insert(Connections, WallRemote.OnClientEvent:Connect(function(kind, broken, damaged)
+            if kind == "Hit" and #pending > 0 then
+                local _ = claim(broken, false) or claim(damaged, true)
+            end
+        end))
+    end
+    -- Score punches once they've had time to come back (0.6 s covers normal ping).
+    loop(0.1, function()
+        local base = baseSpeed()
+        while pending[1] and (pending[1].landed or os.clock() - pending[1].t > 0.6) do
+            local p = table.remove(pending, 1)
+            Dig.tuned = Dig.tuned or base
+            if p.landed then
+                Dig.landed += 1
+                okRun += 1
+                if okRun >= 4 then
+                    okRun = 0
+                    Dig.tuned = math.max(0.05, Dig.tuned * 0.95)
+                end
+            else
+                Dig.missed += 1
+                okRun = 0
+                Dig.tuned = math.min(base * 1.5, Dig.tuned * 1.1)
+            end
+        end
+    end)
+    Dig.reset = function()
+        Dig.tuned, Dig.landed, Dig.missed, okRun = nil, 0, 0, 0
+        table.clear(pending)
+    end
+
+    local function interval()
+        if Settings.DigAutoTune then
+            return math.max(0.05, Dig.tuned or baseSpeed())
+        end
+        return math.max(0.05, baseSpeed() * 100 / math.max(Settings.DigSpeed, 10))
     end
     Dig.interval = interval
     loop(interval, function()
@@ -213,12 +315,18 @@ do
         end
         local cam = Workspace.CurrentCamera
         local reach = Config and Config.REACH or 7
-        if cam and Voxel.cast(cam.CFrame.Position, cam.CFrame.LookVector * reach) then
+        local t = cam and Voxel.cast(cam.CFrame.Position, cam.CFrame.LookVector * reach)
+        if t then
             -- One frame so DigClient's own aim sees the same block.
             task.wait()
+            local full = LocalPlayer:GetAttribute("BackpackFull")
             pcall(swing)
             Dig.swings += 1
-            Dig.info = LocalPlayer:GetAttribute("BackpackFull") and "backpack full" or "digging"
+            if not full and Settings.DigAutoTune and Voxel.breakable(t) then
+                table.insert(pending, { i = t.i, j = t.j, k = t.k, t = os.clock() })
+            end
+            Dig.lastHit = { pos = t.pos, t = os.clock() }
+            Dig.info = full and "backpack full" or "digging"
         else
             Dig.info = "look at a wall"
         end
@@ -427,6 +535,406 @@ do
     end)
 end
 
+--// Markers: a floating label in the world \\--
+local Marks = {}
+do
+    local folder = Instance.new("Folder")
+    folder.Name = "PrisonMarks"
+    folder.Parent = Workspace
+    table.insert(Cleanups, function()
+        folder:Destroy()
+    end)
+    Marks.folder = folder
+    function Marks.new(pos, color, text)
+        local p = Instance.new("Part")
+        p.Anchored, p.CanCollide, p.CanQuery, p.CanTouch = true, false, false, false
+        p.Transparency = 1
+        p.Size = Vector3.new(0.4, 0.4, 0.4)
+        p.Position = pos
+        local bb = Instance.new("BillboardGui")
+        bb.Size = UDim2.fromOffset(150, 34)
+        bb.AlwaysOnTop = true
+        bb.MaxDistance = math.huge
+        bb.Parent = p
+        local t = Instance.new("TextLabel")
+        t.BackgroundTransparency = 1
+        t.Size = UDim2.fromScale(1, 1)
+        t.Font = Enum.Font.GothamBold
+        t.TextSize = 13
+        t.TextColor3 = color
+        t.TextStrokeTransparency = 0.3
+        t.Text = text
+        t.Parent = bb
+        p.Parent = folder
+        return p, t
+    end
+end
+
+--// Tunnel finder: follow TunnelHeat to the hidden exit \\--
+local SIDES = { "-Z wall", "+Z wall", "-X wall", "+X wall" }
+local Tunnel = { info = "", heat = nil, best = nil, probes = {}, scanning = false }
+do
+    local DigRemote = remote("Dig")
+    local function heat()
+        local v = wattr("TunnelHeat")
+        return type(v) == "number" and v or nil
+    end
+    Tunnel.heat = heat
+    local function word(h)
+        if not h then
+            return "no reading yet"
+        end
+        return ("%d%% %s"):format(math.floor(h * 100 + 0.5), h >= 0.7 and "HOT" or h >= 0.25 and "warm" or "cold")
+    end
+    Tunnel.word = word
+    local function isCell()
+        if WallView and WallView.layout then
+            local ok, l = pcall(WallView.layout)
+            return ok and l == "Cell"
+        end
+        return true
+    end
+    -- Which wall a world point is in, and how far along it.
+    local function sideOf(pos)
+        local half = Grid.ROOM * Grid.SIZE / 2
+        local d = pos - Grid.ORIGIN
+        if math.abs(d.X) > math.abs(d.Z) then
+            return d.X < 0 and 3 or 4, d.Z, half
+        end
+        return d.Z < 0 and 1 or 2, d.X, half
+    end
+
+    local trail = {}
+    local function clearTrail()
+        for _, m in trail do
+            m:Destroy()
+        end
+        table.clear(trail)
+    end
+    Tunnel.clear = function()
+        clearTrail()
+        for _, p in Tunnel.probes do
+            if p.mark then
+                p.mark:Destroy()
+            end
+        end
+        table.clear(Tunnel.probes)
+        Tunnel.best = nil
+    end
+    table.insert(Cleanups, Tunnel.clear)
+
+    local function setBest(pos, h, side, stand)
+        Tunnel.best = { pos = pos, heat = h, side = side, stand = stand }
+    end
+
+    -- Heat trail: whenever the heat goes up, drop a mark where we last dug.
+    local last = heat()
+    loop(0.15, function()
+        local h = heat()
+        if h and last and h > last + 0.001 and Settings.HeatTrail and not Tunnel.scanning then
+            local hit = Dig.lastHit
+            local pos = hit and os.clock() - hit.t < 3 and hit.pos
+            if not pos then
+                local cam = Workspace.CurrentCamera
+                local t = cam and Voxel.cast(cam.CFrame.Position, cam.CFrame.LookVector * ((Config and Config.REACH) or 7) * 2)
+                pos = t and t.pos
+            end
+            if pos then
+                local color = h >= 0.7 and Color3.fromRGB(255, 80, 60) or h >= 0.25 and Color3.fromRGB(255, 190, 60) or Color3.fromRGB(110, 190, 255)
+                local m = Marks.new(pos, color, ("%s (+%d%%)"):format(word(h), math.floor((h - last) * 100 + 0.5)))
+                table.insert(trail, m)
+                if #trail > 25 then
+                    table.remove(trail, 1):Destroy()
+                end
+                if not Tunnel.best or h >= Tunnel.best.heat then
+                    setBest(pos, h, (sideOf(pos)))
+                end
+            end
+        end
+        last = h or last
+        local hint = wattr("TunnelHint")
+        local map = wattr("TunnelMapAt")
+        if World and World:FindFirstChild("Exit") then
+            Tunnel.info = "The exit is open (turn on Show the exit)"
+        elseif typeof(map) == "Vector3" then
+            Tunnel.info = "Tunnel map bought: the game marks it"
+        elseif type(hint) == "number" and SIDES[hint] then
+            Tunnel.info = "Mastermind chalk: it's behind the " .. SIDES[hint]
+        elseif Tunnel.best then
+            Tunnel.info = ("Hottest so far: %s, %s"):format(SIDES[Tunnel.best.side] or "?", word(Tunnel.best.heat))
+        else
+            Tunnel.info = "Dig or scan the walls to get a reading"
+        end
+    end)
+
+    -- Scan: stand in front of each wall at a few spots, punch once, read the heat.
+    local function waitHeat(before, timeout)
+        local t0 = os.clock()
+        while alive() and os.clock() - t0 < timeout do
+            local h = heat()
+            if h and (not before or math.abs(h - before) > 0.0005) then
+                return h
+            end
+            task.wait(0.05)
+        end
+        return heat()
+    end
+    function Tunnel.scan()
+        if Tunnel.scanning then
+            return
+        end
+        local root = rootPart()
+        if not (root and DigRemote and Grid and Grid.OUTWARD) then
+            notify("Not ready yet")
+            return
+        end
+        if not isCell() then
+            notify("The scan only works inside the cell (chapter 1 walls)")
+            return
+        end
+        if World and World:FindFirstChild("Exit") then
+            notify("The exit is already open")
+            return
+        end
+        Tunnel.scanning = true
+        local back = root.CFrame
+        local half = Grid.ROOM * Grid.SIZE / 2
+        local spots = math.max(1, Settings.ProbeSpots)
+        local margin = 1.6
+        local gap = math.max(0.25, Dig.interval and Dig.interval() or 0.4)
+        local done = 0
+        for side = 1, 4 do
+            local out = Grid.OUTWARD[side]
+            local lat = Vector3.new(-out.Z, 0, out.X)
+            for n = 1, spots do
+                if not alive() or not Tunnel.scanning then
+                    break
+                end
+                if LocalPlayer:GetAttribute("BackpackFull") then
+                    Tunnel.info = "Scan paused: backpack full"
+                    break
+                end
+                local off = -half + margin + (n - 0.5) * (2 * (half - margin)) / spots
+                local stand = Grid.ORIGIN + out * (half - 2.2) + lat * off
+                stand = Vector3.new(stand.X, back.Position.Y, stand.Z)
+                root = rootPart()
+                if not root then
+                    break
+                end
+                root.CFrame = CFrame.lookAt(stand, stand + out)
+                root.AssemblyLinearVelocity = Vector3.zero
+                task.wait(0.15)
+                local t = Voxel.cast(stand + Vector3.new(0, 1.5, 0), out * 9)
+                if t and Voxel.breakable(t) then
+                    local before = heat()
+                    DigRemote:FireServer(t.i, t.j, t.k, t.axis, t.su, t.sv)
+                    local after = waitHeat(before, 1.2) or 0
+                    local rose = after > (before or 0) + 0.0005
+                    local probe = { pos = t.pos, side = side, heat = after, rose = rose, stand = CFrame.lookAt(stand, stand + out) }
+                    probe.mark = Marks.new(t.pos, rose and Color3.fromRGB(255, 120, 60) or Color3.fromRGB(150, 160, 180),
+                        (rose and "▲ " or "") .. word(after))
+                    table.insert(Tunnel.probes, probe)
+                    if rose or not Tunnel.best or after > Tunnel.best.heat then
+                        setBest(t.pos, after, side, probe.stand)
+                    end
+                    done += 1
+                    Tunnel.info = ("Scanning %s (%d/%d)"):format(SIDES[side], (side - 1) * spots + n, 4 * spots)
+                    task.wait(gap)
+                end
+            end
+        end
+        root = rootPart()
+        if root then
+            root.CFrame = back
+        end
+        Tunnel.scanning = false
+        if Tunnel.best then
+            notify(("Scanned %d spots. Hottest: %s, %s"):format(done, SIDES[Tunnel.best.side] or "?", word(Tunnel.best.heat)), 6)
+        else
+            notify("Scan got no readings (the game may only send heat once you're deeper)", 6)
+        end
+    end
+    function Tunnel.goBest()
+        local b = Tunnel.best
+        local root = rootPart()
+        if not (b and root) then
+            notify("No hot spot yet: scan or dig first")
+            return
+        end
+        if b.stand then
+            root.CFrame = b.stand
+        else
+            local cam = Workspace.CurrentCamera
+            local dir = (b.pos - root.Position) * Vector3.new(1, 0, 1)
+            local stand = b.pos - (dir.Magnitude > 0.1 and dir.Unit or Vector3.new(0, 0, 1)) * 2.5
+            root.CFrame = CFrame.lookAt(Vector3.new(stand.X, root.Position.Y, stand.Z), Vector3.new(b.pos.X, root.Position.Y, b.pos.Z))
+            if cam then
+                cam.CFrame = CFrame.lookAt(cam.CFrame.Position, b.pos)
+            end
+        end
+    end
+end
+
+--// Auto drill \\--
+local Drill = { info = "off", used = 0 }
+do
+    local DrillRemote = remote("UseDrill")
+    loop(0.5, function()
+        if not Settings.AutoDrill then
+            Drill.info = "off"
+            return
+        end
+        local level = 0
+        if Config and Config.stat then
+            local ok, v = pcall(Config.stat, LocalPlayer, "Drill")
+            level = ok and type(v) == "number" and v or 0
+        end
+        if not DrillRemote or level <= 0 then
+            Drill.info = "buy the Drill upgrade first"
+            return
+        end
+        if wattr("DrillActive") then
+            Drill.info = "drilling..."
+            return
+        end
+        local wait = (wattr("DrillReadyAt") or 0) - Workspace:GetServerTimeNow()
+        if wait > 0 then
+            Drill.info = ("ready in %ds"):format(math.ceil(wait))
+            return
+        end
+        if blocked() then
+            Drill.info = "waiting (menu or scene)"
+            return
+        end
+        local t, back
+        if Settings.DrillAt == "Hottest spot" and Tunnel.best and Tunnel.best.stand then
+            local root = rootPart()
+            if root then
+                back = root.CFrame
+                root.CFrame = Tunnel.best.stand
+                task.wait(0.15)
+                t = Voxel.cast(Tunnel.best.stand.Position + Vector3.new(0, 1.5, 0), Tunnel.best.stand.LookVector * 9)
+            end
+        else
+            local cam = Workspace.CurrentCamera
+            t = cam and Voxel.cast(cam.CFrame.Position, cam.CFrame.LookVector * ((Config and Config.REACH) or 7))
+        end
+        if t and t.axis ~= 3 and t.axis ~= 4 then
+            DrillRemote:FireServer(t.i, t.j, t.k, t.axis)
+            Drill.used += 1
+            Drill.info = "drill placed"
+            task.wait(0.4)
+        else
+            Drill.info = back and "hottest spot has no wall in front" or "ready: look at a wall"
+        end
+        local root = rootPart()
+        if back and root then
+            root.CFrame = back
+        end
+        task.wait(0.6)
+    end)
+end
+
+--// Gem ESP \\--
+local Gems = { info = "off", count = 0 }
+do
+    local NuggetRemote = remote("Nugget")
+    local own = {}
+    -- NuggetClient keeps every gem the server told it about in one table; borrow it
+    -- so gems sent before we loaded show too.
+    local theirs
+    local function findTheirs()
+        if theirs or not NuggetRemote or typeof(getconnections) ~= "function" or not (debug and debug.getupvalue) then
+            return
+        end
+        for _, c in getconnections(NuggetRemote.OnClientEvent) do
+            local f = c.Function
+            if type(f) == "function" then
+                for n = 1, 8 do
+                    local ok, v = pcall(debug.getupvalue, f, n)
+                    if ok and type(v) == "table" then
+                        local _, g = next(v)
+                        if type(g) == "table" and type(g.box) == "table" then
+                            theirs = v
+                            return
+                        end
+                    end
+                end
+            end
+        end
+    end
+    if NuggetRemote then
+        table.insert(Connections, NuggetRemote.OnClientEvent:Connect(function(kind, list)
+            if kind == "Show" and type(list) == "table" then
+                for _, g in list do
+                    if type(g) == "table" and type(g.id) == "number" and type(g.box) == "table" then
+                        own[g.id] = { box = g.box, value = tonumber(g.value) or 2 }
+                    end
+                end
+            elseif kind == "Take" and type(list) == "table" then
+                for _, id in list do
+                    own[type(id) == "table" and id.id or id] = nil
+                end
+            elseif kind == "Clear" then
+                table.clear(own)
+            end
+        end))
+    end
+    local holder = Instance.new("Part")
+    holder.Anchored, holder.CanCollide, holder.CanQuery, holder.CanTouch = true, false, false, false
+    holder.Transparency = 1
+    holder.Size = Vector3.new(0.1, 0.1, 0.1)
+    holder.CFrame = CFrame.new()
+    holder.Parent = Marks.folder
+    local boxes = {}
+    local function clear()
+        for id, b in boxes do
+            b:Destroy()
+            boxes[id] = nil
+        end
+    end
+    table.insert(Cleanups, clear)
+    loop(1, function()
+        if not Settings.EspGems or not Grid then
+            clear()
+            Gems.info = "off"
+            return
+        end
+        findTheirs()
+        local src = theirs or own
+        local seen, n = {}, 0
+        for id, g in src do
+            local b = type(g) == "table" and g.box
+            if type(b) == "table" and #b >= 6 then
+                seen[id] = true
+                n += 1
+                if not boxes[id] then
+                    local a, z = Grid.center(b[1], b[2], b[3]), Grid.center(b[4], b[5], b[6])
+                    local v = tonumber(g.value) or 2
+                    local box = Instance.new("BoxHandleAdornment")
+                    box.Adornee = holder
+                    box.AlwaysOnTop = true
+                    box.ZIndex = 5
+                    box.Transparency = 0.35
+                    box.Color3 = v >= 5 and Color3.fromRGB(255, 210, 60) or v >= 3 and Color3.fromRGB(190, 110, 255) or Color3.fromRGB(70, 180, 255)
+                    box.CFrame = CFrame.new((a + z) / 2)
+                    box.Size = Vector3.new(b[4] - b[1] + 1, b[5] - b[2] + 1, b[6] - b[3] + 1) * Grid.SIZE
+                    box.Parent = holder
+                    boxes[id] = box
+                end
+            end
+        end
+        for id, b in boxes do
+            if not seen[id] then
+                b:Destroy()
+                boxes[id] = nil
+            end
+        end
+        Gems.count = n
+        Gems.info = (theirs and "reading the game's list" or "listening for gems") .. (n == 0 and " (none sent yet)" or "")
+    end)
+end
+
 --// ESP: the exit and the crusher \\--
 do
     local folder = Instance.new("Folder")
@@ -600,11 +1108,20 @@ do
     local Tab = Window:AddTab("Dig", "pickaxe", "Digging")
     local Box = Tab:AddLeftGroupbox("Auto dig", "pickaxe")
     toggle(Box, "AutoDig", "Auto dig", "Keeps punching the block you look at, through the game's own swing. No AutoDig upgrade needed")
-    slider(Box, "DigSpeed", "Punch speed", 50, 500, 0, "%", "100% is your real Speed stat. Higher punches faster: if blocks stop breaking, the server is limiting it")
+    Box:AddToggle("DigAutoTune", {
+        Text = "Auto tune speed", Default = Settings.DigAutoTune,
+        Tooltip = "Finds the fastest punch rate the server still accepts (it ignores punches that come too soon). Turn off to use the slider",
+        Callback = function(v)
+            Settings.DigAutoTune = v
+            Dig.reset()
+        end,
+    })
+    slider(Box, "DigSpeed", "Punch speed (tune off)", 50, 500, 0, "%", "100% is your real Speed stat. Past what the server allows, the extra punches are thrown away")
     toggle(Box, "ReachOn", "Longer reach", "How far away you can aim at a block (the game's is 7 studs)")
     slider(Box, "Reach", "Reach", 7, 40, 0, " studs")
     live(Box:AddLabel("...", true), function()
-        return ("Swing: %s\nNow: %s\nPunches: %d (every %.2fs)"):format(Dig.status, Dig.info, Dig.swings, Dig.interval())
+        local landed = Dig.landed + Dig.missed > 0 and ("\nLanded: %d / %d"):format(Dig.landed, Dig.landed + Dig.missed) or ""
+        return ("Swing: %s\nNow: %s\nPunches: %d (every %.2fs)%s"):format(Dig.status, Dig.info, Dig.swings, Dig.interval(), landed)
     end)
 
     local Nk = Tab:AddRightGroupbox("Nuker", "bomb")
@@ -633,6 +1150,35 @@ do
     slider(B, "BuyEvery", "Check every", 0.5, 30, 1, " s")
     live(B:AddLabel("...", true), function()
         return ("Now: %s\nBought: %d\nMoney: %s"):format(Buy.info, Buy.bought, tostring(LocalPlayer:GetAttribute("Money") or "?"))
+    end)
+end
+
+do
+    local Tab = Window:AddTab("Escape", "key", "Find the tunnel")
+    local F = Tab:AddLeftGroupbox("Tunnel finder", "compass")
+    F:AddButton({ Text = "Scan the walls", Func = function()
+        task.spawn(Tunnel.scan)
+    end, Tooltip = "Teleports to a few spots on each wall, punches once and reads the hot / cold meter. Comes back when done" })
+    F:AddButton({ Text = "Stop scan", Func = function()
+        Tunnel.scanning = false
+    end })
+    slider(F, "ProbeSpots", "Spots per wall", 2, 12, 0, "", "More spots = more exact, slower scan")
+    F:AddButton({ Text = "Go to hottest spot", Func = Tunnel.goBest, Tooltip = "Puts you in front of the hottest wall spot found so far" })
+    toggle(F, "HeatTrail", "Heat trail", "Every time the meter goes up while you dig, leaves a mark there")
+    F:AddButton({ Text = "Clear marks", Func = Tunnel.clear })
+    live(F:AddLabel("...", true), function()
+        return ("Heat: %s\n%s"):format(Tunnel.word(Tunnel.heat()), Tunnel.info)
+    end)
+
+    local D = Tab:AddRightGroupbox("Drill and gems", "zap")
+    toggle(D, "AutoDrill", "Auto drill", "Places the team drill the moment its cooldown ends (needs the Drill upgrade)")
+    dropdown(D, "DrillAt", "Drill at", { "Where I look", "Hottest spot" }, "Hottest spot teleports to the tunnel finder's best spot, drills, and comes back")
+    live(D:AddLabel("...", true), function()
+        return ("Drill: %s (used %d)"):format(Drill.info, Drill.used)
+    end)
+    toggle(D, "EspGems", "Show gems", "Boxes every gem the server has told the game about, through walls")
+    live(D:AddLabel("...", true), function()
+        return ("Gems: %s, %d shown"):format(Gems.info, Gems.count)
     end)
 end
 
