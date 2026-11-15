@@ -8,8 +8,8 @@ local v7 = workspace
 local v8 = v1.LocalPlayer
 
 local v9 = (typeof(getgenv) == "function" and getgenv()) or _G
-if v9.__c46 then
-    pcall(v9.__c46)
+if v9.__c49 then
+    pcall(v9.__c49)
 end
 
 local v10 = false
@@ -22,10 +22,13 @@ end
 local v14 = loadstring(game:HttpGet("https://github.com/SSHRKs/LumeUI/releases/latest/download/main.lua"))()
 
 local v15 = {
-    k13 = false,
-    k21 = false,
-    k5 = false,
+    k15 = false,
+    k23 = false,
+    k7 = false,
     k4 = false,
+    k47 = false,
+    k6 = "Spoof",
+    k5 = 8,
 }
 
 local v16 = v3:WaitForChild("Remotes", 10)
@@ -172,82 +175,82 @@ local function v65()
 end
 
 local v68 = {
-    k45 = 3.0,
-    k37 = 0.034,
-    k6 = 0.067,
-    k8 = 196.2,
-    k14 = 0.06,
-    k35 = 0.01,
-    k7 = 80,
-    k38 = 1 / 30,
-    k25 = 2.0,
-    k24 = 0.4,
-    k42 = 0.7,
-    k23 = 0.1,
-    k31 = 0.12,
-    k32 = 1.5,
-    k33 = 0.8,
-    k34 = 1.5,
-    k39 = 0.5,
+    k48 = 3.0,
+    k39 = 0.034,
+    k8 = 0.067,
+    k10 = 196.2,
+    k16 = 0.06,
+    k37 = 0.01,
+    k9 = 80,
+    k40 = 1 / 30,
+    k27 = 2.0,
+    k26 = 0.4,
     k44 = 0.7,
-    k41 = 3,
-    k40 = 0.9,
-    k15 = 0.2,
+    k25 = 0.1,
+    k33 = 0.12,
+    k34 = 1.5,
+    k35 = 0.8,
+    k36 = 1.5,
+    k41 = 0.5,
+    k46 = 0.7,
+    k43 = 3,
+    k42 = 0.9,
+    k17 = 0.2,
     k1 = 0.05,
     k2 = 40,
-    k43 = 0.035,
+    k45 = 0.035,
     k3 = 0.05,
-    k10 = 1.0,
-    k16 = 3,
-    k36 = 0.2,
-    k18 = 1.2,
-    k9 = 0.5,
-    k12 = 0.95,
-    k17 = 0.35,
-    k20 = 0.75,
-    k11 = 0.3,
-    k19 = -0.5,
-    k27 = -0.3,
-    k26 = 0.4,
-    k30 = 0.005,
-    k28 = 0.07,
-    k29 = 0.12,
-    k22 = 2,
+    k12 = 1.0,
+    k18 = 3,
+    k38 = 0.2,
+    k20 = 1.2,
+    k11 = 0.5,
+    k14 = 0.95,
+    k19 = 0.35,
+    k22 = 0.75,
+    k13 = 0.3,
+    k21 = -0.5,
+    k29 = -0.3,
+    k28 = 0.4,
+    k32 = 0.005,
+    k30 = 0.07,
+    k31 = 0.12,
+    k24 = 2,
 }
 
 function v68.new()
-    return { k73 = {}, k64 = nil, k65 = true, k104 = {}, k71 = {}, k67 = 50 }
+    return { k76 = {}, k67 = nil, k68 = true, k107 = {}, k74 = {}, k70 = 50 }
 end
 
-function v68.k86(v69, v70, v71, v72)
-    local v73 = v69.k73
+function v68.k89(v69, v70, v71, v72)
+    local v73 = v69.k76
     local v74 = #v73
-    if v74 > 0 and v70 <= v73[v74].k103 then
+    if v74 > 0 and v70 <= v73[v74].k106 then
         return
     end
-    v73[v74 + 1] = { k103 = v70, k83 = v71 }
+    v73[v74 + 1] = { k106 = v70, k86 = v71 }
     v74 += 1
     if v72 then
-        v69.k64 = v71.Y
+        v69.k67 = v71.Y
     end
-    if v69.k65 and not v72 then
-        local v75 = v69.k70 ~= nil and v70 - v69.k70 < 0.2
-        table.insert(v69.k104, { k103 = v70, k88 = v75 })
-    elseif v72 and not v69.k65 then
-        v69.k70 = v70
-        table.insert(v69.k71, v70)
+    if v69.k68 and not v72 then
+        local v75 = v69.k73 ~= nil and v70 - v69.k73 < 0.2
+        table.insert(v69.k107, { k106 = v70, k91 = v75 })
+    elseif v72 and not v69.k68 then
+        v69.k73 = v70
+        table.insert(v69.k74, v70)
     end
-    local v76 = v70 - v68.k16
-    while v69.k104[1] and v69.k104[1].k103 < v76 do
-        table.remove(v69.k104, 1)
+    local v76 = v70 - v68.k18
+    while v69.k107[1] and v69.k107[1].k106 < v76 do
+        table.remove(v69.k107, 1)
     end
-    while v69.k71[1] and v69.k71[1] < v76 do
-        table.remove(v69.k71, 1)
+    while v69.k74[1] and v69.k74[1] < v76 do
+        table.remove(v69.k74, 1)
     end
-    v69.k65 = v72
-    local v77 = v70 - v68.k45 - 0.2
+    v69.k68 = v72
+    local v77 = v70 - v68.k48 - 0.2
     local v78 = 0
-    while v78 < v74 - 2 and v73[v78 + 1].k103 < v77 do
+    while v78 < v74 - 2 and v73[v78 + 1].k106 < v77 do
         v78 += 1
     end
     if v78 > 0 then
@@ -258,30 +261,30 @@ function v68.k86(v69, v70, v71, v72)
     end
 end
 
-function v68.k54(v80, v81)
-    local v82 = v80.k73
+function v68.k57(v80, v81)
+    local v82 = v80.k76
     local v83 = #v82
-    if v81 >= v82[v83].k103 then
-        return v82[v83].k83
+    if v81 >= v82[v83].k106 then
+        return v82[v83].k86
     end
-    if v81 <= v82[1].k103 then
-        return v82[1].k83
+    if v81 <= v82[1].k106 then
+        return v82[1].k86
     end
     local v84, v85 = 1, v83
     while v85 - v84 > 1 do
         local v86 = (v84 + v85) // 2
-        if v82[v86].k103 <= v81 then
+        if v82[v86].k106 <= v81 then
             v84 = v86
         else
             v85 = v86
         end
     end
     local v87, v88 = v82[v84], v82[v85]
-    return v87.k83 + (v88.k83 - v87.k83) * ((v81 - v87.k103) / math.max(v88.k103 - v87.k103, 1e-6))
+    return v87.k86 + (v88.k86 - v87.k86) * ((v81 - v87.k106) / math.max(v88.k106 - v87.k106, 1e-6))
 end
 
-function v68.k109(v89, v90, v91)
-    return (v68.k54(v89, v90) - v68.k54(v89, v90 - v91)) / v91
+function v68.k112(v89, v90, v91)
+    return (v68.k57(v89, v90) - v68.k57(v89, v90 - v91)) / v91
 end
 
 local function v92(v93)
@@ -289,11 +292,11 @@ local function v92(v93)
     return v93 - math.pi
 end
 
-function v68.k63(v94, v95, v96)
+function v68.k66(v94, v95, v96)
     local v97, v98, v99, v100, v101, v102, v103 = 0, 0, 0, 0, 0, 0, 0
     for v104 = 0, 4 do
         local v105 = -v96 * v104 / 4
-        local v106 = v68.k54(v94, v95 + v105)
+        local v106 = v68.k57(v94, v95 + v105)
         v97 += 1
         v98 += v105
         v99 += v106.X
@@ -309,44 +312,44 @@ function v68.k63(v94, v95, v96)
     return (v97 * v102 - v98 * v99) / v107, (v97 * v103 - v98 * v100) / v107
 end
 
-function v68.k75(v108)
-    local v109 = v108.k73
-    local v110 = v109[#v109].k103
-    local v111 = math.max(v109[1].k103 + v68.k37, v110 - v68.k45)
+function v68.k78(v108)
+    local v109 = v108.k76
+    local v110 = v109[#v109].k106
+    local v111 = math.max(v109[1].k106 + v68.k39, v110 - v68.k48)
     local v112 = {}
     local v113 = v111
     while v113 <= v110 + 1e-6 do
-        local v114 = v68.k109(v108, v113, v68.k37)
-        v112[#v112 + 1] = { k103 = v113, k110 = v114.X, k111 = v114.Z, k94 = math.sqrt(v114.X * v114.X + v114.Z * v114.Z) }
+        local v114 = v68.k112(v108, v113, v68.k39)
+        v112[#v112 + 1] = { k106 = v113, k113 = v114.X, k114 = v114.Z, k97 = math.sqrt(v114.X * v114.X + v114.Z * v114.Z) }
         v113 += 1 / 60
     end
     local v115 = {}
     for _, v116 in v112 do
-        if v116.k94 > v68.k25 then
-            v115[#v115 + 1] = v116.k94
+        if v116.k97 > v68.k27 then
+            v115[#v115 + 1] = v116.k97
         end
     end
     table.sort(v115)
     local v117 = #v115 >= 6 and v115[math.max(1, math.floor(#v115 * 0.7))] or 16
-    local v118 = math.max(v68.k25, v117 * v68.k24)
+    local v118 = math.max(v68.k27, v117 * v68.k26)
     local v119 = v68.k3
-    local v120 = v119 * math.log(1 / v68.k24) + v68.k37 / 2
-    local v121 = v119 * math.log(1 / (1 - v68.k24)) + v68.k37 / 2
+    local v120 = v119 * math.log(1 / v68.k26) + v68.k39 / 2
+    local v121 = v119 * math.log(1 / (1 - v68.k26)) + v68.k39 / 2
     local v122 = {
-        k76 = {}, k101 = {}, k107 = {}, k99 = {},
-        k102 = 0, k96 = 0, k62 = 0,
-        k108 = v117, k105 = v118,
+        k79 = {}, k104 = {}, k110 = {}, k102 = {},
+        k105 = 0, k99 = 0, k65 = 0,
+        k111 = v117, k108 = v118,
     }
     local v123, v124, v125, v126, v127, v128
     local v129, v130, v131
     local v132 = {}
     local v133
     for _, v134 in v112 do
-        local v135 = v134.k94 > v118
-        local v136 = v135 and math.atan2(v134.k111, v134.k110) or nil
+        local v135 = v134.k97 > v118
+        local v136 = v135 and math.atan2(v134.k114, v134.k113) or nil
         if not v123 then
             v123 = v135 and "move" or "stop"
-            v124, v125 = v134.k103, false
+            v124, v125 = v134.k106, false
             if v135 then
                 v126 = v136
                 v127, v128 = math.cos(v136), math.sin(v136)
@@ -355,32 +358,32 @@ function v68.k75(v108)
             if v135 then
                 table.insert(v132, v134)
                 local v137 = v92(v136 - v126)
-                if math.abs(v137) > v68.k42 then
+                if math.abs(v137) > v68.k44 then
                     local v138 = math.abs(v137) / 2
-                    local v139 = v134.k103
+                    local v139 = v134.k106
                     for _, v140 in v132 do
-                        local v141 = v140.k110 * v127 + v140.k111 * v128
-                        local v142 = math.abs(v140.k110 * v128 - v140.k111 * v127)
+                        local v141 = v140.k113 * v127 + v140.k114 * v128
+                        local v142 = math.abs(v140.k113 * v128 - v140.k114 * v127)
                         if math.atan2(v142, v141) >= v138 then
-                            v139 = v140.k103
+                            v139 = v140.k106
                             break
                         end
                     end
-                    v139 -= v68.k43 + v68.k37 / 2
-                    local v143 = v122.k107[#v122.k107]
-                    if v133 and v143 and v139 - v133 < v68.k23 and (v143 > 0) == (v137 > 0) and math.abs(v143 + v137) <= math.pi + 0.3 then
+                    v139 -= v68.k45 + v68.k39 / 2
+                    local v143 = v122.k110[#v122.k110]
+                    if v133 and v143 and v139 - v133 < v68.k25 and (v143 > 0) == (v137 > 0) and math.abs(v143 + v137) <= math.pi + 0.3 then
                         if math.abs(v143) <= 1.6 and math.abs(v143 + v137) > 1.6 then
-                            v122.k96 += 1
+                            v122.k99 += 1
                         end
-                        v122.k107[#v122.k107] = v143 + v137
+                        v122.k110[#v122.k110] = v143 + v137
                     else
                         if v125 then
-                            table.insert(v122.k76, v139 - v124)
+                            table.insert(v122.k79, v139 - v124)
                         end
-                        table.insert(v122.k107, v137)
-                        v122.k62 += 1
+                        table.insert(v122.k110, v137)
+                        v122.k65 += 1
                         if math.abs(v137) > 1.6 then
-                            v122.k96 += 1
+                            v122.k99 += 1
                         end
                         v124, v125 = v139, true
                     end
@@ -391,35 +394,35 @@ function v68.k75(v108)
                 end
             else
                 v123 = "low"
-                v129 = v134.k103
-                v130 = v134.k103 - v120
+                v129 = v134.k106
+                v130 = v134.k106 - v120
                 v131 = v126
             end
         elseif v123 == "low" then
             if v135 then
                 local v144 = v92(v136 - v131)
-                if v134.k103 - v129 < v68.k31 then
-                    if math.abs(v144) > v68.k42 then
-                        local v145 = (v130 + v134.k103 - v121) / 2
+                if v134.k106 - v129 < v68.k33 then
+                    if math.abs(v144) > v68.k44 then
+                        local v145 = (v130 + v134.k106 - v121) / 2
                         if v125 then
-                            table.insert(v122.k76, v145 - v124)
+                            table.insert(v122.k79, v145 - v124)
                         end
-                        table.insert(v122.k107, v144)
-                        v122.k62 += 1
+                        table.insert(v122.k110, v144)
+                        v122.k65 += 1
                         if math.abs(v144) > 1.6 then
-                            v122.k96 += 1
+                            v122.k99 += 1
                         end
                         v124, v125 = v145, true
                     end
                 else
-                    local v146 = v134.k103 - v121
+                    local v146 = v134.k106 - v121
                     if v125 then
-                        table.insert(v122.k76, v130 - v124)
+                        table.insert(v122.k79, v130 - v124)
                     end
-                    table.insert(v122.k101, v146 - v130)
-                    table.insert(v122.k99, v144)
-                    v122.k102 += 1
-                    v122.k62 += 1
+                    table.insert(v122.k104, v146 - v130)
+                    table.insert(v122.k102, v144)
+                    v122.k105 += 1
+                    v122.k65 += 1
                     v124, v125 = v146, true
                 end
                 v123 = "move"
@@ -430,7 +433,7 @@ function v68.k75(v108)
         else
             if v135 then
                 v123 = "move"
-                v124, v125 = v134.k103 - v121, false
+                v124, v125 = v134.k106 - v121, false
                 v126 = v136
                 v127, v128 = math.cos(v136), math.sin(v136)
                 v132 = {}
@@ -438,8 +441,8 @@ function v68.k75(v108)
         end
     end
     local v147, v148 = 0, 0
-    for v149 = 2, #v122.k107 do
-        local v150, v151 = v122.k107[v149 - 1], v122.k107[v149]
+    for v149 = 2, #v122.k110 do
+        local v150, v151 = v122.k110[v149 - 1], v122.k110[v149]
         if math.abs(v150) < 2.8 and math.abs(v151) < 2.8 then
             if (v150 > 0) == (v151 > 0) then
                 v147 += 1
@@ -448,38 +451,38 @@ function v68.k75(v108)
             end
         end
     end
-    v122.k51 = (v148 + 1) / (v148 + v147 + 2)
-    local v152 = v122.k107[#v122.k107]
-    v122.k72 = v152 and (v152 > 0 and 1 or -1) or nil
-    v122.k100 = v123
-    v122.k90 = v126
+    v122.k54 = (v148 + 1) / (v148 + v147 + 2)
+    local v152 = v122.k110[#v122.k110]
+    v122.k75 = v152 and (v152 > 0 and 1 or -1) or nil
+    v122.k103 = v123
+    v122.k93 = v126
     if v123 == "move" then
-        v122.k60 = v110 - v124
+        v122.k63 = v110 - v124
     elseif v123 == "low" then
-        v122.k74 = v110 - v129
-        v122.k60 = v110 - v130
-        v122.k90 = v131
-        if v122.k74 >= v68.k31 then
-            v122.k100 = "stop"
+        v122.k77 = v110 - v129
+        v122.k63 = v110 - v130
+        v122.k93 = v131
+        if v122.k77 >= v68.k33 then
+            v122.k103 = "stop"
         end
     else
-        v122.k60 = v110 - v111
+        v122.k63 = v110 - v111
     end
     return v122
 end
 
 local function v153(v154)
-    if v154 >= v68.k41 then
-        return v68.k40
+    if v154 >= v68.k43 then
+        return v68.k42
     end
-    return v154 / (v154 + v68.k34)
+    return v154 / (v154 + v68.k36)
 end
 
 local function v155(v156, v157, v158)
     local v159 = #v156
     if v159 > 0 and math.random() < v153(v159) then
         local v160 = math.sqrt(-2 * math.log(1 - math.random())) * math.cos(2 * math.pi * math.random())
-        return math.max(0.02, v156[math.random(1, v159)] * math.exp(v68.k15 * v160))
+        return math.max(0.02, v156[math.random(1, v159)] * math.exp(v68.k17 * v160))
     end
     return v158 - v157 * math.log(1 - math.random())
 end
@@ -573,20 +576,20 @@ local function v190(v191, v192, v193)
     return v192.X + math.cos(v215) * v216, v192.Z + math.sin(v215) * v216, v204 / v194
 end
 
-function v68.k50(v217, v218, v219, v220)
-    local v221 = v217.k73
+function v68.k53(v217, v218, v219, v220)
+    local v221 = v217.k76
     local v222 = #v221
     if v222 == 0 then
         return nil
     end
-    local v223 = v221[v222].k103
-    local v224 = v221[v222].k83
-    local v225, v226 = v68.k63(v217, v223, v68.k6)
-    local v227 = v68.k109(v217, v223, 0.035).Y
-    local v228 = math.abs(v227) > 6 or (not v217.k65 and v217.k64 ~= nil and v224.Y > v217.k64 + 0.5)
-    local v229 = v68.k8
-    local v230 = v217.k64
-    local v231 = v219 and v68.k19 or v68.k11
+    local v223 = v221[v222].k106
+    local v224 = v221[v222].k86
+    local v225, v226 = v68.k66(v217, v223, v68.k8)
+    local v227 = v68.k112(v217, v223, 0.035).Y
+    local v228 = math.abs(v227) > 6 or (not v217.k68 and v217.k67 ~= nil and v224.Y > v217.k67 + 0.5)
+    local v229 = v68.k10
+    local v230 = v217.k67
+    local v231 = v219 and v68.k21 or v68.k13
     local function v232(v233)
         if not v228 then
             return v224.Y + v231
@@ -597,7 +600,7 @@ function v68.k50(v217, v218, v219, v220)
         end
         return v234 + v231 * 0.5
     end
-    local v235 = math.max(0, v220 + v68.k14 + v68.k35)
+    local v235 = math.max(0, v220 + v68.k16 + v68.k37)
     if v222 < 8 then
         local v236 = v235
         if v219 then
@@ -605,19 +608,19 @@ function v68.k50(v217, v218, v219, v220)
         end
         return Vector3.new(v224.X + v225 * v236, v232(v236), v224.Z + v226 * v236), v236, 1
     end
-    local v237 = v68.k75(v217)
-    local v238 = v237.k108
-    local v239 = v68.k109(v217, v223, v68.k37)
-    local v240 = v68.k109(v217, v223 - v68.k37, v68.k37)
-    local v241, v242 = (v239.X - v240.X) / v68.k37, (v239.Z - v240.Z) / v68.k37
+    local v237 = v68.k78(v217)
+    local v238 = v237.k111
+    local v239 = v68.k112(v217, v223, v68.k39)
+    local v240 = v68.k112(v217, v223 - v68.k39, v68.k39)
+    local v241, v242 = (v239.X - v240.X) / v68.k39, (v239.Z - v240.Z) / v68.k39
     local v243 = math.sqrt(v225 * v225 + v226 * v226)
     local v244 = v243 > 0.5 and (v241 * v225 + v242 * v226) / v243 or 0
     local v245 = math.atan2(v226, v225)
     local v246 = v243
-    if v237.k100 == "move" then
+    if v237.k103 == "move" then
         local v247, v248 = v239.X + v241 * v68.k1, v239.Z + v242 * v68.k1
         local v249 = math.sqrt(v247 * v247 + v248 * v248)
-        if math.sqrt(v241 * v241 + v242 * v242) > v68.k2 and v249 > v237.k105 then
+        if math.sqrt(v241 * v241 + v242 * v242) > v68.k2 and v249 > v237.k108 then
             v245 = math.atan2(v248, v247)
             if v243 < v238 * 0.85 and v249 > v243 then
                 v246 = math.min(v249, v238)
@@ -627,9 +630,9 @@ function v68.k50(v217, v218, v219, v220)
             v246 = v238
         end
     end
-    local v250 = (v237.k102 + v68.k39) / (v237.k102 + v237.k96 + v68.k39 + v68.k44)
+    local v250 = (v237.k105 + v68.k41) / (v237.k105 + v237.k99 + v68.k41 + v68.k46)
     local v251
-    if v237.k100 == "low" then
+    if v237.k103 == "low" then
         local v252, v253 = v239.X + v241 * v68.k1, v239.Z + v242 * v68.k1
         local v254 = math.clamp((math.sqrt(v252 * v252 + v253 * v253) / v238 - 0.3) / 0.4, 0, 1)
         local v255 = v250 * (1 - 0.7 * v254)
@@ -639,62 +642,62 @@ function v68.k50(v217, v218, v219, v220)
             v251 = math.atan2(v253, v252)
         end
     end
-    local v257 = (v237.k102 + v68.k39 * 0.5) / (v237.k62 + v68.k39 * 0.5 + v68.k44)
-    local v258 = v237.k90 or v245
-    local v259 = math.min(v68.k16, v223 - v221[1].k103)
+    local v257 = (v237.k105 + v68.k41 * 0.5) / (v237.k65 + v68.k41 * 0.5 + v68.k46)
+    local v258 = v237.k93 or v245
+    local v259 = math.min(v68.k18, v223 - v221[1].k106)
     local v260, v261 = 0, 0
-    for _, v262 in v217.k104 do
-        if v262.k103 + 0.06 <= v223 and v68.k109(v217, v262.k103 + 0.06, 0.05).Y > 8 then
+    for _, v262 in v217.k107 do
+        if v262.k106 + 0.06 <= v223 and v68.k112(v217, v262.k106 + 0.06, 0.05).Y > 8 then
             v260 += 1
-            if v262.k88 then
+            if v262.k91 then
                 v261 += 1
             end
         end
     end
     local v263 = v259 > 0.5 and v260 / v259 or 0
-    local v264 = math.clamp((v261 + v68.k36) / (#v217.k71 + 1), 0, 0.95)
-    local v265 = v217.k67 or 50
+    local v264 = math.clamp((v261 + v68.k38) / (#v217.k74 + 1), 0, 0.95)
+    local v265 = v217.k70 or 50
     local v266 = v230 or (v228 and -math.huge or v224.Y)
-    local v267 = v68.k38
+    local v267 = v68.k40
     local v268 = v219 and v235 + 1.6 or v235 + v267
     local v269 = {}
     local v270 = {}
     local v271 = v68.k3
-    for v272 = 1, v68.k7 do
+    for v272 = 1, v68.k9 do
         local v273, v274 = v224.X, v224.Z
         local v275, v276 = v225, v226
         local v277, v278, v279, v280
         local v281
         local v282 = v258
-        if v237.k100 == "move" then
+        if v237.k103 == "move" then
             v277, v278, v279 = true, v245, v246
-            v281 = v165(v237.k76, v68.k32, 0.25, v237.k60)
-        elseif v237.k100 == "low" then
+            v281 = v165(v237.k79, v68.k34, 0.25, v237.k63)
+        elseif v237.k103 == "low" then
             if math.random() < v250 then
                 v277 = false
-                v281 = v165(v237.k101, v68.k33, 0.15, v237.k60)
+                v281 = v165(v237.k104, v68.k35, 0.15, v237.k63)
             else
-                local v283 = v161(v237.k107)
+                local v283 = v161(v237.k110)
                 if math.abs(v283) < 1.6 then
                     v283 = math.pi
                 end
                 v277, v278, v279 = true, v251 or v258 + v283, v238
                 v282 = v278
-                v281 = v155(v237.k76, v68.k32, 0.25)
+                v281 = v155(v237.k79, v68.k34, 0.25)
             end
         else
             v277 = false
-            v280 = v243 < v237.k105
-            v281 = v165(v237.k101, v68.k33, 0.15, v237.k60)
+            v280 = v243 < v237.k108
+            v281 = v165(v237.k104, v68.k35, 0.15, v237.k63)
         end
         local v284 = 0
         local v285
-        local v286 = v237.k72
+        local v286 = v237.k75
         local function v287()
-            local v288 = math.abs(v161(v237.k107))
+            local v288 = math.abs(v161(v237.k110))
             local v289
             if v286 and v288 < 2.8 then
-                v289 = math.random() < v237.k51 and -v286 or v286
+                v289 = math.random() < v237.k54 and -v286 or v286
             else
                 v289 = math.random() < 0.5 and 1 or -1
             end
@@ -742,17 +745,17 @@ function v68.k50(v217, v218, v219, v220)
                         v277 = false
                         v280 = false
                         v282 = v278
-                        v281 = v155(v237.k101, v68.k33, 0.15)
+                        v281 = v155(v237.k104, v68.k35, 0.15)
                     else
                         v278 += v287()
-                        v281 = v155(v237.k76, v68.k32, 0.25)
+                        v281 = v155(v237.k79, v68.k34, 0.25)
                     end
                 else
                     v277 = true
                     v280 = false
-                    v278 = v282 + v161(v237.k99)
+                    v278 = v282 + v161(v237.k102)
                     v279 = v238
-                    v281 = v155(v237.k76, v68.k32, 0.25)
+                    v281 = v155(v237.k79, v68.k34, 0.25)
                 end
             end
             v293(v300)
@@ -778,11 +781,11 @@ function v68.k50(v217, v218, v219, v220)
     end
     local v303 = v235
     if v219 then
-        local v304, v305, v306 = v190(v269, v218, v68.k18)
+        local v304, v305, v306 = v190(v269, v218, v68.k20)
         local v307, v308, v309 = 0, 0, 0
         for v310 = 1, #v269 do
             local v311, v312 = v269[v310][1] - v304, v269[v310][2] - v305
-            if v311 * v311 + v312 * v312 <= v68.k18 ^ 2 then
+            if v311 * v311 + v312 * v312 <= v68.k20 ^ 2 then
                 v307 += v270[v310]
                 v308 += v269[v310][3]
                 v309 += 1
@@ -793,11 +796,11 @@ function v68.k50(v217, v218, v219, v220)
         return Vector3.new(v304, v313, v305), v303, v306
     end
     do
-        local v314, v315, v316 = v171(v269, v68.k10)
+        local v314, v315, v316 = v171(v269, v68.k12)
         local v317, v318 = 0, 0
         for v319 = 1, #v269 do
             local v320, v321 = v269[v319][1] - v314, v269[v319][2] - v315
-            if v320 * v320 + v321 * v321 <= v68.k10 ^ 2 then
+            if v320 * v320 + v321 * v321 <= v68.k12 ^ 2 then
                 v317 += v269[v319][3]
                 v318 += 1
             end
@@ -806,32 +809,32 @@ function v68.k50(v217, v218, v219, v220)
     end
 end
 
-function v68.k87(v322, v323, v324)
+function v68.k90(v322, v323, v324)
     if v322 then
-        return v323 >= v68.k20 or v324 >= v68.k17
+        return v323 >= v68.k22 or v324 >= v68.k19
     end
-    return v323 >= v68.k12 or v324 >= v68.k9
+    return v323 >= v68.k14 or v324 >= v68.k11
 end
 
-function v68.k77()
-    local v325 = { k95 = {}, k97 = 0 }
+function v68.k80()
+    local v325 = { k98 = {}, k100 = 0 }
     local v326 = 0
-    local v327 = v68.k27
-    while v327 <= v68.k26 + 1e-9 do
+    local v327 = v68.k29
+    while v327 <= v68.k28 + 1e-9 do
         v326 += 1
-        local v328 = (v327 - v68.k28) / v68.k29
-        v325.k95[v326] = -0.5 * v328 * v328
-        v327 += v68.k30
+        local v328 = (v327 - v68.k30) / v68.k31
+        v325.k98[v326] = -0.5 * v328 * v328
+        v327 += v68.k32
     end
     return v325
 end
 
-function v68.k79(v329, v330, v331, v332, v333, v334, v335, v336)
-    local v337 = v330.k73
+function v68.k82(v329, v330, v331, v332, v333, v334, v335, v336)
+    local v337 = v330.k76
     if #v337 < 2 then
         return false
     end
-    local v338 = v337[#v337].k103
+    local v338 = v337[#v337].k106
     local v339 = v334 - v333
     local v340, v341 = v339.X, v339.Z
     local v342 = math.sqrt(v340 * v340 + v341 * v341)
@@ -839,11 +842,11 @@ function v68.k79(v329, v330, v331, v332, v333, v334, v335, v336)
         return false
     end
     v340, v341 = v340 / v342, v341 / v342
-    local v343 = v68.k18 + 0.2
+    local v343 = v68.k20 + 0.2
     local v344 = {}
     local v345 = 0
-    local v346 = v68.k27
-    while v346 <= v68.k26 + 1e-9 do
+    local v346 = v68.k29
+    while v346 <= v68.k28 + 1e-9 do
         v345 += 1
         local v347 = false
         local v348 = false
@@ -854,7 +857,7 @@ function v68.k79(v329, v330, v331, v332, v333, v334, v335, v336)
                 break
             end
             v348 = true
-            local v351 = v68.k54(v330, v350)
+            local v351 = v68.k57(v330, v350)
             local v352, v353 = v333.X + v340 * v335 * v349, v333.Z + v341 * v335 * v349
             local v354, v355 = v351.X - v352, v351.Z - v353
             if v354 * v354 + v355 * v355 <= v343 * v343 then
@@ -870,7 +873,7 @@ function v68.k79(v329, v330, v331, v332, v333, v334, v335, v336)
         else
             v344[v345] = v347 and 0.2 or 0.85
         end
-        v346 += v68.k30
+        v346 += v68.k32
     end
     local v356, v357 = math.huge, -math.huge
     for _, v358 in v344 do
@@ -881,18 +884,18 @@ function v68.k79(v329, v330, v331, v332, v333, v334, v335, v336)
         return false
     end
     for v359, v360 in v344 do
-        v329.k95[v359] += math.log(v360)
+        v329.k98[v359] += math.log(v360)
     end
-    v329.k97 += 1
+    v329.k100 += 1
     return true
 end
 
-function v68.k78(v361, v362, v363, v364, v365, v366, v367)
-    local v368 = v362.k73
+function v68.k81(v361, v362, v363, v364, v365, v366, v367)
+    local v368 = v362.k76
     if #v368 < 2 then
         return false
     end
-    local v369 = v368[#v368].k103
+    local v369 = v368[#v368].k106
     local v370 = v366 - v365
     local v371, v372 = v370.X, v370.Z
     local v373 = math.sqrt(v371 * v371 + v372 * v372)
@@ -903,11 +906,11 @@ function v68.k78(v361, v362, v363, v364, v365, v366, v367)
     local v374 = false
     local v375 = {}
     local v376 = 0
-    local v377 = v68.k27
-    while v377 <= v68.k26 + 1e-9 do
+    local v377 = v68.k29
+    while v377 <= v68.k28 + 1e-9 do
         v376 += 1
         local v378 = v363 + v364 + v377
-        local v379 = v68.k54(v362, v378)
+        local v379 = v68.k57(v362, v378)
         local v380
         if v378 > v369 then
             v380 = 0.5
@@ -927,7 +930,7 @@ function v68.k78(v361, v362, v363, v364, v365, v366, v367)
             end
         end
         v375[v376] = v380
-        v377 += v68.k30
+        v377 += v68.k32
     end
     local v389, v390 = math.huge, -math.huge
     for _, v391 in v375 do
@@ -939,29 +942,29 @@ function v68.k78(v361, v362, v363, v364, v365, v366, v367)
         return false
     end
     for v392, v393 in v375 do
-        v361.k95[v392] += math.log(v393)
+        v361.k98[v392] += math.log(v393)
     end
-    v361.k97 += 1
+    v361.k100 += 1
     return true
 end
 
-function v68.k81(v394)
-    if v394.k97 < v68.k22 then
+function v68.k84(v394)
+    if v394.k100 < v68.k24 then
         return nil
     end
     local v395, v396 = 1, -math.huge
-    for v397, v398 in v394.k95 do
+    for v397, v398 in v394.k98 do
         if v398 > v396 then
             v395, v396 = v397, v398
         end
     end
-    return v68.k27 + (v395 - 1) * v68.k30
+    return v68.k29 + (v395 - 1) * v68.k32
 end
 
-function v68.k52(v399)
-    local v400 = v68.k81(v399)
+function v68.k55(v399)
+    local v400 = v68.k84(v399)
     if v400 then
-        v68.k14 = math.clamp(v400 - v68.k35, v68.k27, v68.k26)
+        v68.k16 = math.clamp(v400 - v68.k37, v68.k29, v68.k28)
     end
     return v400
 end
@@ -994,7 +997,7 @@ task.spawn(function()
         if v410 then
             v404 += (math.clamp(v410, 0, 0.6) - v404) * 0.35
         end
-        v68.k8 = v7.Gravity
+        v68.k10 = v7.Gravity
         task.wait(0.5)
     end
 end)
@@ -1020,56 +1023,56 @@ end
 v414()
 
 local v418 = {}
-local v419 = { k68 = nil, k106 = nil, k91 = nil, k55 = nil }
+local v419 = { k71 = nil, k109 = nil, k94 = nil, k58 = nil }
 local v420
 local v421 = {}
 local v422
 local v423
 
 local v424 = 3
-local v425 = v9.__c47
-if type(v425) ~= "table" or v9.__c48 ~= game.JobId or v9.__c49 ~= v424 then
-    v425 = v68.k77()
-    v9.__c47, v9.__c48, v9.__c49 = v425, game.JobId, v424
+local v425 = v9.__c50
+if type(v425) ~= "table" or v9.__c51 ~= game.JobId or v9.__c52 ~= v424 then
+    v425 = v68.k80()
+    v9.__c50, v9.__c51, v9.__c52 = v425, game.JobId, v424
 end
 local function v426()
-    v68.k52(v425)
+    v68.k55(v425)
 end
 v426()
 
 local function v427(v428)
-    return (v428 == "Gun" and v15.k13) or (v428 == "Knife" and v15.k21)
+    return (v428 == "Gun" and v15.k15) or (v428 == "Knife" and v15.k23)
 end
 
 local function v429()
     local v430 = v8.Character
     local v431 = v430 and v430:FindFirstChildOfClass("Tool")
-    if v431 == v419.k106 and (not v431 or v419.k91 and v419.k91.Parent) then
+    if v431 == v419.k109 and (not v431 or v419.k94 and v419.k94.Parent) then
         return
     end
-    v419.k106, v419.k68, v419.k91 = v431, nil, nil
+    v419.k109, v419.k71, v419.k94 = v431, nil, nil
     if v431 then
         if v28(v431) then
             local v432 = v431:FindFirstChild("Events")
-            v419.k68 = "Knife"
-            v419.k91 = v432 and v432:FindFirstChild("KnifeThrown")
+            v419.k71 = "Knife"
+            v419.k94 = v432 and v432:FindFirstChild("KnifeThrown")
         elseif v25(v431) then
-            v419.k68 = "Gun"
-            v419.k91 = v431:FindFirstChild("Shoot")
+            v419.k71 = "Gun"
+            v419.k94 = v431:FindFirstChild("Shoot")
         end
     end
     local v433 = v430 and v430:FindFirstChild("HumanoidRootPart")
-    v419.k55 = v433 and v433:FindFirstChild("GunRaycastAttachment")
+    v419.k58 = v433 and v433:FindFirstChild("GunRaycastAttachment")
 end
 
 local function v434(v435, v436)
     if typeof(v436) == "CFrame" then
         return v436.Position
     end
-    if v435 == "Gun" and v419.k55 then
-        return v419.k55.WorldPosition
+    if v435 == "Gun" and v419.k58 then
+        return v419.k58.WorldPosition
     end
-    local v437 = v419.k106 and v419.k106:FindFirstChild("Handle")
+    local v437 = v419.k109 and v419.k109:FindFirstChild("Handle")
     return v437 and v437.Position
 end
 
@@ -1119,7 +1122,7 @@ local function v444(v445)
                         v464 = v449 + v463
                     end
                     local v465 = v459 == "Sheriff" or v459 == "Hero"
-                    local v466 = { k84 = v456, k92 = v457, k57 = v458, k80 = math.clamp(v464 / v449, 0, 2), k85 = v465 }
+                    local v466 = { k87 = v456, k95 = v457, k60 = v458, k83 = math.clamp(v464 / v449, 0, 2), k88 = v465 }
                     if v459 == "Murderer" then
                         v453 = v466
                     end
@@ -1128,7 +1131,7 @@ local function v444(v445)
                     if v445 == "Knife" and v465 then
                         v467 -= 120
                     end
-                    if v420 and v420.k84 == v456 then
+                    if v420 and v420.k87 == v456 then
                         v467 -= 40
                     end
                     if not v455 or v467 < v455 then
@@ -1174,18 +1177,18 @@ local function v477(v478, v479, v480)
 end
 
 local function v482(v483, v484, v485)
-    if not v483 or not v483.k92.Parent then
+    if not v483 or not v483.k95.Parent then
         return nil
     end
-    local v486 = v418[v483.k84]
-    if not v486 or v486.k92 ~= v483.k92 or #v486.k73 < 2 then
+    local v486 = v418[v483.k87]
+    if not v486 or v486.k95 ~= v483.k95 or #v486.k76 < 2 then
         return nil
     end
-    local v487, _, v488, v489 = v68.k50(v486, v485, v484 == "Knife" and v401 or nil, v404)
+    local v487, _, v488, v489 = v68.k53(v486, v485, v484 == "Knife" and v401 or nil, v404)
     if not v487 then
         return nil
     end
-    local v490 = v486.k73[#v486.k73].k83
+    local v490 = v486.k76[#v486.k76].k86
     local v491 = v487 - v490
     if v491.Magnitude > 0.5 then
         local v492 = v411(v7, v490, v491, v412)
@@ -1194,7 +1197,7 @@ local function v482(v483, v484, v485)
         end
     end
     local function v493(v494)
-        return v468(v485, v494, v483.k57, v484 == "Gun" and v477(v485, v494, v489) or nil)
+        return v468(v485, v494, v483.k60, v484 == "Gun" and v477(v485, v494, v489) or nil)
     end
     if not v493(v487) then
         local v495 = v487 - v485
@@ -1221,7 +1224,7 @@ local function v499(v500, v501)
         for _, v507 in v421 do
             local v508, v509, v510 = v482(v507, v500, v501)
             if v508 then
-                local v511 = v509 - 0.05 * v507.k80 + (v507.k85 and 0.08 or 0)
+                local v511 = v509 - 0.05 * v507.k83 + (v507.k88 and 0.08 or 0)
                 if not v505 or v511 > v505 then
                     v502, v503, v504, v505, v506 = v507, v508, v509, v511, v510
                 end
@@ -1248,11 +1251,11 @@ local function v520(v521, v522)
 end
 
 local function v524(v525, v526, v527, v528)
-    local v529 = v526 and v418[v526.k84]
+    local v529 = v526 and v418[v526.k87]
     if not v529 then
         return
     end
-    local v530 = { k68 = v525, k103 = os.clock(), k93 = v404, k82 = v527, k50 = v528, k89 = v529, k57 = v526.k57, k106 = v419.k106 }
+    local v530 = { k71 = v525, k106 = os.clock(), k96 = v404, k85 = v527, k53 = v528, k92 = v529, k60 = v526.k60, k109 = v419.k109 }
     if v525 == "Gun" then
         v423 = v530
         return
@@ -1261,9 +1264,9 @@ local function v524(v525, v526, v527, v528)
         if v10 then
             return
         end
-        local v531 = v529.k59
-        local v532 = v531 ~= nil and v531 >= v530.k103 and v531 <= v530.k103 + 1.7
-        if v68.k79(v425, v529, v530.k103, v530.k93, v530.k82, v530.k50, v401, v532) then
+        local v531 = v529.k62
+        local v532 = v531 ~= nil and v531 >= v530.k106 and v531 <= v530.k106 + 1.7
+        if v68.k82(v425, v529, v530.k106, v530.k96, v530.k85, v530.k53, v401, v532) then
             v426()
         end
     end)
@@ -1271,11 +1274,11 @@ end
 
 local function v533(v534, v535, v536, v537)
     local v538 = v423
-    if not v538 or v534 ~= v538.k106 or typeof(v536) ~= "Vector3" or os.clock() - v538.k103 > 1.5 then
+    if not v538 or v534 ~= v538.k109 or typeof(v536) ~= "Vector3" or os.clock() - v538.k106 > 1.5 then
         return
     end
     v423 = nil
-    local v539 = v538.k82
+    local v539 = v538.k85
     if typeof(v535) == "Vector3" then
         v539 = v535
     elseif typeof(v535) == "Instance" then
@@ -1285,12 +1288,12 @@ local function v533(v534, v535, v536, v537)
             v539 = v535.Position
         end
     end
-    local v540 = typeof(v537) == "Instance" and v538.k57 ~= nil and v537:IsDescendantOf(v538.k57)
+    local v540 = typeof(v537) == "Instance" and v538.k60 ~= nil and v537:IsDescendantOf(v538.k60)
     task.delay(1.1, function()
         if v10 then
             return
         end
-        if v68.k78(v425, v538.k89, v538.k103, v538.k93, v539, v536, v540) then
+        if v68.k81(v425, v538.k92, v538.k106, v538.k96, v539, v536, v540) then
             v426()
         end
     end)
@@ -1306,338 +1309,447 @@ task.spawn(function()
     end
 end)
 
-local function v544(v545)
+local v544 = 4
+local function v545(v546, v547, v548)
+    local v549 = Vector3.new(v547.X - v546.X, 0, v547.Z - v546.Z)
+    local v550 = v549.Magnitude
+    local v551 = math.min(v548, v550 - v544)
+    if v550 < 0.5 or v551 <= 0 then
+        return v546
+    end
+    local v552 = v549 / v550
+    local v553 = v411(v7, v546, v552 * (v551 + 1.5), v412)
+    if v553 and v553.Instance.Transparency < 1 then
+        v551 = math.min(v551, (v553.Position - v546).Magnitude - 1.5)
+    end
+    if v551 <= 0 then
+        return v546
+    end
+    return v546 + v552 * v551
+end
+
+local function v554(v555, v556)
+    if v427("Knife") then
+        local v557, _, v558 = v499("Knife", v555)
+        if v557 then
+            return CFrame.new(v557), v558
+        end
+    end
+    return v556, nil
+end
+
+local v559 = false
+local function v560(v561, v562, v563, v564, v565, v566)
+    local v567 = v8.Character
+    local v568 = v567 and v567:FindFirstChild("HumanoidRootPart")
+    local v569 = v419.k109 and v419.k109:FindFirstChild("Handle")
+    local v570 = v564 - v563
+    v570 = Vector3.new(v570.X, 0, v570.Z)
+    if v559 or not (v568 and v569) or v570.Magnitude < 0.2 then
+        v562[2] = v566
+        pcall(v520, v561, v562)
+        v524("Knife", v565, v563, v566.Position)
+        return
+    end
+    v559 = true
+    local v571 = false
+    local v572 = v5:GetInstanceAddedSignal("ThrowingKnife"):Connect(function()
+        v571 = true
+    end)
+    v568.CFrame += v570
+    v2.Heartbeat:Wait()
+    v2.Heartbeat:Wait()
+    local v573 = v569.Position
+    v562[1] = v569.CFrame
+    local v574, v575 = v554(v573, v566)
+    v562[2] = v574
+    pcall(v520, v561, v562)
+    v524("Knife", v575 or v565, v573, v574.Position)
+    local v576 = os.clock()
+    while not v571 and not v10 and os.clock() - v576 < 1 do
+        v2.PreSimulation:Wait()
+    end
+    v572:Disconnect()
+    if v568.Parent then
+        v568.CFrame -= v570
+    end
+    v559 = false
+end
+
+local function v577(v578, v579, v580)
+    local v581 = v434("Knife", v579[1])
+    local v582, v583 = v554(v581, v579[2])
+    v583 = v583 or v580
+    if not (v15.k47 and v581 and typeof(v582) == "CFrame") then
+        v579[2] = v582
+        v520(v578, v579)
+        if v581 and typeof(v582) == "CFrame" then
+            v524("Knife", v583, v581, v582.Position)
+        end
+        return
+    end
+    local v584 = v545(v581, v582.Position, v15.k5)
+    if v15.k6 == "Change" then
+        task.spawn(v560, v578, v579, v581, v584, v583, v582)
+        return
+    end
+    local v585 = typeof(v579[1]) == "CFrame" and (v579[1] - v579[1].Position) or CFrame.new()
+    v579[1] = CFrame.new(v584) * v585
+    local v586, v587 = v554(v584, v582)
+    v579[2] = v586
+    v520(v578, v579)
+    v524("Knife", v587 or v583, v584, v586.Position)
+end
+
+local function v588(v589)
     v422 = nil
-    local v546 = v545.k53
-    if v545.k68 == "Gun" and v419.k55 and typeof(v546[1]) == "CFrame" then
-        v546[1] = v419.k55.WorldCFrame
+    if v589.k71 == "Knife" then
+        pcall(v577, v589.k94, v589.k56, v589.k64)
+        return
     end
-    local v547 = v434(v545.k68, v546[1]) or v545.k82
-    local v548, _, v549, v550 = v499(v545.k68, v547)
-    if v548 then
-        v546[2] = v515(v545.k68, v547, v548, v550)
-    elseif v545.k50 then
-        v546[2] = v545.k50
+    local v590 = v589.k56
+    if v589.k71 == "Gun" and v419.k58 and typeof(v590[1]) == "CFrame" then
+        v590[1] = v419.k58.WorldCFrame
     end
-    if pcall(v520, v545.k91, v546) and typeof(v546[2]) == "CFrame" then
-        v524(v545.k68, v549 or v545.k61, v547, v546[2].Position)
+    local v591 = v434(v589.k71, v590[1]) or v589.k85
+    local v592, _, v593, v594 = v499(v589.k71, v591)
+    if v592 then
+        v590[2] = v515(v589.k71, v591, v592, v594)
+    elseif v589.k53 then
+        v590[2] = v589.k53
+    end
+    if pcall(v520, v589.k94, v590) and typeof(v590[2]) == "CFrame" then
+        v524(v589.k71, v593 or v589.k64, v591, v590[2].Position)
     end
 end
 
-local v551 = 0
+local v595 = 0
 v12(v2.PreSimulation:Connect(function()
     if v10 then
         return
     end
-    if not (v15.k13 or v15.k21) then
+    if not (v15.k15 or v15.k23) then
         if next(v418) then
             table.clear(v418)
         end
         v420 = nil
         table.clear(v421)
         if v422 then
-            v544(v422)
+            v588(v422)
         end
         return
     end
-    local v552 = os.clock()
-    for _, v553 in v1:GetPlayers() do
-        if v553 ~= v8 then
-            local v554 = v553.Character
-            local v555 = v554 and v554:FindFirstChild("HumanoidRootPart")
-            local v556 = v554 and v554:FindFirstChildOfClass("Humanoid")
-            if v555 and v556 then
-                local v557 = v418[v553]
-                if not v557 or v557.k92 ~= v555 then
-                    v557 = v68.new()
-                    v557.k92 = v555
-                    v418[v553] = v557
+    local v596 = os.clock()
+    for _, v597 in v1:GetPlayers() do
+        if v597 ~= v8 then
+            local v598 = v597.Character
+            local v599 = v598 and v598:FindFirstChild("HumanoidRootPart")
+            local v600 = v598 and v598:FindFirstChildOfClass("Humanoid")
+            if v599 and v600 then
+                local v601 = v418[v597]
+                if not v601 or v601.k95 ~= v599 then
+                    v601 = v68.new()
+                    v601.k95 = v599
+                    v418[v597] = v601
                 end
-                if v556.Health <= 0 then
-                    v557.k59 = v557.k59 or v552
+                if v600.Health <= 0 then
+                    v601.k62 = v601.k62 or v596
                 end
-                if v556.UseJumpPower then
-                    v557.k67 = v556.JumpPower
+                if v600.UseJumpPower then
+                    v601.k70 = v600.JumpPower
                 else
-                    v557.k67 = math.sqrt(2 * v7.Gravity * v556.JumpHeight)
+                    v601.k70 = math.sqrt(2 * v7.Gravity * v600.JumpHeight)
                 end
-                if not v557.k59 or v552 - v557.k59 < 0.6 then
-                    local v558 = v556:GetState()
-                    local v559 = v556.FloorMaterial ~= Enum.Material.Air
-                        or (v558 ~= Enum.HumanoidStateType.Freefall and v558 ~= Enum.HumanoidStateType.Jumping)
-                    v68.k86(v557, v552, v555.Position, v559)
+                if not v601.k62 or v596 - v601.k62 < 0.6 then
+                    local v602 = v600:GetState()
+                    local v603 = v600.FloorMaterial ~= Enum.Material.Air
+                        or (v602 ~= Enum.HumanoidStateType.Freefall and v602 ~= Enum.HumanoidStateType.Jumping)
+                    v68.k89(v601, v596, v599.Position, v603)
                 end
             else
-                v418[v553] = nil
+                v418[v597] = nil
             end
         end
     end
-    v551 += 1
-    if v551 % 60 == 0 then
+    v595 += 1
+    if v595 % 60 == 0 then
         v414()
     end
     v429()
-    if v419.k68 and v427(v419.k68) then
-        v420 = v444(v419.k68)
+    if v419.k71 and v427(v419.k71) then
+        v420 = v444(v419.k71)
     else
         v420 = nil
         table.clear(v421)
     end
-    local v560 = v422
-    if v560 then
-        if v560.k91 ~= v419.k91 or not v420 then
-            v544(v560)
+    local v604 = v422
+    if v604 then
+        if v604.k94 ~= v419.k94 or not v420 then
+            v588(v604)
         else
-            local v561 = v434(v560.k68, v419.k55 and v419.k55.WorldCFrame) or v560.k82
-            local _, v562 = v499(v560.k68, v561)
-            if not v562 or v68.k87(v560.k68 == "Knife", v562, v552 - v560.k98) then
-                v544(v560)
+            local v605 = v434(v604.k71, v419.k58 and v419.k58.WorldCFrame) or v604.k85
+            local _, v606 = v499(v604.k71, v605)
+            if not v606 or v68.k90(v604.k71 == "Knife", v606, v596 - v604.k101) then
+                v588(v604)
             end
         end
     end
 end))
-v12(v1.PlayerRemoving:Connect(function(v563)
-    v418[v563] = nil
+v12(v1.PlayerRemoving:Connect(function(v607)
+    v418[v607] = nil
 end))
 
-local function v564(v565, v566)
-    local v567 = v419.k68
-    local v568 = v434(v567, v566[1])
-    if not v568 then
+local function v608(v609, v610)
+    local v611 = v419.k71
+    local v612 = v434(v611, v610[1])
+    if not v612 then
         return false
     end
-    local v569, v570, v571, v572 = v499(v567, v568)
-    if not v569 then
+    local v613, v614, v615, v616 = v499(v611, v612)
+    if not v613 then
         return false
     end
-    local v573 = v515(v567, v568, v569, v572)
-    if not v68.k87(v567 == "Knife", v570, 0) then
+    local v617 = v515(v611, v612, v613, v616)
+    if not v68.k90(v611 == "Knife", v614, 0) then
         if v422 then
-            v544(v422)
+            v588(v422)
         end
-        v422 = { k91 = v565, k53 = v566, k68 = v567, k82 = v568, k50 = v573, k61 = v571, k98 = os.clock() }
+        v422 = { k94 = v609, k56 = v610, k71 = v611, k85 = v612, k53 = v617, k64 = v615, k101 = os.clock() }
         return true
     end
-    v566[2] = v573
-    v520(v565, v566)
-    v524(v567, v571, v568, v573.Position)
+    if v611 == "Knife" then
+        v577(v609, v610, v615)
+        return true
+    end
+    v610[2] = v617
+    v520(v609, v610)
+    v524(v611, v615, v612, v617.Position)
     return true
 end
 
-local v574 = false
+local v618 = false
 if typeof(hookmetamethod) == "function" and typeof(getnamecallmethod) == "function" then
-    local v575
-    local v576 = typeof(checkcaller) == "function" and checkcaller or function()
+    local v619
+    local v620 = typeof(checkcaller) == "function" and checkcaller or function()
         return false
     end
-    local function v577(self, ...)
-        if v10 or self ~= v419.k91 then
-            return v575(self, ...)
+    local function v621(self, ...)
+        if v10 or self ~= v419.k94 then
+            return v619(self, ...)
         end
-        if getnamecallmethod() ~= "FireServer" or v576() or not v427(v419.k68) then
-            return v575(self, ...)
+        if getnamecallmethod() ~= "FireServer" or v620() then
+            return v619(self, ...)
         end
-        local v578 = table.pack(...)
-        local v579, v580 = pcall(v564, self, table.pack(...))
-        if v579 and v580 then
+        if not v427(v419.k71) then
+            if v419.k71 == "Knife" and v15.k47 then
+                local v622 = pcall(v577, self, table.pack(...))
+                if v622 then
+                    return nil
+                end
+            end
+            return v619(self, ...)
+        end
+        local v623 = table.pack(...)
+        local v624, v625 = pcall(v608, self, table.pack(...))
+        if v624 and v625 then
             return nil
         end
-        return v520(self, v578)
+        return v520(self, v623)
     end
     if typeof(newcclosure) == "function" then
-        v577 = newcclosure(v577)
+        v621 = newcclosure(v621)
     end
-    v575 = hookmetamethod(game, "__namecall", v577)
-    v574 = true
+    v619 = hookmetamethod(game, "__namecall", v621)
+    v618 = true
 end
 
-local v581
+local v626
 pcall(function()
-    v581 = require(v3:WaitForChild("ClientServices", 5):WaitForChild("WeaponService", 5))
+    v626 = require(v3:WaitForChild("ClientServices", 5):WaitForChild("WeaponService", 5))
 end)
-local v582, v583
-if not v574 and type(v581) == "table" then
-    v582, v583 = v581.GetMouseTargetCFrame, v581.GetTargetPosition
-    local function v584()
-        local v585 = v419.k68
-        if v10 or not v585 or not v427(v585) then
+local v627, v628
+if not v618 and type(v626) == "table" then
+    v627, v628 = v626.GetMouseTargetCFrame, v626.GetTargetPosition
+    local function v629()
+        local v630 = v419.k71
+        if v10 or not v630 or not v427(v630) then
             return nil
         end
-        local v586 = v434(v585)
-        if not v586 then
+        local v631 = v434(v630)
+        if not v631 then
             return nil
         end
-        local v587, _, _, v588 = v499(v585, v586)
-        return v587 and v515(v585, v586, v587, v588)
+        local v632, _, _, v633 = v499(v630, v631)
+        return v632 and v515(v630, v631, v632, v633)
     end
-    v581.GetMouseTargetCFrame = function(self, ...)
-        local v589, v590 = pcall(v584)
-        if v589 and v590 then
-            return v590
+    v626.GetMouseTargetCFrame = function(self, ...)
+        local v634, v635 = pcall(v629)
+        if v634 and v635 then
+            return v635
         end
-        return v582(self, ...)
+        return v627(self, ...)
     end
-    v581.GetTargetPosition = function(self, v591, v592, ...)
-        v58, v59 = Vector2.new(v591, v592), os.clock()
-        local v593, v594 = pcall(v584)
-        if v593 and v594 then
-            return v594
+    v626.GetTargetPosition = function(self, v636, v637, ...)
+        v58, v59 = Vector2.new(v636, v637), os.clock()
+        local v638, v639 = pcall(v629)
+        if v638 and v639 then
+            return v639
         end
-        return v583(self, v591, v592, ...)
+        return v628(self, v636, v637, ...)
     end
 end
 
-local v595 = Instance.new("Folder")
-v595.Name = "\0"
-v595.Parent = (typeof(gethui) == "function" and gethui()) or game:GetService("CoreGui")
-local v596 = {}
-local v597 = {
+local v640 = Instance.new("Folder")
+v640.Name = "\0"
+v640.Parent = (typeof(gethui) == "function" and gethui()) or game:GetService("CoreGui")
+local v641 = {}
+local v642 = {
     Murderer = Color3.fromRGB(255, 50, 50),
     Sheriff = Color3.fromRGB(50, 140, 255),
     Hero = Color3.fromRGB(50, 140, 255),
     Innocent = Color3.fromRGB(60, 230, 90),
 }
-local function v598(v599)
-    local v600 = v596[v599]
-    if v600 then
-        v600.k66:Destroy()
-        v600.k56:Destroy()
-        v596[v599] = nil
+local function v643(v644)
+    local v645 = v641[v644]
+    if v645 then
+        v645.k69:Destroy()
+        v645.k59:Destroy()
+        v641[v644] = nil
     end
 end
-v12(v1.PlayerRemoving:Connect(v598))
-local function v601()
-    for _, v602 in v1:GetPlayers() do
-        if v602 ~= v8 then
-            local v603, _, v604 = v41(v602)
-            local v605, v606 = v35(v602)
-            if v15.k5 and v603 and not v606 then
-                local v607 = v597[v605] or v597.Innocent
-                local v608 = v596[v602]
-                if not v608 or v608.k57 ~= v604 then
-                    v598(v602)
-                    local v609 = Instance.new("Highlight")
-                    v609.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
-                    v609.FillTransparency = 0.55
-                    v609.OutlineTransparency = 0
-                    v609.Adornee = v604
-                    v609.Parent = v595
-                    local v610 = Instance.new("BillboardGui")
-                    v610.AlwaysOnTop = true
-                    v610.Size = UDim2.fromOffset(160, 22)
-                    v610.StudsOffset = Vector3.new(0, 3.4, 0)
-                    v610.Adornee = v603
-                    v610.Parent = v595
-                    local v611 = Instance.new("TextLabel")
-                    v611.BackgroundTransparency = 1
-                    v611.Size = UDim2.fromScale(1, 1)
-                    v611.Font = Enum.Font.GothamBold
-                    v611.TextSize = 13
-                    v611.TextStrokeTransparency = 0.4
-                    v611.Text = v602.DisplayName
-                    v611.Parent = v610
-                    v608 = { k66 = v609, k56 = v610, k69 = v611, k57 = v604 }
-                    v596[v602] = v608
+v12(v1.PlayerRemoving:Connect(v643))
+local function v646()
+    for _, v647 in v1:GetPlayers() do
+        if v647 ~= v8 then
+            local v648, _, v649 = v41(v647)
+            local v650, v651 = v35(v647)
+            if v15.k7 and v648 and not v651 then
+                local v652 = v642[v650] or v642.Innocent
+                local v653 = v641[v647]
+                if not v653 or v653.k60 ~= v649 then
+                    v643(v647)
+                    local v654 = Instance.new("Highlight")
+                    v654.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+                    v654.FillTransparency = 0.55
+                    v654.OutlineTransparency = 0
+                    v654.Adornee = v649
+                    v654.Parent = v640
+                    local v655 = Instance.new("BillboardGui")
+                    v655.AlwaysOnTop = true
+                    v655.Size = UDim2.fromOffset(160, 22)
+                    v655.StudsOffset = Vector3.new(0, 3.4, 0)
+                    v655.Adornee = v648
+                    v655.Parent = v640
+                    local v656 = Instance.new("TextLabel")
+                    v656.BackgroundTransparency = 1
+                    v656.Size = UDim2.fromScale(1, 1)
+                    v656.Font = Enum.Font.GothamBold
+                    v656.TextSize = 13
+                    v656.TextStrokeTransparency = 0.4
+                    v656.Text = v647.DisplayName
+                    v656.Parent = v655
+                    v653 = { k69 = v654, k59 = v655, k72 = v656, k60 = v649 }
+                    v641[v647] = v653
                 end
-                if v608.k58 ~= v607 then
-                    v608.k58 = v607
-                    v608.k66.FillColor = v607
-                    v608.k66.OutlineColor = v607
-                    v608.k69.TextColor3 = v607
+                if v653.k61 ~= v652 then
+                    v653.k61 = v652
+                    v653.k69.FillColor = v652
+                    v653.k69.OutlineColor = v652
+                    v653.k72.TextColor3 = v652
                 end
             else
-                v598(v602)
+                v643(v647)
             end
         end
     end
 end
 task.spawn(function()
     while not v10 do
-        pcall(v601)
+        pcall(v646)
         task.wait(0.25)
     end
 end)
 
-local v612 = {}
-local v613 = {}
-local v614
-local function v615(v616)
-    local v617 = v613[v616]
-    if v617 then
-        return v617
+local v657 = {}
+local v658 = {}
+local v659
+local function v660(v661)
+    local v662 = v658[v661]
+    if v662 then
+        return v662
     end
-    local v618 = {}
-    for _, v619 in v616:GetDescendants() do
-        if v619:IsA("BasePart") then
-            table.insert(v618, v619)
+    local v663 = {}
+    for _, v664 in v661:GetDescendants() do
+        if v664:IsA("BasePart") then
+            table.insert(v663, v664)
         end
     end
-    v613[v616] = v618
-    local v620
-    v620 = v616.DescendantAdded:Connect(function(v621)
-        if v621:IsA("BasePart") then
-            table.insert(v618, v621)
+    v658[v661] = v663
+    local v665
+    v665 = v661.DescendantAdded:Connect(function(v666)
+        if v666:IsA("BasePart") then
+            table.insert(v663, v666)
         end
     end)
-    v616.AncestryChanged:Once(function()
-        v613[v616] = nil
-        v620:Disconnect()
+    v661.AncestryChanged:Once(function()
+        v658[v661] = nil
+        v665:Disconnect()
     end)
-    return v618
+    return v663
 end
 v12(v2.PreSimulation:Connect(function()
     if not v15.k4 then
-        v614 = nil
+        v659 = nil
         return
     end
-    local v622, v623 = v41(v8)
-    local v624 = os.clock()
-    for _, v625 in v1:GetPlayers() do
-        if v625 ~= v8 then
-            local v626 = v625.Character
-            local v627 = v626 and v626:FindFirstChild("HumanoidRootPart")
-            if v627 and v622 then
-                local v628 = v627.Position - v622.Position
-                if v628.X * v628.X + v628.Y * v628.Y + v628.Z * v628.Z < 3600 then
-                    local v629 = v627.AssemblyAngularVelocity
-                    local v630 = v627.AssemblyLinearVelocity
-                    if v629:Dot(v629) > 625 or v630:Dot(v630) > 14400 then
-                        v612[v625] = v624 + 3
+    local v667, v668 = v41(v8)
+    local v669 = os.clock()
+    for _, v670 in v1:GetPlayers() do
+        if v670 ~= v8 then
+            local v671 = v670.Character
+            local v672 = v671 and v671:FindFirstChild("HumanoidRootPart")
+            if v672 and v667 then
+                local v673 = v672.Position - v667.Position
+                if v673.X * v673.X + v673.Y * v673.Y + v673.Z * v673.Z < 3600 then
+                    local v674 = v672.AssemblyAngularVelocity
+                    local v675 = v672.AssemblyLinearVelocity
+                    if v674:Dot(v674) > 625 or v675:Dot(v675) > 14400 then
+                        v657[v670] = v669 + 3
                     end
                 end
             end
-            local v631 = v612[v625]
-            if v631 then
-                if v624 > v631 or not v626 then
-                    v612[v625] = nil
+            local v676 = v657[v670]
+            if v676 then
+                if v669 > v676 or not v671 then
+                    v657[v670] = nil
                 else
-                    for _, v632 in v615(v626) do
-                        if v632.CanCollide then
-                            v632.CanCollide = false
+                    for _, v677 in v660(v671) do
+                        if v677.CanCollide then
+                            v677.CanCollide = false
                         end
                     end
                 end
             end
         end
     end
-    if not v622 then
-        v614 = nil
+    if not v667 then
+        v659 = nil
         return
     end
-    local v633 = v622.AssemblyLinearVelocity
-    local v634 = math.sqrt(v633.X * v633.X + v633.Z * v633.Z)
-    local v635 = v622.AssemblyAngularVelocity.Magnitude
-    local v636 = v623.WalkSpeed
-    if (v634 > math.max(v636 * 5, 90) or v633.Y > 140 or v635 > 35) and v614 then
-        v622.AssemblyLinearVelocity = Vector3.zero
-        v622.AssemblyAngularVelocity = Vector3.zero
-        v622.CFrame = v614
-    elseif v634 < v636 * 2 + 4 and v635 < 8 and math.abs(v633.Y) < 60 then
-        v614 = v622.CFrame
+    local v678 = v667.AssemblyLinearVelocity
+    local v679 = math.sqrt(v678.X * v678.X + v678.Z * v678.Z)
+    local v680 = v667.AssemblyAngularVelocity.Magnitude
+    local v681 = v668.WalkSpeed
+    if (v679 > math.max(v681 * 5, 90) or v678.Y > 140 or v680 > 35) and v659 then
+        v667.AssemblyLinearVelocity = Vector3.zero
+        v667.AssemblyAngularVelocity = Vector3.zero
+        v667.CFrame = v659
+    elseif v679 < v681 * 2 + 4 and v680 < 8 and math.abs(v678.Y) < 60 then
+        v659 = v667.CFrame
     end
 end))
 
-local v637 = v14:CreateWindow({
+local v682 = v14:CreateWindow({
     Name = "MM2",
     Author = "ily",
     Icon = "swords",
@@ -1650,138 +1762,166 @@ local v637 = v14:CreateWindow({
     },
 })
 
-local v638 = "\u{200B}\u{200C}\u{200B}"
+local v683 = "\u{200B}\u{200C}\u{200B}"
 pcall(function()
-    v637:EditOpenButton({
-        Title = v638,
+    v682:EditOpenButton({
+        Title = v683,
         Icon = "",
         Transparency = 1,
         StrokeThickness = 0,
     })
 end)
-local v639 = {}
-local function v640()
-    local v641 = { game:GetService("CoreGui") }
+local v684 = {}
+local function v685()
+    local v686 = { game:GetService("CoreGui") }
     if typeof(gethui) == "function" then
-        table.insert(v641, gethui())
+        table.insert(v686, gethui())
     end
-    local v642 = v8:FindFirstChildOfClass("PlayerGui")
-    if v642 then
-        table.insert(v641, v642)
+    local v687 = v8:FindFirstChildOfClass("PlayerGui")
+    if v687 then
+        table.insert(v686, v687)
     end
-    local v643 = false
-    for _, v644 in v641 do
-        local v645, v646 = pcall(v644.GetDescendants, v644)
-        if v645 then
-            for _, v647 in v646 do
-                if (v647:IsA("TextLabel") or v647:IsA("TextButton")) and v647.Text == v638 then
-                    local v648 = v647
-                    local v649 = v647.Parent
-                    while v649 and v649:IsA("GuiObject") and v649.AbsoluteSize.X * v649.AbsoluteSize.Y < 320 * 160 do
-                        v648 = v649
-                        v649 = v649.Parent
+    local v688 = false
+    for _, v689 in v686 do
+        local v690, v691 = pcall(v689.GetDescendants, v689)
+        if v690 then
+            for _, v692 in v691 do
+                if (v692:IsA("TextLabel") or v692:IsA("TextButton")) and v692.Text == v683 then
+                    local v693 = v692
+                    local v694 = v692.Parent
+                    while v694 and v694:IsA("GuiObject") and v694.AbsoluteSize.X * v694.AbsoluteSize.Y < 320 * 160 do
+                        v693 = v694
+                        v694 = v694.Parent
                     end
-                    if v648:IsA("GuiObject") and not v639[v648] then
-                        v639[v648] = true
-                        v648.Visible = false
-                        v12(v648:GetPropertyChangedSignal("Visible"):Connect(function()
-                            if v648.Visible then
-                                v648.Visible = false
+                    if v693:IsA("GuiObject") and not v684[v693] then
+                        v684[v693] = true
+                        v693.Visible = false
+                        v12(v693:GetPropertyChangedSignal("Visible"):Connect(function()
+                            if v693.Visible then
+                                v693.Visible = false
                             end
                         end))
                     end
-                    v643 = true
+                    v688 = true
                 end
             end
         end
     end
-    return v643
+    return v688
 end
 task.spawn(function()
-    for _, v650 in { 0.2, 0.5, 1, 2, 4, 8 } do
-        task.wait(v650)
+    for _, v695 in { 0.2, 0.5, 1, 2, 4, 8 } do
+        task.wait(v695)
         if v10 then
             return
         end
-        local v651, v652 = pcall(v640)
-        if v651 and v652 then
+        local v696, v697 = pcall(v685)
+        if v696 and v697 then
             return
         end
     end
 end)
-local v653 = Enum.KeyCode.K
-v12(v4.InputBegan:Connect(function(v654)
-    if v654.KeyCode == v653 then
-        task.delay(0.15, pcall, v640)
-        task.delay(0.6, pcall, v640)
+local v698 = Enum.KeyCode.K
+v12(v4.InputBegan:Connect(function(v699)
+    if v699.KeyCode == v698 then
+        task.delay(0.15, pcall, v685)
+        task.delay(0.6, pcall, v685)
     end
 end))
 
-local v655 = v637:Tab({ Title = "Main", Icon = "crosshair" })
-v655:Section({ Title = "Silent Aim" })
-v655:Toggle({
+local v700 = v682:Tab({ Title = "Main", Icon = "crosshair" })
+v700:Section({ Title = "Silent Aim" })
+v700:Toggle({
     Title = "Gun Silent Aim",
     Default = false,
-    Callback = function(v656)
-        v15.k13 = v656
+    Callback = function(v701)
+        v15.k15 = v701
     end,
 })
-v655:Toggle({
+v700:Toggle({
     Title = "Murderer Silent Aim",
     Default = false,
-    Callback = function(v657)
-        v15.k21 = v657
+    Callback = function(v702)
+        v15.k23 = v702
     end,
 })
-v655:Section({ Title = "Other" })
-v655:Toggle({
+v700:Section({ Title = "Knife Throw" })
+v700:Toggle({
+    Title = "Start Throw Closer",
+    Default = false,
+    Callback = function(v703)
+        v15.k47 = v703
+    end,
+})
+v700:DropDown({
+    Title = "Closer Method",
+    Option = { "Spoof", "Change" },
+    Value = "Spoof",
+    Callback = function(v704)
+        if v704 == "Spoof" or v704 == "Change" then
+            v15.k6 = v704
+        end
+    end,
+})
+v700:Slider({
+    Title = "Closer By (studs)",
+    Step = 1,
+    Value = { Min = 1, Max = 40, Default = 8 },
+    Callback = function(v705)
+        if type(v705) == "number" then
+            v15.k5 = v705
+        end
+    end,
+})
+v700:Section({ Title = "Other" })
+v700:Toggle({
     Title = "ESP",
     Default = false,
-    Callback = function(v658)
-        v15.k5 = v658
+    Callback = function(v706)
+        v15.k7 = v706
     end,
 })
-v655:Toggle({
+v700:Toggle({
     Title = "Anti Fling",
     Default = false,
-    Callback = function(v659)
-        v15.k4 = v659
-        if not v659 then
-            table.clear(v612)
+    Callback = function(v707)
+        v15.k4 = v707
+        if not v707 then
+            table.clear(v657)
         end
     end,
 })
 
-local v660 = v637:Tab({ Title = "Settings", Icon = "settings" })
-local v661 = v660:Keybind({
+local v708 = v682:Tab({ Title = "Settings", Icon = "settings" })
+local v709 = v708:Keybind({
     Title = "Toggle UI",
-    Callback = function(v662)
-        local v663 = typeof(v662) == "EnumItem" and v662 or Enum.KeyCode[tostring(v662)]
-        if v663 then
-            v653 = v663
-            pcall(v637.SetToggleKey, v637, v663)
+    Callback = function(v710)
+        local v711 = typeof(v710) == "EnumItem" and v710 or Enum.KeyCode[tostring(v710)]
+        if v711 then
+            v698 = v711
+            pcall(v682.SetToggleKey, v682, v711)
         end
     end,
 })
 pcall(function()
-    v661:SetValue("K")
+    v709:SetValue("K")
 end)
 
-v9.__c46 = function()
+v9.__c49 = function()
     v10 = true
     if v422 then
-        pcall(v544, v422)
+        pcall(v588, v422)
     end
-    for _, v664 in v11 do
-        pcall(v664.Disconnect, v664)
+    for _, v712 in v11 do
+        pcall(v712.Disconnect, v712)
     end
-    for v665 in v596 do
-        v598(v665)
+    for v713 in v641 do
+        v643(v713)
     end
-    v595:Destroy()
-    if v582 and v581 then
-        v581.GetMouseTargetCFrame = v582
-        v581.GetTargetPosition = v583
+    v640:Destroy()
+    if v627 and v626 then
+        v626.GetMouseTargetCFrame = v627
+        v626.GetTargetPosition = v628
     end
-    pcall(v637.Close, v637)
+    pcall(v682.Close, v682)
 end
