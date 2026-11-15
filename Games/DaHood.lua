@@ -94,6 +94,14 @@ local Settings = {
     CashColor = Color3.fromRGB(90, 255, 120),
     -- misc
     AntiAfk = true,
+    -- hitbox
+    Hitbox = false, HitboxSize = 8, HitboxTransparency = 75, HitboxSkipCrew = true, HitboxSkipKnocked = true,
+    -- macro
+    CustomMacro = false, MacroButton = true, MacroHold = false, MacroTurn = 100, MacroOnlyMoving = true, MacroOnlyAir = false,
+    -- world
+    AtmEsp = false, VaultEsp = false, ItemEsp = false, WorldShowBroken = false, WorldEspMax = 1500,
+    AtmColor = Color3.fromRGB(90, 255, 120), VaultColor = Color3.fromRGB(255, 215, 70), ItemColor = Color3.fromRGB(150, 200, 255),
+    AutoPunchAtm = false, AtmFarm = false, AtmFarmRange = 400, AtmPunchDelay = 0.35,
 }
 
 --// Plumbing \\--
@@ -1227,6 +1235,489 @@ local function serverHop()
     rejoin()
 end
 
+--// Hitbox expander \\--
+-- Guns raycast on your side and send the part they hit, so other players'
+-- HumanoidRootParts made bigger on your screen get hit from further off.
+-- Only you see the change (other players' parts don't replicate from you).
+local Hitbox = { count = 0 }
+do
+    local original = {}
+    local function restore(part)
+        local o = original[part]
+        if o then
+            pcall(function()
+                part.Size = o.Size
+                part.Transparency = o.Transparency
+                part.CanCollide = o.CanCollide
+                part.Massless = o.Massless
+            end)
+            original[part] = nil
+        end
+    end
+    local function restoreAll()
+        for part in original do
+            restore(part)
+        end
+    end
+    table.insert(Cleanups, restoreAll)
+    loop(0.1, function()
+        if not Settings.Hitbox then
+            if next(original) then
+                restoreAll()
+            end
+            Hitbox.count = 0
+            return
+        end
+        local n = 0
+        local want = {}
+        for _, t in Targets.list() do
+            local skip = (Settings.HitboxSkipCrew and Game.sameCrew(t.player))
+                or (Settings.HitboxSkipKnocked and (Game.knocked(t.char) or Game.dead(t.char)))
+            if not skip then
+                local part = t.root
+                want[part] = true
+                if not original[part] then
+                    original[part] = { Size = part.Size, Transparency = part.Transparency, CanCollide = part.CanCollide, Massless = part.Massless }
+                end
+                local s = Settings.HitboxSize
+                part.Size = Vector3.new(s, s, s)
+                part.Transparency = Settings.HitboxTransparency / 100
+                part.CanCollide = false
+                part.Massless = true
+                n += 1
+            end
+        end
+        for part in original do
+            if not want[part] or not part.Parent then
+                restore(part)
+            end
+        end
+        Hitbox.count = n
+    end)
+end
+
+--// Macro \\--
+-- Da Hood has its own macro (the speed glitch): while it's on, your root turns
+-- to face where the camera looks every frame (MobileMacroButton, RenderStep
+-- "MobileMacro"). It's only offered when Lighting.MacroAllow is on, nobody
+-- voted it off, and you're skinny (MuscleInformation <= -7500).
+local Macro = { custom = false, info = "" }
+do
+    local UGS = UserSettings():GetService("UserGameSettings")
+    function Macro.allowed()
+        local l = game:GetService("Lighting")
+        return l:GetAttribute("MacroAllow") == true and not l:GetAttribute("PlayersWantMacroToBeDisabled")
+    end
+    function Macro.skinny()
+        local ok, v = pcall(function()
+            return LocalPlayer.DataFolder.Information.MuscleInformation.Value
+        end)
+        return ok and tonumber(v) ~= nil and tonumber(v) <= -7500
+    end
+    local function gameButton()
+        local gui = LocalPlayer:FindFirstChild("PlayerGui")
+        local main = gui and gui:FindFirstChild("MainScreenGui")
+        local layout = main and main:FindFirstChild("MobileLayout")
+        return layout and layout:FindFirstChild("Macro")
+    end
+    -- The game's own macro, on / off.
+    function Macro.gameOn()
+        local b = gameButton()
+        local stroke = b and b:FindFirstChildOfClass("UIStroke")
+        return stroke ~= nil and stroke.Enabled == true
+    end
+    -- Toggles the game's own macro through its own button handler.
+    function Macro.toggleGame()
+        local b = gameButton()
+        if not b then
+            notify("The game's macro button isn't loaded")
+            return
+        end
+        if not Macro.allowed() then
+            notify("Macro is turned off on this server")
+            return
+        end
+        if not Macro.skinny() and not Macro.gameOn() then
+            notify("The game only lets skinny characters macro. Use the custom macro instead")
+            return
+        end
+        if typeof(getconnections) ~= "function" then
+            notify("Your executor has no getconnections")
+            return
+        end
+        local fired = false
+        for _, c in getconnections(b.Activated) do
+            if c.Function then
+                task.spawn(c.Function)
+                fired = true
+            end
+        end
+        if not fired then
+            notify("Couldn't reach the game's macro button")
+        end
+    end
+
+    -- Custom macro: the same steering the game does, on any build, with its
+    -- own on-screen button for phones.
+    local steering = false
+    local rotationBefore = nil
+    local function stop()
+        if steering then
+            steering = false
+            if rotationBefore then
+                pcall(function()
+                    UGS.RotationType = rotationBefore
+                end)
+                rotationBefore = nil
+            end
+        end
+    end
+    table.insert(Cleanups, stop)
+    function Macro.active()
+        return alive() and Settings.CustomMacro and Macro.custom
+    end
+    local function yaw(v)
+        return math.atan2(-v.X, -v.Z)
+    end
+    RunService:BindToRenderStep("DaHoodMacro", 41, function(dt)
+        if not Macro.active() then
+            stop()
+            Macro.info = Settings.CustomMacro and "ready (tap the MACRO button)" or "off"
+            return
+        end
+        local c = myChar()
+        local root = c and c:FindFirstChild("HumanoidRootPart")
+        local hum = c and c:FindFirstChildOfClass("Humanoid")
+        if not (root and hum) or hum.Sit or hum.PlatformStand or hum.Health <= 0 or Game.knocked(c) or Game.grabbed(c) then
+            stop()
+            Macro.info = "paused"
+            return
+        end
+        if Settings.MacroOnlyMoving and hum.MoveDirection.Magnitude < 0.1 then
+            stop()
+            Macro.info = "waiting (not moving)"
+            return
+        end
+        if Settings.MacroOnlyAir and hum.FloorMaterial ~= Enum.Material.Air then
+            stop()
+            Macro.info = "waiting (on the ground)"
+            return
+        end
+        if not steering then
+            steering = true
+            rotationBefore = UGS.RotationType
+        end
+        pcall(function()
+            UGS.RotationType = Enum.RotationType.MovementRelative
+        end)
+        local look = root.CFrame.LookVector
+        local cam = camera().CFrame.LookVector
+        local now = yaw(look)
+        local diff = ((yaw(cam) - now + math.pi) % (2 * math.pi)) - math.pi
+        local a = 1 - 0.64 ^ (dt * 240 * Settings.MacroTurn / 100)
+        root.CFrame = CFrame.new(root.Position) * CFrame.Angles(0, now + diff * a, 0)
+        Macro.info = "macroing"
+    end)
+    table.insert(Cleanups, function()
+        pcall(RunService.UnbindFromRenderStep, RunService, "DaHoodMacro")
+    end)
+
+    -- On-screen MACRO button (drag it anywhere). Tap = toggle, or hold.
+    local gui
+    do
+        local ok, parent = pcall(function()
+            return (typeof(gethui) == "function" and gethui()) or game:GetService("CoreGui")
+        end)
+        gui = Instance.new("ScreenGui")
+        gui.Name = "DHMacro"
+        gui.ResetOnSpawn = false
+        gui.DisplayOrder = 50
+        if not (ok and pcall(function()
+            gui.Parent = parent
+        end)) then
+            gui.Parent = LocalPlayer:WaitForChild("PlayerGui")
+        end
+        local b = Instance.new("TextButton")
+        b.Size = UDim2.fromOffset(72, 72)
+        b.Position = UDim2.new(1, -170, 0.5, -36)
+        b.BackgroundColor3 = Color3.fromRGB(35, 35, 40)
+        b.TextColor3 = Color3.new(1, 1, 1)
+        b.Font = Enum.Font.GothamBold
+        b.TextSize = 14
+        b.Text = "MACRO"
+        b.AutoButtonColor = false
+        b.Parent = gui
+        Instance.new("UICorner", b).CornerRadius = UDim.new(1, 0)
+        local stroke = Instance.new("UIStroke", b)
+        stroke.Thickness = 2
+        stroke.Color = Color3.fromRGB(70, 70, 78)
+        local function paint()
+            b.BackgroundColor3 = Macro.custom and Color3.fromRGB(40, 120, 55) or Color3.fromRGB(35, 35, 40)
+            stroke.Color = Macro.custom and Color3.fromRGB(90, 210, 120) or Color3.fromRGB(70, 70, 78)
+        end
+        Macro.paint = paint
+        local downAt, startPos, dragging, inputObj = nil, nil, false, nil
+        bind(b.InputBegan, function(i)
+            if i.UserInputType == Enum.UserInputType.Touch or i.UserInputType == Enum.UserInputType.MouseButton1 then
+                downAt, startPos, dragging, inputObj = i.Position, b.Position, false, i
+                if Settings.MacroHold then
+                    Macro.custom = true
+                    paint()
+                end
+            end
+        end)
+        bind(UserInputService.InputChanged, function(i)
+            if downAt and (i == inputObj or i.UserInputType == Enum.UserInputType.MouseMovement) then
+                local d = i.Position - downAt
+                if d.Magnitude > 12 then
+                    dragging = true
+                end
+                if dragging then
+                    b.Position = startPos + UDim2.fromOffset(d.X, d.Y)
+                end
+            end
+        end)
+        bind(UserInputService.InputEnded, function(i)
+            if downAt and (i == inputObj or i.UserInputType == Enum.UserInputType.MouseButton1) then
+                if Settings.MacroHold then
+                    Macro.custom = false
+                elseif not dragging then
+                    Macro.custom = not Macro.custom
+                end
+                downAt = nil
+                paint()
+            end
+        end)
+        table.insert(Cleanups, function()
+            gui:Destroy()
+        end)
+        loop(0.25, function()
+            gui.Enabled = Settings.CustomMacro and Settings.MacroButton
+            if not Settings.CustomMacro and Macro.custom then
+                Macro.custom = false
+                paint()
+            end
+        end)
+    end
+end
+
+--// World: ATMs, vaults, dropped items \\--
+local World = { atms = 0, vaults = 0 }
+do
+    -- workspace.Cashiers holds the ATMs ("CA$HIER") and vaults ("VAULT"), each a
+    -- model with a Humanoid: broken open = health 0.
+    function World.breakables()
+        local out = {}
+        local folder = Workspace:FindFirstChild("Cashiers")
+        if not folder then
+            return out
+        end
+        for _, m in folder:GetChildren() do
+            local hum = m:FindFirstChildOfClass("Humanoid")
+            local head = m:FindFirstChild("Head") or m:FindFirstChild("Open") or m:FindFirstChildWhichIsA("BasePart")
+            if hum and head then
+                local kind = m.Name:find("VAULT") and "Vault" or "ATM"
+                table.insert(out, { model = m, hum = hum, head = head, kind = kind, broken = hum.Health <= 0 })
+            end
+        end
+        return out
+    end
+    function World.items()
+        local out = {}
+        local ign = Workspace:FindFirstChild("Ignored")
+        local folder = ign and ign:FindFirstChild("ItemsDrop")
+        if not folder then
+            return out
+        end
+        for _, cd in folder:GetDescendants() do
+            if cd:IsA("ClickDetector") then
+                local holder = cd.Parent
+                local part = holder:IsA("BasePart") and holder or holder:FindFirstChildWhichIsA("BasePart", true)
+                if part then
+                    table.insert(out, { name = holder.Name, part = part, cd = cd })
+                end
+            end
+        end
+        return out
+    end
+
+    local cache, items = {}, {}
+    loop(0.5, function()
+        cache = World.breakables()
+        items = World.items()
+        local a, v = 0, 0
+        for _, b in cache do
+            if not b.broken then
+                if b.kind == "ATM" then
+                    a += 1
+                else
+                    v += 1
+                end
+            end
+        end
+        World.atms, World.vaults = a, v
+    end)
+
+    local labels = {}
+    bind(RunService.RenderStepped, function()
+        local cam = camera()
+        local root = myRoot()
+        local used = 0
+        local function put(pos, text, col)
+            local sp, vis = cam:WorldToViewportPoint(pos)
+            if not vis then
+                return
+            end
+            used += 1
+            local l = labels[used]
+            if not l then
+                l = Draw.new("Text", { Size = 13, Center = true, Outline = true })
+                labels[used] = l
+            end
+            if l then
+                l.Visible = true
+                l.Text = text
+                l.Position = Vector2.new(sp.X, sp.Y)
+                l.Color = col
+            end
+        end
+        if alive() and Draw.ok and cam then
+            for _, b in cache do
+                local want = (b.kind == "ATM" and Settings.AtmEsp) or (b.kind == "Vault" and Settings.VaultEsp)
+                if want and b.head.Parent and (Settings.WorldShowBroken or b.hum.Health > 0) then
+                    local dist = root and (b.head.Position - root.Position).Magnitude or 0
+                    if dist <= Settings.WorldEspMax then
+                        local hp = math.floor(b.hum.Health / math.max(1, b.hum.MaxHealth) * 100 + 0.5)
+                        local col = b.hum.Health <= 0 and Color3.fromRGB(130, 130, 130)
+                            or (b.kind == "Vault" and Settings.VaultColor or Settings.AtmColor)
+                        put(b.head.Position + Vector3.new(0, 2, 0),
+                            ("%s %s · %dm"):format(b.kind, b.hum.Health <= 0 and "(open)" or (hp .. "%"), dist), col)
+                    end
+                end
+            end
+            if Settings.ItemEsp then
+                for _, it in items do
+                    if it.part.Parent then
+                        local dist = root and (it.part.Position - root.Position).Magnitude or 0
+                        if dist <= Settings.WorldEspMax then
+                            put(it.part.Position + Vector3.new(0, 1.5, 0), ("%s · %dm"):format(it.name, dist), Settings.ItemColor)
+                        end
+                    end
+                end
+            end
+        end
+        for i = used + 1, #labels do
+            if labels[i] then
+                labels[i].Visible = false
+            end
+        end
+    end)
+
+    -- Punches ATMs with Combat (Tool:Activate, the same as tapping). Farm mode
+    -- also walks you (teleports) from one unbroken ATM to the next and picks
+    -- up the cash they drop.
+    World.info, World.broken = "off", 0
+    local function nearestAtm(maxDist)
+        local root = myRoot()
+        if not root then
+            return nil
+        end
+        local best, bestD
+        for _, b in World.breakables() do
+            if b.kind == "ATM" and b.hum.Health > 0 then
+                local d = (b.head.Position - root.Position).Magnitude
+                if d <= maxDist and (not bestD or d < bestD) then
+                    best, bestD = b, d
+                end
+            end
+        end
+        return best, bestD
+    end
+    local function combat()
+        local c = myChar()
+        local hum = c and c:FindFirstChildOfClass("Humanoid")
+        if not hum then
+            return nil
+        end
+        local held = c:FindFirstChild("Combat")
+        if held then
+            return held
+        end
+        local bp = LocalPlayer:FindFirstChild("Backpack")
+        local tool = bp and bp:FindFirstChild("Combat")
+        if tool then
+            hum:EquipTool(tool)
+            task.wait(0.1)
+            return c:FindFirstChild("Combat")
+        end
+        return nil
+    end
+    local function collect(around)
+        if typeof(fireclickdetector) ~= "function" then
+            return
+        end
+        local root = myRoot()
+        for _, d in Money.drops() do
+            if root and (d.part.Position - around).Magnitude <= 18 then
+                root.CFrame = CFrame.new(d.part.Position + Vector3.new(0, 2.5, 0))
+                root.AssemblyLinearVelocity = Vector3.zero
+                task.wait(0.12)
+                pcall(fireclickdetector, d.cd)
+                Money.picked += 1
+                task.wait(0.08)
+            end
+        end
+    end
+    loop(0.05, function()
+        if not (Settings.AtmFarm or Settings.AutoPunchAtm) then
+            World.info = "off"
+            return
+        end
+        local me = myChar()
+        local root = myRoot()
+        if not root or Game.knocked(me) or Game.dead(me) then
+            World.info = "waiting (knocked / dead)"
+            return
+        end
+        local atm, d = nearestAtm(Settings.AtmFarm and Settings.AtmFarmRange or 7)
+        if not atm then
+            World.info = Settings.AtmFarm and "no unbroken ATM in range" or "no ATM in reach"
+            return
+        end
+        local head = atm.head
+        if d > 5 then
+            if not Settings.AtmFarm then
+                return
+            end
+            local flat = Vector3.new(root.Position.X - head.Position.X, 0, root.Position.Z - head.Position.Z)
+            local dir = flat.Magnitude > 0.1 and flat.Unit or Vector3.new(0, 0, 1)
+            local stand = head.Position + dir * 3
+            root.CFrame = CFrame.lookAt(stand, Vector3.new(head.Position.X, stand.Y, head.Position.Z))
+            root.AssemblyLinearVelocity = Vector3.zero
+            task.wait(0.2)
+        end
+        local tool = combat()
+        if not tool then
+            World.info = "no Combat tool"
+            return
+        end
+        local flatLook = Vector3.new(head.Position.X, root.Position.Y, head.Position.Z)
+        if (flatLook - root.Position).Magnitude > 0.5 then
+            root.CFrame = CFrame.lookAt(root.Position, flatLook)
+        end
+        World.info = ("punching ATM (%d%%)"):format(math.floor(atm.hum.Health / math.max(1, atm.hum.MaxHealth) * 100))
+        pcall(tool.Activate, tool)
+        task.wait(Settings.AtmPunchDelay)
+        if atm.hum.Health <= 0 then
+            World.broken += 1
+            if Settings.AtmFarm then
+                task.wait(0.4)
+                collect(head.Position)
+            end
+        end
+    end)
+end
+
 --// UI \\--
 local Window = Library:CreateWindow({
     Title = "Da Hood",
@@ -1340,6 +1831,16 @@ do
             task.spawn(Shop.buy, label)
         end,
     })
+    local Hb = Tab:AddLeftGroupbox("Hitbox expander", "maximize")
+    toggle(Hb, "Hitbox", "Hitbox expander",
+        "Makes other players' root part bigger on your screen, so your gun's own raycast hits them from further off. Silent aim is usually cleaner")
+    slider(Hb, "HitboxSize", "Size", 2, 30, 0, " studs")
+    slider(Hb, "HitboxTransparency", "See-through", 0, 100, 0, "%", "100 is invisible")
+    toggle(Hb, "HitboxSkipCrew", "Not your crew")
+    toggle(Hb, "HitboxSkipKnocked", "Not knocked players")
+    status(Hb, function()
+        return ("Expanded: %d"):format(Hitbox.count)
+    end)
 end
 
 do
@@ -1371,6 +1872,44 @@ do
     toggle(Box, "Noclip", "Noclip")
     toggle(Box, "InfJump", "Infinite jump")
     Box:AddLabel("Da Hood checks movement on the server. Keep speed low and fly short.", true)
+
+    local Mac = Tab:AddRightGroupbox("Macro", "zap")
+    Mac:AddButton({ Text = "Toggle the game's own macro", Func = Macro.toggleGame })
+    Mac:AddLabel("The game's own macro: needs the server to allow it and a skinny character.", true)
+    toggle(Mac, "CustomMacro", "Custom macro",
+        "The same steering the game's macro does (your body turns to face the camera every frame), on any build, with its own button")
+    toggle(Mac, "MacroButton", "Show MACRO button", "A round button on screen you can drag anywhere. Tap to turn the macro on / off")
+    toggle(Mac, "MacroHold", "Hold the button instead", "Macro only while your finger is on the button")
+    slider(Mac, "MacroTurn", "Turn speed", 10, 300, 0, "%", "100 is exactly the game's own macro")
+    toggle(Mac, "MacroOnlyMoving", "Only while moving")
+    toggle(Mac, "MacroOnlyAir", "Only in the air")
+    status(Mac, function()
+        return ("Server allows macro: %s\nSkinny: %s\nGame macro: %s\nCustom: %s"):format(
+            Macro.allowed() and "yes" or "no", Macro.skinny() and "yes" or "no", Macro.gameOn() and "on" or "off", Macro.info)
+    end)
+end
+
+do
+    local Tab = Window:AddTab("World", "landmark", "ATMs, vaults, items")
+    local Box = Tab:AddLeftGroupbox("World ESP", "eye")
+    color(toggle(Box, "AtmEsp", "ATM ESP", "Every ATM that can still be broken open, with its health"), "AtmColor", "ATM colour")
+    color(toggle(Box, "VaultEsp", "Vault ESP", "Bank vaults that can still be broken open"), "VaultColor", "Vault colour")
+    color(toggle(Box, "ItemEsp", "Dropped item ESP", "Lockpicks and other items lying around"), "ItemColor", "Item colour")
+    toggle(Box, "WorldShowBroken", "Also show opened ones", "Greyed out")
+    slider(Box, "WorldEspMax", "Max distance", 50, 5000, 0, " studs")
+    status(Box, function()
+        return ("Unbroken ATMs: %d\nUnbroken vaults: %d"):format(World.atms, World.vaults)
+    end)
+
+    local Farm = Tab:AddRightGroupbox("ATMs", "dollar-sign")
+    toggle(Farm, "AutoPunchAtm", "Auto punch ATM", "Punches an unbroken ATM in reach with Combat (the game's own punch)")
+    toggle(Farm, "AtmFarm", "ATM farm",
+        "Goes from one unbroken ATM to the next, breaks it and picks up the cash. Teleports: risky, use an alt")
+    slider(Farm, "AtmFarmRange", "Farm range", 20, 3000, 0, " studs")
+    slider(Farm, "AtmPunchDelay", "Punch delay", 0.15, 1, 2, " s")
+    status(Farm, function()
+        return ("ATM: %s\nBroken: %d\nCash picked: %d"):format(World.info, World.broken, Money.picked)
+    end)
 end
 
 do
