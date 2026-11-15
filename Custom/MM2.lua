@@ -280,24 +280,26 @@ if typeof(hookmetamethod) == "function" and typeof(getnamecallmethod) == "functi
         if Unloaded or not (Settings.GunAim or Settings.KnifeAim) or typeof(self) ~= "Instance" or getnamecallmethod() ~= "FireServer" then
             return original(self, ...)
         end
-        if self.Name == "Shoot" and self.Parent and self.Parent:IsA("Tool") and Settings.GunAim then
-            local origin = ...
-            local ok, cf = pcall(redirect, "Gun", origin)
-            if ok and cf then
-                return original(self, origin, cf, select(3, ...))
-            end
-        elseif self.Name == "KnifeThrown" and Settings.KnifeAim then
-            local events = self.Parent
-            local tool = events and events.Parent
-            if tool and tool:IsA("Tool") then
-                local handle = ...
-                local ok, cf = pcall(redirect, "Knife", handle)
-                if ok and cf then
-                    return original(self, handle, cf, select(3, ...))
-                end
-            end
+        if self.ClassName ~= "RemoteEvent" then
+            return original(self, ...)
         end
-        return original(self, ...)
+        local kind
+        local parent = self.Parent
+        if self.Name == "Shoot" and Settings.GunAim and parent and parent.ClassName == "Tool" then
+            kind = "Gun"
+        elseif self.Name == "KnifeThrown" and Settings.KnifeAim and parent and parent.Parent and parent.Parent.ClassName == "Tool" then
+            kind = "Knife"
+        end
+        if not kind then
+            return original(self, ...)
+        end
+        local args = table.pack(...)
+        local fire = self.FireServer
+        local ok, cf = pcall(redirect, kind, args[1])
+        if ok and cf then
+            args[2] = cf
+        end
+        return fire(self, table.unpack(args, 1, args.n))
     end
     if typeof(newcclosure) == "function" then
         onNamecall = newcclosure(onNamecall)
