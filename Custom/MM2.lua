@@ -492,10 +492,10 @@ end))
 
 local Window = LumeUI:CreateWindow({
     Name = "MM2",
-    Author = "dookie hub",
+    Author = "ily",
     Icon = "swords",
     SideBarWidth = 130,
-    ToggleKey = Enum.KeyCode.RightShift,
+    ToggleKey = Enum.KeyCode.K,
     Size = UDim2.fromOffset(460, 300),
     Elements = {
         Minimized = false,
@@ -609,7 +609,7 @@ local Bind = SettingsTab:Keybind({
     end,
 })
 pcall(function()
-    Bind:SetValue("RightShift")
+    Bind:SetValue("K")
 end)
 
 Genv.__CustomMM2Unload = function()
