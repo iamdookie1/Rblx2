@@ -21,8 +21,10 @@ end
 local LumeUI = loadstring(game:HttpGet("https://github.com/SSHRKs/LumeUI/releases/latest/download/main.lua"))()
 
 local Settings = {
-    GunAim = 0,
-    KnifeAim = 0,
+    GunAim = false,
+    KnifeAim = false,
+    GunPrediction = 0,
+    KnifePrediction = 0,
     Esp = false,
     AntiFling = false,
 }
@@ -170,11 +172,6 @@ local function aimPoint()
     return UserInputService:GetMouseLocation()
 end
 
-local function fovRadius(value)
-    local vp = Workspace.CurrentCamera.ViewportSize
-    return value / 100 * vp.Magnitude / 2
-end
-
 local KNIFE_SPEED = 96
 track(CollectionService:GetInstanceAddedSignal("ThrowingKnife"):Connect(function(k)
     local s = k:GetAttribute("ThrowSpeed")
@@ -188,7 +185,7 @@ local function ping()
     return ok and type(p) == "number" and math.clamp(p, 0, 0.5) or 0.06
 end
 
-local function predict(root, hum, from, speed)
+local function predict(root, hum, from, speed, extra)
     local vel = root.AssemblyLinearVelocity
     local flat = Vector3.new(vel.X, 0, vel.Z)
     local maxFlat = math.max(hum.WalkSpeed * 1.6, 24)
@@ -199,7 +196,7 @@ local function predict(root, hum, from, speed)
     local grounded = hum.FloorMaterial ~= Enum.Material.Air
     local g = Workspace.Gravity
     local base = root.Position
-    local lead = ping() + 0.02
+    local lead = ping() + 0.02 + (extra or 0)
     local t = lead
     local pos = base
     for _ = 1, 4 do
@@ -216,15 +213,14 @@ local function predict(root, hum, from, speed)
     return pos
 end
 
-local function pickTarget(kind, value)
+local function pickTarget(kind)
     local me = aliveRoot(LocalPlayer)
-    if not me or value <= 0 then
+    if not me then
         return nil
     end
     local cam = Workspace.CurrentCamera
     local center = aimPoint()
-    local radius = fovRadius(value)
-    local anywhere = value >= 100
+    local radius = cam.ViewportSize.Magnitude
     local head = LocalPlayer.Character:FindFirstChild("Head")
     local eye = head and head.Position or me.Position
     local best, bestScore
@@ -239,8 +235,8 @@ local function pickTarget(kind, value)
             if wanted then
                 local sp, onScreen = cam:WorldToViewportPoint(root.Position)
                 local screenDist = (Vector2.new(sp.X, sp.Y) - center).Magnitude
-                local inFov = onScreen and sp.Z > 0 and screenDist <= radius
-                if inFov or anywhere then
+                local inFov = onScreen and sp.Z > 0
+                do
                     local seen = clearLine(eye, root.Position, char)
                     local score = (inFov and screenDist or radius + (root.Position - me.Position).Magnitude * 4)
                     if not seen then
@@ -260,13 +256,14 @@ local function pickTarget(kind, value)
 end
 
 local function redirect(kind, origin)
-    local value = kind == "Gun" and Settings.GunAim or Settings.KnifeAim
-    local target = pickTarget(kind, value)
+    local on = kind == "Gun" and Settings.GunAim or kind == "Knife" and Settings.KnifeAim
+    local target = on and pickTarget(kind)
     if not target then
         return nil
     end
     local from = typeof(origin) == "CFrame" and origin.Position or target.root.Position
-    local pos = predict(target.root, target.hum, from, kind == "Knife" and KNIFE_SPEED or nil)
+    local extra = kind == "Gun" and Settings.GunPrediction or Settings.KnifePrediction
+    local pos = predict(target.root, target.hum, from, kind == "Knife" and KNIFE_SPEED or nil, extra)
     if kind == "Gun" then
         local torso = target.char:FindFirstChild("UpperTorso") or target.char:FindFirstChild("Torso")
         if torso then
@@ -280,16 +277,16 @@ local hooked = false
 if typeof(hookmetamethod) == "function" and typeof(getnamecallmethod) == "function" then
     local original
     local function onNamecall(self, ...)
-        if Unloaded or (Settings.GunAim <= 0 and Settings.KnifeAim <= 0) or typeof(self) ~= "Instance" or getnamecallmethod() ~= "FireServer" then
+        if Unloaded or not (Settings.GunAim or Settings.KnifeAim) or typeof(self) ~= "Instance" or getnamecallmethod() ~= "FireServer" then
             return original(self, ...)
         end
-        if self.Name == "Shoot" and self.Parent and self.Parent:IsA("Tool") and Settings.GunAim > 0 then
+        if self.Name == "Shoot" and self.Parent and self.Parent:IsA("Tool") and Settings.GunAim then
             local origin = ...
             local ok, cf = pcall(redirect, "Gun", origin)
             if ok and cf then
                 return original(self, origin, cf, select(3, ...))
             end
-        elseif self.Name == "KnifeThrown" and Settings.KnifeAim > 0 then
+        elseif self.Name == "KnifeThrown" and Settings.KnifeAim then
             local events = self.Parent
             local tool = events and events.Parent
             if tool and tool:IsA("Tool") then
@@ -358,42 +355,6 @@ if not hooked and type(WeaponService) == "table" then
         return origTarget(self, x, y, ...)
     end
 end
-
-local Circle
-if typeof(Drawing) == "table" and Drawing.new then
-    pcall(function()
-        Circle = Drawing.new("Circle")
-        Circle.Thickness = 1.5
-        Circle.NumSides = 64
-        Circle.Filled = false
-        Circle.Transparency = 0.6
-        Circle.Color = Color3.fromRGB(255, 255, 255)
-        Circle.Visible = false
-    end)
-end
-track(RunService.RenderStepped:Connect(function()
-    if not Circle then
-        return
-    end
-    local char = LocalPlayer.Character
-    local value = 0
-    if char then
-        for _, item in char:GetChildren() do
-            if isKnife(item) then
-                value = Settings.KnifeAim
-            elseif isGun(item) then
-                value = Settings.GunAim
-            end
-        end
-    end
-    if value > 0 and value < 100 then
-        Circle.Position = aimPoint()
-        Circle.Radius = fovRadius(value)
-        Circle.Visible = true
-    else
-        Circle.Visible = false
-    end
-end))
 
 local EspFolder = Instance.new("Folder")
 EspFolder.Name = "\0"
@@ -588,20 +549,34 @@ end)
 
 local Main = Window:Tab({ Title = "Main", Icon = "crosshair" })
 Main:Section({ Title = "Silent Aim" })
-Main:Slider({
+Main:Toggle({
     Title = "Gun Silent Aim",
-    Step = 1,
-    Value = { Min = 0, Max = 100, Default = 0 },
-    Callback = function(v)
-        Settings.GunAim = tonumber(v) or 0
+    Default = false,
+    Callback = function(state)
+        Settings.GunAim = state
     end,
 })
 Main:Slider({
-    Title = "Knife Silent Aim",
-    Step = 1,
-    Value = { Min = 0, Max = 100, Default = 0 },
+    Title = "Gun Prediction",
+    Step = 0.05,
+    Value = { Min = 0, Max = 3, Default = 0 },
     Callback = function(v)
-        Settings.KnifeAim = tonumber(v) or 0
+        Settings.GunPrediction = tonumber(v) or 0
+    end,
+})
+Main:Toggle({
+    Title = "Murderer Silent Aim",
+    Default = false,
+    Callback = function(state)
+        Settings.KnifeAim = state
+    end,
+})
+Main:Slider({
+    Title = "Murderer Prediction",
+    Step = 0.05,
+    Value = { Min = 0, Max = 3, Default = 0 },
+    Callback = function(v)
+        Settings.KnifePrediction = tonumber(v) or 0
     end,
 })
 Main:Section({ Title = "Other" })
@@ -646,9 +621,6 @@ Genv.__CustomMM2Unload = function()
         dropMark(plr)
     end
     EspFolder:Destroy()
-    if Circle then
-        pcall(Circle.Remove, Circle)
-    end
     if origMouse and WeaponService then
         WeaponService.GetMouseTargetCFrame = origMouse
         WeaponService.GetTargetPosition = origTarget
