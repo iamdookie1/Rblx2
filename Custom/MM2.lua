@@ -195,6 +195,14 @@ local Predict = {
     GUN_SURE = 0.85,
     KNIFE_HOLD = 0,
     KNIFE_SURE = 0.7,
+    GUN_RAISE = 1.0,
+    KNIFE_RAISE = 1.5,
+    OFFSET_MIN = -0.04,
+    OFFSET_MAX = 0.4,
+    OFFSET_STEP = 0.005,
+    OFFSET_PRIOR = 0.07,
+    OFFSET_SPREAD = 0.08,
+    LEARN_AFTER = 2,
 }
 
 function Predict.new()
@@ -424,15 +432,16 @@ function Predict.aim(rec, origin, speed, net)
     local airborne = math.abs(vy) > 6 or (not rec.grounded and rec.groundY ~= nil and p0.Y > rec.groundY + 0.5)
     local g = Predict.GRAVITY
     local floor = rec.groundY
+    local raise = speed and Predict.KNIFE_RAISE or Predict.GUN_RAISE
     local function height(T)
         if not airborne then
-            return p0.Y
+            return p0.Y + raise
         end
         local y = p0.Y + vy * T - 0.5 * g * T * T
         if floor and y < floor then
             y = floor
         end
-        return y
+        return y + raise * 0.5
     end
     local base = net + Predict.INTERP + Predict.PROCESS
     local flatSpeed = math.sqrt(v.X * v.X + v.Z * v.Z)
@@ -574,6 +583,151 @@ function Predict.ready(knife, confidence, waited)
     return confidence >= Predict.GUN_SURE or waited >= Predict.GUN_HOLD
 end
 
+function Predict.newCalibration()
+    local cal = { score = {}, shots = 0 }
+    local i = 0
+    local o = Predict.OFFSET_MIN
+    while o <= Predict.OFFSET_MAX + 1e-9 do
+        i += 1
+        local z = (o - Predict.OFFSET_PRIOR) / Predict.OFFSET_SPREAD
+        cal.score[i] = -0.5 * z * z
+        o += Predict.OFFSET_STEP
+    end
+    return cal
+end
+
+function Predict.observeThrow(cal, rec, firedAt, rtt, origin, toward, speed, hit)
+    local list = rec.list
+    if #list < 2 then
+        return false
+    end
+    local last = list[#list].t
+    local dir = toward - origin
+    local fx, fz = dir.X, dir.Z
+    local len = math.sqrt(fx * fx + fz * fz)
+    if len < 0.5 then
+        return false
+    end
+    fx, fz = fx / len, fz / len
+    local reach = Predict.KNIFE_RADIUS + 0.2
+    local likes = {}
+    local i = 0
+    local o = Predict.OFFSET_MIN
+    while o <= Predict.OFFSET_MAX + 1e-9 do
+        i += 1
+        local would = false
+        local covered = false
+        local f = 0
+        while f <= 1.2 do
+            local c = firedAt + rtt + o + f
+            if c > last then
+                break
+            end
+            covered = true
+            local p = Predict.at(rec, c)
+            local kx, kz = origin.X + fx * speed * f, origin.Z + fz * speed * f
+            local dx, dz = p.X - kx, p.Z - kz
+            if dx * dx + dz * dz <= reach * reach then
+                would = true
+                break
+            end
+            f += 1 / 60
+        end
+        if not covered then
+            likes[i] = 0.5
+        elseif hit then
+            likes[i] = would and 0.9 or 0.15
+        else
+            likes[i] = would and 0.2 or 0.85
+        end
+        o += Predict.OFFSET_STEP
+    end
+    local lo, hi = math.huge, -math.huge
+    for _, l in likes do
+        lo = math.min(lo, l)
+        hi = math.max(hi, l)
+    end
+    if hi - lo < 0.3 then
+        return false
+    end
+    for k, l in likes do
+        cal.score[k] += math.log(l)
+    end
+    cal.shots += 1
+    return true
+end
+
+function Predict.observeShot(cal, rec, firedAt, rtt, origin, finish, hit)
+    local list = rec.list
+    if #list < 2 then
+        return false
+    end
+    local last = list[#list].t
+    local dir = finish - origin
+    local fx, fz = dir.X, dir.Z
+    local len = math.sqrt(fx * fx + fz * fz)
+    if len < 0.5 then
+        return false
+    end
+    fx, fz = fx / len, fz / len
+    local informative = false
+    local likes = {}
+    local i = 0
+    local o = Predict.OFFSET_MIN
+    while o <= Predict.OFFSET_MAX + 1e-9 do
+        i += 1
+        local c = firedAt + rtt + o
+        local p = Predict.at(rec, c)
+        local like
+        if c > last then
+            like = 0.5
+        elseif hit then
+            local dx, dz = p.X - finish.X, p.Z - finish.Z
+            local d = math.sqrt(dx * dx + dz * dz)
+            local over = math.max(0, d - 1.3)
+            like = 0.08 + 0.92 * math.exp(-over * over / 0.32)
+        else
+            local rx, rz = p.X - origin.X, p.Z - origin.Z
+            local along = rx * fx + rz * fz
+            local across = math.abs(rx * fz - rz * fx)
+            if along > 0 and along < len + 2 and across < 1.0 then
+                like = 0.25
+            else
+                like = 0.85
+            end
+        end
+        likes[i] = like
+        o += Predict.OFFSET_STEP
+    end
+    local lo, hi = math.huge, -math.huge
+    for _, l in likes do
+        lo = math.min(lo, l)
+        hi = math.max(hi, l)
+    end
+    informative = hi - lo > 0.3
+    if not informative then
+        return false
+    end
+    for k, l in likes do
+        cal.score[k] += math.log(l)
+    end
+    cal.shots += 1
+    return true
+end
+
+function Predict.offset(cal)
+    if cal.shots < Predict.LEARN_AFTER then
+        return nil
+    end
+    local best, bestScore = 1, -math.huge
+    for k, v in cal.score do
+        if v > bestScore then
+            best, bestScore = k, v
+        end
+    end
+    return Predict.OFFSET_MIN + (best - 1) * Predict.OFFSET_STEP
+end
+
 local KNIFE_SPEED = 96
 track(CollectionService:GetInstanceAddedSignal("ThrowingKnife"):Connect(function(k)
     local s = k:GetAttribute("ThrowSpeed")
@@ -627,7 +781,23 @@ refreshWorldParams()
 local Records = {}
 local Weapon = { kind = nil, tool = nil, remote = nil, attachment = nil }
 local Target
+local Candidates = {}
 local Pending
+local LastShot
+
+local CAL_VERSION = 2
+local Cal = Genv.__MM2Cal
+if type(Cal) ~= "table" or Genv.__MM2CalJob ~= game.JobId or Genv.__MM2CalVersion ~= CAL_VERSION then
+    Cal = Predict.newCalibration()
+    Genv.__MM2Cal, Genv.__MM2CalJob, Genv.__MM2CalVersion = Cal, game.JobId, CAL_VERSION
+end
+local function applyCalibration()
+    local o = Predict.offset(Cal)
+    if o then
+        Predict.INTERP = math.clamp(o - Predict.PROCESS, 0, 0.35)
+    end
+end
+applyCalibration()
 
 local function enabledFor(kind)
     return (kind == "Gun" and Settings.GunAim) or (kind == "Knife" and Settings.KnifeAim)
@@ -671,6 +841,7 @@ local function visible(eye, char)
 end
 
 local function chooseTarget(kind)
+    table.clear(Candidates)
     local me = aliveRoot(LocalPlayer)
     if not me then
         return nil
@@ -693,12 +864,14 @@ local function chooseTarget(kind)
                 if onScreen and sp.Z > 0 then
                     local dist = (Vector2.new(sp.X, sp.Y) - center).Magnitude
                     if dist <= fov and visible(eye, char) then
-                        local entry = { plr = plr, root = root, char = char }
+                        local priority = role == "Sheriff" or role == "Hero"
+                        local entry = { plr = plr, root = root, char = char, off = dist / fov, priority = priority }
                         if role == "Murderer" then
                             murderer = entry
                         end
+                        table.insert(Candidates, entry)
                         local score = dist
-                        if kind == "Knife" and (role == "Sheriff" or role == "Hero") then
+                        if kind == "Knife" and priority then
                             score -= 40
                         end
                         if Target and Target.plr == plr then
@@ -713,18 +886,21 @@ local function chooseTarget(kind)
         end
     end
     if kind == "Gun" and murdererKnown then
+        table.clear(Candidates)
+        if murderer then
+            table.insert(Candidates, murderer)
+        end
         return murderer
     end
     return best
 end
 
-local function solve(kind, origin)
-    local t = Target
-    if not t or not t.root.Parent then
+local function solveFor(entry, kind, origin)
+    if not entry or not entry.root.Parent then
         return nil
     end
-    local rec = Records[t.plr]
-    if not rec or rec.root ~= t.root or #rec.list < 2 then
+    local rec = Records[entry.plr]
+    if not rec or rec.root ~= entry.root or #rec.list < 2 then
         return nil
     end
     local pos, _, confidence = Predict.aim(rec, origin, kind == "Knife" and KNIFE_SPEED or nil, RTT)
@@ -740,6 +916,26 @@ local function solve(kind, origin)
         end
     end
     return pos, confidence
+end
+
+local function solve(kind, origin)
+    if kind == "Knife" and #Candidates > 1 then
+        local best, bestPos, bestConf, bestScore
+        for _, c in Candidates do
+            local pos, confidence = solveFor(c, kind, origin)
+            if pos then
+                local score = confidence - 0.25 * c.off + (c.priority and 0.08 or 0)
+                if not bestScore or score > bestScore then
+                    best, bestPos, bestConf, bestScore = c, pos, confidence, score
+                end
+            end
+        end
+        if best then
+            return bestPos, bestConf, best
+        end
+    end
+    local pos, confidence = solveFor(Target, kind, origin)
+    return pos, confidence, Target
 end
 
 local function aimFrame(kind, origin, pos)
@@ -768,20 +964,81 @@ local function send(remote, args)
     return fire(remote, table.unpack(args, 1, args.n))
 end
 
-local function flush(p, now)
+local function noteShot(kind, entry, origin, aimPos)
+    local rec = entry and Records[entry.plr]
+    if not rec then
+        return
+    end
+    local shot = { kind = kind, t = os.clock(), rtt = RTT, origin = origin, aim = aimPos, rec = rec, char = entry.char, tool = Weapon.tool }
+    if kind == "Gun" then
+        LastShot = shot
+        return
+    end
+    task.delay(1.9, function()
+        if Unloaded then
+            return
+        end
+        local died = rec.deadAt
+        local hit = died ~= nil and died >= shot.t and died <= shot.t + 1.7
+        if Predict.observeThrow(Cal, rec, shot.t, shot.rtt, shot.origin, shot.aim, KNIFE_SPEED, hit) then
+            applyCalibration()
+        end
+    end)
+end
+
+local function onGunFired(tool, start, finish, hitPart)
+    local shot = LastShot
+    if not shot or tool ~= shot.tool or typeof(finish) ~= "Vector3" or os.clock() - shot.t > 1.5 then
+        return
+    end
+    LastShot = nil
+    local from = shot.origin
+    if typeof(start) == "Vector3" then
+        from = start
+    elseif typeof(start) == "Instance" then
+        if start:IsA("Attachment") then
+            from = start.WorldPosition
+        elseif start:IsA("BasePart") then
+            from = start.Position
+        end
+    end
+    local hit = typeof(hitPart) == "Instance" and shot.char ~= nil and hitPart:IsDescendantOf(shot.char)
+    task.delay(1.1, function()
+        if Unloaded then
+            return
+        end
+        if Predict.observeShot(Cal, shot.rec, shot.t, shot.rtt, from, finish, hit) then
+            applyCalibration()
+        end
+    end)
+end
+task.spawn(function()
+    local services = ReplicatedStorage:WaitForChild("ClientServices", 10)
+    local ws = services and services:WaitForChild("WeaponService", 10)
+    local fired = ws and ws:WaitForChild("GunFired", 10)
+    if fired and not Unloaded then
+        track(fired.OnClientEvent:Connect(function(...)
+            pcall(onGunFired, ...)
+        end))
+    end
+end)
+
+local function flush(p)
     Pending = nil
     local args = p.args
     if p.kind == "Gun" and Weapon.attachment and typeof(args[1]) == "CFrame" then
         args[1] = Weapon.attachment.WorldCFrame
     end
     local origin = originOf(p.kind, args[1]) or p.origin
-    local pos = solve(p.kind, origin)
+    local pos, _, entry = solve(p.kind, origin)
     if pos then
         args[2] = aimFrame(p.kind, origin, pos)
     elseif p.aim then
         args[2] = p.aim
     end
-    pcall(send, p.remote, args)
+    if pcall(send, p.remote, args) and typeof(args[2]) == "CFrame" then
+        noteShot(p.kind, entry or p.entry, origin, args[2].Position)
+    end
 end
 
 local HoldStep = 0
@@ -794,6 +1051,7 @@ track(RunService.PreSimulation:Connect(function()
             table.clear(Records)
         end
         Target = nil
+        table.clear(Candidates)
         if Pending then
             flush(Pending)
         end
@@ -802,18 +1060,25 @@ track(RunService.PreSimulation:Connect(function()
     local now = os.clock()
     for _, plr in Players:GetPlayers() do
         if plr ~= LocalPlayer then
-            local root, hum = aliveRoot(plr)
-            if root then
+            local char = plr.Character
+            local root = char and char:FindFirstChild("HumanoidRootPart")
+            local hum = char and char:FindFirstChildOfClass("Humanoid")
+            if root and hum then
                 local rec = Records[plr]
                 if not rec or rec.root ~= root then
                     rec = Predict.new()
                     rec.root = root
                     Records[plr] = rec
                 end
-                local state = hum:GetState()
-                local grounded = hum.FloorMaterial ~= Enum.Material.Air
-                    or (state ~= Enum.HumanoidStateType.Freefall and state ~= Enum.HumanoidStateType.Jumping)
-                Predict.push(rec, now, root.Position, grounded)
+                if hum.Health <= 0 then
+                    rec.deadAt = rec.deadAt or now
+                end
+                if not rec.deadAt or now - rec.deadAt < 0.6 then
+                    local state = hum:GetState()
+                    local grounded = hum.FloorMaterial ~= Enum.Material.Air
+                        or (state ~= Enum.HumanoidStateType.Freefall and state ~= Enum.HumanoidStateType.Jumping)
+                    Predict.push(rec, now, root.Position, grounded)
+                end
             else
                 Records[plr] = nil
             end
@@ -828,16 +1093,17 @@ track(RunService.PreSimulation:Connect(function()
         Target = chooseTarget(Weapon.kind)
     else
         Target = nil
+        table.clear(Candidates)
     end
     local p = Pending
     if p then
         if p.remote ~= Weapon.remote or not Target then
-            flush(p, now)
+            flush(p)
         else
             local origin = originOf(p.kind, Weapon.attachment and Weapon.attachment.WorldCFrame) or p.origin
             local _, confidence = solve(p.kind, origin)
             if not confidence or Predict.ready(p.kind == "Knife", confidence, now - p.start) then
-                flush(p, now)
+                flush(p)
             end
         end
     end
@@ -852,7 +1118,7 @@ local function redirectCall(remote, args)
     if not origin then
         return false
     end
-    local pos, confidence = solve(kind, origin)
+    local pos, confidence, entry = solve(kind, origin)
     if not pos then
         return false
     end
@@ -861,11 +1127,12 @@ local function redirectCall(remote, args)
         if Pending then
             flush(Pending)
         end
-        Pending = { remote = remote, args = args, kind = kind, origin = origin, aim = frame, start = os.clock() }
+        Pending = { remote = remote, args = args, kind = kind, origin = origin, aim = frame, entry = entry, start = os.clock() }
         return true
     end
     args[2] = frame
     send(remote, args)
+    noteShot(kind, entry, origin, frame.Position)
     return true
 end
 
