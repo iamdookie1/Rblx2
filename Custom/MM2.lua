@@ -180,37 +180,93 @@ track(CollectionService:GetInstanceAddedSignal("ThrowingKnife"):Connect(function
     end
 end))
 
+local Motion = {}
+track(RunService.PreSimulation:Connect(function(dt)
+    if not (Settings.GunAim or Settings.KnifeAim) or dt <= 0 then
+        return
+    end
+    for _, plr in Players:GetPlayers() do
+        if plr ~= LocalPlayer then
+            local char = plr.Character
+            local root = char and char:FindFirstChild("HumanoidRootPart")
+            if root then
+                local pos = root.Position
+                local m = Motion[plr]
+                if not m or m.root ~= root then
+                    Motion[plr] = { root = root, pos = pos, vel = Vector3.zero }
+                else
+                    local step = (pos - m.pos) / dt
+                    if step.Magnitude > 80 then
+                        m.vel = Vector3.zero
+                    else
+                        m.vel = m.vel:Lerp(step, math.clamp(dt * 12, 0, 1))
+                    end
+                    m.pos = pos
+                end
+            else
+                Motion[plr] = nil
+            end
+        end
+    end
+end))
+track(Players.PlayerRemoving:Connect(function(plr)
+    Motion[plr] = nil
+end))
+
 local function ping()
     local ok, p = pcall(LocalPlayer.GetNetworkPing, LocalPlayer)
-    return ok and type(p) == "number" and math.clamp(p, 0, 0.5) or 0.06
+    return ok and type(p) == "number" and math.clamp(p, 0, 0.3) or 0.05
 end
 
-local function predict(root, hum, from, speed, extra)
-    local vel = root.AssemblyLinearVelocity
+local function worldParams(extra)
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    local list = ignoreList(extra)
+    for _, plr in Players:GetPlayers() do
+        if plr.Character then
+            table.insert(list, plr.Character)
+        end
+    end
+    params.FilterDescendantsInstances = list
+    return params
+end
+
+local function predict(target, from, speed, extra)
+    local root, hum = target.root, target.hum
+    local m = Motion[target.plr]
+    local vel = (m and m.root == root) and m.vel or root.AssemblyLinearVelocity
     local flat = Vector3.new(vel.X, 0, vel.Z)
-    local maxFlat = math.max(hum.WalkSpeed * 1.6, 24)
+    local maxFlat = math.max(hum.WalkSpeed, 16) * 1.25
     if flat.Magnitude > maxFlat then
         flat = flat.Unit * maxFlat
     end
-    local vy = math.clamp(vel.Y, -80, 60)
-    local grounded = hum.FloorMaterial ~= Enum.Material.Air
-    local g = Workspace.Gravity
     local base = root.Position
-    local lead = ping() + 0.02 + (extra or 0)
+    local lead = ping() + (extra or 0)
     local t = lead
-    local pos = base
-    for _ = 1, 4 do
-        if speed then
-            t = (pos - from).Magnitude / speed + lead
+    if speed then
+        for _ = 1, 3 do
+            t = ((base + flat * t) - from).Magnitude / speed + lead
         end
-        local drop = 0
-        if not grounded then
-            drop = vy * t - 0.5 * g * t * t
-            drop = math.max(drop, -(root.Position.Y - (base.Y - 12)))
-        end
-        pos = base + flat * t + Vector3.new(0, drop, 0)
     end
-    return pos
+    local goal = base + flat * t
+    if hum.FloorMaterial == Enum.Material.Air then
+        local vy = math.clamp(vel.Y, -60, 50)
+        local rise = vy * math.min(t, 0.4)
+        goal += Vector3.new(0, math.clamp(rise, -6, 6), 0)
+    end
+    local params = worldParams()
+    local move = goal - base
+    if move.Magnitude > 0.05 then
+        local hit = Workspace:Raycast(base, move, params)
+        if hit then
+            goal = hit.Position - move.Unit * 1.2
+        end
+    end
+    local down = Workspace:Raycast(goal + Vector3.new(0, 2, 0), Vector3.new(0, -8, 0), params)
+    if down and goal.Y < down.Position.Y + 1 then
+        goal = Vector3.new(goal.X, down.Position.Y + 1.5, goal.Z)
+    end
+    return goal
 end
 
 local function pickTarget(kind)
@@ -220,7 +276,7 @@ local function pickTarget(kind)
     end
     local cam = Workspace.CurrentCamera
     local center = aimPoint()
-    local far = cam.ViewportSize.Magnitude
+    local fov = math.max(cam.ViewportSize.Y * 0.45, 220)
     local head = LocalPlayer.Character:FindFirstChild("Head")
     local eye = head and head.Position or me.Position
     local list, murderer = {}, false
@@ -229,33 +285,32 @@ local function pickTarget(kind)
             local root, hum, char = aliveRoot(plr)
             if root then
                 local role, dead = roleOf(plr)
-                if not dead or carried(plr) then
-                    if role == "Murderer" then
-                        murderer = true
+                if not dead and role == "Murderer" then
+                    murderer = true
+                end
+                if not dead then
+                    local sp, onScreen = cam:WorldToViewportPoint(root.Position)
+                    local dist = (Vector2.new(sp.X, sp.Y) - center).Magnitude
+                    if onScreen and sp.Z > 0 and dist <= fov then
+                        local tHead = char:FindFirstChild("Head")
+                        if clearLine(eye, root.Position, char) or (tHead and clearLine(eye, tHead.Position, char)) then
+                            table.insert(list, { plr = plr, root = root, hum = hum, char = char, role = role, dist = dist })
+                        end
                     end
-                    table.insert(list, { root = root, hum = hum, char = char, role = role })
                 end
             end
         end
     end
-    local best, bestScore
+    local best
     for _, c in list do
         if kind ~= "Gun" or not murderer or c.role == "Murderer" then
-            local sp, onScreen = cam:WorldToViewportPoint(c.root.Position)
-            local score
-            if onScreen and sp.Z > 0 then
-                score = (Vector2.new(sp.X, sp.Y) - center).Magnitude
-            else
-                score = far + (c.root.Position - me.Position).Magnitude * 4
-            end
-            if not clearLine(eye, c.root.Position, c.char) then
-                score += far * 10
-            end
+            local score = c.dist
             if kind == "Knife" and (c.role == "Sheriff" or c.role == "Hero") then
                 score -= 40
             end
-            if not bestScore or score < bestScore then
-                best, bestScore = c, score
+            if not best or score < best.score then
+                c.score = score
+                best = c
             end
         end
     end
@@ -270,12 +325,15 @@ local function redirect(kind, origin)
     end
     local from = typeof(origin) == "CFrame" and origin.Position or target.root.Position
     local extra = kind == "Gun" and Settings.GunPrediction or Settings.KnifePrediction
-    local pos = predict(target.root, target.hum, from, kind == "Knife" and KNIFE_SPEED or nil, extra)
+    local pos = predict(target, from, kind == "Knife" and KNIFE_SPEED or nil, tonumber(extra) or 0)
     if kind == "Gun" then
         local torso = target.char:FindFirstChild("UpperTorso") or target.char:FindFirstChild("Torso")
         if torso then
             pos += torso.Position - target.root.Position
         end
+    end
+    if not clearLine(from, pos, target.char) then
+        pos = target.root.Position
     end
     return CFrame.new(pos)
 end
@@ -302,6 +360,9 @@ if typeof(hookmetamethod) == "function" and typeof(getnamecallmethod) == "functi
         local args = table.pack(...)
         local fire = self.FireServer
         local ok, cf = pcall(redirect, kind, args[1])
+        if not ok then
+            warn("[MM2] " .. tostring(cf))
+        end
         if ok and cf then
             args[2] = cf
         end
