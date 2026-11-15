@@ -415,9 +415,12 @@ local function espStep()
                     m = { hl = hl, bb = bb, label = label, char = char }
                     Marks[plr] = m
                 end
-                m.hl.FillColor = color
-                m.hl.OutlineColor = color
-                m.label.TextColor3 = color
+                if m.color ~= color then
+                    m.color = color
+                    m.hl.FillColor = color
+                    m.hl.OutlineColor = color
+                    m.label.TextColor3 = color
+                end
             else
                 dropMark(plr)
             end
@@ -432,68 +435,81 @@ task.spawn(function()
 end)
 
 local Flagged = {}
+local PartCache = {}
 local safeCFrame
 local function partsOf(char)
+    local cached = PartCache[char]
+    if cached then
+        return cached
+    end
     local out = {}
     for _, d in char:GetDescendants() do
         if d:IsA("BasePart") then
             table.insert(out, d)
         end
     end
+    PartCache[char] = out
+    local conn
+    conn = char.DescendantAdded:Connect(function(d)
+        if d:IsA("BasePart") then
+            table.insert(out, d)
+        end
+    end)
+    char.AncestryChanged:Once(function()
+        PartCache[char] = nil
+        conn:Disconnect()
+    end)
     return out
 end
-track(RunService.Stepped:Connect(function()
+track(RunService.PreSimulation:Connect(function()
     if not Settings.AntiFling then
+        safeCFrame = nil
         return
     end
-    local me = aliveRoot(LocalPlayer)
+    local me, myHum = aliveRoot(LocalPlayer)
     local now = os.clock()
     for _, plr in Players:GetPlayers() do
         if plr ~= LocalPlayer then
             local char = plr.Character
             local root = char and char:FindFirstChild("HumanoidRootPart")
-            if root then
-                local spin = root.AssemblyAngularVelocity.Magnitude
-                local speed = root.AssemblyLinearVelocity.Magnitude
-                local near = me and (root.Position - me.Position).Magnitude < 60
-                if near and (spin > 25 or speed > 120) then
-                    Flagged[plr] = now + 3
+            if root and me then
+                local offset = root.Position - me.Position
+                if offset.X * offset.X + offset.Y * offset.Y + offset.Z * offset.Z < 3600 then
+                    local spin = root.AssemblyAngularVelocity
+                    local speed = root.AssemblyLinearVelocity
+                    if spin:Dot(spin) > 625 or speed:Dot(speed) > 14400 then
+                        Flagged[plr] = now + 3
+                    end
                 end
             end
-            if Flagged[plr] then
-                if now > Flagged[plr] then
+            local until_ = Flagged[plr]
+            if until_ then
+                if now > until_ or not char then
                     Flagged[plr] = nil
-                elseif char then
-                    for _, p in partsOf(char) do
-                        p.CanCollide = false
-                        p.AssemblyLinearVelocity = Vector3.zero
-                        p.AssemblyAngularVelocity = Vector3.zero
+                else
+                    for _, part in partsOf(char) do
+                        if part.CanCollide then
+                            part.CanCollide = false
+                        end
                     end
                 end
             end
         end
     end
-end))
-track(RunService.Heartbeat:Connect(function()
-    if not Settings.AntiFling then
+    if not me then
         safeCFrame = nil
         return
     end
-    local root, hum = aliveRoot(LocalPlayer)
-    if not root then
-        safeCFrame = nil
-        return
-    end
-    local v = root.AssemblyLinearVelocity
-    local flat = Vector3.new(v.X, 0, v.Z).Magnitude
-    local spin = root.AssemblyAngularVelocity.Magnitude
-    local flung = flat > math.max(hum.WalkSpeed * 5, 90) or v.Y > 140 or spin > 35
-    if flung and safeCFrame then
-        root.AssemblyLinearVelocity = Vector3.zero
-        root.AssemblyAngularVelocity = Vector3.zero
-        root.CFrame = safeCFrame
-    elseif flat < hum.WalkSpeed * 2 + 4 and spin < 8 and math.abs(v.Y) < 60 then
-        safeCFrame = root.CFrame
+    local v = me.AssemblyLinearVelocity
+    local flat = math.sqrt(v.X * v.X + v.Z * v.Z)
+    local spin = me.AssemblyAngularVelocity.Magnitude
+    local walk = myHum.WalkSpeed
+    if (flat > math.max(walk * 5, 90) or v.Y > 140 or spin > 35) and safeCFrame then
+        me.AssemblyLinearVelocity = Vector3.zero
+        me.AssemblyAngularVelocity = Vector3.zero
+        me.CFrame = safeCFrame
+    elseif flat < walk * 2 + 4 and spin < 8 and math.abs(v.Y) < 60 then
+        safeCFrame = me.CFrame
     end
 end))
 
@@ -519,6 +535,7 @@ pcall(function()
         StrokeThickness = 0,
     })
 end)
+local Hidden = {}
 local function hideOpenButton()
     local roots = { game:GetService("CoreGui") }
     if typeof(gethui) == "function" then
@@ -528,6 +545,7 @@ local function hideOpenButton()
     if pg then
         table.insert(roots, pg)
     end
+    local found = false
     for _, r in roots do
         local ok, list = pcall(r.GetDescendants, r)
         if ok then
@@ -539,20 +557,41 @@ local function hideOpenButton()
                         top = p
                         p = p.Parent
                     end
-                    if top:IsA("GuiObject") then
+                    if top:IsA("GuiObject") and not Hidden[top] then
+                        Hidden[top] = true
                         top.Visible = false
+                        track(top:GetPropertyChangedSignal("Visible"):Connect(function()
+                            if top.Visible then
+                                top.Visible = false
+                            end
+                        end))
                     end
+                    found = true
                 end
             end
         end
     end
+    return found
 end
 task.spawn(function()
-    while not Unloaded do
-        pcall(hideOpenButton)
-        task.wait(0.5)
+    for _, delay in { 0.2, 0.5, 1, 2, 4, 8 } do
+        task.wait(delay)
+        if Unloaded then
+            return
+        end
+        local ok, found = pcall(hideOpenButton)
+        if ok and found then
+            return
+        end
     end
 end)
+local ToggleKey = Enum.KeyCode.K
+track(UserInputService.InputBegan:Connect(function(input)
+    if input.KeyCode == ToggleKey then
+        task.delay(0.15, pcall, hideOpenButton)
+        task.delay(0.6, pcall, hideOpenButton)
+    end
+end))
 
 local Main = Window:Tab({ Title = "Main", Icon = "crosshair" })
 Main:Section({ Title = "Silent Aim" })
@@ -611,6 +650,7 @@ local Bind = SettingsTab:Keybind({
     Callback = function(key)
         local code = typeof(key) == "EnumItem" and key or Enum.KeyCode[tostring(key)]
         if code then
+            ToggleKey = code
             pcall(Window.SetToggleKey, Window, code)
         end
     end,
