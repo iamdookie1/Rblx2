@@ -172,36 +172,43 @@ local function aimPoint()
 end
 
 local Predict = {
-    WINDOW = 2.0,
+    WINDOW = 3.0,
     SPAN = 0.034,
+    FIT = 0.067,
     GRAVITY = 196.2,
     INTERP = 0.06,
     PROCESS = 0.01,
     FUTURES = 64,
     STEP = 1 / 30,
-    MOVING = 4,
+    MOVE_MIN = 2.0,
+    MOVE_FRACTION = 0.4,
     TURN = 0.7,
-    PRIOR_DURATION = 1.5,
+    PASS = 0.12,
+    PRIOR_MOVE = 1.5,
+    PRIOR_STOP = 0.8,
     PRIOR_WEIGHT = 1.5,
-    GUN_RADIUS = 1.0,
-    KNIFE_RADIUS = 1.2,
-    ACCEL_LEAD = 0.05,
-    TURN_LAG = 0.035,
-    ACCEL_TAU = 0.05,
+    STOP_PRIOR = 0.5,
+    TURN_PRIOR = 0.7,
     TRUST_AT = 3,
     TRUST = 0.9,
     JITTER = 0.2,
+    ACCEL_LEAD = 0.05,
+    ACCEL_MIN = 40,
+    TURN_LAG = 0.035,
+    ACCEL_TAU = 0.05,
+    GUN_RADIUS = 1.0,
+    KNIFE_RADIUS = 1.2,
     GUN_HOLD = 0.2,
     GUN_SURE = 0.85,
     KNIFE_HOLD = 0,
     KNIFE_SURE = 0.7,
     GUN_RAISE = 1.0,
     KNIFE_RAISE = 1.5,
-    OFFSET_MIN = -0.04,
+    OFFSET_MIN = -0.3,
     OFFSET_MAX = 0.4,
     OFFSET_STEP = 0.005,
     OFFSET_PRIOR = 0.07,
-    OFFSET_SPREAD = 0.08,
+    OFFSET_SPREAD = 0.12,
     LEARN_AFTER = 2,
 }
 
@@ -265,53 +272,159 @@ local function wrap(a)
     return a - math.pi
 end
 
-function Predict.turns(rec)
+function Predict.fit(rec, t, span)
+    local n, st, sx, sz, stt, stx, stz = 0, 0, 0, 0, 0, 0, 0
+    for k = 0, 4 do
+        local tk = -span * k / 4
+        local p = Predict.at(rec, t + tk)
+        n += 1
+        st += tk
+        sx += p.X
+        sz += p.Z
+        stt += tk * tk
+        stx += tk * p.X
+        stz += tk * p.Z
+    end
+    local den = n * stt - st * st
+    if den <= 1e-9 then
+        return 0, 0
+    end
+    return (n * stx - st * sx) / den, (n * stz - st * sz) / den
+end
+
+function Predict.motion(rec)
     local list = rec.list
     local now = list[#list].t
     local first = math.max(list[1].t + Predict.SPAN, now - Predict.WINDOW)
-    local events = {}
-    local ref, refX, refZ
-    local since = {}
+    local samples = {}
     local t = first
     while t <= now + 1e-6 do
         local v = Predict.velocity(rec, t, Predict.SPAN)
-        local moving = v.X * v.X + v.Z * v.Z > Predict.MOVING * Predict.MOVING
-        if ref then
-            table.insert(since, { t = t, x = v.X, z = v.Z })
+        samples[#samples + 1] = { t = t, x = v.X, z = v.Z, s = math.sqrt(v.X * v.X + v.Z * v.Z) }
+        t += 1 / 60
+    end
+    local speeds = {}
+    for _, smp in samples do
+        if smp.s > Predict.MOVE_MIN then
+            speeds[#speeds + 1] = smp.s
         end
-        if moving then
-            local h = math.atan2(v.Z, v.X)
-            if not ref then
+    end
+    table.sort(speeds)
+    local typical = #speeds >= 6 and speeds[math.max(1, math.floor(#speeds * 0.7))] or 16
+    local thr = math.max(Predict.MOVE_MIN, typical * Predict.MOVE_FRACTION)
+    local tau = Predict.ACCEL_TAU
+    local stopShift = tau * math.log(1 / Predict.MOVE_FRACTION) + Predict.SPAN / 2
+    local startShift = tau * math.log(1 / (1 - Predict.MOVE_FRACTION)) + Predict.SPAN / 2
+    local m = {
+        moveDur = {}, stopDur = {}, turnAngles = {}, startAngles = {},
+        stops = 0, sharp = 0, events = 0,
+        typical = typical, thr = thr,
+    }
+    local state, since, valid, ref, refX, refZ
+    local lowStart, lowEvent, lowRef
+    local trail = {}
+    for _, smp in samples do
+        local moving = smp.s > thr
+        local h = moving and math.atan2(smp.z, smp.x) or nil
+        if not state then
+            state = moving and "move" or "stop"
+            since, valid = smp.t, false
+            if moving then
                 ref = h
                 refX, refZ = math.cos(h), math.sin(h)
-            else
+            end
+        elseif state == "move" then
+            if moving then
+                table.insert(trail, smp)
                 local d = wrap(h - ref)
                 if math.abs(d) > Predict.TURN then
                     local half = math.abs(d) / 2
-                    local at = t
-                    for _, smp in since do
-                        local proj = smp.x * refX + smp.z * refZ
-                        local perp = math.abs(smp.x * refZ - smp.z * refX)
+                    local at = smp.t
+                    for _, q in trail do
+                        local proj = q.x * refX + q.z * refZ
+                        local perp = math.abs(q.x * refZ - q.z * refX)
                         if math.atan2(perp, proj) >= half then
-                            at = smp.t
+                            at = q.t
                             break
                         end
                     end
-                    table.insert(events, { t = at - Predict.TURN_LAG - Predict.SPAN / 2, a = d })
+                    at -= Predict.TURN_LAG + Predict.SPAN / 2
+                    if valid then
+                        table.insert(m.moveDur, at - since)
+                    end
+                    table.insert(m.turnAngles, d)
+                    m.events += 1
+                    if math.abs(d) > 1.6 then
+                        m.sharp += 1
+                    end
+                    since, valid = at, true
                     ref = h
                     refX, refZ = math.cos(h), math.sin(h)
-                    since = {}
+                    trail = {}
                 end
+            else
+                state = "low"
+                lowStart = smp.t
+                lowEvent = smp.t - stopShift
+                lowRef = ref
+            end
+        elseif state == "low" then
+            if moving then
+                local rel = wrap(h - lowRef)
+                if smp.t - lowStart < Predict.PASS then
+                    if math.abs(rel) > Predict.TURN then
+                        local at = (lowEvent + smp.t - startShift) / 2
+                        if valid then
+                            table.insert(m.moveDur, at - since)
+                        end
+                        table.insert(m.turnAngles, rel)
+                        m.events += 1
+                        if math.abs(rel) > 1.6 then
+                            m.sharp += 1
+                        end
+                        since, valid = at, true
+                    end
+                else
+                    local startAt = smp.t - startShift
+                    if valid then
+                        table.insert(m.moveDur, lowEvent - since)
+                    end
+                    table.insert(m.stopDur, startAt - lowEvent)
+                    table.insert(m.startAngles, rel)
+                    m.stops += 1
+                    m.events += 1
+                    since, valid = startAt, true
+                end
+                state = "move"
+                ref = h
+                refX, refZ = math.cos(h), math.sin(h)
+                trail = {}
+            end
+        else
+            if moving then
+                state = "move"
+                since, valid = smp.t - startShift, false
+                ref = h
+                refX, refZ = math.cos(h), math.sin(h)
+                trail = {}
             end
         end
-        t += 1 / 60
     end
-    local durations = {}
-    for i = 2, #events do
-        table.insert(durations, events[i].t - events[i - 1].t)
+    m.state = state
+    m.ref = ref
+    if state == "move" then
+        m.elapsed = now - since
+    elseif state == "low" then
+        m.lowFor = now - lowStart
+        m.elapsed = now - lowEvent
+        m.ref = lowRef
+        if m.lowFor >= Predict.PASS then
+            m.state = "stop"
+        end
+    else
+        m.elapsed = now - first
     end
-    local elapsed = #events > 0 and now - events[#events].t or now - first
-    return events, durations, elapsed, ref
+    return m
 end
 
 local function trust(k)
@@ -321,32 +434,32 @@ local function trust(k)
     return k / (k + Predict.PRIOR_WEIGHT)
 end
 
-local function drawDuration(durations)
-    local k = #durations
+local function drawFrom(pool, prior, floor)
+    local k = #pool
     if k > 0 and math.random() < trust(k) then
         local g = math.sqrt(-2 * math.log(1 - math.random())) * math.cos(2 * math.pi * math.random())
-        return durations[math.random(1, k)] * math.exp(Predict.JITTER * g)
+        return math.max(0.02, pool[math.random(1, k)] * math.exp(Predict.JITTER * g))
     end
-    return 0.25 - Predict.PRIOR_DURATION * math.log(1 - math.random())
+    return floor - prior * math.log(1 - math.random())
 end
 
-local function drawAngle(events)
-    local k = #events
+local function drawAngleFrom(pool)
+    local k = #pool
     if k > 0 and math.random() < trust(k) then
-        local a = events[math.random(1, k)].a
+        local a = pool[math.random(1, k)]
         return math.random() < 0.5 and a or -a
     end
     return (math.random() * 2 - 1) * math.pi
 end
 
-local function residual(durations, elapsed)
+local function residualFrom(pool, prior, floor, elapsed)
     for _ = 1, 24 do
-        local d = drawDuration(durations)
+        local d = drawFrom(pool, prior, floor)
         if d > elapsed then
             return d - elapsed
         end
     end
-    return -Predict.PRIOR_DURATION * math.log(1 - math.random()) * 0.5
+    return -prior * math.log(1 - math.random()) * 0.5
 end
 
 local function modePoint(points, radius)
@@ -427,7 +540,7 @@ function Predict.aim(rec, origin, speed, net)
     end
     local now = list[n].t
     local p0 = list[n].p
-    local v = Predict.velocity(rec, now, Predict.SPAN)
+    local vx0, vz0 = Predict.fit(rec, now, Predict.FIT)
     local vy = Predict.velocity(rec, now, 0.035).Y
     local airborne = math.abs(vy) > 6 or (not rec.grounded and rec.groundY ~= nil and p0.Y > rec.groundY + 0.5)
     local g = Predict.GRAVITY
@@ -443,64 +556,50 @@ function Predict.aim(rec, origin, speed, net)
         end
         return y + raise * 0.5
     end
-    local base = net + Predict.INTERP + Predict.PROCESS
-    local flatSpeed = math.sqrt(v.X * v.X + v.Z * v.Z)
-    local heading0 = math.atan2(v.Z, v.X)
-    local cruise, lastMoving = flatSpeed, nil
-    do
-        local t = now
-        while t > now - 0.6 and t > list[1].t + Predict.SPAN do
-            local u = Predict.velocity(rec, t, Predict.SPAN)
-            local s2 = math.sqrt(u.X * u.X + u.Z * u.Z)
-            if s2 > cruise then
-                cruise = s2
-            end
-            if not lastMoving and s2 > Predict.MOVING then
-                lastMoving = { t = t, h = math.atan2(u.Z, u.X) }
-            end
-            t -= 1 / 30
-        end
-    end
-    local turning
-    do
-        local vPrev = Predict.velocity(rec, now - Predict.SPAN, Predict.SPAN)
-        local ax, az = (v.X - vPrev.X) / Predict.SPAN, (v.Z - vPrev.Z) / Predict.SPAN
-        local lead = Predict.ACCEL_LEAD
-        local wx, wz = v.X + ax * lead, v.Z + az * lead
-        local wm = math.sqrt(wx * wx + wz * wz)
-        if wm > Predict.MOVING and math.sqrt(ax * ax + az * az) > 40 then
-            local h = math.atan2(wz, wx)
-            local d = flatSpeed > 1 and math.abs(wrap(h - heading0)) or math.pi
-            heading0 = h
-            flatSpeed = math.max(flatSpeed, math.min(wm, cruise))
-            if d > Predict.TURN then
-                turning = d
-            end
-        end
-    end
-    local stopped = flatSpeed < Predict.MOVING and (not lastMoving or now - lastMoving.t > 0.25)
-    if flatSpeed < Predict.MOVING and not stopped then
-        heading0 = lastMoving.h + math.pi
-        flatSpeed = cruise
-    elseif flatSpeed < cruise * 0.85 and flatSpeed >= Predict.MOVING then
-        flatSpeed = math.max(flatSpeed, cruise * 0.9)
-    end
-    if n < 4 or stopped then
+    local base = math.max(0, net + Predict.INTERP + Predict.PROCESS)
+    if n < 8 then
         local T = base
         if speed then
             T = base + (p0 - origin).Magnitude / speed
         end
-        return Vector3.new(p0.X + v.X * T, height(T), p0.Z + v.Z * T), T, 1
+        return Vector3.new(p0.X + vx0 * T, height(T), p0.Z + vz0 * T), T, 1
     end
-    local events, durations, elapsed, ref = Predict.turns(rec)
-    if (turning or (flatSpeed >= Predict.MOVING and ref and math.abs(wrap(heading0 - ref)) > Predict.TURN)) and elapsed > Predict.TURN_LAG + Predict.SPAN then
-        local d = turning or wrap(heading0 - ref)
-        if #events > 0 then
-            table.insert(durations, (now - Predict.TURN_LAG - Predict.SPAN / 2) - events[#events].t)
+    local m = Predict.motion(rec)
+    local typical = m.typical
+    local vShort = Predict.velocity(rec, now, Predict.SPAN)
+    local vPrev = Predict.velocity(rec, now - Predict.SPAN, Predict.SPAN)
+    local ax, az = (vShort.X - vPrev.X) / Predict.SPAN, (vShort.Z - vPrev.Z) / Predict.SPAN
+    local speed0 = math.sqrt(vx0 * vx0 + vz0 * vz0)
+    local along = speed0 > 0.5 and (ax * vx0 + az * vz0) / speed0 or 0
+    local heading0 = math.atan2(vz0, vx0)
+    local desired = speed0
+    if m.state == "move" then
+        local wx, wz = vShort.X + ax * Predict.ACCEL_LEAD, vShort.Z + az * Predict.ACCEL_LEAD
+        local wm = math.sqrt(wx * wx + wz * wz)
+        if math.sqrt(ax * ax + az * az) > Predict.ACCEL_MIN and wm > m.thr then
+            heading0 = math.atan2(wz, wx)
+            if speed0 < typical * 0.85 and wm > speed0 then
+                desired = math.min(wm, typical)
+            end
         end
-        table.insert(events, { t = now - Predict.TURN_LAG - Predict.SPAN / 2, a = d })
-        elapsed = Predict.TURN_LAG + Predict.SPAN / 2
+        if along > Predict.ACCEL_MIN and speed0 < typical * 0.85 then
+            desired = typical
+        end
     end
+    local pStop = (m.stops + Predict.STOP_PRIOR) / (m.stops + m.sharp + Predict.STOP_PRIOR + Predict.TURN_PRIOR)
+    local lowHeading
+    if m.state == "low" then
+        local wx, wz = vShort.X + ax * Predict.ACCEL_LEAD, vShort.Z + az * Predict.ACCEL_LEAD
+        local k = math.clamp((math.sqrt(wx * wx + wz * wz) / typical - 0.3) / 0.4, 0, 1)
+        local a1 = pStop * (1 - 0.7 * k)
+        local a2 = (1 - pStop) * (0.3 + 0.7 * k)
+        pStop = a1 / math.max(a1 + a2, 1e-6)
+        if k > 0.5 then
+            lowHeading = math.atan2(wz, wx)
+        end
+    end
+    local pStopEvent = (m.stops + Predict.STOP_PRIOR * 0.5) / (m.events + Predict.STOP_PRIOR * 0.5 + Predict.TURN_PRIOR)
+    local refHeading = m.ref or heading0
     local step = Predict.STEP
     local horizon = speed and base + 1.6 or base + step
     local points = {}
@@ -508,13 +607,40 @@ function Predict.aim(rec, origin, speed, net)
     local tau = Predict.ACCEL_TAU
     for f = 1, Predict.FUTURES do
         local x, z = p0.X, p0.Z
-        local vx, vz = v.X, v.Z
-        local heading = heading0
-        local nextTurn = residual(durations, elapsed)
+        local vx, vz = vx0, vz0
+        local moving, heading, spd, drift
+        local nextEvent
+        local lastHeading = refHeading
+        if m.state == "move" then
+            moving, heading, spd = true, heading0, desired
+            nextEvent = residualFrom(m.moveDur, Predict.PRIOR_MOVE, 0.25, m.elapsed)
+        elseif m.state == "low" then
+            if math.random() < pStop then
+                moving = false
+                nextEvent = residualFrom(m.stopDur, Predict.PRIOR_STOP, 0.15, m.elapsed)
+            else
+                local turn = drawAngleFrom(m.turnAngles)
+                if math.abs(turn) < 1.6 then
+                    turn = math.pi
+                end
+                moving, heading, spd = true, lowHeading or refHeading + turn, typical
+                lastHeading = heading
+                nextEvent = drawFrom(m.moveDur, Predict.PRIOR_MOVE, 0.25)
+            end
+        else
+            moving = false
+            drift = speed0 < m.thr
+            nextEvent = residualFrom(m.stopDur, Predict.PRIOR_STOP, 0.15, m.elapsed)
+        end
         local t = 0
         local hit
         local function advance(span)
-            local dx, dz = math.cos(heading) * flatSpeed, math.sin(heading) * flatSpeed
+            local dx, dz = 0, 0
+            if moving then
+                dx, dz = math.cos(heading) * spd, math.sin(heading) * spd
+            elseif drift then
+                dx, dz = vx0, vz0
+            end
             local e = math.exp(-span / tau)
             local k = tau * (1 - e)
             x += dx * span + (vx - dx) * k
@@ -528,14 +654,29 @@ function Predict.aim(rec, origin, speed, net)
                 dt = base - t
             end
             local left = dt
-            while nextTurn < left do
-                advance(nextTurn)
-                left -= nextTurn
-                heading += drawAngle(events)
-                nextTurn = drawDuration(durations)
+            while nextEvent < left do
+                advance(nextEvent)
+                left -= nextEvent
+                if moving then
+                    if math.random() < pStopEvent then
+                        moving = false
+                        drift = false
+                        lastHeading = heading
+                        nextEvent = drawFrom(m.stopDur, Predict.PRIOR_STOP, 0.15)
+                    else
+                        heading += drawAngleFrom(m.turnAngles)
+                        nextEvent = drawFrom(m.moveDur, Predict.PRIOR_MOVE, 0.25)
+                    end
+                else
+                    moving = true
+                    drift = false
+                    heading = lastHeading + drawAngleFrom(m.startAngles)
+                    spd = typical
+                    nextEvent = drawFrom(m.moveDur, Predict.PRIOR_MOVE, 0.25)
+                end
             end
             advance(left)
-            nextTurn -= left
+            nextEvent -= left
             t += dt
             if speed then
                 if t >= base then
@@ -555,17 +696,17 @@ function Predict.aim(rec, origin, speed, net)
         points[f] = hit or { x, z }
         times[f] = times[f] or t
     end
-    local ax, az, confidence
+    local ax2, az2, confidence
     if speed then
-        ax, az, confidence = modeAngle(points, origin, Predict.KNIFE_RADIUS)
+        ax2, az2, confidence = modeAngle(points, origin, Predict.KNIFE_RADIUS)
     else
-        ax, az, confidence = modePoint(points, Predict.GUN_RADIUS)
+        ax2, az2, confidence = modePoint(points, Predict.GUN_RADIUS)
     end
     local T = base
     if speed then
         local sum, c = 0, 0
         for f = 1, #points do
-            local dx, dz = points[f][1] - ax, points[f][2] - az
+            local dx, dz = points[f][1] - ax2, points[f][2] - az2
             if dx * dx + dz * dz <= Predict.KNIFE_RADIUS ^ 2 then
                 sum += times[f]
                 c += 1
@@ -573,7 +714,7 @@ function Predict.aim(rec, origin, speed, net)
         end
         T = c > 0 and sum / c or base
     end
-    return Vector3.new(ax, height(T), az), T, confidence
+    return Vector3.new(ax2, height(T), az2), T, confidence
 end
 
 function Predict.ready(knife, confidence, waited)
@@ -728,6 +869,14 @@ function Predict.offset(cal)
     return Predict.OFFSET_MIN + (best - 1) * Predict.OFFSET_STEP
 end
 
+function Predict.apply(cal)
+    local o = Predict.offset(cal)
+    if o then
+        Predict.INTERP = math.clamp(o - Predict.PROCESS, Predict.OFFSET_MIN, Predict.OFFSET_MAX)
+    end
+    return o
+end
+
 local KNIFE_SPEED = 96
 track(CollectionService:GetInstanceAddedSignal("ThrowingKnife"):Connect(function(k)
     local s = k:GetAttribute("ThrowSpeed")
@@ -785,17 +934,14 @@ local Candidates = {}
 local Pending
 local LastShot
 
-local CAL_VERSION = 2
+local CAL_VERSION = 3
 local Cal = Genv.__MM2Cal
 if type(Cal) ~= "table" or Genv.__MM2CalJob ~= game.JobId or Genv.__MM2CalVersion ~= CAL_VERSION then
     Cal = Predict.newCalibration()
     Genv.__MM2Cal, Genv.__MM2CalJob, Genv.__MM2CalVersion = Cal, game.JobId, CAL_VERSION
 end
 local function applyCalibration()
-    local o = Predict.offset(Cal)
-    if o then
-        Predict.INTERP = math.clamp(o - Predict.PROCESS, 0, 0.35)
-    end
+    Predict.apply(Cal)
 end
 applyCalibration()
 
@@ -895,6 +1041,11 @@ local function chooseTarget(kind)
     return best
 end
 
+local function clearShot(origin, pos)
+    local hit = Raycast(Workspace, origin, pos - origin, WorldParams)
+    return not hit or hit.Instance.Transparency >= 1
+end
+
 local function solveFor(entry, kind, origin)
     if not entry or not entry.root.Parent then
         return nil
@@ -913,6 +1064,15 @@ local function solveFor(entry, kind, origin)
         local hit = Raycast(Workspace, from, move, WorldParams)
         if hit and hit.Instance.CanCollide then
             pos = hit.Position - move.Unit * 1.5
+        end
+    end
+    if not clearShot(origin, pos) then
+        for _, dy in { 0.8, -1.0, -2.0 } do
+            local alt = pos + Vector3.new(0, dy, 0)
+            if clearShot(origin, alt) then
+                pos = alt
+                break
+            end
         end
     end
     return pos, confidence
