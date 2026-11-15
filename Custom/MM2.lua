@@ -198,10 +198,10 @@ local v68 = {
     k3 = 0.05,
     k10 = 1.0,
     k17 = 1.2,
-    k9 = 0.2,
+    k9 = 0.3,
     k12 = 0.85,
-    k16 = 0,
-    k19 = 0.7,
+    k16 = 0.35,
+    k19 = 0.75,
     k11 = 1.0,
     k18 = 1.5,
     k25 = -0.3,
@@ -971,14 +971,25 @@ local function v393()
 end
 
 local function v398(v399, v400)
-    for _, v401 in { "HumanoidRootPart", "Head", "UpperTorso", "Torso" } do
-        local v402 = v400:FindFirstChild(v401)
-        if v402 then
-            local v403 = v376(v7, v399, v402.Position - v399, v377)
-            if not v403 then
+    if typeof(v400) == "CFrame" then
+        return v400.Position
+    end
+    if v399 == "Gun" and v383.k51 then
+        return v383.k51.WorldPosition
+    end
+    local v401 = v383.k96 and v383.k96:FindFirstChild("Handle")
+    return v401 and v401.Position
+end
+
+local function v402(v403, v404)
+    for _, v405 in { "HumanoidRootPart", "Head", "UpperTorso", "Torso", "LowerTorso", "LeftUpperLeg", "RightUpperLeg" } do
+        local v406 = v404:FindFirstChild(v405)
+        if v406 then
+            local v407 = v376(v7, v403, v406.Position - v403, v377)
+            if not v407 then
                 return true
             end
-            if v403.Instance.Transparency >= 1 and v50(v399, v402.Position, v400) then
+            if v407.Instance.Transparency >= 1 and v50(v403, v406.Position, v404) then
                 return true
             end
         end
@@ -986,222 +997,222 @@ local function v398(v399, v400)
     return false
 end
 
-local function v404(v405)
+local function v408(v409)
     table.clear(v385)
-    local v406 = v41(v8)
-    if not v406 then
+    local v410 = v41(v8)
+    if not v410 then
         return nil
     end
-    local v407 = v7.CurrentCamera
-    local v408 = v65()
-    local v409 = math.max(v407.ViewportSize.Y * 0.45, 220)
-    local v410 = v8.Character:FindFirstChild("Head")
-    local v411 = v410 and v410.Position or v406.Position
-    local v412, v413, v414, v415 = false, nil, nil, nil
-    for _, v416 in v1:GetPlayers() do
-        if v416 ~= v8 then
-            local v417, _, v418 = v41(v416)
-            local v419, v420 = v35(v416)
-            if v417 and not v420 then
-                if v419 == "Murderer" then
-                    v412 = true
+    local v411 = v7.CurrentCamera
+    local v412 = v65()
+    local v413 = math.max(v411.ViewportSize.Magnitude, 1)
+    local v414 = v8.Character:FindFirstChild("Head")
+    local v415 = v398(v409) or (v414 and v414.Position) or v410.Position
+    local v416, v417, v418, v419 = false, nil, nil, nil
+    for _, v420 in v1:GetPlayers() do
+        if v420 ~= v8 then
+            local v421, _, v422 = v41(v420)
+            local v423, v424 = v35(v420)
+            if v421 and not v424 then
+                if v423 == "Murderer" then
+                    v416 = true
                 end
-                local v421, v422 = v407:WorldToViewportPoint(v417.Position)
-                if v422 and v421.Z > 0 then
-                    local v423 = (Vector2.new(v421.X, v421.Y) - v408).Magnitude
-                    if v423 <= v409 and v398(v411, v418) then
-                        local v424 = v419 == "Sheriff" or v419 == "Hero"
-                        local v425 = { k76 = v416, k83 = v417, k53 = v418, k72 = v423 / v409, k77 = v424 }
-                        if v419 == "Murderer" then
-                            v413 = v425
-                        end
-                        table.insert(v385, v425)
-                        local v426 = v423
-                        if v405 == "Knife" and v424 then
-                            v426 -= 40
-                        end
-                        if v384 and v384.k76 == v416 then
-                            v426 -= 25
-                        end
-                        if not v415 or v426 < v415 then
-                            v414, v415 = v425, v426
-                        end
+                if v402(v415, v422) then
+                    local v425, v426 = v411:WorldToViewportPoint(v421.Position)
+                    local v427 = (v421.Position - v410.Position).Magnitude
+                    local v428
+                    if v426 and v425.Z > 0 then
+                        v428 = (Vector2.new(v425.X, v425.Y) - v412).Magnitude
+                    else
+                        v428 = v413 + v427
+                    end
+                    local v429 = v423 == "Sheriff" or v423 == "Hero"
+                    local v430 = { k76 = v420, k83 = v421, k53 = v422, k72 = math.clamp(v428 / v413, 0, 2), k77 = v429 }
+                    if v423 == "Murderer" then
+                        v417 = v430
+                    end
+                    table.insert(v385, v430)
+                    local v431 = v428 + v427 * 3
+                    if v409 == "Knife" and v429 then
+                        v431 -= 120
+                    end
+                    if v384 and v384.k76 == v420 then
+                        v431 -= 40
+                    end
+                    if not v419 or v431 < v419 then
+                        v418, v419 = v430, v431
                     end
                 end
             end
         end
     end
-    if v405 == "Gun" and v412 then
+    if v409 == "Gun" and v416 then
         table.clear(v385)
-        if v413 then
-            table.insert(v385, v413)
+        if v417 then
+            table.insert(v385, v417)
         end
-        return v413
+        return v417
     end
-    return v414
+    return v418
 end
 
-local function v427(v428, v429)
-    local v430 = v376(v7, v428, v429 - v428, v377)
-    return not v430 or v430.Instance.Transparency >= 1
+local function v432(v433, v434)
+    local v435 = v376(v7, v433, v434 - v433, v377)
+    return not v435 or v435.Instance.Transparency >= 1
 end
 
-local function v431(v432, v433, v434)
-    if not v432 or not v432.k83.Parent then
+local function v436(v437, v438, v439)
+    if not v437 or not v437.k83.Parent then
         return nil
     end
-    local v435 = v382[v432.k76]
-    if not v435 or v435.k83 ~= v432.k83 or #v435.k65 < 2 then
+    local v440 = v382[v437.k76]
+    if not v440 or v440.k83 ~= v437.k83 or #v440.k65 < 2 then
         return nil
     end
-    local v436, _, v437 = v68.k47(v435, v434, v433 == "Knife" and v366 or nil, v369)
-    if not v436 then
+    local v441, _, v442 = v68.k47(v440, v439, v438 == "Knife" and v366 or nil, v369)
+    if not v441 then
         return nil
     end
-    local v438 = v435.k65[#v435.k65].k75
-    local v439 = v436 - v438
-    if v439.Magnitude > 0.5 then
-        local v440 = v376(v7, v438, v439, v377)
-        if v440 and v440.Instance.CanCollide then
-            v436 = v440.Position - v439.Unit * 1.5
+    local v443 = v440.k65[#v440.k65].k75
+    local v444 = v441 - v443
+    if v444.Magnitude > 0.5 then
+        local v445 = v376(v7, v443, v444, v377)
+        if v445 and v445.Instance.CanCollide then
+            v441 = v445.Position - v444.Unit * 1.5
         end
     end
-    if not v427(v434, v436) then
-        for _, v441 in { 0.8, -1.0, -2.0 } do
-            local v442 = v436 + Vector3.new(0, v441, 0)
-            if v427(v434, v442) then
-                v436 = v442
+    if not v432(v439, v441) then
+        local v446 = v441 - v439
+        local v447 = Vector3.new(-v446.Z, 0, v446.X)
+        v447 = v447.Magnitude > 0.01 and v447.Unit or Vector3.new(1, 0, 0)
+        for _, v448 in {
+            Vector3.new(0, 0.8, 0), Vector3.new(0, 1.6, 0), Vector3.new(0, -1.0, 0), Vector3.new(0, -2.0, 0),
+            v447 * 0.7, -v447 * 0.7, v447 * 0.6 + Vector3.new(0, 0.8, 0), -v447 * 0.6 + Vector3.new(0, 0.8, 0),
+            v447 * 0.6 - Vector3.new(0, 1.0, 0), -v447 * 0.6 - Vector3.new(0, 1.0, 0),
+        } do
+            local v449 = v441 + v448
+            if v432(v439, v449) then
+                v441 = v449
                 break
             end
         end
     end
-    return v436, v437
+    return v441, v442
 end
 
-local function v443(v444, v445)
-    if v444 == "Knife" and #v385 > 1 then
-        local v446, v447, v448, v449
-        for _, v450 in v385 do
-            local v451, v452 = v431(v450, v444, v445)
-            if v451 then
-                local v453 = v452 - 0.25 * v450.k72 + (v450.k77 and 0.08 or 0)
-                if not v449 or v453 > v449 then
-                    v446, v447, v448, v449 = v450, v451, v452, v453
+local function v450(v451, v452)
+    if v451 == "Knife" and #v385 > 1 then
+        local v453, v454, v455, v456
+        for _, v457 in v385 do
+            local v458, v459 = v436(v457, v451, v452)
+            if v458 then
+                local v460 = v459 - 0.05 * v457.k72 + (v457.k77 and 0.08 or 0)
+                if not v456 or v460 > v456 then
+                    v453, v454, v455, v456 = v457, v458, v459, v460
                 end
             end
         end
-        if v446 then
-            return v447, v448, v446
+        if v453 then
+            return v454, v455, v453
         end
     end
-    local v454, v455 = v431(v384, v444, v445)
-    return v454, v455, v384
+    local v461, v462 = v436(v384, v451, v452)
+    return v461, v462, v384
 end
 
-local function v456(v457, v458, v459)
-    if v457 == "Gun" then
-        local v460 = v459 - v458
-        if v460.Magnitude > 0.1 then
-            return CFrame.new(v459 + v460.Unit * 4)
+local function v463(v464, v465, v466)
+    if v464 == "Gun" then
+        local v467 = v466 - v465
+        if v467.Magnitude > 0.1 then
+            return CFrame.new(v466 + v467.Unit * 4)
         end
     end
-    return CFrame.new(v459)
+    return CFrame.new(v466)
 end
 
-local function v461(v462, v463)
-    if typeof(v463) == "CFrame" then
-        return v463.Position
-    end
-    if v462 == "Gun" and v383.k51 then
-        return v383.k51.WorldPosition
-    end
-    local v464 = v383.k96 and v383.k96:FindFirstChild("Handle")
-    return v464 and v464.Position
+local function v468(v469, v470)
+    local v471 = v469.FireServer
+    return v471(v469, table.unpack(v470, 1, v470.n))
 end
 
-local function v465(v466, v467)
-    local v468 = v466.FireServer
-    return v468(v466, table.unpack(v467, 1, v467.n))
-end
-
-local function v469(v470, v471, v472, v473)
-    local v474 = v471 and v382[v471.k76]
-    if not v474 then
+local function v472(v473, v474, v475, v476)
+    local v477 = v474 and v382[v474.k76]
+    if not v477 then
         return
     end
-    local v475 = { k63 = v470, k94 = os.clock(), k84 = v369, k74 = v472, k47 = v473, k80 = v474, k53 = v471.k53, k96 = v383.k96 }
-    if v470 == "Gun" then
-        v387 = v475
+    local v478 = { k63 = v473, k94 = os.clock(), k84 = v369, k74 = v475, k47 = v476, k80 = v477, k53 = v474.k53, k96 = v383.k96 }
+    if v473 == "Gun" then
+        v387 = v478
         return
     end
     task.delay(1.9, function()
         if v10 then
             return
         end
-        local v476 = v474.k55
-        local v477 = v476 ~= nil and v476 >= v475.k94 and v476 <= v475.k94 + 1.7
-        if v68.k71(v389, v474, v475.k94, v475.k84, v475.k74, v475.k47, v366, v477) then
+        local v479 = v477.k55
+        local v480 = v479 ~= nil and v479 >= v478.k94 and v479 <= v478.k94 + 1.7
+        if v68.k71(v389, v477, v478.k94, v478.k84, v478.k74, v478.k47, v366, v480) then
             v390()
         end
     end)
 end
 
-local function v478(v479, v480, v481, v482)
-    local v483 = v387
-    if not v483 or v479 ~= v483.k96 or typeof(v481) ~= "Vector3" or os.clock() - v483.k94 > 1.5 then
+local function v481(v482, v483, v484, v485)
+    local v486 = v387
+    if not v486 or v482 ~= v486.k96 or typeof(v484) ~= "Vector3" or os.clock() - v486.k94 > 1.5 then
         return
     end
     v387 = nil
-    local v484 = v483.k74
-    if typeof(v480) == "Vector3" then
-        v484 = v480
-    elseif typeof(v480) == "Instance" then
-        if v480:IsA("Attachment") then
-            v484 = v480.WorldPosition
-        elseif v480:IsA("BasePart") then
-            v484 = v480.Position
+    local v487 = v486.k74
+    if typeof(v483) == "Vector3" then
+        v487 = v483
+    elseif typeof(v483) == "Instance" then
+        if v483:IsA("Attachment") then
+            v487 = v483.WorldPosition
+        elseif v483:IsA("BasePart") then
+            v487 = v483.Position
         end
     end
-    local v485 = typeof(v482) == "Instance" and v483.k53 ~= nil and v482:IsDescendantOf(v483.k53)
+    local v488 = typeof(v485) == "Instance" and v486.k53 ~= nil and v485:IsDescendantOf(v486.k53)
     task.delay(1.1, function()
         if v10 then
             return
         end
-        if v68.k70(v389, v483.k80, v483.k94, v483.k84, v484, v481, v485) then
+        if v68.k70(v389, v486.k80, v486.k94, v486.k84, v487, v484, v488) then
             v390()
         end
     end)
 end
 task.spawn(function()
-    local v486 = v3:WaitForChild("ClientServices", 10)
-    local v487 = v486 and v486:WaitForChild("WeaponService", 10)
-    local v488 = v487 and v487:WaitForChild("GunFired", 10)
-    if v488 and not v10 then
-        v12(v488.OnClientEvent:Connect(function(...)
-            pcall(v478, ...)
+    local v489 = v3:WaitForChild("ClientServices", 10)
+    local v490 = v489 and v489:WaitForChild("WeaponService", 10)
+    local v491 = v490 and v490:WaitForChild("GunFired", 10)
+    if v491 and not v10 then
+        v12(v491.OnClientEvent:Connect(function(...)
+            pcall(v481, ...)
         end))
     end
 end)
 
-local function v489(v490)
+local function v492(v493)
     v386 = nil
-    local v491 = v490.k49
-    if v490.k63 == "Gun" and v383.k51 and typeof(v491[1]) == "CFrame" then
-        v491[1] = v383.k51.WorldCFrame
+    local v494 = v493.k49
+    if v493.k63 == "Gun" and v383.k51 and typeof(v494[1]) == "CFrame" then
+        v494[1] = v383.k51.WorldCFrame
     end
-    local v492 = v461(v490.k63, v491[1]) or v490.k74
-    local v493, _, v494 = v443(v490.k63, v492)
-    if v493 then
-        v491[2] = v456(v490.k63, v492, v493)
-    elseif v490.k47 then
-        v491[2] = v490.k47
+    local v495 = v398(v493.k63, v494[1]) or v493.k74
+    local v496, _, v497 = v450(v493.k63, v495)
+    if v496 then
+        v494[2] = v463(v493.k63, v495, v496)
+    elseif v493.k47 then
+        v494[2] = v493.k47
     end
-    if pcall(v465, v490.k82, v491) and typeof(v491[2]) == "CFrame" then
-        v469(v490.k63, v494 or v490.k57, v492, v491[2].Position)
+    if pcall(v468, v493.k82, v494) and typeof(v494[2]) == "CFrame" then
+        v472(v493.k63, v497 or v493.k57, v495, v494[2].Position)
     end
 end
 
-local v495 = 0
+local v498 = 0
 v12(v2.PreSimulation:Connect(function()
     if v10 then
         return
@@ -1213,300 +1224,300 @@ v12(v2.PreSimulation:Connect(function()
         v384 = nil
         table.clear(v385)
         if v386 then
-            v489(v386)
+            v492(v386)
         end
         return
     end
-    local v496 = os.clock()
-    for _, v497 in v1:GetPlayers() do
-        if v497 ~= v8 then
-            local v498 = v497.Character
-            local v499 = v498 and v498:FindFirstChild("HumanoidRootPart")
-            local v500 = v498 and v498:FindFirstChildOfClass("Humanoid")
-            if v499 and v500 then
-                local v501 = v382[v497]
-                if not v501 or v501.k83 ~= v499 then
-                    v501 = v68.new()
-                    v501.k83 = v499
-                    v382[v497] = v501
+    local v499 = os.clock()
+    for _, v500 in v1:GetPlayers() do
+        if v500 ~= v8 then
+            local v501 = v500.Character
+            local v502 = v501 and v501:FindFirstChild("HumanoidRootPart")
+            local v503 = v501 and v501:FindFirstChildOfClass("Humanoid")
+            if v502 and v503 then
+                local v504 = v382[v500]
+                if not v504 or v504.k83 ~= v502 then
+                    v504 = v68.new()
+                    v504.k83 = v502
+                    v382[v500] = v504
                 end
-                if v500.Health <= 0 then
-                    v501.k55 = v501.k55 or v496
+                if v503.Health <= 0 then
+                    v504.k55 = v504.k55 or v499
                 end
-                if not v501.k55 or v496 - v501.k55 < 0.6 then
-                    local v502 = v500:GetState()
-                    local v503 = v500.FloorMaterial ~= Enum.Material.Air
-                        or (v502 ~= Enum.HumanoidStateType.Freefall and v502 ~= Enum.HumanoidStateType.Jumping)
-                    v68.k78(v501, v496, v499.Position, v503)
+                if not v504.k55 or v499 - v504.k55 < 0.6 then
+                    local v505 = v503:GetState()
+                    local v506 = v503.FloorMaterial ~= Enum.Material.Air
+                        or (v505 ~= Enum.HumanoidStateType.Freefall and v505 ~= Enum.HumanoidStateType.Jumping)
+                    v68.k78(v504, v499, v502.Position, v506)
                 end
             else
-                v382[v497] = nil
+                v382[v500] = nil
             end
         end
     end
-    v495 += 1
-    if v495 % 60 == 0 then
+    v498 += 1
+    if v498 % 60 == 0 then
         v378()
     end
     v393()
     if v383.k63 and v391(v383.k63) then
-        v384 = v404(v383.k63)
+        v384 = v408(v383.k63)
     else
         v384 = nil
         table.clear(v385)
     end
-    local v504 = v386
-    if v504 then
-        if v504.k82 ~= v383.k82 or not v384 then
-            v489(v504)
+    local v507 = v386
+    if v507 then
+        if v507.k82 ~= v383.k82 or not v384 then
+            v492(v507)
         else
-            local v505 = v461(v504.k63, v383.k51 and v383.k51.WorldCFrame) or v504.k74
-            local _, v506 = v443(v504.k63, v505)
-            if not v506 or v68.k79(v504.k63 == "Knife", v506, v496 - v504.k89) then
-                v489(v504)
+            local v508 = v398(v507.k63, v383.k51 and v383.k51.WorldCFrame) or v507.k74
+            local _, v509 = v450(v507.k63, v508)
+            if not v509 or v68.k79(v507.k63 == "Knife", v509, v499 - v507.k89) then
+                v492(v507)
             end
         end
     end
 end))
-v12(v1.PlayerRemoving:Connect(function(v507)
-    v382[v507] = nil
+v12(v1.PlayerRemoving:Connect(function(v510)
+    v382[v510] = nil
 end))
 
-local function v508(v509, v510)
-    local v511 = v383.k63
-    local v512 = v461(v511, v510[1])
-    if not v512 then
+local function v511(v512, v513)
+    local v514 = v383.k63
+    local v515 = v398(v514, v513[1])
+    if not v515 then
         return false
     end
-    local v513, v514, v515 = v443(v511, v512)
-    if not v513 then
+    local v516, v517, v518 = v450(v514, v515)
+    if not v516 then
         return false
     end
-    local v516 = v456(v511, v512, v513)
-    if not v68.k79(v511 == "Knife", v514, 0) then
+    local v519 = v463(v514, v515, v516)
+    if not v68.k79(v514 == "Knife", v517, 0) then
         if v386 then
-            v489(v386)
+            v492(v386)
         end
-        v386 = { k82 = v509, k49 = v510, k63 = v511, k74 = v512, k47 = v516, k57 = v515, k89 = os.clock() }
+        v386 = { k82 = v512, k49 = v513, k63 = v514, k74 = v515, k47 = v519, k57 = v518, k89 = os.clock() }
         return true
     end
-    v510[2] = v516
-    v465(v509, v510)
-    v469(v511, v515, v512, v516.Position)
+    v513[2] = v519
+    v468(v512, v513)
+    v472(v514, v518, v515, v519.Position)
     return true
 end
 
-local v517 = false
+local v520 = false
 if typeof(hookmetamethod) == "function" and typeof(getnamecallmethod) == "function" then
-    local v518
-    local v519 = typeof(checkcaller) == "function" and checkcaller or function()
+    local v521
+    local v522 = typeof(checkcaller) == "function" and checkcaller or function()
         return false
     end
-    local function v520(self, ...)
+    local function v523(self, ...)
         if v10 or self ~= v383.k82 then
-            return v518(self, ...)
+            return v521(self, ...)
         end
-        if getnamecallmethod() ~= "FireServer" or v519() or not v391(v383.k63) then
-            return v518(self, ...)
+        if getnamecallmethod() ~= "FireServer" or v522() or not v391(v383.k63) then
+            return v521(self, ...)
         end
-        local v521 = table.pack(...)
-        local v522, v523 = pcall(v508, self, table.pack(...))
-        if v522 and v523 then
+        local v524 = table.pack(...)
+        local v525, v526 = pcall(v511, self, table.pack(...))
+        if v525 and v526 then
             return nil
         end
-        return v465(self, v521)
+        return v468(self, v524)
     end
     if typeof(newcclosure) == "function" then
-        v520 = newcclosure(v520)
+        v523 = newcclosure(v523)
     end
-    v518 = hookmetamethod(game, "__namecall", v520)
-    v517 = true
+    v521 = hookmetamethod(game, "__namecall", v523)
+    v520 = true
 end
 
-local v524
+local v527
 pcall(function()
-    v524 = require(v3:WaitForChild("ClientServices", 5):WaitForChild("WeaponService", 5))
+    v527 = require(v3:WaitForChild("ClientServices", 5):WaitForChild("WeaponService", 5))
 end)
-local v525, v526
-if not v517 and type(v524) == "table" then
-    v525, v526 = v524.GetMouseTargetCFrame, v524.GetTargetPosition
-    local function v527()
-        local v528 = v383.k63
-        if v10 or not v528 or not v391(v528) then
+local v528, v529
+if not v520 and type(v527) == "table" then
+    v528, v529 = v527.GetMouseTargetCFrame, v527.GetTargetPosition
+    local function v530()
+        local v531 = v383.k63
+        if v10 or not v531 or not v391(v531) then
             return nil
         end
-        local v529 = v461(v528)
-        local v530 = v529 and v443(v528, v529)
-        return v530 and v456(v528, v529, v530)
+        local v532 = v398(v531)
+        local v533 = v532 and v450(v531, v532)
+        return v533 and v463(v531, v532, v533)
     end
-    v524.GetMouseTargetCFrame = function(self, ...)
-        local v531, v532 = pcall(v527)
-        if v531 and v532 then
-            return v532
+    v527.GetMouseTargetCFrame = function(self, ...)
+        local v534, v535 = pcall(v530)
+        if v534 and v535 then
+            return v535
         end
-        return v525(self, ...)
+        return v528(self, ...)
     end
-    v524.GetTargetPosition = function(self, v533, v534, ...)
-        v58, v59 = Vector2.new(v533, v534), os.clock()
-        local v535, v536 = pcall(v527)
-        if v535 and v536 then
-            return v536
+    v527.GetTargetPosition = function(self, v536, v537, ...)
+        v58, v59 = Vector2.new(v536, v537), os.clock()
+        local v538, v539 = pcall(v530)
+        if v538 and v539 then
+            return v539
         end
-        return v526(self, v533, v534, ...)
+        return v529(self, v536, v537, ...)
     end
 end
 
-local v537 = Instance.new("Folder")
-v537.Name = "\0"
-v537.Parent = (typeof(gethui) == "function" and gethui()) or game:GetService("CoreGui")
-local v538 = {}
-local v539 = {
+local v540 = Instance.new("Folder")
+v540.Name = "\0"
+v540.Parent = (typeof(gethui) == "function" and gethui()) or game:GetService("CoreGui")
+local v541 = {}
+local v542 = {
     Murderer = Color3.fromRGB(255, 50, 50),
     Sheriff = Color3.fromRGB(50, 140, 255),
     Hero = Color3.fromRGB(50, 140, 255),
     Innocent = Color3.fromRGB(60, 230, 90),
 }
-local function v540(v541)
-    local v542 = v538[v541]
-    if v542 then
-        v542.k62:Destroy()
-        v542.k52:Destroy()
-        v538[v541] = nil
+local function v543(v544)
+    local v545 = v541[v544]
+    if v545 then
+        v545.k62:Destroy()
+        v545.k52:Destroy()
+        v541[v544] = nil
     end
 end
-v12(v1.PlayerRemoving:Connect(v540))
-local function v543()
-    for _, v544 in v1:GetPlayers() do
-        if v544 ~= v8 then
-            local v545, _, v546 = v41(v544)
-            local v547, v548 = v35(v544)
-            if v15.k5 and v545 and not v548 then
-                local v549 = v539[v547] or v539.Innocent
-                local v550 = v538[v544]
-                if not v550 or v550.k53 ~= v546 then
-                    v540(v544)
-                    local v551 = Instance.new("Highlight")
-                    v551.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
-                    v551.FillTransparency = 0.55
-                    v551.OutlineTransparency = 0
-                    v551.Adornee = v546
-                    v551.Parent = v537
-                    local v552 = Instance.new("BillboardGui")
-                    v552.AlwaysOnTop = true
-                    v552.Size = UDim2.fromOffset(160, 22)
-                    v552.StudsOffset = Vector3.new(0, 3.4, 0)
-                    v552.Adornee = v545
-                    v552.Parent = v537
-                    local v553 = Instance.new("TextLabel")
-                    v553.BackgroundTransparency = 1
-                    v553.Size = UDim2.fromScale(1, 1)
-                    v553.Font = Enum.Font.GothamBold
-                    v553.TextSize = 13
-                    v553.TextStrokeTransparency = 0.4
-                    v553.Text = v544.DisplayName
-                    v553.Parent = v552
-                    v550 = { k62 = v551, k52 = v552, k64 = v553, k53 = v546 }
-                    v538[v544] = v550
+v12(v1.PlayerRemoving:Connect(v543))
+local function v546()
+    for _, v547 in v1:GetPlayers() do
+        if v547 ~= v8 then
+            local v548, _, v549 = v41(v547)
+            local v550, v551 = v35(v547)
+            if v15.k5 and v548 and not v551 then
+                local v552 = v542[v550] or v542.Innocent
+                local v553 = v541[v547]
+                if not v553 or v553.k53 ~= v549 then
+                    v543(v547)
+                    local v554 = Instance.new("Highlight")
+                    v554.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+                    v554.FillTransparency = 0.55
+                    v554.OutlineTransparency = 0
+                    v554.Adornee = v549
+                    v554.Parent = v540
+                    local v555 = Instance.new("BillboardGui")
+                    v555.AlwaysOnTop = true
+                    v555.Size = UDim2.fromOffset(160, 22)
+                    v555.StudsOffset = Vector3.new(0, 3.4, 0)
+                    v555.Adornee = v548
+                    v555.Parent = v540
+                    local v556 = Instance.new("TextLabel")
+                    v556.BackgroundTransparency = 1
+                    v556.Size = UDim2.fromScale(1, 1)
+                    v556.Font = Enum.Font.GothamBold
+                    v556.TextSize = 13
+                    v556.TextStrokeTransparency = 0.4
+                    v556.Text = v547.DisplayName
+                    v556.Parent = v555
+                    v553 = { k62 = v554, k52 = v555, k64 = v556, k53 = v549 }
+                    v541[v547] = v553
                 end
-                if v550.k54 ~= v549 then
-                    v550.k54 = v549
-                    v550.k62.FillColor = v549
-                    v550.k62.OutlineColor = v549
-                    v550.k64.TextColor3 = v549
+                if v553.k54 ~= v552 then
+                    v553.k54 = v552
+                    v553.k62.FillColor = v552
+                    v553.k62.OutlineColor = v552
+                    v553.k64.TextColor3 = v552
                 end
             else
-                v540(v544)
+                v543(v547)
             end
         end
     end
 end
 task.spawn(function()
     while not v10 do
-        pcall(v543)
+        pcall(v546)
         task.wait(0.25)
     end
 end)
 
-local v554 = {}
-local v555 = {}
-local v556
-local function v557(v558)
-    local v559 = v555[v558]
-    if v559 then
-        return v559
+local v557 = {}
+local v558 = {}
+local v559
+local function v560(v561)
+    local v562 = v558[v561]
+    if v562 then
+        return v562
     end
-    local v560 = {}
-    for _, v561 in v558:GetDescendants() do
-        if v561:IsA("BasePart") then
-            table.insert(v560, v561)
+    local v563 = {}
+    for _, v564 in v561:GetDescendants() do
+        if v564:IsA("BasePart") then
+            table.insert(v563, v564)
         end
     end
-    v555[v558] = v560
-    local v562
-    v562 = v558.DescendantAdded:Connect(function(v563)
-        if v563:IsA("BasePart") then
-            table.insert(v560, v563)
+    v558[v561] = v563
+    local v565
+    v565 = v561.DescendantAdded:Connect(function(v566)
+        if v566:IsA("BasePart") then
+            table.insert(v563, v566)
         end
     end)
-    v558.AncestryChanged:Once(function()
-        v555[v558] = nil
-        v562:Disconnect()
+    v561.AncestryChanged:Once(function()
+        v558[v561] = nil
+        v565:Disconnect()
     end)
-    return v560
+    return v563
 end
 v12(v2.PreSimulation:Connect(function()
     if not v15.k4 then
-        v556 = nil
+        v559 = nil
         return
     end
-    local v564, v565 = v41(v8)
-    local v566 = os.clock()
-    for _, v567 in v1:GetPlayers() do
-        if v567 ~= v8 then
-            local v568 = v567.Character
-            local v569 = v568 and v568:FindFirstChild("HumanoidRootPart")
-            if v569 and v564 then
-                local v570 = v569.Position - v564.Position
-                if v570.X * v570.X + v570.Y * v570.Y + v570.Z * v570.Z < 3600 then
-                    local v571 = v569.AssemblyAngularVelocity
-                    local v572 = v569.AssemblyLinearVelocity
-                    if v571:Dot(v571) > 625 or v572:Dot(v572) > 14400 then
-                        v554[v567] = v566 + 3
+    local v567, v568 = v41(v8)
+    local v569 = os.clock()
+    for _, v570 in v1:GetPlayers() do
+        if v570 ~= v8 then
+            local v571 = v570.Character
+            local v572 = v571 and v571:FindFirstChild("HumanoidRootPart")
+            if v572 and v567 then
+                local v573 = v572.Position - v567.Position
+                if v573.X * v573.X + v573.Y * v573.Y + v573.Z * v573.Z < 3600 then
+                    local v574 = v572.AssemblyAngularVelocity
+                    local v575 = v572.AssemblyLinearVelocity
+                    if v574:Dot(v574) > 625 or v575:Dot(v575) > 14400 then
+                        v557[v570] = v569 + 3
                     end
                 end
             end
-            local v573 = v554[v567]
-            if v573 then
-                if v566 > v573 or not v568 then
-                    v554[v567] = nil
+            local v576 = v557[v570]
+            if v576 then
+                if v569 > v576 or not v571 then
+                    v557[v570] = nil
                 else
-                    for _, v574 in v557(v568) do
-                        if v574.CanCollide then
-                            v574.CanCollide = false
+                    for _, v577 in v560(v571) do
+                        if v577.CanCollide then
+                            v577.CanCollide = false
                         end
                     end
                 end
             end
         end
     end
-    if not v564 then
-        v556 = nil
+    if not v567 then
+        v559 = nil
         return
     end
-    local v575 = v564.AssemblyLinearVelocity
-    local v576 = math.sqrt(v575.X * v575.X + v575.Z * v575.Z)
-    local v577 = v564.AssemblyAngularVelocity.Magnitude
-    local v578 = v565.WalkSpeed
-    if (v576 > math.max(v578 * 5, 90) or v575.Y > 140 or v577 > 35) and v556 then
-        v564.AssemblyLinearVelocity = Vector3.zero
-        v564.AssemblyAngularVelocity = Vector3.zero
-        v564.CFrame = v556
-    elseif v576 < v578 * 2 + 4 and v577 < 8 and math.abs(v575.Y) < 60 then
-        v556 = v564.CFrame
+    local v578 = v567.AssemblyLinearVelocity
+    local v579 = math.sqrt(v578.X * v578.X + v578.Z * v578.Z)
+    local v580 = v567.AssemblyAngularVelocity.Magnitude
+    local v581 = v568.WalkSpeed
+    if (v579 > math.max(v581 * 5, 90) or v578.Y > 140 or v580 > 35) and v559 then
+        v567.AssemblyLinearVelocity = Vector3.zero
+        v567.AssemblyAngularVelocity = Vector3.zero
+        v567.CFrame = v559
+    elseif v579 < v581 * 2 + 4 and v580 < 8 and math.abs(v578.Y) < 60 then
+        v559 = v567.CFrame
     end
 end))
 
-local v579 = v14:CreateWindow({
+local v582 = v14:CreateWindow({
     Name = "MM2",
     Author = "ily",
     Icon = "swords",
@@ -1519,138 +1530,138 @@ local v579 = v14:CreateWindow({
     },
 })
 
-local v580 = "\u{200B}\u{200C}\u{200B}"
+local v583 = "\u{200B}\u{200C}\u{200B}"
 pcall(function()
-    v579:EditOpenButton({
-        Title = v580,
+    v582:EditOpenButton({
+        Title = v583,
         Icon = "",
         Transparency = 1,
         StrokeThickness = 0,
     })
 end)
-local v581 = {}
-local function v582()
-    local v583 = { game:GetService("CoreGui") }
+local v584 = {}
+local function v585()
+    local v586 = { game:GetService("CoreGui") }
     if typeof(gethui) == "function" then
-        table.insert(v583, gethui())
+        table.insert(v586, gethui())
     end
-    local v584 = v8:FindFirstChildOfClass("PlayerGui")
-    if v584 then
-        table.insert(v583, v584)
+    local v587 = v8:FindFirstChildOfClass("PlayerGui")
+    if v587 then
+        table.insert(v586, v587)
     end
-    local v585 = false
-    for _, v586 in v583 do
-        local v587, v588 = pcall(v586.GetDescendants, v586)
-        if v587 then
-            for _, v589 in v588 do
-                if (v589:IsA("TextLabel") or v589:IsA("TextButton")) and v589.Text == v580 then
-                    local v590 = v589
-                    local v591 = v589.Parent
-                    while v591 and v591:IsA("GuiObject") and v591.AbsoluteSize.X * v591.AbsoluteSize.Y < 320 * 160 do
-                        v590 = v591
-                        v591 = v591.Parent
+    local v588 = false
+    for _, v589 in v586 do
+        local v590, v591 = pcall(v589.GetDescendants, v589)
+        if v590 then
+            for _, v592 in v591 do
+                if (v592:IsA("TextLabel") or v592:IsA("TextButton")) and v592.Text == v583 then
+                    local v593 = v592
+                    local v594 = v592.Parent
+                    while v594 and v594:IsA("GuiObject") and v594.AbsoluteSize.X * v594.AbsoluteSize.Y < 320 * 160 do
+                        v593 = v594
+                        v594 = v594.Parent
                     end
-                    if v590:IsA("GuiObject") and not v581[v590] then
-                        v581[v590] = true
-                        v590.Visible = false
-                        v12(v590:GetPropertyChangedSignal("Visible"):Connect(function()
-                            if v590.Visible then
-                                v590.Visible = false
+                    if v593:IsA("GuiObject") and not v584[v593] then
+                        v584[v593] = true
+                        v593.Visible = false
+                        v12(v593:GetPropertyChangedSignal("Visible"):Connect(function()
+                            if v593.Visible then
+                                v593.Visible = false
                             end
                         end))
                     end
-                    v585 = true
+                    v588 = true
                 end
             end
         end
     end
-    return v585
+    return v588
 end
 task.spawn(function()
-    for _, v592 in { 0.2, 0.5, 1, 2, 4, 8 } do
-        task.wait(v592)
+    for _, v595 in { 0.2, 0.5, 1, 2, 4, 8 } do
+        task.wait(v595)
         if v10 then
             return
         end
-        local v593, v594 = pcall(v582)
-        if v593 and v594 then
+        local v596, v597 = pcall(v585)
+        if v596 and v597 then
             return
         end
     end
 end)
-local v595 = Enum.KeyCode.K
-v12(v4.InputBegan:Connect(function(v596)
-    if v596.KeyCode == v595 then
-        task.delay(0.15, pcall, v582)
-        task.delay(0.6, pcall, v582)
+local v598 = Enum.KeyCode.K
+v12(v4.InputBegan:Connect(function(v599)
+    if v599.KeyCode == v598 then
+        task.delay(0.15, pcall, v585)
+        task.delay(0.6, pcall, v585)
     end
 end))
 
-local v597 = v579:Tab({ Title = "Main", Icon = "crosshair" })
-v597:Section({ Title = "Silent Aim" })
-v597:Toggle({
+local v600 = v582:Tab({ Title = "Main", Icon = "crosshair" })
+v600:Section({ Title = "Silent Aim" })
+v600:Toggle({
     Title = "Gun Silent Aim",
     Default = false,
-    Callback = function(v598)
-        v15.k13 = v598
+    Callback = function(v601)
+        v15.k13 = v601
     end,
 })
-v597:Toggle({
+v600:Toggle({
     Title = "Murderer Silent Aim",
     Default = false,
-    Callback = function(v599)
-        v15.k20 = v599
+    Callback = function(v602)
+        v15.k20 = v602
     end,
 })
-v597:Section({ Title = "Other" })
-v597:Toggle({
+v600:Section({ Title = "Other" })
+v600:Toggle({
     Title = "ESP",
     Default = false,
-    Callback = function(v600)
-        v15.k5 = v600
+    Callback = function(v603)
+        v15.k5 = v603
     end,
 })
-v597:Toggle({
+v600:Toggle({
     Title = "Anti Fling",
     Default = false,
-    Callback = function(v601)
-        v15.k4 = v601
-        if not v601 then
-            table.clear(v554)
+    Callback = function(v604)
+        v15.k4 = v604
+        if not v604 then
+            table.clear(v557)
         end
     end,
 })
 
-local v602 = v579:Tab({ Title = "Settings", Icon = "settings" })
-local v603 = v602:Keybind({
+local v605 = v582:Tab({ Title = "Settings", Icon = "settings" })
+local v606 = v605:Keybind({
     Title = "Toggle UI",
-    Callback = function(v604)
-        local v605 = typeof(v604) == "EnumItem" and v604 or Enum.KeyCode[tostring(v604)]
-        if v605 then
-            v595 = v605
-            pcall(v579.SetToggleKey, v579, v605)
+    Callback = function(v607)
+        local v608 = typeof(v607) == "EnumItem" and v607 or Enum.KeyCode[tostring(v607)]
+        if v608 then
+            v598 = v608
+            pcall(v582.SetToggleKey, v582, v608)
         end
     end,
 })
 pcall(function()
-    v603:SetValue("K")
+    v606:SetValue("K")
 end)
 
 v9.__c43 = function()
     v10 = true
     if v386 then
-        pcall(v489, v386)
+        pcall(v492, v386)
     end
-    for _, v606 in v11 do
-        pcall(v606.Disconnect, v606)
+    for _, v609 in v11 do
+        pcall(v609.Disconnect, v609)
     end
-    for v607 in v538 do
-        v540(v607)
+    for v610 in v541 do
+        v543(v610)
     end
-    v537:Destroy()
-    if v525 and v524 then
-        v524.GetMouseTargetCFrame = v525
-        v524.GetTargetPosition = v526
+    v540:Destroy()
+    if v528 and v527 then
+        v527.GetMouseTargetCFrame = v528
+        v527.GetTargetPosition = v529
     end
-    pcall(v579.Close, v579)
+    pcall(v582.Close, v582)
 end
