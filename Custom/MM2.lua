@@ -220,35 +220,42 @@ local function pickTarget(kind)
     end
     local cam = Workspace.CurrentCamera
     local center = aimPoint()
-    local radius = cam.ViewportSize.Magnitude
+    local far = cam.ViewportSize.Magnitude
     local head = LocalPlayer.Character:FindFirstChild("Head")
     local eye = head and head.Position or me.Position
-    local best, bestScore
+    local list, murderer = {}, false
     for _, plr in Players:GetPlayers() do
         if plr ~= LocalPlayer then
             local root, hum, char = aliveRoot(plr)
-            local role, dead = roleOf(plr)
-            local wanted = root and not dead
-            if wanted and kind == "Gun" then
-                wanted = role == "Murderer"
-            end
-            if wanted then
-                local sp, onScreen = cam:WorldToViewportPoint(root.Position)
-                local screenDist = (Vector2.new(sp.X, sp.Y) - center).Magnitude
-                local inFov = onScreen and sp.Z > 0
-                do
-                    local seen = clearLine(eye, root.Position, char)
-                    local score = (inFov and screenDist or radius + (root.Position - me.Position).Magnitude * 4)
-                    if not seen then
-                        score += 100000
+            if root then
+                local role, dead = roleOf(plr)
+                if not dead or carried(plr) then
+                    if role == "Murderer" then
+                        murderer = true
                     end
-                    if kind == "Knife" and (role == "Sheriff" or role == "Hero") then
-                        score -= 40
-                    end
-                    if not bestScore or score < bestScore then
-                        best, bestScore = { root = root, hum = hum, char = char }, score
-                    end
+                    table.insert(list, { root = root, hum = hum, char = char, role = role })
                 end
+            end
+        end
+    end
+    local best, bestScore
+    for _, c in list do
+        if kind ~= "Gun" or not murderer or c.role == "Murderer" then
+            local sp, onScreen = cam:WorldToViewportPoint(c.root.Position)
+            local score
+            if onScreen and sp.Z > 0 then
+                score = (Vector2.new(sp.X, sp.Y) - center).Magnitude
+            else
+                score = far + (c.root.Position - me.Position).Magnitude * 4
+            end
+            if not clearLine(eye, c.root.Position, c.char) then
+                score += far * 10
+            end
+            if kind == "Knife" and (c.role == "Sheriff" or c.role == "Hero") then
+                score -= 40
+            end
+            if not bestScore or score < bestScore then
+                best, bestScore = c, score
             end
         end
     end
@@ -273,7 +280,6 @@ local function redirect(kind, origin)
     return CFrame.new(pos)
 end
 
-local hooked = false
 if typeof(hookmetamethod) == "function" and typeof(getnamecallmethod) == "function" then
     local original
     local function onNamecall(self, ...)
@@ -305,7 +311,6 @@ if typeof(hookmetamethod) == "function" and typeof(getnamecallmethod) == "functi
         onNamecall = newcclosure(onNamecall)
     end
     original = hookmetamethod(game, "__namecall", onNamecall)
-    hooked = true
 end
 
 local WeaponService
@@ -313,7 +318,7 @@ pcall(function()
     WeaponService = require(ReplicatedStorage:WaitForChild("ClientServices", 5):WaitForChild("WeaponService", 5))
 end)
 local origMouse, origTarget
-if not hooked and type(WeaponService) == "table" then
+if type(WeaponService) == "table" then
     origMouse, origTarget = WeaponService.GetMouseTargetCFrame, WeaponService.GetTargetPosition
     local function heldKind()
         local char = LocalPlayer.Character
