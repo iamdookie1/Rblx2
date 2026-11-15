@@ -8,8 +8,8 @@ local v7 = workspace
 local v8 = v1.LocalPlayer
 
 local v9 = (typeof(getgenv) == "function" and getgenv()) or _G
-if v9.__CustomMM2Unload then
-    pcall(v9.__CustomMM2Unload)
+if v9.__c43 then
+    pcall(v9.__c43)
 end
 
 local v10 = false
@@ -22,10 +22,10 @@ end
 local v14 = loadstring(game:HttpGet("https://github.com/SSHRKs/LumeUI/releases/latest/download/main.lua"))()
 
 local v15 = {
-    GunAim = false,
-    KnifeAim = false,
-    Esp = false,
-    AntiFling = false,
+    k13 = false,
+    k20 = false,
+    k5 = false,
+    k4 = false,
 }
 
 local v16 = v3:WaitForChild("Remotes", 10)
@@ -172,65 +172,65 @@ local function v65()
 end
 
 local v68 = {
-    WINDOW = 3.0,
-    SPAN = 0.034,
-    FIT = 0.067,
-    GRAVITY = 196.2,
-    INTERP = 0.06,
-    PROCESS = 0.01,
-    FUTURES = 64,
-    STEP = 1 / 30,
-    MOVE_MIN = 2.0,
-    MOVE_FRACTION = 0.4,
-    TURN = 0.7,
-    PASS = 0.12,
-    PRIOR_MOVE = 1.5,
-    PRIOR_STOP = 0.8,
-    PRIOR_WEIGHT = 1.5,
-    STOP_PRIOR = 0.5,
-    TURN_PRIOR = 0.7,
-    TRUST_AT = 3,
-    TRUST = 0.9,
-    JITTER = 0.2,
-    ACCEL_LEAD = 0.05,
-    ACCEL_MIN = 40,
-    TURN_LAG = 0.035,
-    ACCEL_TAU = 0.05,
-    GUN_RADIUS = 1.0,
-    KNIFE_RADIUS = 1.2,
-    GUN_HOLD = 0.2,
-    GUN_SURE = 0.85,
-    KNIFE_HOLD = 0,
-    KNIFE_SURE = 0.7,
-    GUN_RAISE = 1.0,
-    KNIFE_RAISE = 1.5,
-    OFFSET_MIN = -0.3,
-    OFFSET_MAX = 0.4,
-    OFFSET_STEP = 0.005,
-    OFFSET_PRIOR = 0.07,
-    OFFSET_SPREAD = 0.12,
-    LEARN_AFTER = 2,
+    k42 = 3.0,
+    k34 = 0.034,
+    k6 = 0.067,
+    k8 = 196.2,
+    k14 = 0.06,
+    k33 = 0.01,
+    k7 = 64,
+    k35 = 1 / 30,
+    k23 = 2.0,
+    k22 = 0.4,
+    k39 = 0.7,
+    k29 = 0.12,
+    k30 = 1.5,
+    k31 = 0.8,
+    k32 = 1.5,
+    k36 = 0.5,
+    k41 = 0.7,
+    k38 = 3,
+    k37 = 0.9,
+    k15 = 0.2,
+    k1 = 0.05,
+    k2 = 40,
+    k40 = 0.035,
+    k3 = 0.05,
+    k10 = 1.0,
+    k17 = 1.2,
+    k9 = 0.2,
+    k12 = 0.85,
+    k16 = 0,
+    k19 = 0.7,
+    k11 = 1.0,
+    k18 = 1.5,
+    k25 = -0.3,
+    k24 = 0.4,
+    k28 = 0.005,
+    k26 = 0.07,
+    k27 = 0.12,
+    k21 = 2,
 }
 
 function v68.new()
-    return { list = {}, groundY = nil, grounded = true }
+    return { k65 = {}, k60 = nil, k61 = true }
 end
 
-function v68.push(v69, v70, v71, v72)
-    local v73 = v69.list
+function v68.k78(v69, v70, v71, v72)
+    local v73 = v69.k65
     local v74 = #v73
-    if v74 > 0 and v70 <= v73[v74].t then
+    if v74 > 0 and v70 <= v73[v74].k94 then
         return
     end
-    v73[v74 + 1] = { t = v70, p = v71 }
+    v73[v74 + 1] = { k94 = v70, k75 = v71 }
     v74 += 1
     if v72 then
-        v69.groundY = v71.Y
+        v69.k60 = v71.Y
     end
-    v69.grounded = v72
-    local v75 = v70 - v68.WINDOW - 0.2
+    v69.k61 = v72
+    local v75 = v70 - v68.k42 - 0.2
     local v76 = 0
-    while v76 < v74 - 2 and v73[v76 + 1].t < v75 do
+    while v76 < v74 - 2 and v73[v76 + 1].k94 < v75 do
         v76 += 1
     end
     if v76 > 0 then
@@ -241,30 +241,30 @@ function v68.push(v69, v70, v71, v72)
     end
 end
 
-function v68.at(v78, v79)
-    local v80 = v78.list
+function v68.k50(v78, v79)
+    local v80 = v78.k65
     local v81 = #v80
-    if v79 >= v80[v81].t then
-        return v80[v81].p
+    if v79 >= v80[v81].k94 then
+        return v80[v81].k75
     end
-    if v79 <= v80[1].t then
-        return v80[1].p
+    if v79 <= v80[1].k94 then
+        return v80[1].k75
     end
     local v82, v83 = 1, v81
     while v83 - v82 > 1 do
         local v84 = (v82 + v83) // 2
-        if v80[v84].t <= v79 then
+        if v80[v84].k94 <= v79 then
             v82 = v84
         else
             v83 = v84
         end
     end
     local v85, v86 = v80[v82], v80[v83]
-    return v85.p + (v86.p - v85.p) * ((v79 - v85.t) / math.max(v86.t - v85.t, 1e-6))
+    return v85.k75 + (v86.k75 - v85.k75) * ((v79 - v85.k94) / math.max(v86.k94 - v85.k94, 1e-6))
 end
 
-function v68.velocity(v87, v88, v89)
-    return (v68.at(v87, v88) - v68.at(v87, v88 - v89)) / v89
+function v68.k99(v87, v88, v89)
+    return (v68.k50(v87, v88) - v68.k50(v87, v88 - v89)) / v89
 end
 
 local function v90(v91)
@@ -272,11 +272,11 @@ local function v90(v91)
     return v91 - math.pi
 end
 
-function v68.fit(v92, v93, v94)
+function v68.k59(v92, v93, v94)
     local v95, v96, v97, v98, v99, v100, v101 = 0, 0, 0, 0, 0, 0, 0
     for v102 = 0, 4 do
         local v103 = -v94 * v102 / 4
-        local v104 = v68.at(v92, v93 + v103)
+        local v104 = v68.k50(v92, v93 + v103)
         v95 += 1
         v96 += v103
         v97 += v104.X
@@ -292,43 +292,43 @@ function v68.fit(v92, v93, v94)
     return (v95 * v100 - v96 * v97) / v105, (v95 * v101 - v96 * v98) / v105
 end
 
-function v68.motion(v106)
-    local v107 = v106.list
-    local v108 = v107[#v107].t
-    local v109 = math.max(v107[1].t + v68.SPAN, v108 - v68.WINDOW)
+function v68.k67(v106)
+    local v107 = v106.k65
+    local v108 = v107[#v107].k94
+    local v109 = math.max(v107[1].k94 + v68.k34, v108 - v68.k42)
     local v110 = {}
     local v111 = v109
     while v111 <= v108 + 1e-6 do
-        local v112 = v68.velocity(v106, v111, v68.SPAN)
-        v110[#v110 + 1] = { t = v111, x = v112.X, z = v112.Z, s = math.sqrt(v112.X * v112.X + v112.Z * v112.Z) }
+        local v112 = v68.k99(v106, v111, v68.k34)
+        v110[#v110 + 1] = { k94 = v111, k100 = v112.X, k101 = v112.Z, k85 = math.sqrt(v112.X * v112.X + v112.Z * v112.Z) }
         v111 += 1 / 60
     end
     local v113 = {}
     for _, v114 in v110 do
-        if v114.s > v68.MOVE_MIN then
-            v113[#v113 + 1] = v114.s
+        if v114.k85 > v68.k23 then
+            v113[#v113 + 1] = v114.k85
         end
     end
     table.sort(v113)
     local v115 = #v113 >= 6 and v113[math.max(1, math.floor(#v113 * 0.7))] or 16
-    local v116 = math.max(v68.MOVE_MIN, v115 * v68.MOVE_FRACTION)
-    local v117 = v68.ACCEL_TAU
-    local v118 = v117 * math.log(1 / v68.MOVE_FRACTION) + v68.SPAN / 2
-    local v119 = v117 * math.log(1 / (1 - v68.MOVE_FRACTION)) + v68.SPAN / 2
+    local v116 = math.max(v68.k23, v115 * v68.k22)
+    local v117 = v68.k3
+    local v118 = v117 * math.log(1 / v68.k22) + v68.k34 / 2
+    local v119 = v117 * math.log(1 / (1 - v68.k22)) + v68.k34 / 2
     local v120 = {
-        moveDur = {}, stopDur = {}, turnAngles = {}, startAngles = {},
-        stops = 0, sharp = 0, events = 0,
-        typical = v115, thr = v116,
+        k68 = {}, k92 = {}, k97 = {}, k90 = {},
+        k93 = 0, k87 = 0, k58 = 0,
+        k98 = v115, k95 = v116,
     }
     local v121, v122, v123, v124, v125, v126
     local v127, v128, v129
     local v130 = {}
     for _, v131 in v110 do
-        local v132 = v131.s > v116
-        local v133 = v132 and math.atan2(v131.z, v131.x) or nil
+        local v132 = v131.k85 > v116
+        local v133 = v132 and math.atan2(v131.k101, v131.k100) or nil
         if not v121 then
             v121 = v132 and "move" or "stop"
-            v122, v123 = v131.t, false
+            v122, v123 = v131.k94, false
             if v132 then
                 v124 = v133
                 v125, v126 = math.cos(v133), math.sin(v133)
@@ -337,25 +337,25 @@ function v68.motion(v106)
             if v132 then
                 table.insert(v130, v131)
                 local v134 = v90(v133 - v124)
-                if math.abs(v134) > v68.TURN then
+                if math.abs(v134) > v68.k39 then
                     local v135 = math.abs(v134) / 2
-                    local v136 = v131.t
+                    local v136 = v131.k94
                     for _, v137 in v130 do
-                        local v138 = v137.x * v125 + v137.z * v126
-                        local v139 = math.abs(v137.x * v126 - v137.z * v125)
+                        local v138 = v137.k100 * v125 + v137.k101 * v126
+                        local v139 = math.abs(v137.k100 * v126 - v137.k101 * v125)
                         if math.atan2(v139, v138) >= v135 then
-                            v136 = v137.t
+                            v136 = v137.k94
                             break
                         end
                     end
-                    v136 -= v68.TURN_LAG + v68.SPAN / 2
+                    v136 -= v68.k40 + v68.k34 / 2
                     if v123 then
-                        table.insert(v120.moveDur, v136 - v122)
+                        table.insert(v120.k68, v136 - v122)
                     end
-                    table.insert(v120.turnAngles, v134)
-                    v120.events += 1
+                    table.insert(v120.k97, v134)
+                    v120.k58 += 1
                     if math.abs(v134) > 1.6 then
-                        v120.sharp += 1
+                        v120.k87 += 1
                     end
                     v122, v123 = v136, true
                     v124 = v133
@@ -364,35 +364,35 @@ function v68.motion(v106)
                 end
             else
                 v121 = "low"
-                v127 = v131.t
-                v128 = v131.t - v118
+                v127 = v131.k94
+                v128 = v131.k94 - v118
                 v129 = v124
             end
         elseif v121 == "low" then
             if v132 then
                 local v140 = v90(v133 - v129)
-                if v131.t - v127 < v68.PASS then
-                    if math.abs(v140) > v68.TURN then
-                        local v141 = (v128 + v131.t - v119) / 2
+                if v131.k94 - v127 < v68.k29 then
+                    if math.abs(v140) > v68.k39 then
+                        local v141 = (v128 + v131.k94 - v119) / 2
                         if v123 then
-                            table.insert(v120.moveDur, v141 - v122)
+                            table.insert(v120.k68, v141 - v122)
                         end
-                        table.insert(v120.turnAngles, v140)
-                        v120.events += 1
+                        table.insert(v120.k97, v140)
+                        v120.k58 += 1
                         if math.abs(v140) > 1.6 then
-                            v120.sharp += 1
+                            v120.k87 += 1
                         end
                         v122, v123 = v141, true
                     end
                 else
-                    local v142 = v131.t - v119
+                    local v142 = v131.k94 - v119
                     if v123 then
-                        table.insert(v120.moveDur, v128 - v122)
+                        table.insert(v120.k68, v128 - v122)
                     end
-                    table.insert(v120.stopDur, v142 - v128)
-                    table.insert(v120.startAngles, v140)
-                    v120.stops += 1
-                    v120.events += 1
+                    table.insert(v120.k92, v142 - v128)
+                    table.insert(v120.k90, v140)
+                    v120.k93 += 1
+                    v120.k58 += 1
                     v122, v123 = v142, true
                 end
                 v121 = "move"
@@ -403,42 +403,42 @@ function v68.motion(v106)
         else
             if v132 then
                 v121 = "move"
-                v122, v123 = v131.t - v119, false
+                v122, v123 = v131.k94 - v119, false
                 v124 = v133
                 v125, v126 = math.cos(v133), math.sin(v133)
                 v130 = {}
             end
         end
     end
-    v120.state = v121
-    v120.ref = v124
+    v120.k91 = v121
+    v120.k81 = v124
     if v121 == "move" then
-        v120.elapsed = v108 - v122
+        v120.k56 = v108 - v122
     elseif v121 == "low" then
-        v120.lowFor = v108 - v127
-        v120.elapsed = v108 - v128
-        v120.ref = v129
-        if v120.lowFor >= v68.PASS then
-            v120.state = "stop"
+        v120.k66 = v108 - v127
+        v120.k56 = v108 - v128
+        v120.k81 = v129
+        if v120.k66 >= v68.k29 then
+            v120.k91 = "stop"
         end
     else
-        v120.elapsed = v108 - v109
+        v120.k56 = v108 - v109
     end
     return v120
 end
 
 local function v143(v144)
-    if v144 >= v68.TRUST_AT then
-        return v68.TRUST
+    if v144 >= v68.k38 then
+        return v68.k37
     end
-    return v144 / (v144 + v68.PRIOR_WEIGHT)
+    return v144 / (v144 + v68.k32)
 end
 
 local function v145(v146, v147, v148)
     local v149 = #v146
     if v149 > 0 and math.random() < v143(v149) then
         local v150 = math.sqrt(-2 * math.log(1 - math.random())) * math.cos(2 * math.pi * math.random())
-        return math.max(0.02, v146[math.random(1, v149)] * math.exp(v68.JITTER * v150))
+        return math.max(0.02, v146[math.random(1, v149)] * math.exp(v68.k15 * v150))
     end
     return v148 - v147 * math.log(1 - math.random())
 end
@@ -532,20 +532,20 @@ local function v180(v181, v182, v183)
     return v182.X + math.cos(v205) * v206, v182.Z + math.sin(v205) * v206, v194 / v184
 end
 
-function v68.aim(v207, v208, v209, v210)
-    local v211 = v207.list
+function v68.k47(v207, v208, v209, v210)
+    local v211 = v207.k65
     local v212 = #v211
     if v212 == 0 then
         return nil
     end
-    local v213 = v211[v212].t
-    local v214 = v211[v212].p
-    local v215, v216 = v68.fit(v207, v213, v68.FIT)
-    local v217 = v68.velocity(v207, v213, 0.035).Y
-    local v218 = math.abs(v217) > 6 or (not v207.grounded and v207.groundY ~= nil and v214.Y > v207.groundY + 0.5)
-    local v219 = v68.GRAVITY
-    local v220 = v207.groundY
-    local v221 = v209 and v68.KNIFE_RAISE or v68.GUN_RAISE
+    local v213 = v211[v212].k94
+    local v214 = v211[v212].k75
+    local v215, v216 = v68.k59(v207, v213, v68.k6)
+    local v217 = v68.k99(v207, v213, 0.035).Y
+    local v218 = math.abs(v217) > 6 or (not v207.k61 and v207.k60 ~= nil and v214.Y > v207.k60 + 0.5)
+    local v219 = v68.k8
+    local v220 = v207.k60
+    local v221 = v209 and v68.k18 or v68.k11
     local function v222(v223)
         if not v218 then
             return v214.Y + v221
@@ -556,7 +556,7 @@ function v68.aim(v207, v208, v209, v210)
         end
         return v224 + v221 * 0.5
     end
-    local v225 = math.max(0, v210 + v68.INTERP + v68.PROCESS)
+    local v225 = math.max(0, v210 + v68.k14 + v68.k33)
     if v212 < 8 then
         local v226 = v225
         if v209 then
@@ -564,32 +564,32 @@ function v68.aim(v207, v208, v209, v210)
         end
         return Vector3.new(v214.X + v215 * v226, v222(v226), v214.Z + v216 * v226), v226, 1
     end
-    local v227 = v68.motion(v207)
-    local v228 = v227.typical
-    local v229 = v68.velocity(v207, v213, v68.SPAN)
-    local v230 = v68.velocity(v207, v213 - v68.SPAN, v68.SPAN)
-    local v231, v232 = (v229.X - v230.X) / v68.SPAN, (v229.Z - v230.Z) / v68.SPAN
+    local v227 = v68.k67(v207)
+    local v228 = v227.k98
+    local v229 = v68.k99(v207, v213, v68.k34)
+    local v230 = v68.k99(v207, v213 - v68.k34, v68.k34)
+    local v231, v232 = (v229.X - v230.X) / v68.k34, (v229.Z - v230.Z) / v68.k34
     local v233 = math.sqrt(v215 * v215 + v216 * v216)
     local v234 = v233 > 0.5 and (v231 * v215 + v232 * v216) / v233 or 0
     local v235 = math.atan2(v216, v215)
     local v236 = v233
-    if v227.state == "move" then
-        local v237, v238 = v229.X + v231 * v68.ACCEL_LEAD, v229.Z + v232 * v68.ACCEL_LEAD
+    if v227.k91 == "move" then
+        local v237, v238 = v229.X + v231 * v68.k1, v229.Z + v232 * v68.k1
         local v239 = math.sqrt(v237 * v237 + v238 * v238)
-        if math.sqrt(v231 * v231 + v232 * v232) > v68.ACCEL_MIN and v239 > v227.thr then
+        if math.sqrt(v231 * v231 + v232 * v232) > v68.k2 and v239 > v227.k95 then
             v235 = math.atan2(v238, v237)
             if v233 < v228 * 0.85 and v239 > v233 then
                 v236 = math.min(v239, v228)
             end
         end
-        if v234 > v68.ACCEL_MIN and v233 < v228 * 0.85 then
+        if v234 > v68.k2 and v233 < v228 * 0.85 then
             v236 = v228
         end
     end
-    local v240 = (v227.stops + v68.STOP_PRIOR) / (v227.stops + v227.sharp + v68.STOP_PRIOR + v68.TURN_PRIOR)
+    local v240 = (v227.k93 + v68.k36) / (v227.k93 + v227.k87 + v68.k36 + v68.k41)
     local v241
-    if v227.state == "low" then
-        local v242, v243 = v229.X + v231 * v68.ACCEL_LEAD, v229.Z + v232 * v68.ACCEL_LEAD
+    if v227.k91 == "low" then
+        local v242, v243 = v229.X + v231 * v68.k1, v229.Z + v232 * v68.k1
         local v244 = math.clamp((math.sqrt(v242 * v242 + v243 * v243) / v228 - 0.3) / 0.4, 0, 1)
         local v245 = v240 * (1 - 0.7 * v244)
         local v246 = (1 - v240) * (0.3 + 0.7 * v244)
@@ -598,39 +598,39 @@ function v68.aim(v207, v208, v209, v210)
             v241 = math.atan2(v243, v242)
         end
     end
-    local v247 = (v227.stops + v68.STOP_PRIOR * 0.5) / (v227.events + v68.STOP_PRIOR * 0.5 + v68.TURN_PRIOR)
-    local v248 = v227.ref or v235
-    local v249 = v68.STEP
+    local v247 = (v227.k93 + v68.k36 * 0.5) / (v227.k58 + v68.k36 * 0.5 + v68.k41)
+    local v248 = v227.k81 or v235
+    local v249 = v68.k35
     local v250 = v209 and v225 + 1.6 or v225 + v249
     local v251 = {}
     local v252 = {}
-    local v253 = v68.ACCEL_TAU
-    for v254 = 1, v68.FUTURES do
+    local v253 = v68.k3
+    for v254 = 1, v68.k7 do
         local v255, v256 = v214.X, v214.Z
         local v257, v258 = v215, v216
         local v259, v260, v261, v262
         local v263
         local v264 = v248
-        if v227.state == "move" then
+        if v227.k91 == "move" then
             v259, v260, v261 = true, v235, v236
-            v263 = v155(v227.moveDur, v68.PRIOR_MOVE, 0.25, v227.elapsed)
-        elseif v227.state == "low" then
+            v263 = v155(v227.k68, v68.k30, 0.25, v227.k56)
+        elseif v227.k91 == "low" then
             if math.random() < v240 then
                 v259 = false
-                v263 = v155(v227.stopDur, v68.PRIOR_STOP, 0.15, v227.elapsed)
+                v263 = v155(v227.k92, v68.k31, 0.15, v227.k56)
             else
-                local v265 = v151(v227.turnAngles)
+                local v265 = v151(v227.k97)
                 if math.abs(v265) < 1.6 then
                     v265 = math.pi
                 end
                 v259, v260, v261 = true, v241 or v248 + v265, v228
                 v264 = v260
-                v263 = v145(v227.moveDur, v68.PRIOR_MOVE, 0.25)
+                v263 = v145(v227.k68, v68.k30, 0.25)
             end
         else
             v259 = false
-            v262 = v233 < v227.thr
-            v263 = v155(v227.stopDur, v68.PRIOR_STOP, 0.15, v227.elapsed)
+            v262 = v233 < v227.k95
+            v263 = v155(v227.k92, v68.k31, 0.15, v227.k56)
         end
         local v266 = 0
         local v267
@@ -662,17 +662,17 @@ function v68.aim(v207, v208, v209, v210)
                         v259 = false
                         v262 = false
                         v264 = v260
-                        v263 = v145(v227.stopDur, v68.PRIOR_STOP, 0.15)
+                        v263 = v145(v227.k92, v68.k31, 0.15)
                     else
-                        v260 += v151(v227.turnAngles)
-                        v263 = v145(v227.moveDur, v68.PRIOR_MOVE, 0.25)
+                        v260 += v151(v227.k97)
+                        v263 = v145(v227.k68, v68.k30, 0.25)
                     end
                 else
                     v259 = true
                     v262 = false
-                    v260 = v264 + v151(v227.startAngles)
+                    v260 = v264 + v151(v227.k90)
                     v261 = v228
-                    v263 = v145(v227.moveDur, v68.PRIOR_MOVE, 0.25)
+                    v263 = v145(v227.k68, v68.k30, 0.25)
                 end
             end
             v268(v275)
@@ -698,16 +698,16 @@ function v68.aim(v207, v208, v209, v210)
     end
     local v278, v279, v280
     if v209 then
-        v278, v279, v280 = v180(v251, v208, v68.KNIFE_RADIUS)
+        v278, v279, v280 = v180(v251, v208, v68.k17)
     else
-        v278, v279, v280 = v161(v251, v68.GUN_RADIUS)
+        v278, v279, v280 = v161(v251, v68.k10)
     end
     local v281 = v225
     if v209 then
         local v282, v283 = 0, 0
         for v284 = 1, #v251 do
             local v285, v286 = v251[v284][1] - v278, v251[v284][2] - v279
-            if v285 * v285 + v286 * v286 <= v68.KNIFE_RADIUS ^ 2 then
+            if v285 * v285 + v286 * v286 <= v68.k17 ^ 2 then
                 v282 += v252[v284]
                 v283 += 1
             end
@@ -717,32 +717,32 @@ function v68.aim(v207, v208, v209, v210)
     return Vector3.new(v278, v222(v281), v279), v281, v280
 end
 
-function v68.ready(v287, v288, v289)
+function v68.k79(v287, v288, v289)
     if v287 then
-        return v288 >= v68.KNIFE_SURE or v289 >= v68.KNIFE_HOLD
+        return v288 >= v68.k19 or v289 >= v68.k16
     end
-    return v288 >= v68.GUN_SURE or v289 >= v68.GUN_HOLD
+    return v288 >= v68.k12 or v289 >= v68.k9
 end
 
-function v68.newCalibration()
-    local v290 = { score = {}, shots = 0 }
+function v68.k69()
+    local v290 = { k86 = {}, k88 = 0 }
     local v291 = 0
-    local v292 = v68.OFFSET_MIN
-    while v292 <= v68.OFFSET_MAX + 1e-9 do
+    local v292 = v68.k25
+    while v292 <= v68.k24 + 1e-9 do
         v291 += 1
-        local v293 = (v292 - v68.OFFSET_PRIOR) / v68.OFFSET_SPREAD
-        v290.score[v291] = -0.5 * v293 * v293
-        v292 += v68.OFFSET_STEP
+        local v293 = (v292 - v68.k26) / v68.k27
+        v290.k86[v291] = -0.5 * v293 * v293
+        v292 += v68.k28
     end
     return v290
 end
 
-function v68.observeThrow(v294, v295, v296, v297, v298, v299, v300, v301)
-    local v302 = v295.list
+function v68.k71(v294, v295, v296, v297, v298, v299, v300, v301)
+    local v302 = v295.k65
     if #v302 < 2 then
         return false
     end
-    local v303 = v302[#v302].t
+    local v303 = v302[#v302].k94
     local v304 = v299 - v298
     local v305, v306 = v304.X, v304.Z
     local v307 = math.sqrt(v305 * v305 + v306 * v306)
@@ -750,11 +750,11 @@ function v68.observeThrow(v294, v295, v296, v297, v298, v299, v300, v301)
         return false
     end
     v305, v306 = v305 / v307, v306 / v307
-    local v308 = v68.KNIFE_RADIUS + 0.2
+    local v308 = v68.k17 + 0.2
     local v309 = {}
     local v310 = 0
-    local v311 = v68.OFFSET_MIN
-    while v311 <= v68.OFFSET_MAX + 1e-9 do
+    local v311 = v68.k25
+    while v311 <= v68.k24 + 1e-9 do
         v310 += 1
         local v312 = false
         local v313 = false
@@ -765,7 +765,7 @@ function v68.observeThrow(v294, v295, v296, v297, v298, v299, v300, v301)
                 break
             end
             v313 = true
-            local v316 = v68.at(v295, v315)
+            local v316 = v68.k50(v295, v315)
             local v317, v318 = v298.X + v305 * v300 * v314, v298.Z + v306 * v300 * v314
             local v319, v320 = v316.X - v317, v316.Z - v318
             if v319 * v319 + v320 * v320 <= v308 * v308 then
@@ -781,7 +781,7 @@ function v68.observeThrow(v294, v295, v296, v297, v298, v299, v300, v301)
         else
             v309[v310] = v312 and 0.2 or 0.85
         end
-        v311 += v68.OFFSET_STEP
+        v311 += v68.k28
     end
     local v321, v322 = math.huge, -math.huge
     for _, v323 in v309 do
@@ -792,18 +792,18 @@ function v68.observeThrow(v294, v295, v296, v297, v298, v299, v300, v301)
         return false
     end
     for v324, v325 in v309 do
-        v294.score[v324] += math.log(v325)
+        v294.k86[v324] += math.log(v325)
     end
-    v294.shots += 1
+    v294.k88 += 1
     return true
 end
 
-function v68.observeShot(v326, v327, v328, v329, v330, v331, v332)
-    local v333 = v327.list
+function v68.k70(v326, v327, v328, v329, v330, v331, v332)
+    local v333 = v327.k65
     if #v333 < 2 then
         return false
     end
-    local v334 = v333[#v333].t
+    local v334 = v333[#v333].k94
     local v335 = v331 - v330
     local v336, v337 = v335.X, v335.Z
     local v338 = math.sqrt(v336 * v336 + v337 * v337)
@@ -814,11 +814,11 @@ function v68.observeShot(v326, v327, v328, v329, v330, v331, v332)
     local v339 = false
     local v340 = {}
     local v341 = 0
-    local v342 = v68.OFFSET_MIN
-    while v342 <= v68.OFFSET_MAX + 1e-9 do
+    local v342 = v68.k25
+    while v342 <= v68.k24 + 1e-9 do
         v341 += 1
         local v343 = v328 + v329 + v342
-        local v344 = v68.at(v327, v343)
+        local v344 = v68.k50(v327, v343)
         local v345
         if v343 > v334 then
             v345 = 0.5
@@ -838,7 +838,7 @@ function v68.observeShot(v326, v327, v328, v329, v330, v331, v332)
             end
         end
         v340[v341] = v345
-        v342 += v68.OFFSET_STEP
+        v342 += v68.k28
     end
     local v354, v355 = math.huge, -math.huge
     for _, v356 in v340 do
@@ -850,29 +850,29 @@ function v68.observeShot(v326, v327, v328, v329, v330, v331, v332)
         return false
     end
     for v357, v358 in v340 do
-        v326.score[v357] += math.log(v358)
+        v326.k86[v357] += math.log(v358)
     end
-    v326.shots += 1
+    v326.k88 += 1
     return true
 end
 
-function v68.offset(v359)
-    if v359.shots < v68.LEARN_AFTER then
+function v68.k73(v359)
+    if v359.k88 < v68.k21 then
         return nil
     end
     local v360, v361 = 1, -math.huge
-    for v362, v363 in v359.score do
+    for v362, v363 in v359.k86 do
         if v363 > v361 then
             v360, v361 = v362, v363
         end
     end
-    return v68.OFFSET_MIN + (v360 - 1) * v68.OFFSET_STEP
+    return v68.k25 + (v360 - 1) * v68.k28
 end
 
-function v68.apply(v364)
-    local v365 = v68.offset(v364)
+function v68.k48(v364)
+    local v365 = v68.k73(v364)
     if v365 then
-        v68.INTERP = math.clamp(v365 - v68.PROCESS, v68.OFFSET_MIN, v68.OFFSET_MAX)
+        v68.k14 = math.clamp(v365 - v68.k33, v68.k25, v68.k24)
     end
     return v365
 end
@@ -905,7 +905,7 @@ task.spawn(function()
         if v375 then
             v369 += (math.clamp(v375, 0, 0.6) - v369) * 0.35
         end
-        v68.GRAVITY = v7.Gravity
+        v68.k8 = v7.Gravity
         task.wait(0.5)
     end
 end)
@@ -928,46 +928,46 @@ end
 v378()
 
 local v382 = {}
-local v383 = { kind = nil, tool = nil, remote = nil, attachment = nil }
+local v383 = { k63 = nil, k96 = nil, k82 = nil, k51 = nil }
 local v384
 local v385 = {}
 local v386
 local v387
 
 local v388 = 3
-local v389 = v9.__MM2Cal
-if type(v389) ~= "table" or v9.__MM2CalJob ~= game.JobId or v9.__MM2CalVersion ~= v388 then
-    v389 = v68.newCalibration()
-    v9.__MM2Cal, v9.__MM2CalJob, v9.__MM2CalVersion = v389, game.JobId, v388
+local v389 = v9.__c44
+if type(v389) ~= "table" or v9.__c45 ~= game.JobId or v9.__c46 ~= v388 then
+    v389 = v68.k69()
+    v9.__c44, v9.__c45, v9.__c46 = v389, game.JobId, v388
 end
 local function v390()
-    v68.apply(v389)
+    v68.k48(v389)
 end
 v390()
 
 local function v391(v392)
-    return (v392 == "Gun" and v15.GunAim) or (v392 == "Knife" and v15.KnifeAim)
+    return (v392 == "Gun" and v15.k13) or (v392 == "Knife" and v15.k20)
 end
 
 local function v393()
     local v394 = v8.Character
     local v395 = v394 and v394:FindFirstChildOfClass("Tool")
-    if v395 == v383.tool and (not v395 or v383.remote and v383.remote.Parent) then
+    if v395 == v383.k96 and (not v395 or v383.k82 and v383.k82.Parent) then
         return
     end
-    v383.tool, v383.kind, v383.remote = v395, nil, nil
+    v383.k96, v383.k63, v383.k82 = v395, nil, nil
     if v395 then
         if v28(v395) then
             local v396 = v395:FindFirstChild("Events")
-            v383.kind = "Knife"
-            v383.remote = v396 and v396:FindFirstChild("KnifeThrown")
+            v383.k63 = "Knife"
+            v383.k82 = v396 and v396:FindFirstChild("KnifeThrown")
         elseif v25(v395) then
-            v383.kind = "Gun"
-            v383.remote = v395:FindFirstChild("Shoot")
+            v383.k63 = "Gun"
+            v383.k82 = v395:FindFirstChild("Shoot")
         end
     end
     local v397 = v394 and v394:FindFirstChild("HumanoidRootPart")
-    v383.attachment = v397 and v397:FindFirstChild("GunRaycastAttachment")
+    v383.k51 = v397 and v397:FindFirstChild("GunRaycastAttachment")
 end
 
 local function v398(v399, v400)
@@ -1011,7 +1011,7 @@ local function v404(v405)
                     local v423 = (Vector2.new(v421.X, v421.Y) - v408).Magnitude
                     if v423 <= v409 and v398(v411, v418) then
                         local v424 = v419 == "Sheriff" or v419 == "Hero"
-                        local v425 = { plr = v416, root = v417, char = v418, off = v423 / v409, priority = v424 }
+                        local v425 = { k76 = v416, k83 = v417, k53 = v418, k72 = v423 / v409, k77 = v424 }
                         if v419 == "Murderer" then
                             v413 = v425
                         end
@@ -1020,7 +1020,7 @@ local function v404(v405)
                         if v405 == "Knife" and v424 then
                             v426 -= 40
                         end
-                        if v384 and v384.plr == v416 then
+                        if v384 and v384.k76 == v416 then
                             v426 -= 25
                         end
                         if not v415 or v426 < v415 then
@@ -1047,18 +1047,18 @@ local function v427(v428, v429)
 end
 
 local function v431(v432, v433, v434)
-    if not v432 or not v432.root.Parent then
+    if not v432 or not v432.k83.Parent then
         return nil
     end
-    local v435 = v382[v432.plr]
-    if not v435 or v435.root ~= v432.root or #v435.list < 2 then
+    local v435 = v382[v432.k76]
+    if not v435 or v435.k83 ~= v432.k83 or #v435.k65 < 2 then
         return nil
     end
-    local v436, _, v437 = v68.aim(v435, v434, v433 == "Knife" and v366 or nil, v369)
+    local v436, _, v437 = v68.k47(v435, v434, v433 == "Knife" and v366 or nil, v369)
     if not v436 then
         return nil
     end
-    local v438 = v435.list[#v435.list].p
+    local v438 = v435.k65[#v435.k65].k75
     local v439 = v436 - v438
     if v439.Magnitude > 0.5 then
         local v440 = v376(v7, v438, v439, v377)
@@ -1084,7 +1084,7 @@ local function v443(v444, v445)
         for _, v450 in v385 do
             local v451, v452 = v431(v450, v444, v445)
             if v451 then
-                local v453 = v452 - 0.25 * v450.off + (v450.priority and 0.08 or 0)
+                local v453 = v452 - 0.25 * v450.k72 + (v450.k77 and 0.08 or 0)
                 if not v449 or v453 > v449 then
                     v446, v447, v448, v449 = v450, v451, v452, v453
                 end
@@ -1112,10 +1112,10 @@ local function v461(v462, v463)
     if typeof(v463) == "CFrame" then
         return v463.Position
     end
-    if v462 == "Gun" and v383.attachment then
-        return v383.attachment.WorldPosition
+    if v462 == "Gun" and v383.k51 then
+        return v383.k51.WorldPosition
     end
-    local v464 = v383.tool and v383.tool:FindFirstChild("Handle")
+    local v464 = v383.k96 and v383.k96:FindFirstChild("Handle")
     return v464 and v464.Position
 end
 
@@ -1125,11 +1125,11 @@ local function v465(v466, v467)
 end
 
 local function v469(v470, v471, v472, v473)
-    local v474 = v471 and v382[v471.plr]
+    local v474 = v471 and v382[v471.k76]
     if not v474 then
         return
     end
-    local v475 = { kind = v470, t = os.clock(), rtt = v369, origin = v472, aim = v473, rec = v474, char = v471.char, tool = v383.tool }
+    local v475 = { k63 = v470, k94 = os.clock(), k84 = v369, k74 = v472, k47 = v473, k80 = v474, k53 = v471.k53, k96 = v383.k96 }
     if v470 == "Gun" then
         v387 = v475
         return
@@ -1138,9 +1138,9 @@ local function v469(v470, v471, v472, v473)
         if v10 then
             return
         end
-        local v476 = v474.deadAt
-        local v477 = v476 ~= nil and v476 >= v475.t and v476 <= v475.t + 1.7
-        if v68.observeThrow(v389, v474, v475.t, v475.rtt, v475.origin, v475.aim, v366, v477) then
+        local v476 = v474.k55
+        local v477 = v476 ~= nil and v476 >= v475.k94 and v476 <= v475.k94 + 1.7
+        if v68.k71(v389, v474, v475.k94, v475.k84, v475.k74, v475.k47, v366, v477) then
             v390()
         end
     end)
@@ -1148,11 +1148,11 @@ end
 
 local function v478(v479, v480, v481, v482)
     local v483 = v387
-    if not v483 or v479 ~= v483.tool or typeof(v481) ~= "Vector3" or os.clock() - v483.t > 1.5 then
+    if not v483 or v479 ~= v483.k96 or typeof(v481) ~= "Vector3" or os.clock() - v483.k94 > 1.5 then
         return
     end
     v387 = nil
-    local v484 = v483.origin
+    local v484 = v483.k74
     if typeof(v480) == "Vector3" then
         v484 = v480
     elseif typeof(v480) == "Instance" then
@@ -1162,12 +1162,12 @@ local function v478(v479, v480, v481, v482)
             v484 = v480.Position
         end
     end
-    local v485 = typeof(v482) == "Instance" and v483.char ~= nil and v482:IsDescendantOf(v483.char)
+    local v485 = typeof(v482) == "Instance" and v483.k53 ~= nil and v482:IsDescendantOf(v483.k53)
     task.delay(1.1, function()
         if v10 then
             return
         end
-        if v68.observeShot(v389, v483.rec, v483.t, v483.rtt, v484, v481, v485) then
+        if v68.k70(v389, v483.k80, v483.k94, v483.k84, v484, v481, v485) then
             v390()
         end
     end)
@@ -1185,19 +1185,19 @@ end)
 
 local function v489(v490)
     v386 = nil
-    local v491 = v490.args
-    if v490.kind == "Gun" and v383.attachment and typeof(v491[1]) == "CFrame" then
-        v491[1] = v383.attachment.WorldCFrame
+    local v491 = v490.k49
+    if v490.k63 == "Gun" and v383.k51 and typeof(v491[1]) == "CFrame" then
+        v491[1] = v383.k51.WorldCFrame
     end
-    local v492 = v461(v490.kind, v491[1]) or v490.origin
-    local v493, _, v494 = v443(v490.kind, v492)
+    local v492 = v461(v490.k63, v491[1]) or v490.k74
+    local v493, _, v494 = v443(v490.k63, v492)
     if v493 then
-        v491[2] = v456(v490.kind, v492, v493)
-    elseif v490.aim then
-        v491[2] = v490.aim
+        v491[2] = v456(v490.k63, v492, v493)
+    elseif v490.k47 then
+        v491[2] = v490.k47
     end
-    if pcall(v465, v490.remote, v491) and typeof(v491[2]) == "CFrame" then
-        v469(v490.kind, v494 or v490.entry, v492, v491[2].Position)
+    if pcall(v465, v490.k82, v491) and typeof(v491[2]) == "CFrame" then
+        v469(v490.k63, v494 or v490.k57, v492, v491[2].Position)
     end
 end
 
@@ -1206,7 +1206,7 @@ v12(v2.PreSimulation:Connect(function()
     if v10 then
         return
     end
-    if not (v15.GunAim or v15.KnifeAim) then
+    if not (v15.k13 or v15.k20) then
         if next(v382) then
             table.clear(v382)
         end
@@ -1225,19 +1225,19 @@ v12(v2.PreSimulation:Connect(function()
             local v500 = v498 and v498:FindFirstChildOfClass("Humanoid")
             if v499 and v500 then
                 local v501 = v382[v497]
-                if not v501 or v501.root ~= v499 then
+                if not v501 or v501.k83 ~= v499 then
                     v501 = v68.new()
-                    v501.root = v499
+                    v501.k83 = v499
                     v382[v497] = v501
                 end
                 if v500.Health <= 0 then
-                    v501.deadAt = v501.deadAt or v496
+                    v501.k55 = v501.k55 or v496
                 end
-                if not v501.deadAt or v496 - v501.deadAt < 0.6 then
+                if not v501.k55 or v496 - v501.k55 < 0.6 then
                     local v502 = v500:GetState()
                     local v503 = v500.FloorMaterial ~= Enum.Material.Air
                         or (v502 ~= Enum.HumanoidStateType.Freefall and v502 ~= Enum.HumanoidStateType.Jumping)
-                    v68.push(v501, v496, v499.Position, v503)
+                    v68.k78(v501, v496, v499.Position, v503)
                 end
             else
                 v382[v497] = nil
@@ -1249,20 +1249,20 @@ v12(v2.PreSimulation:Connect(function()
         v378()
     end
     v393()
-    if v383.kind and v391(v383.kind) then
-        v384 = v404(v383.kind)
+    if v383.k63 and v391(v383.k63) then
+        v384 = v404(v383.k63)
     else
         v384 = nil
         table.clear(v385)
     end
     local v504 = v386
     if v504 then
-        if v504.remote ~= v383.remote or not v384 then
+        if v504.k82 ~= v383.k82 or not v384 then
             v489(v504)
         else
-            local v505 = v461(v504.kind, v383.attachment and v383.attachment.WorldCFrame) or v504.origin
-            local _, v506 = v443(v504.kind, v505)
-            if not v506 or v68.ready(v504.kind == "Knife", v506, v496 - v504.start) then
+            local v505 = v461(v504.k63, v383.k51 and v383.k51.WorldCFrame) or v504.k74
+            local _, v506 = v443(v504.k63, v505)
+            if not v506 or v68.k79(v504.k63 == "Knife", v506, v496 - v504.k89) then
                 v489(v504)
             end
         end
@@ -1273,7 +1273,7 @@ v12(v1.PlayerRemoving:Connect(function(v507)
 end))
 
 local function v508(v509, v510)
-    local v511 = v383.kind
+    local v511 = v383.k63
     local v512 = v461(v511, v510[1])
     if not v512 then
         return false
@@ -1283,11 +1283,11 @@ local function v508(v509, v510)
         return false
     end
     local v516 = v456(v511, v512, v513)
-    if not v68.ready(v511 == "Knife", v514, 0) then
+    if not v68.k79(v511 == "Knife", v514, 0) then
         if v386 then
             v489(v386)
         end
-        v386 = { remote = v509, args = v510, kind = v511, origin = v512, aim = v516, entry = v515, start = os.clock() }
+        v386 = { k82 = v509, k49 = v510, k63 = v511, k74 = v512, k47 = v516, k57 = v515, k89 = os.clock() }
         return true
     end
     v510[2] = v516
@@ -1303,10 +1303,10 @@ if typeof(hookmetamethod) == "function" and typeof(getnamecallmethod) == "functi
         return false
     end
     local function v520(self, ...)
-        if v10 or self ~= v383.remote then
+        if v10 or self ~= v383.k82 then
             return v518(self, ...)
         end
-        if getnamecallmethod() ~= "FireServer" or v519() or not v391(v383.kind) then
+        if getnamecallmethod() ~= "FireServer" or v519() or not v391(v383.k63) then
             return v518(self, ...)
         end
         local v521 = table.pack(...)
@@ -1331,7 +1331,7 @@ local v525, v526
 if not v517 and type(v524) == "table" then
     v525, v526 = v524.GetMouseTargetCFrame, v524.GetTargetPosition
     local function v527()
-        local v528 = v383.kind
+        local v528 = v383.k63
         if v10 or not v528 or not v391(v528) then
             return nil
         end
@@ -1369,8 +1369,8 @@ local v539 = {
 local function v540(v541)
     local v542 = v538[v541]
     if v542 then
-        v542.hl:Destroy()
-        v542.bb:Destroy()
+        v542.k62:Destroy()
+        v542.k52:Destroy()
         v538[v541] = nil
     end
 end
@@ -1380,10 +1380,10 @@ local function v543()
         if v544 ~= v8 then
             local v545, _, v546 = v41(v544)
             local v547, v548 = v35(v544)
-            if v15.Esp and v545 and not v548 then
+            if v15.k5 and v545 and not v548 then
                 local v549 = v539[v547] or v539.Innocent
                 local v550 = v538[v544]
-                if not v550 or v550.char ~= v546 then
+                if not v550 or v550.k53 ~= v546 then
                     v540(v544)
                     local v551 = Instance.new("Highlight")
                     v551.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
@@ -1405,14 +1405,14 @@ local function v543()
                     v553.TextStrokeTransparency = 0.4
                     v553.Text = v544.DisplayName
                     v553.Parent = v552
-                    v550 = { hl = v551, bb = v552, label = v553, char = v546 }
+                    v550 = { k62 = v551, k52 = v552, k64 = v553, k53 = v546 }
                     v538[v544] = v550
                 end
-                if v550.color ~= v549 then
-                    v550.color = v549
-                    v550.hl.FillColor = v549
-                    v550.hl.OutlineColor = v549
-                    v550.label.TextColor3 = v549
+                if v550.k54 ~= v549 then
+                    v550.k54 = v549
+                    v550.k62.FillColor = v549
+                    v550.k62.OutlineColor = v549
+                    v550.k64.TextColor3 = v549
                 end
             else
                 v540(v544)
@@ -1455,7 +1455,7 @@ local function v557(v558)
     return v560
 end
 v12(v2.PreSimulation:Connect(function()
-    if not v15.AntiFling then
+    if not v15.k4 then
         v556 = nil
         return
     end
@@ -1592,14 +1592,14 @@ v597:Toggle({
     Title = "Gun Silent Aim",
     Default = false,
     Callback = function(v598)
-        v15.GunAim = v598
+        v15.k13 = v598
     end,
 })
 v597:Toggle({
     Title = "Murderer Silent Aim",
     Default = false,
     Callback = function(v599)
-        v15.KnifeAim = v599
+        v15.k20 = v599
     end,
 })
 v597:Section({ Title = "Other" })
@@ -1607,14 +1607,14 @@ v597:Toggle({
     Title = "ESP",
     Default = false,
     Callback = function(v600)
-        v15.Esp = v600
+        v15.k5 = v600
     end,
 })
 v597:Toggle({
     Title = "Anti Fling",
     Default = false,
     Callback = function(v601)
-        v15.AntiFling = v601
+        v15.k4 = v601
         if not v601 then
             table.clear(v554)
         end
@@ -1636,7 +1636,7 @@ pcall(function()
     v603:SetValue("K")
 end)
 
-v9.__CustomMM2Unload = function()
+v9.__c43 = function()
     v10 = true
     if v386 then
         pcall(v489, v386)
