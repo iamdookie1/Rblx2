@@ -98,6 +98,7 @@ local Settings = {
     Hitbox = false, HitboxSize = 8, HitboxTransparency = 75, HitboxSkipCrew = true, HitboxSkipKnocked = true,
     -- macro
     CustomMacro = false, MacroButton = true, MacroHold = false, MacroTurn = 100, MacroOnlyMoving = true, MacroOnlyAir = false,
+    QuickMacro = false, QuickEmote = nil, QuickEmoteWait = 0.15, QuickNudge = 0.3, QuickLockpick = true,
     -- world
     AtmEsp = false, VaultEsp = false, ItemEsp = false, WorldShowBroken = false, WorldEspMax = 1500,
     AtmColor = Color3.fromRGB(90, 255, 120), VaultColor = Color3.fromRGB(255, 215, 70), ItemColor = Color3.fromRGB(150, 200, 255),
@@ -1501,6 +1502,166 @@ do
     end
 end
 
+--// Quick macro: emote -> wait -> lockpick -> nudge \\--
+-- One tap while a macro is on: plays an emote from your equipped emote wheel
+-- (Humanoid:PlayEmote, the same thing the wheel does), waits, pulls out a
+-- lockpick if you have one, and steps a tiny bit forward to cancel the emote.
+local Quick = { info = "", runs = 0 }
+do
+    function Quick.emotes()
+        local list = {}
+        local c = myChar()
+        local hum = c and c:FindFirstChildOfClass("Humanoid")
+        local desc = hum and hum:FindFirstChildOfClass("HumanoidDescription")
+        if not desc then
+            return list
+        end
+        local ok, eq = pcall(desc.GetEquippedEmotes, desc)
+        if ok and type(eq) == "table" then
+            table.sort(eq, function(a, b)
+                return (a.Slot or 0) < (b.Slot or 0)
+            end)
+            for _, e in eq do
+                if e.Name and not table.find(list, e.Name) then
+                    table.insert(list, e.Name)
+                end
+            end
+        end
+        return list
+    end
+    local function lockpick()
+        local c = myChar()
+        if c and c:FindFirstChild("[LockPicker]") then
+            return c["[LockPicker]"]
+        end
+        local bp = LocalPlayer:FindFirstChild("Backpack")
+        return bp and bp:FindFirstChild("[LockPicker]")
+    end
+    local busy = false
+    function Quick.run()
+        if busy then
+            return
+        end
+        if not (Macro.gameOn() or Macro.active()) then
+            Quick.info = "turn a macro on first"
+            notify("Quick macro needs the game's macro or the custom macro on", 2)
+            return
+        end
+        local c = myChar()
+        local hum = c and c:FindFirstChildOfClass("Humanoid")
+        local root = c and c:FindFirstChild("HumanoidRootPart")
+        if not (hum and root) or hum.Health <= 0 or Game.knocked(c) then
+            return
+        end
+        local emote = Settings.QuickEmote
+        if not emote or emote == "" then
+            emote = Quick.emotes()[1]
+        end
+        if not emote then
+            Quick.info = "no emotes equipped"
+            notify("Equip an emote in your emote wheel first", 2)
+            return
+        end
+        busy = true
+        task.spawn(function()
+            -- PlayEmote only works standing: drop the held tool first.
+            if c:FindFirstChildOfClass("Tool") then
+                hum:UnequipTools()
+                RunService.Heartbeat:Wait()
+            end
+            local ok, played = pcall(hum.PlayEmote, hum, emote)
+            if not (ok and played) then
+                Quick.info = "emote didn't play (jumping / falling?)"
+                busy = false
+                return
+            end
+            task.wait(Settings.QuickEmoteWait)
+            if Settings.QuickLockpick then
+                local lp = lockpick()
+                if lp and lp.Parent ~= c then
+                    hum:EquipTool(lp)
+                end
+            end
+            -- A tiny step forward cancels the emote.
+            local look = root.CFrame.LookVector
+            local flat = Vector3.new(look.X, 0, look.Z)
+            flat = flat.Magnitude > 0 and flat.Unit or Vector3.new(0, 0, -1)
+            root.CFrame += flat * Settings.QuickNudge
+            local t = os.clock()
+            while os.clock() - t < 0.06 do
+                hum:Move(flat, false)
+                RunService.Heartbeat:Wait()
+            end
+            hum:Move(Vector3.zero, false)
+            Quick.runs += 1
+            Quick.info = ("did %s"):format(emote)
+            busy = false
+        end)
+    end
+
+    -- On-screen QUICK button (drag it anywhere, tap to run).
+    local gui = Instance.new("ScreenGui")
+    gui.Name = "DHQuickMacro"
+    gui.ResetOnSpawn = false
+    gui.DisplayOrder = 50
+    local ok, parent = pcall(function()
+        return (typeof(gethui) == "function" and gethui()) or game:GetService("CoreGui")
+    end)
+    if not (ok and pcall(function()
+        gui.Parent = parent
+    end)) then
+        gui.Parent = LocalPlayer:WaitForChild("PlayerGui")
+    end
+    local b = Instance.new("TextButton")
+    b.Size = UDim2.fromOffset(72, 72)
+    b.Position = UDim2.new(1, -170, 0.5, 46)
+    b.BackgroundColor3 = Color3.fromRGB(35, 35, 40)
+    b.TextColor3 = Color3.new(1, 1, 1)
+    b.Font = Enum.Font.GothamBold
+    b.TextSize = 14
+    b.Text = "QUICK"
+    b.AutoButtonColor = false
+    b.Parent = gui
+    Instance.new("UICorner", b).CornerRadius = UDim.new(1, 0)
+    local stroke = Instance.new("UIStroke", b)
+    stroke.Thickness = 2
+    stroke.Color = Color3.fromRGB(70, 70, 78)
+    local downAt, startPos, dragging, inputObj = nil, nil, false, nil
+    bind(b.InputBegan, function(i)
+        if i.UserInputType == Enum.UserInputType.Touch or i.UserInputType == Enum.UserInputType.MouseButton1 then
+            downAt, startPos, dragging, inputObj = i.Position, b.Position, false, i
+        end
+    end)
+    bind(UserInputService.InputChanged, function(i)
+        if downAt and (i == inputObj or i.UserInputType == Enum.UserInputType.MouseMovement) then
+            local d = i.Position - downAt
+            if d.Magnitude > 12 then
+                dragging = true
+            end
+            if dragging then
+                b.Position = startPos + UDim2.fromOffset(d.X, d.Y)
+            end
+        end
+    end)
+    bind(UserInputService.InputEnded, function(i)
+        if downAt and (i == inputObj or i.UserInputType == Enum.UserInputType.MouseButton1) then
+            if not dragging then
+                Quick.run()
+            end
+            downAt = nil
+        end
+    end)
+    table.insert(Cleanups, function()
+        gui:Destroy()
+    end)
+    loop(0.2, function()
+        gui.Enabled = Settings.QuickMacro
+        local ready = Macro.gameOn() or Macro.active()
+        stroke.Color = ready and Color3.fromRGB(90, 210, 120) or Color3.fromRGB(70, 70, 78)
+        b.BackgroundColor3 = busy and Color3.fromRGB(40, 120, 55) or Color3.fromRGB(35, 35, 40)
+    end)
+end
+
 --// World: ATMs, vaults, dropped items \\--
 local World = { atms = 0, vaults = 0 }
 do
@@ -1883,6 +2044,45 @@ do
     slider(Mac, "MacroTurn", "Turn speed", 10, 300, 0, "%", "100 is exactly the game's own macro")
     toggle(Mac, "MacroOnlyMoving", "Only while moving")
     toggle(Mac, "MacroOnlyAir", "Only in the air")
+    local Qm = Tab:AddRightGroupbox("Quick macro", "sparkles")
+    toggle(Qm, "QuickMacro", "Quick macro button",
+        "A QUICK button on screen: with a macro on, one tap plays your emote, waits, pulls out a lockpick and steps forward to cancel the emote")
+    local emoteDD = Qm:AddDropdown("QuickEmote", {
+        Text = "Emote", Values = Quick.emotes(), Default = nil,
+        Tooltip = "From your equipped emote wheel. Empty = the first one",
+        Callback = function(v)
+            Settings.QuickEmote = v
+        end,
+    })
+    Qm:AddButton({
+        Text = "Refresh emotes",
+        Func = function()
+            pcall(function()
+                emoteDD:SetValues(Quick.emotes())
+            end)
+        end,
+    })
+    slider(Qm, "QuickEmoteWait", "Wait before lockpick", 0, 1.5, 2, " s")
+    toggle(Qm, "QuickLockpick", "Pull out lockpick", "Only if you have a [LockPicker]")
+    slider(Qm, "QuickNudge", "Forward step", 0.05, 2, 2, " studs", "How far the cancel step moves you")
+    Qm:AddButton({ Text = "Run once", Func = function() Quick.run() end })
+    status(Qm, function()
+        return ("Quick: %s\nRuns: %d"):format(Quick.info ~= "" and Quick.info or "ready", Quick.runs)
+    end)
+    task.defer(function()
+        -- Fill the emote list once your character has loaded.
+        for _ = 1, 20 do
+            local list = Quick.emotes()
+            if #list > 0 then
+                pcall(function()
+                    emoteDD:SetValues(list)
+                end)
+                break
+            end
+            task.wait(1)
+        end
+    end)
+
     status(Mac, function()
         return ("Server allows macro: %s\nSkinny: %s\nGame macro: %s\nCustom: %s"):format(
             Macro.allowed() and "yes" or "no", Macro.skinny() and "yes" or "no", Macro.gameOn() and "on" or "off", Macro.info)
