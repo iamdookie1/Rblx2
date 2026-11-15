@@ -3,6 +3,7 @@ local RunService = game:GetService("RunService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local UserInputService = game:GetService("UserInputService")
 local CollectionService = game:GetService("CollectionService")
+local Stats = game:GetService("Stats")
 local Workspace = workspace
 local LocalPlayer = Players.LocalPlayer
 
@@ -23,8 +24,6 @@ local LumeUI = loadstring(game:HttpGet("https://github.com/SSHRKs/LumeUI/release
 local Settings = {
     GunAim = false,
     KnifeAim = false,
-    GunPrediction = 0,
-    KnifePrediction = 0,
     Esp = false,
     AntiFling = false,
 }
@@ -172,6 +171,409 @@ local function aimPoint()
     return UserInputService:GetMouseLocation()
 end
 
+local Predict = {
+    WINDOW = 2.0,
+    SPAN = 0.034,
+    GRAVITY = 196.2,
+    INTERP = 0.06,
+    PROCESS = 0.01,
+    FUTURES = 64,
+    STEP = 1 / 30,
+    MOVING = 4,
+    TURN = 0.7,
+    PRIOR_DURATION = 1.5,
+    PRIOR_WEIGHT = 1.5,
+    GUN_RADIUS = 1.0,
+    KNIFE_RADIUS = 1.2,
+    ACCEL_LEAD = 0.05,
+    TURN_LAG = 0.035,
+    ACCEL_TAU = 0.05,
+    TRUST_AT = 3,
+    TRUST = 0.9,
+    JITTER = 0.2,
+    GUN_HOLD = 0.2,
+    GUN_SURE = 0.85,
+    KNIFE_HOLD = 0,
+    KNIFE_SURE = 0.7,
+}
+
+function Predict.new()
+    return { list = {}, groundY = nil, grounded = true }
+end
+
+function Predict.push(rec, now, pos, grounded)
+    local list = rec.list
+    local n = #list
+    if n > 0 and now <= list[n].t then
+        return
+    end
+    list[n + 1] = { t = now, p = pos }
+    n += 1
+    if grounded then
+        rec.groundY = pos.Y
+    end
+    rec.grounded = grounded
+    local cut = now - Predict.WINDOW - 0.2
+    local drop = 0
+    while drop < n - 2 and list[drop + 1].t < cut do
+        drop += 1
+    end
+    if drop > 0 then
+        table.move(list, drop + 1, n, 1)
+        for i = n - drop + 1, n do
+            list[i] = nil
+        end
+    end
+end
+
+function Predict.at(rec, t)
+    local list = rec.list
+    local n = #list
+    if t >= list[n].t then
+        return list[n].p
+    end
+    if t <= list[1].t then
+        return list[1].p
+    end
+    local lo, hi = 1, n
+    while hi - lo > 1 do
+        local mid = (lo + hi) // 2
+        if list[mid].t <= t then
+            lo = mid
+        else
+            hi = mid
+        end
+    end
+    local a, b = list[lo], list[hi]
+    return a.p + (b.p - a.p) * ((t - a.t) / math.max(b.t - a.t, 1e-6))
+end
+
+function Predict.velocity(rec, t, span)
+    return (Predict.at(rec, t) - Predict.at(rec, t - span)) / span
+end
+
+local function wrap(a)
+    a = (a + math.pi) % (2 * math.pi)
+    return a - math.pi
+end
+
+function Predict.turns(rec)
+    local list = rec.list
+    local now = list[#list].t
+    local first = math.max(list[1].t + Predict.SPAN, now - Predict.WINDOW)
+    local events = {}
+    local ref, refX, refZ
+    local since = {}
+    local t = first
+    while t <= now + 1e-6 do
+        local v = Predict.velocity(rec, t, Predict.SPAN)
+        local moving = v.X * v.X + v.Z * v.Z > Predict.MOVING * Predict.MOVING
+        if ref then
+            table.insert(since, { t = t, x = v.X, z = v.Z })
+        end
+        if moving then
+            local h = math.atan2(v.Z, v.X)
+            if not ref then
+                ref = h
+                refX, refZ = math.cos(h), math.sin(h)
+            else
+                local d = wrap(h - ref)
+                if math.abs(d) > Predict.TURN then
+                    local half = math.abs(d) / 2
+                    local at = t
+                    for _, smp in since do
+                        local proj = smp.x * refX + smp.z * refZ
+                        local perp = math.abs(smp.x * refZ - smp.z * refX)
+                        if math.atan2(perp, proj) >= half then
+                            at = smp.t
+                            break
+                        end
+                    end
+                    table.insert(events, { t = at - Predict.TURN_LAG - Predict.SPAN / 2, a = d })
+                    ref = h
+                    refX, refZ = math.cos(h), math.sin(h)
+                    since = {}
+                end
+            end
+        end
+        t += 1 / 60
+    end
+    local durations = {}
+    for i = 2, #events do
+        table.insert(durations, events[i].t - events[i - 1].t)
+    end
+    local elapsed = #events > 0 and now - events[#events].t or now - first
+    return events, durations, elapsed, ref
+end
+
+local function trust(k)
+    if k >= Predict.TRUST_AT then
+        return Predict.TRUST
+    end
+    return k / (k + Predict.PRIOR_WEIGHT)
+end
+
+local function drawDuration(durations)
+    local k = #durations
+    if k > 0 and math.random() < trust(k) then
+        local g = math.sqrt(-2 * math.log(1 - math.random())) * math.cos(2 * math.pi * math.random())
+        return durations[math.random(1, k)] * math.exp(Predict.JITTER * g)
+    end
+    return 0.25 - Predict.PRIOR_DURATION * math.log(1 - math.random())
+end
+
+local function drawAngle(events)
+    local k = #events
+    if k > 0 and math.random() < trust(k) then
+        local a = events[math.random(1, k)].a
+        return math.random() < 0.5 and a or -a
+    end
+    return (math.random() * 2 - 1) * math.pi
+end
+
+local function residual(durations, elapsed)
+    for _ = 1, 24 do
+        local d = drawDuration(durations)
+        if d > elapsed then
+            return d - elapsed
+        end
+    end
+    return -Predict.PRIOR_DURATION * math.log(1 - math.random()) * 0.5
+end
+
+local function modePoint(points, radius)
+    local r2 = radius * radius
+    local best, bestCount = 1, -1
+    for i, a in points do
+        local c = 0
+        for _, b in points do
+            local dx, dz = a[1] - b[1], a[2] - b[2]
+            if dx * dx + dz * dz <= r2 then
+                c += 1
+            end
+        end
+        if c > bestCount then
+            best, bestCount = i, c
+        end
+    end
+    local a = points[best]
+    local sx, sz, n = 0, 0, 0
+    for _, b in points do
+        local dx, dz = a[1] - b[1], a[2] - b[2]
+        if dx * dx + dz * dz <= r2 then
+            sx += b[1]
+            sz += b[2]
+            n += 1
+        end
+    end
+    return sx / n, sz / n, bestCount / #points
+end
+
+local function modeAngle(points, origin, radius)
+    local n = #points
+    local ang, half, dist = {}, {}, {}
+    for i, p in points do
+        local dx, dz = p[1] - origin.X, p[2] - origin.Z
+        local d = math.max(math.sqrt(dx * dx + dz * dz), radius * 1.01)
+        ang[i] = math.atan2(dz, dx)
+        half[i] = math.asin(radius / d)
+        dist[i] = d
+    end
+    local bestA, bestCount = ang[1], -1
+    for i = 1, n do
+        local c = 0
+        local a = ang[i]
+        for j = 1, n do
+            if math.abs(wrap(a - ang[j])) <= half[j] then
+                c += 1
+            end
+        end
+        if c > bestCount then
+            bestA, bestCount = a, c
+        end
+    end
+    local lo, hi = -math.huge, math.huge
+    local sd, m = 0, 0
+    for j = 1, n do
+        local off = wrap(ang[j] - bestA)
+        if math.abs(off) <= half[j] then
+            lo = math.max(lo, off - half[j])
+            hi = math.min(hi, off + half[j])
+            sd += dist[j]
+            m += 1
+        end
+    end
+    local center = bestA
+    if lo <= hi then
+        center = bestA + (lo + hi) / 2
+    end
+    local d = sd / math.max(m, 1)
+    return origin.X + math.cos(center) * d, origin.Z + math.sin(center) * d, bestCount / n
+end
+
+function Predict.aim(rec, origin, speed, net)
+    local list = rec.list
+    local n = #list
+    if n == 0 then
+        return nil
+    end
+    local now = list[n].t
+    local p0 = list[n].p
+    local v = Predict.velocity(rec, now, Predict.SPAN)
+    local vy = Predict.velocity(rec, now, 0.035).Y
+    local airborne = math.abs(vy) > 6 or (not rec.grounded and rec.groundY ~= nil and p0.Y > rec.groundY + 0.5)
+    local g = Predict.GRAVITY
+    local floor = rec.groundY
+    local function height(T)
+        if not airborne then
+            return p0.Y
+        end
+        local y = p0.Y + vy * T - 0.5 * g * T * T
+        if floor and y < floor then
+            y = floor
+        end
+        return y
+    end
+    local base = net + Predict.INTERP + Predict.PROCESS
+    local flatSpeed = math.sqrt(v.X * v.X + v.Z * v.Z)
+    local heading0 = math.atan2(v.Z, v.X)
+    local cruise, lastMoving = flatSpeed, nil
+    do
+        local t = now
+        while t > now - 0.6 and t > list[1].t + Predict.SPAN do
+            local u = Predict.velocity(rec, t, Predict.SPAN)
+            local s2 = math.sqrt(u.X * u.X + u.Z * u.Z)
+            if s2 > cruise then
+                cruise = s2
+            end
+            if not lastMoving and s2 > Predict.MOVING then
+                lastMoving = { t = t, h = math.atan2(u.Z, u.X) }
+            end
+            t -= 1 / 30
+        end
+    end
+    local turning
+    do
+        local vPrev = Predict.velocity(rec, now - Predict.SPAN, Predict.SPAN)
+        local ax, az = (v.X - vPrev.X) / Predict.SPAN, (v.Z - vPrev.Z) / Predict.SPAN
+        local lead = Predict.ACCEL_LEAD
+        local wx, wz = v.X + ax * lead, v.Z + az * lead
+        local wm = math.sqrt(wx * wx + wz * wz)
+        if wm > Predict.MOVING and math.sqrt(ax * ax + az * az) > 40 then
+            local h = math.atan2(wz, wx)
+            local d = flatSpeed > 1 and math.abs(wrap(h - heading0)) or math.pi
+            heading0 = h
+            flatSpeed = math.max(flatSpeed, math.min(wm, cruise))
+            if d > Predict.TURN then
+                turning = d
+            end
+        end
+    end
+    local stopped = flatSpeed < Predict.MOVING and (not lastMoving or now - lastMoving.t > 0.25)
+    if flatSpeed < Predict.MOVING and not stopped then
+        heading0 = lastMoving.h + math.pi
+        flatSpeed = cruise
+    elseif flatSpeed < cruise * 0.85 and flatSpeed >= Predict.MOVING then
+        flatSpeed = math.max(flatSpeed, cruise * 0.9)
+    end
+    if n < 4 or stopped then
+        local T = base
+        if speed then
+            T = base + (p0 - origin).Magnitude / speed
+        end
+        return Vector3.new(p0.X + v.X * T, height(T), p0.Z + v.Z * T), T, 1
+    end
+    local events, durations, elapsed, ref = Predict.turns(rec)
+    if (turning or (flatSpeed >= Predict.MOVING and ref and math.abs(wrap(heading0 - ref)) > Predict.TURN)) and elapsed > Predict.TURN_LAG + Predict.SPAN then
+        local d = turning or wrap(heading0 - ref)
+        if #events > 0 then
+            table.insert(durations, (now - Predict.TURN_LAG - Predict.SPAN / 2) - events[#events].t)
+        end
+        table.insert(events, { t = now - Predict.TURN_LAG - Predict.SPAN / 2, a = d })
+        elapsed = Predict.TURN_LAG + Predict.SPAN / 2
+    end
+    local step = Predict.STEP
+    local horizon = speed and base + 1.6 or base + step
+    local points = {}
+    local times = {}
+    local tau = Predict.ACCEL_TAU
+    for f = 1, Predict.FUTURES do
+        local x, z = p0.X, p0.Z
+        local vx, vz = v.X, v.Z
+        local heading = heading0
+        local nextTurn = residual(durations, elapsed)
+        local t = 0
+        local hit
+        local function advance(span)
+            local dx, dz = math.cos(heading) * flatSpeed, math.sin(heading) * flatSpeed
+            local e = math.exp(-span / tau)
+            local k = tau * (1 - e)
+            x += dx * span + (vx - dx) * k
+            z += dz * span + (vz - dz) * k
+            vx = dx + (vx - dx) * e
+            vz = dz + (vz - dz) * e
+        end
+        while t < horizon do
+            local dt = math.min(step, horizon - t)
+            if not speed and t + dt > base then
+                dt = base - t
+            end
+            local left = dt
+            while nextTurn < left do
+                advance(nextTurn)
+                left -= nextTurn
+                heading += drawAngle(events)
+                nextTurn = drawDuration(durations)
+            end
+            advance(left)
+            nextTurn -= left
+            t += dt
+            if speed then
+                if t >= base then
+                    local dx, dz = x - origin.X, z - origin.Z
+                    if math.sqrt(dx * dx + dz * dz) <= speed * (t - base) then
+                        hit = { x, z }
+                        times[f] = t
+                        break
+                    end
+                end
+            elseif t >= base - 1e-9 then
+                hit = { x, z }
+                times[f] = t
+                break
+            end
+        end
+        points[f] = hit or { x, z }
+        times[f] = times[f] or t
+    end
+    local ax, az, confidence
+    if speed then
+        ax, az, confidence = modeAngle(points, origin, Predict.KNIFE_RADIUS)
+    else
+        ax, az, confidence = modePoint(points, Predict.GUN_RADIUS)
+    end
+    local T = base
+    if speed then
+        local sum, c = 0, 0
+        for f = 1, #points do
+            local dx, dz = points[f][1] - ax, points[f][2] - az
+            if dx * dx + dz * dz <= Predict.KNIFE_RADIUS ^ 2 then
+                sum += times[f]
+                c += 1
+            end
+        end
+        T = c > 0 and sum / c or base
+    end
+    return Vector3.new(ax, height(T), az), T, confidence
+end
+
+function Predict.ready(knife, confidence, waited)
+    if knife then
+        return confidence >= Predict.KNIFE_SURE or waited >= Predict.KNIFE_HOLD
+    end
+    return confidence >= Predict.GUN_SURE or waited >= Predict.GUN_HOLD
+end
+
 local KNIFE_SPEED = 96
 track(CollectionService:GetInstanceAddedSignal("ThrowingKnife"):Connect(function(k)
     local s = k:GetAttribute("ThrowSpeed")
@@ -180,96 +582,95 @@ track(CollectionService:GetInstanceAddedSignal("ThrowingKnife"):Connect(function
     end
 end))
 
-local Motion = {}
-track(RunService.PreSimulation:Connect(function(dt)
-    if not (Settings.GunAim or Settings.KnifeAim) or dt <= 0 then
-        return
+local RTT = 0.12
+local function readPing()
+    local ok, v = pcall(function()
+        return Stats.Network.ServerStatsItem["Data Ping"]:GetValue()
+    end)
+    if ok and type(v) == "number" and v > 0 then
+        return v / 1000
     end
-    for _, plr in Players:GetPlayers() do
-        if plr ~= LocalPlayer then
-            local char = plr.Character
-            local root = char and char:FindFirstChild("HumanoidRootPart")
-            if root then
-                local pos = root.Position
-                local m = Motion[plr]
-                if not m or m.root ~= root then
-                    Motion[plr] = { root = root, pos = pos, vel = Vector3.zero }
-                else
-                    local step = (pos - m.pos) / dt
-                    if step.Magnitude > 80 then
-                        m.vel = Vector3.zero
-                    else
-                        m.vel = m.vel:Lerp(step, math.clamp(dt * 12, 0, 1))
-                    end
-                    m.pos = pos
-                end
-            else
-                Motion[plr] = nil
-            end
-        end
+    local ok2, p = pcall(LocalPlayer.GetNetworkPing, LocalPlayer)
+    if ok2 and type(p) == "number" and p > 0 then
+        return p * 2
     end
-end))
-track(Players.PlayerRemoving:Connect(function(plr)
-    Motion[plr] = nil
-end))
-
-local function ping()
-    local ok, p = pcall(LocalPlayer.GetNetworkPing, LocalPlayer)
-    return ok and type(p) == "number" and math.clamp(p, 0, 0.3) or 0.05
+    return nil
 end
+task.spawn(function()
+    while not Unloaded do
+        local p = readPing()
+        if p then
+            RTT += (math.clamp(p, 0, 0.6) - RTT) * 0.35
+        end
+        Predict.GRAVITY = Workspace.Gravity
+        task.wait(0.5)
+    end
+end)
 
-local function worldParams(extra)
-    local params = RaycastParams.new()
-    params.FilterType = Enum.RaycastFilterType.Exclude
-    local list = ignoreList(extra)
+local Raycast = Workspace.Raycast
+local WorldParams = RaycastParams.new()
+WorldParams.FilterType = Enum.RaycastFilterType.Exclude
+local function refreshWorldParams()
+    local list = {}
     for _, plr in Players:GetPlayers() do
         if plr.Character then
             table.insert(list, plr.Character)
         end
     end
-    params.FilterDescendantsInstances = list
-    return params
+    for _, inst in CollectionService:GetTagged("WeaponPassthrough") do
+        table.insert(list, inst)
+    end
+    WorldParams.FilterDescendantsInstances = list
+end
+refreshWorldParams()
+
+local Records = {}
+local Weapon = { kind = nil, tool = nil, remote = nil, attachment = nil }
+local Target
+local Pending
+
+local function enabledFor(kind)
+    return (kind == "Gun" and Settings.GunAim) or (kind == "Knife" and Settings.KnifeAim)
 end
 
-local function predict(target, from, speed, extra)
-    local root, hum = target.root, target.hum
-    local m = Motion[target.plr]
-    local vel = (m and m.root == root) and m.vel or root.AssemblyLinearVelocity
-    local flat = Vector3.new(vel.X, 0, vel.Z)
-    local maxFlat = math.max(hum.WalkSpeed, 16) * 1.25
-    if flat.Magnitude > maxFlat then
-        flat = flat.Unit * maxFlat
+local function refreshWeapon()
+    local char = LocalPlayer.Character
+    local tool = char and char:FindFirstChildOfClass("Tool")
+    if tool == Weapon.tool and (not tool or Weapon.remote and Weapon.remote.Parent) then
+        return
     end
-    local base = root.Position
-    local lead = ping() + (extra or 0)
-    local t = lead
-    if speed then
-        for _ = 1, 3 do
-            t = ((base + flat * t) - from).Magnitude / speed + lead
+    Weapon.tool, Weapon.kind, Weapon.remote = tool, nil, nil
+    if tool then
+        if isKnife(tool) then
+            local events = tool:FindFirstChild("Events")
+            Weapon.kind = "Knife"
+            Weapon.remote = events and events:FindFirstChild("KnifeThrown")
+        elseif isGun(tool) then
+            Weapon.kind = "Gun"
+            Weapon.remote = tool:FindFirstChild("Shoot")
         end
     end
-    local goal = base + flat * t
-    if hum.FloorMaterial == Enum.Material.Air then
-        local vy = math.clamp(vel.Y, -60, 50)
-        local rise = vy * math.min(t, 0.4)
-        goal += Vector3.new(0, math.clamp(rise, -6, 6), 0)
-    end
-    local params = worldParams()
-    local move = goal - base
-    if move.Magnitude > 0.05 then
-        local hit = Workspace:Raycast(base, move, params)
-        if hit then
-            goal = hit.Position - move.Unit * 1.2
-        end
-    end
-    local down = Workspace:Raycast(goal + Vector3.new(0, 2, 0), Vector3.new(0, -8, 0), params)
-    if down and goal.Y < down.Position.Y + 1 then
-        goal = Vector3.new(goal.X, down.Position.Y + 1.5, goal.Z)
-    end
-    return goal
+    local root = char and char:FindFirstChild("HumanoidRootPart")
+    Weapon.attachment = root and root:FindFirstChild("GunRaycastAttachment")
 end
 
-local function pickTarget(kind)
+local function visible(eye, char)
+    for _, name in { "HumanoidRootPart", "Head", "UpperTorso", "Torso" } do
+        local part = char:FindFirstChild(name)
+        if part then
+            local hit = Raycast(Workspace, eye, part.Position - eye, WorldParams)
+            if not hit then
+                return true
+            end
+            if hit.Instance.Transparency >= 1 and clearLine(eye, part.Position, char) then
+                return true
+            end
+        end
+    end
+    return false
+end
+
+local function chooseTarget(kind)
     local me = aliveRoot(LocalPlayer)
     if not me then
         return nil
@@ -279,99 +680,220 @@ local function pickTarget(kind)
     local fov = math.max(cam.ViewportSize.Y * 0.45, 220)
     local head = LocalPlayer.Character:FindFirstChild("Head")
     local eye = head and head.Position or me.Position
-    local list, murderer = {}, false
+    local murdererKnown, murderer, best, bestScore = false, nil, nil, nil
     for _, plr in Players:GetPlayers() do
         if plr ~= LocalPlayer then
-            local root, hum, char = aliveRoot(plr)
-            if root then
-                local role, dead = roleOf(plr)
-                if not dead and role == "Murderer" then
-                    murderer = true
+            local root, _, char = aliveRoot(plr)
+            local role, dead = roleOf(plr)
+            if root and not dead then
+                if role == "Murderer" then
+                    murdererKnown = true
                 end
-                if not dead then
-                    local sp, onScreen = cam:WorldToViewportPoint(root.Position)
+                local sp, onScreen = cam:WorldToViewportPoint(root.Position)
+                if onScreen and sp.Z > 0 then
                     local dist = (Vector2.new(sp.X, sp.Y) - center).Magnitude
-                    if onScreen and sp.Z > 0 and dist <= fov then
-                        local tHead = char:FindFirstChild("Head")
-                        if clearLine(eye, root.Position, char) or (tHead and clearLine(eye, tHead.Position, char)) then
-                            table.insert(list, { plr = plr, root = root, hum = hum, char = char, role = role, dist = dist })
+                    if dist <= fov and visible(eye, char) then
+                        local entry = { plr = plr, root = root, char = char }
+                        if role == "Murderer" then
+                            murderer = entry
+                        end
+                        local score = dist
+                        if kind == "Knife" and (role == "Sheriff" or role == "Hero") then
+                            score -= 40
+                        end
+                        if Target and Target.plr == plr then
+                            score -= 25
+                        end
+                        if not bestScore or score < bestScore then
+                            best, bestScore = entry, score
                         end
                     end
                 end
             end
         end
     end
-    local best
-    for _, c in list do
-        if kind ~= "Gun" or not murderer or c.role == "Murderer" then
-            local score = c.dist
-            if kind == "Knife" and (c.role == "Sheriff" or c.role == "Hero") then
-                score -= 40
-            end
-            if not best or score < best.score then
-                c.score = score
-                best = c
-            end
-        end
+    if kind == "Gun" and murdererKnown then
+        return murderer
     end
     return best
 end
 
-local function redirect(kind, origin)
-    local on = kind == "Gun" and Settings.GunAim or kind == "Knife" and Settings.KnifeAim
-    local target = on and pickTarget(kind)
-    if not target then
+local function solve(kind, origin)
+    local t = Target
+    if not t or not t.root.Parent then
         return nil
     end
-    local from = typeof(origin) == "CFrame" and origin.Position or target.root.Position
-    local extra = kind == "Gun" and Settings.GunPrediction or Settings.KnifePrediction
-    local pos = predict(target, from, kind == "Knife" and KNIFE_SPEED or nil, tonumber(extra) or 0)
-    if kind == "Gun" then
-        local torso = target.char:FindFirstChild("UpperTorso") or target.char:FindFirstChild("Torso")
-        if torso then
-            pos += torso.Position - target.root.Position
+    local rec = Records[t.plr]
+    if not rec or rec.root ~= t.root or #rec.list < 2 then
+        return nil
+    end
+    local pos, _, confidence = Predict.aim(rec, origin, kind == "Knife" and KNIFE_SPEED or nil, RTT)
+    if not pos then
+        return nil
+    end
+    local from = rec.list[#rec.list].p
+    local move = pos - from
+    if move.Magnitude > 0.5 then
+        local hit = Raycast(Workspace, from, move, WorldParams)
+        if hit and hit.Instance.CanCollide then
+            pos = hit.Position - move.Unit * 1.5
         end
     end
-    if not clearLine(from, pos, target.char) then
-        pos = target.root.Position
+    return pos, confidence
+end
+
+local function aimFrame(kind, origin, pos)
+    if kind == "Gun" then
+        local dir = pos - origin
+        if dir.Magnitude > 0.1 then
+            return CFrame.new(pos + dir.Unit * 4)
+        end
     end
     return CFrame.new(pos)
 end
 
+local function originOf(kind, sent)
+    if typeof(sent) == "CFrame" then
+        return sent.Position
+    end
+    if kind == "Gun" and Weapon.attachment then
+        return Weapon.attachment.WorldPosition
+    end
+    local handle = Weapon.tool and Weapon.tool:FindFirstChild("Handle")
+    return handle and handle.Position
+end
+
+local function send(remote, args)
+    local fire = remote.FireServer
+    return fire(remote, table.unpack(args, 1, args.n))
+end
+
+local function flush(p, now)
+    Pending = nil
+    local args = p.args
+    if p.kind == "Gun" and Weapon.attachment and typeof(args[1]) == "CFrame" then
+        args[1] = Weapon.attachment.WorldCFrame
+    end
+    local origin = originOf(p.kind, args[1]) or p.origin
+    local pos = solve(p.kind, origin)
+    if pos then
+        args[2] = aimFrame(p.kind, origin, pos)
+    elseif p.aim then
+        args[2] = p.aim
+    end
+    pcall(send, p.remote, args)
+end
+
+local HoldStep = 0
+track(RunService.PreSimulation:Connect(function()
+    if Unloaded then
+        return
+    end
+    if not (Settings.GunAim or Settings.KnifeAim) then
+        if next(Records) then
+            table.clear(Records)
+        end
+        Target = nil
+        if Pending then
+            flush(Pending)
+        end
+        return
+    end
+    local now = os.clock()
+    for _, plr in Players:GetPlayers() do
+        if plr ~= LocalPlayer then
+            local root, hum = aliveRoot(plr)
+            if root then
+                local rec = Records[plr]
+                if not rec or rec.root ~= root then
+                    rec = Predict.new()
+                    rec.root = root
+                    Records[plr] = rec
+                end
+                local state = hum:GetState()
+                local grounded = hum.FloorMaterial ~= Enum.Material.Air
+                    or (state ~= Enum.HumanoidStateType.Freefall and state ~= Enum.HumanoidStateType.Jumping)
+                Predict.push(rec, now, root.Position, grounded)
+            else
+                Records[plr] = nil
+            end
+        end
+    end
+    HoldStep += 1
+    if HoldStep % 60 == 0 then
+        refreshWorldParams()
+    end
+    refreshWeapon()
+    if Weapon.kind and enabledFor(Weapon.kind) then
+        Target = chooseTarget(Weapon.kind)
+    else
+        Target = nil
+    end
+    local p = Pending
+    if p then
+        if p.remote ~= Weapon.remote or not Target then
+            flush(p, now)
+        else
+            local origin = originOf(p.kind, Weapon.attachment and Weapon.attachment.WorldCFrame) or p.origin
+            local _, confidence = solve(p.kind, origin)
+            if not confidence or Predict.ready(p.kind == "Knife", confidence, now - p.start) then
+                flush(p, now)
+            end
+        end
+    end
+end))
+track(Players.PlayerRemoving:Connect(function(plr)
+    Records[plr] = nil
+end))
+
+local function redirectCall(remote, args)
+    local kind = Weapon.kind
+    local origin = originOf(kind, args[1])
+    if not origin then
+        return false
+    end
+    local pos, confidence = solve(kind, origin)
+    if not pos then
+        return false
+    end
+    local frame = aimFrame(kind, origin, pos)
+    if not Predict.ready(kind == "Knife", confidence, 0) then
+        if Pending then
+            flush(Pending)
+        end
+        Pending = { remote = remote, args = args, kind = kind, origin = origin, aim = frame, start = os.clock() }
+        return true
+    end
+    args[2] = frame
+    send(remote, args)
+    return true
+end
+
+local hooked = false
 if typeof(hookmetamethod) == "function" and typeof(getnamecallmethod) == "function" then
     local original
+    local isOurs = typeof(checkcaller) == "function" and checkcaller or function()
+        return false
+    end
     local function onNamecall(self, ...)
-        if Unloaded or not (Settings.GunAim or Settings.KnifeAim) or typeof(self) ~= "Instance" or getnamecallmethod() ~= "FireServer" then
+        if Unloaded or self ~= Weapon.remote then
             return original(self, ...)
         end
-        if self.ClassName ~= "RemoteEvent" then
-            return original(self, ...)
-        end
-        local kind
-        local parent = self.Parent
-        if self.Name == "Shoot" and Settings.GunAim and parent and parent.ClassName == "Tool" then
-            kind = "Gun"
-        elseif self.Name == "KnifeThrown" and Settings.KnifeAim and parent and parent.Parent and parent.Parent.ClassName == "Tool" then
-            kind = "Knife"
-        end
-        if not kind then
+        if getnamecallmethod() ~= "FireServer" or isOurs() or not enabledFor(Weapon.kind) then
             return original(self, ...)
         end
         local args = table.pack(...)
-        local fire = self.FireServer
-        local ok, cf = pcall(redirect, kind, args[1])
-        if not ok then
-            warn("[MM2] " .. tostring(cf))
+        local ok, handled = pcall(redirectCall, self, table.pack(...))
+        if ok and handled then
+            return nil
         end
-        if ok and cf then
-            args[2] = cf
-        end
-        return fire(self, table.unpack(args, 1, args.n))
+        return send(self, args)
     end
     if typeof(newcclosure) == "function" then
         onNamecall = newcclosure(onNamecall)
     end
     original = hookmetamethod(game, "__namecall", onNamecall)
+    hooked = true
 end
 
 local WeaponService
@@ -379,46 +901,29 @@ pcall(function()
     WeaponService = require(ReplicatedStorage:WaitForChild("ClientServices", 5):WaitForChild("WeaponService", 5))
 end)
 local origMouse, origTarget
-if type(WeaponService) == "table" then
+if not hooked and type(WeaponService) == "table" then
     origMouse, origTarget = WeaponService.GetMouseTargetCFrame, WeaponService.GetTargetPosition
-    local function heldKind()
-        local char = LocalPlayer.Character
-        if not char then
+    local function override()
+        local kind = Weapon.kind
+        if Unloaded or not kind or not enabledFor(kind) then
             return nil
         end
-        for _, item in char:GetChildren() do
-            if isKnife(item) then
-                return "Knife"
-            elseif isGun(item) then
-                return "Gun"
-            end
-        end
-        return nil
-    end
-    local function handleOrigin()
-        local char = LocalPlayer.Character
-        local tool = char and char:FindFirstChildOfClass("Tool")
-        local h = tool and tool:FindFirstChild("Handle")
-        return h and h.CFrame
+        local origin = originOf(kind)
+        local pos = origin and solve(kind, origin)
+        return pos and aimFrame(kind, origin, pos)
     end
     WeaponService.GetMouseTargetCFrame = function(self, ...)
-        local kind = heldKind()
-        if kind and not Unloaded then
-            local ok, cf = pcall(redirect, kind, handleOrigin())
-            if ok and cf then
-                return cf
-            end
+        local ok, cf = pcall(override)
+        if ok and cf then
+            return cf
         end
         return origMouse(self, ...)
     end
     WeaponService.GetTargetPosition = function(self, x, y, ...)
         lastTap, lastTapAt = Vector2.new(x, y), os.clock()
-        local kind = heldKind()
-        if kind and not Unloaded then
-            local ok, cf = pcall(redirect, kind, handleOrigin())
-            if ok and cf then
-                return cf
-            end
+        local ok, cf = pcall(override)
+        if ok and cf then
+            return cf
         end
         return origTarget(self, x, y, ...)
     end
@@ -663,27 +1168,11 @@ Main:Toggle({
         Settings.GunAim = state
     end,
 })
-Main:Slider({
-    Title = "Gun Prediction",
-    Step = 0.05,
-    Value = { Min = 0, Max = 3, Default = 0 },
-    Callback = function(v)
-        Settings.GunPrediction = tonumber(v) or 0
-    end,
-})
 Main:Toggle({
     Title = "Murderer Silent Aim",
     Default = false,
     Callback = function(state)
         Settings.KnifeAim = state
-    end,
-})
-Main:Slider({
-    Title = "Murderer Prediction",
-    Step = 0.05,
-    Value = { Min = 0, Max = 3, Default = 0 },
-    Callback = function(v)
-        Settings.KnifePrediction = tonumber(v) or 0
     end,
 })
 Main:Section({ Title = "Other" })
@@ -722,6 +1211,9 @@ end)
 
 Genv.__CustomMM2Unload = function()
     Unloaded = true
+    if Pending then
+        pcall(flush, Pending)
+    end
     for _, c in Connections do
         pcall(c.Disconnect, c)
     end
