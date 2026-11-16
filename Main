@@ -26,6 +26,8 @@ local Games = {
     [129415455370018] = { Name = 'Runaways (hard)', Script = 'Games/Runaways.lua' },
     [137470666387963] = { Name = 'Blast Soccer', Script = 'Games/BlastSoccer.lua' },
     [117090155680637] = { Name = "No Man's Land", Script = 'Games/NoMansLand.lua' },
+    -- [DUELS] Murderers VS Sheriffs (game 7219654364), from its dump's own place id.
+    [135856908115931] = { Name = 'Murderers VS Sheriffs Duels', Script = 'Games/MurderersVsSheriffs.lua' },
     -- Da Hood (game 1008451066), from its dump's own place id.
     [2788229376] = { Name = 'Da Hood', Script = 'Games/DaHood.lua' },
     -- Prison (Game) by zenixiope (game 10771327607), from its dump's own place id.
