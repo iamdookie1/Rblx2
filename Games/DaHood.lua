@@ -103,6 +103,15 @@ local Settings = {
     AtmEsp = false, VaultEsp = false, ItemEsp = false, WorldShowBroken = false, WorldEspMax = 1500,
     AtmColor = Color3.fromRGB(90, 255, 120), VaultColor = Color3.fromRGB(255, 215, 70), ItemColor = Color3.fromRGB(150, 200, 255),
     AutoPunchAtm = false, AtmFarm = false, AtmFarmRange = 400, AtmPunchDelay = 0.35,
+    -- shop / supplies
+    BuyPick = "Closest", BuyCount = 1, BuyPauseNear = 0,
+    AutoEat = false, EatHP = 70,
+    AutoFood = false, FoodItem = "[Hamburger]", FoodBuyHP = 75, FoodBuyCount = 3,
+    AutoArmor = false, ArmorItem = "[High-Medium Armor]", ArmorMin = 40,
+    AutoAmmo = false, AmmoMin = 30,
+    -- anti kill
+    AntiKill = false, AntiKillHP = 35, AntiKillMethod = "Sky", SkyHeight = 1500, AntiKillReturn = true, ReturnHP = 85,
+    AntiKillEat = true, AntiKillKnocked = false,
 }
 
 --// Plumbing \\--
@@ -1099,28 +1108,43 @@ do
 end
 
 --// Shop \\--
-local Shop = {}
+-- Shop items are models in workspace.Ignored.Shop named "[Item] - $price"
+-- (ammo: "12 [Revolver Ammo] - $56"), each with a ClickDetector (click range 9).
+-- The server checks your distance to it, so a far item means a short hop there.
+local Shop = { busy = false, info = "idle", bought = 0 }
 do
-    -- Shop items are models named "[Item] - $price" (ammo: "12 [Revolver Ammo] - $56").
-    function Shop.items()
+    local cache, cacheAt = {}, -10
+    function Shop.items(fresh)
+        if not fresh and os.clock() - cacheAt < 2 then
+            return cache
+        end
         local out = {}
         local ign = Workspace:FindFirstChild("Ignored")
         local folder = ign and ign:FindFirstChild("Shop")
-        if not folder then
-            return out
-        end
-        for _, m in folder:GetChildren() do
-            local cd = m:FindFirstChildWhichIsA("ClickDetector", true)
-            if cd then
-                local label, price = m.Name:match("^(.-)%s*%-%s*%$(%d+)")
-                table.insert(out, { model = m, cd = cd, label = label or m.Name, price = tonumber(price) or 0 })
+        if folder then
+            for _, m in folder:GetChildren() do
+                local cd = m:FindFirstChildWhichIsA("ClickDetector", true)
+                if cd then
+                    local label, price = m.Name:match("^(.-)%s*%-%s*%$(%d+)")
+                    local p
+                    local okP, cf = pcall(m.GetPivot, m)
+                    if okP and cf then
+                        p = cf.Position
+                    elseif cd.Parent and cd.Parent:IsA("BasePart") then
+                        p = cd.Parent.Position
+                    end
+                    if p then
+                        table.insert(out, { model = m, cd = cd, label = label or m.Name, price = tonumber(price) or 0, pos = p })
+                    end
+                end
             end
         end
+        cache, cacheAt = out, os.clock()
         return out
     end
     function Shop.names()
         local seen, list = {}, {}
-        for _, it in Shop.items() do
+        for _, it in Shop.items(true) do
             if not seen[it.label] then
                 seen[it.label] = true
                 table.insert(list, it.label)
@@ -1129,59 +1153,19 @@ do
         table.sort(list)
         return list
     end
-    local function pos(it)
-        local ok, cf = pcall(it.model.GetPivot, it.model)
-        if ok and cf then
-            return cf.Position
-        end
-        local p = it.cd.Parent
-        return p and p:IsA("BasePart") and p.Position or nil
-    end
-    -- Goes to the closest one with that name, clicks it, comes back.
-    function Shop.buy(label)
-        if typeof(fireclickdetector) ~= "function" then
-            notify("Your executor has no fireclickdetector")
-            return false
-        end
+    function Shop.find(label)
         local root = myRoot()
-        if not root then
-            return false
-        end
-        local best, bestD, bestPos
+        local best, bestScore
         for _, it in Shop.items() do
-            if it.label == label then
-                local p = pos(it)
-                if p then
-                    local d = (p - root.Position).Magnitude
-                    if not bestD or d < bestD then
-                        best, bestD, bestPos = it, d, p
-                    end
+            if it.label == label and it.model.Parent then
+                local d = root and (it.pos - root.Position).Magnitude or 0
+                local score = Settings.BuyPick == "Cheapest" and (it.price * 100000 + d) or d
+                if not bestScore or score < bestScore then
+                    best, bestScore = it, score
                 end
             end
         end
-        if not best then
-            notify("Couldn't find " .. tostring(label) .. " in the shop")
-            return false
-        end
-        local cash = Game.cash()
-        if cash and cash < best.price then
-            notify(("Not enough cash for %s ($%d)"):format(label, best.price))
-            return false
-        end
-        local back = root.CFrame
-        local far = bestD > best.cd.MaxActivationDistance - 1
-        if far then
-            root.CFrame = CFrame.new(bestPos + Vector3.new(0, 3, 0))
-            root.AssemblyLinearVelocity = Vector3.zero
-            task.wait(0.25)
-        end
-        pcall(fireclickdetector, best.cd)
-        task.wait(0.3)
-        if far and root.Parent then
-            root.CFrame = back
-        end
-        notify(("Bought %s ($%d)"):format(label, best.price), 2)
-        return true
+        return best
     end
     function Shop.ammoFor(tool)
         local base = tool and tool.Name:match("^%[(.-)%]$")
@@ -1195,6 +1179,379 @@ do
         end
         return nil
     end
+
+    -- What a purchase changes: cash, items, armor, ammo.
+    local function snapshot()
+        local s = { cash = Game.cash() or 0, tools = 0, armor = 0, fire = 0, ammo = 0 }
+        local c = myChar()
+        local bp = LocalPlayer:FindFirstChild("Backpack")
+        for _, holder in { bp, c } do
+            if holder then
+                for _, t in holder:GetChildren() do
+                    if t:IsA("Tool") then
+                        s.tools += 1
+                    end
+                end
+            end
+        end
+        local be = Game.effects(c)
+        s.armor = tonumber(Game.val(be, "Armor")) or 0
+        s.fire = tonumber(Game.val(be, "FireArmor")) or 0
+        local ok, inv = pcall(function()
+            return LocalPlayer.DataFolder.Inventory
+        end)
+        if ok and inv then
+            for _, v in inv:GetChildren() do
+                s.ammo += tonumber(v.Value) or 0
+            end
+        end
+        return s
+    end
+    local function changed(a, b)
+        return b.cash < a.cash or b.tools > a.tools or b.armor > a.armor or b.fire > a.fire or b.ammo > a.ammo
+    end
+
+    local function doBuy(label, count, quiet)
+        if typeof(fireclickdetector) ~= "function" then
+            notify("Your executor has no fireclickdetector")
+            return 0
+        end
+        local c = myChar()
+        local root = myRoot()
+        if not root or Game.knocked(c) or Game.dead(c) or Game.grabbed(c) then
+            Shop.info = "can't buy right now (knocked / grabbed)"
+            return 0
+        end
+        local it = Shop.find(label)
+        if not it then
+            if not quiet then
+                notify("Couldn't find " .. tostring(label) .. " in the shop")
+            end
+            Shop.info = "not found: " .. tostring(label)
+            return 0
+        end
+        local cash = Game.cash()
+        if cash and cash < it.price then
+            if not quiet then
+                notify(("Not enough cash for %s ($%d)"):format(label, it.price))
+            end
+            Shop.info = "not enough cash"
+            return 0
+        end
+        Shop.info = ("buying %s ($%d)"):format(label, it.price)
+        local back = root.CFrame
+        local reach = it.cd.MaxActivationDistance
+        local moved = (it.pos - root.Position).Magnitude > reach - 1.5
+        local stand = CFrame.new(it.pos + Vector3.new(0, 2.5, 0)) * (back - back.Position)
+        local function hold()
+            if moved and root.Parent then
+                root.CFrame = stand
+                root.AssemblyLinearVelocity = Vector3.zero
+            end
+        end
+        if moved then
+            hold()
+            -- Let the server see you there before the click arrives.
+            RunService.Heartbeat:Wait()
+            hold()
+            RunService.Heartbeat:Wait()
+        end
+        local got = 0
+        for _ = 1, count do
+            local before = snapshot()
+            if before.cash < it.price then
+                break
+            end
+            local done = false
+            for _ = 1, 3 do
+                pcall(fireclickdetector, it.cd)
+                local t0 = os.clock()
+                while os.clock() - t0 < 0.4 do
+                    hold()
+                    RunService.Heartbeat:Wait()
+                    if changed(before, snapshot()) then
+                        done = true
+                        break
+                    end
+                end
+                if done then
+                    break
+                end
+            end
+            if not done then
+                break
+            end
+            got += 1
+            Shop.bought += 1
+        end
+        if moved and root.Parent then
+            root.CFrame = back
+            root.AssemblyLinearVelocity = Vector3.zero
+        end
+        Shop.info = got > 0 and ("bought %s x%d"):format(label, got) or ("%s didn't go through"):format(label)
+        if not quiet then
+            notify(Shop.info, 2)
+        end
+        return got
+    end
+    -- One purchase at a time; a second request waits its turn.
+    function Shop.buy(label, count, quiet)
+        local waited = os.clock()
+        while Shop.busy and os.clock() - waited < 5 do
+            task.wait(0.05)
+        end
+        if Shop.busy then
+            return 0
+        end
+        Shop.busy = true
+        local ok, got = pcall(doBuy, label, math.max(1, count or 1), quiet)
+        Shop.busy = false
+        return ok and got or 0
+    end
+end
+
+--// Supplies: auto eat, auto food / armor / ammo \\--
+local Supplies = { info = "off", ate = 0 }
+local Safe = { active = false, info = "off", spot = nil }
+do
+    local function isFood(t)
+        return t:IsA("Tool") and (t:FindFirstChild("Eat") or t:FindFirstChild("Drink") or t.Name == "[Lettuce]") ~= nil
+    end
+    function Supplies.foods()
+        local out = {}
+        local c = myChar()
+        local bp = LocalPlayer:FindFirstChild("Backpack")
+        for _, holder in { c, bp } do
+            if holder then
+                for _, t in holder:GetChildren() do
+                    if isFood(t) then
+                        table.insert(out, t)
+                    end
+                end
+            end
+        end
+        return out
+    end
+    local function hpPct()
+        local c = myChar()
+        local hum = c and c:FindFirstChildOfClass("Humanoid")
+        if not hum or hum.MaxHealth <= 0 then
+            return 100, hum
+        end
+        return hum.Health / hum.MaxHealth * 100, hum
+    end
+    Supplies.hpPct = hpPct
+    local function blocked()
+        local c = myChar()
+        return not c or Game.knocked(c) or Game.dead(c) or Game.grabbed(c)
+    end
+    local function enemyNear(range)
+        if range <= 0 then
+            return false
+        end
+        local root = myRoot()
+        if not root then
+            return false
+        end
+        for _, t in Targets.list() do
+            if not Game.sameCrew(t.player) and (t.root.Position - root.Position).Magnitude <= range then
+                return true
+            end
+        end
+        return false
+    end
+
+    -- Eat: hold the food out and use it (the same as tapping with it out).
+    local eating = false
+    function Supplies.eat()
+        if eating or blocked() then
+            return false
+        end
+        local food = Supplies.foods()[1]
+        if not food then
+            return false
+        end
+        eating = true
+        local c = myChar()
+        local hum = c:FindFirstChildOfClass("Humanoid")
+        local held = c:FindFirstChildOfClass("Tool")
+        if held == food then
+            held = nil
+        end
+        if food.Parent ~= c then
+            hum:EquipTool(food)
+            task.wait(0.1)
+        end
+        for _ = 1, 16 do
+            if food.Parent ~= c or hpPct() >= 99.5 or blocked() then
+                break
+            end
+            pcall(food.Activate, food)
+            task.wait(0.25)
+        end
+        Supplies.ate += 1
+        if held and held.Parent == LocalPlayer:FindFirstChild("Backpack") and not blocked() then
+            hum:EquipTool(held)
+        end
+        eating = false
+        return true
+    end
+
+    local lastFood, lastArmor, lastAmmo = 0, 0, {}
+    loop(0.25, function()
+        local any = Settings.AutoEat or Settings.AutoFood or Settings.AutoArmor or Settings.AutoAmmo
+        if not any then
+            Supplies.info = "off"
+            return
+        end
+        if blocked() then
+            Supplies.info = "waiting (knocked / grabbed / dead)"
+            return
+        end
+        local hp = hpPct()
+        if Settings.AutoEat and hp < Settings.EatHP and #Supplies.foods() > 0 then
+            Supplies.info = ("eating (%d%% hp)"):format(hp)
+            Supplies.eat()
+            return
+        end
+        if Safe.active then
+            Supplies.info = "anti kill is holding you safe"
+            return
+        end
+        if Shop.busy or enemyNear(Settings.BuyPauseNear) then
+            Supplies.info = Shop.busy and "buying..." or "paused (enemy close)"
+            return
+        end
+        local now = os.clock()
+        if Settings.AutoFood and hp < Settings.FoodBuyHP and #Supplies.foods() == 0 and now - lastFood > 3 then
+            lastFood = now
+            Supplies.info = "buying food"
+            Shop.buy(Settings.FoodItem, Settings.FoodBuyCount, true)
+            return
+        end
+        if Settings.AutoArmor and now - lastArmor > 3 then
+            local be = Game.effects(myChar())
+            local kind = Settings.ArmorItem == "[Fire Armor]" and "FireArmor" or "Armor"
+            local armor = tonumber(Game.val(be, kind)) or 0
+            if armor < Settings.ArmorMin then
+                lastArmor = now
+                Supplies.info = ("buying armor (%d)"):format(armor)
+                Shop.buy(Settings.ArmorItem, 1, true)
+                return
+            end
+        end
+        if Settings.AutoAmmo then
+            local ok, inv = pcall(function()
+                return LocalPlayer.DataFolder.Inventory
+            end)
+            if ok and inv then
+                local c = myChar()
+                local bp = LocalPlayer:FindFirstChild("Backpack")
+                for _, holder in { c, bp } do
+                    for _, t in holder and holder:GetChildren() or {} do
+                        if t:IsA("Tool") and t:FindFirstChild("Ammo") then
+                            local slot = inv:FindFirstChild(t.Name)
+                            local left = slot and tonumber(slot.Value)
+                            if left and left < Settings.AmmoMin and now - (lastAmmo[t.Name] or 0) > 4 then
+                                local label = Shop.ammoFor(t)
+                                if label then
+                                    lastAmmo[t.Name] = now
+                                    Supplies.info = "buying " .. label
+                                    Shop.buy(label, 1, true)
+                                    return
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        Supplies.info = "watching"
+    end)
+end
+
+--// Anti kill: get out of the fight at low health \\--
+-- Moves you away (CFrame only: no anchoring, which the game kicks for, and
+-- no body movers, which it reports) and holds you there until you've healed.
+do
+    local back, hold
+    local function release(toBack)
+        local root = myRoot()
+        if toBack and back and root then
+            root.CFrame = back
+            root.AssemblyLinearVelocity = Vector3.zero
+        end
+        Safe.active, back, hold = false, nil, nil
+    end
+    table.insert(Cleanups, function()
+        if Safe.active then
+            release(true)
+        end
+    end)
+    local function target(root)
+        local m = Settings.AntiKillMethod
+        if m == "Hidden spot" and Safe.spot then
+            return Safe.spot
+        elseif m == "Far away" then
+            local a = math.random() * 2 * math.pi
+            local d = math.random(2500, 4000)
+            return CFrame.new(root.Position + Vector3.new(math.cos(a) * d, Settings.SkyHeight * 0.3, math.sin(a) * d))
+        end
+        return CFrame.new(root.Position + Vector3.new(0, Settings.SkyHeight, 0))
+    end
+    function Safe.setSpot()
+        local root = myRoot()
+        if root then
+            Safe.spot = root.CFrame
+            notify("Hidden spot saved here", 2)
+        end
+    end
+    bind(RunService.Heartbeat, function()
+        if not alive() then
+            return
+        end
+        local c = myChar()
+        local root = c and c:FindFirstChild("HumanoidRootPart")
+        local hum = c and c:FindFirstChildOfClass("Humanoid")
+        if not Settings.AntiKill then
+            if Safe.active then
+                release(Settings.AntiKillReturn)
+            end
+            Safe.info = "off"
+            return
+        end
+        if not (root and hum) or hum.Health <= 0 or Game.dead(c) then
+            if Safe.active then
+                release(false)
+            end
+            Safe.info = "waiting"
+            return
+        end
+        local hp = hum.Health / math.max(1, hum.MaxHealth) * 100
+        local knocked = Game.knocked(c)
+        if not Safe.active then
+            if hp <= Settings.AntiKillHP or (Settings.AntiKillKnocked and knocked) then
+                back = root.CFrame
+                hold = target(root)
+                Safe.active = true
+                notify(("Anti kill: %d%% hp, moved to safety"):format(hp), 2)
+            else
+                Safe.info = ("ready (%d%% hp)"):format(hp)
+                return
+            end
+        end
+        root.CFrame = hold
+        root.AssemblyLinearVelocity = Vector3.zero
+        root.AssemblyAngularVelocity = Vector3.zero
+        Safe.info = ("safe (%d%% hp)"):format(hp)
+        if Settings.AntiKillEat and not knocked and hp < 99 and #Supplies.foods() > 0 then
+            task.spawn(Supplies.eat)
+        end
+        if Settings.AntiKillReturn and not knocked and hp >= Settings.ReturnHP then
+            release(true)
+            notify("Anti kill: healed, back in", 2)
+        end
+    end)
 end
 
 --// Misc \\--
@@ -1569,30 +1926,63 @@ do
                 hum:UnequipTools()
                 RunService.Heartbeat:Wait()
             end
+            -- Remember which animation tracks the emote starts, so they can be
+            -- stopped directly (a small step alone doesn't end an emote).
+            local animator = hum:FindFirstChildOfClass("Animator")
+            local before = {}
+            if animator then
+                for _, tr in animator:GetPlayingAnimationTracks() do
+                    before[tr] = true
+                end
+            end
             local ok, played = pcall(hum.PlayEmote, hum, emote)
             if not (ok and played) then
                 Quick.info = "emote didn't play (jumping / falling?)"
                 busy = false
                 return
             end
-            task.wait(Settings.QuickEmoteWait)
+            local started = os.clock()
+            RunService.Heartbeat:Wait()
+            local emoteTracks = {}
+            if animator then
+                for _, tr in animator:GetPlayingAnimationTracks() do
+                    if not before[tr] then
+                        table.insert(emoteTracks, tr)
+                    end
+                end
+            end
+            local left = Settings.QuickEmoteWait - (os.clock() - started)
+            if left > 0 then
+                task.wait(left)
+            end
             if Settings.QuickLockpick then
                 local lp = lockpick()
                 if lp and lp.Parent ~= c then
                     hum:EquipTool(lp)
                 end
             end
-            -- A tiny step forward cancels the emote.
+            -- Cancel the emote: stop its tracks, then a tiny real step forward
+            -- (with walking speed, so the game's Animate script sees you move).
+            for _, tr in emoteTracks do
+                pcall(tr.Stop, tr, 0.05)
+            end
             local look = root.CFrame.LookVector
             local flat = Vector3.new(look.X, 0, look.Z)
             flat = flat.Magnitude > 0 and flat.Unit or Vector3.new(0, 0, -1)
             root.CFrame += flat * Settings.QuickNudge
             local t = os.clock()
-            while os.clock() - t < 0.06 do
+            while os.clock() - t < 0.08 do
+                local v = root.AssemblyLinearVelocity
+                root.AssemblyLinearVelocity = Vector3.new(flat.X * hum.WalkSpeed, v.Y, flat.Z * hum.WalkSpeed)
                 hum:Move(flat, false)
                 RunService.Heartbeat:Wait()
             end
             hum:Move(Vector3.zero, false)
+            for _, tr in emoteTracks do
+                if tr.IsPlaying then
+                    pcall(tr.Stop, tr, 0)
+                end
+            end
             Quick.runs += 1
             Quick.info = ("did %s"):format(emote)
             busy = false
@@ -2161,6 +2551,8 @@ do
             end)
         end,
     })
+    dropdown(Buy, "BuyPick", "Which shop", { "Closest", "Cheapest" }, "Prices differ between shops. Cheapest can mean a longer hop")
+    slider(Buy, "BuyCount", "Amount", 1, 20, 0, "", "Buys this many in one trip")
     Buy:AddButton({
         Text = "Buy",
         Func = function()
@@ -2168,10 +2560,66 @@ do
                 notify("Pick an item first")
                 return
             end
-            task.spawn(Shop.buy, selected)
+            task.spawn(Shop.buy, selected, Settings.BuyCount)
         end,
     })
-    Buy:AddLabel("Buying goes to the item, clicks it and comes back.", true)
+    status(Buy, function()
+        return ("Shop: %s\nBought this session: %d"):format(Shop.info, Shop.bought)
+    end)
+    Buy:AddLabel("Far items: hops there, clicks the moment the server sees you, comes back as soon as the buy goes through.", true)
+
+    local Auto = Tab:AddLeftGroupbox("Auto buy", "repeat")
+    local foodList = { "[Hamburger]", "[Chicken]", "[Pizza]", "[Taco]", "[HotDog]", "[Donut]", "[Meat]", "[Popcorn]",
+        "[Popsicle]", "[IceCream]", "[Lettuce]", "[Cranberry]", "[Lemonade]", "[Da Milk]", "[Starblox Latte]" }
+    toggle(Auto, "AutoFood", "Auto buy food", "When your health is low and you have no food left")
+    dropdown(Auto, "FoodItem", "Food", foodList)
+    slider(Auto, "FoodBuyHP", "Buy food below", 10, 100, 0, "% hp")
+    slider(Auto, "FoodBuyCount", "How many", 1, 10, 0, "")
+    toggle(Auto, "AutoArmor", "Auto buy armor", "When your armor drops below the amount")
+    dropdown(Auto, "ArmorItem", "Armor", { "[Medium Armor]", "[High-Medium Armor]", "[Fire Armor]" })
+    slider(Auto, "ArmorMin", "Buy armor below", 1, 200, 0, "", "Armor goes up to 200")
+    toggle(Auto, "AutoAmmo", "Auto buy ammo", "For every gun you own, when its spare ammo runs low")
+    slider(Auto, "AmmoMin", "Buy ammo below", 1, 300, 0, " spare")
+    slider(Auto, "BuyPauseNear", "Pause if enemy within", 0, 100, 0, " studs", "0 = never pause. Stops auto buy hopping away mid-fight")
+    status(Auto, function()
+        return "Auto: " .. Supplies.info
+    end)
+end
+
+do
+    local Tab = Window:AddTab("Survive", "heart", "Anti kill, auto heal")
+    local Box = Tab:AddLeftGroupbox("Anti kill", "shield")
+    toggle(Box, "AntiKill", "Anti kill", "At low health, moves you somewhere safe and holds you there until you've healed")
+    slider(Box, "AntiKillHP", "Trigger at", 5, 90, 0, "% hp")
+    dropdown(Box, "AntiKillMethod", "Where to", { "Sky", "Hidden spot", "Far away" },
+        "Sky: straight up. Hidden spot: the spot you save below. Far away: thousands of studs off, up high")
+    slider(Box, "SkyHeight", "Sky height", 200, 5000, 0, " studs")
+    Box:AddButton({ Text = "Save hidden spot here", Func = Safe.setSpot })
+    toggle(Box, "AntiKillEat", "Eat while safe", "Uses your food while you wait")
+    toggle(Box, "AntiKillReturn", "Come back when healed", "Off: stays there until you turn anti kill off")
+    slider(Box, "ReturnHP", "Come back at", 20, 100, 0, "% hp")
+    toggle(Box, "AntiKillKnocked", "Also when knocked", "Takes you away when you're knocked so nobody can stomp you. Riskier")
+    status(Box, function()
+        return ("Anti kill: %s\nHidden spot: %s"):format(Safe.info, Safe.spot and "saved" or "not saved")
+    end)
+
+    local Heal = Tab:AddRightGroupbox("Auto heal", "heart")
+    toggle(Heal, "AutoEat", "Auto eat", "Eats your food when your health is low, then puts your item back")
+    slider(Heal, "EatHP", "Eat below", 10, 100, 0, "% hp")
+    Heal:AddButton({
+        Text = "Eat now",
+        Func = function()
+            task.spawn(function()
+                if not Supplies.eat() then
+                    notify("No food to eat", 2)
+                end
+            end)
+        end,
+    })
+    status(Heal, function()
+        return ("Health: %d%%\nFood: %d\nAte: %d"):format(Supplies.hpPct(), #Supplies.foods(), Supplies.ate)
+    end)
+    Heal:AddLabel("God mode isn't possible: health is only changed by the server. This tab is the closest thing.", true)
 end
 
 do
