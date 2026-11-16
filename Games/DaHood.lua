@@ -38,7 +38,15 @@
 --     the result goes to the server in "ShootGun". Wallbang swaps that result
 --     for the player behind the wall. Whether a shot counts is the server's call.
 --   * Rapid fire: each GunClient keeps ShootingCooldown in an upvalue of its
---     Tool.Activated handler; it's scaled down with debug.setupvalue.
+--     Tool.Activated handler, and GunHandler.getCanShoot checks the tool's
+--     ShootingCooldown.Value against LocalLastShotAt on every shot. Both are
+--     lowered (the Value only on your side).
+--   * Smooth walk speed / jump: your physics velocity stays what the game
+--     set, and the extra distance is added to your CFrame each frame, so a
+--     velocity check sees normal numbers. Real mode sets WalkSpeed / JumpPower.
+--   * Wallbang also moves the "ShootGun" origin to just past the wall on your
+--     side (up to Wallbang reach studs), for servers that check the line from
+--     the origin.
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -112,9 +120,10 @@ local Settings = {
     -- hitbox
     Hitbox = false, HitboxMethod = "Ghost box", HitboxSize = 8, HitboxTransparency = 75, HitboxSkipCrew = true, HitboxSkipKnocked = true,
     -- risky
-    WalkSpeedOn = false, WalkSpeedValue = 30, NoSpeedStun = true, JumpPowerOn = false, JumpPowerValue = 80,
-    LowGravity = false, GravityValue = 100, ClickTp = false, TpTarget = nil,
-    Wallbang = false, WallbangAny = true, RapidFire = false, FireRate = 50,
+    WalkSpeedOn = false, WalkSpeedValue = 30, WalkSpeedMode = "Smooth", NoSpeedStun = true,
+    JumpPowerOn = false, JumpPowerValue = 80, JumpMode = "Smooth",
+    LowGravity = false, GravityValue = 100, ClickTp = false, TpTarget = nil, TpMode = "Fly there", TpSpeed = 60,
+    Wallbang = false, WallbangAny = true, WallbangReach = 10, RapidFire = false, FireRate = 50,
     -- macro
     CustomMacro = false, MacroButton = true, MacroHold = false, MacroTurn = 100, MacroOnlyMoving = true, MacroOnlyAir = false,
     MacroSpeedCap = false, MacroCapSpeed = 45, AntiSit = false,
@@ -293,7 +302,8 @@ end
 -- Filled in by the hitbox expander further down; aiming and the triggerbot
 -- need to know its boxes before then.
 local Hitbox = { count = 0, hits = 0, owner = {}, folder = nil }
-local Wallbang = { shots = 0 }
+local Wallbang = { shots = 0, shifted = 0, pending = nil }
+local Travel = {}
 
 --// Whitelist \\--
 -- Whitelisted players are left out of the features picked in "Exclude from".
@@ -651,6 +661,43 @@ do
         end)
         H.installed = ok
     end
+    H.shoot = function(args)
+        local p = Wallbang.pending
+        if not (p and p.origin and Settings.Wallbang) or os.clock() - p.at > 0.25 then
+            return nil
+        end
+        if args[5] ~= p.part or typeof(args[3]) ~= "Vector3" then
+            return nil
+        end
+        Wallbang.pending = nil
+        args[3] = p.origin
+        Wallbang.shifted += 1
+        return args
+    end
+    table.insert(Cleanups, function()
+        H.shoot = nil
+    end)
+    if (H.version or 1) < 2 and typeof(hookmetamethod) == "function" and typeof(getnamecallmethod) == "function" then
+        local ok = pcall(function()
+            local old
+            old = hookmetamethod(game, "__namecall", function(self, ...)
+                local fn = H.shoot
+                if fn and getnamecallmethod() == "FireServer" then
+                    local a1 = ...
+                    if a1 == "ShootGun" and not (typeof(checkcaller) == "function" and checkcaller()) then
+                        local ok2, args = pcall(fn, table.pack(...))
+                        if ok2 and type(args) == "table" then
+                            return old(self, table.unpack(args, 1, args.n))
+                        end
+                    end
+                end
+                return old(self, ...)
+            end)
+        end)
+        if ok then
+            H.version = 2
+        end
+    end
     Silent.serverAim = H.installed and "hooked" or "not available (no hookmetamethod)"
 end
 
@@ -976,16 +1023,78 @@ do
         if not hum or hum.Health <= 0 or Game.knocked(c) or Game.grabbed(c) then
             return
         end
-        if Settings.WalkSpeedOn and hum.WalkSpeed ~= Settings.WalkSpeedValue then
+        if Settings.WalkSpeedOn and Settings.WalkSpeedMode == "Real" and hum.WalkSpeed ~= Settings.WalkSpeedValue then
             hum.WalkSpeed = Settings.WalkSpeedValue
         end
-        if Settings.JumpPowerOn then
+        if Settings.JumpPowerOn and Settings.JumpMode == "Real" then
             if hum.UseJumpPower then
                 if hum.JumpPower ~= Settings.JumpPowerValue then
                     hum.JumpPower = Settings.JumpPowerValue
                 end
             else
                 hum.JumpHeight = Settings.JumpPowerValue ^ 2 / (2 * Workspace.Gravity)
+            end
+        end
+    end)
+
+    -- Smooth: keep the velocity the game gave you and add the rest as CFrame
+    -- steps, stopping short of walls and ceilings.
+    local stepParams = RaycastParams.new()
+    stepParams.FilterType = Enum.RaycastFilterType.Exclude
+    local function clearAhead(from, dir, dist)
+        local ignore = { myChar(), Workspace:FindFirstChild("Ignored"), Hitbox.folder }
+        for _, plr in Players:GetPlayers() do
+            if plr.Character then
+                table.insert(ignore, plr.Character)
+            end
+        end
+        stepParams.FilterDescendantsInstances = ignore
+        local hit = Workspace:Raycast(from, dir * (dist + 1.5), stepParams)
+        if hit then
+            return math.max(0, (hit.Position - from).Magnitude - 1.5)
+        end
+        return dist
+    end
+    local gameJump = 50
+    bind(RunService.Heartbeat, function(dt)
+        if not alive() or Settings.Fly then
+            return
+        end
+        local c = myChar()
+        local root = c and c:FindFirstChild("HumanoidRootPart")
+        local hum = c and c:FindFirstChildOfClass("Humanoid")
+        if not (root and hum) or hum.Health <= 0 or Game.knocked(c) or Game.grabbed(c) or root.Anchored then
+            return
+        end
+        if hum.UseJumpPower and hum.JumpPower > 0 and not (Settings.JumpPowerOn and Settings.JumpMode == "Real") then
+            gameJump = hum.JumpPower
+        end
+        if Settings.WalkSpeedOn and Settings.WalkSpeedMode ~= "Real" then
+            local move = hum.MoveDirection
+            local extra = Settings.WalkSpeedValue - math.max(hum.WalkSpeed, 0)
+            if extra > 0 and move.Magnitude > 0.05 then
+                local dir = Vector3.new(move.X, 0, move.Z)
+                if dir.Magnitude > 0.01 then
+                    dir = dir.Unit
+                    local dist = clearAhead(root.Position, dir, extra * dt)
+                    if dist > 0 then
+                        root.CFrame += dir * dist
+                    end
+                end
+            end
+        end
+        if Settings.JumpPowerOn and Settings.JumpMode ~= "Real" then
+            local vy = root.AssemblyLinearVelocity.Y
+            local state = hum:GetState()
+            if vy > 0.5 and (state == Enum.HumanoidStateType.Jumping or state == Enum.HumanoidStateType.Freefall) then
+                local ratio = math.clamp((Settings.JumpPowerValue / math.max(gameJump, 1)) ^ 2, 1, 40)
+                local rise = vy * (ratio - 1) * dt
+                if rise > 0 then
+                    local up = clearAhead(root.Position, Vector3.new(0, 1, 0), rise)
+                    if up > 0 then
+                        root.CFrame += Vector3.new(0, up, 0)
+                    end
+                end
             end
         end
     end)
@@ -1003,7 +1112,7 @@ do
         end
     end
     loop(0.5, function()
-        local want = Settings.WalkSpeedOn and Settings.NoSpeedStun and Settings.WalkSpeedValue > 38
+        local want = Settings.WalkSpeedOn and Settings.WalkSpeedMode == "Real" and Settings.NoSpeedStun and Settings.WalkSpeedValue > 38
         local be = Game.effects(myChar())
         local mv = be and be:FindFirstChild("Movement")
         if want and mv then
@@ -1022,12 +1131,38 @@ do
     end)
     table.insert(Cleanups, dropFlag)
 
-    local function teleport(pos)
+    local tpToken = 0
+    local function teleport(pos, follow)
         local root = myRoot()
-        if root and typeof(pos) == "Vector3" then
+        if not (root and typeof(pos) == "Vector3") then
+            return
+        end
+        tpToken += 1
+        local mine = tpToken
+        if Settings.TpMode == "Instant" or not Travel.fly then
             root.AssemblyLinearVelocity = Vector3.zero
             root.CFrame = CFrame.new(pos) * root.CFrame.Rotation
+            return
         end
+        task.spawn(function()
+            Risky.info = "flying there"
+            local ok = Travel.fly(pos, function()
+                return tpToken == mine and alive()
+            end, Settings.TpSpeed)
+            if tpToken ~= mine then
+                return
+            end
+            local r = myRoot()
+            local final = follow and follow() or pos
+            if ok and r and typeof(final) == "Vector3" and (r.Position - final).Magnitude < 25 then
+                r.AssemblyLinearVelocity = Vector3.zero
+                r.CFrame = CFrame.new(final) * r.CFrame.Rotation
+            end
+            Risky.info = ok and "arrived" or "stopped"
+        end)
+    end
+    function Risky.cancel()
+        tpToken += 1
     end
     bind(UserInputService.InputBegan, function(i, gpe)
         if gpe or not (alive() and Settings.ClickTp) then
@@ -1059,60 +1194,80 @@ do
     end)
     function Risky.goTo(name)
         local plr = name and Players:FindFirstChild(name)
-        local c = plr and plr.Character
-        local root = c and c:FindFirstChild("HumanoidRootPart")
-        if not root then
+        local function behind()
+            local c = plr and plr.Character
+            local root = c and c:FindFirstChild("HumanoidRootPart")
+            return root and (root.CFrame * CFrame.new(0, 0, 3)).Position
+        end
+        local at = behind()
+        if not at then
             notify("Pick someone who's spawned in")
             return
         end
-        teleport((root.CFrame * CFrame.new(0, 0, 3)).Position)
+        teleport(at, behind)
     end
 
     -- Rapid fire: scale the cooldown upvalue of each gun's Activated handler.
     local saved = setmetatable({}, { __mode = "k" })
+    local base = setmetatable({}, { __mode = "k" })
+    local applied = setmetatable({}, { __mode = "k" })
     local canPatch = typeof(getconnections) == "function" and type(debug) == "table"
         and type(debug.getupvalues) == "function" and type(debug.setupvalue) == "function"
     local function patch(tool, factor)
         local cd = tool:FindFirstChild("ShootingCooldown")
-        if not (cd and type(cd.Value) == "number" and cd.Value > 0) then
+        if not (cd and type(cd.Value) == "number") then
             return 0
         end
-        local ok, conns = pcall(getconnections, tool.Activated)
-        if not ok or type(conns) ~= "table" then
+        local b = base[tool]
+        local last = applied[tool]
+        if b == nil or (last and math.abs(cd.Value - last) > 1e-6) then
+            b = cd.Value
+            base[tool] = b
+        end
+        if b <= 0 then
             return 0
         end
-        local n = 0
-        for _, c in conns do
-            local f = c.Function
-            if type(f) == "function" then
-                local s = saved[f]
-                if s == nil then
-                    s = false
-                    local okU, ups = pcall(debug.getupvalues, f)
-                    if okU and type(ups) == "table" then
-                        for i, v in pairs(ups) do
-                            if type(i) == "number" and type(v) == "number" and math.abs(v - cd.Value) < 1e-6 then
-                                s = { index = i, value = v }
-                                break
+        local want = b * factor
+        if math.abs(cd.Value - want) > 1e-6 then
+            pcall(function()
+                cd.Value = want
+            end)
+        end
+        applied[tool] = want
+        local n = 1
+        if canPatch then
+            local ok, conns = pcall(getconnections, tool.Activated)
+            if ok and type(conns) == "table" then
+                for _, c in conns do
+                    local f = c.Function
+                    if type(f) == "function" then
+                        local s = saved[f]
+                        if s == nil then
+                            s = false
+                            local okU, ups = pcall(debug.getupvalues, f)
+                            if okU and type(ups) == "table" then
+                                for i, v in pairs(ups) do
+                                    if type(i) == "number" and type(v) == "number"
+                                        and (math.abs(v - b) < 1e-6 or math.abs(v - want) < 1e-6) then
+                                        s = { index = i }
+                                        break
+                                    end
+                                end
                             end
+                            saved[f] = s
+                        end
+                        if s then
+                            s.base = b
+                            pcall(debug.setupvalue, f, s.index, want)
                         end
                     end
-                    saved[f] = s
-                end
-                if s then
-                    pcall(debug.setupvalue, f, s.index, s.value * factor)
-                    n += 1
                 end
             end
         end
         return n
     end
     local patched = false
-    loop(0.5, function()
-        if not canPatch then
-            Rapid.info = "your executor can't (needs getconnections and debug.setupvalue)"
-            return
-        end
+    loop(0.3, function()
         if not Settings.RapidFire and not patched then
             Rapid.info = "off"
             return
@@ -1130,12 +1285,24 @@ do
         end
         patched = Settings.RapidFire
         Rapid.guns = n
-        Rapid.info = Settings.RapidFire and ("on (%d guns)"):format(n) or "off"
+        if Settings.RapidFire then
+            Rapid.info = ("on (%d guns%s)"):format(n, canPatch and "" or ", no debug.setupvalue: needs a re-equip after buying")
+        else
+            Rapid.info = "off"
+        end
     end)
     table.insert(Cleanups, function()
         for f, s in saved do
-            if s then
-                pcall(debug.setupvalue, f, s.index, s.value)
+            if s and s.base then
+                pcall(debug.setupvalue, f, s.index, s.base)
+            end
+        end
+        for tool, b in base do
+            local cd = typeof(tool) == "Instance" and tool:FindFirstChild("ShootingCooldown")
+            if cd then
+                pcall(function()
+                    cd.Value = b
+                end)
             end
         end
     end)
@@ -2076,6 +2243,43 @@ do
             end
             return nil
         end
+        -- Just past the last wall between the muzzle and the target, if that's
+        -- within Wallbang reach of the muzzle.
+        local mapParams = RaycastParams.new()
+        mapParams.FilterType = Enum.RaycastFilterType.Exclude
+        mapParams.IgnoreWater = true
+        function Wallbang.shift(params, target)
+            local handle = params.Handle
+            local muzzle = handle and handle:FindFirstChild("Muzzle")
+            local origin = params.ForcedOrigin or (muzzle and muzzle.WorldPosition)
+            if typeof(origin) ~= "Vector3" or typeof(target) ~= "Vector3" then
+                return nil
+            end
+            local list = { folder }
+            for _, plr in Players:GetPlayers() do
+                if plr.Character then
+                    table.insert(list, plr.Character)
+                end
+            end
+            for _, v in ignoredList() do
+                table.insert(list, v)
+            end
+            local ign = Workspace:FindFirstChild("Ignored")
+            if ign then
+                table.insert(list, ign)
+            end
+            mapParams.FilterDescendantsInstances = list
+            local back = Workspace:Raycast(target, origin - target, mapParams)
+            if not back then
+                return nil
+            end
+            local toward = (target - origin).Unit
+            local exit = back.Position + toward * 0.3
+            if (exit - origin).Magnitude > Settings.WallbangReach then
+                return nil
+            end
+            return exit
+        end
         Gun.shoot = function(params, ...)
             local r = table.pack(originalShoot(params, ...))
             if type(params) ~= "table" or params.ReplicatedShot or params.Shooter ~= myChar() then
@@ -2106,6 +2310,8 @@ do
                     r[1], r[2], r[3] = pos, part, normal
                     r.n = math.max(r.n, 3)
                     Wallbang.shots += 1
+                    local okS, origin = pcall(Wallbang.shift, params, pos)
+                    Wallbang.pending = { part = part, origin = okS and origin or nil, at = os.clock() }
                 end
             end
             return table.unpack(r, 1, r.n)
@@ -3010,7 +3216,7 @@ do
         end
         return pts, length
     end
-    function Mover.fly(pts, wanted)
+    function Mover.fly(pts, wanted, speed)
         local root = myRoot()
         if not root then
             return false
@@ -3021,7 +3227,8 @@ do
         for k = 2, #pts do
             length += (pts[k] - pts[k - 1]).Magnitude
         end
-        local deadline = os.clock() + length / math.max(Settings.AtmFlySpeed, 1) * 1.5 + 3
+        local flySpeed = speed or Settings.AtmFlySpeed
+        local deadline = os.clock() + length / math.max(flySpeed, 1) * 1.5 + 3
         local doorParams = RaycastParams.new()
         doorParams.FilterType = Enum.RaycastFilterType.Exclude
         local lastDoorCheck = 0
@@ -3063,7 +3270,7 @@ do
                 end
             end
             local dist = delta.Magnitude
-            local step = Settings.AtmFlySpeed * dt
+            local step = flySpeed * dt
             local new
             if dist <= step then
                 new = goal
@@ -3085,6 +3292,14 @@ do
         return true
     end
     -- Gets you next to a position: teleport, or fly the path there.
+    function Travel.fly(pos, wanted, speed)
+        local root = myRoot()
+        if not root then
+            return false
+        end
+        local pts = Mover.path(root.Position, pos) or Mover.over(root.Position, pos)
+        return Mover.fly(pts, wanted, speed)
+    end
     function Mover.go(pos, wanted, pts)
         local root = myRoot()
         if not root then
@@ -3913,14 +4128,21 @@ do
         return list
     end
     local Mv = Tab:AddLeftGroupbox("Movement", "move")
-    toggle(Mv, "WalkSpeedOn", "Walk speed", "Sets your real WalkSpeed every frame, over the game's own. The server can see how fast you move")
+    toggle(Mv, "WalkSpeedOn", "Walk speed", "How fast you move")
     slider(Mv, "WalkSpeedValue", "Speed", 16, 250, 0, "")
-    toggle(Mv, "NoSpeedStun", "No speed stun", "Past 40 studs/s the game stops you and freezes your camera for half a second. This turns that off")
-    toggle(Mv, "JumpPowerOn", "Jump power", "Sets your real JumpPower every frame, which also skips the game's jump cooldown")
-    slider(Mv, "JumpPowerValue", "Power", 50, 400, 0, "")
+    dropdown(Mv, "WalkSpeedMode", "How", { "Smooth", "Real" },
+        "Smooth: your velocity stays normal and the rest is added as small steps, so velocity checks see nothing. Real: sets your actual WalkSpeed")
+    toggle(Mv, "NoSpeedStun", "No speed stun (Real)", "In Real mode, past 40 studs/s the game stops you and freezes your camera for half a second. This turns that off")
+    toggle(Mv, "JumpPowerOn", "Jump power", "How high you jump")
+    slider(Mv, "JumpPowerValue", "Power", 50, 400, 0, "", "50 is normal")
+    dropdown(Mv, "JumpMode", "How", { "Smooth", "Real" },
+        "Smooth: a normal jump that keeps rising. Real: sets your actual JumpPower, which also skips the jump cooldown")
     toggle(Mv, "LowGravity", "Gravity changer")
     slider(Mv, "GravityValue", "Gravity", 0, 196, 0, "", "196 is normal")
-    toggle(Mv, "ClickTp", "Click teleport", "Ctrl + left click teleports you there")
+    toggle(Mv, "ClickTp", "Click teleport", "Ctrl + left click to go there")
+    dropdown(Mv, "TpMode", "Teleports", { "Fly there", "Instant" },
+        "Fly there: flies the path at the speed below (over buildings when there's no way through), which the server takes much better than a jump across the map")
+    slider(Mv, "TpSpeed", "Fly speed", 20, 200, 0, " studs/s")
     local tp = Mv:AddDropdown("TpPlayer", {
         Text = "Teleport to", Values = names(), Searchable = true,
         Callback = function(v)
@@ -3932,8 +4154,14 @@ do
         Func = function()
             Risky.goTo(Settings.TpTarget)
         end,
-        Tooltip = "Puts you right behind them",
+        Tooltip = "Ends right behind them",
     })
+    Mv:AddButton({ Text = "Stop teleport", Func = function()
+        Risky.cancel()
+    end })
+    status(Mv, function()
+        return ("Teleport: %s"):format(Risky.info ~= "" and Risky.info or "idle")
+    end)
     local function refresh()
         pcall(function()
             tp:SetValues(names())
@@ -3950,10 +4178,12 @@ do
     toggle(G, "Wallbang", "Wallbang",
         "Your shots count on the player behind the wall: the game's own raycast stops at walls, this hands the server the player instead. Also lets silent aim pick people behind walls")
     toggle(G, "WallbangAny", "Even without silent aim", "Any shot whose line passes through a player behind a wall hits them")
+    slider(G, "WallbangReach", "Wallbang reach", 2, 30, 0, " studs",
+        "Moves where the shot starts to just past the wall, if the wall is this close to your gun. Lower is less suspicious")
     toggle(G, "RapidFire", "Rapid fire", "Cuts each gun's own cooldown between shots")
     slider(G, "FireRate", "Cooldown", 5, 100, 0, "%", "Of the gun's normal time between shots. 50% is twice as fast")
     status(G, function()
-        return ("Wallbang hits: %d\nRapid fire: %s"):format(Wallbang.shots, Rapid.info)
+        return ("Wallbang hits: %d (origin moved %d)\nRapid fire: %s"):format(Wallbang.shots, Wallbang.shifted, Rapid.info)
     end)
 end
 
