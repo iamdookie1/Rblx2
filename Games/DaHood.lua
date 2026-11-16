@@ -3509,6 +3509,30 @@ do
 end
 
 do
+    local Tab = Window:AddTab("Info", "info", "Bank status")
+    local Box = Tab:AddLeftGroupbox("Bank", "landmark")
+    -- The bank's vaults are the VAULT models in workspace.Cashiers: robbable
+    -- while their health is above 0, broken open at 0 until they come back.
+    status(Box, function()
+        local total, closed = 0, 0
+        for _, b in World.breakables() do
+            if b.kind == "Vault" then
+                total += 1
+                if b.hum.Health > 0 then
+                    closed += 1
+                end
+            end
+        end
+        if total == 0 then
+            return "Bank: unknown (the bank isn't loaded, get closer to it)"
+        elseif closed > 0 then
+            return ("Bank: ROBBABLE\n%d of %d vaults can be broken open"):format(closed, total)
+        end
+        return ("Bank: not robbable\nall %d vaults are already broken open"):format(total)
+    end)
+end
+
+do
     local Tab = Window:AddTab("Whitelist", "user-check", "Friends and anti hit")
     local function names()
         local list = {}
