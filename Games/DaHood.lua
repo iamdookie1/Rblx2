@@ -33,6 +33,7 @@ local UserInputService = game:GetService("UserInputService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local TeleportService = game:GetService("TeleportService")
 local HttpService = game:GetService("HttpService")
+local PathfindingService = game:GetService("PathfindingService")
 local Workspace = workspace
 local LocalPlayer = Players.LocalPlayer
 local Mouse = LocalPlayer:GetMouse()
@@ -104,6 +105,7 @@ local Settings = {
     AtmEsp = false, VaultEsp = false, ItemEsp = false, WorldShowBroken = false, WorldEspMax = 1500,
     AtmColor = Color3.fromRGB(90, 255, 120), VaultColor = Color3.fromRGB(255, 215, 70), ItemColor = Color3.fromRGB(150, 200, 255),
     AutoPunchAtm = false, AtmFarm = false, AtmFarmRange = 400, AtmPunchDelay = 0.35, AtmUseGun = false,
+    AtmMove = "Fly (path)", AtmFlySpeed = 45,
     -- whitelist
     Whitelist = {}, AntiHit = {},
     WhitelistFrom = { ["Silent aim"] = true, ["Camlock"] = true, ["Triggerbot"] = true, ["Hitbox expander"] = true,
@@ -2445,6 +2447,196 @@ do
     -- also walks you (teleports) from one unbroken ATM to the next and picks
     -- up the cash they drop.
     World.info, World.broken = "off", 0
+
+    -- Getting around: a path from PathfindingService (it only walks around
+    -- parts you can collide with, so it goes straight through ones you can't),
+    -- followed by moving your CFrame along it at the speed you set. No noclip,
+    -- no teleport.
+    local Mover = {}
+    local floorParams = RaycastParams.new()
+    floorParams.FilterType = Enum.RaycastFilterType.Exclude
+    local function floorBelow(pos)
+        local ignore = { myChar(), Workspace:FindFirstChild("Ignored"), Workspace:FindFirstChild("Players"), Hitbox.folder }
+        floorParams.FilterDescendantsInstances = ignore
+        local hit = Workspace:Raycast(pos + Vector3.new(0, 3, 0), Vector3.new(0, -80, 0), floorParams)
+        return hit and hit.Position or nil
+    end
+    local function rootLift()
+        local c = myChar()
+        local hum = c and c:FindFirstChildOfClass("Humanoid")
+        local root = c and c:FindFirstChild("HumanoidRootPart")
+        if hum and root then
+            return hum.HipHeight + root.Size.Y / 2
+        end
+        return 3
+    end
+    function Mover.path(fromPos, toPos)
+        local a = floorBelow(fromPos) or fromPos
+        local b = floorBelow(toPos) or toPos
+        local path = PathfindingService:CreatePath({
+            AgentRadius = 1.6, AgentHeight = 5, AgentCanJump = true, AgentCanClimb = true, WaypointSpacing = 3,
+        })
+        local ok = pcall(path.ComputeAsync, path, a, b)
+        if not ok or path.Status ~= Enum.PathStatus.Success then
+            return nil
+        end
+        local pts, length, last = {}, 0, nil
+        for _, w in path:GetWaypoints() do
+            table.insert(pts, w.Position)
+            if last then
+                length += (w.Position - last).Magnitude
+            end
+            last = w.Position
+        end
+        return pts, length
+    end
+    function Mover.fly(pts, wanted)
+        local root = myRoot()
+        if not root then
+            return false
+        end
+        local lift = rootLift()
+        local i = 1
+        local length = 0
+        for k = 2, #pts do
+            length += (pts[k] - pts[k - 1]).Magnitude
+        end
+        local deadline = os.clock() + length / math.max(Settings.AtmFlySpeed, 1) * 1.5 + 3
+        while i <= #pts do
+            if not alive() or (wanted and not wanted()) then
+                return false
+            end
+            local c = myChar()
+            if not root.Parent or Game.knocked(c) or Game.dead(c) then
+                return false
+            end
+            local dt = RunService.Heartbeat:Wait()
+            local goal = pts[i] + Vector3.new(0, lift, 0)
+            local pos = root.Position
+            local delta = goal - pos
+            local dist = delta.Magnitude
+            local step = Settings.AtmFlySpeed * dt
+            local new
+            if dist <= step then
+                new = goal
+                i += 1
+            else
+                new = pos + delta.Unit * step
+            end
+            local flat = Vector3.new(delta.X, 0, delta.Z)
+            if flat.Magnitude > 0.1 then
+                root.CFrame = CFrame.lookAt(new, new + flat)
+            else
+                root.CFrame = CFrame.new(new) * (root.CFrame - root.CFrame.Position)
+            end
+            root.AssemblyLinearVelocity = Vector3.zero
+            if os.clock() > deadline then
+                return false
+            end
+        end
+        return true
+    end
+    -- Gets you next to a position: teleport, or fly the path there.
+    function Mover.go(pos, wanted, pts)
+        local root = myRoot()
+        if not root then
+            return false
+        end
+        if Settings.AtmMove == "Teleport" then
+            root.CFrame = CFrame.new(pos + Vector3.new(0, 2.5, 0)) * (root.CFrame - root.CFrame.Position)
+            root.AssemblyLinearVelocity = Vector3.zero
+            RunService.Heartbeat:Wait()
+            RunService.Heartbeat:Wait()
+            return true
+        end
+        pts = pts or Mover.path(root.Position, pos)
+        if not pts then
+            return false
+        end
+        return Mover.fly(pts, wanted)
+    end
+
+    -- Where to stand at an ATM: in front of it, on the floor, with a clear
+    -- line to it (ATMs sit against walls, so the side you came from can be
+    -- the wrong one).
+    local function standSpot(b, off)
+        local head = b.head
+        local cf = head.CFrame
+        local root = myRoot()
+        local dirs = { cf.LookVector, -cf.LookVector, cf.RightVector, -cf.RightVector }
+        if root then
+            local flat = Vector3.new(root.Position.X - head.Position.X, 0, root.Position.Z - head.Position.Z)
+            if flat.Magnitude > 0.1 then
+                table.insert(dirs, 1, flat.Unit)
+            end
+        end
+        local ignore = { myChar(), b.model, Workspace:FindFirstChild("Ignored"), Workspace:FindFirstChild("Players"), Hitbox.folder }
+        local rp = RaycastParams.new()
+        rp.FilterType = Enum.RaycastFilterType.Exclude
+        rp.FilterDescendantsInstances = ignore
+        for _, d in dirs do
+            local flat = Vector3.new(d.X, 0, d.Z)
+            if flat.Magnitude > 0.1 then
+                local spot = head.Position + flat.Unit * off
+                local floor = floorBelow(spot)
+                if floor and math.abs(floor.Y - head.Position.Y) < 8 then
+                    local eye = floor + Vector3.new(0, 3, 0)
+                    if not Workspace:Raycast(eye, head.Position - eye, rp) then
+                        return floor
+                    end
+                end
+            end
+        end
+        return head.Position
+    end
+
+    -- The ATM you can actually get to first: the few nearest in a straight
+    -- line, compared by the length of the path to them.
+    local unreachable = {}
+    local function pickAtm(range, off)
+        local root = myRoot()
+        if not root then
+            return nil
+        end
+        local now = os.clock()
+        local list = {}
+        for _, b in World.breakables() do
+            if b.kind == "ATM" and b.hum.Health > 0 and (unreachable[b.model] or 0) < now then
+                local d = (b.head.Position - root.Position).Magnitude
+                if d <= range then
+                    table.insert(list, { b = b, d = d })
+                end
+            end
+        end
+        table.sort(list, function(x, y)
+            return x.d < y.d
+        end)
+        if #list == 0 then
+            return nil
+        end
+        if Settings.AtmMove == "Teleport" or list[1].d <= off + 2 then
+            local first = list[1]
+            return first.b, first.d, standSpot(first.b, off)
+        end
+        local best, bestLen, bestSpot, bestPts
+        for i = 1, math.min(4, #list) do
+            local b = list[i].b
+            local spot = standSpot(b, off)
+            local pts, len = Mover.path(root.Position, spot)
+            if pts then
+                if not bestLen or len < bestLen then
+                    best, bestLen, bestSpot, bestPts = b, len, spot, pts
+                end
+            else
+                unreachable[b.model] = now + 30
+            end
+        end
+        if not best then
+            return nil
+        end
+        return best, (best.head.Position - root.Position).Magnitude, bestSpot, bestPts
+    end
+
     local function nearestAtm(maxDist)
         local root = myRoot()
         if not root then
@@ -2517,12 +2709,12 @@ do
             else
                 lastSeen = os.clock()
                 tried[best.part] = (tried[best.part] or 0) + 1
-                local stand = CFrame.new(best.part.Position + Vector3.new(0, 2.5, 0))
-                if bestD > 6 then
-                    root.CFrame = stand
-                    root.AssemblyLinearVelocity = Vector3.zero
-                    RunService.Heartbeat:Wait()
-                    RunService.Heartbeat:Wait()
+                local reach = math.min(best.cd.MaxActivationDistance, 12) - 3
+                if bestD > reach then
+                    local part = best.part
+                    Mover.go(part.Position, function()
+                        return part.Parent ~= nil and (part.Position - root.Position).Magnitude > reach
+                    end)
                 end
                 pcall(fireclickdetector, best.cd)
                 local t0 = os.clock()
@@ -2601,24 +2793,36 @@ do
         end
         local gun = Settings.AtmUseGun and bestGun() or nil
         local reach = gun and 14 or 7
-        local atm, d = nearestAtm(Settings.AtmFarm and Settings.AtmFarmRange or reach)
+        local standOff = gun and 7 or 3
+        local atm, d, spot, pts
+        if Settings.AtmFarm then
+            World.info = "finding the closest ATM"
+            atm, d, spot, pts = pickAtm(Settings.AtmFarmRange, standOff)
+        else
+            atm, d = nearestAtm(reach)
+        end
         if not atm then
-            World.info = Settings.AtmFarm and "no unbroken ATM in range" or "no ATM in reach"
+            World.info = Settings.AtmFarm and "no reachable unbroken ATM in range" or "no ATM in reach"
             Aim.forced = nil
             return
         end
         local head = atm.head
-        local standOff = gun and 7 or 3
         if d > standOff + 2 then
             if not Settings.AtmFarm then
                 return
             end
-            local flat = Vector3.new(root.Position.X - head.Position.X, 0, root.Position.Z - head.Position.Z)
-            local dir = flat.Magnitude > 0.1 and flat.Unit or Vector3.new(0, 0, 1)
-            local stand = head.Position + dir * standOff
-            root.CFrame = CFrame.lookAt(stand, Vector3.new(head.Position.X, stand.Y, head.Position.Z))
-            root.AssemblyLinearVelocity = Vector3.zero
-            task.wait(0.15)
+            World.info = Settings.AtmMove == "Teleport" and "going to the ATM" or "flying to the ATM"
+            local model = atm.model
+            local arrived = Mover.go(spot or head.Position, function()
+                return Settings.AtmFarm and atm.hum.Health > 0 and model.Parent ~= nil
+            end, pts)
+            if not arrived then
+                if atm.hum.Health > 0 and Settings.AtmFarm then
+                    unreachable[model] = os.clock() + 30
+                    World.info = "couldn't get there, trying the next ATM"
+                end
+                return
+            end
         end
         face(root, head.Position)
         local pct = math.floor(atm.hum.Health / math.max(1, atm.hum.MaxHealth) * 100)
@@ -2902,6 +3106,9 @@ do
         "Goes from one unbroken ATM to the next, breaks it and picks up the cash. Teleports: risky, use an alt")
     slider(Farm, "AtmFarmRange", "Farm range", 20, 3000, 0, " studs")
     slider(Farm, "AtmPunchDelay", "Punch delay", 0.15, 1, 2, " s")
+    dropdown(Farm, "AtmMove", "Getting there", { "Fly (path)", "Teleport" },
+        "Fly: follows a walkable path (goes through parts you can't collide with, no noclip) at the speed below. Teleport: the old instant hop")
+    slider(Farm, "AtmFlySpeed", "Fly speed", 10, 300, 0, " studs/s", "Running is about 16-26. Faster gets there sooner but looks less legit")
     toggle(Farm, "AtmUseGun", "Use gun",
         "Shoots ATMs with your strongest gun (by damage, never the RPG or grenade launcher) instead of punching. Reloads by itself, punches again when every gun is empty")
     status(Farm, function()
