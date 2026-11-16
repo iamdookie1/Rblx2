@@ -98,12 +98,16 @@ local Settings = {
     Hitbox = false, HitboxMethod = "Ghost box", HitboxSize = 8, HitboxTransparency = 75, HitboxSkipCrew = true, HitboxSkipKnocked = true,
     -- macro
     CustomMacro = false, MacroButton = true, MacroHold = false, MacroTurn = 100, MacroOnlyMoving = true, MacroOnlyAir = false,
-    MacroSpeedCap = false, MacroCapSpeed = 45,
+    MacroSpeedCap = false, MacroCapSpeed = 45, AntiSit = false,
     QuickMacro = false, QuickEmote = nil, QuickEmoteWait = 0.15, QuickNudge = 0.3, QuickLockpick = true,
     -- world
     AtmEsp = false, VaultEsp = false, ItemEsp = false, WorldShowBroken = false, WorldEspMax = 1500,
     AtmColor = Color3.fromRGB(90, 255, 120), VaultColor = Color3.fromRGB(255, 215, 70), ItemColor = Color3.fromRGB(150, 200, 255),
-    AutoPunchAtm = false, AtmFarm = false, AtmFarmRange = 400, AtmPunchDelay = 0.35,
+    AutoPunchAtm = false, AtmFarm = false, AtmFarmRange = 400, AtmPunchDelay = 0.35, AtmUseGun = false,
+    -- whitelist
+    Whitelist = {}, AntiHit = {},
+    WhitelistFrom = { ["Silent aim"] = true, ["Camlock"] = true, ["Triggerbot"] = true, ["Hitbox expander"] = true,
+        ["Auto stomp"] = true, ["Auto block"] = true, ["ESP friend colour"] = true },
     -- shop / supplies
     BuyPick = "Closest", BuyCount = 1, BuyPauseNear = 0,
     AutoEat = false, EatHP = 70,
@@ -270,6 +274,31 @@ end
 -- need to know its boxes before then.
 local Hitbox = { count = 0, hits = 0, owner = {}, folder = nil }
 
+--// Whitelist \\--
+-- Whitelisted players are left out of the features picked in "Exclude from".
+-- Anti hit players are never aimed at, and your own shots pass through them.
+local Whitelist = {}
+function Whitelist.listed(player, what)
+    return player ~= nil and Settings.Whitelist[player.Name] == true and Settings.WhitelistFrom[what] == true
+end
+function Whitelist.antiHit(player)
+    return player ~= nil and Settings.AntiHit[player.Name] == true
+end
+function Whitelist.skip(player, what)
+    return Whitelist.listed(player, what) or Whitelist.antiHit(player)
+end
+function Whitelist.playerOf(inst)
+    local node = inst
+    while node and node ~= Workspace do
+        local p = Players:GetPlayerFromCharacter(node)
+        if p then
+            return p, node
+        end
+        node = node.Parent
+    end
+    return nil
+end
+
 --// Targets \\--
 local Targets = {}
 do
@@ -395,7 +424,7 @@ function Lead.point(part, root)
 end
 
 --// Aim (target picking, silent aim, camlock) \\--
-local Aim = { target = nil, point = nil, info = "off" }
+local Aim = { target = nil, point = nil, camTarget = nil, camPoint = nil, forced = nil, info = "off" }
 do
     local fov = Draw.new("Circle", { Thickness = 1.5, NumSides = 64, Filled = false, Transparency = 0.8, Visible = false })
     local mark = Draw.new("Circle", { Thickness = 2, NumSides = 16, Radius = 5, Filled = false, Visible = false })
@@ -406,8 +435,8 @@ do
         end
         return UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton2)
     end
-    local function score(t, centre, cam, root)
-        if not Targets.valid(t) then
+    local function score(t, centre, cam, root, feature)
+        if not Targets.valid(t) or Whitelist.skip(t.player, feature) then
             return nil
         end
         if root and (t.root.Position - root.Position).Magnitude > Settings.AimMaxDistance then
@@ -430,7 +459,7 @@ do
         end
         return d, part
     end
-    function Aim.pick()
+    function Aim.pick(feature, prev)
         local cam = camera()
         if not cam then
             return nil
@@ -438,10 +467,10 @@ do
         local centre = Targets.aimCentre()
         local root = myRoot()
         local list = Targets.list()
-        if Settings.StickyTarget and Aim.target then
+        if Settings.StickyTarget and prev then
             for _, t in list do
-                if t.player == Aim.target.player then
-                    local d, part = score(t, centre, cam, root)
+                if t.player == prev.player then
+                    local d, part = score(t, centre, cam, root, feature)
                     if d then
                         t.part = part
                         return t
@@ -451,7 +480,7 @@ do
         end
         local best, bestD
         for _, t in list do
-            local d, part = score(t, centre, cam, root)
+            local d, part = score(t, centre, cam, root, feature)
             if d and (not bestD or d < bestD) then
                 t.part = part
                 best, bestD = t, d
@@ -468,25 +497,37 @@ do
             if fov.Visible then
                 fov.Radius = Settings.AimFOV
                 fov.Position = Targets.aimCentre()
-                fov.Color = Aim.target and Settings.EnemyColor or Settings.FOVColor
+                fov.Color = (Aim.target or Aim.camTarget) and Settings.EnemyColor or Settings.FOVColor
             end
         end
         if not (using and cam and active()) then
-            Aim.target, Aim.point = nil, nil
+            Aim.target, Aim.point, Aim.camTarget, Aim.camPoint = nil, nil, nil, nil
             Aim.info = using and "waiting (hold right click)" or "off"
             if mark then
                 mark.Visible = false
             end
             return
         end
-        local t = Aim.pick()
+        local t = (Settings.SilentAim or Settings.Triggerbot) and Aim.pick("Silent aim", Aim.target) or nil
         Aim.target = t
         Aim.point = t and Lead.point(t.part, t.root) or nil
-        Aim.info = t and ("on %s"):format(t.player.DisplayName) or "no target in the circle"
+        local ct = nil
+        if Settings.CamLock then
+            if t and not Whitelist.skip(t.player, "Camlock") then
+                ct = t
+            else
+                ct = Aim.pick("Camlock", Aim.camTarget)
+            end
+        end
+        Aim.camTarget = ct
+        Aim.camPoint = ct and (ct == t and Aim.point or Lead.point(ct.part, ct.root)) or nil
+        local shown = t or ct
+        Aim.info = shown and ("on %s"):format(shown.player.DisplayName) or "no target in the circle"
         if mark then
-            local show = Settings.ShowTarget and Aim.point ~= nil
+            local markAt = Aim.point or Aim.camPoint
+            local show = Settings.ShowTarget and markAt ~= nil
             if show then
-                local sp, on = cam:WorldToViewportPoint(Aim.point)
+                local sp, on = cam:WorldToViewportPoint(markAt)
                 mark.Visible = on
                 mark.Position = Vector2.new(sp.X, sp.Y)
                 mark.Color = Settings.EnemyColor
@@ -495,9 +536,9 @@ do
             end
         end
         -- Camlock: turns your real camera (works on mobile too).
-        if Settings.CamLock and Aim.point then
+        if Settings.CamLock and Aim.camPoint then
             local cf = cam.CFrame
-            local goal = CFrame.lookAt(cf.Position, Aim.point)
+            local goal = CFrame.lookAt(cf.Position, Aim.camPoint)
             local a = 1 / math.max(1, Settings.CamSmooth)
             cam.CFrame = cf:Lerp(goal, a)
         end
@@ -518,6 +559,9 @@ do
         return rollOk
     end
     function Aim.silentPoint()
+        if alive() and Aim.forced then
+            return Aim.forced
+        end
         if alive() and Settings.SilentAim and Aim.point and Aim.rolled() then
             return Aim.point
         end
@@ -607,20 +651,14 @@ do
         end
         local boxed = hit and Hitbox.owner[hit]
         if boxed then
-            return Targets.valid({ player = boxed.player, char = boxed.char })
+            return Targets.valid({ player = boxed.player, char = boxed.char }) and not Whitelist.skip(boxed.player, "Triggerbot")
         end
-        local node = hit
-        while node and node ~= Workspace do
-            local p = Players:GetPlayerFromCharacter(node)
-            if p then
-                if p ~= LocalPlayer then
-                    return Targets.valid({ player = p, char = node })
-                end
-                break
-            end
-            node = node.Parent
+        local p, char = Whitelist.playerOf(hit)
+        if p and p ~= LocalPlayer then
+            return Targets.valid({ player = p, char = char }) and not Whitelist.skip(p, "Triggerbot")
         end
-        if Settings.TriggerOnSilentTarget and Settings.SilentAim and Aim.point then
+        if Settings.TriggerOnSilentTarget and Settings.SilentAim and Aim.point and Aim.target
+            and not Whitelist.skip(Aim.target.player, "Triggerbot") then
             return true
         end
         return false
@@ -697,7 +735,7 @@ do
         local best, bestD
         for _, t in Targets.list() do
             if Game.knocked(t.char) and not Game.dead(t.char) and not Game.grabbed(t.char)
-                and (Settings.StompCrew or not Game.sameCrew(t.player)) then
+                and (Settings.StompCrew or not Game.sameCrew(t.player)) and not Whitelist.listed(t.player, "Auto stomp") then
                 local d = (t.root.Position - root.Position).Magnitude
                 if d <= range and (not bestD or d < bestD) then
                     best, bestD = t, d
@@ -765,7 +803,7 @@ do
         end
         local threat = false
         for _, t in Targets.list() do
-            if not Game.knocked(t.char) and not Game.sameCrew(t.player) then
+            if not Game.knocked(t.char) and not Game.sameCrew(t.player) and not Whitelist.listed(t.player, "Auto block") then
                 local d = (t.root.Position - root.Position).Magnitude
                 if d <= Settings.BlockRange then
                     local be = Game.effects(t.char)
@@ -892,6 +930,54 @@ do
     end)
 end
 
+--// Anti sit \\--
+-- Seats are a common trap (sit someone in a car / chair and fling or kill them).
+-- With this on your character can't take the Seated state, and if something
+-- sits you anyway you're stood straight back up.
+do
+    local applied = nil
+    local function setSeat(hum, on)
+        pcall(hum.SetStateEnabled, hum, Enum.HumanoidStateType.Seated, on)
+    end
+    table.insert(Cleanups, function()
+        if applied and applied.Parent then
+            setSeat(applied, true)
+        end
+    end)
+    bind(RunService.Heartbeat, function()
+        if not alive() then
+            return
+        end
+        local c = myChar()
+        local hum = c and c:FindFirstChildOfClass("Humanoid")
+        if not hum then
+            return
+        end
+        if not Settings.AntiSit then
+            if applied then
+                if applied.Parent then
+                    setSeat(applied, true)
+                end
+                applied = nil
+            end
+            return
+        end
+        if applied ~= hum then
+            setSeat(hum, false)
+            applied = hum
+        end
+        if hum.Sit or hum.SeatPart then
+            local seat = hum.SeatPart
+            local weld = seat and seat:FindFirstChild("SeatWeld")
+            if weld then
+                pcall(weld.Destroy, weld)
+            end
+            hum.Sit = false
+            pcall(hum.ChangeState, hum, Enum.HumanoidStateType.Jumping)
+        end
+    end)
+end
+
 --// ESP \\--
 do
     local pool = {}
@@ -938,7 +1024,7 @@ do
                     e = make()
                     pool[p] = e
                 end
-                local crew = Game.sameCrew(p)
+                local crew = Game.sameCrew(p) or Whitelist.listed(p, "ESP friend colour")
                 local dist = root and (t.root.Position - root.Position).Magnitude or 0
                 if dist > Settings.EspMax or (crew and not Settings.EspCrew) then
                     hide(e)
@@ -1652,10 +1738,14 @@ do
     table.insert(Cleanups, restoreAll)
 
     local function place()
+        local query = Aim.forced == nil
         for _, b in boxes do
             local o = Hitbox.owner[b]
             if o and o.root.Parent then
                 b.CFrame = o.root.CFrame
+            end
+            if b.CanQuery ~= query then
+                b.CanQuery = query
             end
         end
     end
@@ -1667,10 +1757,65 @@ do
     if Gun then
         Genv.__DaHoodOrigShoot = Genv.__DaHoodOrigShoot or rawget(Gun, "shoot")
         local originalShoot = Genv.__DaHoodOrigShoot
+        local mainIgnored
+        local function ignoredList()
+            if mainIgnored == nil then
+                local ok, mm = pcall(require, ReplicatedStorage:WaitForChild("MainModule", 2))
+                mainIgnored = ok and type(mm) == "table" and type(mm.Ignored) == "table" and mm.Ignored or false
+            end
+            return mainIgnored or {}
+        end
+        -- Cast the shot again with anti hit players left out, so it carries on
+        -- to whatever is behind them.
+        local function recast(params)
+            local handle = params.Handle
+            local muzzle = handle and handle:FindFirstChild("Muzzle")
+            local origin = params.ForcedOrigin or (muzzle and muzzle.WorldPosition)
+            local aimPos = params.AimPosition
+            if typeof(origin) ~= "Vector3" or typeof(aimPos) ~= "Vector3" then
+                return nil
+            end
+            local range = params.Range or 200
+            local dir = aimPos - origin
+            if dir.Magnitude < 0.01 then
+                return nil
+            end
+            dir = dir.Unit
+            local list = { params.Shooter }
+            for _, v in ignoredList() do
+                table.insert(list, v)
+            end
+            for _, plr in Players:GetPlayers() do
+                if Whitelist.antiHit(plr) and plr.Character then
+                    table.insert(list, plr.Character)
+                end
+            end
+            local rp = RaycastParams.new()
+            rp.FilterType = Enum.RaycastFilterType.Exclude
+            rp.IgnoreWater = true
+            rp.FilterDescendantsInstances = list
+            local hit = Workspace:Raycast(origin, dir * range, rp)
+            if hit then
+                return true, hit.Position, hit.Instance, hit.Normal
+            end
+            return true, origin + dir * range, nil, nil
+        end
         Gun.shoot = function(params, ...)
             local r = table.pack(originalShoot(params, ...))
+            if type(params) ~= "table" or params.ReplicatedShot or params.Shooter ~= myChar() then
+                return table.unpack(r, 1, r.n)
+            end
+            local hitPlayer = typeof(r[2]) == "Instance" and Whitelist.playerOf(r[2])
+            if hitPlayer and Whitelist.antiHit(hitPlayer) then
+                local ok, pos, inst, normal = recast(params)
+                if ok then
+                    r[1], r[2], r[3] = pos, inst, normal
+                    r.n = math.max(r.n, 3)
+                    Hitbox.saved = (Hitbox.saved or 0) + 1
+                end
+            end
             local o = typeof(r[2]) == "Instance" and Hitbox.owner[r[2]]
-            if o then
+            if o and Aim.forced == nil then
                 local real = o.char:FindFirstChild("UpperTorso") or o.char:FindFirstChild("Torso") or o.root
                 if real and real.Parent then
                     r[2] = real
@@ -1695,6 +1840,7 @@ do
             for _, t in Targets.list() do
                 local skip = (Settings.HitboxSkipCrew and Game.sameCrew(t.player))
                     or (Settings.HitboxSkipKnocked and (Game.knocked(t.char) or Game.dead(t.char)))
+                    or Whitelist.skip(t.player, "Hitbox expander")
                 if not skip then
                     n += 1
                     local s = Settings.HitboxSize
@@ -2334,67 +2480,189 @@ do
         end
         return nil
     end
+    -- Picks up every drop near a broken ATM: waits for the cash to fall out,
+    -- goes to each one, clicks it, checks it's gone (retries once), and only
+    -- leaves once nothing new has dropped for a moment.
     local function collect(around)
         if typeof(fireclickdetector) ~= "function" then
-            return
+            return 0
         end
         local root = myRoot()
-        for _, d in Money.drops() do
-            if root and (d.part.Position - around).Magnitude <= 18 then
-                root.CFrame = CFrame.new(d.part.Position + Vector3.new(0, 2.5, 0))
-                root.AssemblyLinearVelocity = Vector3.zero
-                task.wait(0.12)
-                pcall(fireclickdetector, d.cd)
-                Money.picked += 1
-                task.wait(0.08)
+        if not root then
+            return 0
+        end
+        local got = 0
+        local started, lastSeen = os.clock(), os.clock()
+        local tried = {}
+        while alive() and (Settings.AtmFarm or Settings.AutoPunchAtm) and os.clock() - started < 8 do
+            local c = myChar()
+            if Game.knocked(c) or Game.dead(c) then
+                break
+            end
+            local best, bestD
+            for _, d in Money.drops() do
+                local dist = (d.part.Position - around).Magnitude
+                if dist <= 30 and (tried[d.part] or 0) < 3 then
+                    local fromMe = (d.part.Position - root.Position).Magnitude
+                    if not bestD or fromMe < bestD then
+                        best, bestD = d, fromMe
+                    end
+                end
+            end
+            if not best then
+                if os.clock() - lastSeen > 1.3 then
+                    break
+                end
+                task.wait(0.1)
+            else
+                lastSeen = os.clock()
+                tried[best.part] = (tried[best.part] or 0) + 1
+                local stand = CFrame.new(best.part.Position + Vector3.new(0, 2.5, 0))
+                if bestD > 6 then
+                    root.CFrame = stand
+                    root.AssemblyLinearVelocity = Vector3.zero
+                    RunService.Heartbeat:Wait()
+                    RunService.Heartbeat:Wait()
+                end
+                pcall(fireclickdetector, best.cd)
+                local t0 = os.clock()
+                while best.part.Parent and os.clock() - t0 < 0.5 do
+                    root.AssemblyLinearVelocity = Vector3.zero
+                    RunService.Heartbeat:Wait()
+                end
+                if not best.part.Parent then
+                    got += 1
+                    Money.picked += 1
+                end
             end
         end
+        return got
     end
+
+    -- The strongest gun you own (by its Damage value), never the RPG or the
+    -- grenade launcher, and only one that still has ammo somewhere.
+    local NO_GUN = { ["[RPG]"] = true, ["[GrenadeLauncher]"] = true }
+    local function bestGun()
+        local c = myChar()
+        local bp = LocalPlayer:FindFirstChild("Backpack")
+        local okInv, inv = pcall(function()
+            return LocalPlayer.DataFolder.Inventory
+        end)
+        local best, bestDmg
+        for _, holder in { c, bp } do
+            for _, t in holder and holder:GetChildren() or {} do
+                if t:IsA("Tool") and t:FindFirstChild("Ammo") and t:FindFirstChild("Handle") and not NO_GUN[t.Name] then
+                    local dmg = t:FindFirstChild("Damage")
+                    dmg = dmg and tonumber(dmg.Value) or 0
+                    local spare = okInv and inv and inv:FindFirstChild(t.Name)
+                    spare = spare and tonumber(spare.Value) or 0
+                    if (t.Ammo.Value > 0 or spare > 0) and (not bestDmg or dmg > bestDmg) then
+                        best, bestDmg = t, dmg
+                    end
+                end
+            end
+        end
+        return best
+    end
+    local function equip(tool)
+        local c = myChar()
+        local hum = c and c:FindFirstChildOfClass("Humanoid")
+        if not (tool and hum) then
+            return nil
+        end
+        if tool.Parent ~= c then
+            hum:EquipTool(tool)
+            task.wait(0.15)
+        end
+        return tool.Parent == c and tool or nil
+    end
+    local function face(root, pos)
+        local flat = Vector3.new(pos.X, root.Position.Y, pos.Z)
+        if (flat - root.Position).Magnitude > 0.5 then
+            root.CFrame = CFrame.lookAt(root.Position, flat)
+        end
+    end
+    table.insert(Cleanups, function()
+        Aim.forced = nil
+    end)
+
     loop(0.05, function()
         if not (Settings.AtmFarm or Settings.AutoPunchAtm) then
             World.info = "off"
+            Aim.forced = nil
             return
         end
         local me = myChar()
         local root = myRoot()
         if not root or Game.knocked(me) or Game.dead(me) then
             World.info = "waiting (knocked / dead)"
+            Aim.forced = nil
             return
         end
-        local atm, d = nearestAtm(Settings.AtmFarm and Settings.AtmFarmRange or 7)
+        local gun = Settings.AtmUseGun and bestGun() or nil
+        local reach = gun and 14 or 7
+        local atm, d = nearestAtm(Settings.AtmFarm and Settings.AtmFarmRange or reach)
         if not atm then
             World.info = Settings.AtmFarm and "no unbroken ATM in range" or "no ATM in reach"
+            Aim.forced = nil
             return
         end
         local head = atm.head
-        if d > 5 then
+        local standOff = gun and 7 or 3
+        if d > standOff + 2 then
             if not Settings.AtmFarm then
                 return
             end
             local flat = Vector3.new(root.Position.X - head.Position.X, 0, root.Position.Z - head.Position.Z)
             local dir = flat.Magnitude > 0.1 and flat.Unit or Vector3.new(0, 0, 1)
-            local stand = head.Position + dir * 3
+            local stand = head.Position + dir * standOff
             root.CFrame = CFrame.lookAt(stand, Vector3.new(head.Position.X, stand.Y, head.Position.Z))
             root.AssemblyLinearVelocity = Vector3.zero
-            task.wait(0.2)
+            task.wait(0.15)
         end
-        local tool = combat()
-        if not tool then
-            World.info = "no Combat tool"
-            return
+        face(root, head.Position)
+        local pct = math.floor(atm.hum.Health / math.max(1, atm.hum.MaxHealth) * 100)
+        if gun then
+            local held = equip(gun)
+            if not held then
+                World.info = "couldn't hold the gun"
+                return
+            end
+            if held.Ammo.Value <= 0 then
+                World.info = "reloading"
+                local be = Game.effects(me)
+                if Game.val(be, "Reload") ~= true then
+                    Game.fire("Reload", held)
+                end
+                local t0 = os.clock()
+                while held.Ammo.Value <= 0 and os.clock() - t0 < 3 do
+                    task.wait(0.1)
+                end
+                return
+            end
+            World.info = ("shooting ATM with %s (%d%%)"):format(held.Name, pct)
+            Aim.forced = head.Position
+            pcall(held.Activate, held)
+            local cd = held:FindFirstChild("ShootingCooldown")
+            task.wait((cd and cd.Value or 0.2) + 0.04)
+            Aim.forced = nil
+        else
+            local tool = combat()
+            if not tool then
+                World.info = "no Combat tool"
+                return
+            end
+            World.info = ("punching ATM (%d%%)"):format(pct)
+            pcall(tool.Activate, tool)
+            task.wait(Settings.AtmPunchDelay)
         end
-        local flatLook = Vector3.new(head.Position.X, root.Position.Y, head.Position.Z)
-        if (flatLook - root.Position).Magnitude > 0.5 then
-            root.CFrame = CFrame.lookAt(root.Position, flatLook)
-        end
-        World.info = ("punching ATM (%d%%)"):format(math.floor(atm.hum.Health / math.max(1, atm.hum.MaxHealth) * 100))
-        pcall(tool.Activate, tool)
-        task.wait(Settings.AtmPunchDelay)
         if atm.hum.Health <= 0 then
             World.broken += 1
-            if Settings.AtmFarm then
-                task.wait(0.4)
-                collect(head.Position)
+            Aim.forced = nil
+            if Settings.AtmFarm or Settings.AutoPunchAtm then
+                World.info = "picking up the cash"
+                local got = collect(head.Position)
+                World.info = ("picked up %d drops"):format(got)
             end
         end
     end)
@@ -2555,6 +2823,7 @@ do
     slider(Box, "FlySpeed", "Fly speed", 10, 200, 0, " studs/s")
     toggle(Box, "Noclip", "Noclip")
     toggle(Box, "InfJump", "Infinite jump")
+    toggle(Box, "AntiSit", "Anti sit", "You can't be sat in seats or cars (a common trap for flinging / killing)")
     Box:AddLabel("Da Hood checks movement on the server. Keep speed low and fly short.", true)
 
     local Mac = Tab:AddRightGroupbox("Macro", "zap")
@@ -2569,7 +2838,7 @@ do
     toggle(Mac, "MacroOnlyAir", "Only in the air")
     toggle(Mac, "MacroSpeedCap", "Speed cap",
         "While either macro is on, speed above the cap is eased off over a few frames (no snap). Jumps and falls aren't touched")
-    slider(Mac, "MacroCapSpeed", "Max speed", 16, 150, 0, " studs/s", "Normal running is about 16-26")
+    slider(Mac, "MacroCapSpeed", "Max speed", 16, 1500, 0, " studs/s", "Normal running is about 16-26")
     local Qm = Tab:AddRightGroupbox("Quick macro", "sparkles")
     toggle(Qm, "QuickMacro", "Quick macro button",
         "A QUICK button on screen: with a macro on, one tap plays your emote, waits, pulls out a lockpick and steps forward to cancel the emote")
@@ -2633,6 +2902,8 @@ do
         "Goes from one unbroken ATM to the next, breaks it and picks up the cash. Teleports: risky, use an alt")
     slider(Farm, "AtmFarmRange", "Farm range", 20, 3000, 0, " studs")
     slider(Farm, "AtmPunchDelay", "Punch delay", 0.15, 1, 2, " s")
+    toggle(Farm, "AtmUseGun", "Use gun",
+        "Shoots ATMs with your strongest gun (by damage, never the RPG or grenade launcher) instead of punching. Reloads by itself, punches again when every gun is empty")
     status(Farm, function()
         return ("ATM: %s\nBroken: %d\nCash picked: %d"):format(World.info, World.broken, Money.picked)
     end)
@@ -2756,6 +3027,90 @@ do
         return ("Health: %d%%\nFood: %d\nAte: %d"):format(Supplies.hpPct(), #Supplies.foods(), Supplies.ate)
     end)
     Heal:AddLabel("God mode isn't possible: health is only changed by the server. This tab is the closest thing.", true)
+end
+
+do
+    local Tab = Window:AddTab("Whitelist", "user-check", "Friends and anti hit")
+    local function names()
+        local list = {}
+        for _, p in Players:GetPlayers() do
+            if p ~= LocalPlayer then
+                table.insert(list, p.Name)
+            end
+        end
+        table.sort(list, function(a, b)
+            return a:lower() < b:lower()
+        end)
+        return list
+    end
+    local function asSet(v)
+        local out = {}
+        if type(v) == "table" then
+            for k, on in pairs(v) do
+                if on == true and type(k) == "string" then
+                    out[k] = true
+                elseif type(on) == "string" then
+                    out[on] = true
+                end
+            end
+        end
+        return out
+    end
+    local function count(set)
+        local n = 0
+        for _ in set do
+            n += 1
+        end
+        return n
+    end
+
+    local Box = Tab:AddLeftGroupbox("Whitelist", "user-check")
+    local wl = Box:AddDropdown("WhitelistPlayers", {
+        Text = "Players", Values = names(), Default = {}, Multi = true, Searchable = true,
+        Callback = function(v)
+            Settings.Whitelist = asSet(v)
+        end,
+    })
+    local fromList = { "Silent aim", "Camlock", "Triggerbot", "Hitbox expander", "Auto stomp", "Auto block", "ESP friend colour" }
+    Box:AddDropdown("WhitelistFrom", {
+        Text = "Exclude them from", Values = fromList, Default = fromList, Multi = true,
+        Tooltip = "What leaves whitelisted players alone",
+        Callback = function(v)
+            Settings.WhitelistFrom = asSet(v)
+        end,
+    })
+
+    local Hit = Tab:AddRightGroupbox("Anti hit", "shield-off")
+    local ah = Hit:AddDropdown("AntiHitPlayers", {
+        Text = "Players", Values = names(), Default = {}, Multi = true, Searchable = true,
+        Tooltip = "Your own shots pass straight through them (to whatever is behind), and nothing of yours aims at them",
+        Callback = function(v)
+            Settings.AntiHit = asSet(v)
+        end,
+    })
+    Hit:AddLabel("Only your own shots: other players' shots are decided on their side, so nothing can stop those.", true)
+
+    local function refresh()
+        for _, d in { { wl, "Whitelist" }, { ah, "AntiHit" } } do
+            pcall(function()
+                d[1]:SetValues(names())
+                d[1]:SetValue(Settings[d[2]])
+            end)
+        end
+    end
+    Box:AddButton({ Text = "Refresh players", Func = refresh })
+    bind(Players.PlayerAdded, function()
+        task.delay(0.5, refresh)
+    end)
+    bind(Players.PlayerRemoving, function()
+        task.delay(0.5, refresh)
+    end)
+    status(Box, function()
+        return ("Whitelisted: %d"):format(count(Settings.Whitelist))
+    end)
+    status(Hit, function()
+        return ("Anti hit: %d players\nShots passed through them: %d"):format(count(Settings.AntiHit), Hitbox.saved or 0)
+    end)
 end
 
 do
