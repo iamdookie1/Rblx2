@@ -54,6 +54,19 @@ local Games = {
     [96802054849934] = { Name = 'Volleyball Legends (Training)', Script = 'Games/VolleyballLegends.lua' },
     [117134837736236] = { Name = 'Volleyball Legends (Sandbox)', Script = 'Games/VolleyballLegends.lua' },
     [85395484560711] = { Name = 'Volleyball Legends (Tutorial)', Script = 'Games/VolleyballLegends.lua' },
+    -- Fisch (game 5750914919): every fishing place from the game's own
+    -- library Places / PlaceTypes. The Trade Plaza places (95655505523303,
+    -- 78575977164594, 99519129453387) have no fishing, so they're left out.
+    [131716211654599] = { Name = 'Fisch (new player)', Script = 'Games/Fisch.lua' },
+    [131579468225600] = { Name = 'Fisch', Script = 'Games/Fisch.lua' },
+    [140688791331730] = { Name = 'Fisch', Script = 'Games/Fisch.lua' },
+    [124935812290893] = { Name = 'Fisch', Script = 'Games/Fisch.lua' },
+    [16732694052] = { Name = 'Fisch', Script = 'Games/Fisch.lua' },
+    [115164489660674] = { Name = 'Fisch (Sea 2)', Script = 'Games/Fisch.lua' },
+    [135499799161875] = { Name = 'Fisch (Sea 2)', Script = 'Games/Fisch.lua' },
+    [72907489978215] = { Name = 'Fisch (Sea 2)', Script = 'Games/Fisch.lua' },
+    [106011698424775] = { Name = 'Fisch (Deep Sea)', Script = 'Games/Fisch.lua' },
+    [70451556031302] = { Name = 'Fisch (Deep Sea, Sea 2)', Script = 'Games/Fisch.lua' },
     [662417684] = { Name = 'Lucky Blocks', Script = 'Games/LuckyBlocks.lua' },
     [129363360542125] = { Name = 'Doodle Drop', Script = 'Games/DoodleDrop.lua' },
     -- Doodle Drop's level creator, from UGC_PLACE_ID in the game's own Config.
