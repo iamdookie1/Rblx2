@@ -10,9 +10,13 @@
 --            9 CatchFinished) and values.casted. rodClient charges a power
 --            bar and calls RF/FishingRod/Cast(power 0-100, perfect).
 --            RE/FishingRod/Reset puts the rod back.
---   Shake    the server invokes RF/LureShake/Start on you, a "shakeui" goes
---            into PlayerGui, and every click sends RE/LureShake/Shake (the
---            game allows one every 0.25s). RE/LureShake/Stop ends it.
+--   Shake    two systems, both a PlayerGui "shakeui". New: the server invokes
+--            RF/LureShake/Start, LureShakeController puts a button in
+--            safezone and each press sends RE/LureShake/Shake (one per
+--            0.25s). Old: the server clones resources.replicated.fishing
+--            .shakeui itself (safezone has bobber / char values) and a
+--            server Script there counts real clicks on safezone "button"s,
+--            so those buttons have to be pressed for real.
 --   Reel     the server invokes RF/Reel/Start; ReelController.StartReel
 --            runs the whole minigame on your side (fishPosition, barPosition,
 --            barSize, progress) and EndMinigame sends RE/Reel/Finish
@@ -22,8 +26,11 @@
 --            choice calls events.SellAll with { npc = merchant }.
 --            events.PreviewSellAll(false) is what your fish are worth, and
 --            events.selleverything sells from anywhere (gamepass).
---   Other    RF/Conch/RequestTpSpots (every client asks for it at load),
---            RE/FastTravel/Teleport(key) (Traveler's Whistle), events.runcode
+--   Places   the map streams in, so far spawn points aren't on your side.
+--            PlayerGui.loading's loading/client has a camera CFrame for every
+--            Sea 1 area (the loading screen); those are built in here and you
+--            land on dry ground near where each one looks.
+--   Other    events.runcode
 --            (codes), RE/DailyReward/Claim, RE/TotemCrafting/ClaimCraft,
 --            events.open_treasure(id) for "ChestClosed" chests, MeteorItem
 --            tagged meteor drops with a ProximityPrompt.
@@ -74,7 +81,7 @@ local Settings = {
     -- selling
     AutoSell = false, SellWhen = "Worth over", SellWorth = 10000, SellEvery = 5, SellAnywhere = false, SellReturn = true,
     -- teleports
-    TpSpot = nil, FastTravel = nil,
+    TpSpot = nil, SpotName = "",
     -- world
     EspPools = false, EspEvents = false, EspChests = false, EspMeteors = false, EspNpcs = false,
     AutoChests = false, AutoMeteors = false,
@@ -153,11 +160,19 @@ local function activeReel()
 end
 local function shakeUi()
     local pg = LocalPlayer:FindFirstChildOfClass("PlayerGui")
-    local ui = pg and pg:FindFirstChild("shakeui")
-    if ui and ui:IsA("ScreenGui") then
-        return ui
+    if not pg then
+        return nil
     end
-    return nil
+    local found
+    for _, g in pg:GetChildren() do
+        if g.Name == "shakeui" and g:IsA("ScreenGui") then
+            if g.Enabled then
+                return g
+            end
+            found = found or g
+        end
+    end
+    return found
 end
 local function isRod(t)
     if not (t and t:IsA("Tool")) then
@@ -205,7 +220,6 @@ local Fish = { info = "off", casts = 0, shakes = 0, reels = 0, caught = 0, misse
 do
     local castRemote = net("RF/FishingRod/Cast")
     local resetRemote = net("RE/FishingRod/Reset")
-    local shakeRemote = net("RE/LureShake/Shake")
     local castAt, idleSince, lastState = 0, os.clock(), nil
 
     loop(0.2, function()
@@ -291,17 +305,105 @@ do
         end
     end)
 
-    -- Shake: the game's own remote, at the pace the shake button allows.
+    -- Shake: press the shake button for real (select it and press Enter, or
+    -- click its middle), which works for both shake systems. Without
+    -- VirtualInputManager, fall back to the remotes.
+    local GuiService = game:GetService("GuiService")
+    local VIM
+    do
+        local ok, svc = pcall(game.GetService, game, "VirtualInputManager")
+        VIM = ok and svc or nil
+    end
+    local function shakeButton(ui)
+        local safe = ui:FindFirstChild("safezone")
+        if not safe then
+            return nil, false
+        end
+        local legacy = safe:FindFirstChild("bobber") ~= nil or safe:FindFirstChild("char") ~= nil or ui:FindFirstChild("cancel") ~= nil
+        for _, d in safe:GetDescendants() do
+            if d:IsA("GuiButton") and d.Visible and d.AbsoluteSize.X > 1 and (d.Name == "button" or not legacy) then
+                return d, legacy
+            end
+        end
+        return nil, legacy
+    end
+    local function press(btn)
+        if not VIM then
+            return false
+        end
+        if btn.Selectable then
+            local prev = GuiService.SelectedObject
+            pcall(function()
+                GuiService.SelectedObject = btn
+            end)
+            if GuiService.SelectedObject == btn then
+                VIM:SendKeyEvent(true, Enum.KeyCode.Return, false, game)
+                task.wait()
+                VIM:SendKeyEvent(false, Enum.KeyCode.Return, false, game)
+                task.delay(0.05, function()
+                    if GuiService.SelectedObject == btn or not btn.Parent then
+                        pcall(function()
+                            GuiService.SelectedObject = prev
+                        end)
+                    end
+                end)
+                return true
+            end
+        end
+        local gui = btn:FindFirstAncestorWhichIsA("ScreenGui")
+        local c = btn.AbsolutePosition + btn.AbsoluteSize / 2
+        if not (gui and gui.IgnoreGuiInset) then
+            c += GuiService:GetGuiInset()
+        end
+        VIM:SendMouseButtonEvent(c.X, c.Y, 0, true, game, 0)
+        task.wait()
+        VIM:SendMouseButtonEvent(c.X, c.Y, 0, false, game, 0)
+        return true
+    end
+    Fish.shakeInfo = "off"
     loop(function()
         return math.max(0.05, Settings.ShakeDelay)
     end, function()
-        if not (Settings.AutoShake and shakeRemote) then
+        if not Settings.AutoShake then
+            Fish.shakeInfo = "off"
             return
         end
         local ui = shakeUi()
-        if ui and ui.Enabled then
-            shakeRemote:FireServer()
+        if not (ui and ui.Enabled) then
+            Fish.shakeInfo = "waiting for a shake"
+            return
+        end
+        local btn, legacy = shakeButton(ui)
+        local pressed = false
+        if btn then
+            local ok, res = pcall(press, btn)
+            pressed = ok and res
+        end
+        if not pressed then
+            if legacy then
+                local r = btn and btn:FindFirstChild("shake")
+                if r and r:IsA("RemoteEvent") then
+                    r:FireServer()
+                    pressed = true
+                end
+                if btn and typeof(firesignal) == "function" then
+                    pcall(firesignal, btn.MouseButton1Click)
+                    pcall(firesignal, btn.Activated)
+                    pressed = true
+                end
+            else
+                local r = net("RE/LureShake/Shake")
+                if r then
+                    r:FireServer()
+                    pressed = true
+                end
+            end
+        end
+        if pressed then
             Fish.shakes += 1
+            Fish.shakeInfo = (legacy and "shaking (old shake)" or "shaking") .. (VIM and "" or ", no VirtualInputManager: using the remotes")
+        else
+            Fish.shakeInfo = "can't find the shake button"
         end
     end)
 
@@ -467,6 +569,234 @@ do
     end
 end
 
+--// Teleports \\--
+-- Places don't have to be loaded on your side: the loading screen's camera
+-- spots for every Sea 1 area are built in, plus spawn points that are
+-- loaded and spots you save yourself.
+local Tp = { spots = {}, names = {}, info = "" }
+local BUILT_IN = {
+	["Starter"] = CFrame.new(317.298, 134.766, 277.479) * CFrame.fromOrientation(0, -0.9948376736367679, 0.22689280275926285),
+	["Abyssal Zenith"] = CFrame.new(-13589, -11004, 18) * CFrame.fromOrientation(-0.5235987755982988, 2.199114857512855, -0.22689280275926285),
+	["AncientIsle"] = CFrame.new(6076, 206, 256) * CFrame.fromOrientation(-0.22689280275926285, 2.8099800957108707, 0.22689280275926285),
+	["Atlantis"] = CFrame.new(-4150, -555, 1747) * CFrame.fromOrientation(-0.24434609527920614, 2.0420352248333655, 0.22689280275926285),
+	["Calm Zone"] = CFrame.new(-4293, -11194, 1748) * CFrame.fromOrientation(-0.17453292519943295, -0.13962634015954636, 0.22689280275926285),
+	["Castaway Cliffs"] = CFrame.new(673, 159, -1757) * CFrame.fromOrientation(0.4363323129985824, 0.4363323129985824, -0.24434609527920614),
+	["Challengers Deep"] = CFrame.new(-738, -3236, -673) * CFrame.fromOrientation(-0.3141592653589793, 1.9722220547535925, -0.22689280275926285),
+	["CryogenicCanal"] = CFrame.new(20310, 724, 5657) * CFrame.fromOrientation(0.15707963267948966, 2.199114857512855, -0.22689280275926285),
+	["CrystalCove"] = CFrame.new(1382, -615, 2456) * CFrame.fromOrientation(0.06981317007977318, 0.20943951023931956, -0.22689280275926285),
+	["DesolateDeep"] = CFrame.new(-1656, -207, -2935) * CFrame.fromOrientation(-0.20943951023931956, -2.6179938779914944, 0.22689280275926285),
+	["Forsaken Shores"] = CFrame.new(-2449, 147, 1493) * CFrame.fromOrientation(-0.017453292519943295, 2.129301687433082, 0.22689280275926285),
+	["FrigidCavern"] = CFrame.new(19723, 422, 5411) * CFrame.fromOrientation(-0.08726646259971647, -1.2566370614359172, -0.22689280275926285),
+	["GlacialGrotto"] = CFrame.new(19997, 1144, 5568) * CFrame.fromOrientation(0.20943951023931956, 0.6806784082777885, 0.22689280275926285),
+	["Living Garden"] = CFrame.new(-2493, -300, -3106) * CFrame.fromOrientation(-0.12217304763960307, -2.4958208303518914, 0.22689280275926285),
+	["Lost Jungle"] = CFrame.new(-2670, 170, -2080) * CFrame.fromOrientation(-0.2792526803190927, 1.710422666954443, 0.22689280275926285),
+	["LuminescentCavern"] = CFrame.new(-1023, -330, -4078) * CFrame.fromOrientation(-0, -0.10471975511965978, 0.22689280275926285),
+	["Moosewood"] = CFrame.new(454, 154, 249) * CFrame.fromOrientation(-0.06981317007977318, -1.8500490071139892, -0.22689280275926285),
+	["OvergrowthCaves"] = CFrame.new(19541, 176, 5358) * CFrame.fromOrientation(-0.5585053606381855, -0.4014257279586958, 0.2617993877991494),
+	["Roslit"] = CFrame.new(-1419, 137, 754) * CFrame.fromOrientation(0.05235987755982989, 0.8726646259971648, -0.22689280275926285),
+	["Scoria Reach"] = CFrame.new(-5098, 140, -1461) * CFrame.fromOrientation(0.2792526803190927, 1.5882496193148399, 0.24434609527920614),
+	["SharkSanctuary"] = CFrame.new(-4012, -1865, -861) * CFrame.fromOrientation(-0.03490658503988659, 0.20943951023931956, 0.2617993877991494),
+	["Snowcap"] = CFrame.new(2669, 155, 2362) * CFrame.fromOrientation(0.08726646259971647, -2.670353755551324, -0.22689280275926285),
+	["Sunstone"] = CFrame.new(-904, 141, -1146) * CFrame.fromOrientation(0.2617993877991494, 2.426007660272118, 0.22689280275926285),
+	["Terrapin"] = CFrame.new(-124, 161, 1928) * CFrame.fromOrientation(-0.20943951023931956, 1.710422666954443, 0.22689280275926285),
+	["The Depths"] = CFrame.new(943, -696, 1173) * CFrame.fromOrientation(0.06981317007977318, 3.1066860685499065, -0.22689280275926285),
+	["Tidefall"] = CFrame.new(3091, -1098, 805) * CFrame.fromOrientation(0.15707963267948966, -1.0122909661567112, 0.22689280275926285),
+	["Volcanic Vents"] = CFrame.new(-3352, -2242, 3811) * CFrame.fromOrientation(-0.08726646259971647, 2.478367537831948, -0.22689280275926285),
+	["FischFright"] = CFrame.new(-14596, 157, -9640) * CFrame.fromOrientation(0.08726646259971647, 1.4835298641951802, 0.2617993877991494),
+}
+local WATCHED = {
+    ["The Depths"] = true, ["Tidefall"] = true, ["CrystalCove"] = true, ["Living Garden"] = true,
+    ["Scoria Reach"] = true, ["Toxic Grove"] = true, ["Nectar Den"] = true,
+}
+local MERCHANT_ISLANDS = { "Moosewood", "Roslit", "Terrapin", "Snowcap", "Sunstone", "Forsaken Shores", "AncientIsle" }
+do
+    local world = ReplicatedStorage:GetAttribute("CurrentWorld") or "Sea 1"
+    local SEA_LEVEL = world == "Sea 2" and 74 or 127
+    local FILE = "Ui3/Fisch/spots.json"
+
+    local saved = {}
+    local function readSaved()
+        if typeof(readfile) ~= "function" or typeof(isfile) ~= "function" then
+            return
+        end
+        local ok, data = pcall(function()
+            return isfile(FILE) and HttpService:JSONDecode(readfile(FILE)) or nil
+        end)
+        if ok and type(data) == "table" and type(data[world]) == "table" then
+            for name, v in data[world] do
+                if type(v) == "table" and tonumber(v[1]) and tonumber(v[2]) and tonumber(v[3]) then
+                    saved[name] = CFrame.new(v[1], v[2], v[3])
+                end
+            end
+        end
+    end
+    local function writeSaved()
+        if typeof(writefile) ~= "function" then
+            return false
+        end
+        local all = {}
+        pcall(function()
+            if typeof(isfile) == "function" and isfile(FILE) then
+                all = HttpService:JSONDecode(readfile(FILE))
+            end
+        end)
+        if type(all) ~= "table" then
+            all = {}
+        end
+        local mine = {}
+        for name, cf in saved do
+            local p = cf.Position
+            mine[name] = { math.floor(p.X * 10) / 10, math.floor(p.Y * 10) / 10, math.floor(p.Z * 10) / 10 }
+        end
+        all[world] = mine
+        return pcall(function()
+            if typeof(makefolder) == "function" then
+                pcall(makefolder, "Ui3")
+                pcall(makefolder, "Ui3/Fisch")
+            end
+            writefile(FILE, HttpService:JSONEncode(all))
+        end)
+    end
+    readSaved()
+
+    function Tp.load()
+        local spots = {}
+        if world == "Sea 1" then
+            for name, cf in BUILT_IN do
+                spots[name .. (WATCHED[name] and " (watched zone)" or "")] = { cf = cf, kind = "camera" }
+            end
+        end
+        local w = Workspace:FindFirstChild("world")
+        local sp = w and w:FindFirstChild("spawns")
+        if sp then
+            for _, folder in sp:GetChildren() do
+                local found = folder:IsA("BasePart") and folder or folder:FindFirstChildWhichIsA("BasePart", true)
+                local name = folder.Name
+                if found and not (BUILT_IN[name] and world == "Sea 1") and name ~= "loading" then
+                    spots[name .. (WATCHED[name] and " (watched zone)" or "")] = { cf = found.CFrame, kind = "spawn" }
+                end
+            end
+        end
+        for name, cf in saved do
+            spots["* " .. name] = { cf = cf, kind = "saved" }
+        end
+        local names = {}
+        for k in spots do
+            table.insert(names, k)
+        end
+        table.sort(names, function(a, b)
+            return a:lower() < b:lower()
+        end)
+        Tp.spots, Tp.names = spots, names
+        Tp.info = ("%d spots"):format(#names)
+        return names
+    end
+
+    -- Dry ground near a camera spot: along where it looks for islands, under
+    -- it for caves and deep places.
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    local function ground(p, depth)
+        params.FilterDescendantsInstances = { myChar() }
+        local hit = Workspace:Raycast(p + Vector3.new(0, 120, 0), Vector3.new(0, -(depth or 500), 0), params)
+        if hit and hit.Material ~= Enum.Material.Water then
+            return hit.Position
+        end
+        return nil
+    end
+    local function landing(cf)
+        local pos = cf.Position
+        if pos.Y < SEA_LEVEL - 10 then
+            params.FilterDescendantsInstances = { myChar() }
+            local hit = Workspace:Raycast(pos, Vector3.new(0, -400, 0), params)
+            return hit and hit.Position or nil
+        end
+        local look = Vector3.new(cf.LookVector.X, 0, cf.LookVector.Z)
+        if look.Magnitude < 0.01 then
+            look = Vector3.new(0, 0, -1)
+        end
+        look = look.Unit
+        local here = ground(pos)
+        if here and here.Y > SEA_LEVEL + 1 then
+            return here
+        end
+        for t = 15, 900, 15 do
+            local g = ground(pos + look * t)
+            if g and g.Y > SEA_LEVEL + 1 then
+                return g
+            end
+        end
+        return nil
+    end
+    function Tp.land(cf)
+        local root = myRoot()
+        if not root then
+            return false
+        end
+        pcall(LocalPlayer.RequestStreamAroundAsync, LocalPlayer, cf.Position, 6)
+        root.AssemblyLinearVelocity = Vector3.zero
+        root.CFrame = CFrame.new(cf.Position) * root.CFrame.Rotation
+        local spot
+        for _ = 1, 6 do
+            task.wait(0.25)
+            local r = myRoot()
+            if not r then
+                return false
+            end
+            spot = landing(cf)
+            if spot then
+                break
+            end
+            r.AssemblyLinearVelocity = Vector3.zero
+            r.CFrame = CFrame.new(cf.Position) * r.CFrame.Rotation
+        end
+        local r = myRoot()
+        if r and spot then
+            r.AssemblyLinearVelocity = Vector3.zero
+            r.CFrame = CFrame.new(spot + Vector3.new(0, 3.5, 0)) * r.CFrame.Rotation
+        end
+        return true
+    end
+    function Tp.go(name)
+        local s = name and Tp.spots[name]
+        if not s then
+            notify("Pick a spot first")
+            return
+        end
+        Tp.info = "going to " .. name
+        if s.kind == "camera" then
+            Tp.land(s.cf)
+        else
+            Move.to(s.cf.Position)
+        end
+        Tp.info = "went to " .. name
+    end
+    function Tp.save(name)
+        local root = myRoot()
+        name = tostring(name or ""):gsub("^%s+", ""):gsub("%s+$", "")
+        if not root or name == "" then
+            notify("Type a name for this spot first")
+            return
+        end
+        saved[name] = root.CFrame
+        local ok = writeSaved()
+        notify(ok and ("Saved " .. name) or ("Saved " .. name .. " for this session (your executor can't write files)"))
+    end
+    function Tp.forget(label)
+        local name = type(label) == "string" and label:match("^%* (.+)$")
+        if not (name and saved[name]) then
+            notify("Pick one of your saved spots (they start with *)")
+            return
+        end
+        saved[name] = nil
+        writeSaved()
+        notify("Removed " .. name)
+    end
+    function Tp.camera(name)
+        return world == "Sea 1" and BUILT_IN[name] or nil
+    end
+end
+
 --// Selling \\--
 local Sell = { info = "off", sold = 0, worth = nil }
 do
@@ -522,18 +852,41 @@ do
             end
             return
         end
-        local m, d = nearest()
-        if not m then
-            Sell.info = "no merchant loaded near you (teleport to an island first)"
-            return
-        end
         local sellAll = ev("SellAll")
         if not sellAll then
             Sell.info = "SellAll not found"
             return
         end
+        local m, d = nearest()
+        local root = myRoot()
+        local island
+        if not m and root then
+            local bestD
+            for _, name in MERCHANT_ISLANDS do
+                local cf = Tp.camera(name)
+                if cf then
+                    local dd = (cf.Position - root.Position).Magnitude
+                    if not bestD or dd < bestD then
+                        island, bestD = name, dd
+                    end
+                end
+            end
+            if not island then
+                Sell.info = "no merchant loaded near you"
+                return
+            end
+        end
         local done = false
         Move.trip("selling", function()
+            if not m then
+                Sell.info = "going to " .. island .. " to sell"
+                Tp.land(Tp.camera(island))
+                task.wait(0.8)
+                m, d = nearest()
+                if not m then
+                    return
+                end
+            end
             if d > 8 then
                 Move.near(m, 4)
                 task.wait(0.5)
@@ -548,6 +901,8 @@ do
         if done then
             Sell.sold += 1
             Sell.info = "sold at " .. m.Name
+        elseif not m then
+            Sell.info = "couldn't find the merchant at " .. tostring(island)
         else
             Sell.info = "the merchant didn't take it (nothing to sell?)"
         end
@@ -586,107 +941,6 @@ do
         lastSell = os.clock()
         Sell.now()
     end)
-end
-
---// Teleports \\--
-local Tp = { spots = {}, names = {}, info = "" }
-local FAST_TRAVEL = {
-    "volcanicvents", "challengersdeep", "abyssalzenith", "calmzone", "veilofforsaken",
-    "base", "cryogenic", "frigidcavern", "glacial", "overgrowthcaves", "borealpines",
-    "bellona", "apollo", "poseidon", "zeus", "hades", "olympian", "sunkendepths", "etherealabyss",
-    "poseidontemple", "zeustrial", "krakenlair",
-    "vertigo", "thedepths", "crystalcove", "venue",
-    "toxicgrove", "livinggarden", "nectarden",
-    "desolatepocket", "brinepool", "luminescentcavern", "crimsoncavern",
-    "lairentrance", "hallofwhispers", "passageofoaths", "thesanctum",
-    "sunkenreliquary", "coralbastion", "collapsedruins", "crownedruins",
-    "treasureisland", "abovetheclouds",
-}
-do
-    local function toPos(v)
-        local t = typeof(v)
-        if t == "Vector3" then
-            return v
-        elseif t == "CFrame" then
-            return v.Position
-        elseif t == "Instance" then
-            if v:IsA("BasePart") then
-                return v.Position
-            elseif v:IsA("Model") then
-                local ok, p = pcall(v.GetPivot, v)
-                return ok and p.Position or nil
-            elseif v:IsA("Attachment") then
-                return v.WorldPosition
-            end
-        elseif t == "table" then
-            return toPos(v.CFrame or v.Position or v.cframe or v.position or v[1])
-        end
-        return nil
-    end
-    function Tp.load()
-        local spots = {}
-        local f = net("RF/Conch/RequestTpSpots")
-        if f then
-            local ok, t = pcall(f.InvokeServer, f)
-            if ok and type(t) == "table" then
-                for k, v in pairs(t) do
-                    local pos = toPos(v)
-                    if type(k) == "string" and pos then
-                        spots[k] = pos
-                    end
-                end
-            end
-        end
-        local world = Workspace:FindFirstChild("world")
-        local sp = world and world:FindFirstChild("spawns")
-        if sp then
-            for _, folder in sp:GetChildren() do
-                if folder.Name == "TpSpots" then
-                    for _, p in folder:GetChildren() do
-                        if p:IsA("BasePart") and not spots[p.Name] then
-                            spots[p.Name] = p.Position
-                        end
-                    end
-                elseif folder:IsA("Folder") and not spots[folder.Name] then
-                    for _, p in folder:GetDescendants() do
-                        if p:IsA("BasePart") then
-                            spots[folder.Name] = p.Position
-                            break
-                        end
-                    end
-                end
-            end
-        end
-        local names = {}
-        for k in spots do
-            table.insert(names, k)
-        end
-        table.sort(names, function(a, b)
-            return a:lower() < b:lower()
-        end)
-        Tp.spots, Tp.names = spots, names
-        Tp.info = ("%d spots"):format(#names)
-        return names
-    end
-    function Tp.go(name)
-        local pos = name and Tp.spots[name]
-        if not pos then
-            notify("Pick a spot first")
-            return
-        end
-        if Move.to(pos) then
-            Tp.info = "went to " .. name
-        end
-    end
-    function Tp.fast(key)
-        local r = net("RE/FastTravel/Teleport")
-        if not (key and r) then
-            notify("Pick a place first")
-            return
-        end
-        r:FireServer(key)
-        Tp.info = "fast travel to " .. key .. " (needs the Traveler's Whistle and that place unlocked)"
-    end
 end
 
 --// World: ESP, chests, meteors \\--
@@ -1042,7 +1296,7 @@ do
     toggle(S, "AutoShake", "Auto shake", "Sends the shake while the shake button is up")
     slider(S, "ShakeDelay", "Every", 0.1, 1, 2, " s", "The game allows one shake every 0.25s; faster can be thrown away")
     status(S, function()
-        return ("Shakes: %d"):format(Fish.shakes)
+        return ("Now: %s\nShakes: %d"):format(Fish.shakeInfo or "off", Fish.shakes)
     end)
 
     local R = Tab:AddRightGroupbox("Auto reel", "refresh-cw")
@@ -1078,7 +1332,7 @@ do
 end
 
 do
-    local Tab = Window:AddTab("Teleport", "map-pin", "Islands and fast travel")
+    local Tab = Window:AddTab("Teleport", "map-pin", "Islands, caves, your own spots")
     local T = Tab:AddLeftGroupbox("Teleport", "map-pin")
     local spots = T:AddDropdown("TpSpot", {
         Text = "Spot", Values = {}, Searchable = true,
@@ -1093,20 +1347,30 @@ do
         end)
     end
     T:AddButton({ Text = "Go", Func = function()
-        Tp.go(Settings.TpSpot)
-    end, Tooltip = "Locked zones are watched by the server: going into one you haven't unlocked is risky" })
+        task.spawn(Tp.go, Settings.TpSpot)
+    end, Tooltip = "Works without the place being loaded. Zones marked watched are checked by the server: going into one you haven't unlocked is risky" })
     T:AddButton({ Text = "Refresh spots", Func = function()
         task.spawn(refresh)
-    end })
+    end, Tooltip = "Adds spawn points that have loaded in since" })
     task.spawn(refresh)
-    local F = Tab:AddRightGroupbox("Fast travel", "wind")
-    dropdown(F, "FastTravel", "Place", FAST_TRAVEL, "The game's own fast travel", true)
-    F:AddButton({ Text = "Travel", Func = function()
-        Tp.fast(Settings.FastTravel)
-    end, Tooltip = "Needs the Traveler's Whistle and that place unlocked" })
-    status(F, function()
+    status(T, function()
         return Tp.info
     end)
+    local Sv = Tab:AddRightGroupbox("Your spots", "bookmark")
+    Sv:AddInput("SpotName", {
+        Text = "Name", Placeholder = "e.g. my fishing spot", Default = "", Finished = false,
+        Callback = function(t)
+            Settings.SpotName = t
+        end,
+    })
+    Sv:AddButton({ Text = "Save where I am", Func = function()
+        Tp.save(Settings.SpotName)
+        refresh()
+    end, Tooltip = "Saved to a file, so it's still there next time" })
+    Sv:AddButton({ Text = "Delete picked spot", Func = function()
+        Tp.forget(Settings.TpSpot)
+        refresh()
+    end, Tooltip = "Pick one of your spots (they start with *) in the list first" })
 end
 
 do
