@@ -378,28 +378,71 @@ function Lead.knife(t, from)
 end
 
 --// The hook: redirect the game's own weapon raycasts \\--
-local Hook = { gunShots = 0, wallbangs = 0, throws = 0, knifeHits = 0, status = "not installed" }
+-- Important: inside a __namecall hook, any other method call on an Instance
+-- (IsA, FindFirstChild...) changes which method the original call runs. So
+-- before the real call is made, this only does table lookups and property
+-- reads; anything heavier happens after it.
+local Hook = { gunShots = 0, wallbangs = 0, throws = 0, knifeHits = 0, status = "not installed", force = nil, forceUntil = 0,
+    lastGunShot = 0 }
+local Held = { tool = nil, kind = nil }
+local Scripts = {}
 do
-    local function owner(scr)
-        return typeof(scr) == "Instance" and scr or nil
+    -- Which of your tools' scripts is which, rebuilt outside the hook.
+    local function scan()
+        local map = {}
+        local c = myChar()
+        local bp = LocalPlayer:FindFirstChild("Backpack")
+        local held, kind = nil, nil
+        for _, holder in { c, bp } do
+            for _, t in holder and holder:GetChildren() or {} do
+                if t:IsA("Tool") then
+                    local ls = t:FindFirstChild("LocalScript")
+                    if ls then
+                        if Game.isGun(t) then
+                            map[ls] = "gun"
+                            if holder == c then
+                                held, kind = t, "gun"
+                            end
+                        elseif Game.isKnife(t) then
+                            map[ls] = "knife"
+                            local fl = ls:FindFirstChild("ThrowingKinfeHandlerScript")
+                            if fl then
+                                map[fl] = "flight"
+                            end
+                            if holder == c then
+                                held, kind = t, "knife"
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        Scripts, Held.tool, Held.kind = map, held, kind
     end
-    -- Gun LocalScript: its parent is a gun tool you're holding.
-    local function isGunScript(scr)
-        return scr and scr.Name == "LocalScript" and Game.isGun(scr.Parent) and scr.Parent.Parent == myChar()
-    end
-    -- Knife LocalScript (picks the throw target).
-    local function isKnifeScript(scr)
-        return scr and scr.Name == "LocalScript" and Game.isKnife(scr.Parent) and scr.Parent.Parent == myChar()
-    end
-    -- ThrowingKinfeHandlerScript (steps your flying knife).
-    local function isFlightScript(scr)
-        return scr and scr.Name == "ThrowingKinfeHandlerScript"
+    loop(0.25, scan)
+
+    local function kindOf(scr)
+        if scr == nil then
+            return nil
+        end
+        local k = Scripts[scr]
+        if k then
+            return k
+        end
+        -- Fallbacks using property reads only.
+        local name = scr.Name
+        if name == "ThrowingKinfeHandlerScript" then
+            return "flight"
+        end
+        if name == "LocalScript" and Held.tool and scr.Parent == Held.tool then
+            return Held.kind
+        end
+        return nil
     end
     local fakeMeta = {}
     local function fakeResult(inst, pos, normal)
         return setmetatable({ Instance = inst, Position = pos, Normal = normal, Material = Enum.Material.Plastic, Distance = 0 }, fakeMeta)
     end
-    -- Closest point on segment a->b to p, and how far along (0..1).
     local function closest(a, b, p)
         local ab = b - a
         local len2 = ab:Dot(ab)
@@ -409,6 +452,23 @@ do
         local t = math.clamp((p - a):Dot(ab) / len2, 0, 1)
         return a + ab * t, t
     end
+    local function visiblePart(t, ignore)
+        local part = t.part
+        if part and part.Transparency >= 1 then
+            part = nil
+            for _, n in { "UpperTorso", "Torso", "Head", "LowerTorso" } do
+                local x = t.char:FindFirstChild(n)
+                if x and x:IsA("BasePart") and x.Transparency < 1 then
+                    part = x
+                    break
+                end
+            end
+        end
+        if part and type(ignore) == "table" and table.find(ignore, part) then
+            return nil
+        end
+        return part
+    end
 
     if typeof(hookmetamethod) == "function" and typeof(getnamecallmethod) == "function" then
         local getCaller = typeof(getcallingscript) == "function" and getcallingscript or nil
@@ -417,95 +477,92 @@ do
         end
         local old
         local handler = function(self, ...)
-            if Unloaded or self ~= Workspace or not getCaller or isOurs() then
+            if Unloaded or self ~= Workspace then
                 return old(self, ...)
             end
             local method = getnamecallmethod()
+            if method ~= "Raycast" and method ~= "FindPartOnRayWithIgnoreList" then
+                return old(self, ...)
+            end
+            local kind
+            if isOurs() then
+                -- Our own calls pass straight through, except the game's
+                -- weapon code that this script runs itself (fast shots,
+                -- auto throws).
+                if Hook.force and os.clock() < Hook.forceUntil then
+                    kind = Hook.force
+                else
+                    return old(self, ...)
+                end
+            else
+                kind = kindOf(getCaller and getCaller() or nil)
+            end
+            if not kind then
+                return old(self, ...)
+            end
+
             if method == "Raycast" then
-                if not (Settings.GunSilent or Settings.Wallbang) then
+                if kind ~= "gun" then
                     return old(self, ...)
                 end
-                local scr = owner(getCaller())
-                if not isGunScript(scr) then
-                    return old(self, ...)
-                end
+                Hook.lastGunShot = os.clock()
                 local t = Aim.target
-                if not t or not t.part or not t.part.Parent then
-                    return old(self, ...)
-                end
                 local origin, _, rp = ...
-                if typeof(origin) ~= "Vector3" then
+                if not ((Settings.GunSilent or Settings.Wallbang) and t and t.part and typeof(origin) == "Vector3") then
                     return old(self, ...)
                 end
                 local at = Lead.gun(t)
                 local dir = (at - origin).Unit * 10000
                 local real = old(self, origin, dir, rp)
+                -- From here on other calls are safe.
                 if real and real.Instance and real.Instance:IsDescendantOf(t.char) then
                     Hook.gunShots += 1
                     return real
                 end
-                if Settings.Wallbang then
+                if Settings.Wallbang and t.part.Parent then
                     Hook.wallbangs += 1
                     return fakeResult(t.part, at, -dir.Unit)
                 end
                 return real
-            elseif method == "FindPartOnRayWithIgnoreList" then
-                local scr = owner(getCaller())
-                local ray, ignore = ...
-                if typeof(ray) ~= "Ray" then
-                    return old(self, ...)
-                end
+            end
+
+            -- FindPartOnRayWithIgnoreList: do the real call first.
+            local ray, ignore = ...
+            local r = table.pack(old(self, ...))
+            if typeof(ray) ~= "Ray" then
+                return table.unpack(r, 1, r.n)
+            end
+            if kind == "knife" and Settings.KnifeSilent then
                 -- Picking where to throw.
-                if Settings.KnifeSilent and isKnifeScript(scr) then
-                    local t = Aim.target
-                    local tool = scr.Parent
-                    local handle = tool:FindFirstChild("Handle")
-                    -- The game re-casts while it hits fully see-through parts,
-                    -- so always hand it a visible one (never twice).
-                    local part = t and t.part
-                    if part and part.Transparency >= 1 then
-                        part = nil
-                        for _, n in { "UpperTorso", "Torso", "Head", "LowerTorso" } do
-                            local x = t.char:FindFirstChild(n)
-                            if x and x:IsA("BasePart") and x.Transparency < 1 then
-                                part = x
-                                break
-                            end
-                        end
-                    end
-                    if part and type(ignore) == "table" and table.find(ignore, part) then
-                        part = nil
-                    end
-                    if t and part and part.Parent and handle then
-                        Hook.throws += 1
-                        local at = Lead.knife(t, handle.Position)
-                        return part, at, -(at - handle.Position).Unit
-                    end
-                    return old(self, ...)
+                local t = Aim.target
+                local tool = Held.tool
+                local handle = tool and tool:FindFirstChild("Handle")
+                local part = t and visiblePart(t, ignore)
+                if part and part.Parent and handle then
+                    Hook.throws += 1
+                    local at = Lead.knife(t, handle.Position)
+                    return part, at, -(at - handle.Position).Unit
                 end
+            elseif kind == "flight" and Settings.KnifeHitbox > 0 then
                 -- Stepping your flying knife: a bigger hitbox around enemies.
-                if Settings.KnifeHitbox > 0 and isFlightScript(scr) then
-                    local hit, pos, normal, mat = old(self, ...)
-                    local a = ray.Origin
-                    local b = ray.Origin + ray.Direction
-                    local wallT = hit and ((pos - a).Magnitude / math.max(ray.Direction.Magnitude, 1e-6)) or 2
-                    local bestPart, bestPos, bestT
-                    for _, t in Targets.list(false) do
-                        local part = Targets.part(t.char) or t.root
-                        local c, along = closest(a, b, part.Position)
-                        if (c - part.Position).Magnitude <= Settings.KnifeHitbox and along <= wallT
-                            and (not bestT or along < bestT) then
-                            bestPart, bestPos, bestT = part, c, along
-                        end
+                local hit, pos = r[1], r[2]
+                local a = ray.Origin
+                local b = ray.Origin + ray.Direction
+                local wallT = (hit and typeof(pos) == "Vector3") and ((pos - a).Magnitude / math.max(ray.Direction.Magnitude, 1e-6)) or 2
+                local bestPart, bestPos, bestT
+                for _, t in Targets.list(false) do
+                    local part = Targets.part(t.char) or t.root
+                    local c, along = closest(a, b, part.Position)
+                    if (c - part.Position).Magnitude <= Settings.KnifeHitbox and along <= wallT and (not bestT or along < bestT) then
+                        bestPart, bestPos, bestT = part, c, along
                     end
-                    if bestPart and not (hit and hit:IsDescendantOf(bestPart.Parent)) then
-                        Hook.knifeHits += 1
-                        return bestPart, bestPos, -(ray.Direction.Unit)
-                    end
-                    return hit, pos, normal, mat
+                end
+                if bestPart and not (hit and hit:IsDescendantOf(bestPart.Parent)) then
+                    Hook.knifeHits += 1
+                    return bestPart, bestPos, -(ray.Direction.Unit), Enum.Material.Plastic
                 end
             end
-            return old(self, ...)
+            return table.unpack(r, 1, r.n)
         end
         if typeof(newcclosure) == "function" then
             handler = newcclosure(handler)
@@ -517,13 +574,13 @@ do
     end
 end
 
---// Fire / throw rate: the game's own busy flags \\--
--- Gun: the Activated handler's debounce flag (true for 2.5s after a shot).
--- Knife: the flag shared by slash and throw. Both live only on your side; this
--- clears them sooner.
-local Rate = { status = "" }
+--// Fire / throw rate \\--
+-- Gun: the game's own shoot function (from its Activated handler) is called for
+-- extra shots while the gun's 2.5s wait is running. The gun's own state is never
+-- changed, so it can't get stuck.
+-- Knife: the flag shared by slash and throw is cleared sooner (only on your side).
+local Rate = { status = "", fast = 0 }
 do
-    -- The tool's own LocalScript's Activated handler.
     local function handlerOf(tool)
         if typeof(getconnections) ~= "function" then
             return nil
@@ -543,42 +600,91 @@ do
         end
         return nil
     end
-    local gunState, knifeState = {}, {}
-    local function track(tool, state, slot, cooldown)
-        local f, ups = handlerOf(tool)
-        if not f then
-            return "no handler"
+    Rate.handlerOf = handlerOf
+
+    -- Gun: its Activated handler's upvalues are (player, MatchState, busy, Shoot).
+    local hooked = setmetatable({}, { __mode = "k" })
+    local lastFast = 0
+    local function onActivated(tool)
+        if not (alive() and Settings.FastGun) then
+            return
         end
-        local v = ups[slot]
-        if type(v) ~= "boolean" then
-            return "flag not found"
-        end
-        local now = os.clock()
-        if v then
-            state.since = state.since or now
-            if now - state.since >= cooldown then
-                pcall(debug.setupvalue, f, slot, false)
-                state.since = nil
+        task.defer(function()
+            local f, ups = handlerOf(tool)
+            if not f then
+                Rate.status = "gun handler not found"
+                return
             end
-        else
-            state.since = nil
-        end
-        return "on"
+            local busy, shoot = ups[3], ups[4]
+            if type(busy) ~= "boolean" or type(shoot) ~= "function" then
+                Rate.status = "gun shoot function not found"
+                return
+            end
+            local now = os.clock()
+            -- The game just shot on this click itself, or isn't busy: leave it.
+            if not busy or now - Hook.lastGunShot < 0.08 then
+                return
+            end
+            if now - math.max(lastFast, Hook.lastGunShot) < Settings.GunCooldown or not Game.roundLive() then
+                return
+            end
+            local c = myChar()
+            local hum = c and c:FindFirstChildOfClass("Humanoid")
+            if not hum or hum.Health <= 0 or tool.Parent ~= c then
+                return
+            end
+            lastFast = now
+            Rate.fast += 1
+            Hook.force, Hook.forceUntil = "gun", os.clock() + 0.25
+            pcall(shoot)
+            Hook.force = nil
+            Rate.status = "gun: extra shot"
+        end)
     end
-    -- Upvalue slots, in the order the game's handlers capture them (checked to
-    -- be booleans before anything is changed).
-    local GUN_SLOT, KNIFE_SLOT = 3, 5
+    loop(0.5, function()
+        local c = myChar()
+        local bp = LocalPlayer:FindFirstChild("Backpack")
+        for _, holder in { c, bp } do
+            for _, t in holder and holder:GetChildren() or {} do
+                if Game.isGun(t) and not hooked[t] then
+                    hooked[t] = true
+                    bind(t.Activated, function()
+                        onActivated(t)
+                    end)
+                end
+            end
+        end
+    end)
+
+    -- Knife: the Activated handler's 5th upvalue is the busy flag.
+    local KNIFE_SLOT = 5
+    local knifeSince = nil
     bind(RunService.Heartbeat, function()
         if not alive() or type(debug.setupvalue) ~= "function" then
             return
         end
-        local tool = Game.tool()
-        if Settings.FastGun and Game.isGun(tool) then
-            Rate.status = "gun: " .. track(tool, gunState, GUN_SLOT, Settings.GunCooldown)
-        elseif Settings.FastKnife and Game.isKnife(tool) then
-            Rate.status = "knife: " .. track(tool, knifeState, KNIFE_SLOT, Settings.KnifeCooldown)
-        else
+        local tool = Held.tool
+        if Settings.FastKnife and Held.kind == "knife" and tool then
+            local f, ups = handlerOf(tool)
+            local v = ups and ups[KNIFE_SLOT]
+            if not f or type(v) ~= "boolean" then
+                Rate.status = "knife flag not found"
+                return
+            end
+            local now = os.clock()
+            if v then
+                knifeSince = knifeSince or now
+                if now - knifeSince >= Settings.KnifeCooldown then
+                    pcall(debug.setupvalue, f, KNIFE_SLOT, false)
+                    knifeSince = nil
+                end
+            else
+                knifeSince = nil
+            end
+            Rate.status = "knife: on"
+        elseif not Settings.FastGun then
             Rate.status = "off"
+            knifeSince = nil
         end
     end)
 end
@@ -681,6 +787,7 @@ do
                     lastThrow = now
                     KnifeAuto.throws += 1
                     KnifeAuto.info = "throwing at " .. t.player.DisplayName
+                    Hook.force, Hook.forceUntil = "knife", os.clock() + 0.6
                     task.spawn(cache.fn, { UserInputState = Enum.UserInputState.Begin, KeyCode = Enum.KeyCode.E,
                         UserInputType = Enum.UserInputType.Keyboard }, false)
                 else
@@ -1108,11 +1215,12 @@ do
     slider(Box, "GunLead", "Lead", 0, 300, 0, " ms", "Shoot ahead of moving targets. Usually 0: the hit is decided on your screen")
     toggle(Box, "GunTrigger", "Triggerbot", "Shoots (the game's own trigger) as soon as there's a target")
     slider(Box, "GunTriggerDelay", "Trigger reaction", 0, 500, 0, " ms")
-    toggle(Box, "FastGun", "Faster shooting", "The 2.5s between shots is only on your side: this lets you shoot again sooner")
+    toggle(Box, "FastGun", "Faster shooting",
+        "Extra shots through the game's own shoot function while its 2.5s wait runs. The gun itself is never changed. If shots stop counting, the server enforces the 2.5s")
     slider(Box, "GunCooldown", "Time between shots", 0.1, 2.5, 2, " s")
     status(Box, function()
-        return ("Target: %s\nHook: %s\nSilent hits: %d  Wallbangs: %d\nTrigger: %s (%d)\nRate: %s"):format(
-            Aim.info, Hook.status, Hook.gunShots, Hook.wallbangs, Trigger.info, Trigger.shots, Rate.status)
+        return ("Target: %s\nHook: %s\nSilent hits: %d  Wallbangs: %d\nTrigger: %s (%d)\nRate: %s (extra shots %d)"):format(
+            Aim.info, Hook.status, Hook.gunShots, Hook.wallbangs, Trigger.info, Trigger.shots, Rate.status, Rate.fast)
     end)
 
     local Pick = Tab:AddRightGroupbox("Targeting", "users")
