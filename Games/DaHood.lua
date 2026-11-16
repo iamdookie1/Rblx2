@@ -34,6 +34,7 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local TeleportService = game:GetService("TeleportService")
 local HttpService = game:GetService("HttpService")
 local PathfindingService = game:GetService("PathfindingService")
+local CollectionService = game:GetService("CollectionService")
 local Workspace = workspace
 local LocalPlayer = Players.LocalPlayer
 local Mouse = LocalPlayer:GetMouse()
@@ -1903,6 +1904,95 @@ do
     end)
 end
 
+--// Buttons in the game's own mobile layout \\--
+-- Clones the game's Macro button (same icon, label and outline) into
+-- MainScreenGui.MobileLayout and stacks it right above one of the game's
+-- buttons, following it if you move that button in the layout editor. Where the
+-- mobile layout isn't showing (PC), the floating button is used instead.
+local Dock = {}
+do
+    local made = {}
+    function Dock.layout()
+        local gui = LocalPlayer:FindFirstChild("PlayerGui")
+        local main = gui and gui:FindFirstChild("MainScreenGui")
+        local lay = main and main:FindFirstChild("MobileLayout")
+        if lay and lay:IsA("GuiObject") and lay.Visible and main.Enabled ~= false then
+            return lay
+        end
+        return nil
+    end
+    local function pressed(i)
+        return i.UserInputType == Enum.UserInputType.Touch or i.UserInputType == Enum.UserInputType.MouseButton1
+    end
+    -- spec = { name = , text = , above = , down = fn, up = fn }
+    function Dock.update(spec, want)
+        local lay = want and Dock.layout() or nil
+        local template = lay and lay:FindFirstChild("Macro")
+        local anchor = lay and lay:FindFirstChild(spec.above)
+        local b = made[spec.name]
+        if not (template and anchor) then
+            if b then
+                b.Visible = false
+            end
+            return nil
+        end
+        if not b or b.Parent ~= lay then
+            if b then
+                pcall(b.Destroy, b)
+            end
+            b = template:Clone()
+            b.Name = spec.name
+            for _, d in b:GetDescendants() do
+                if d:IsA("LuaSourceContainer") then
+                    d:Destroy()
+                end
+            end
+            b.Parent = lay
+            made[spec.name] = b
+            b.InputBegan:Connect(function(i)
+                if pressed(i) and spec.down then
+                    spec.down()
+                end
+            end)
+            b.InputEnded:Connect(function(i)
+                if pressed(i) and spec.up then
+                    spec.up()
+                end
+            end)
+        end
+        local label = b:FindFirstChild("Label")
+        if label and label:IsA("TextLabel") and label.Text ~= spec.text then
+            label.Text = spec.text
+        end
+        b.Visible = true
+        b.Active = true
+        b.AnchorPoint = anchor.AnchorPoint
+        b.Size = anchor.Size
+        b.ZIndex = anchor.ZIndex
+        b.Position = anchor.Position - UDim2.new(0, 0, anchor.Size.Y.Scale * 1.12, anchor.Size.Y.Offset * 1.12 + 4)
+        return b
+    end
+    -- Same colours the game uses for its own macro button.
+    function Dock.paint(b, on, ready)
+        if not b then
+            return
+        end
+        b.BackgroundColor3 = on and Color3.fromRGB(40, 120, 55) or Color3.fromRGB(35, 35, 40)
+        b.ImageColor3 = on and Color3.fromRGB(90, 210, 120) or Color3.fromRGB(255, 255, 255)
+        local st = b:FindFirstChild("State")
+        if st and st:IsA("UIStroke") then
+            local lit = on or ready == true
+            st.Color = lit and Color3.fromRGB(90, 210, 120) or Color3.fromRGB(70, 70, 78)
+            st.Enabled = lit
+        end
+    end
+    table.insert(Cleanups, function()
+        for _, b in made do
+            pcall(b.Destroy, b)
+        end
+    end)
+end
+
 --// Macro \\--
 -- Da Hood has its own macro (the speed glitch): while it's on, your root turns
 -- to face where the camera looks every frame (MobileMacroButton, RenderStep
@@ -2051,18 +2141,37 @@ do
         b.TextColor3 = Color3.new(1, 1, 1)
         b.Font = Enum.Font.GothamBold
         b.TextSize = 14
-        b.Text = "MACRO"
+        b.Text = "MACRO V2"
         b.AutoButtonColor = false
         b.Parent = gui
         Instance.new("UICorner", b).CornerRadius = UDim.new(1, 0)
         local stroke = Instance.new("UIStroke", b)
         stroke.Thickness = 2
         stroke.Color = Color3.fromRGB(70, 70, 78)
+        local docked
         local function paint()
             b.BackgroundColor3 = Macro.custom and Color3.fromRGB(40, 120, 55) or Color3.fromRGB(35, 35, 40)
             stroke.Color = Macro.custom and Color3.fromRGB(90, 210, 120) or Color3.fromRGB(70, 70, 78)
+            Dock.paint(docked, Macro.custom)
         end
         Macro.paint = paint
+        local spec = {
+            name = "MacroV2", text = "MACRO V2", above = "Macro",
+            down = function()
+                if Settings.MacroHold then
+                    Macro.custom = true
+                    paint()
+                end
+            end,
+            up = function()
+                if Settings.MacroHold then
+                    Macro.custom = false
+                else
+                    Macro.custom = not Macro.custom
+                end
+                paint()
+            end,
+        }
         local downAt, startPos, dragging, inputObj = nil, nil, false, nil
         bind(b.InputBegan, function(i)
             if i.UserInputType == Enum.UserInputType.Touch or i.UserInputType == Enum.UserInputType.MouseButton1 then
@@ -2099,11 +2208,13 @@ do
             gui:Destroy()
         end)
         loop(0.25, function()
-            gui.Enabled = Settings.CustomMacro and Settings.MacroButton
+            local want = Settings.CustomMacro and Settings.MacroButton
+            docked = Dock.update(spec, want)
+            gui.Enabled = want and docked == nil
             if not Settings.CustomMacro and Macro.custom then
                 Macro.custom = false
-                paint()
             end
+            paint()
         end)
     end
 end
@@ -2323,11 +2434,16 @@ do
     table.insert(Cleanups, function()
         gui:Destroy()
     end)
+    local spec = { name = "QuickMacro", text = "QUICK", above = "Block", up = function()
+        Quick.run()
+    end }
     loop(0.2, function()
-        gui.Enabled = Settings.QuickMacro
+        local docked = Dock.update(spec, Settings.QuickMacro)
+        gui.Enabled = Settings.QuickMacro and docked == nil
         local ready = Macro.gameOn() or Macro.active()
         stroke.Color = ready and Color3.fromRGB(90, 210, 120) or Color3.fromRGB(70, 70, 78)
         b.BackgroundColor3 = busy and Color3.fromRGB(40, 120, 55) or Color3.fromRGB(35, 35, 40)
+        Dock.paint(docked, busy, ready)
     end)
 end
 
@@ -2470,14 +2586,101 @@ do
         end
         return 3
     end
+    -- Doors: models with a LockBool value, a lock (click range 5) and the door
+    -- itself (click range 7). Their parts carry PathfindingModifiers tagged
+    -- DoorPassage. Unlocked doors are made passable for the path (and opened
+    -- on the way), locked ones count as walls.
+    local Doors = { list = {}, byModel = {}, at = -100 }
+    local function lockedOf(model)
+        local lb = model:FindFirstChild("LockBool")
+        return lb ~= nil and lb:IsA("BoolValue") and lb.Value == true
+    end
+    function Doors.scan()
+        if os.clock() - Doors.at < 30 then
+            return
+        end
+        Doors.at = os.clock()
+        local byModel, list = {}, {}
+        for _, mod in CollectionService:GetTagged("DoorPassage") do
+            local m = mod.Parent
+            while m and m ~= Workspace and not (m:IsA("Model") and m:FindFirstChild("LockBool")) do
+                m = m.Parent
+            end
+            if m and m ~= Workspace then
+                local d = byModel[m]
+                if not d then
+                    local cd
+                    for _, x in m:GetDescendants() do
+                        if x:IsA("ClickDetector") and x.Parent and not x.Parent.Name:find("Lock") then
+                            cd = x
+                            break
+                        end
+                    end
+                    d = { model = m, cd = cd, mods = {} }
+                    byModel[m] = d
+                    table.insert(list, d)
+                end
+                if mod:IsA("PathfindingModifier") then
+                    table.insert(d.mods, mod)
+                end
+            end
+        end
+        Doors.list, Doors.byModel = list, byModel
+    end
+    local origPass = {}
+    function Doors.prepare()
+        Doors.scan()
+        for _, d in Doors.list do
+            local passable = not lockedOf(d.model)
+            for _, mod in d.mods do
+                if mod.Parent then
+                    if origPass[mod] == nil then
+                        origPass[mod] = mod.PassThrough
+                    end
+                    if mod.PassThrough ~= passable then
+                        mod.PassThrough = passable
+                    end
+                end
+            end
+        end
+    end
+    table.insert(Cleanups, function()
+        for mod, v in origPass do
+            pcall(function()
+                mod.PassThrough = v
+            end)
+        end
+    end)
+    function Doors.of(inst)
+        local m = inst
+        while m and m ~= Workspace do
+            local d = Doors.byModel[m]
+            if d then
+                return d
+            end
+            m = m.Parent
+        end
+        return nil
+    end
+    Doors.locked = lockedOf
+    World.Doors = Doors
+
+    local function pathOk(status)
+        if status == Enum.PathStatus.Success then
+            return true
+        end
+        local name = tostring(status)
+        return name:find("Closest") ~= nil
+    end
     function Mover.path(fromPos, toPos)
         local a = floorBelow(fromPos) or fromPos
         local b = floorBelow(toPos) or toPos
+        pcall(Doors.prepare)
         local path = PathfindingService:CreatePath({
             AgentRadius = 1.6, AgentHeight = 5, AgentCanJump = true, AgentCanClimb = true, WaypointSpacing = 3,
         })
         local ok = pcall(path.ComputeAsync, path, a, b)
-        if not ok or path.Status ~= Enum.PathStatus.Success then
+        if not ok or not pathOk(path.Status) then
             return nil
         end
         local pts, length, last = {}, 0, nil
@@ -2487,6 +2690,41 @@ do
                 length += (w.Position - last).Magnitude
             end
             last = w.Position
+        end
+        if #pts == 0 then
+            return nil
+        end
+        -- A "closest" path that stops short: fine if the end is within a step.
+        local gap = (pts[#pts] - b).Magnitude
+        if gap > 8 then
+            return nil
+        elseif gap > 0.5 then
+            table.insert(pts, b)
+            length += gap
+        end
+        return pts, length
+    end
+    -- No walkable path at all: go up, across above everything, and down.
+    function Mover.over(fromPos, toPos)
+        local a = floorBelow(fromPos) or fromPos
+        local b = floorBelow(toPos) or toPos
+        local ignore = { myChar(), Workspace:FindFirstChild("Ignored"), Workspace:FindFirstChild("Players"), Hitbox.folder }
+        floorParams.FilterDescendantsInstances = ignore
+        local pts
+        for _, h in { 20, 45, 90, 160 } do
+            local top = math.max(a.Y, b.Y) + h
+            local p1, p2 = Vector3.new(a.X, top, a.Z), Vector3.new(b.X, top, b.Z)
+            local up = a + Vector3.new(0, 3, 0)
+            local down = b + Vector3.new(0, 3, 0)
+            pts = { a, p1, p2, b }
+            if not Workspace:Raycast(up, p1 - up, floorParams) and not Workspace:Raycast(p1, p2 - p1, floorParams)
+                and not Workspace:Raycast(p2, down - p2, floorParams) then
+                break
+            end
+        end
+        local length = 0
+        for k = 2, #pts do
+            length += (pts[k] - pts[k - 1]).Magnitude
         end
         return pts, length
     end
@@ -2502,6 +2740,9 @@ do
             length += (pts[k] - pts[k - 1]).Magnitude
         end
         local deadline = os.clock() + length / math.max(Settings.AtmFlySpeed, 1) * 1.5 + 3
+        local doorParams = RaycastParams.new()
+        doorParams.FilterType = Enum.RaycastFilterType.Exclude
+        local lastDoorCheck = 0
         while i <= #pts do
             if not alive() or (wanted and not wanted()) then
                 return false
@@ -2514,6 +2755,31 @@ do
             local goal = pts[i] + Vector3.new(0, lift, 0)
             local pos = root.Position
             local delta = goal - pos
+            -- A closed door just ahead: open it (if it isn't locked) and wait for it.
+            if typeof(fireclickdetector) == "function" and os.clock() - lastDoorCheck > 0.12 and delta.Magnitude > 0.5 then
+                lastDoorCheck = os.clock()
+                doorParams.FilterDescendantsInstances = { myChar(), Workspace:FindFirstChild("Players"), Workspace:FindFirstChild("Ignored"), Hitbox.folder }
+                local ahead = delta.Unit * math.min(delta.Magnitude + 3, 6)
+                local hit = Workspace:Raycast(pos, ahead, doorParams)
+                local door = hit and Doors.of(hit.Instance)
+                if door and door.cd and not lockedOf(door.model) and os.clock() - (door.clicked or 0) > 2.5 then
+                    door.clicked = os.clock()
+                    pcall(fireclickdetector, door.cd)
+                    local here = root.CFrame
+                    local t0 = os.clock()
+                    while os.clock() - t0 < 0.9 do
+                        RunService.Heartbeat:Wait()
+                        root.CFrame = here
+                        root.AssemblyLinearVelocity = Vector3.zero
+                        local again = Workspace:Raycast(pos, ahead, doorParams)
+                        if not (again and Doors.of(again.Instance) == door) then
+                            break
+                        end
+                    end
+                    deadline += os.clock() - t0
+                    dt = 0
+                end
+            end
             local dist = delta.Magnitude
             local step = Settings.AtmFlySpeed * dt
             local new
@@ -2549,10 +2815,7 @@ do
             RunService.Heartbeat:Wait()
             return true
         end
-        pts = pts or Mover.path(root.Position, pos)
-        if not pts then
-            return false
-        end
+        pts = pts or Mover.path(root.Position, pos) or Mover.over(root.Position, pos)
         return Mover.fly(pts, wanted)
     end
 
@@ -2592,7 +2855,7 @@ do
 
     -- The ATM you can actually get to first: the few nearest in a straight
     -- line, compared by the length of the path to them.
-    local unreachable = {}
+    local unreachable, strikes = {}, {}
     local function pickAtm(range, off)
         local root = myRoot()
         if not root then
@@ -2619,20 +2882,29 @@ do
             return first.b, first.d, standSpot(first.b, off)
         end
         local best, bestLen, bestSpot, bestPts
-        for i = 1, math.min(4, #list) do
+        for i = 1, math.min(6, #list) do
             local b = list[i].b
             local spot = standSpot(b, off)
             local pts, len = Mover.path(root.Position, spot)
             if pts then
+                strikes[b.model] = nil
                 if not bestLen or len < bestLen then
                     best, bestLen, bestSpot, bestPts = b, len, spot, pts
                 end
             else
-                unreachable[b.model] = now + 30
+                strikes[b.model] = (strikes[b.model] or 0) + 1
+                if strikes[b.model] >= 2 then
+                    strikes[b.model] = nil
+                    unreachable[b.model] = now + 20
+                end
             end
         end
         if not best then
-            return nil
+            -- Nothing walkable right now: fly over to the nearest one instead of stalling.
+            local first = list[1]
+            local spot = standSpot(first.b, off)
+            local pts = Mover.over(root.Position, spot)
+            return first.b, first.d, spot, pts
         end
         return best, (best.head.Position - root.Position).Magnitude, bestSpot, bestPts
     end
@@ -2818,7 +3090,7 @@ do
             end, pts)
             if not arrived then
                 if atm.hum.Health > 0 and Settings.AtmFarm then
-                    unreachable[model] = os.clock() + 30
+                    unreachable[model] = os.clock() + 20
                     World.info = "couldn't get there, trying the next ATM"
                 end
                 return
