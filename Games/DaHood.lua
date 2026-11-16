@@ -98,6 +98,7 @@ local Settings = {
     Hitbox = false, HitboxMethod = "Ghost box", HitboxSize = 8, HitboxTransparency = 75, HitboxSkipCrew = true, HitboxSkipKnocked = true,
     -- macro
     CustomMacro = false, MacroButton = true, MacroHold = false, MacroTurn = 100, MacroOnlyMoving = true, MacroOnlyAir = false,
+    MacroSpeedCap = false, MacroCapSpeed = 45,
     QuickMacro = false, QuickEmote = nil, QuickEmoteWait = 0.15, QuickNudge = 0.3, QuickLockpick = true,
     -- world
     AtmEsp = false, VaultEsp = false, ItemEsp = false, WorldShowBroken = false, WorldEspMax = 1500,
@@ -1959,6 +1960,36 @@ do
     end
 end
 
+--// Macro speed cap \\--
+-- While either macro is on, horizontal speed above the cap is trimmed off a
+-- little every frame (never cut dead in one frame), so you keep control without
+-- an obvious snap. Vertical speed (jumps, falls) is left alone.
+do
+    local soft = 0.12
+    bind(RunService.Heartbeat, function(dt)
+        if not (alive() and Settings.MacroSpeedCap) then
+            return
+        end
+        if not (Macro.gameOn() or Macro.active()) then
+            return
+        end
+        local root = myRoot()
+        if not root then
+            return
+        end
+        local v = root.AssemblyLinearVelocity
+        local flat = Vector3.new(v.X, 0, v.Z)
+        local speed = flat.Magnitude
+        local cap = Settings.MacroCapSpeed
+        if speed <= cap or speed < 0.01 then
+            return
+        end
+        local keep = cap + (speed - cap) * math.exp(-dt / soft)
+        local f = flat * (keep / speed)
+        root.AssemblyLinearVelocity = Vector3.new(f.X, v.Y, f.Z)
+    end)
+end
+
 --// Quick macro: emote -> wait -> lockpick -> nudge \\--
 -- One tap while a macro is on: plays an emote from your equipped emote wheel
 -- (Humanoid:PlayEmote, the same thing the wheel does), waits, pulls out a
@@ -2536,6 +2567,9 @@ do
     slider(Mac, "MacroTurn", "Turn speed", 10, 300, 0, "%", "100 is exactly the game's own macro")
     toggle(Mac, "MacroOnlyMoving", "Only while moving")
     toggle(Mac, "MacroOnlyAir", "Only in the air")
+    toggle(Mac, "MacroSpeedCap", "Speed cap",
+        "While either macro is on, speed above the cap is eased off over a few frames (no snap). Jumps and falls aren't touched")
+    slider(Mac, "MacroCapSpeed", "Max speed", 16, 150, 0, " studs/s", "Normal running is about 16-26")
     local Qm = Tab:AddRightGroupbox("Quick macro", "sparkles")
     toggle(Qm, "QuickMacro", "Quick macro button",
         "A QUICK button on screen: with a macro on, one tap plays your emote, waits, pulls out a lockpick and steps forward to cancel the emote")
