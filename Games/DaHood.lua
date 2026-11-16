@@ -95,7 +95,7 @@ local Settings = {
     -- misc
     AntiAfk = true,
     -- hitbox
-    Hitbox = false, HitboxSize = 8, HitboxTransparency = 75, HitboxSkipCrew = true, HitboxSkipKnocked = true,
+    Hitbox = false, HitboxMethod = "Ghost box", HitboxSize = 8, HitboxTransparency = 75, HitboxSkipCrew = true, HitboxSkipKnocked = true,
     -- macro
     CustomMacro = false, MacroButton = true, MacroHold = false, MacroTurn = 100, MacroOnlyMoving = true, MacroOnlyAir = false,
     QuickMacro = false, QuickEmote = nil, QuickEmoteWait = 0.15, QuickNudge = 0.3, QuickLockpick = true,
@@ -265,6 +265,10 @@ do
     end
 end
 
+-- Filled in by the hitbox expander further down; aiming and the triggerbot
+-- need to know its boxes before then.
+local Hitbox = { count = 0, hits = 0, owner = {}, folder = nil }
+
 --// Targets \\--
 local Targets = {}
 do
@@ -326,6 +330,9 @@ do
         local ign = Workspace:FindFirstChild("Ignored")
         if ign then
             table.insert(ignore, ign)
+        end
+        if Hitbox.folder then
+            table.insert(ignore, Hitbox.folder)
         end
         params.FilterDescendantsInstances = ignore
         local from = cam.CFrame.Position
@@ -592,10 +599,14 @@ do
             local cam = camera()
             local params = RaycastParams.new()
             params.FilterType = Enum.RaycastFilterType.Exclude
-            local ign = { myChar(), Workspace:FindFirstChild("Ignored") }
+            local ign = { myChar(), Workspace:FindFirstChild("Ignored"), Hitbox.folder }
             params.FilterDescendantsInstances = ign
             local r = Workspace:Raycast(cam.CFrame.Position, cam.CFrame.LookVector * 500, params)
             hit = r and r.Instance
+        end
+        local boxed = hit and Hitbox.owner[hit]
+        if boxed then
+            return Targets.valid({ player = boxed.player, char = boxed.char })
         end
         local node = hit
         while node and node ~= Workspace do
@@ -1594,11 +1605,32 @@ local function serverHop()
 end
 
 --// Hitbox expander \\--
--- Guns raycast on your side and send the part they hit, so other players'
--- HumanoidRootParts made bigger on your screen get hit from further off.
--- Only you see the change (other players' parts don't replicate from you).
-local Hitbox = { count = 0 }
+-- Guns raycast on your side (GunHandler.shoot) and send the part they hit.
+--   Ghost box (default): an invisible box of your own follows each player every
+--     frame. When your shot's raycast hits it, the hit is handed to the game as
+--     that player's real torso. Their real parts are never touched, so they keep
+--     moving normally on your screen.
+--   Resize: makes their real HumanoidRootPart bigger on your screen (size,
+--     see-through and collision only).
 do
+    local folder = Instance.new("Folder")
+    folder.Name = "\0"
+    folder.Parent = Workspace
+    Hitbox.folder = folder
+    table.insert(Cleanups, function()
+        folder:Destroy()
+    end)
+    local boxes = {}
+    local function dropBox(p)
+        local b = boxes[p]
+        if b then
+            Hitbox.owner[b] = nil
+            b:Destroy()
+            boxes[p] = nil
+        end
+    end
+    bind(Players.PlayerRemoving, dropBox)
+
     local original = {}
     local function restore(part)
         local o = original[part]
@@ -1607,7 +1639,6 @@ do
                 part.Size = o.Size
                 part.Transparency = o.Transparency
                 part.CanCollide = o.CanCollide
-                part.Massless = o.Massless
             end)
             original[part] = nil
         end
@@ -1618,35 +1649,104 @@ do
         end
     end
     table.insert(Cleanups, restoreAll)
-    loop(0.1, function()
-        if not Settings.Hitbox then
-            if next(original) then
-                restoreAll()
+
+    local function place()
+        for _, b in boxes do
+            local o = Hitbox.owner[b]
+            if o and o.root.Parent then
+                b.CFrame = o.root.CFrame
             end
-            Hitbox.count = 0
-            return
         end
-        local n = 0
-        local want = {}
-        for _, t in Targets.list() do
-            local skip = (Settings.HitboxSkipCrew and Game.sameCrew(t.player))
-                or (Settings.HitboxSkipKnocked and (Game.knocked(t.char) or Game.dead(t.char)))
-            if not skip then
-                local part = t.root
-                want[part] = true
-                if not original[part] then
-                    original[part] = { Size = part.Size, Transparency = part.Transparency, CanCollide = part.CanCollide, Massless = part.Massless }
+    end
+    bind(RunService.RenderStepped, place)
+    bind(RunService.Heartbeat, place)
+
+    -- Your shot hit a ghost box: hand the game that player's real torso.
+    local Gun = Game.Gun
+    if Gun then
+        Genv.__DaHoodOrigShoot = Genv.__DaHoodOrigShoot or rawget(Gun, "shoot")
+        local originalShoot = Genv.__DaHoodOrigShoot
+        Gun.shoot = function(params, ...)
+            local r = table.pack(originalShoot(params, ...))
+            local o = typeof(r[2]) == "Instance" and Hitbox.owner[r[2]]
+            if o then
+                local real = o.char:FindFirstChild("UpperTorso") or o.char:FindFirstChild("Torso") or o.root
+                if real and real.Parent then
+                    r[2] = real
+                    r[1] = real.Position
+                    Hitbox.hits += 1
                 end
-                local s = Settings.HitboxSize
-                part.Size = Vector3.new(s, s, s)
-                part.Transparency = Settings.HitboxTransparency / 100
-                part.CanCollide = false
-                part.Massless = true
-                n += 1
+            end
+            return table.unpack(r, 1, r.n)
+        end
+        table.insert(Cleanups, function()
+            Gun.shoot = originalShoot
+        end)
+    end
+
+    loop(0.1, function()
+        local on = Settings.Hitbox
+        local ghost = on and Settings.HitboxMethod ~= "Resize"
+        local resize = on and Settings.HitboxMethod == "Resize"
+        local n = 0
+        local seenBox, seenPart = {}, {}
+        if on then
+            for _, t in Targets.list() do
+                local skip = (Settings.HitboxSkipCrew and Game.sameCrew(t.player))
+                    or (Settings.HitboxSkipKnocked and (Game.knocked(t.char) or Game.dead(t.char)))
+                if not skip then
+                    n += 1
+                    local s = Settings.HitboxSize
+                    local size = Vector3.new(s, s, s)
+                    local see = Settings.HitboxTransparency / 100
+                    if ghost then
+                        seenBox[t.player] = true
+                        local b = boxes[t.player]
+                        if not b or not b.Parent then
+                            b = Instance.new("Part")
+                            b.Name = "\0"
+                            b.Anchored = true
+                            b.CanCollide = false
+                            b.CanTouch = false
+                            b.CanQuery = true
+                            b.CastShadow = false
+                            b.Material = Enum.Material.SmoothPlastic
+                            b.Parent = folder
+                            boxes[t.player] = b
+                        end
+                        Hitbox.owner[b] = t
+                        if b.Size ~= size then
+                            b.Size = size
+                        end
+                        b.Transparency = see
+                        b.Color = Settings.EnemyColor
+                        b.CFrame = t.root.CFrame
+                    elseif resize then
+                        local part = t.root
+                        seenPart[part] = true
+                        if not original[part] then
+                            original[part] = { Size = part.Size, Transparency = part.Transparency, CanCollide = part.CanCollide }
+                        end
+                        if part.Size ~= size then
+                            part.Size = size
+                        end
+                        if part.Transparency ~= see then
+                            part.Transparency = see
+                        end
+                        if part.CanCollide then
+                            part.CanCollide = false
+                        end
+                    end
+                end
+            end
+        end
+        for p in boxes do
+            if not seenBox[p] then
+                dropBox(p)
             end
         end
         for part in original do
-            if not want[part] or not part.Parent then
+            if not seenPart[part] or not part.Parent then
                 restore(part)
             end
         end
@@ -2385,12 +2485,14 @@ do
     local Hb = Tab:AddLeftGroupbox("Hitbox expander", "maximize")
     toggle(Hb, "Hitbox", "Hitbox expander",
         "Makes other players' root part bigger on your screen, so your gun's own raycast hits them from further off. Silent aim is usually cleaner")
+    dropdown(Hb, "HitboxMethod", "Method", { "Ghost box", "Resize" },
+        "Ghost box: a box of your own follows them, their real parts are untouched (no freezing). Resize: makes their real root part bigger")
     slider(Hb, "HitboxSize", "Size", 2, 30, 0, " studs")
     slider(Hb, "HitboxTransparency", "See-through", 0, 100, 0, "%", "100 is invisible")
     toggle(Hb, "HitboxSkipCrew", "Not your crew")
     toggle(Hb, "HitboxSkipKnocked", "Not knocked players")
     status(Hb, function()
-        return ("Expanded: %d"):format(Hitbox.count)
+        return ("Expanded: %d\nGhost box hits: %d"):format(Hitbox.count, Hitbox.hits)
     end)
 end
 
