@@ -19,6 +19,10 @@ Suites
 
 Variants: `ap` (auto parry, Remote), `apkey` (auto parry, Keypress), `tb` / `tbkey` (triggerbot).
 
+`luajit Tools/ParrySim/capture_test.lua <script.lua> [trials]` runs the script's real capture hook
+against a fake PRY sender (clock read, token, FireServer by namecall or plain call, sometimes across a
+10ms clock tick) and counts captures whose key comes out wrong ("animation, no parry").
+
 Every trial randomises ping (20-500ms, by trial index), jitter, lag spikes, frame rate (60/144/240),
 the render smoothing delay, the server's homing law (proportional / constant rate / tightening, with
 or without speed scaling), the deflect range, whether Roblox signals are deferred, and whether you
@@ -28,7 +32,7 @@ Environment switches
 - `SIM_CSV=path` per-trial CSV (for compare.py), `SIM_VERBOSE=1` one line per trial,
   `SIM_ONLY=n` run only trial n, `SIM_LOG=1` the script's flight log, `SIM_DBG=1` debug events and
   holds, `SIM_EVAL=1` every auto parry evaluation, `SIM_WLOG=1` server events.
-- `SIM_S=key=value,...` override settings (`timing=100`, `hp_preparry=true`, ...).
+- `SIM_S=key=value,...` override settings (`accuracy_base=100,accuracy=100`, `hp_preparry=true`, ...).
 - `SIM_PINGBIAS=0.5` Data Ping reports half the real round trip; `SIM_BUF=0.22` a long render
   smoothing delay; `SIM_NOCAL=1` turns off the residual timing correction.
 

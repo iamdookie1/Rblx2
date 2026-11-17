@@ -1,6 +1,6 @@
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.6.0"
+local SCRIPT_VERSION = "rewrite-0.6.1"
 
 local genv = (getgenv and getgenv()) or _G
 if type(genv.__BladeBallShutdown) == 'function' then pcall(genv.__BladeBallShutdown) end
@@ -257,7 +257,7 @@ do
 
     local S = {
         autoparry = false, triggerbot = false, parry_mode = "Remote",
-        one_parry_capture = true, rescue_press = true, preparry = false, preparry_range = 30, hp_preparry = true, timing = 0, timing_now = 0,
+        one_parry_capture = true, rescue_press = true, preparry = false, preparry_range = 30, hp_preparry = true,
         anticurve = "Smart", dot_threshold = 0.5, curve_bias = 0.5, close_anticurve = true, close_range = 30, instant_retarget = true,
         accuracy = 50, accuracy_base = 50,
         extra_distance = 0, ping_compensation = false, retry_delay = 1,
@@ -303,11 +303,11 @@ do
     end
 
     function Util.rollAcc()
-        local t = S.timing or 0
+        local acc = S.accuracy_base or 50
         if S.random_accuracy and S.random_accuracy_amount > 0 then
-            t = t + math.random(-S.random_accuracy_amount, S.random_accuracy_amount)
+            acc = acc + math.random(-S.random_accuracy_amount, S.random_accuracy_amount)
         end
-        S.timing_now = math.clamp(t, 0, 100)
+        S.accuracy = math.clamp(acc, 1, 100)
     end
     Parry.roll = Util.rollAcc
     function Util.indexOf(list, name)
@@ -665,7 +665,7 @@ do
         if not ok then pcall_(hookmetamethod_, game, "__namecall", original) end
     end
 
-    local function learn(remote, hash, uid, token, a4, t)
+    local function learn(remote, hash, uid, token, a4, t, exact)
         local text = tostring_(floor_(t * 100))
         if #token ~= #text then return end
         local key = {}
@@ -674,9 +674,9 @@ do
         Core.cap_n = Core.cap_n + 1
         Core.cap = { remote = remote, hash = hash, uid = uid, key = key, len = #text, ball2 = typeof_(a4) == "CFrame",
             verified = Core.bac() == hash or hash == Core.known_real, id = Core.cap_n,
-            win = type_(a4) == "number" and a4 or nil }
+            win = type_(a4) == "number" and a4 or nil, exact = exact == true }
         local text2 = tostring_(floor_(t * 100) - 1)
-        if #text2 == #token then
+        if not exact and #text2 == #token then
             local alt, differs = {}, false
             for i = 1, #text2 do
                 alt[i] = bxor_(byte_(token, i), (byte_(text2, i) + i) % 256)
@@ -687,7 +687,10 @@ do
         Core.misses, Core.pending = 0, nil
         Core.new_capture = { prev = prev }
         if Parry.onCapture then task.defer(pcall, Parry.onCapture, Core.cap) end
-        DBG.ev(Core.cap.verified and "CAPTURE: real parry hash confirmed" or "CAPTURE: taken (real hash not readable)")
+        DBG.ev((Core.cap.verified and "CAPTURE: real parry hash confirmed" or "CAPTURE: taken (real hash not readable)")
+            .. (exact and ", key from the sender's own clock read (exact)" or ", key from the hook's clock read (may be a tick off)"))
+        logp(("capture #%d: %s, key %s"):format(Core.cap.id, Core.cap.verified and "real hash" or "hash not confirmed",
+            exact and "exact (the sender's own clock read)" or "from the hook's clock read -- a second key is kept in case it was a tick off"))
     end
 
     local function inspect(entry)
@@ -700,33 +703,26 @@ do
         if typeof_(self) == 'Instance' and self.ClassName == 'RemoteEvent'
             and type_(a1) == 'string' and #a1 == 36 and a1 ~= JOB_ID and type_(a2) == 'string' and type_(a3) == 'string'
             and ((type_(a4) == 'number' and typeof_(a5) == 'CFrame') or (typeof_(a4) == 'CFrame' and typeof_(a5) == 'CFrame')) then
-            learn(self, a1, a2, a3, a4, entry[4])
+            local t, st, exact = entry[4], entry[6], false
+            if type_(st) == "number" and st <= t + 1e-3 and t - st < 0.05 then t, exact = st, true end
+            learn(self, a1, a2, a3, a4, t, exact)
             return true
         end
         return false
     end
 
-    local box = { want = false, nc = nil, fire = nil, list = {}, ws = Workspace, now = Workspace.GetServerTimeNow }
+    local box = { want = false, nc = nil, fire = nil, list = {}, ws = Workspace, now = Workspace.GetServerTimeNow, sv_t = nil }
+    function box.stamp(t, ...)
+        if type_(t) == "number" then box.sv_t = t end
+        return t, ...
+    end
+    function box.take()
+        local t = box.sv_t
+        box.sv_t = nil
+        return t
+    end
     Util.HOOK_NAME = "=ReplicatedStorage.Packages._Index.sleitnick_net@0.1.0.net"
-    Util.NC_SRC = [[
-local box, getncm, sel = ...
-return function(self, ...)
-    if sel("#", ...) >= 6 and box.want and getncm() == "FireServer" then
-        local l = box.list
-        if #l < 4 then l[#l + 1] = {self, sel("#", ...), {...}, box.now(box.ws)} end
-    end
-    return box.nc(self, ...)
-end]]
-    Util.FIRE_SRC = [[
-local box, sel = ...
-return function(self, ...)
-    if sel("#", ...) >= 6 and box.want then
-        local l = box.list
-        if #l < 4 then l[#l + 1] = {self, sel("#", ...), {...}, box.now(box.ws)} end
-    end
-    return box.fire(self, ...)
-end]]
-    
+
     do
         local ok, renv = pcall(function() return getrenv and getrenv() end)
         Util.CLEAN_ENV = (ok and type(renv) == 'table' and renv.writefile == nil) and setmetatable({}, { __index = renv }) or {}
@@ -742,23 +738,28 @@ end]]
     end
     Core.isolated = false
     local NC_BODY = function(self, ...)
-        if select_("#", ...) >= 6 and box.want and getnamecallmethod_() == "FireServer" then
-            local l = box.list
-            if #l < 4 then l[#l + 1] = { self, select_("#", ...), { ... }, box.now(box.ws), "nc" } end
+        if box.want then
+            local n = select_("#", ...)
+            if n == 0 then
+                if getnamecallmethod_() == "GetServerTimeNow" then return box.stamp(box.nc(self, ...)) end
+            elseif n >= 6 and getnamecallmethod_() == "FireServer" then
+                local l = box.list
+                if #l < 4 then l[#l + 1] = { self, n, { ... }, box.now(box.ws), "nc", box.take() } end
+            end
         end
         return box.nc(self, ...)
     end
     local FIRE_BODY = function(self, ...)
         if select_("#", ...) >= 6 and box.want then
             local l = box.list
-            if #l < 4 then l[#l + 1] = { self, select_("#", ...), { ... }, box.now(box.ws), "fire" } end
+            if #l < 4 then l[#l + 1] = { self, select_("#", ...), { ... }, box.now(box.ws), "fire", box.take() } end
         end
         return box.fire(self, ...)
     end
 
     local function unhook()
         local fire, nc = H.fire, H.nc
-        H.fire, H.nc, H.want, box.want = nil, nil, false, false
+        H.fire, H.nc, H.want, box.want, box.sv_t = nil, nil, false, false, nil
         if fire and not (restore_ and pcall_(restore_, FIRE_FN)) then pcall_(hookfunction_, FIRE_FN, fire) end
         if nc then restoreNc(nc) end
         box.nc, box.fire = nil, nil
@@ -2252,7 +2253,7 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         return math.max(lo + add, 0), math.max(med + add, 0), math.max(hi + add, 0)
     end
     function AP.closeness()
-        return math.clamp((S.timing_now or S.timing or 0) / 100, 0, 1)
+        return math.clamp(((S.accuracy or 50) - 1) / 99, 0, 1)
     end
     function AP.plan(E, r_lo, r_mid, r_hi, W)
         local b = AP.cal.bias
@@ -2465,16 +2466,6 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         if verdict > 0 then AP.addRes(-math.min(verdict + 0.03, 0.15))
         else AP.addRes(math.min(-verdict * 0.5, 0.06)) end
     end
-    function Parry.timingMs()
-        local r_lo, r_mid, r_hi = AP.reach(AP.kind())
-        local W = parryWin() or 0.5
-        local spread = (r_hi - r_lo) + 0.01
-        local slack = W - spread - AP.MARGIN_EARLY - AP.MARGIN_LATE
-        local c = AP.closeness()
-        local e = AP.MARGIN_EARLY + math.max(slack, 0) * 0.5 * (1 - c) + math.min(math.max(slack, 0) * 0.5, AP.CLOSE) * c
-        return e * 1000
-    end
-    Parry.cushionMs = Parry.timingMs
 
     local function decide(ball, st, root, now, via) return AP.evaluate(ball, st, root, now, via) end
 
@@ -3544,26 +3535,16 @@ Gui.AP:AddToggle("UnlockFPS", {
 })
 
 Gui.APS = Gui.Tabs.Parry:AddRightGroupbox("Timing", "sliders-horizontal")
-function Gui.timingText()
-    local ok, ms = pcall(Parry.timingMs)
-    return ok and ("Straight balls: parry up ~%d ms before they land (at your ping now)"):format(math.floor(ms + 0.5))
-        or "Straight balls: parry up ~250 ms before they land"
-end
-Gui.APS:AddSlider("ParryTiming", {
-    Text = "Timing (0 = safe, 100 = close)", Default = 0, Min = 0, Max = 100, Rounding = 0,
-    Tooltip = "Where the ball lands inside your parry. 0 = the middle of the parry window: the most room for lag spikes and curves either way (best in tests). 100 = the parry goes up just before the ball: looks closer, less room for error. Curves always wait as long as they need to.",
-    Callback = function(v)
-        S.timing = v; Parry.roll()
-        if Gui.AccLabel then pcall(function() Gui.AccLabel:SetText(Gui.timingText()) end) end
-    end,
+Gui.APS:AddSlider("Accuracy", {
+    Text = "Accuracy", Default = 50, Min = 1, Max = 100, Rounding = 0,
+    Tooltip = "How close to the ball the parry goes up. 100 = right before it lands, with only a small safety margin. 1 = the middle of the parry, the most room for lag spikes either way. In between moves evenly from one to the other. A curve the prediction isn't sure about waits until the last safe moment at any setting.",
+    Callback = function(v) S.accuracy_base = v; Parry.roll() end,
 })
-Gui.AccLabel = Gui.APS:AddLabel("Straight balls: parry up ~250 ms before they land", true)
-Gui.APS:AddToggle("RandomAccuracy", { Text = "Randomize timing", Default = false, Callback = function(v) S.random_accuracy = v; Parry.roll() end })
+Gui.APS:AddToggle("RandomAccuracy", { Text = "Randomize accuracy", Default = false, Callback = function(v) S.random_accuracy = v; Parry.roll() end })
 Gui.APS:AddSlider("RandomAccuracyAmount", {
     Text = "Randomize amount", Default = 10, Min = 0, Max = 50, Rounding = 0, Suffix = " +/-",
     Callback = function(v) S.random_accuracy_amount = v; Parry.roll() end,
 })
-Gui.APS:AddLabel("Timing corrects itself: every parry the server answers twice (taken, then landed), and the gap shows where the ball landed in your parry. Debug > Timing shows the correction.", true)
 
 Gui.AIM = Gui.Tabs.Parry:AddRightGroupbox("Aim & Curve", "spline")
 Gui.AIM:AddDropdown("TargetMode", {
@@ -3617,8 +3598,8 @@ Parry.onCaptureBad = function()
     Notify("Capture dropped", "The server wasn't taking its parries. Parry once to take a fresh one.", 5)
 end
 Parry.onCapture = function(cap)
-    Notify("Parry remote captured", cap.verified and "Real parry hash confirmed -- auto parry is armed."
-        or "Captured (couldn't read the game's real hash to confirm it).", 4)
+    Notify("Parry remote captured", (cap.verified and "Real parry hash confirmed" or "Captured (couldn't read the game's real hash to confirm it)")
+        .. (cap.exact and ", key exact -- auto parry is armed." or ". Key read from the hook's clock: if parries only animate, press Rehook."), 4)
 end
 Gui.CAP:AddButton({
     Text = "Rehook",
