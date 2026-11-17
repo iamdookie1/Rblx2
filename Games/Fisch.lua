@@ -110,8 +110,14 @@ local Settings = {
     -- world
     EspPools = false, EspEvents = false, EspChests = false, EspMeteors = false, EspNpcs = false,
     AutoChests = false, AutoMeteors = false,
+    -- items
+    JunkMode = "Off", JunkBelow = 50, JunkDelay = 0.5, CatchAlert = true, CatchAlertRarity = "Mythical", CatchAlertValue = 100000,
+    AutoMaps = false, AutoFav = false, FavRarity = "Mythical", FavMutated = false, FavValue = 0,
+    AutoBait = false, BaitStat = "Luck", AutoCages = false,
+    AppraiseFor = "Any mutation", AppraiseTries = 20, AppraiseAnywhere = false,
+    TotemPick = nil, TotemAuto = false, TotemWhen = "Night", TotemEvery = 15,
     -- misc
-    AutoDaily = false, AutoTotem = false, AntiAfk = true, Codes = "",
+    AutoDaily = false, AutoTotem = false, AutoRodRewards = false, AntiAfk = true, AutoRejoin = false, Codes = "",
 }
 
 --// Plumbing \\--
@@ -1831,6 +1837,9 @@ do
             and type(Lib.rarities.OrderedChanceGroups) == "table"
         return Lib.ok
     end
+    function Zones.lib()
+        return load() and Lib or nil
+    end
     local function groupOf(f)
         if f.ChanceGroup then
             return f.ChanceGroup
@@ -2720,6 +2729,592 @@ do
     end
 end
 
+--// Items: catches, junk, favourites, bait, treasure maps, crab cages, appraise, totems \\--
+-- Inventory lives in DataController.InventoryReplicator ("Inventory": id ->
+-- { name, sub = { Weight, Mutation, Shiny, Sparkling, Favourited, Repaired,
+-- x, y, z, ... } }); a Tool's "link" value is its id. RE/Backpack/Favourite
+-- (id, on), RE/Bait/Equip(name), CrabCageController:Claim(cage). NPC jobs
+-- (Jack Marrow fixing a held treasure map, the appraiser) are RemoteFunctions
+-- inside the NPC model, found by name. A fixed map's chest shows up in
+-- world.chests and opens with events.open_treasure(id).
+local Items = { log = {}, best = nil, line = "nothing on the line", caught = 0, earned = 0, junked = 0, favs = 0, cages = 0,
+    mapInfo = "", baitInfo = "", appraiseInfo = "", totemInfo = "" }
+do
+    local Data, Mutations, BaitLib, Cages
+    pcall(function()
+        Data = require(ReplicatedStorage.client.legacyControllers.DataController)
+    end)
+    pcall(function()
+        Mutations = require(ReplicatedStorage.shared.modules.fishing.mutations).Mutations
+    end)
+    pcall(function()
+        BaitLib = require(ReplicatedStorage.shared.modules.library.bait)
+    end)
+    pcall(function()
+        Cages = require(ReplicatedStorage.client.legacyControllers.CrabCageController)
+    end)
+    local Inv = type(Data) == "table" and Data.InventoryReplicator or nil
+    local function inventory()
+        local ok, t = pcall(function()
+            return Inv:TryIndex({ "Inventory" })
+        end)
+        return (ok and type(t) == "table") and t or {}
+    end
+    local function itemOf(tool)
+        if not (Data and tool) then
+            return nil
+        end
+        local ok, item, id = pcall(Data.getItemFromLink, tool)
+        if ok and type(item) == "table" then
+            return item, id
+        end
+        return nil
+    end
+    local function rarityOrder(r)
+        local L = Zones.lib()
+        local x = L and L.rarities.Rarities and L.rarities.Rarities[r]
+        return x and tonumber(x.Order) or 0
+    end
+    local function fishData(name)
+        local L = Zones.lib()
+        local f = L and type(name) == "string" and L.fish[name]
+        if type(f) == "table" and not f.NonFish and tonumber(f.Price) then
+            return f
+        end
+        return nil
+    end
+    -- What the merchant pays for one fish (the game's SellFish).
+    function Items.value(name, sub)
+        local f = fishData(name)
+        if not f then
+            return nil
+        end
+        sub = type(sub) == "table" and sub or {}
+        local wp, v = f.WeightPool, f.Price
+        if tonumber(sub.Weight) and type(wp) == "table" and tonumber(wp[2]) and wp[2] > 0 then
+            v = math.ceil(sub.Weight / (wp[2] / 10) * f.Price)
+        end
+        if sub.Shiny then
+            v *= 1.85
+        end
+        if sub.Sparkling then
+            v *= 1.85
+        end
+        if sub.Glitched then
+            v = 0
+        end
+        local m = sub.Mutation and type(Mutations) == "table" and Mutations[sub.Mutation]
+        if type(m) == "table" and tonumber(m.PriceMultiply) then
+            v *= m.PriceMultiply
+        end
+        return v
+    end
+    local function describe(name, sub)
+        local parts = {}
+        if sub.Shiny then
+            table.insert(parts, "Shiny")
+        end
+        if sub.Sparkling then
+            table.insert(parts, "Sparkling")
+        end
+        if sub.Mutation then
+            table.insert(parts, tostring(sub.Mutation))
+        end
+        table.insert(parts, tostring(name))
+        return table.concat(parts, " ") .. (tonumber(sub.Weight) and (" %.1fkg"):format(sub.Weight) or "")
+    end
+    function Items.mutationNames()
+        local out = {}
+        if type(Mutations) == "table" then
+            for name, m in Mutations do
+                if type(name) == "string" and type(m) == "table" then
+                    table.insert(out, name)
+                end
+            end
+        end
+        table.sort(out)
+        return out
+    end
+
+    -- Catch log: every new fish in your inventory.
+    local known, ready = {}, false
+    if Inv then
+        pcall(function()
+            Inv:ObserveKeys({ "Inventory" }, function(id, item)
+                if not alive() then
+                    return
+                end
+                if item == nil then
+                    known[id] = nil
+                    return
+                end
+                if known[id] then
+                    return
+                end
+                known[id] = true
+                if not ready or type(item) ~= "table" then
+                    return
+                end
+                local sub = type(item.sub) == "table" and item.sub or {}
+                local v = Items.value(item.name, sub)
+                if not v then
+                    return
+                end
+                local f = fishData(item.name)
+                local entry = { name = item.name, text = describe(item.name, sub), value = v, rarity = tostring(f.Rarity or "?") }
+                table.insert(Items.log, 1, entry)
+                if #Items.log > 6 then
+                    table.remove(Items.log)
+                end
+                Items.caught += 1
+                Items.earned += v
+                if not Items.best or v > Items.best.value then
+                    Items.best = entry
+                end
+                if Settings.CatchAlert and (rarityOrder(entry.rarity) >= rarityOrder(Settings.CatchAlertRarity) or v >= Settings.CatchAlertValue) then
+                    notify(("Caught %s (%s) ~%s C$"):format(entry.text, entry.rarity, comma(v)), 6)
+                end
+            end)
+        end)
+    end
+    task.delay(3, function()
+        ready = true
+    end)
+    function Items.logText()
+        local lines = {
+            ("On the line: %s"):format(Items.line),
+            ("This session: %d fish, ~%s C$%s"):format(Items.caught, comma(Items.earned), Items.junked > 0 and (", %d junk skipped"):format(Items.junked) or ""),
+        }
+        if Items.best then
+            table.insert(lines, ("Best: %s ~%s C$"):format(Items.best.text, comma(Items.best.value)))
+        end
+        for _, e in Items.log do
+            table.insert(lines, ("· %s (%s) ~%s"):format(e.text, e.rarity, comma(e.value)))
+        end
+        return table.concat(lines, "\n")
+    end
+
+    -- What's on the line, and junk: reel it in instantly or let it go.
+    local junkAt = setmetatable({}, { __mode = "k" })
+    bind(RunService.Heartbeat, function()
+        if not alive() then
+            return
+        end
+        local r = activeReel()
+        if not r then
+            Items.line = "nothing"
+            return
+        end
+        local fish = r.fish
+        local name = (typeof(fish) == "Instance" and fish.Name) or (type(fish) == "table" and (fish.Name or fish.name)) or nil
+        if type(name) ~= "string" then
+            return
+        end
+        local L = Zones.lib()
+        local raw = L and L.fish[name]
+        local f = fishData(name)
+        local avg = f and Zones.valueOf(f) or 0
+        Items.line = ("%s (%s) ~%s C$"):format(name, type(raw) == "table" and tostring(raw.Rarity) or "?", comma(avg))
+        local keep = type(raw) == "table" and raw.NonFish and raw.Rarity ~= "Trash"
+        if Settings.JunkMode ~= "Off" and not keep and not junkAt[r] and r.active and r.ready and avg < Settings.JunkBelow then
+            junkAt[r] = os.clock()
+        end
+        local at = junkAt[r]
+        if at and not r.__dkEnded and os.clock() - at >= Settings.JunkDelay then
+            r.__dkEnded = true
+            Items.junked += 1
+            local catch = Settings.JunkMode == "Reel instantly"
+            task.spawn(function()
+                pcall(r.EndMinigame, r, catch)
+            end)
+        end
+    end)
+
+    -- Auto favourite: keeps the good ones out of Sell All.
+    local favDone = {}
+    loop(3, function()
+        if not (Settings.AutoFav and Inv) then
+            return
+        end
+        local r = net("RE/Backpack/Favourite")
+        if not r then
+            return
+        end
+        local min = Settings.FavRarity ~= "Off" and rarityOrder(Settings.FavRarity) or math.huge
+        local sent = 0
+        for id, item in table.clone(inventory()) do
+            if not favDone[id] and type(item) == "table" then
+                local sub = type(item.sub) == "table" and item.sub or {}
+                local f = fishData(item.name)
+                if sub.Favourited then
+                    favDone[id] = true
+                elseif f then
+                    local want = rarityOrder(f.Rarity) >= min
+                        or (Settings.FavMutated and (sub.Mutation ~= nil or sub.Shiny or sub.Sparkling))
+                        or (Settings.FavValue > 0 and (Items.value(item.name, sub) or 0) >= Settings.FavValue)
+                    if want then
+                        r:FireServer(id, true)
+                        favDone[id] = true
+                        Items.favs += 1
+                        sent += 1
+                        if sent >= 10 then
+                            break
+                        end
+                        task.wait(0.15)
+                    end
+                end
+            end
+        end
+    end)
+
+    -- Bait: equip the best one you have.
+    local function statsFolder()
+        local ok, s = pcall(function()
+            return Workspace.PlayerStats[LocalPlayer.Name].T[LocalPlayer.Name].Stats
+        end)
+        return ok and s or nil
+    end
+    function Items.baits()
+        local s = statsFolder()
+        local b = s and s:FindFirstChild("bait")
+        local owned = {}
+        if b then
+            for _, c in b:GetChildren() do
+                local n = c.Name:match("^bait_(.+)$")
+                if n and tonumber(c.Value) and c.Value > 0 then
+                    owned[n] = c.Value
+                end
+            end
+        end
+        return owned, b and b.Value or nil
+    end
+    loop(4, function()
+        if not Settings.AutoBait then
+            return
+        end
+        local owned, equipped = Items.baits()
+        local best, bestV
+        for name in owned do
+            local d = type(BaitLib) == "table" and BaitLib[name]
+            local v = type(d) == "table" and tonumber(d[Settings.BaitStat]) or 0
+            if not bestV or v > bestV then
+                best, bestV = name, v
+            end
+        end
+        if not best then
+            Items.baitInfo = "you have no bait"
+        elseif best ~= equipped then
+            local r = net("RE/Bait/Equip")
+            if r then
+                r:FireServer(best)
+                Items.baitInfo = ("equipped %s (%s %s)"):format(best, Settings.BaitStat, tostring(bestV))
+            end
+        else
+            Items.baitInfo = ("using %s (%d left)"):format(best, owned[best] or 0)
+        end
+    end)
+
+    -- NPCs
+    local function findNpc(name, kind)
+        local w = Workspace:FindFirstChild("world")
+        local npcs = w and w:FindFirstChild("npcs")
+        if not npcs then
+            return nil
+        end
+        for _, d in npcs:GetDescendants() do
+            if d:IsA("Model") and ((name and d.Name == name) or (kind and d:GetAttribute("NpcType") == kind)) then
+                return d
+            end
+        end
+        return nil
+    end
+    local function remoteIn(model, pattern)
+        for _, d in model:GetDescendants() do
+            if (d:IsA("RemoteFunction") or d:IsA("RemoteEvent")) and d.Name:lower():find(pattern, 1, true) then
+                return d
+            end
+        end
+        return nil
+    end
+    local function call(r, ...)
+        if r:IsA("RemoteFunction") then
+            return pcall(r.InvokeServer, r, ...)
+        end
+        return pcall(r.FireServer, r, ...)
+    end
+    -- Walk up to an NPC, going to its island first if it isn't loaded.
+    local function reach(name, kind, island)
+        local npc = findNpc(name, kind)
+        if not npc then
+            local cf = Tp.camera(island)
+            if cf then
+                Tp.land(cf)
+                for _ = 1, 12 do
+                    task.wait(0.3)
+                    npc = findNpc(name, kind)
+                    if npc then
+                        break
+                    end
+                end
+            end
+        end
+        if npc then
+            Move.near(npc, 4)
+            task.wait(0.4)
+        end
+        return npc
+    end
+    local function toolById(id)
+        for _, holder in { myChar(), LocalPlayer:FindFirstChildOfClass("Backpack") } do
+            if holder then
+                for _, t in holder:GetChildren() do
+                    local link = t:IsA("Tool") and t:FindFirstChild("link")
+                    if link and link.Value == id then
+                        return t
+                    end
+                end
+            end
+        end
+        return nil
+    end
+
+    -- Treasure maps
+    function Items.maps()
+        local broken, fixed = {}, {}
+        for _, holder in { LocalPlayer:FindFirstChildOfClass("Backpack"), myChar() } do
+            if holder then
+                for _, t in holder:GetChildren() do
+                    if t:IsA("Tool") and t.Name == "Treasure Map" then
+                        local item = itemOf(t)
+                        local sub = item and type(item.sub) == "table" and item.sub or nil
+                        table.insert((sub and sub.Repaired) and fixed or broken, { tool = t, sub = sub })
+                    end
+                end
+            end
+        end
+        return broken, fixed
+    end
+    function Items.mapText()
+        local broken, fixed = Items.maps()
+        local lines = { ("Maps to fix: %d · fixed: %d"):format(#broken, #fixed) }
+        for i = 1, math.min(3, #fixed) do
+            local s = fixed[i].sub
+            local where = "?"
+            pcall(function()
+                where = require(ReplicatedStorage.shared.utils.FischUtils).GetZoneName(Vector3.new(s.x, s.y, s.z))
+            end)
+            table.insert(lines, ("· chest at %s"):format(tostring(where)))
+        end
+        if Items.mapInfo ~= "" then
+            table.insert(lines, Items.mapInfo)
+        end
+        return table.concat(lines, "\n")
+    end
+    function Items.fixMaps()
+        local broken = Items.maps()
+        if #broken == 0 then
+            Items.mapInfo = "no maps to fix"
+            return
+        end
+        Items.mapInfo = ""
+        Move.trip("fixing treasure maps", function()
+            local npc = reach("Jack Marrow", nil, "Moosewood")
+            if not npc then
+                Items.mapInfo = "couldn't find Jack Marrow (Moosewood)"
+                return
+            end
+            local r = remoteIn(npc, "repair")
+            if not r then
+                Items.mapInfo = "Jack Marrow's repair isn't loaded yet"
+                return
+            end
+            local hum = myHum()
+            for _, m in broken do
+                if m.tool.Parent and hum then
+                    hum:EquipTool(m.tool)
+                    task.wait(0.35)
+                    call(r)
+                    task.wait(0.6)
+                end
+            end
+            if hum then
+                pcall(hum.UnequipTools, hum)
+            end
+        end)
+        local left = Items.maps()
+        local n = #broken - #left
+        if Items.mapInfo == "" or n > 0 then
+            Items.mapInfo = ("fixed %d, %d left%s"):format(n, #left, (n == 0 and #left > 0) and " (enough C$?)" or "")
+        end
+    end
+    loop(20, function()
+        if Settings.AutoMaps and not Busy.reason and not activeReel() and not shakeUi() then
+            local broken = Items.maps()
+            if #broken > 0 then
+                Items.fixMaps()
+            end
+        end
+    end)
+
+    -- Crab cages: claim the full ones (walking over if the server wants you close).
+    local tries = {}
+    loop(5, function()
+        if not (Settings.AutoCages and type(Cages) == "table" and type(Cages.ActiveCages) == "table") then
+            return
+        end
+        for _, c in Cages.ActiveCages do
+            if type(c) == "table" and type(c.data) == "table" and c.data.s == 2 and not c.pending then
+                tries[c] = (tries[c] or 0) + 1
+                if tries[c] > 1 and c.model and c.model.Parent and not Busy.reason and not activeReel() then
+                    Move.trip("claiming a crab cage", function()
+                        Move.near(c.model, 3)
+                        task.wait(0.4)
+                        pcall(Cages.Claim, Cages, c)
+                        task.wait(0.4)
+                    end)
+                else
+                    pcall(Cages.Claim, Cages, c)
+                end
+                Items.cages += 1
+                task.wait(0.3)
+            end
+        end
+    end)
+
+    -- Appraise the held fish until it has what you want.
+    local function wanted(sub)
+        local w = Settings.AppraiseFor
+        if w == "Any mutation" then
+            return sub.Mutation ~= nil
+        elseif w == "Shiny" then
+            return sub.Shiny == true
+        elseif w == "Sparkling" then
+            return sub.Sparkling == true
+        end
+        return sub.Mutation == w
+    end
+    function Items.heldFish()
+        local c = myChar()
+        local t = c and c:FindFirstChildOfClass("Tool")
+        local item, id = itemOf(t)
+        if item and fishData(item.name) then
+            return t, item, id
+        end
+        return nil
+    end
+    function Items.stopAppraise()
+        Items.appraising = false
+    end
+    function Items.appraise()
+        if Items.appraising then
+            return
+        end
+        local tool, item, id = Items.heldFish()
+        if not tool then
+            notify("Hold the fish you want appraised")
+            return
+        end
+        if wanted(item.sub or {}) then
+            notify("That fish already has it")
+            return
+        end
+        Items.appraising = true
+        local function oneTry(r)
+            local t = toolById(id) or tool
+            local hum = myHum()
+            if hum and t.Parent ~= myChar() then
+                hum:EquipTool(t)
+                task.wait(0.3)
+            end
+            call(r)
+            task.wait(0.8)
+            local now = inventory()[id]
+            return now and type(now.sub) == "table" and now.sub or {}
+        end
+        local function run(r)
+            for i = 1, Settings.AppraiseTries do
+                if not (Items.appraising and alive()) then
+                    break
+                end
+                local sub = oneTry(r)
+                Items.appraiseInfo = ("try %d: %s"):format(i, describe(item.name, sub))
+                if wanted(sub) then
+                    notify("Appraised: " .. describe(item.name, sub), 6)
+                    break
+                end
+            end
+        end
+        if Settings.AppraiseAnywhere then
+            local r = net("RF/AppraiseAnywhere/Fire")
+            if r then
+                run(r)
+            else
+                Items.appraiseInfo = "appraise anywhere remote not found"
+            end
+        else
+            Move.trip("appraising", function()
+                local npc = reach(nil, "Appraiser", "Moosewood")
+                local r = npc and remoteIn(npc, "apprais")
+                if not r then
+                    Items.appraiseInfo = "couldn't find the appraiser"
+                    return
+                end
+                run(r)
+            end)
+        end
+        Items.appraising = false
+    end
+
+    -- Totems
+    function Items.totems()
+        local seen, out = {}, {}
+        for _, holder in { LocalPlayer:FindFirstChildOfClass("Backpack"), myChar() } do
+            if holder then
+                for _, t in holder:GetChildren() do
+                    if t:IsA("Tool") and t.Name:find("Totem", 1, true) and not seen[t.Name] then
+                        seen[t.Name] = true
+                        table.insert(out, t.Name)
+                    end
+                end
+            end
+        end
+        table.sort(out)
+        return out
+    end
+    function Items.useTotem(name)
+        name = name or Settings.TotemPick
+        local hum = myHum()
+        local bp = LocalPlayer:FindFirstChildOfClass("Backpack")
+        local t = name and ((bp and bp:FindFirstChild(name)) or (myChar() and myChar():FindFirstChild(name)))
+        if not (t and hum) then
+            Items.totemInfo = "you don't have " .. tostring(name or "that totem")
+            return false
+        end
+        hum:EquipTool(t)
+        task.wait(0.4)
+        pcall(t.Activate, t)
+        task.wait(1.5)
+        pcall(hum.UnequipTools, hum)
+        Items.totemInfo = "used " .. name
+        Items.lastTotem = os.clock()
+        return true
+    end
+    loop(10, function()
+        if not Settings.TotemAuto or Busy.reason or activeReel() then
+            return
+        end
+        if Items.lastTotem and os.clock() - Items.lastTotem < Settings.TotemEvery * 60 then
+            return
+        end
+        local w = ReplicatedStorage:FindFirstChild("world")
+        local cycle = w and w:FindFirstChild("cycle") and w.cycle.Value
+        if Settings.TotemWhen ~= "Any time" and cycle ~= Settings.TotemWhen then
+            return
+        end
+        Items.useTotem()
+    end)
+end
+
 --// Claims, codes, anti-AFK \\--
 local Claims = { info = "", codes = 0 }
 do
@@ -2729,6 +3324,14 @@ do
             if r then
                 r:FireServer()
                 Claims.info = "daily reward claimed (if it was ready)"
+            end
+        end
+    end)
+    loop(120, function()
+        if Settings.AutoRodRewards then
+            local r = net("RE/RodJournal/ClaimAllRodRewards")
+            if r then
+                r:FireServer()
             end
         end
     end)
@@ -2754,6 +3357,65 @@ do
         end
         Claims.codes += n
         notify(n > 0 and ("Sent %d code%s"):format(n, n == 1 and "" or "s") or "Type a code first")
+    end
+
+    -- Servers
+    local TeleportService = game:GetService("TeleportService")
+    function Claims.hop()
+        notify("Finding another server...")
+        local r = net("RF/ServerBrowser/TeleportToRandom")
+        local ok = r and pcall(r.InvokeServer, r)
+        task.wait(8)
+        if alive() then
+            pcall(TeleportService.Teleport, TeleportService, game.PlaceId, LocalPlayer)
+        end
+        return ok
+    end
+    function Claims.rejoin()
+        local ok = pcall(TeleportService.TeleportToPlaceInstance, TeleportService, game.PlaceId, game.JobId, LocalPlayer)
+        if not ok then
+            pcall(TeleportService.Teleport, TeleportService, game.PlaceId, LocalPlayer)
+        end
+    end
+    local GuiService = game:GetService("GuiService")
+    bind(GuiService.ErrorMessageChanged, function(msg)
+        if Settings.AutoRejoin and alive() and type(msg) == "string" and msg ~= "" then
+            task.delay(3, Claims.rejoin)
+        end
+    end)
+    function Claims.fpsBoost()
+        local Lighting = game:GetService("Lighting")
+        pcall(function()
+            Lighting.GlobalShadows = false
+            Lighting.FogEnd = 1e6
+        end)
+        pcall(function()
+            settings().Rendering.QualityLevel = Enum.QualityLevel.Level01
+        end)
+        local terrain = Workspace:FindFirstChildOfClass("Terrain")
+        if terrain then
+            pcall(function()
+                terrain.WaterWaveSize = 0
+                terrain.WaterWaveSpeed = 0
+                terrain.WaterReflectance = 0
+                terrain.Decoration = false
+            end)
+        end
+        local n = 0
+        for _, d in Workspace:GetDescendants() do
+            if d:IsA("ParticleEmitter") or d:IsA("Trail") or d:IsA("Beam") or d:IsA("Smoke") or d:IsA("Fire") or d:IsA("Sparkles") then
+                d.Enabled = false
+                n += 1
+            elseif d:IsA("BasePart") and d.CastShadow then
+                d.CastShadow = false
+            end
+        end
+        for _, e in Lighting:GetChildren() do
+            if e:IsA("PostEffect") then
+                e.Enabled = false
+            end
+        end
+        notify(("FPS boost on (%d effects off). Rejoin to undo"):format(n))
     end
 
     local idled = {}
@@ -2890,6 +3552,17 @@ do
         return ("Reel: %s\nInstant reels: %d\nCaught: %d  Missed: %d"):format(
             Reel and (activeReel() and "reeling" or "waiting") or "ReelController not found", Fish.reels, Fish.caught, Fish.missed)
     end)
+
+    local J = Tab:AddRightGroupbox("Junk fish", "trash-2")
+    dropdown(J, "JunkMode", "Junk fish", { "Off", "Reel instantly", "Let it go" },
+        "A bite worth less than the amount below (trash included) is reeled in at once, or let go so you can cast again")
+    slider(J, "JunkBelow", "Junk if worth under", 0, 10000, 0, " C$")
+    slider(J, "JunkDelay", "Wait first", 0, 5, 1, " s")
+    local K = Tab:AddRightGroupbox("Catches", "list")
+    toggle(K, "CatchAlert", "Tell me about big catches")
+    dropdown(K, "CatchAlertRarity", "Rarity at least", { "Rare", "Legendary", "Mythical", "Exotic", "Secret" })
+    slider(K, "CatchAlertValue", "Or worth at least", 1000, 5000000, 0, " C$")
+    status(K, Items.logText)
 end
 
 do
@@ -3121,6 +3794,78 @@ do
 end
 
 do
+    local Tab = Window:AddTab("Items", "package", "Treasure maps, favourites, bait, crab cages, appraise, totems")
+    local T = Tab:AddLeftGroupbox("Treasure maps", "map")
+    toggle(T, "AutoMaps", "Fix treasure maps", "Takes your unfixed maps to Jack Marrow (Moosewood), gets each one fixed and comes back")
+    toggle(T, "AutoChests", "Open treasure chests", "Goes to each chest from a fixed map, opens it, comes back")
+    T:AddButton({ Text = "Fix maps now", Func = function()
+        task.spawn(Items.fixMaps)
+    end })
+    status(T, Items.mapText)
+    local F = Tab:AddLeftGroupbox("Favourites", "star")
+    toggle(F, "AutoFav", "Auto favourite", "Favourites fish that match below, so Sell All keeps them")
+    dropdown(F, "FavRarity", "Rarity at least", { "Off", "Rare", "Legendary", "Mythical", "Exotic", "Secret" })
+    toggle(F, "FavMutated", "Any mutation, shiny or sparkling")
+    slider(F, "FavValue", "Or worth at least (0 = off)", 0, 1000000, 0, " C$")
+    status(F, function()
+        return ("Favourited: %d"):format(Items.favs)
+    end)
+    local C = Tab:AddLeftGroupbox("Crab cages", "box")
+    toggle(C, "AutoCages", "Claim full crab cages", "Claims your cages when they're ready (walks over if it has to)")
+    status(C, function()
+        return ("Claimed: %d"):format(Items.cages)
+    end)
+    local B = Tab:AddRightGroupbox("Bait", "anchor")
+    toggle(B, "AutoBait", "Use your best bait", "Equips the bait you own with the most of the stat below, and switches when it runs out")
+    dropdown(B, "BaitStat", "Best by", { "Luck", "PreferredLuck", "Lure", "Resilience", "Control", "ProgressSpeed" },
+        "Luck: universal luck. PreferredLuck: extra luck on fish that like it. Lure: faster bites")
+    status(B, function()
+        local owned, equipped = Items.baits()
+        local n = 0
+        for _ in owned do
+            n += 1
+        end
+        return ("Now: %s\nEquipped: %s · %d kinds owned"):format(Items.baitInfo ~= "" and Items.baitInfo or "off", tostring(equipped or "none"), n)
+    end)
+    local A = Tab:AddRightGroupbox("Appraise", "search")
+    local wants = { "Any mutation", "Shiny", "Sparkling" }
+    for _, m in Items.mutationNames() do
+        table.insert(wants, m)
+    end
+    dropdown(A, "AppraiseFor", "Until it has", wants, "Hold the fish, then start. It goes to the appraiser and keeps appraising until the fish has this", true)
+    slider(A, "AppraiseTries", "At most", 1, 200, 0, " tries")
+    toggle(A, "AppraiseAnywhere", "Appraise anywhere (gamepass)", "Uses the appraise-anywhere gamepass instead of going to the appraiser")
+    A:AddButton({ Text = "Start appraising", Func = function()
+        task.spawn(Items.appraise)
+    end })
+    A:AddButton({ Text = "Stop", Func = Items.stopAppraise })
+    status(A, function()
+        return (Items.appraising and "Appraising: " or "Last: ") .. (Items.appraiseInfo ~= "" and Items.appraiseInfo or "-")
+    end)
+    local O = Tab:AddRightGroupbox("Totems", "sun")
+    local pick = O:AddDropdown("TotemPick", {
+        Text = "Totem", Values = Items.totems(),
+        Callback = function(v)
+            Settings.TotemPick = v
+        end,
+    })
+    O:AddButton({ Text = "Use totem", Func = function()
+        task.spawn(Items.useTotem)
+    end })
+    O:AddButton({ Text = "Refresh totems", Func = function()
+        pcall(function()
+            pick:SetValues(Items.totems())
+        end)
+    end })
+    toggle(O, "TotemAuto", "Use it by itself", "Uses the picked totem at the time below, then waits before using another")
+    dropdown(O, "TotemWhen", "When", { "Night", "Day", "Any time" })
+    slider(O, "TotemEvery", "Wait between", 1, 60, 0, " min")
+    status(O, function()
+        return Items.totemInfo ~= "" and Items.totemInfo or "-"
+    end)
+end
+
+do
     local Tab = Window:AddTab("World", "globe", "ESP, chests, meteors")
     local E = Tab:AddLeftGroupbox("ESP", "eye")
     toggle(E, "EspPools", "Fish pools", "Zones with a boosted fish, and which fish")
@@ -3129,7 +3874,6 @@ do
     toggle(E, "EspMeteors", "Meteors")
     toggle(E, "EspNpcs", "Merchants and shops")
     local A = Tab:AddRightGroupbox("Collect", "package")
-    toggle(A, "AutoChests", "Open treasure chests", "Goes to each loaded chest, opens it, comes back")
     toggle(A, "AutoMeteors", "Grab meteors", "Goes to a landed meteor, picks it up, comes back")
     status(A, function()
         local live = World.events()
@@ -3142,6 +3886,7 @@ do
     local M = Tab:AddLeftGroupbox("Claims", "gift")
     toggle(M, "AutoDaily", "Claim daily reward")
     toggle(M, "AutoTotem", "Claim crafted totems")
+    toggle(M, "AutoRodRewards", "Claim rod journal rewards")
     toggle(M, "AntiAfk", "Anti-AFK")
     status(M, function()
         return Claims.info ~= "" and Claims.info or "Daily reward is tried every 5 minutes"
@@ -3156,6 +3901,17 @@ do
     K:AddButton({ Text = "Redeem", Func = function()
         task.spawn(Claims.redeem, Settings.Codes)
     end })
+    local Sv = Tab:AddLeftGroupbox("Server", "server")
+    Sv:AddButton({ Text = "Server hop", Func = function()
+        task.spawn(Claims.hop)
+    end, Tooltip = "Joins another server (handy for finding events)" })
+    Sv:AddButton({ Text = "Rejoin", Func = function()
+        task.spawn(Claims.rejoin)
+    end })
+    toggle(Sv, "AutoRejoin", "Rejoin if kicked", "Rejoins when you get disconnected or kicked")
+    Sv:AddButton({ Text = "FPS boost", Func = function()
+        task.spawn(Claims.fpsBoost)
+    end, Tooltip = "Turns off shadows, particles, water waves and post effects. Rejoin to undo" })
     local U = Tab:AddRightGroupbox("Script", "power")
     U:AddButton({ Text = "Unload", Func = function()
         if Genv.__FischUnload then
