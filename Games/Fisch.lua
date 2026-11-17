@@ -10,13 +10,14 @@
 --            9 CatchFinished) and values.casted. rodClient charges a power
 --            bar and calls RF/FishingRod/Cast(power 0-100, perfect).
 --            RE/FishingRod/Reset puts the rod back.
---   Shake    two systems, both a PlayerGui "shakeui". New: the server invokes
---            RF/LureShake/Start, LureShakeController puts a button in
---            safezone and each press sends RE/LureShake/Shake (one per
---            0.25s). Old: the server clones resources.replicated.fishing
---            .shakeui itself (safezone has bobber / char values) and a
---            server Script there counts real clicks on safezone "button"s,
---            so those buttons have to be pressed for real.
+--   Shake    a PlayerGui "shakeui". The server invokes RF/LureShake/Start,
+--            LureShakeController puts a button in safezone whose Activated
+--            runs onShake: RE/LureShake/Shake at most every 0.25 / ShakeScale
+--            s, each one taking a seeded random bite out of the shake timer.
+--            Calling that connection is a real shake with no input. The old
+--            template (resources.replicated.fishing.shakeui, a server Script
+--            counting real clicks on safezone "button"s) is still in the
+--            game; those buttons get pressed for real.
 --   Reel     the server invokes RF/Reel/Start; ReelController.StartReel
 --            runs the whole minigame on your side (fishPosition, barPosition,
 --            barSize, progress) and EndMinigame sends RE/Reel/Finish
@@ -97,12 +98,15 @@ local Settings = {
     TpSpot = nil, SpotName = "",
     -- zones
     ZonePick = nil, ZoneSort = "Best value", EspZones = false,
+    EventAlert = true, EventAutoGo = false, EventUseBoat = false,
     -- player
     SpeedOn = false, WalkSpeed = 32, JumpOn = false, JumpPower = 80, InfJump = false,
     Fly = false, FlySpeed = 80, Noclip = false, WaterWalk = false,
     AntiDrown = false, DrownAt = 35, DrownReturn = true,
     -- boat
-    BoatSpeedOn = false, BoatSpeed = 2, BoatFly = false, BoatFlySpeed = 60, BoatInfBoost = false,
+    BoatSpeedOn = false, BoatSpeed = 2, BoatTurnOn = false, BoatTurn = 2, BoatFly = false, BoatFlySpeed = 60,
+    BoatInfBoost = false, BoatAnyBoost = false, BoatBoostPower = 0.75, BoatAlwaysBoost = false,
+    BoatInstant = false, BoatSteady = false, BoatKeepSpeed = false, BoatNoclip = false, BoatPick = nil,
     -- world
     EspPools = false, EspEvents = false, EspChests = false, EspMeteors = false, EspNpcs = false,
     AutoChests = false, AutoMeteors = false,
@@ -331,19 +335,58 @@ do
         end
     end)
 
-    -- Shake. New system: RE/LureShake/Shake is all it takes. Old system: the
-    -- server only counts real presses of the safezone "button"s, so those get
-    -- pressed with the method you pick:
-    --   Tap             a touch with its own finger, so your movement stick
-    --                   keeps working on mobile
-    --   Select + Enter  selects the button and presses Enter
-    --   Mouse click     clicks its middle
-    --   VirtualUser     clicks through VirtualUser instead of
-    --                   VirtualInputManager
-    --   Remote          fires the remotes only (instant, may not count on the
-    --                   old system)
-    --   Auto            Remote on the new system; Tap on a phone, Select + Enter
-    --                   on a computer for the old one
+    -- The new shake (LureShakeController): the server invokes RF/LureShake/Start
+    -- with { seed, initialTimer, ShakePower, ShakeScale, ButtonName }. The
+    -- button's Activated is connected to the game's onShake, which fires
+    -- RE/LureShake/Shake at most once every 0.25 / ShakeScale s and knocks
+    -- Random.new(seed):NextNumber(0.5, 1.5) * ShakePower off the timer; the
+    -- shake ends when the timer (which also runs down by itself) hits 0.
+    --   Game handler  calls that onShake straight from the button's
+    --                 connections every frame: no input at all, and as fast
+    --                 as the game itself allows
+    --   Remote        fires RE/LureShake/Shake on your own timer
+    --   Tap / Select + Enter / Mouse click / VirtualUser click
+    --                 press the button like a player would
+    -- An old shakeui (resources.replicated.fishing.shakeui) is still in the
+    -- game; its buttons only count real presses, so on that one the handler
+    -- and remote methods fall back to a press.
+    local Shake = { data = nil, started = 0, need = nil, sent = 0 }
+    Fish.shake = Shake
+    local LureShake
+    pcall(function()
+        LureShake = require(ReplicatedStorage:WaitForChild("client", 5).legacyControllers.LureShakeController)
+    end)
+    local function shakesNeeded(d)
+        local seed, timer, power = tonumber(d.seed), tonumber(d.initialTimer), tonumber(d.ShakePower)
+        if not (seed and timer and power and power > 0) then
+            return nil
+        end
+        local rng, n = Random.new(seed), 0
+        while timer > 0 and n < 500 do
+            timer -= rng:NextNumber(0.5, 1.5) * power
+            n += 1
+        end
+        return n
+    end
+    if type(LureShake) == "table" and type(rawget(LureShake, "StartMinigame")) == "function" then
+        local original = LureShake.StartMinigame
+        LureShake.StartMinigame = function(self, data, ...)
+            if type(data) == "table" then
+                Shake.data, Shake.started, Shake.sent = data, os.clock(), 0
+                Shake.need = shakesNeeded(data)
+            end
+            return original(self, data, ...)
+        end
+        table.insert(Cleanups, function()
+            LureShake.StartMinigame = original
+        end)
+    end
+    local function interval()
+        local d = Shake.data
+        local scale = d and tonumber(d.ShakeScale) or 1
+        return 0.25 / math.max(scale, 0.01)
+    end
+    Shake.interval = interval
     local GuiService = game:GetService("GuiService")
     local UserInputService = game:GetService("UserInputService")
     local VIM, VU
@@ -454,23 +497,63 @@ do
         end
         return false
     end
+    local canHandler = typeof(getconnections) == "function" or typeof(firesignal) == "function"
     local function methodFor(legacy)
         local m = Settings.ShakeMethod
-        if m == "Auto" then
-            if not legacy then
-                return "Remote"
-            end
+        if legacy and (m == "Game handler" or m == "Remote" or m == "Auto") then
             if UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled then
                 return "Tap"
             end
             return "Select + Enter"
         end
+        if m == "Auto" then
+            return canHandler and "Game handler" or "Remote"
+        end
+        if m == "Game handler" and not canHandler then
+            return "Remote"
+        end
         return m
+    end
+    local function progress(kind)
+        local need = Shake.need
+        return ("%d%s shakes, %s"):format(Shake.sent, need and (" / ~" .. need) or "", kind)
+    end
+
+    -- Game handler: run the button's own Activated connections (the game's
+    -- onShake) every frame; it rate-limits itself.
+    local handlers = setmetatable({}, { __mode = "k" })
+    local function runHandlers(btn)
+        local list = handlers[btn]
+        if list == nil then
+            list = false
+            if typeof(getconnections) == "function" then
+                local ok, cons = pcall(getconnections, btn.Activated)
+                if ok and type(cons) == "table" and #cons > 0 then
+                    list = cons
+                end
+            end
+            handlers[btn] = list
+        end
+        if list then
+            for _, c in list do
+                local fn = c.Function
+                if type(fn) == "function" then
+                    pcall(fn)
+                elseif c.Fire then
+                    pcall(c.Fire, c)
+                end
+            end
+            return true
+        end
+        if typeof(firesignal) == "function" then
+            return (pcall(firesignal, btn.Activated))
+        end
+        return false
     end
     Fish.shakeInfo = "off"
     local lastShake = 0
     local pressedAt = setmetatable({}, { __mode = "k" })
-    loop(0.03, function()
+    local function step(fromFrame)
         if not Settings.AutoShake then
             Fish.shakeInfo = "off"
             return
@@ -478,30 +561,61 @@ do
         local ui = shakeUi()
         if not (ui and ui.Enabled) then
             Fish.shakeInfo = "waiting for a shake"
-            return
-        end
-        local now = os.clock()
-        if now - lastShake < math.max(0.03, Settings.ShakeDelay) then
+            if Shake.data and os.clock() - Shake.started > 1 then
+                Shake.data, Shake.need = nil, nil
+            end
+            if not Shake.data then
+                Shake.sent = 0
+            end
             return
         end
         local btn, legacy = shakeButton(ui)
         local method = methodFor(legacy)
         local kind = legacy and "old shake" or "new shake"
+        if method == "Game handler" then
+            if not fromFrame then
+                return
+            end
+            if not btn then
+                local safe = ui:FindFirstChild("safezone")
+                btn = safe and safe:FindFirstChildWhichIsA("GuiButton", true)
+            end
+            if btn and runHandlers(btn) then
+                if Shake.data then
+                    local n = math.floor((os.clock() - Shake.started) / interval()) + 1
+                    Shake.sent = Shake.need and math.min(n, Shake.need) or n
+                end
+                Fish.shakeInfo = ("shaking (game handler): %s"):format(progress(kind))
+            elseif not btn then
+                Fish.shakeInfo = "waiting for the shake button"
+            end
+            return
+        end
+        if fromFrame then
+            return
+        end
+        local now = os.clock()
         if method == "Remote" then
+            if now - lastShake < math.max(0, Settings.ShakeDelay) then
+                return
+            end
             lastShake = now
             if remoteShake(btn, legacy) then
-                Fish.shakes += 1
-                Fish.shakeInfo = ("shaking (remote, %s)"):format(kind)
+                Shake.sent += 1
+                Fish.shakeInfo = ("shaking (remote): %s"):format(progress(kind))
             else
                 Fish.shakeInfo = "no shake remote found"
             end
+            return
+        end
+        if now - lastShake < math.max(0.03, Settings.ShakeDelay) then
             return
         end
         if not btn then
             Fish.shakeInfo = "waiting for the shake button"
             return
         end
-        if pressedAt[btn] and now - pressedAt[btn] < 0.5 then
+        if pressedAt[btn] and now - pressedAt[btn] < (legacy and 0.5 or interval()) then
             return
         end
         local press = Press[method]
@@ -512,14 +626,21 @@ do
         lastShake = now
         pressedAt[btn] = now
         if ok and res then
-            Fish.shakes += 1
-            Fish.shakeInfo = ("shaking (%s, %s)"):format(method, kind)
+            Shake.sent += 1
+            Fish.shakeInfo = ("shaking (%s): %s"):format(method, progress(kind))
         elseif remoteShake(btn, legacy) then
-            Fish.shakes += 1
             Fish.shakeInfo = ("%s isn't available here, used the remote (%s)"):format(method, kind)
         else
             Fish.shakeInfo = method .. " isn't available here"
         end
+    end
+    bind(RunService.Heartbeat, function()
+        if alive() then
+            step(true)
+        end
+    end)
+    loop(0.03, function()
+        step(false)
     end)
 
     -- Reel: steer the bar, lock it on the fish, or finish it.
@@ -727,6 +848,7 @@ local MERCHANT_ISLANDS = { "Moosewood", "Roslit", "Terrapin", "Snowcap", "Sunsto
 do
     local world = ReplicatedStorage:GetAttribute("CurrentWorld") or "Sea 1"
     local SEA_LEVEL = world == "Sea 2" and 74 or 127
+    Tp.seaLevel = SEA_LEVEL
     local FILE = "Ui3/Fisch/spots.json"
 
     local saved = {}
@@ -1297,10 +1419,14 @@ end
 
 --// Boat \\--
 -- Your boat runs on your side, from BoatController.Physics.currentBoatData:
--- swap in a copy with more speed, or make it a flying boat.
-local Boat = { info = "" }
+-- swap in a copy with the mods on. Boats are spawned with RF/Boats/Spawn
+-- (RE/Boats/Close first if you're docked, like the quick-access menu), you
+-- sit with VehicleSeat:Sit, and a boat is moved with PivotTo while you drive
+-- it plus its PlanePart (the water plane it's held to) set to the new water
+-- height.
+local Boat = { info = "", owned = {} }
 do
-    local Phys
+    local Phys, Vessels
     local function phys()
         if Phys == nil then
             local ok, m = pcall(function()
@@ -1310,7 +1436,93 @@ do
         end
         return Phys or nil
     end
+    local function vessels()
+        if Vessels == nil then
+            local ok, m = pcall(function()
+                return require(ReplicatedStorage.shared.modules.vessels)
+            end)
+            Vessels = (ok and type(m) == "table") and m or false
+        end
+        return Vessels or nil
+    end
+    local function num(v, default)
+        return tonumber(v) or default
+    end
+    function Boat.current()
+        local p = phys()
+        local b = p and p.currentBoat
+        if type(b) == "table" and b.Instance and b.Instance.Parent and b.VehicleSeat then
+            return b, p
+        end
+        return nil, p
+    end
+    function Boat.list()
+        local v = vessels()
+        local out = {}
+        if v and type(v.library) == "table" then
+            for name, data in v.library do
+                if type(data) == "table" and type(name) == "string" then
+                    local ok, has = pcall(v.Has, v, LocalPlayer, name)
+                    if ok and has then
+                        table.insert(out, name)
+                    end
+                end
+            end
+        end
+        table.sort(out)
+        Boat.owned = out
+        return out
+    end
+
+    -- Mods
     local base, modded, sig, plane, weSetVertical
+    local function anyMod()
+        return Settings.BoatSpeedOn or Settings.BoatTurnOn or Settings.BoatFly or Settings.BoatInfBoost or Settings.BoatAlwaysBoost
+            or Settings.BoatAnyBoost or Settings.BoatInstant or Settings.BoatSteady or Settings.BoatKeepSpeed
+    end
+    local function signature()
+        return table.concat({
+            tostring(Settings.BoatSpeedOn), tostring(Settings.BoatSpeed), tostring(Settings.BoatTurnOn), tostring(Settings.BoatTurn),
+            tostring(Settings.BoatFly), tostring(Settings.BoatFlySpeed), tostring(Settings.BoatAnyBoost), tostring(Settings.BoatBoostPower),
+            tostring(Settings.BoatInstant), tostring(Settings.BoatSteady), tostring(Settings.BoatKeepSpeed),
+        }, "|")
+    end
+    local function build(b)
+        local m = table.clone(b)
+        if Settings.BoatSpeedOn then
+            local k = Settings.BoatSpeed
+            m.MaxSpeed = num(b.MaxSpeed, 0) * k
+            m.Accel = num(b.Accel, 1) * k
+            if num(b.BoostMaxSpeed) then
+                m.BoostMaxSpeed = b.BoostMaxSpeed * k
+            end
+        end
+        if Settings.BoatTurnOn then
+            m.TurningSpeed = num(b.TurningSpeed, 1) * Settings.BoatTurn
+        end
+        if Settings.BoatInstant then
+            m.Accel = math.max(num(m.Accel, 1), 1) * 50
+            m.StopEfficiency = math.max(num(b.StopEfficiency, 1), 1) * 4
+            m.BackwardsEfficiency = math.max(num(b.BackwardsEfficiency, 1), 1)
+        end
+        if Settings.BoatSteady then
+            m.Bobbing, m.SteerTilt, m.ForwardTilt = 0, 0, 0
+        end
+        if Settings.BoatKeepSpeed then
+            m.NoMomentumLossOnImpact = true
+        end
+        if Settings.BoatAnyBoost then
+            m.BoostEnabled = true
+            m.BoostMaxSpeed = num(m.MaxSpeed, 50) * Settings.BoatBoostPower
+            m.BoostMaxTime = num(b.BoostMaxTime, 3)
+            m.BoostChargeTime = num(b.BoostChargeTime, 4)
+        end
+        if Settings.BoatFly then
+            m.FlyingBoat = true
+            m.VerticalMaxSpeed = Settings.BoatFlySpeed
+        end
+        return m
+    end
     local function restore(p)
         if p and modded and p.currentBoatData == modded then
             p.currentBoatData = base
@@ -1327,7 +1539,7 @@ do
         end
         base, modded, sig, weSetVertical = nil, nil, nil, nil
     end
-    local function upInput(boat)
+    local function upInput(b)
         local up = 0
         if not UserInputService:GetFocusedTextBox() then
             if UserInputService:IsKeyDown(Enum.KeyCode.R) then
@@ -1338,7 +1550,7 @@ do
             end
         end
         if up == 0 and UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled then
-            local seat = boat.VehicleSeat
+            local seat = b.VehicleSeat
             local cam = Workspace.CurrentCamera
             if seat and cam and math.abs(seat.ThrottleFloat) > 0.1 then
                 local ly = cam.CFrame.LookVector.Y
@@ -1353,58 +1565,46 @@ do
         if not alive() then
             return
         end
-        local p = phys()
+        local b, p = Boat.current()
         if not p then
             Boat.info = "boat controller not found"
             return
         end
-        local boat, data = p.currentBoat, p.currentBoatData
-        if not (boat and data) then
+        local data = p.currentBoatData
+        if not (b and data) then
             if modded or plane then
                 restore(p)
             end
-            Boat.info = "not in your own boat"
+            Boat.info = "no boat of yours out"
             return
         end
-        Boat.info = ("%s: %.0f studs/s"):format(tostring(boat.Name or "boat"), tonumber(p.currentTotalSpeed) or 0)
-        if not (Settings.BoatSpeedOn or Settings.BoatFly or Settings.BoatInfBoost) then
+        local hum = myHum()
+        Boat.info = ("%s: %s studs/s%s"):format(tostring(b.Name or b.Instance.Name), comma(num(p.currentTotalSpeed, 0)),
+            (hum and hum.SeatPart == b.VehicleSeat) and "" or " (not in it)")
+        if not anyMod() then
             if modded or plane then
                 restore(p)
             end
             return
         end
-        local want = ("%s|%s|%s|%s"):format(tostring(Settings.BoatSpeedOn), tostring(Settings.BoatSpeed), tostring(Settings.BoatFly), tostring(Settings.BoatFlySpeed))
+        local want = signature()
         if data ~= modded or want ~= sig then
             if data ~= modded then
                 base = data
             end
-            local m = table.clone(base)
-            if Settings.BoatSpeedOn then
-                local k = Settings.BoatSpeed
-                m.MaxSpeed = (tonumber(base.MaxSpeed) or 0) * k
-                m.Accel = (tonumber(base.Accel) or 1) * k
-                m.TurningSpeed = (tonumber(base.TurningSpeed) or 1) * (1 + (k - 1) * 0.5)
-                if tonumber(base.BoostMaxSpeed) then
-                    m.BoostMaxSpeed = base.BoostMaxSpeed * k
-                end
-            end
-            if Settings.BoatFly then
-                m.FlyingBoat = true
-                m.VerticalMaxSpeed = Settings.BoatFlySpeed
-            end
-            modded, sig = m, want
-            p.currentBoatData = m
+            modded, sig = build(base), want
+            p.currentBoatData = modded
             if p.controlsEnabled then
                 pcall(p.EnableControls, p)
             end
         end
         if Settings.BoatFly then
-            local pc = boat.PlaneConstraint
+            local pc = b.PlaneConstraint
             if pc and pc.Enabled then
                 pc.Enabled = false
                 plane = pc
             end
-            local up = upInput(boat)
+            local up = upInput(b)
             if up ~= 0 then
                 p.targetVerticalSpeed = up * Settings.BoatFlySpeed
                 weSetVertical = true
@@ -1416,13 +1616,198 @@ do
             plane.Enabled = true
             plane = nil
         end
-        if Settings.BoatInfBoost and p.currentBoatData and p.currentBoatData.BoostEnabled then
-            p.pboostCharge = 1
+        local d = p.currentBoatData
+        if d and d.BoostEnabled then
+            if Settings.BoatInfBoost or Settings.BoatAlwaysBoost then
+                p.pboostCharge = 1
+            end
+            if Settings.BoatAlwaysBoost and p.controlsEnabled and not p.pboostActive then
+                p.pboostActive = true
+                pcall(function()
+                    p.PlayerBoostStarted:Fire(1)
+                end)
+            end
+        end
+    end)
+
+    -- Boat noclip: through rocks, docks and islands (it stays on the water).
+    local ghosted = {}
+    local function unghost()
+        for part in ghosted do
+            if part.Parent then
+                part.CanCollide = true
+            end
+        end
+        table.clear(ghosted)
+    end
+    loop(0.5, function()
+        local b = Boat.current()
+        if Settings.BoatNoclip and b then
+            for _, part in b.Instance:GetDescendants() do
+                if part:IsA("BasePart") and part.CanCollide then
+                    ghosted[part] = true
+                    part.CanCollide = false
+                end
+            end
+        elseif next(ghosted) then
+            unghost()
         end
     end)
     table.insert(Cleanups, function()
         restore(phys())
+        unghost()
     end)
+
+    -- Spawning, sitting, moving
+    function Boat.spawn(name)
+        name = name or Settings.BoatPick
+        if not name or name == "" then
+            notify("Pick one of your boats first")
+            return false
+        end
+        local spawnFn, close = net("RF/Boats/Spawn"), net("RE/Boats/Close")
+        if not spawnFn then
+            notify("Boat spawn remote not found")
+            return false
+        end
+        local dock = LocalPlayer:GetAttribute("LastDock")
+        if close and type(dock) == "string" and dock ~= "None" then
+            close:FireServer()
+            local t = os.clock()
+            while LocalPlayer:GetAttribute("LastDock") == dock and os.clock() - t < 3 do
+                task.wait(0.1)
+            end
+        end
+        local ok, res = pcall(spawnFn.InvokeServer, spawnFn, name)
+        if not ok then
+            notify("Couldn't spawn " .. name .. ": " .. tostring(res))
+            return false
+        end
+        if type(res) == "string" and res ~= "" then
+            notify(name .. ": " .. res)
+        end
+        local t = os.clock()
+        while not Boat.current() and os.clock() - t < 8 do
+            task.wait(0.2)
+        end
+        return Boat.current() ~= nil
+    end
+    function Boat.sit(b)
+        local hum, root = myHum(), myRoot()
+        if not (hum and root and b) then
+            return false
+        end
+        local seat = b.VehicleSeat
+        if hum.SeatPart == seat then
+            return true
+        end
+        if seat.Occupant then
+            return false
+        end
+        pcall(hum.UnequipTools, hum)
+        root.AssemblyLinearVelocity = Vector3.zero
+        root.CFrame = seat.CFrame + Vector3.new(0, 3, 0)
+        task.wait(0.15)
+        pcall(seat.Sit, seat, hum)
+        local t = os.clock()
+        while hum.SeatPart ~= seat and os.clock() - t < 1.5 do
+            task.wait(0.1)
+        end
+        if hum.SeatPart ~= seat then
+            local prompt = seat:FindFirstChild("sitprompt")
+            if prompt and typeof(fireproximityprompt) == "function" then
+                pcall(fireproximityprompt, prompt)
+                task.wait(0.6)
+            end
+        end
+        return hum.SeatPart == seat
+    end
+    function Boat.moveTo(surface)
+        local b, p = Boat.current()
+        if not (b and surface) then
+            return false
+        end
+        local inst = b.Instance
+        local pivot = inst:GetPivot()
+        local planeY = (b.PlanePart and b.PlanePart.Position.Y) or Tp.seaLevel
+        local _, yaw = pivot:ToOrientation()
+        pcall(LocalPlayer.RequestStreamAroundAsync, LocalPlayer, surface, 6)
+        inst:PivotTo(CFrame.new(surface.X, surface.Y + (pivot.Position.Y - planeY), surface.Z) * CFrame.fromOrientation(0, yaw, 0))
+        if b.PlanePart then
+            b.PlanePart.CFrame = CFrame.new(0, surface.Y, 0)
+        end
+        if b.Base then
+            b.Base.AssemblyLinearVelocity = Vector3.zero
+            b.Base.AssemblyAngularVelocity = Vector3.zero
+        end
+        if p then
+            p.currentSpeed, p._springVelocity = 0, 0
+        end
+        return true
+    end
+    -- Open water near a spot (the closest ring of points that hits water).
+    function Boat.waterNear(pos, maxR)
+        for r = 0, maxR or 700, 35 do
+            local n = r == 0 and 1 or math.max(8, math.floor(r / 10))
+            for i = 1, n do
+                local a = i / n * math.pi * 2
+                local x, z = pos.X + math.cos(a) * r, pos.Z + math.sin(a) * r
+                local hit = Plat.ray(Vector3.new(x, math.max(pos.Y, Tp.seaLevel) + 150, z), Vector3.new(0, -500, 0))
+                if hit and hit.Material == Enum.Material.Water then
+                    return hit.Position
+                end
+            end
+        end
+        return nil
+    end
+    -- Get in your boat (spawning the picked one if none is out) and drive it
+    -- to a water surface.
+    function Boat.go(surface, what)
+        if Busy.reason then
+            notify("Busy: " .. Busy.reason)
+            return false
+        end
+        if not surface then
+            notify("No water found there for the boat")
+            return false
+        end
+        local b = Boat.current()
+        if not b then
+            notify("Spawning your " .. tostring(Settings.BoatPick or "boat") .. "...")
+            if not Boat.spawn() then
+                notify("No boat: pick one of yours in the Boat tab (and be somewhere it can spawn)")
+                return false
+            end
+            b = Boat.current()
+        end
+        Busy.reason = "moving the boat"
+        local ok, err = pcall(function()
+            if not Boat.sit(b) then
+                error("couldn't get in the boat (someone in the seat?)")
+            end
+            task.wait(0.1)
+            Boat.moveTo(surface)
+        end)
+        Busy.reason = nil
+        if not ok then
+            notify((tostring(err):gsub("^.-:%d+: ", "")))
+            return false
+        end
+        notify("Boat at " .. (what or "the spot"))
+        return true
+    end
+    function Boat.bring()
+        local root = myRoot()
+        if not root then
+            return
+        end
+        local water = Boat.waterNear(root.Position, 400)
+        if not water then
+            notify("No water near you")
+            return
+        end
+        Boat.go(water, "you")
+    end
 end
 
 --// Fishing zones: what bites where, and what it's worth \\--
@@ -1595,6 +1980,47 @@ do
         return z and z:FindFirstChild("fishing")
     end
 
+    -- Events: hunts and limited pools (Megalodon, sharks, Kraken, orcas,
+    -- whales, Scylla, Lovestorm, Golden Tide, ...) show up as new parts in
+    -- workspace.zones.fishing, so they're caught the moment they spawn.
+    local EVENT_WORDS = {
+        "Megalodon", "Shark", "Kraken", "Orca", "Whale", "Leviathan", "Scylla", "Hunt", "Lovestorm", "Golden Tide",
+        "Isonade", "Narwhal", "Beluga", "Bloop", "Dragon", "Animal Pool", "Octophant", "Frightful", "Phantasmal",
+        "Nessie", "Algae Pool", "Zeus Pool", "Poseidon Pool", "Ashfall", "Cults Curse", "Sharky", "Glitched", "Smurf",
+        "Lucky Gold", "Storm", "Blue Moon", "Terrosunder", "Kerauno", "Birthday", "Anniversary", "Shamrock", "Serpent",
+        "Frenzy", "Haunt", "Charybdis", "Skolopendra",
+    }
+    function Zones.isEvent(name)
+        if not load() then
+            return false
+        end
+        local z = Lib.zones[name]
+        if type(z) == "table" and z.IsHunt then
+            return true
+        end
+        for _, w in EVENT_WORDS do
+            if name:find(w, 1, true) then
+                return true
+            end
+        end
+        return false
+    end
+    local function rarityOrder(r)
+        local x = Lib.rarities.Rarities and Lib.rarities.Rarities[r]
+        return x and tonumber(x.Order) or 0
+    end
+    -- The catch worth going for: the most valuable fish there.
+    local function bestOf(rows)
+        local best
+        for _, r in rows or {} do
+            if not best or r.value > best.value then
+                best = r
+            end
+        end
+        return best
+    end
+    Zones.bestOf = bestOf
+
     function Zones.refresh()
         if not load() then
             Zones.info = "couldn't read the game's fish lists"
@@ -1612,26 +2038,30 @@ do
             if type(zone) == "table" and type(zone.Pool) == "table" then
                 local e = byName[part.Name]
                 if not e then
-                    e = { zone = part.Name, parts = {} }
+                    e = { zone = part.Name, parts = {}, event = Zones.isEvent(part.Name) }
                     byName[part.Name] = e
                     table.insert(entries, e)
                 end
                 table.insert(e.parts, part)
                 local fish, boost = boostOf(part)
                 if fish then
-                    table.insert(entries, { zone = part.Name, parts = { part }, boosted = fish, boost = boost })
+                    table.insert(entries, { zone = part.Name, parts = { part }, boosted = fish, boost = boost, event = e.event })
                 end
             end
         end
         local labels, byLabel = {}, {}
         for _, e in entries do
             e.rows, e.worth = Zones.odds(e.zone, e.boosted, e.boost)
+            e.best = bestOf(e.rows)
             local name = displayName(e.zone)
             local label
             if e.boosted then
                 label = ("%s pool @ %s  ~%s C$"):format(e.boosted, name, comma(e.worth or 0))
             else
                 label = ("%s  ~%s C$"):format(name, comma(e.worth or 0))
+            end
+            if e.event then
+                label = "[EVENT] " .. label
             end
             while byLabel[label] do
                 label ..= " "
@@ -1640,6 +2070,9 @@ do
             byLabel[label] = e
         end
         table.sort(entries, function(a, b)
+            if a.event ~= b.event then
+                return a.event == true
+            end
             if Settings.ZoneSort == "Name" then
                 return a.label:lower() < b.label:lower()
             end
@@ -1663,8 +2096,12 @@ do
             return displayName(e.zone) .. ": nothing can bite here with your rod"
         end
         local lines = {
-            ("%s%s\nAverage catch ~%s C$ (no mutation)"):format(displayName(e.zone), e.boosted and (" · " .. e.boosted .. " boosted") or "", comma(e.worth or 0)),
+            ("%s%s%s\nAverage catch ~%s C$ (no mutation)"):format(e.event and "EVENT: " or "", displayName(e.zone),
+                e.boosted and (" · " .. e.boosted .. " boosted") or "", comma(e.worth or 0)),
         }
+        if e.best then
+            table.insert(lines, ("Best: %s (%s) ~%s C$"):format(e.best.name, e.best.rarity, comma(e.best.value)))
+        end
         for i = 1, math.min(10, #e.rows) do
             local r = e.rows[i]
             local pct = r.chance < 0.001 and " <0.1%" or ("%5.1f%%"):format(r.chance * 100)
@@ -1683,7 +2120,7 @@ do
         end
         local fish, boost = boostOf(part)
         local rows, worth = oddsCached(part.Name, fish, boost)
-        local lines = { displayName(part.Name) .. (fish and (" · " .. fish .. " pool") or "") }
+        local lines = { (Zones.isEvent(part.Name) and "[EVENT] " or "") .. displayName(part.Name) .. (fish and (" · " .. fish .. " pool") or "") }
         if rows then
             lines[1] ..= ("  ~%s C$"):format(comma(worth or 0))
             for i = 1, math.min(3, #rows) do
@@ -1713,14 +2150,9 @@ do
         end
         return best
     end
-    function Zones.go(label)
-        local e = label and Zones.byLabel[label]
-        if not e then
-            notify("Pick a zone first")
-            return
-        end
+    local function biggest(parts)
         local part, vol
-        for _, p in e.parts do
+        for _, p in parts do
             if p.Parent then
                 local v = p.Size.X * p.Size.Y * p.Size.Z
                 if not vol or v > vol then
@@ -1728,12 +2160,43 @@ do
                 end
             end
         end
+        return part
+    end
+
+    -- Go to a zone part: on foot (onto the water, with something to stand
+    -- on) or in your boat.
+    function Zones.goPart(part, withBoat)
         local root = myRoot()
-        if not (part and root) then
+        if not (part and part.Parent and root) then
             notify("That zone isn't there any more, refresh the list")
             return
         end
+        local name = displayName(part.Name)
         local top = part.CFrame:PointToWorldSpace(Vector3.new(0, part.Size.Y / 2 + 4, 0))
+        if withBoat then
+            pcall(LocalPlayer.RequestStreamAroundAsync, LocalPlayer, top, 6)
+            local spot
+            for _ = 1, 8 do
+                spot = surfaceIn(part)
+                if spot then
+                    break
+                end
+                task.wait(0.25)
+            end
+            if not spot then
+                local lo = part.Position.Y - part.Size.Y / 2
+                local hi = part.Position.Y + part.Size.Y / 2
+                if Tp.seaLevel >= lo - 5 and Tp.seaLevel <= hi + 5 then
+                    spot = Vector3.new(part.Position.X, Tp.seaLevel, part.Position.Z)
+                end
+            end
+            Boat.go(spot, name)
+            return
+        end
+        if Busy.reason then
+            notify("Busy: " .. Busy.reason)
+            return
+        end
         pcall(LocalPlayer.RequestStreamAroundAsync, LocalPlayer, top, 6)
         root.AssemblyLinearVelocity = Vector3.zero
         root.CFrame = CFrame.new(top) * root.CFrame.Rotation
@@ -1763,8 +2226,131 @@ do
                 r.CFrame = CFrame.new(hit.Position + Vector3.new(0, 3.5, 0)) * r.CFrame.Rotation
             end
         end
-        notify("At " .. displayName(e.zone) .. (spot and " (standing on the water, cast away)" or ""))
+        notify("At " .. name .. (spot and " (standing on the water, cast away)" or ""))
     end
+    function Zones.go(label, withBoat)
+        local e = label and Zones.byLabel[label]
+        if not e then
+            notify("Pick a zone first")
+            return
+        end
+        Zones.goPart(biggest(e.parts), withBoat)
+    end
+
+    -- What's live right now, best first.
+    function Zones.events()
+        local out = {}
+        for _, e in Zones.entries do
+            if e.event and biggest(e.parts) then
+                table.insert(out, e)
+            end
+        end
+        table.sort(out, function(a, b)
+            return (a.worth or 0) > (b.worth or 0)
+        end)
+        return out
+    end
+    function Zones.eventsText()
+        local live = Zones.events()
+        if #live == 0 then
+            return "No events up right now. You get told the moment one spawns."
+        end
+        local root = myRoot()
+        local lines = {}
+        for i = 1, math.min(6, #live) do
+            local e = live[i]
+            local part = biggest(e.parts)
+            local dist = root and part and comma((part.Position - root.Position).Magnitude) or "?"
+            table.insert(lines, ("%s · ~%s C$%s · %s studs"):format(displayName(e.zone), comma(e.worth or 0),
+                e.best and (" · best " .. e.best.name) or "", dist))
+        end
+        return table.concat(lines, "\n")
+    end
+    function Zones.goBestEvent(withBoat)
+        if #Zones.entries == 0 then
+            Zones.refresh()
+        end
+        local e = Zones.events()[1]
+        if not e then
+            notify("No events up right now")
+            return
+        end
+        Zones.goPart(biggest(e.parts), withBoat)
+    end
+
+    local pending
+    local function changed()
+        if pending then
+            return
+        end
+        pending = true
+        task.delay(0.6, function()
+            pending = false
+            if not alive() then
+                return
+            end
+            Zones.refresh()
+            if Zones.onChange then
+                pcall(Zones.onChange, Zones.labels)
+            end
+        end)
+    end
+    local alerted = {}
+    local function check(part, atStart)
+        if not (alive() and part:IsA("BasePart") and part.Parent and load()) then
+            return
+        end
+        local name = part.Name
+        local zone = Lib.zones[name]
+        if type(zone) ~= "table" or type(zone.Pool) ~= "table" then
+            return
+        end
+        local boosted, boost = boostOf(part)
+        local event = Zones.isEvent(name)
+        local rarePool = boosted and type(Lib.fish[boosted]) == "table" and rarityOrder(Lib.fish[boosted].Rarity) >= rarityOrder("Mythical")
+        if not (event or rarePool) then
+            return
+        end
+        local key = name .. "|" .. tostring(boosted)
+        if alerted[key] and os.clock() - alerted[key] < 300 then
+            return
+        end
+        alerted[key] = os.clock()
+        local rows, worth = Zones.odds(name, boosted, boost)
+        local best = bestOf(rows)
+        local root = myRoot()
+        local dist = root and comma((part.Position - root.Position).Magnitude) or "?"
+        local what = rarePool and (boosted .. " pool at " .. displayName(name)) or displayName(name)
+        if Settings.EventAlert then
+            notify(("%s %s! Avg ~%s C$%s · %s studs away"):format(what, atStart and "is up" or "just spawned", comma(worth or 0),
+                best and (" · best " .. best.name .. " ~" .. comma(best.value) .. " C$") or "", dist), 10)
+        end
+        if Settings.EventAutoGo and not atStart and not Busy.reason and not activeReel() then
+            task.spawn(Zones.goPart, part, Settings.EventUseBoat)
+        end
+    end
+    task.spawn(function()
+        local f
+        for _ = 1, 60 do
+            f = folder()
+            if f or not alive() then
+                break
+            end
+            task.wait(1)
+        end
+        if not (f and alive()) then
+            return
+        end
+        bind(f.ChildAdded, function(part)
+            changed()
+            task.delay(0.5, check, part, false)
+        end)
+        bind(f.ChildRemoved, changed)
+        task.wait(2)
+        for _, part in f:GetChildren() do
+            check(part, true)
+        end
+    end)
 end
 
 --// Selling \\--
@@ -2016,7 +2602,9 @@ do
                     local text = Zones.espText(z)
                     if text then
                         local boosted = z:FindFirstChild("Abundance") ~= nil
-                        mark(z, z, boosted and Color3.fromRGB(120, 220, 255) or Color3.fromRGB(235, 235, 235), text, {
+                        local color = Zones.isEvent(z.Name) and Color3.fromRGB(255, 160, 50)
+                            or boosted and Color3.fromRGB(120, 220, 255) or Color3.fromRGB(235, 235, 235)
+                        mark(z, z, color, text, {
                             size = UDim2.fromOffset(240, 64),
                             offset = Vector3.new(0, math.min(z.Size.Y / 2, 60) + 2, 0),
                             range = 1500,
@@ -2277,18 +2865,18 @@ do
     toggle(C, "PerfectCast", "Perfect cast", "Every cast at 97-100% power, counted as perfect")
     slider(C, "CastPower", "Power (not perfect)", 10, 100, 0, "%")
     slider(C, "CastDelay", "Wait before casting", 0, 5, 1, " s")
-    slider(C, "StuckReset", "Recast after no bite for", 15, 180, 0, " s")
+    slider(C, "StuckReset", "Recast after no bite for", 15, 600, 0, " s")
     status(C, function()
         return ("Now: %s\nCasts: %d"):format(Fish.info, Fish.casts)
     end)
 
     local S = Tab:AddLeftGroupbox("Auto shake", "hand")
     toggle(S, "AutoShake", "Auto shake", "Shakes while the shake button is up")
-    dropdown(S, "ShakeMethod", "Method", { "Auto", "Remote", "Tap", "Select + Enter", "Mouse click", "VirtualUser click" },
-        "Auto: the remote on the new shake, Tap on a phone / Select + Enter on a computer for the old one. Remote: fastest, no input at all. Tap: its own finger, so your movement stick keeps working. Select + Enter and Mouse click use VirtualInputManager, VirtualUser click doesn't")
-    slider(S, "ShakeDelay", "Every", 0.05, 1, 2, " s", "Time between shakes. The new shake takes one every 0.25s; faster can be thrown away")
+    dropdown(S, "ShakeMethod", "Method", { "Auto", "Game handler", "Remote", "Tap", "Select + Enter", "Mouse click", "VirtualUser click" },
+        "Game handler: runs the shake button's own connection (the game's shake code) every frame, so it shakes as fast as the game allows with no input at all. Remote: fires the shake remote on the timer below. Tap / Select + Enter / Mouse click / VirtualUser click press the button. Auto: Game handler, or a press on the old shake")
+    slider(S, "ShakeDelay", "Remote / press gap", 0, 1, 2, " s", "Only for Remote and the press methods. The game itself sends one shake every 0.25s (less with some rods); going faster may be thrown away")
     status(S, function()
-        return ("Now: %s\nShakes: %d"):format(Fish.shakeInfo or "off", Fish.shakes)
+        return ("Now: %s\nGame's shake rate: every %.2fs"):format(Fish.shakeInfo or "off", Fish.shake.interval())
     end)
 
     local R = Tab:AddRightGroupbox("Auto reel", "refresh-cw")
@@ -2297,7 +2885,7 @@ do
         "Lock bar on fish: your bar sits on the fish the whole time (perfect catches). Legit: holds and lets go like a player. Instant: finishes the reel right away (the server may check how long it took)")
     slider(R, "InstantDelay", "Instant: wait first", 0, 10, 1, " s", "How long to wait before finishing. A couple of seconds looks more normal")
     toggle(R, "FastReel", "Faster minigame", "The game's own minigame speed setting, on your side")
-    slider(R, "ReelSpeed", "Minigame speed", 1, 5, 1, "x")
+    slider(R, "ReelSpeed", "Minigame speed", 1, 10, 1, "x")
     status(R, function()
         return ("Reel: %s\nInstant reels: %d\nCaught: %d  Missed: %d"):format(
             Reel and (activeReel() and "reeling" or "waiting") or "ReelController not found", Fish.reels, Fish.caught, Fish.missed)
@@ -2330,10 +2918,29 @@ do
     Z:AddButton({ Text = "Teleport to zone", Func = function()
         task.spawn(Zones.go, Settings.ZonePick)
     end, Tooltip = "Puts you on the water in the middle of the zone, with something to stand on so you can cast" })
+    Z:AddButton({ Text = "Teleport with boat", Func = function()
+        task.spawn(Zones.go, Settings.ZonePick, true)
+    end, Tooltip = "Gets in your boat (spawns the one picked in the Boat tab if none is out) and moves it, with you, to the zone" })
     Z:AddButton({ Text = "Refresh zones", Func = function()
         task.spawn(refresh)
-    end, Tooltip = "Pools and event zones come and go, and the odds change with the rod you hold" })
+    end, Tooltip = "The list also updates by itself when zones and pools come and go" })
+    Zones.onChange = function(labels)
+        pcall(function()
+            pick:SetValues(labels)
+        end)
+    end
     task.spawn(refresh)
+    local V = Tab:AddLeftGroupbox("Events", "zap")
+    toggle(V, "EventAlert", "Tell me when one spawns", "Megalodon, sharks, Kraken, orcas, whales, Scylla, hunts, Lovestorm, Golden Tide and pools of a mythical or rarer fish, the moment the zone shows up")
+    toggle(V, "EventAutoGo", "Go there by itself", "Teleports you to a new event as soon as it spawns (not while you're reeling)")
+    toggle(V, "EventUseBoat", "Go by boat", "Auto go takes your boat")
+    V:AddButton({ Text = "Go to best event", Func = function()
+        task.spawn(Zones.goBestEvent, false)
+    end })
+    V:AddButton({ Text = "Go to best event by boat", Func = function()
+        task.spawn(Zones.goBestEvent, true)
+    end })
+    status(V, Zones.eventsText)
     local D = Tab:AddRightGroupbox("Most likely catches", "list")
     status(D, function()
         return Zones.describe(Settings.ZonePick)
@@ -2348,7 +2955,7 @@ do
     local S = Tab:AddLeftGroupbox("Auto sell", "dollar-sign")
     toggle(S, "AutoSell", "Auto sell", "Goes to the nearest merchant, sells every fish that isn't favourited, and comes back")
     dropdown(S, "SellWhen", "When", { "Worth over", "Every few minutes" })
-    slider(S, "SellWorth", "Sell once worth", 500, 500000, 0, " C$")
+    slider(S, "SellWorth", "Sell once worth", 500, 10000000, 0, " C$")
     slider(S, "SellEvery", "Every", 1, 60, 0, " min")
     toggle(S, "SellAnywhere", "Sell from anywhere", "Uses the game's sell-everything (needs the sell anywhere gamepass)")
     toggle(S, "SellReturn", "Come back after selling")
@@ -2380,6 +2987,26 @@ do
     T:AddButton({ Text = "Go", Func = function()
         task.spawn(Tp.go, Settings.TpSpot)
     end, Tooltip = "Works without the place being loaded. Zones marked watched are checked by the server: going into one you haven't unlocked is risky" })
+    T:AddButton({ Text = "Go with boat", Func = function()
+        task.spawn(function()
+            local s = Settings.TpSpot and Tp.spots[Settings.TpSpot]
+            if not s then
+                notify("Pick a spot first")
+                return
+            end
+            local pos = s.cf.Position
+            pcall(LocalPlayer.RequestStreamAroundAsync, LocalPlayer, pos, 6)
+            local water
+            for _ = 1, 3 do
+                water = Boat.waterNear(pos, 700)
+                if water then
+                    break
+                end
+                task.wait(0.6)
+            end
+            Boat.go(water, Settings.TpSpot)
+        end)
+    end, Tooltip = "Takes your boat to the water nearest the spot (spawns the boat picked in the Boat tab if none is out)" })
     T:AddButton({ Text = "Refresh spots", Func = function()
         task.spawn(refresh)
     end, Tooltip = "Adds spawn points that have loaded in since" })
@@ -2405,31 +3032,90 @@ do
 end
 
 do
-    local Tab = Window:AddTab("Player", "user", "Movement, water, air, boat")
+    local Tab = Window:AddTab("Player", "user", "Movement, water, air")
     local M = Tab:AddLeftGroupbox("Movement", "move")
     toggle(M, "SpeedOn", "Walk speed")
-    slider(M, "WalkSpeed", "Speed", 16, 150, 0)
+    slider(M, "WalkSpeed", "Speed", 16, 500, 0)
     toggle(M, "JumpOn", "Jump power")
-    slider(M, "JumpPower", "Power", 50, 300, 0)
+    slider(M, "JumpPower", "Power", 50, 1000, 0)
     toggle(M, "InfJump", "Infinite jump", "Jump again in the air")
     toggle(M, "Fly", "Fly", "Moves where your camera looks. Space goes up, Left Ctrl goes down; on a phone look up or down while you move")
-    slider(M, "FlySpeed", "Fly speed", 10, 300, 0)
+    slider(M, "FlySpeed", "Fly speed", 10, 1000, 0)
     toggle(M, "Noclip", "Noclip", "Walk through walls")
     local W = Tab:AddLeftGroupbox("Water and air", "droplet")
     toggle(W, "WaterWalk", "Walk on water", "Stand and cast on any water. Dive a couple of studs down to go under")
     toggle(W, "AntiDrown", "Anti drown", "When oxygen (or pressure, heat, cold) gets low, goes back to the last spot where nothing was running out, waits until it's full and comes back")
-    slider(W, "DrownAt", "Go up at", 10, 80, 0, "%")
+    slider(W, "DrownAt", "Go up at", 5, 95, 0, "%")
     toggle(W, "DrownReturn", "Come back after")
     status(W, function()
         return ("Now: %s\nLevels: %s\nSaved you: %d times"):format(Air.info, Air.levels(), Air.saves)
     end)
-    local B = Tab:AddRightGroupbox("Boat", "ship")
-    toggle(B, "BoatSpeedOn", "Faster boat", "More top speed, speed-up and turning for your own boat")
-    slider(B, "BoatSpeed", "Speed", 1, 10, 1, "x")
+end
+
+do
+    local Tab = Window:AddTab("Boat", "ship", "Boat mods, spawn, bring, teleport")
+    local B = Tab:AddLeftGroupbox("Boat mods", "ship")
+    toggle(B, "BoatSpeedOn", "Faster boat", "More top speed and speed-up for your own boat")
+    slider(B, "BoatSpeed", "Speed", 1, 50, 1, "x")
+    toggle(B, "BoatTurnOn", "Faster turning")
+    slider(B, "BoatTurn", "Turning", 1, 20, 1, "x")
+    toggle(B, "BoatInstant", "Instant speed-up and stop", "No waiting to get up to speed or to stop")
+    toggle(B, "BoatSteady", "Steady boat", "No bobbing or tilting")
+    toggle(B, "BoatKeepSpeed", "Keep speed on hits", "Bumping into things doesn't stop you")
+    toggle(B, "BoatNoclip", "Boat noclip", "Drive through rocks, docks and islands (the boat stays on the water)")
     toggle(B, "BoatFly", "Flying boat", "Any boat flies. R goes up, F goes down; on a phone look up or down while you drive")
-    slider(B, "BoatFlySpeed", "Up / down speed", 10, 200, 0)
-    toggle(B, "BoatInfBoost", "Infinite boost", "Boats with a boost (jetskis) never run out")
-    status(B, function()
+    slider(B, "BoatFlySpeed", "Up / down speed", 10, 1000, 0)
+    local O = Tab:AddRightGroupbox("Boost", "zap")
+    toggle(O, "BoatAnyBoost", "Boost on any boat", "Gives any boat the jetski boost (Q, or the boost button)")
+    slider(O, "BoatBoostPower", "Boost adds", 0.25, 10, 2, "x top speed")
+    toggle(O, "BoatInfBoost", "Infinite boost", "The boost never runs out")
+    toggle(O, "BoatAlwaysBoost", "Always boosting", "Boosting the whole time you drive")
+    local Y = Tab:AddRightGroupbox("Your boats", "anchor")
+    local pick = Y:AddDropdown("BoatPick", {
+        Text = "Boat", Values = {}, Searchable = true,
+        Tooltip = "Your boats. Used when a boat has to be spawned",
+        Callback = function(v)
+            Settings.BoatPick = v
+        end,
+    })
+    local function refresh()
+        local list = Boat.list()
+        pcall(function()
+            pick:SetValues(list)
+        end)
+        if not Settings.BoatPick and list[1] then
+            pcall(function()
+                pick:SetValue(list[1])
+            end)
+            Settings.BoatPick = Settings.BoatPick or list[1]
+        end
+    end
+    Y:AddButton({ Text = "Spawn boat", Func = function()
+        task.spawn(function()
+            if Boat.spawn() then
+                local b = Boat.current()
+                if b then
+                    Boat.sit(b)
+                end
+            end
+        end)
+    end, Tooltip = "Spawns the picked boat (like the quick menu) and gets you in" })
+    Y:AddButton({ Text = "Bring my boat", Func = function()
+        task.spawn(Boat.bring)
+    end, Tooltip = "Gets in your boat and brings it to the water next to you" })
+    Y:AddButton({ Text = "Get in my boat", Func = function()
+        task.spawn(function()
+            local b = Boat.current()
+            if not (b and Boat.sit(b)) then
+                notify(b and "Couldn't get in (someone in the seat?)" or "No boat of yours out")
+            end
+        end)
+    end })
+    Y:AddButton({ Text = "Refresh boats", Func = function()
+        task.spawn(refresh)
+    end })
+    task.spawn(refresh)
+    status(Y, function()
         return Boat.info
     end)
 end
