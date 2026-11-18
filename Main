@@ -67,6 +67,8 @@ local Games = {
     [72907489978215] = { Name = 'Fisch (Sea 2)', Script = 'Games/Fisch.lua' },
     [106011698424775] = { Name = 'Fisch (Deep Sea)', Script = 'Games/Fisch.lua' },
     [70451556031302] = { Name = 'Fisch (Deep Sea, Sea 2)', Script = 'Games/Fisch.lua' },
+    -- Potato fries shop (game 10767380385, place "Map1"), from its dump's own place id.
+    [139542527731344] = { Name = 'Fries shop', Script = 'Games/PotatoFries.lua' },
     -- ROB IT (game 9472441390): every heist map runs in this one place, from
     -- the game's own modules.Maps; 82316016871591 is the same game's test place.
     [83907398368798] = { Name = 'ROB IT', Script = 'Games/RobIt.lua' },
