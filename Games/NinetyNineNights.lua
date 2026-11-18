@@ -150,6 +150,9 @@ local Settings = {
     KillAura = false, AuraRange = 30, ShowAuraRange = false, AuraColor = Color3.fromRGB(255, 90, 90),
     AuraKinds = { Hostile = true, ["Can attack"] = true }, AuraPerSwing = 3, AuraPriority = "Chasing me first",
     AutoEquip = true, HitFrom = "Your position", ExtraDelay = 0, OneTool = true, SwingMode = "Fast",
+    SilentAim = false, AimFov = 160, AimShowFov = true, AimShowTarget = true, AimPart = "Body", AimRange = 500,
+    AimWallCheck = true, AimKinds = { Hostile = true, ["Can attack"] = true, Passive = true }, AimLead = 0,
+    AimPriority = "Closest to crosshair", AimHits = true, AutoShoot = false, AutoShootEvery = 0.35,
     -- tree farm
     FarmTrees = false, FarmRadius = 250, FarmAround = "Camp fire", FarmNight = "Wait at camp",
     -- movement
@@ -695,6 +698,355 @@ end
 local function chasingMe(model)
     return model:GetAttribute("ChasingPlayer") == LocalPlayer.UserId
 end
+
+--// Silent aim (guns, bows, throwables) \\--
+-- With a ranged item in hand (ToolName Firearm / ThrownWeapon), the shot goes
+-- to the mob picked near your crosshair, whatever way the game works it out:
+-- the camera ray (ScreenPointToRay / ViewportPointToRay), the mouse (Hit,
+-- Target, UnitRay) and the shot's own raycast from your gun all point at it,
+-- and a ranged ToolDamageObject that would land on nothing is sent for it.
+-- Only calls from the game's scripts are changed, and only while you hold a
+-- ranged item and have a target. The hooks never call a method themselves
+-- before handing a call on (that would change which method is being called).
+local Aim = { active = false, target = nil, hooked = false, info = "Off" }
+;(function()
+    local Mouse = LocalPlayer:GetMouse()
+    local RANGED_WORDS = { "gun", "rifle", "revolver", "pistol", "shotgun", "bow", "crossbow", "kunai", "spear", "flintlock",
+        "blaster", "launcher", "sniper", "musket", "javelin", "throw" }
+    local function rangedItem()
+        local name = equippedName()
+        if not name then
+            return nil
+        end
+        local inv = inventory()
+        local item = inv and inv:FindFirstChild(name)
+        if item and (RANGED[item:GetAttribute("ToolName") or ""] or item:GetAttribute("AmmoType") or item:GetAttribute("MaxAmmo")) then
+            return item
+        end
+        local lower = tostring(name):lower()
+        for _, w in RANGED_WORDS do
+            if lower:find(w, 1, true) then
+                return item or name
+            end
+        end
+        return nil
+    end
+    Aim.rangedItem = rangedItem
+
+    local function screenPoint()
+        local cam = Workspace.CurrentCamera
+        if UserInputService.TouchEnabled and not UserInputService.MouseEnabled and cam then
+            return cam.ViewportSize / 2
+        end
+        return UserInputService:GetMouseLocation()
+    end
+    local function aimPart(model)
+        if Settings.AimPart == "Head" then
+            return model:FindFirstChild("Head") or model:FindFirstChild("HumanoidRootPart") or model.PrimaryPart
+        end
+        return model:FindFirstChild("HumanoidRootPart") or model:FindFirstChild("Torso") or model:FindFirstChild("UpperTorso")
+            or model:FindFirstChild("Head") or model.PrimaryPart
+    end
+    local wallParams = RaycastParams.new()
+    wallParams.FilterType = Enum.RaycastFilterType.Exclude
+    wallParams.IgnoreWater = true
+    local function clearShot(from, part, model)
+        local list = { model }
+        local c = character()
+        if c then
+            table.insert(list, c)
+        end
+        local items = itemsFolder()
+        if items then
+            table.insert(list, items)
+        end
+        for _ = 1, 4 do
+            wallParams.FilterDescendantsInstances = list
+            local hit = Workspace:Raycast(from, part.Position - from, wallParams)
+            if not hit then
+                return true
+            end
+            local inst = hit.Instance
+            -- leaves, glass and anything you can shoot through don't block
+            if inst.Transparency >= 0.6 or not inst.CanCollide then
+                table.insert(list, inst)
+            else
+                return false
+            end
+        end
+        return true
+    end
+
+    local function pick()
+        local cam, hrp = Workspace.CurrentCamera, rootPart()
+        if not (cam and hrp) then
+            return nil
+        end
+        local sp = screenPoint()
+        local from = cam.CFrame.Position
+        local best, bestScore
+        for model in Index.mobs do
+            if model.Parent then
+                local kind = mobKind(model)
+                if kind and Settings.AimKinds[kind] then
+                    local part = aimPart(model)
+                    if part then
+                        local d = (part.Position - hrp.Position).Magnitude
+                        if d <= Settings.AimRange then
+                            local v, on = cam:WorldToViewportPoint(part.Position)
+                            if on and v.Z > 0 then
+                                local px = (Vector2.new(v.X, v.Y) - sp).Magnitude
+                                if px <= Settings.AimFov and (not Settings.AimWallCheck or clearShot(from, part, model)) then
+                                    local score = Settings.AimPriority == "Closest to you" and d or px
+                                    if chasingMe(model) then
+                                        score *= 0.75
+                                    end
+                                    if Aim.target and Aim.target.model == model then
+                                        score *= 0.85
+                                    end
+                                    if not bestScore or score < bestScore then
+                                        best, bestScore = { model = model, part = part, kind = kind, d = d }, score
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        return best
+    end
+
+    -- Where the shot goes: the aim part, led by its velocity.
+    function Aim.point()
+        local t = Aim.target
+        local part = t and t.part
+        if not (part and part.Parent) then
+            return nil
+        end
+        local p = part.Position
+        if Settings.AimLead > 0 then
+            p += part.AssemblyLinearVelocity * Settings.AimLead
+        end
+        return p
+    end
+    -- A ray the game casts for the shot: starts at you or the camera, goes
+    -- the way you aim, and is long enough to be a shot (not a ground check).
+    function Aim.redirect(origin, dir)
+        if typeof(origin) ~= "Vector3" or typeof(dir) ~= "Vector3" then
+            return nil
+        end
+        local len = dir.Magnitude
+        if len < 20 then
+            return nil
+        end
+        local nearCam = Aim.camPos and (origin - Aim.camPos).Magnitude < 25
+        local nearMe = Aim.rootPos and (origin - Aim.rootPos).Magnitude < 25
+        if not (nearCam or nearMe) then
+            return nil
+        end
+        local unit = dir / len
+        if Aim.aimDir and unit:Dot(Aim.aimDir) < 0.8 then
+            return nil
+        end
+        local p = Aim.point()
+        if not p then
+            return nil
+        end
+        local to = p - origin
+        if to.Magnitude < 0.5 then
+            return nil
+        end
+        return to.Unit * math.max(len, to.Magnitude + 5)
+    end
+
+    local function install()
+        if Aim.hooked then
+            return true
+        end
+        if typeof(hookmetamethod) ~= "function" or typeof(getnamecallmethod) ~= "function" then
+            Aim.info = "Your executor can't hook (no hookmetamethod)"
+            return false
+        end
+        local isOurs = typeof(checkcaller) == "function" and checkcaller or function()
+            return false
+        end
+        local wrap = typeof(newcclosure) == "function" and newcclosure or function(f)
+            return f
+        end
+        local damage = remote("ToolDamageObject")
+        local setMethod = typeof(setnamecallmethod) == "function" and setnamecallmethod or function() end
+        local oldNamecall
+        oldNamecall = hookmetamethod(game, "__namecall", wrap(function(self, ...)
+            if Unloaded or not Aim.active or isOurs() then
+                return oldNamecall(self, ...)
+            end
+            local method = getnamecallmethod()
+            if self == Workspace then
+                if method == "Raycast" then
+                    local origin, dir, params = ...
+                    local nd = Aim.redirect(origin, dir)
+                    if nd then
+                        setMethod(method)
+                        return oldNamecall(self, origin, nd, params)
+                    end
+                elseif method == "FindPartOnRay" or method == "FindPartOnRayWithIgnoreList" or method == "FindPartOnRayWithWhitelist" then
+                    local ray = ...
+                    if typeof(ray) == "Ray" then
+                        local nd = Aim.redirect(ray.Origin, ray.Direction)
+                        if nd then
+                            setMethod(method)
+                            return oldNamecall(self, Ray.new(ray.Origin, nd), select(2, ...))
+                        end
+                    end
+                end
+            elseif method == "ScreenPointToRay" or method == "ViewportPointToRay" then
+                if self == Workspace.CurrentCamera then
+                    local ray = oldNamecall(self, ...)
+                    local p = Aim.point()
+                    if p and typeof(ray) == "Ray" then
+                        return Ray.new(ray.Origin, (p - ray.Origin).Unit)
+                    end
+                    return ray
+                end
+            elseif method == "InvokeServer" and self == damage and Settings.AimHits then
+                local hitTarget, tool = ...
+                local t = Aim.target
+                if t and t.model.Parent and typeof(tool) == "Instance" then
+                    local getAttr = tool.GetAttribute
+                    local ranged = RANGED[getAttr(tool, "ToolName") or ""]
+                    local onMob = typeof(hitTarget) == "Instance" and hitTarget.FindFirstChild(hitTarget, "NPC") ~= nil
+                    if ranged and not onMob then
+                        local args = table.pack(...)
+                        args[1] = t.model
+                        setMethod(method)
+                        return oldNamecall(self, table.unpack(args, 1, args.n))
+                    end
+                end
+            end
+            setMethod(method)
+            return oldNamecall(self, ...)
+        end))
+        local oldIndex
+        oldIndex = hookmetamethod(game, "__index", wrap(function(self, key)
+            if Aim.active and not Unloaded and self == Mouse and not isOurs() then
+                if key == "Hit" then
+                    local p = Aim.point()
+                    if p then
+                        return CFrame.new(p)
+                    end
+                elseif key == "Target" then
+                    local t = Aim.target
+                    if t and t.part.Parent then
+                        return t.part
+                    end
+                elseif key == "UnitRay" then
+                    local p = Aim.point()
+                    if p and Aim.camPos then
+                        return Ray.new(Aim.camPos, (p - Aim.camPos).Unit)
+                    end
+                end
+            end
+            return oldIndex(self, key)
+        end))
+        Aim.hooked = true
+        return true
+    end
+
+    -- FOV circle and target outline
+    local ring = Instance.new("Frame")
+    ring.Name = "AimFov"
+    ring.AnchorPoint = Vector2.new(0.5, 0.5)
+    ring.BackgroundTransparency = 1
+    ring.Visible = false
+    ring.Parent = VisualGui
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(1, 0)
+    corner.Parent = ring
+    local stroke = Instance.new("UIStroke")
+    stroke.Thickness = 1.5
+    stroke.Transparency = 0.25
+    stroke.Parent = ring
+    local outline = Instance.new("Highlight")
+    outline.Name = "AimTarget"
+    outline.FillTransparency = 1
+    outline.OutlineColor = Color3.fromRGB(255, 80, 80)
+    outline.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+    outline.Enabled = false
+    outline.Parent = VisualGui
+
+    local lastShot = 0
+    bind(RunService.RenderStepped, function()
+        if not alive() then
+            Aim.active = false
+            return
+        end
+        local held = Settings.SilentAim and rangedItem() or nil
+        local cam = Workspace.CurrentCamera
+        local hrp = rootPart()
+        Aim.camPos = cam and cam.CFrame.Position or nil
+        Aim.rootPos = hrp and hrp.Position or nil
+        if Settings.SilentAim and not Aim.hooked then
+            install()
+        end
+        if held and Aim.hooked then
+            Aim.target = pick()
+            local sp = screenPoint()
+            if cam then
+                local ray = cam:ViewportPointToRay(sp.X, sp.Y)
+                Aim.aimDir = ray.Direction.Unit
+            end
+            Aim.active = Aim.target ~= nil
+        else
+            Aim.target, Aim.active = nil, false
+        end
+
+        local showRing = Settings.SilentAim and Settings.AimShowFov and held ~= nil
+        ring.Visible = showRing
+        if showRing then
+            local sp = screenPoint()
+            ring.Position = UDim2.fromOffset(sp.X, sp.Y)
+            ring.Size = UDim2.fromOffset(Settings.AimFov * 2, Settings.AimFov * 2)
+            stroke.Color = Aim.target and Color3.fromRGB(255, 90, 90) or Color3.fromRGB(235, 235, 235)
+        end
+        local t = Aim.target
+        if t and Settings.AimShowTarget then
+            outline.Adornee = t.model
+            outline.Enabled = true
+        else
+            outline.Enabled = false
+        end
+
+        if not Settings.SilentAim then
+            Aim.info = "Off"
+        elseif not Aim.hooked then
+            -- install() left its reason
+        elseif not held then
+            Aim.info = "Hold a gun, bow or throwable"
+        elseif t then
+            Aim.info = string.format("Target: %s (%s) · %dm", cleanName(t.model:GetAttribute("Name") or t.model.Name), t.kind, math.floor(t.d))
+        else
+            Aim.info = "No mob in the circle"
+        end
+
+        -- Auto shoot: a click on the target while you hold a ranged item.
+        if Settings.AutoShoot and t and held and os.clock() - lastShot >= Settings.AutoShootEvery
+            and not UserInputService:GetFocusedTextBox() then
+            lastShot = os.clock()
+            local v = cam and cam:WorldToViewportPoint(t.part.Position)
+            if v then
+                local at = Vector2.new(v.X, v.Y)
+                task.spawn(function()
+                    pcall(function()
+                        VirtualUser:Button1Down(at, cam.CFrame)
+                        task.wait(0.03)
+                        VirtualUser:Button1Up(at, cam.CFrame)
+                    end)
+                end)
+            end
+        end
+    end)
+end)()
 
 --// Auto chop + kill aura, side by side \\--
 -- Both share one swing clock (the server sees one tool swing at a time). Each
@@ -2345,17 +2697,37 @@ local function bagKidsInRange()
     end
 end
 
--- Kids in the sack come out at camp.
+-- How long to stand still after a teleport before dropping anything: the
+-- server drops things where IT has you, and right after a teleport that's
+-- still where you came from.
+local function settleTime()
+    local ping = 0.15
+    pcall(function()
+        ping = LocalPlayer:GetNetworkPing()
+    end)
+    return math.clamp(0.6 + ping * 4, 0.8, 2.5)
+end
+
+-- Kids in the sack come out at camp, once you've been there long enough for
+-- the server to agree.
+local nearCampSince = nil
 local function dropKidsAtCamp(force)
     local bagFolder = LocalPlayer:FindFirstChild("ItemBag")
     local bag = itemBag()
     local r = remote("RequestBagDropItem")
     if not bagFolder or not bag or not r or distanceTo(campPos()) > 30 then
+        nearCampSince = nil
         return
     end
+    nearCampSince = nearCampSince or os.clock()
+    if not force and os.clock() - nearCampSince < settleTime() then
+        return
+    end
+    local left = #bagFolder:GetChildren()
     for _, item in bagFolder:GetChildren() do
         if item:GetAttribute("KidId") and (force or tryOnce(item, 3)) then
-            r:FireServer(bag, item, #bagFolder:GetChildren() <= 1)
+            r:FireServer(bag, item, left <= 1)
+            left -= 1
         end
     end
 end
@@ -2631,14 +3003,14 @@ local goToCamp, treeFarm, rescueKids, chestRun, safetyTick
 -- crowd the main chunk's 200 locals.
 ;(function()
 
-function goToCamp(still)
+function goToCamp(still, opts, gap)
     local pos = campPos()
     if not pos then
         setStatus("No camp fire found")
         return false
     end
     setStatus("Going to camp")
-    return moveTo(besideOf(pos, 10)) and (not still or still())
+    return moveTo(besideOf(pos, gap or 10), opts) and (not still or still())
 end
 
 -- Tree farm: walk to the nearest tree an axe you own can break, stay until
@@ -2719,36 +3091,109 @@ function treeFarm(still)
 end
 
 -- Kid rescue: fill the sack with as many kids as it holds (nearest next each
--- time), then one trip to camp drops them all. Dropping doesn't wait for the
--- server to mark them rescued; those kids are just never visited again.
+-- time), then take them to camp. Things come out of the sack where the SERVER
+-- has you, and right after a teleport that's still the last kid's spot, so at
+-- camp it first stands still until the server has caught up, then takes the
+-- kids out one at a time and checks each one landed by the fire. A kid that
+-- landed somewhere else is still lost, so it gets picked up and brought back.
 function rescueKids(still)
     local start = rootPart() and rootPart().Position
-    local rescued, failed, done = 0, {}, {}
+    local rescued, failed, done, landedAway = 0, {}, {}, {}
+    local secondPass = false
     local function inBag()
         local ids = {}
         for _, item in bagContents() do
             local id = item:GetAttribute("KidId")
             if id then
-                ids[id] = true
+                ids[id] = item
             end
         end
         return ids
     end
-    local function dropAll()
-        if not goToCamp(still) then
+    local function kidModel(id)
+        for model in Index.kids do
+            if model.Parent and model:GetAttribute("KidId") == id then
+                return model
+            end
+        end
+        return nil
+    end
+    local function byTheFire(model)
+        if model:GetAttribute("Lost") == false then
+            return true
+        end
+        local camp, pos = campPos(), mobPos(model)
+        return camp ~= nil and pos ~= nil and (pos - camp).Magnitude <= 45
+    end
+    -- Stand still where you are until the server has you there too.
+    local function settle()
+        local r = rootPart()
+        if not r then
             return false
         end
-        local carried = inBag()
-        setStatus("Dropping kids at camp")
-        dropKidsAtCamp(true)
-        waitFor(1.5, function()
-            return kidsInBag() == 0
-        end, still)
-        for id in carried do
-            done[id] = true
-            rescued += 1
-            if logEvent then
-                logEvent("Rescued " .. spaced(id), Color3.fromRGB(255, 220, 80))
+        local cf, t0, wait = r.CFrame, os.clock(), settleTime()
+        while os.clock() - t0 < wait do
+            if not still() then
+                return false
+            end
+            local rr = rootPart()
+            if not rr then
+                return false
+            end
+            rr.CFrame = cf
+            rr.AssemblyLinearVelocity = Vector3.zero
+            RunService.Heartbeat:Wait()
+        end
+        return still()
+    end
+    local function deliver()
+        if not goToCamp(still, runOpts(), 6) then
+            return false
+        end
+        setStatus("At camp: waiting for the server to see you here")
+        if not settle() then
+            return false
+        end
+        local bag, r = itemBag(), remote("RequestBagDropItem")
+        if not (bag and r) then
+            return false
+        end
+        local list = {}
+        for id, item in inBag() do
+            table.insert(list, { id = id, item = item })
+        end
+        local total = #bagContents()
+        for i, e in list do
+            if not still() then
+                return false
+            end
+            setStatus("Dropping " .. spaced(e.id) .. " at camp")
+            r:FireServer(bag, e.item, total - (i - 1) <= 1)
+            waitFor(2, function()
+                return not inBag()[e.id]
+            end, still)
+            task.wait(0.15)
+        end
+        -- Where did each one end up?
+        for _, e in list do
+            local model
+            waitFor(3, function()
+                model = kidModel(e.id)
+                return model ~= nil
+            end, still)
+            if model and not byTheFire(model) then
+                landedAway[e.id] = (landedAway[e.id] or 0) + 1
+                if landedAway[e.id] >= 3 then
+                    failed[e.id] = "kept landing away from camp"
+                else
+                    setStatus(spaced(e.id) .. " landed away from camp: going back for it")
+                end
+            elseif not inBag()[e.id] then
+                done[e.id] = true
+                rescued += 1
+                if logEvent then
+                    logEvent("Rescued " .. spaced(e.id), Color3.fromRGB(255, 220, 80))
+                end
             end
         end
         return true
@@ -2772,11 +3217,25 @@ function rescueKids(still)
         end
         local full = sackSpace() <= 0
         if (not pick or full) and next(carrying) then
-            if not dropAll() then
+            if not deliver() then
                 return
             end
         elseif not pick then
-            break
+            -- One more go at kids that weren't at their map point the first
+            -- time (they wander, and far areas stream in late).
+            local again = false
+            if not secondPass then
+                for kidId, why in failed do
+                    if why == "not found at its map point" then
+                        failed[kidId] = nil
+                        again = true
+                    end
+                end
+                secondPass = true
+            end
+            if not again then
+                break
+            end
         elseif full then
             setStatus("Your sack is full: empty it first")
             notify("Kid rescue", "Your sack is full: empty it first", 5)
@@ -2802,11 +3261,12 @@ function rescueKids(still)
                 local before = kidsInBag()
                 moveTo(safeSpotNear(mobPos(model), 3), runOpts())
                 setStatus("Picking up " .. name)
-                local got = waitFor(4, function()
-                    if tryOnce(model, 0.75) then
+                -- The server checks you're within reach, so keep trying while it catches up.
+                local got = waitFor(6, function()
+                    if model.Parent and tryOnce(model, 0.6) then
                         bagKid(model)
                     end
-                    return kidsInBag() > before or model.Parent == nil
+                    return kidsInBag() > before or inBag()[pick] ~= nil
                 end, still)
                 if not got then
                     failed[pick] = "the sack wouldn't take it"
@@ -2822,7 +3282,7 @@ function rescueKids(still)
     if #skipped > 0 then
         text ..= " · skipped " .. table.concat(skipped, ", ")
     end
-    if still() and rescued == 0 and start then
+    if still() and start and rescued == 0 then
         moveTo(start, runOpts())
     end
     setStatus(text)
@@ -6053,6 +6513,31 @@ choice(UI.AuraBox, "AuraPriority", "Hit first", "AuraPriority", { "Chasing me fi
     "Which mobs get the swing when more are in range than mobs per swing")
 UI.AuraNearLabel = UI.AuraBox:AddLabel("Nearby: -", true)
 
+UI.AimBox = UI.CombatTab:AddLeftGroupbox("Silent aim (guns)", "crosshair")
+toggle(UI.AimBox, "SilentAim", "Silent aim", "SilentAim",
+    "With a gun, bow or throwable in hand, your shots go to the mob nearest your crosshair inside the circle. Kids and pets are never targeted")
+    :AddKeyPicker("SilentAimKey", { Default = "None", Mode = "Toggle", SyncToggleState = true, Text = "Silent aim" })
+slider(UI.AimBox, "AimFov", "Circle size", "AimFov", 20, 800, " px")
+toggle(UI.AimBox, "AimShowFov", "Show the circle", "AimShowFov")
+toggle(UI.AimBox, "AimShowTarget", "Outline the target", "AimShowTarget")
+choice(UI.AimBox, "AimPart", "Aim at", "AimPart", { "Body", "Head" })
+slider(UI.AimBox, "AimRange", "Max distance", "AimRange", 25, 2000, " studs")
+toggle(UI.AimBox, "AimWallCheck", "Only mobs you can see", "AimWallCheck", "Skips mobs behind trees, rocks and walls")
+multi(UI.AimBox, "AimKinds", "Targets", "AimKinds", { "Hostile", "Can attack", "Passive" }, { "Hostile", "Can attack", "Passive" },
+    "Passive covers animals you hunt for food")
+choice(UI.AimBox, "AimPriority", "Pick", "AimPriority", { "Closest to crosshair", "Closest to you" },
+    "Mobs chasing you are picked first either way")
+slider(UI.AimBox, "AimLead", "Lead moving mobs", "AimLead", 0, 0.5, " s",
+    "Aims where a moving mob will be. Leave at 0 for guns that hit instantly; raise it for bows and throwables")
+toggle(UI.AimBox, "AimHits", "Count near misses", "AimHits",
+    "A ranged hit the game would send for nothing is sent for your target instead")
+toggle(UI.AimBox, "AutoShoot", "Auto shoot", "AutoShoot", "Clicks for you while a target is in the circle")
+slider(UI.AimBox, "AutoShootEvery", "Shoot every", "AutoShootEvery", 0.05, 2, " s")
+UI.AimLabel = UI.AimBox:AddLabel("Off", true)
+loop(0.3, function()
+    setText(UI.AimLabel, Aim.info)
+end)
+
 UI.SwingBox = UI.CombatTab:AddLeftGroupbox("Swing settings", "settings-2")
 toggle(UI.SwingBox, "AutoEquip", "Auto equip the right tool", "AutoEquip")
 choice(UI.SwingBox, "SwingMode", "Swing mode", "SwingMode", { "Fast", "Normal" },
@@ -6656,7 +7141,7 @@ do
     toggle(RunBox, "SkipGuarded", "Skip chests with mobs next to them", "SkipGuarded",
         "Chest run leaves a chest alone when a hostile mob is this close to it, unless kill aura is on")
     slider(RunBox, "GuardRadius", "Mob distance", "GuardRadius", 5, 40, " studs")
-    RunBox:AddLabel("Kid rescue needs a sack. It goes to each kid, picks it up and brings it to the camp fire. Turn on kill aura first", true)
+    RunBox:AddLabel("Kid rescue needs a sack. It picks up every kid it can carry, brings them to the camp fire, waits a moment so the server sees you there, then drops them one at a time and goes back for any that landed somewhere else. Turn on kill aura first", true)
 
     local MapBox = ExploreTab:AddRightGroupbox("Map", "map")
     MapBox:AddButton({
