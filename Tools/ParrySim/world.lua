@@ -38,7 +38,7 @@ function World.new(cfg)
     self.events = {}
     self.result = nil
     self.stats = { requests = 0, taken = 0, ignored = 0, passes = 0, success = 0, deaths = 0, uses = {}, reasons = {},
-        my_hits = 0, bot_kills = 0, wasted = 0, flights = {} }
+        my_hits = 0, bot_kills = 0, wasted = 0, flights = {}, doubles = 0 }
     M.reset_scheduler()
     M.now = 0
     return self
@@ -203,10 +203,13 @@ function World:server_deflect(P, B, t)
     self:wlog("deflect by %s at %.3f dist %.1f speed %.0f", P.name, t, (B.pos - tp).Magnitude, B.speed)
     P.win_until, P.cool_until = -1, -1
     if P.is_me then
+        self.my_last_hit = t
         stats.success = stats.success + 1
         stats.my_hits = stats.my_hits + 1
         if self.pass then
             stats.uses[#stats.uses + 1] = t - (P.win_start or t)
+            self.shots = self.shots or {}
+            self.shots[#self.shots + 1] = { u = t - (P.win_start or t), speed = B.speed, curve = self.pass.curve or B.curve }
             self.pass.result = "success"
             stats.flights[#stats.flights + 1] = t - self.pass.t0
         end
@@ -217,16 +220,21 @@ function World:server_deflect(P, B, t)
     end
     local pl = self.player_inst[P.name]
     local remotes = self.remotes
-    self:send_down(function() remotes.ParrySuccessAll.OnClientEvent:Fire("Base Sword", nil, nil, pl) end, true)
-    if self.done then return end
+    local function broadcast() self:send_down(function() remotes.ParrySuccessAll.OnClientEvent:Fire("Base Sword", nil, nil, pl) end, true) end
+    if not self.cfg.attr_first then broadcast() end
+    if self.done then if self.cfg.attr_first then broadcast() end; return end
     local target = self.scenario.choose_target(self, P)
-    if not target then return end
+    if not target then if self.cfg.attr_first then broadcast() end; return end
     local T = self.sv.players[target]
     local curve = self.scenario.choose_curve(self, P)
     B.curve = curve
     local aim = self:aim_dir(B.pos, self:server_pos(T, t), curve)
     local speed = self.scenario.next_speed(self, B.speed, P)
     self:new_pass(B, P.name, target, aim, speed, t)
+    if self.cfg.attr_first then
+        self:replicate(t)
+        broadcast()
+    end
 end
 
 function World:server_kill(P, B, t)
@@ -258,6 +266,20 @@ function World:server_kill(P, B, t)
         stats.bot_kills = stats.bot_kills + 1
         if self.on_bot_death then self:on_bot_death(P, t) end
     end
+end
+
+function World:start_hold(B, by, t, o)
+    local P = self.sv.players[by]
+    B.orbit = { c = P.pos, r = 7.5, w = o.orbit_speed / 7.5, a0 = 0, t0 = t, t1 = t + o.dur, to = o.to, speed = o.speed,
+        attr = o.attr, by = by, curve = o.curve }
+    B.pos = P.pos + v3(7.5, 1, 0)
+    local inst, name, val = self.ball_inst, o.attr, o.value
+    self:send_down(function() inst:SetAttribute(name, val) end, true)
+    if o.target_during then
+        B.target = o.target_during
+        self:send_down(function() inst:SetAttribute("target", o.target_during) end, true)
+    end
+    self:wlog("%s holds the ball (%s) for %.2fs, then sends it to %s at %.0f", by, name, o.dur, o.to, o.speed)
 end
 
 function World:bot_plan(P, B, t)
@@ -292,7 +314,15 @@ function World:wlog(fmt, ...)
 end
 function World:server_request(P, t)
     local stats = self.stats
-    if P.is_me then stats.requests = stats.requests + 1 end
+    if P.is_me then
+        stats.requests = stats.requests + 1
+        local last = self.my_last_req
+        if last and t - last < 0.8 and (self.my_last_hit or -1) < last then
+            stats.doubles = stats.doubles + 1
+            self:wlog("DOUBLE parry: %.3fs after the previous one, no landed parry between", t - last)
+        end
+        self.my_last_req = t
+    end
     local taken = not (t < P.cool_until or t < P.win_until)
     local rec
     if P.is_me and self.pass then
@@ -306,6 +336,7 @@ function World:server_request(P, t)
     end
     P.win_start, P.win_until, P.cool_until = t, t + self.cfg.W, t + self.cfg.cooldown
     if rec then rec.win_until = P.win_until end
+
     if P.is_me then
         stats.taken = stats.taken + 1
         if not self.pass then stats.wasted = stats.wasted + 1 end
@@ -325,6 +356,25 @@ function World:server_tick(t)
     end
     self.sv_req = keep
     if not B or not B.target then return end
+    if B.orbit then
+        local O = B.orbit
+        local a = O.a0 + O.w * (t - O.t0)
+        local np = O.c + v3(math.cos(a) * O.r, 1, math.sin(a) * O.r)
+        B.dir = (np - B.pos).Magnitude > 1e-6 and (np - B.pos).Unit or B.dir
+        B.speed = O.w * O.r
+        B.pos = np
+        if t >= O.t1 then
+            B.orbit = nil
+            local inst, name = self.ball_inst, O.attr
+            self:send_down(function() inst:SetAttribute(name, nil) end, true)
+            self:wlog("ability releases the ball at %s, speed %.0f", O.to, O.speed)
+            local T2 = self.sv.players[O.to]
+            local aim = self:aim_dir(B.pos, self:server_pos(T2, t), O.curve or "straight")
+            self:new_pass(B, O.by, O.to, aim, O.speed, t)
+        end
+        self:replicate(t)
+        return
+    end
     local T = self.sv.players[B.target]
     if not T or not T.alive then return end
     if not T.is_me then self:bot_plan(T, B, t) end
@@ -590,6 +640,7 @@ function World:spawn_ball()
     local ball = M.inst("Part", "Ball")
     rawget(ball, "__d").props.Size = v3(self.cfg.ball_size or 2.2, self.cfg.ball_size or 2.2, self.cfg.ball_size or 2.2)
     ball:SetAttribute("realBall", true)
+    ball:SetAttribute("minHeight", self.cfg.floor or 1.5)
     ball:SetAttribute("target", "")
     local z = M.inst("LinearVelocity", "zoomies")
     rawget(z, "__d").props.VectorVelocity = v3(0, 0, 0)

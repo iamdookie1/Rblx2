@@ -1,6 +1,6 @@
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.6.1"
+local SCRIPT_VERSION = "rewrite-0.6.2"
 
 local genv = (getgenv and getgenv()) or _G
 if type(genv.__BladeBallShutdown) == 'function' then pcall(genv.__BladeBallShutdown) end
@@ -408,6 +408,18 @@ do
             if ball:GetAttribute("IsInTimeHoleAOE") then return "time hole" end
             u = Det.th_hold[ball]
             if u and now < u then return "time hole" end
+        end
+        return nil
+    end
+    function Det.isHoldName(name)
+        return name == "ClosestSingularity" or string.find(name, "SingularityInOrbit", 1, true) ~= nil
+            or string.find(name, "FuryCatch", 1, true) ~= nil
+    end
+    function Det.abilityHold(ball)
+        local ok, attrs = pcall(ball.GetAttributes, ball)
+        if not ok or type(attrs) ~= "table" then return nil end
+        for name, v in pairs(attrs) do
+            if v ~= nil and v ~= false and v ~= "" and Det.isHoldName(name) then return name end
         end
         return nil
     end
@@ -1507,10 +1519,14 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         local th = math.acos(math.clamp(d:Dot(to / dist), -1, 1))
         if last then
             local turn = math.acos(math.clamp(last.d:Dot(d), -1, 1))
-            if turn > 0.6 and now - last.t < 0.06 and (last.th - th) < turn * 0.6 then
+            local jump = last.sp > 1 and math.abs(sp - last.sp) > last.sp * 0.35
+            if jump or (turn > 0.6 and now - last.t < 0.06 and (last.th - th) < turn * 0.6) then
                 T.s, T.snap, T.fit = {}, now, nil
                 s = T.s
-                if DBG.on then DBG.ev(("sudden turn %.0f deg: curve tracking restarted"):format(math.deg(turn))) end
+                if DBG.on then
+                    DBG.ev(jump and ("sudden speed %.0f -> %.0f: curve tracking restarted"):format(last.sp, sp)
+                        or ("sudden turn %.0f deg: curve tracking restarted"):format(math.deg(turn)))
+                end
             elseif th > last.th + 0.02 and turn > 0.01 then
                 T.away_at = now
             end
@@ -1584,9 +1600,9 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         T.fit = best
         return best
     end
-    function Pred.run(pos, dir, speed, accel, tp, tv, gap, horizon, mdl, a, b, tau0, cap)
+    function Pred.run(pos, dir, speed, accel, tp, tv, gap, horizon, mdl, a, b, tau0, cap, minH)
         if speed < 1 then return nil end
-        local t, best, bestT, prev = 0, math.huge, nil, math.huge
+        local t, best, bestT, prev, start = 0, math.huge, nil, math.huge, nil
         local dt = math.clamp(6 / speed, 1 / 240, 1 / 60)
         local sin, cos, acos = math.sin, math.cos, math.acos
         while t < horizon do
@@ -1595,8 +1611,9 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
             local dist = to.Magnitude
             if dist <= gap then return t end
             if cap then
+                start = start or dist
                 if dist < best then best, bestT = dist, t end
-                if dist > prev and best <= gap + cap then return bestT end
+                if dist > prev and best <= gap + cap and bestT > 0 and start - best > math.min(cap, start * 0.3) then return bestT end
                 prev = dist
             end
             local want = to / dist
@@ -1619,6 +1636,7 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
             end
             speed = speed + accel * dt
             pos = pos + dir * move
+            if minH and pos.Y < minH then pos = Vector3.new(pos.X, minH, pos.Z) end
             t = t + dt
         end
         return nil
@@ -1677,19 +1695,21 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         end
         if T and T.away_at and now - T.away_at < 0.12 then alo = math.min(alo, a * 0.5) end
         local hz = horizon or 3
-        local lo = Pred.run(p, dir, speed, accel * 1.5 + speed * 0.05, tp, tv, gap, hz, mdl, ahi, b * (ahi / math.max(a, 1e-3)), tau0, 12)
+        local minH = ball:GetAttribute("minHeight")
+        if type(minH) ~= "number" then minH = nil end
+        local lo = Pred.run(p, dir, speed, accel * 1.5 + speed * 0.05, tp, tv, gap, hz, mdl, ahi, b * (ahi / math.max(a, 1e-3)), tau0, 12, minH)
         local alts = f and f.alt
         local alo_t, ahi_t = math.huge, 0
         if alts then
             for _, c in ipairs(alts) do
-                local e = Pred.run(p, dir, speed, accel, tp, tv, gap, hz + 1, c.m, c.a, c.b, tau0, 3)
+                local e = Pred.run(p, dir, speed, accel, tp, tv, gap, hz + 1, c.m, c.a, c.b, tau0, 3, minH)
                 if e then alo_t, ahi_t = math.min(alo_t, e), math.max(ahi_t, e) else ahi_t = math.huge end
             end
         end
         res.lo = math.max(math.min(lo or math.huge, alo_t), straight * 0.97)
         if res.lo > hz then res.mid, res.hi = math.huge, math.huge; return res end
-        local mid = Pred.run(p, dir, speed, accel, tp, tv, gap, hz + 1, mdl, a, b, tau0, 3)
-        local hi = Pred.run(p, dir, speed, 0, tp, tv, gap, hz + 1.5, mdl, alo, b * (alo / math.max(a, 1e-3)), tau0)
+        local mid = Pred.run(p, dir, speed, accel, tp, tv, gap, hz + 1, mdl, a, b, tau0, 3, minH)
+        local hi = Pred.run(p, dir, speed, 0, tp, tv, gap, hz + 1.5, mdl, alo, b * (alo / math.max(a, 1e-3)), tau0, nil, minH)
         res.mid = math.max(mid or (ahi_t > 0 and math.min(ahi_t, hz + 1)) or hz + 1, res.lo)
         res.hi = math.max(hi or math.huge, ahi_t, res.mid)
         if tv then
@@ -1787,6 +1807,15 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         if z then Util.hookZoomies(ball, st, z) end
         ballConns[#ballConns + 1] = ball.ChildAdded:Connect(function(c)
             if c.Name == 'zoomies' then Util.hookZoomies(ball, st, c) end
+        end)
+        st.hold = Det.abilityHold(ball)
+        if st.hold then AP.held(ball, st, clock_()) end
+        ballConns[#ballConns + 1] = ball.AttributeChanged:Connect(function(name)
+            if not active or not isLive() or type(name) ~= "string" or not Det.isHoldName(name) then return end
+            local was = st.hold
+            st.hold = Det.abilityHold(ball)
+            if was and not st.hold then AP.released(ball, st, was)
+            elseif st.hold and not was then AP.held(ball, st, clock_()) end
         end)
         return st
     end
@@ -2290,6 +2319,8 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         if passBusy(st, now) then DBG.held(st.landed and "this pass landed" or "already fired on this pass", now); return end
         if blocked(ball) then DBG.held("ability detection: " .. (Det.ball_detected(ball) or "you"), now); return end
         if Det.tornado(ball, now) then DBG.held("aerodynamic slash tornado", now); return end
+        if st.hold then DBG.held("ball held by an ability (" .. tostring(st.hold) .. ")", now); return end
+        if SP.auto and Util.hasClash(ball, now) then DBG.held("auto spam has this clash", now); return end
         if st.target_at and now - st.target_at < 0.06 and ball:FindFirstChild('zoomies') and (Pred.zat[ball] or -1) < st.target_at then
             DBG.held("waiting for the ball's new direction", now)
             return
@@ -2300,11 +2331,14 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         local E = AP.predict(ball, st, now, r_hi + W + 0.3)
         if not E then return end
         local verdict, A_lo, A_mid, A_hi, e = AP.plan(E, r_lo, r_mid, r_hi, W)
-        if verdict == "must" and A_lo < -0.01 and not E.straight_in and A_mid > W - AP.MARGIN_LATE then
+        if verdict == "must" and not E.straight_in and A_mid > W - AP.MARGIN_LATE then
             local T = st.trk
             local f = T and T.pass == st.pass_n and Pred.fit(T)
-            if not f and T and now - T.t0 < 0.07 then verdict = nil; DBG.held("must, but no turn measured yet", now)
-            elseif A_lo < 0 and A_mid > W * 0.85 then verdict = nil; DBG.held("fastest case already lost, aiming at the likely arrival", now) end
+            if A_lo < -0.01 and not f and T and now - T.t0 < 0.07 then verdict = nil; DBG.held("must, but no turn measured yet", now)
+            elseif A_lo < 0 and A_mid > W * 0.85 then verdict = nil; DBG.held("fastest case already lost, aiming at the likely arrival", now)
+            elseif f and (f.n or 0) >= 3 and (f.u or 1) < 0.35 and A_mid > W * 0.9 then
+                verdict = nil; DBG.held("curve measured: the likely arrival is after this parry would end", now)
+            end
         end
         if DBG.on then
             local d = DBG.eval
@@ -2386,7 +2420,7 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
             st.preparried = false
         end
         local X = st.target
-        if type(X) ~= 'string' or X == '' or X == me then return end
+        if type(X) ~= 'string' or X == '' or X == me or st.hold then return end
         if not AP.straightReturns(X) then return end
         if not Core.cap and S.parry_mode ~= "Keypress" then return end
         if blocked(ball) or Util.hasClash(ball, now) or not gateOpen() then return end
@@ -2467,12 +2501,108 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         else AP.addRes(math.min(-verdict * 0.5, 0.06)) end
     end
 
-    local function decide(ball, st, root, now, via) return AP.evaluate(ball, st, root, now, via) end
-
     local function trigger(ball, st, now)
-        if passBusy(st, now) or Util.hasClash(ball, now) or blocked(ball) then return end
+        if passBusy(st, now) or st.hold or Util.hasClash(ball, now) or blocked(ball) then return end
         fire(st, now, "triggerbot", nil, ball)
     end
+    local function decide(ball, st, root, now, via) return AP.evaluate(ball, st, root, now, via) end
+    AP.holdDur = {}
+    function AP.holdClass(name) return string.find(tostring(name), "Singularity", 1, true) and "singularity" or "fury" end
+    function AP.held(ball, st, now)
+        st.hold_at, st.hold_class, st.guard_n = now, AP.holdClass(st.hold), 0
+        st.hold_speed = math.max(ballVel(ball).Magnitude, st.hold_speed or 0, 60)
+        local by = ball:GetAttribute("ClosestSingularity")
+        if type(by) ~= "string" or by == "" then
+            local best, bd = nil, math.huge
+            if Alive then
+                for _, m in ipairs(Alive:GetChildren()) do
+                    local hrp = m:FindFirstChild('HumanoidRootPart')
+                    if hrp and m.Name ~= me then
+                        local d = (hrp.Position - ball.Position).Magnitude
+                        if d < bd then best, bd = m.Name, d end
+                    end
+                end
+            end
+            by = best
+        end
+        st.hold_by = by
+        DBG.ev(("ball held by an ability (%s, %s): auto parry waits for the release"):format(tostring(st.hold), tostring(by)))
+    end
+    function AP.holdGuard(ball, st, root, now)
+        if not st.hold or not st.hold_at or S.triggerbot then return end
+        if not Core.cap and S.parry_mode ~= "Keypress" then return end
+        if passBusy(st, now) or (st.preparried and now < st.preparry_until) or not gateOpen() then return end
+        local by = st.hold_by and charRoot(st.hold_by)
+        if not by or st.hold_by == me then return end
+        local onMe = st.target == me
+        if not onMe and not (AP.alive() == 2 or AP.likelyNext(st.hold_by, st, root, by)) then return end
+        local r_lo, r_mid, r_hi = AP.reach(AP.kind())
+        local W = parryWin() or 0.5
+        local v = math.max((st.hold_speed or 100) * 1.5, 200)
+        local d = math.max((by.Position - root.Position).Magnitude - Core.ap_gap(ball), 0)
+        local f = d / v
+        if f >= r_hi + AP.MARGIN_EARLY + 0.05 then return end
+        local L = AP.holdDur[st.hold_class]
+        local due, how
+        if L and #L >= 2 then
+            local o = table.clone(L)
+            table.sort(o)
+            local rel = st.hold_at + o[math.ceil(#o * 0.5)]
+            due, how = rel - r_mid + f - W * 0.4, "timed to the usual release"
+            if now > rel + 0.4 then due, how = now, "release overdue" end
+        else
+            due, how = st.hold_at + 0.25, "release time not learned yet"
+        end
+        if now + frameDt * 0.5 < due then return end
+        local info = { speed = v, dist = d, heading = 0, eta = f, lead = 0, A_lo = f - r_hi, A_mid = f - r_mid, A_hi = f - r_lo,
+            reach = r_mid, spread = 0.5 }
+        if fire(st, now, ("hold guard (%s, %s)"):format(st.hold_class, how), info, ball) then
+            st.preparried, st.preparry_until = true, now + r_hi + W + 0.1
+            st.parried = false
+            Core.pending, Core.watch = nil, nil
+            if AP.shot then AP.shot.pre = true end
+            st.guard_n = (st.guard_n or 0) + 1
+        end
+    end
+    function AP.released(ball, st, why)
+        local now = clock_()
+        if st.hold_at then
+            local dur = now - st.hold_at
+            if dur > 0.15 and dur < 10 then
+                local L = AP.holdDur[st.hold_class or AP.holdClass(why)] or {}
+                AP.holdDur[st.hold_class or AP.holdClass(why)] = L
+                L[#L + 1] = dur
+                if #L > 8 then table.remove(L, 1) end
+            end
+            st.hold_at = nil
+        end
+        DBG.ev(("ability let the ball go (%s): deciding now"):format(tostring(why)))
+        logp(("ability let the ball go (%s): new pass, decided the same frame"):format(tostring(why)))
+        st.pass_n, st.pc = (st.pass_n or 1) + 1, nil
+        if st.target ~= me then return end
+        Util.openPass(st)
+        if not (S.autoparry or S.triggerbot) then return end
+        local root = apRoot()
+        if not root then return end
+        if S.triggerbot then trigger(ball, st, now) else decide(ball, st, root, now, "released") end
+        task.defer(function()
+            if not active or not isLive() or st.target ~= me or st.hold then return end
+            local r = apRoot()
+            if r and not S.triggerbot then decide(ball, st, r, clock_(), "released") end
+        end)
+    end
+    function Parry.evaluateNow(via)
+        if not active or not (S.autoparry or S.triggerbot) then return end
+        local root = apRoot()
+        if not root then return end
+        local now = clock_()
+        for ball, st in pairs(tracked) do
+            if ball.Parent and st.target == me then
+                if S.triggerbot then trigger(ball, st, now) else decide(ball, st, root, now, via) end
+            end
+        end
+    end
+
 
     onRetarget = function(ball, st, new, now)
         if new == me then
@@ -2683,7 +2813,7 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
                     if now - aw.t > 1 then Core.await = nil end
                 else
                     local r_lo, r_mid, r_hi = AP.reach("remote")
-                    local limit = math.max((E.rtt or r_mid) * 2 + 0.03, r_hi * 1.5 + frameDt * 2 + 0.06)
+                    local limit = math.max((E.rtt or r_mid) * 2 + 0.1, r_hi * 2 + frameDt * 2 + 0.1, 0.3)
                     if now - aw.t > limit then
                         Core.await = nil
                         Core.refused(aw, now, now - aw.t)
@@ -2754,6 +2884,7 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
                     elseif not S.triggerbot then
                         AP.anticipate(ball, st, root, now)
                     end
+                    if st.hold and S.autoparry and not S.triggerbot then AP.holdGuard(ball, st, root, now) end
                 end
                 if mine and not mine.list then
                     if S.triggerbot then trigger(mine[1], mine[2], now) else decide(mine[1], mine[2], root, now) end
@@ -2983,7 +3114,9 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
                     local spd = ballVel(ball).Magnitude
                     near = (their.Position - Core.ball_now(ball)).Magnitude <= Util.clashRange(spd) + spd * (pingS() + 0.1)
                 end
-                if r and st.target == me and (st.landed or (st.parried and near)) and ball.Parent then
+                local sw = st.swaps[#st.swaps]
+                local same = sw and sw.to == me and (sw.from == who or sw.from == nil) and now - sw.t < 0.35
+                if r and st.target == me and not same and (st.landed or (st.parried and near)) and ball.Parent then
                     if ballVel(ball):Dot(r.Position - Core.ball_now(ball)) > 0 then
                         Util.openPass(st); reopened = true
                     else
@@ -3702,7 +3835,7 @@ function Mods.watchFury(char)
     local function update()
         local on = char:GetAttribute("FuryCatch") and true or false
         if on and not Det.slashes then Det.slashes, Mods.Slashes.count = true, 0; Mods.runSlashes()
-        elseif not on then Det.slashes = false end
+        elseif not on and Det.slashes then Det.slashes = false; pcall(Parry.evaluateNow, "slashes over") end
     end
     Mods.DetSlashes:connect(char:GetAttributeChangedSignal("FuryCatch"), update)
     update()

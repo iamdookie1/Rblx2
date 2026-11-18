@@ -102,7 +102,7 @@ local function base_world(i, seed, o)
     if o and o.no_move then p.move = nil end
     local cfg = { seed = seed + 17, rtt = p.rtt, jitter = p.jitter, fps = p.fps, buffer = p.buffer, homing = p.homing,
         W = 0.5, cooldown = 1.3, kill_dist = 3.5, deflect_extra = p.dx, deflect_speed = p.ds, move = p.move, spikes = p.spikes,
-        ping_bias = p.ping_bias, frame_jitter = 0.1, log = os.getenv("SIM_LOG") ~= nil, deferred = p.deferred, wlog = os.getenv("SIM_WLOG") ~= nil, perfect_bots = true }
+        ping_bias = p.ping_bias, frame_jitter = 0.1, attr_first = probe.rng() < 0.5, log = os.getenv("SIM_LOG") ~= nil, deferred = p.deferred, wlog = os.getenv("SIM_WLOG") ~= nil, perfect_bots = true }
     if os.getenv("SIM_PINGBIAS") then cfg.ping_bias = tonumber(os.getenv("SIM_PINGBIAS")) end
     if os.getenv("SIM_BUF") then cfg.buffer = tonumber(os.getenv("SIM_BUF")) end
     local w = World.new(cfg)
@@ -152,7 +152,7 @@ local function run_pass(i, seed)
     local out = w.stats.success > 0 and "success" or (w.stats.deaths > 0 and ("dead:" .. (w.last_death and w.last_death.reason or "?")) or "timeout")
     return { rtt = p.rtt, speed = speed, dist = dist, curve = curve, out = out, fps = p.fps, law = p.homing.law, uses = w.stats.uses,
         wasted = w.stats.wasted, errs = M.err_count, log = w.log, flight = w.stats.flights[1],
-        buf_true = w.cfg.buffer, buf_est = w.sim and w.sim.Parry.__Pred and w.sim.Parry.__Pred.buf, buf_n = w.sim and w.sim.Parry.__Pred and w.sim.Parry.__Pred.buf_n }
+        doubles = w.stats.doubles, shots = w.shots, buf_true = w.cfg.buffer, buf_est = w.sim and w.sim.Parry.__Pred and w.sim.Parry.__Pred.buf, buf_n = w.sim and w.sim.Parry.__Pred and w.sim.Parry.__Pred.buf_n }
 end
 
 local function run_rally(i, seed)
@@ -186,7 +186,7 @@ local function run_rally(i, seed)
         for _, e in ipairs(w.sim.Parry.DBG.list) do w.log[#w.log + 1] = ("dbg %.3f %s\n"):format(e.t, e.text) end
     end
     local B = w.sv.ball
-    return { rtt = p.rtt, out = (w.stats.deaths > 0) and ("dead:" .. (w.last_death.reason or "?")) or "survived",
+    return { doubles = w.stats.doubles, rtt = p.rtt, out = (w.stats.deaths > 0) and ("dead:" .. (w.last_death.reason or "?")) or "survived",
         hits = w.stats.my_hits, speed = B and B.speed or 0, dist = dist, errs = M.err_count, fps = p.fps, log = w.log,
         curve = w.last_death and w.last_death.curve }
 end
@@ -224,7 +224,7 @@ local function run_ffa(i, seed)
     end
     w:load_script(chunk, opts)
     w:run(45)
-    return { rtt = p.rtt, deaths = deaths, passes = w.stats.passes, hits = w.stats.my_hits, wasted = w.stats.wasted,
+    return { doubles = w.stats.doubles, rtt = p.rtt, deaths = deaths, passes = w.stats.passes, hits = w.stats.my_hits, wasted = w.stats.wasted,
         errs = M.err_count, fps = p.fps, reasons = w.stats.reasons }
 end
 
@@ -255,11 +255,52 @@ local function run_session(i, seed)
         off = ap and ap.net.off_rem or 0 }
 end
 
+local function run_ability(i, seed)
+    local w, p, probe = base_world(i, seed, { no_move = true })
+    local dist = probe:pick({ 14, 20, 30, 45, 60 })
+    local a = probe:rand(0, 2 * math.pi)
+    local botpos = v3(math.cos(a) * dist, 3, math.sin(a) * dist)
+    w:add_player("Bot", botpos, false, { up = 0.04 })
+    local kind = probe:pick({ "singularity", "fury" })
+    local o = { dur = probe:rand(0.8, 2.5), orbit_speed = probe:rand(60, 220), to = "Me",
+        speed = probe:rand(2, 5) * probe:pick({ 90, 140, 220 }), curve = probe:pick({ "straight", "straight", "slight", "high" }),
+        attr = kind == "singularity" and "ClosestSingularity" or "FuryCatch_Bot", value = kind == "singularity" and "Bot" or true,
+        target_during = probe.rng() < 0.5 and "Me" or nil }
+    w.scenario = {
+        choose_target = function(w2, P) if P.is_me then w2.done = true; return nil end; return "Me" end,
+        choose_curve = function() return "straight" end,
+        next_speed = function(_, s2) return s2 end,
+    }
+    local ball, B = start_ball(w, botpos, "Bot", 120, "straight")
+    w.tick_hook = nil
+    local held = false
+    local prev = w.on_my_death
+    w.on_my_death = function(w2, t, reason)
+        w2.done = true
+        if w2.log then w2.log[#w2.log + 1] = ("t=%.3f DEATH %s\n"):format(t, tostring(reason)) end
+    end
+    w:load_script(chunk, opts)
+    local orig_bot_plan = w.bot_plan
+    w.bot_plan = function(w2, P, B2, t)
+        if not held and (B2.pos - P.pos).Magnitude < 25 then
+            held = true
+            w2:start_hold(B2, P.name, t, o)
+            return
+        end
+        if not held then return orig_bot_plan(w2, P, B2, t) end
+    end
+    w:run(8)
+    local out = w.stats.success > 0 and "success" or (w.stats.deaths > 0 and ("dead:" .. (w.last_death and w.last_death.reason or "?")) or "timeout")
+    return { rtt = p.rtt, out = out, speed = math.floor(o.speed), dist = dist, curve = kind .. (o.target_during and "+on-you" or ""),
+        fps = p.fps, errs = M.err_count, wasted = w.stats.wasted, doubles = w.stats.doubles, log = w.log,
+        flight = w.stats.flights[1] }
+end
+
 ---------------------------------------------------------------- report
 local function bucket(r) return math.floor(r.rtt * 1000 + 0.5) end
 local results = {}
 local t0 = os.clock()
-local runner = ({ pass = run_pass, rally = run_rally, ffa = run_ffa, smoke = run_pass, session = run_session })[suite]
+local runner = ({ pass = run_pass, rally = run_rally, ffa = run_ffa, smoke = run_pass, session = run_session, ability = run_ability })[suite]
 if suite == "smoke" then trials = math.min(trials, 3) end
 local only = os.getenv("SIM_ONLY")
 for i = 1, trials do
@@ -284,11 +325,11 @@ for _, msg in pairs(M.errors) do io.stderr:write("[script error] " .. msg .. "\n
 local csv = os.getenv("SIM_CSV")
 if csv then
     local f = assert(io.open(csv, "w"))
-    f:write("i,seed,rtt,fps,law,speed,dist,curve,out,hits,wasted,flight\n")
+    f:write("i,seed,rtt,fps,law,speed,dist,curve,out,hits,wasted,flight,doubles\n")
     for _, r in ipairs(results) do
-        f:write(("%d,%d,%d,%d,%s,%s,%s,%s,%s,%s,%s,%s\n"):format(r.i, r.seed, bucket(r), r.fps or 0, tostring(r.law), tostring(r.speed),
+        f:write(("%d,%d,%d,%d,%s,%s,%s,%s,%s,%s,%s,%s,%d\n"):format(r.i, r.seed, bucket(r), r.fps or 0, tostring(r.law), tostring(r.speed),
             tostring(r.dist), tostring(r.curve), tostring(r.out or r.deaths), tostring(r.hits or ""), tostring(r.wasted or ""),
-            r.flight and ("%.4f"):format(r.flight) or ""))
+            r.flight and ("%.4f"):format(r.flight) or "", r.doubles or 0))
     end
     f:close()
 end
@@ -360,3 +401,6 @@ for _, k in ipairs(keys) do
     end
 end
 if suite ~= "ffa" then print(("total %.1f%% (%d/%d)"):format(tot_ok / math.max(tot_n, 1) * 100, tot_ok, tot_n)) end
+local dbl, dtr = 0, 0
+for _, r in ipairs(results) do if (r.doubles or 0) > 0 then dbl, dtr = dbl + r.doubles, dtr + 1 end end
+print(("double parries: %d extra parries on the same ball, in %d of %d trials"):format(dbl, dtr, #results))

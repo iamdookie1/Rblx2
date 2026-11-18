@@ -15,7 +15,12 @@ Suites
 - `rally`: 1v1 against a perfect bot that curves randomly; speed grows every hit.
 - `ffa`: you and 5 bots for 45s, random targets; deaths per minute.
 - `session`: a long 1v1 at random speeds, so the in-game timing correction has time to learn.
+- `ability`: a bot holds the ball with a Singularity / Slashes of Fury style hold (orbit, hold
+  attribute, sometimes already targeting you), then launches it at you 2-5x faster.
 - `smoke`: three quick pass trials with the flight log.
+
+Every suite also reports double parries (a second parry reaching the server within 0.8s of the
+first with no landed parry in between).
 
 Variants: `ap` (auto parry, Remote), `apkey` (auto parry, Keypress), `tb` / `tbkey` (triggerbot).
 
