@@ -67,6 +67,10 @@ local Games = {
     [72907489978215] = { Name = 'Fisch (Sea 2)', Script = 'Games/Fisch.lua' },
     [106011698424775] = { Name = 'Fisch (Deep Sea)', Script = 'Games/Fisch.lua' },
     [70451556031302] = { Name = 'Fisch (Deep Sea, Sea 2)', Script = 'Games/Fisch.lua' },
+    -- ROB IT (game 9472441390): every heist map runs in this one place, from
+    -- the game's own modules.Maps; 82316016871591 is the same game's test place.
+    [83907398368798] = { Name = 'ROB IT', Script = 'Games/RobIt.lua' },
+    [82316016871591] = { Name = 'ROB IT (test)', Script = 'Games/RobIt.lua' },
     [662417684] = { Name = 'Lucky Blocks', Script = 'Games/LuckyBlocks.lua' },
     [129363360542125] = { Name = 'Doodle Drop', Script = 'Games/DoodleDrop.lua' },
     -- Doodle Drop's level creator, from UGC_PLACE_ID in the game's own Config.
