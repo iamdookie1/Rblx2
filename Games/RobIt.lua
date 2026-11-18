@@ -67,7 +67,7 @@ end
 
 local Settings = {
     -- steal
-    InstantSteal = false, StealAura = false, StealRange = 11, StealMinWorth = 0, StealThroughWalls = false,
+    FastSteal = false, StealTimePct = 60, StealAura = false, StealRange = 11, StealMinWorth = 0, StealThroughWalls = false,
     AutoDeliver = false, DeliverAt = 9.9, DeliverReturn = true,
     StealOrder = "Best worth first", SkipGuarded = true, GuardRadius = 18, StealAllReturn = true,
     -- stealth
@@ -356,8 +356,11 @@ end
 --// Stealing \\--
 local Steal = { info = "off", stolen = 0, delivered = 0, runInfo = "" }
 do
-    -- Instant steal: no hold time on steal prompts (it's counted on your side).
-    local holds = setmetatable({}, { __mode = "k" })
+    -- Steal time: each steal prompt's hold is set to a share of its normal
+    -- time. The hold is counted on your side, but the server can check how
+    -- long it took, so it's a slider instead of 0.
+    local holds = setmetatable({}, { __mode = "k" }) -- prompt -> its normal hold
+    local setTo = setmetatable({}, { __mode = "k" }) -- prompt -> what we set it to
     -- Through walls: the game's StealPromptSight zeroes the reach of items
     -- your camera can't see; it's switched off and the reach put back.
     local reach = setmetatable({}, { __mode = "k" })
@@ -368,22 +371,32 @@ do
             sightScript.Disabled = not enabled
         end
     end
-    loop(0.3, function()
+    function Steal.normalHold(p)
+        return holds[p] or p.HoldDuration
+    end
+    local function wantHold(p)
+        local normal = Steal.normalHold(p)
+        if Settings.FastSteal then
+            return math.max(normal * Settings.StealTimePct / 100, 0.05)
+        end
+        return normal
+    end
+    loop(0.25, function()
         for _, it in Scan.items do
             local p = it.prompt
             if p.Parent then
                 if p.MaxActivationDistance > 0 and not reach[p] then
                     reach[p] = p.MaxActivationDistance
                 end
-                if Settings.InstantSteal then
-                    if p.HoldDuration > 0 then
-                        holds[p] = holds[p] or p.HoldDuration
-                        p.HoldDuration = 0
-                    end
-                elseif holds[p] then
-                    p.HoldDuration = holds[p]
-                    holds[p] = nil
+                -- the game changed it (a talent, a tool): that's the new normal
+                if not holds[p] or (setTo[p] and math.abs(p.HoldDuration - setTo[p]) > 1e-3) then
+                    holds[p] = p.HoldDuration
                 end
+                local want = wantHold(p)
+                if math.abs(p.HoldDuration - want) > 1e-3 then
+                    p.HoldDuration = want
+                end
+                setTo[p] = p.HoldDuration
                 if Settings.StealThroughWalls and p.MaxActivationDistance <= 0 then
                     p.MaxActivationDistance = reach[p] or 12
                 end
@@ -400,25 +413,79 @@ do
         sight(true)
     end)
 
+    -- Which prompts the game is showing: only shown prompts take a hold, and
+    -- by default only one prompt per key is shown at a time.
+    local shown = setmetatable({}, { __mode = "k" })
+    local PromptService = game:GetService("ProximityPromptService")
+    bind(PromptService.PromptShown, function(p)
+        shown[p] = true
+    end)
+    bind(PromptService.PromptHidden, function(p)
+        shown[p] = nil
+    end)
+    local seen = remote("LayedEyesUponItem")
+
     function Steal.full()
         return bagFill() >= Settings.DeliverAt
     end
+    -- One steal, the way a player does it: the game shows the prompt, it's
+    -- held for its hold time and let go.
     function Steal.take(it)
-        local before = bagFill()
-        local prompt = it.prompt
-        if not (prompt.Parent and prompt.Enabled) then
+        local p = it.prompt
+        if not (p.Parent and p.Enabled) then
             return false
         end
-        firePrompt(prompt)
+        local before = bagFill()
+        if seen and p:GetAttribute("LayedEyesUpon") == false then
+            pcall(seen.FireServer, seen, p)
+        end
+        local excl, los = p.Exclusivity, p.RequiresLineOfSight
+        p.Exclusivity = Enum.ProximityPromptExclusivity.AlwaysShow
+        p.RequiresLineOfSight = false
+        if p.MaxActivationDistance <= 0 then
+            p.MaxActivationDistance = reach[p] or 12
+        end
+        local fired = false
+        local conn = p.Triggered:Connect(function()
+            fired = true
+        end)
         local t0 = os.clock()
-        while alive() and os.clock() - t0 < (prompt.HoldDuration or 0) + 1.5 do
-            if not prompt.Parent or not prompt.Enabled or bagFill() > before then
-                Steal.stolen += 1
-                return true
+        while not shown[p] and os.clock() - t0 < 0.5 and p.Parent do
+            RunService.Heartbeat:Wait()
+        end
+        local hold = p.HoldDuration
+        pcall(p.InputHoldBegin, p)
+        local h0 = os.clock()
+        while not fired and os.clock() - h0 < hold + 0.1 and p.Parent do
+            RunService.Heartbeat:Wait()
+        end
+        pcall(p.InputHoldEnd, p)
+        if not fired and p.Parent and typeof(fireproximityprompt) == "function" then
+            -- The prompt never took the hold (the game didn't show it).
+            pcall(fireproximityprompt, p)
+        end
+        local ok = false
+        local w0 = os.clock()
+        while alive() and os.clock() - w0 < 1.5 do
+            if not p.Parent or not p.Enabled or bagFill() > before then
+                ok = true
+                break
             end
             task.wait(0.05)
         end
-        return false
+        conn:Disconnect()
+        if p.Parent then
+            p.Exclusivity, p.RequiresLineOfSight = excl, los
+        end
+        if ok then
+            Steal.stolen += 1
+            Steal.last = "took " .. it.name
+        elseif fired then
+            Steal.last = it.name .. " wasn't given (steal time too short?)"
+        else
+            Steal.last = "couldn't hold " .. it.name
+        end
+        return ok
     end
 
     -- Hand the bag in at the van.
@@ -495,8 +562,11 @@ do
             working = true
             Tried[best.prompt] = os.clock()
             Steal.info = "taking " .. best.name
-            Steal.take(best)
+            local ok, err = pcall(Steal.take, best)
             working = false
+            if not ok then
+                warn("[ROB IT] steal: " .. tostring(err))
+            end
         else
             Steal.info = "nothing in reach"
         end
@@ -1453,13 +1523,15 @@ end
 do
     local Tab = Window:AddTab("Steal", "gem", "Stealing and handing in")
     local S = Tab:AddLeftGroupbox("Stealing", "hand")
-    toggle(S, "InstantSteal", "Instant steal", "No hold time on steal prompts")
+    toggle(S, "FastSteal", "Faster steal", "Steals take the share of their normal time set below")
+    slider(S, "StealTimePct", "Steal time", 5, 100, 0, "% of normal",
+        "Lower is faster. If steals stop counting, the server wants more time: raise it")
     toggle(S, "StealAura", "Steal aura", "Takes the best item in reach as you walk around")
     slider(S, "StealRange", "Reach", 4, 12, 0, " studs", "The game's own reach is 12")
     slider(S, "StealMinWorth", "Only items worth at least", 0, 50000, 0, " $")
     toggle(S, "StealThroughWalls", "Steal through walls", "Items stay in reach when a wall is in the way (the game only blocks this on your side)")
     status(S, function()
-        return ("Aura: %s\nStolen: %d"):format(Steal.info, Steal.stolen)
+        return ("Aura: %s\nLast: %s\nStolen: %d"):format(Steal.info, Steal.last or "-", Steal.stolen)
     end)
     local D = Tab:AddRightGroupbox("Hand in", "truck")
     toggle(D, "AutoDeliver", "Auto hand in", "Takes a full bag to the van and comes back")
