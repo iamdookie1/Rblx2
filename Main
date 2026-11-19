@@ -73,6 +73,8 @@ local Games = {
     -- and the Pro place its own BallEscalation module names.
     [125848858933944] = { Name = 'Volley Bomb (new players)', Script = 'Games/VolleyBomb.lua' },
     [97790681249268] = { Name = 'Volley Bomb (pro)', Script = 'Games/VolleyBomb.lua' },
+    -- Dont Splash For Eggs (game 10774325480), from its dump's own place id.
+    [87581667376056] = { Name = 'Dont Splash For Eggs', Script = 'Games/DontSplashForEggs.lua' },
     -- ROB IT (game 9472441390): every heist map runs in this one place, from
     -- the game's own modules.Maps; 82316016871591 is the same game's test place.
     [83907398368798] = { Name = 'ROB IT', Script = 'Games/RobIt.lua' },
