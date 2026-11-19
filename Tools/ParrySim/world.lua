@@ -471,6 +471,13 @@ end
 
 function World:flush_out()
     for _, o in ipairs(self.out) do
+        local B = self.sv.ball
+        if B and self.cfg.wlog then
+            local me = self.sv.players[self.me_name]
+            local rp, rv = self:render_state()
+            self:wlog("client sends a parry: server ball %.1f studs from me (rendered ball %.1f), server speed %.0f, me moving %.1f",
+                (B.pos - self:server_pos(me, M.now)).Magnitude, (rp - self:me_pos(M.now)).Magnitude, B.speed, self:me_vel(M.now).Magnitude)
+        end
         self.sv_req[#self.sv_req + 1] = { P = self.sv.players[self.me_name], arrive = M.now + self:lat("up") }
     end
     self.out = {}

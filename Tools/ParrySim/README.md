@@ -17,6 +17,7 @@ Suites
 - `session`: a long 1v1 at random speeds, so the in-game timing correction has time to learn.
 - `ability`: a bot holds the ball with a Singularity / Slashes of Fury style hold (orbit, hold
   attribute, sometimes already targeting you), then launches it at you 2-5x faster.
+- `dots`: a 1v1 at 8-20 studs where the bot hits straight back (a dot) 75% of the time.
 - `smoke`: three quick pass trials with the flight log.
 
 Every suite also reports double parries (a second parry reaching the server within 0.8s of the
@@ -34,7 +35,8 @@ or without speed scaling), the deflect range, whether Roblox signals are deferre
 are strafing.
 
 Environment switches
-- `SIM_CSV=path` per-trial CSV (for compare.py), `SIM_VERBOSE=1` one line per trial,
+- `SIM_CSV=path` per-trial CSV (for compare.py), `SIM_SHOTS=path` every landed parry's speed and
+  how long the parry was up before the ball landed, `SIM_VERBOSE=1` one line per trial,
   `SIM_ONLY=n` run only trial n, `SIM_LOG=1` the script's flight log, `SIM_DBG=1` debug events and
   holds, `SIM_EVAL=1` every auto parry evaluation, `SIM_WLOG=1` server events.
 - `SIM_S=key=value,...` override settings (`accuracy_base=100,accuracy=100`, `hp_preparry=true`, ...).

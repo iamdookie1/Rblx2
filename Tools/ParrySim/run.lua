@@ -296,11 +296,42 @@ local function run_ability(i, seed)
         flight = w.stats.flights[1] }
 end
 
+local function run_dots(i, seed)
+    local w, p, probe = base_world(i, seed, { no_move = true })
+    local dist = probe:pick({ 8, 11, 14, 17, 20 })
+    local a = probe:rand(0, 2 * math.pi)
+    local botpos = v3(math.cos(a) * dist, 3, math.sin(a) * dist)
+    w:add_player("Bot", botpos, false, { up = 0.04 })
+    local growth = probe:rand(0.04, 0.09)
+    local MAXH = 20
+    w.scenario = {
+        choose_target = function(w2, P)
+            if P.is_me then
+                if w2.stats.my_hits >= MAXH then w2.done = true; return nil end
+                return "Bot"
+            end
+            return "Me"
+        end,
+        choose_curve = function(w2, P)
+            if P.is_me then return "straight" end
+            if w2.rng() < 0.75 then return "straight" end
+            return w2:pick(CURVES)
+        end,
+        next_speed = function(w2, s2) return s2 * (1 + growth) + 4 end,
+    }
+    start_ball(w, botpos, "Bot", probe:rand(35, 70), "straight")
+    w.on_my_death = function(w2) w2.done = true end
+    w:load_script(chunk, opts)
+    w:run(60)
+    return { rtt = p.rtt, out = (w.stats.deaths > 0) and ("dead:" .. (w.last_death.reason or "?")) or "survived",
+        hits = w.stats.my_hits, dist = dist, errs = M.err_count, fps = p.fps, doubles = w.stats.doubles }
+end
+
 ---------------------------------------------------------------- report
 local function bucket(r) return math.floor(r.rtt * 1000 + 0.5) end
 local results = {}
 local t0 = os.clock()
-local runner = ({ pass = run_pass, rally = run_rally, ffa = run_ffa, smoke = run_pass, session = run_session, ability = run_ability })[suite]
+local runner = ({ pass = run_pass, rally = run_rally, ffa = run_ffa, smoke = run_pass, session = run_session, ability = run_ability, dots = run_dots })[suite]
 if suite == "smoke" then trials = math.min(trials, 3) end
 local only = os.getenv("SIM_ONLY")
 for i = 1, trials do
@@ -322,6 +353,17 @@ for i = 1, trials do
     ::continue::
 end
 for _, msg in pairs(M.errors) do io.stderr:write("[script error] " .. msg .. "\n") end
+local shots_path = os.getenv("SIM_SHOTS")
+if shots_path then
+    local f = assert(io.open(shots_path, "w"))
+    f:write("i,rtt,speed,u,curve\n")
+    for _, r in ipairs(results) do
+        for _, sh in ipairs(r.shots or {}) do
+            f:write(("%d,%d,%.0f,%.4f,%s\n"):format(r.i, bucket(r), sh.speed, sh.u, tostring(sh.curve)))
+        end
+    end
+    f:close()
+end
 local csv = os.getenv("SIM_CSV")
 if csv then
     local f = assert(io.open(csv, "w"))
@@ -395,7 +437,7 @@ for _, k in ipairs(keys) do
         local med
         if #B.uses > 0 then table.sort(B.uses); med = B.uses[math.ceil(#B.uses / 2)] end
         print(("ping %3dms  %5.1f%%  (%d/%d)%s  [%s]%s"):format(k, B.n > 0 and B.ok / B.n * 100 or 0, B.ok, B.n,
-            suite == "rally" and ("  avg hits %.1f"):format(B.hits / math.max(B.n, 1)) or "",
+            (suite == "rally" or suite == "dots") and ("  avg hits %.1f"):format(B.hits / math.max(B.n, 1)) or "",
             table.concat(rs, ", "), med and ("  window used med %.0fms"):format(med * 1000) or ""))
         tot_n, tot_ok = tot_n + B.n, tot_ok + B.ok
     end

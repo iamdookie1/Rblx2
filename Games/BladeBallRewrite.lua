@@ -1,6 +1,6 @@
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.6.2"
+local SCRIPT_VERSION = "rewrite-0.6.3"
 
 local genv = (getgenv and getgenv()) or _G
 if type(genv.__BladeBallShutdown) == 'function' then pcall(genv.__BladeBallShutdown) end
@@ -257,10 +257,8 @@ do
 
     local S = {
         autoparry = false, triggerbot = false, parry_mode = "Remote",
-        one_parry_capture = true, rescue_press = true, preparry = false, preparry_range = 30, hp_preparry = true,
-        anticurve = "Smart", dot_threshold = 0.5, curve_bias = 0.5, close_anticurve = true, close_range = 30, instant_retarget = true,
+        one_parry_capture = true, rescue_press = true, preparry = false, preparry_range = 30, hp_preparry = true, dot_protect = true,
         accuracy = 50, accuracy_base = 50,
-        extra_distance = 0, ping_compensation = false, retry_delay = 1,
         random_accuracy = false, random_accuracy_amount = 10,
         target_mode = 1, target_method = "Angle", curve_mode = 1, random_curve = false,
         auto_ability = false, cooldown_protection = false,
@@ -664,7 +662,6 @@ do
     local H = { fire = nil, nc = nil, want = false, until_t = 0 }
 
     local function capMethod() return S.one_parry_capture and "Both" or "Namecall" end
-    Core.capture_method = capMethod
 
     local function restoreNc(original)
         local ok = pcall_(function()
@@ -697,7 +694,6 @@ do
             if differs then Core.cap.alt_key = alt end
         end
         Core.misses, Core.pending = 0, nil
-        Core.new_capture = { prev = prev }
         if Parry.onCapture then task.defer(pcall, Parry.onCapture, Core.cap) end
         DBG.ev((Core.cap.verified and "CAPTURE: real parry hash confirmed" or "CAPTURE: taken (real hash not readable)")
             .. (exact and ", key from the sender's own clock read (exact)" or ", key from the hook's clock read (may be a tick off)"))
@@ -748,7 +744,6 @@ do
         end)
         return ok and type(fn) == 'function' and fn or nil
     end
-    Core.isolated = false
     local NC_BODY = function(self, ...)
         if box.want then
             local n = select_("#", ...)
@@ -867,175 +862,6 @@ do
         local g = (getgenv and getgenv()) or {}
         return rawget(g, "getupvalues") or getupvalues or (debug and debug.getupvalues)
     end
-    function Util.rConnFn(c)
-        for _, k in ipairs({ "Function", "function" }) do
-            local ok, f = pcall(function() return c[k] end)
-            if ok and type(f) == "function" then return f end
-        end
-        return nil
-    end
-    function Util.rIsNet(v)
-        if typeof(v) ~= "table" then return false end
-        local re; pcall(function() re = rawget(v, "RemoteEvent") or v.RemoteEvent end)
-        return type(re) == "function"
-    end
-    function Util.rClass(v)
-        local t = typeof(v)
-        if t == "string" then return ("string(#%d)%s"):format(#v, #v == 36 and " <-- hash?" or "") end
-        if t == "Instance" then return ("Instance<%s \"%s\">"):format(v.ClassName, v.Name) end
-        if t == "function" then
-            local ok, s = pcall(function() return debug.info(v, "s") end)
-            return "function" .. (ok and (" @" .. tostring(s)) or "")
-        end
-        if t == "table" then return Util.rIsNet(v) and "table <-- Net?" or "table" end
-        return t
-    end
-    function Util.rDump(fn, getups, label)
-        local ok, ups = pcall(getups, fn)
-        if not ok or type(ups) ~= "table" then logp(("reflect: getupvalues(%s) failed: %s"):format(label, tostring(ups))); return false end
-        local n = 0
-        for i, v in pairs(ups) do
-            n = n + 1
-            logp(("   %s up[%s] = %s"):format(label, tostring(i), Util.rClass(v)))
-            if typeof(v) == "table" and not Util.rIsNet(v) then
-                local ok2 = pcall(function()
-                    local c = 0
-                    for k, vv in pairs(v) do
-                        c = c + 1; if c > 6 then break end
-                        logp(("       .%s = %s"):format(tostring(k), Util.rClass(vv)))
-                    end
-                end)
-            end
-        end
-        if n == 0 then logp(("reflect: %s has no upvalues (maybe stripped)"):format(label)) end
-        return true
-    end
-    function Util.rTrunc(s) s = tostring(s); return #s > 64 and (s:sub(1, 64) .. "..") or s end
-    function Util.rConsts(fn, label)
-        local gc = debug and debug.getconstants
-        if type(gc) ~= "function" then return false end
-        local ok, cs = pcall(gc, fn)
-        if not ok or type(cs) ~= "table" then return true end
-        local out, n = {}, 0
-        for _, c in pairs(cs) do
-            if type(c) == "string" and #c > 0 then n = n + 1; out[#out + 1] = Util.rTrunc(c); if n >= 48 then break end end
-        end
-        if #out > 0 then logp(("reflect: %s consts: %s"):format(label, table.concat(out, " | "))) end
-        return true
-    end
-    function Util.rDeep(v31, getups)
-        local ok, ups = pcall(getups, v31)
-        if not ok or type(ups) ~= "table" then return end
-        for i, v in pairs(ups) do
-            if type(v) == "string" then logp(("reflect: up[%s] value = %s"):format(tostring(i), Util.rTrunc(v))) end
-            if typeof(v) == "table" and not Util.rIsNet(v) then
-                pcall(function()
-                    local idx, tbl = v[1], v[2]
-                    if type(tbl) == "table" and idx ~= nil then
-                        logp(("reflect: up[%s] uid-holder? [1]=%s [3]=%s -> [2][[1]]=%s"):format(
-                            tostring(i), tostring(idx), Util.rTrunc(v[3]), Util.rTrunc(tbl[idx])))
-                    end
-                end)
-            end
-            if Util.rIsNet(v) then
-                pcall(function()
-                    local ks = {}
-                    for k in pairs(v) do ks[#ks + 1] = tostring(k); if #ks >= 14 then break end end
-                    logp(("reflect: up[%s] (Net) keys: %s"):format(tostring(i), table.concat(ks, ", ")))
-                end)
-            end
-        end
-        local gotc = Util.rConsts(v31, "v31")
-        if not gotc then logp("reflect: debug.getconstants unavailable") end
-        local gp = debug and debug.getprotos
-        if type(gp) == "function" then
-            local ok2, ps = pcall(gp, v31)
-            if ok2 and type(ps) == "table" then
-                logp(("reflect: v31 has %d nested proto(s)"):format(#ps))
-                for pi, pf in ipairs(ps) do Util.rConsts(pf, "proto#" .. pi); if pi >= 6 then break end end
-            end
-        else
-            logp("reflect: debug.getprotos unavailable")
-        end
-    end
-    function Parry.reflectProbe()
-        local getups = Util.rGetUps()
-        if type(getups) ~= "function" then logp("reflect: getupvalues NOT available on this executor"); return end
-        local function clean(s) return (tostring(s):gsub("[^%w]", "")) end
-        local pry
-        pcall(function()
-            local c = ReplicatedStorage:FindFirstChild("Controllers")
-            local sc = c and c:FindFirstChild("SwordsController")
-            pry = sc and sc:FindFirstChild("PRY")
-        end)
-        if not pry then
-            pcall(function()
-                for _, d in ipairs(ReplicatedStorage:GetDescendants()) do
-                    if d:IsA("ModuleScript") and clean(d.Name):upper() == "PRY" then
-                        local p = d.Parent
-                        if p and clean(p.Name):find("[Ss]word") then pry = d; break end
-                        pry = pry or d
-                    end
-                end
-            end)
-        end
-        if pry then
-            logp(("reflect: found module '%s' at %s"):format(pry.Name, pry:GetFullName()))
-            logp("reflect: name bytes = " .. table.concat({ string.byte(pry.Name, 1, math.min(#pry.Name, 20)) }, ","))
-            logp("reflect: requiring (cached, read-only)...")
-            local ok, v31 = pcall(require, pry)
-            if not ok then
-                logp("reflect: require(PRY) errored: " .. tostring(v31))
-            elseif type(v31) == "function" then
-                logp("reflect: PRY returned a FUNCTION (the sender). Upvalues:")
-                Util.rDump(v31, getups, "v31")
-                Util.rDeep(v31, getups)
-                logp("reflect: done (read-only, nothing called/fired). Send me these lines.")
-                return
-            elseif type(v31) == "table" then
-                logp("reflect: PRY returned a TABLE; dumping its function fields' upvalues:")
-                local c = 0
-                for k, vv in pairs(v31) do
-                    if type(vv) == "function" then c = c + 1; Util.rDump(vv, getups, "PRY." .. tostring(k)) end
-                    if c > 8 then break end
-                end
-                logp("reflect: done (read-only). Send me these lines.")
-                return
-            else
-                logp("reflect: PRY returned a " .. typeof(v31) .. " (unexpected).")
-            end
-        else
-            logp("reflect: ReplicatedStorage.Controllers.SwordsController.PRY not found (path changed?)")
-        end
-        local getconns = getconnections
-        if type(getconns) ~= "function" then logp("reflect: getconnections unavailable; cannot fall back"); return end
-        local ok, conns = pcall(getconns, UserInputService.InputBegan)
-        if not ok or type(conns) ~= "table" then logp("reflect: getconnections(InputBegan) failed: " .. tostring(conns)); return end
-        logp(("reflect: fallback -- scanning %d InputBegan handlers (read-only)..."):format(#conns))
-        local seen, found = {}, {}
-        local function scan(fn, depth)
-            if depth > 6 or type(fn) ~= "function" or seen[fn] then return end
-            seen[fn] = true
-            local ok2, ups = pcall(getups, fn)
-            if not ok2 or type(ups) ~= "table" then return end
-            local has36, hasNet = false, false
-            for _, v in pairs(ups) do
-                if typeof(v) == "string" and #v == 36 then has36 = true end
-                if Util.rIsNet(v) then hasNet = true end
-            end
-            if has36 and hasNet then found[#found + 1] = fn end
-            for _, v in pairs(ups) do if type(v) == "function" then scan(v, depth + 1) end end
-        end
-        for _, c in ipairs(conns) do local f = Util.rConnFn(c); if f then scan(f, 0) end end
-        if #found == 0 then
-            logp("reflect: fallback found no sender candidate either. Send me the PRY lines above.")
-            return
-        end
-        logp(("reflect: fallback found %d candidate(s):"):format(#found))
-        for n, fn in ipairs(found) do Util.rDump(fn, getups, "cand" .. n); if n >= 2 then break end end
-        logp("reflect: done (read-only). Send me these lines.")
-    end
-
     function Util.findPry()
         local function clean(s) return (tostring(s):gsub("[^%w]", "")) end
         local p
@@ -1403,7 +1229,6 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
     end
     function Core.ap_gap(ball) return contactGap(ball) + 1.5 end
     local Pred, AP = { prior = {}, buf = 0.08, buf_n = 0, hist = setmetatable({}, { __mode = 'k' }) }, {}
-    Util.SIM_DT = 1 / 120
     function Pred.priorK(speed)
         local p = Pred.prior
         if #p < 4 then return 6, 2.5, math.max(16, speed * 0.05) end
@@ -1677,8 +1502,8 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
             local e = straight
             res.lo, res.mid, res.hi = e * 0.97, e, e * 1.03 + 0.004
             if tv then
-                local vm = tv.Magnitude
-                res.lo, res.hi = res.lo * speed / (speed + vm), res.hi * speed / math.max(speed - vm, speed * 0.4)
+                local vu = math.min(tv.Magnitude, 16) * 0.5
+                res.lo, res.hi = res.lo * speed / (speed + vu), res.hi * speed / math.max(speed - vu, speed * 0.5)
             end
             res.k, res.straight_in = f and f.a, true
             return res
@@ -1712,10 +1537,13 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         local hi = Pred.run(p, dir, speed, 0, tp, tv, gap, hz + 1.5, mdl, alo, b * (alo / math.max(a, 1e-3)), tau0, nil, minH)
         res.mid = math.max(mid or (ahi_t > 0 and math.min(ahi_t, hz + 1)) or hz + 1, res.lo)
         res.hi = math.max(hi or math.huge, ahi_t, res.mid)
+        if heading >= 0.985 and res.hi < math.huge then
+            res.hi = math.min(res.hi, math.max(res.mid * 1.08 + 0.02, straight * 1.15 + 0.02))
+        end
         if tv then
-            local vm = tv.Magnitude
-            res.lo = res.lo * speed / (speed + vm)
-            if res.hi < math.huge then res.hi = res.hi * speed / math.max(speed - vm, speed * 0.4) end
+            local vu = math.min(tv.Magnitude, 16) * 0.5
+            res.lo = res.lo * speed / (speed + vu)
+            if res.hi < math.huge then res.hi = res.hi * speed / math.max(speed - vu, speed * 0.5) end
         end
         res.fresh = T and #T.s or 0
         return res
@@ -1865,18 +1693,6 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
             elseif e.who == partner then theirs = theirs + 1 end
         end
         return mine >= 1 and (theirs + unknown) >= 1
-    end
-    function Util.returnsToUs(their, root, partner, gap)
-        local to = root.Position - their.Position
-        local m = to.Magnitude
-        if m < 0.5 or their.CFrame.LookVector:Dot(to / m) > 0.5 then return true end
-        for _, model in ipairs(Alive:GetChildren()) do
-            if model.Name ~= me and model.Name ~= partner then
-                local hrp = model:FindFirstChild('HumanoidRootPart')
-                if hrp and (hrp.Position - their.Position).Magnitude < gap then return false end
-            end
-        end
-        return true
     end
     local function clashOn(ball, root, now, held)
         local st = ballState(ball)
@@ -2248,7 +2064,7 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
 
     AP.net = { win = {}, at = -1, echo_rem = {}, echo_key = {} }
     AP.cal = { res = {}, bias = 0, n = 0, uses = {} }
-    AP.MARGIN_EARLY, AP.MARGIN_LATE, AP.CLOSE = 0.02, 0.03, 0.045
+    AP.MARGIN_EARLY, AP.MARGIN_LATE, AP.CLOSE, AP.CLOSE_STUDS, AP.LEAN = 0.02, 0.03, 0.06, 3, 0.7
     function AP.netTick(now)
         local N = AP.net
         if now - N.at < 0.05 then return end
@@ -2282,7 +2098,12 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         return math.max(lo + add, 0), math.max(med + add, 0), math.max(hi + add, 0)
     end
     function AP.closeness()
+        if S.smart_timing then return 0 end
         return math.clamp(((S.accuracy or 50) - 1) / 99, 0, 1)
+    end
+    function AP.closeMargin(speed, r_mid, r_hi)
+        local jit = math.max(r_hi - r_mid, 0)
+        return math.min(math.max(AP.CLOSE, jit * 2 + 0.03, AP.CLOSE_STUDS / math.max(speed or 100, 1)), 0.2)
     end
     function AP.plan(E, r_lo, r_mid, r_hi, W)
         local b = AP.cal.bias
@@ -2292,7 +2113,11 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         local slack = W - (A_hi - A_lo) - me_ - ml
         local c = AP.closeness()
         local e = me_
-        if slack > 0 then e = me_ + slack * 0.5 * (1 - c) + math.min(slack * 0.5, AP.CLOSE) * c end
+        if slack > 0 then
+            local safe = slack * AP.LEAN
+            local close = math.min(safe, AP.closeMargin(E.speed, r_mid, r_hi))
+            e = me_ + close + (safe - close) * (1 - c)
+        end
         if A_lo <= me_ + step then return "must", A_lo, A_mid, A_hi, e end
         if slack > 0 and A_lo <= e + step then return slack < 0.1 and "tight" or "planned", A_lo, A_mid, A_hi, e end
         return nil, A_lo, A_mid, A_hi, e
@@ -2405,29 +2230,36 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         L[#L + 1] = flight <= r.straight * 1.6 + 0.12
         if #L > 6 then table.remove(L, 1) end
     end
-    function AP.straightReturns(X)
+    function AP.returnStyle(X)
         local L = AP.ret[X]
-        if not L or #L < 2 then return false end
+        if not L or #L < 2 then return nil end
         local fast = 0
         for _, f in ipairs(L) do if f then fast = fast + 1 end end
-        return fast >= #L * 0.7
+        return fast / #L
     end
+    function AP.straightReturns(X) local f = AP.returnStyle(X); return f ~= nil and f >= 0.7 end
+    AP.DOT_RANGE = 20
     function AP.anticipate(ball, st, root, now)
         local duel = AP.alive() == 2
-        if not (S.preparry or (S.hp_preparry and duel and AP.rtt() >= 0.08)) then return end
+        local pre = S.preparry or (S.hp_preparry and duel and AP.rtt() >= 0.08)
+        if not (pre or S.dot_protect) then return end
         if st.preparried then
             if now < st.preparry_until then return end
             st.preparried = false
         end
         local X = st.target
         if type(X) ~= 'string' or X == '' or X == me or st.hold then return end
-        if not AP.straightReturns(X) then return end
         if not Core.cap and S.parry_mode ~= "Keypress" then return end
         if blocked(ball) or Util.hasClash(ball, now) or not gateOpen() then return end
         local their = charRoot(X)
         if not their then return end
         local gap = (their.Position - root.Position).Magnitude
-        if not duel and (gap > (S.preparry_range or 30) or not AP.likelyNext(X, st, root, their)) then return end
+        local dot = S.dot_protect and gap <= AP.DOT_RANGE
+        local style = AP.returnStyle(X)
+        if dot then
+            if style ~= nil and style < 0.5 then return end
+        elseif not (style ~= nil and style >= 0.7) then return end
+        if not duel and ((not dot and gap > (S.preparry_range or 30)) or not AP.likelyNext(X, st, root, their)) then return end
         local kind = AP.kind()
         local r_lo, r_mid, r_hi = AP.reach(kind)
         local W = parryWin() or 0.5
@@ -2443,7 +2275,7 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         local verdict, A_lo, A_mid, A_hi, e = AP.plan(R, r_lo, r_mid, r_hi, W)
         if not verdict or (verdict == "must" and A_mid < 0) then return end
         local info = AP.info(R, A_lo, A_mid, A_hi, e, r_mid)
-        if fire(st, now, ("pre-parry (%s returns it)"):format(X), info, ball) then
+        if fire(st, now, (dot and "dot protection (%s is point blank)" or "pre-parry (%s returns it)"):format(X), info, ball) then
             st.preparried, st.preparry_until = true, now + r_hi + W + 0.15
             Core.pending, Core.watch = nil, nil
             if AP.shot then AP.shot.pre = true end
@@ -3668,9 +3500,14 @@ Gui.AP:AddToggle("UnlockFPS", {
 })
 
 Gui.APS = Gui.Tabs.Parry:AddRightGroupbox("Timing", "sliders-horizontal")
+Gui.APS:AddToggle("SmartTiming", {
+    Text = "Smart timing (ignores Accuracy)", Default = false,
+    Tooltip = "Picks the safest moment for every ball by itself: early in the parry window whenever the ball's arrival is known well enough (lag spikes make balls land sooner, so it leaves more room on that side), the last safe moment only for curves it can't be sure about. Accuracy and Randomize do nothing while this is on.",
+    Callback = function(v) S.smart_timing = v end,
+})
 Gui.APS:AddSlider("Accuracy", {
     Text = "Accuracy", Default = 50, Min = 1, Max = 100, Rounding = 0,
-    Tooltip = "How close to the ball the parry goes up. 100 = right before it lands, with only a small safety margin. 1 = the middle of the parry, the most room for lag spikes either way. In between moves evenly from one to the other. A curve the prediction isn't sure about waits until the last safe moment at any setting.",
+    Tooltip = "How close to the ball the parry goes up. 100 = just before it lands: a small safety margin that is never under 3 studs of the ball's travel or twice your ping jitter, so slow and fast balls both stay safe. 1 = early in the parry, the most room for lag spikes (leaning to the side they push the ball). A curve the prediction isn't sure about waits until the last safe moment at any setting.",
     Callback = function(v) S.accuracy_base = v; Parry.roll() end,
 })
 Gui.APS:AddToggle("RandomAccuracy", { Text = "Randomize accuracy", Default = false, Callback = function(v) S.random_accuracy = v; Parry.roll() end })
@@ -3755,6 +3592,11 @@ Gui.PP:AddToggle("PreParry", {
 Gui.PP:AddSlider("PreParryRange", {
     Text = "Pre-parry range", Default = 30, Min = 8, Max = 80, Rounding = 0, Suffix = " studs",
     Callback = function(v) S.preparry_range = v end,
+})
+Gui.PP:AddToggle("DotProtect", {
+    Text = "Dot protection", Default = true,
+    Tooltip = "A player within 20 studs has the ball and their straight point-blank return (a dot) would land faster than your ping lets you react: parry ahead of it, the same frame it becomes possible. Skipped against a player whose recent returns were curves (those get parried normally).",
+    Callback = function(v) S.dot_protect = v end,
 })
 Gui.PP:AddToggle("HighPingPreParry", {
     Text = "Auto pre-parry at high ping", Default = true,
