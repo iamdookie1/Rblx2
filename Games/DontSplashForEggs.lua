@@ -282,28 +282,88 @@ end
 --// Moving \\--
 local Move = { busy = false }
 do
-    -- Fly in a straight line at FlySpeed (held every frame, so nothing trips you on
-    -- the way). Returns false if `still` stopped it.
+    -- Is the straight line a -> b free of solid things (a ball about your size)?
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.RespectCanCollide = true
+    local RADIUS = 1.75
+    local function clear(a, b)
+        local d = b - a
+        if d.Magnitude < 0.05 then
+            return true
+        end
+        local skip = {}
+        for _, plr in Players:GetPlayers() do
+            if plr.Character then
+                table.insert(skip, plr.Character)
+            end
+        end
+        params.FilterDescendantsInstances = skip
+        local ok, hit = pcall(Workspace.Spherecast, Workspace, a, RADIUS, d, params)
+        if not ok then
+            ok, hit = pcall(Workspace.Raycast, Workspace, a, d, params)
+        end
+        return not (ok and hit)
+    end
+    -- A way there that doesn't go into or through walls: straight if it's clear,
+    -- else up over whatever is in the way and back down, else round the side.
+    -- Returns the points to fly through (the last one is `pos`).
+    function Move.route(from, pos)
+        if clear(from, pos) then
+            return { pos }
+        end
+        local top = math.max(from.Y, pos.Y)
+        for h = top + 8, top + 400, 12 do
+            local a = Vector3.new(from.X, h, from.Z)
+            local b = Vector3.new(pos.X, h, pos.Z)
+            if clear(from, a) and clear(a, b) and clear(b, pos) then
+                return { a, b, pos }
+            end
+        end
+        local flat = Vector3.new(pos.X - from.X, 0, pos.Z - from.Z)
+        local side = flat.Magnitude > 0.1 and flat.Unit:Cross(Vector3.yAxis) or Vector3.xAxis
+        local mid = from:Lerp(pos, 0.5)
+        for _, off in { 25, -25, 50, -50, 90, -90, 150, -150 } do
+            for _, up in { 0, 20, 50 } do
+                local w = mid + side * off + Vector3.new(0, up, 0)
+                if clear(from, w) and clear(w, pos) then
+                    return { w, pos }
+                end
+            end
+        end
+        return nil
+    end
+    -- Fly there at FlySpeed (held every frame, so nothing trips you on the way),
+    -- going round walls instead of through them. Returns false if `still` stopped it
+    -- or there's no open way there.
     function Move.to(pos, still)
         local root = myRoot()
         if not (root and pos) then
             return false
         end
+        local path = Move.route(root.Position, pos)
+        if not path then
+            Move.info = "No open way there (walls all round)"
+            return false
+        end
+        local speed = math.max(Settings.FlySpeed, 10)
         local from = root.Position
-        local dist = (pos - from).Magnitude
-        local t, total = 0, dist / math.max(Settings.FlySpeed, 10)
-        while t < total do
-            if still and not still() then
-                return false
+        for _, to in path do
+            local t, total = 0, (to - from).Magnitude / speed
+            while t < total do
+                if still and not still() then
+                    return false
+                end
+                local r = myRoot()
+                if not r then
+                    return false
+                end
+                t += RunService.Heartbeat:Wait()
+                local p = from:Lerp(to, math.min(t / total, 1))
+                r.AssemblyLinearVelocity = Vector3.zero
+                r.CFrame = CFrame.new(p) * r.CFrame.Rotation
             end
-            local r = myRoot()
-            if not r then
-                return false
-            end
-            t += RunService.Heartbeat:Wait()
-            local p = from:Lerp(pos, math.min(t / total, 1))
-            r.AssemblyLinearVelocity = Vector3.zero
-            r.CFrame = CFrame.new(p) * r.CFrame.Rotation
+            from = to
         end
         return true
     end
@@ -1648,7 +1708,9 @@ do
     goButton(T, "My pen", function()
         local s = Game.penSpot()
         if s then
-            Move.to(s)
+            if not Move.to(s) then
+                notify("No open way there: walls all round")
+            end
         end
     end)
     goButton(T, "Hub", function()
@@ -1656,7 +1718,9 @@ do
         local hub = map and map:FindFirstChild("Hub")
         local spot = hub and (pivotOf(hub:FindFirstChild("FreeGift")) or pivotOf(hub:FindFirstChild("SpinWheel")))
         if spot then
-            Move.to(spot + Vector3.new(6, 5, 0))
+            if not Move.to(spot + Vector3.new(6, 5, 0)) then
+                notify("No open way there: walls all round")
+            end
         end
     end)
     for _, name in BIOMES do
@@ -1665,7 +1729,9 @@ do
             local s = z and z:GetAttribute("ZStart")
             if s then
                 Game.stream(Vector3.new(0, 62, s - 20), 2)
-                Move.to(Vector3.new(0, 68, s - 15))
+                if not Move.to(Vector3.new(0, 68, s - 15)) then
+                    notify("No open way there: walls all round")
+                end
             else
                 notify(name .. " isn't loaded or open yet")
             end
