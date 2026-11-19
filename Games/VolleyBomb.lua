@@ -66,7 +66,7 @@ end
 
 local Settings = {
     -- play
-    AutoHit = false, AutoServe = false, ServeDelay = 0.5, AutoMove = false, AutoSpike = false, WaitPerfect = true,
+    AutoHit = false, HitAnims = true, AutoServe = false, ServeDelay = 0.5, AutoMove = false, AutoSpike = false, WaitPerfect = true,
     AutoDive = false, BlastDodge = false, BackToMiddle = false, LeaveToTeammate = false,
     -- aim
     AimMode = "Hardest to save", AimFocus = "Anyone", ReachExtra = 0,
@@ -704,15 +704,82 @@ local function nextFrameOk(c, kind)
     return true, dy2
 end
 
-local function playTrack(kind)
-    local tracks = BC._tracks
-    local tr = tracks and tracks[kind]
+--// Swing animations \\--
+-- The game's own bump / spike animations (Ball.Animations), loaded on your character's
+-- Animator like the game does (Action4), so everyone sees you swing. A bump starts a
+-- moment before the ball gets to you, like a player clicking a little early; a hit right
+-- after doesn't restart it.
+local Anim = { tracks = {}, char = nil, last = {} }
+local SWING = { Bump = 0.35, Spike = 0.3 }
+function Anim.track(kind)
+    local char = LocalPlayer.Character
+    if Anim.char ~= char then
+        for _, t in Anim.tracks do
+            pcall(t.Destroy, t)
+        end
+        Anim.tracks, Anim.char, Anim.last = {}, char, {}
+    end
+    local t = Anim.tracks[kind]
+    if t then
+        return t
+    end
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    local animator = hum and hum:FindFirstChildOfClass("Animator")
+    local id = Ball and Ball.Animations and Ball.Animations[kind]
+    if animator and id then
+        local a = Instance.new("Animation")
+        a.AnimationId = "rbxassetid://" .. tostring(id)
+        local ok, tr = pcall(animator.LoadAnimation, animator, a)
+        if ok and tr then
+            tr.Priority = Enum.AnimationPriority.Action4
+            Anim.tracks[kind] = tr
+            return tr
+        end
+    end
+    return BC and BC._tracks and BC._tracks[kind]
+end
+function Anim.play(kind, early)
+    local window = SWING[kind]
+    if not (Settings.HitAnims and window) then
+        return
+    end
+    local last = Anim.last[kind]
+    if last and os.clock() - last < window then
+        return
+    end
+    Anim.last[kind] = os.clock()
+    local tr = Anim.track(kind)
     if tr then
         pcall(tr.Play, tr)
     end
-    if kind == "Spike" and tracks and tracks.Jump then
-        pcall(tracks.Jump.Stop, tracks.Jump)
+    if kind == "Spike" then
+        local jump = BC._tracks and BC._tracks.Jump
+        if jump then
+            pcall(jump.Stop, jump)
+        end
     end
+    if early then
+        -- the game counts you as mid-swing too (no dive or grounded ability over it)
+        BC._swingEnd = math.max(BC._swingEnd or 0, os.clock() + window)
+    end
+end
+table.insert(Cleanups, function()
+    for _, t in Anim.tracks do
+        pcall(t.Stop, t)
+        pcall(t.Destroy, t)
+    end
+end)
+-- Will the ball be in reach a moment from now?
+local function soonInReach(c, kind, dt)
+    local p2 = c.ballPos
+    if c.pred.path then
+        p2 = Ball.Contain(posAt(c.pred, c.now + dt))
+    end
+    if Ball.ZoneAt(c.zones, p2) ~= c.myZone then
+        return false
+    end
+    local root2 = c.root.Position + c.root.AssemblyLinearVelocity * dt
+    return (Ball.Reach(kind, root2, c.char) - p2).Magnitude <= (Ball.Ranges[kind] or 7) + Ball.Radius + Settings.ReachExtra
 end
 local function doHit(c, kind, resolved, q)
     local d, limit, point = reachOf(c, resolved)
@@ -735,18 +802,19 @@ local function doHit(c, kind, resolved, q)
         return false
     end
     Play.hits += 1
+    BC._swingEnd = 0
     if resolved == "Spike" then
         Play.spikes += 1
         BC._spiked = true
         if q >= 0.9 then
             Play.perfects += 1
         end
-        playTrack("Spike")
+        Anim.play("Spike")
         Play.lastAction = q >= 0.9 and "Perfect spike" or ("Spike (" .. math.floor(q * 100) .. "%)")
     elseif resolved == "Bump" then
         Play.bumps += 1
         BC._lastBump = c.now
-        playTrack("Bump")
+        Anim.play("Bump")
         Play.lastAction = "Bump"
     end
     if dir and Aim.info then
@@ -816,14 +884,18 @@ local function tryHit(c, plan)
         return false
     end
     if c.grounded then
+        if c.now - (BC._lastBump or 0) < (Ball.BumpCooldown or 0.5) then
+            return false
+        end
+        local holding = plan and plan.kind == "Spike" and plan.t - c.now > 0.08
         local d, limit = reachOf(c, "Bump")
         if d > limit + math.max(Settings.ReachExtra, 0) then
+            if not holding and soonInReach(c, "Bump", 0.1) then
+                Anim.play("Bump", true)
+            end
             return false
         end
-        if plan and plan.kind == "Spike" and plan.t - c.now > 0.08 and nextFrameOk(c, "Bump") then
-            return false
-        end
-        if c.now - (BC._lastBump or 0) < (Ball.BumpCooldown or 0.5) then
+        if holding and nextFrameOk(c, "Bump") then
             return false
         end
         return doHit(c, "Bump", "Bump", 1)
@@ -1796,6 +1868,7 @@ do
     local Tab = Window:AddTab("Play", "volleyball", "Auto hit, spikes, serves")
     local A = Tab:AddLeftGroupbox("Auto play", "play")
     toggle(A, "AutoHit", "Auto hit", "Hits the ball the moment it's in reach in your zone, with the game's own hit")
+    toggle(A, "HitAnims", "Swing animations", "Plays the game's bump and spike animations on auto hits, so you look like you're swinging")
     toggle(A, "AutoMove", "Move to the ball", "Walks you to where you can hit the ball when it's coming to your zone")
     toggle(A, "AutoSpike", "Perfect spikes", "Jumps at the right time so the ball is at the top of your jump: a Perfect spike")
     toggle(A, "WaitPerfect", "Wait for perfect", "In the air, only spikes once it's Perfect (unless it's the last chance)")
