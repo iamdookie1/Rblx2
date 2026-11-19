@@ -69,6 +69,10 @@ local Games = {
     [70451556031302] = { Name = 'Fisch (Deep Sea, Sea 2)', Script = 'Games/Fisch.lua' },
     -- Potato fries shop (game 10767380385, place "Map1"), from its dump's own place id.
     [139542527731344] = { Name = 'Fries shop', Script = 'Games/PotatoFries.lua' },
+    -- Volley Bomb (game 10774204862): the New Players place its dump came from,
+    -- and the Pro place its own BallEscalation module names.
+    [125848858933944] = { Name = 'Volley Bomb (new players)', Script = 'Games/VolleyBomb.lua' },
+    [97790681249268] = { Name = 'Volley Bomb (pro)', Script = 'Games/VolleyBomb.lua' },
     -- ROB IT (game 9472441390): every heist map runs in this one place, from
     -- the game's own modules.Maps; 82316016871591 is the same game's test place.
     [83907398368798] = { Name = 'ROB IT', Script = 'Games/RobIt.lua' },
@@ -163,6 +167,7 @@ local GameIds = {
     [10768845402] = { Name = 'RoChess', Script = 'Games/RoChess.lua' },
     [1335695570] = { Name = 'Ninja Legends', Script = 'Games/NinjaLegends.lua' },
     [10769958564] = { Name = 'Math Wars', Script = 'Games/MathWars.lua' },
+    [10774204862] = { Name = 'Volley Bomb', Script = 'Games/VolleyBomb.lua' },
 }
 
 -- Games whose other modes (ranked, duels, events...) each have their own place
