@@ -71,14 +71,14 @@ local GEAR_BUY = { "Pebbles", "SplashShield", "GhostCloak", "Incubator5", "Incub
 local Settings = {
     -- eggs
     EggFarm = false, EggMinRarity = "Common", EggPick = "Best value", EggBiomes = {}, GrabDropped = true, AutoPlant = true,
-    MoveMethod = "Teleport", FlySpeed = 160,
+    FlySpeed = 160,
     -- steal
     StealAura = false, StealTravel = false, StealMinRarity = "Rare",
     -- safety
-    NoSplash = true, WalkOnWater = true, AntiFling = true, RunFromGuardians = false, RunRange = 25,
+    WalkOnWater = true, AntiFling = true, RunFromGuardians = false, RunRange = 25,
     AutoCloak = false, AutoPebbles = false,
     -- combo
-    InfCombo = false, ComboMethod = "Teleport hop", ComboRate = 3, ComboBankAt = 0, AutoTricks = false,
+    InfCombo = false, ComboMethod = "Teleport hop", ComboRate = 4, ComboBankAt = 0, AutoTricks = false,
     -- base
     AutoCollect = false, CollectEvery = 5, AutoTrain = false, AutoBarbell = false, AutoRebirth = false, AutoEquipBest = false,
     AutoSell = false, SellUpTo = "Common", AutoPenUpgrade = false, AutoTreasure = false,
@@ -282,17 +282,12 @@ end
 --// Moving \\--
 local Move = { busy = false }
 do
-    -- Teleport, or fly in a straight line at FlySpeed (held every frame, so nothing
-    -- trips you on the way). Returns false if `still` stopped it.
+    -- Fly in a straight line at FlySpeed (held every frame, so nothing trips you on
+    -- the way). Returns false if `still` stopped it.
     function Move.to(pos, still)
         local root = myRoot()
         if not (root and pos) then
             return false
-        end
-        if Settings.MoveMethod == "Teleport" then
-            root.AssemblyLinearVelocity = Vector3.zero
-            root.CFrame = CFrame.new(pos) * root.CFrame.Rotation
-            return true
         end
         local from = root.Position
         local dist = (pos - from).Magnitude
@@ -359,121 +354,98 @@ local function startJob(name, fn)
     end)
 end
 
---// Safety: no splash, walk on water, anti-fling \\--
+--// Safety: walk on water, anti-fling \\--
 do
-    -- No splash: the WaterSense script is the only thing that tells the server you're
-    -- in the water. Switched off, the guardians never hear a splash.
-    local sense
-    local function waterSense()
-        if sense and sense.Parent then
-            return sense
-        end
-        local ps = LocalPlayer:FindFirstChild("PlayerScripts")
-        sense = ps and ps:FindFirstChild("WaterSense")
-        return sense
+    -- Walk on water: an invisible floor (only on your side) sits on top of every
+    -- liquid, so you stand on it instead of sinking and slowing down. Liquids are
+    -- what the game's own WaterSense counts: every part in a biome's Water folder,
+    -- whatever it's called (lava, slime, ...), plus anything with a Liquid attribute
+    -- or Water material. Biomes stream in and out, so it keeps looking.
+    local floors = {} -- liquid part -> our floor part
+    local found = setmetatable({}, { __mode = "k" })
+    local lastDeep = 0
+    local function isLiquid(p)
+        return p:IsA("BasePart") and (p:GetAttribute("Liquid") ~= nil or p.Material == Enum.Material.Water)
     end
-    local blocked = false
-    local hooked = false
-    local function setSense(on)
-        local s = waterSense()
-        if s then
-            pcall(function()
-                s.Enabled = on
-            end)
-            pcall(function()
-                s.Disabled = not on
-            end)
-        end
-    end
-    -- If the script can't be switched off, its remote is blocked instead.
-    local function hookSense()
-        if hooked or typeof(hookmetamethod) ~= "function" or typeof(getnamecallmethod) ~= "function" then
-            return
-        end
-        local r = remote("WaterSense")
-        if not r then
-            return
-        end
-        hooked = true
-        local old
-        old = hookmetamethod(game, "__namecall", function(self, ...)
-            if self == r and blocked and not Unloaded then
-                local m = getnamecallmethod()
-                if m == "FireServer" then
-                    return nil
+    local function scanWater()
+        for _, z in Game.zones() do
+            for _, f in z:GetChildren() do
+                if f.Name == "Water" then
+                    if f:IsA("BasePart") then
+                        found[f] = true
+                    end
+                    for _, p in f:GetDescendants() do
+                        if p:IsA("BasePart") then
+                            found[p] = true
+                        end
+                    end
                 end
             end
-            return old(self, ...)
-        end)
+        end
+        -- the slower, full look every few seconds
+        if os.clock() - lastDeep > 4 then
+            lastDeep = os.clock()
+            local roots = { Workspace:FindFirstChild("Zones"), Workspace:FindFirstChild("Map") }
+            for _, r in roots do
+                for _, p in r and r:GetDescendants() or {} do
+                    if isLiquid(p) then
+                        found[p] = true
+                    end
+                end
+            end
+        end
     end
-    local function senseOn(s)
-        local ok, on = pcall(function()
-            return s.Enabled
-        end)
-        return ok and on ~= false
+    local function removeFloor(p)
+        local f = floors[p]
+        floors[p] = nil
+        if f then
+            pcall(f.Destroy, f)
+        end
+    end
+    local function clearFloors()
+        for p in floors do
+            removeFloor(p)
+        end
     end
     loop(1, function()
-        local s = waterSense()
-        if Settings.NoSplash then
-            blocked = true
-            -- (also catches the script loading late or the game turning it back on)
-            if s and senseOn(s) then
-                setSense(false)
-                if senseOn(s) then
-                    hookSense()
-                end
-            elseif not s then
-                hookSense()
+        if not Settings.WalkOnWater then
+            if next(floors) then
+                clearFloors()
             end
-        elseif blocked then
-            blocked = false
-            setSense(true)
+            return
         end
-    end)
-    table.insert(Cleanups, function()
-        blocked = false
-        setSense(true)
-    end)
-
-    -- Walk on water: every Water part is solid for you (only on your side), so you
-    -- stand on it instead of sinking and slowing down.
-    local solid = {}
-    local function waterParts()
-        local list = {}
-        for _, z in Game.zones() do
-            local w = z:FindFirstChild("Water")
-            for _, p in w and w:GetDescendants() or {} do
-                if p:IsA("BasePart") and p.Name == "Water" then
-                    table.insert(list, p)
+        scanWater()
+        for p in found do
+            if not p.Parent or not p:IsDescendantOf(Workspace) then
+                found[p] = nil
+                removeFloor(p)
+            else
+                local f = floors[p]
+                if not (f and f.Parent) then
+                    f = Instance.new("Part")
+                    f.Name = "WalkOnWaterFloor"
+                    f.Anchored = true
+                    f.CanCollide = true
+                    f.CanQuery = false
+                    f.CanTouch = false
+                    f.Transparency = 1
+                    f.CastShadow = false
+                    f.Parent = Workspace
+                    floors[p] = f
                 end
-            end
-        end
-        return list
-    end
-    loop(1.5, function()
-        if Settings.WalkOnWater then
-            for _, p in waterParts() do
-                if solid[p] == nil then
-                    solid[p] = p.CanCollide
-                    p.CanCollide = true
+                -- a slab whose top is the liquid's surface (WaterSense: below it = splash)
+                local size = Vector3.new(p.Size.X, 1, p.Size.Z)
+                local cf = CFrame.new(p.Position.X, p.Position.Y + p.Size.Y / 2 - 0.5, p.Position.Z)
+                if f.Size ~= size then
+                    f.Size = size
+                end
+                if f.CFrame ~= cf then
+                    f.CFrame = cf
                 end
             end
-        elseif next(solid) then
-            for p, was in solid do
-                pcall(function()
-                    p.CanCollide = was
-                end)
-            end
-            table.clear(solid)
         end
     end)
-    table.insert(Cleanups, function()
-        for p, was in solid do
-            pcall(function()
-                p.CanCollide = was
-            end)
-        end
-    end)
+    table.insert(Cleanups, clearFloors)
 
     -- Anti-fling: the game's handler that throws and ragdolls you is switched off.
     local flingOff = {}
@@ -554,8 +526,12 @@ loop(0.25, function()
         end
         if Settings.RunFromGuardians and Job.name ~= "Inf combo" and tryOnce("run", 2) then
             local spot = Game.penSpot()
-            if spot then
-                Move.to(spot)
+            if spot and not Move.busy then
+                Move.busy = true
+                task.spawn(function()
+                    Move.to(spot)
+                    Move.busy = false
+                end)
             end
         end
     end
@@ -821,15 +797,22 @@ function Steal.run(still)
 end
 
 --// Inf combo \\--
--- Hops platform to platform: each landing at least 6 studs from the last, no
--- platform again within 10 s, never longer than the 5 s timer between landings,
--- never touching water (no splash keeps the guardians away too). Three ways:
+-- Hops platform to platform. The game's rules (GameConfig.Combo): a landing counts
+-- after MinAir 0.3 s (the client lets 0.24 through), at least MinHop 6 studs from
+-- the last one, the same platform not again inside PlatformCooldown 10 s, and the
+-- Timer is 5 s between landings. Each platform's cooldown is tracked on its own, so
+-- it goes as fast as the air-time rule lets it as long as enough platforms are
+-- loaded (it borrows nearby biomes' platforms when one biome hasn't got enough).
 --   Teleport hop:  put you on the next platform and report the landing,
---   Real fall:     drop you onto it from 12 studs up so the game reports it itself,
+--   Real fall:     drop you onto it from just high enough so the game reports it,
 --   Report only:   report landings without moving you at all (if the server takes it).
 -- It watches what the server says back ("why" a landing didn't count) and moves to
 -- a slower way by itself when a faster one isn't counted.
 local Combo = { info = "Off", why = "-", landed = 0, sent = 0, banked = 0, lastBank = 0, lost = 0, best = 0 }
+local CC = type(Config.Combo) == "table" and Config.Combo or {}
+local COMBO_MINAIR = (tonumber(CC.MinAir) or 0.3) * 0.8 + 0.01
+local COMBO_MINHOP = (tonumber(CC.MinHop) or 6) + 0.5
+local COMBO_COOLDOWN = (tonumber(CC.PlatformCooldown) or 10) + 0.3
 do
     local r = remote("Combo")
     if r and r:IsA("RemoteEvent") then
@@ -871,114 +854,158 @@ local function platformsIn(zone)
             end
         end
     end
-    -- in order along the biome, so each hop is short but more than 6 studs
-    table.sort(out, function(a, b)
-        return a.top.Z > b.top.Z
-    end)
-    local spaced, last = {}, nil
-    for _, p in out do
-        if not last or (p.top - last.top).Magnitude >= 6.5 then
-            table.insert(spaced, p)
-            last = p
+    return out
+end
+-- The biome you're in (else the nearest with platforms), plus the next nearest
+-- biomes until there are enough platforms for the hop rate you asked for.
+local function comboPlatforms(root, gap)
+    local zones = {}
+    for _, z in Game.zones() do
+        local c = Game.zoneCenter(z)
+        local list = platformsIn(z)
+        if c and #list > 0 then
+            local d = (Game.zoneAt(root.Position) == z) and -1 or (c - root.Position).Magnitude
+            table.insert(zones, { zone = z, d = d, list = list })
         end
     end
-    return spaced
+    table.sort(zones, function(a, b)
+        return a.d < b.d
+    end)
+    local need = math.ceil(COMBO_COOLDOWN / gap) + 6
+    local plats, home = {}, nil
+    for _, z in zones do
+        home = home or z.zone
+        for _, p in z.list do
+            table.insert(plats, p)
+        end
+        if #plats >= need then
+            break
+        end
+    end
+    return plats, home
 end
 function Combo.run(still)
     local root = myRoot()
     if not root then
         return
     end
-    -- the biome you're in, else the nearest one with enough platforms
-    local zone = Game.zoneAt(root.Position)
-    local plats = zone and platformsIn(zone) or {}
-    if #plats < 4 then
-        local bestZ, bestD
-        for _, z in Game.zones() do
-            local c = Game.zoneCenter(z)
-            if c then
-                local d = (c - root.Position).Magnitude
-                if (not bestD or d < bestD) and #platformsIn(z) >= 4 then
-                    bestZ, bestD = z, d
-                end
-            end
-        end
-        zone = bestZ
-        plats = zone and platformsIn(zone) or {}
+    local function gapNow()
+        return math.max(1 / math.max(Settings.ComboRate, 0.5), COMBO_MINAIR)
     end
+    local plats, home = comboPlatforms(root, gapNow())
     if #plats < 4 then
         Combo.info = "No biome with platforms loaded near you: walk into one first"
         return
     end
     local methods = { "Report only", "Teleport hop", "Real fall" }
     local mi = table.find(methods, Settings.ComboMethod) or 2
-    local i = 0
+    local used = {} -- platform model -> when it last counted
+    local prev = nil
     local lastLand = 0
+    local refreshAt = os.clock() + 15
     local tries, landedAt = 0, Combo.landed
     local rem = remote("Combo")
+    -- off cooldown, far enough from the last one; longest-unused first, then nearest
+    local function pick()
+        local now = os.clock()
+        local best, bestUsed, bestD
+        for _, p in plats do
+            if p.model.Parent and p.part.Parent then
+                local u = used[p.model] or 0
+                local d = prev and (p.top - prev.top).Magnitude or 0
+                if now - u >= COMBO_COOLDOWN and (not prev or d >= COMBO_MINHOP) then
+                    if not best or u < bestUsed or (u == bestUsed and d < bestD) then
+                        best, bestUsed, bestD = p, u, d
+                    end
+                end
+            end
+        end
+        return best
+    end
+    local function waitUntil(t, spot)
+        if spot then
+            Move.hold(spot, math.max(t - os.clock(), 0), nil, still)
+        else
+            local left = t - os.clock()
+            if left > 0 then
+                task.wait(left)
+            end
+        end
+    end
     while still() do
         local count = tonumber(attr("ComboCount")) or 0
+        -- now and then pick up platforms that streamed in (or out)
+        if os.clock() > refreshAt then
+            refreshAt = os.clock() + 15
+            local r = myRoot()
+            if r then
+                local fresh = comboPlatforms(r, gapNow())
+                if #fresh >= 4 then
+                    plats = fresh
+                end
+            end
+        end
         -- bank: stop landing until the timer runs out and the combo pays
         if Settings.ComboBankAt > 0 and count >= Settings.ComboBankAt then
             Combo.info = ("Banking x%d..."):format(count)
-            local spot = plats[1].top + Vector3.new(0, 3, 0)
+            local spot = (prev or plats[1]).top + Vector3.new(0, 3, 0)
             Move.hold(spot, 6.5, function()
                 return (tonumber(attr("ComboCount")) or 0) == 0
             end, still)
         else
-            -- one platform each step, spaced so none comes back inside 10.5 s
-            local gap = math.max(1 / math.max(Settings.ComboRate, 0.5), 10.6 / #plats, 0.33)
-            i = i % #plats + 1
-            local p = plats[i]
+            local gap = gapNow()
+            local p = pick()
             local method = methods[mi]
-            if p.model.Parent and p.part.Parent then
+            if not p then
+                -- every platform is cooling down: wait for the first one back
+                Combo.info = ("Waiting on platforms (%d loaded)"):format(#plats)
+                task.wait(0.05)
+            else
+                local due = lastLand + gap
                 if method == "Report only" then
+                    waitUntil(due)
                     if rem then
                         rem:FireServer("land", p.part)
                     end
-                    Combo.sent += 1
-                    lastLand = os.clock()
-                    task.wait(gap)
                 elseif method == "Teleport hop" then
                     local spot = p.top + Vector3.new(0, 3, 0)
-                    Move.hold(spot, 0.12, nil, still)
-                    local wait = 0.31 - (os.clock() - lastLand)
-                    if wait > 0 then
-                        Move.hold(spot, wait, nil, still)
-                    end
+                    -- get there, sit for the rest of the air time, then land
+                    Move.hold(spot, 0.03, nil, still)
+                    waitUntil(math.max(due, os.clock()), spot)
                     if rem then
                         rem:FireServer("land", p.part)
                     end
-                    Combo.sent += 1
-                    lastLand = os.clock()
-                    Move.hold(spot, math.max(gap - 0.12, 0.02), nil, still)
                 else
-                    -- dropped from above: the game sees a real landing and reports it
+                    -- dropped from just high enough that the fall is a real landing
+                    local h = 0.5 * Workspace.Gravity * (COMBO_MINAIR + 0.02) ^ 2 + 3
+                    waitUntil(due - (COMBO_MINAIR + 0.02))
                     local r = myRoot()
                     if r then
                         r.AssemblyLinearVelocity = Vector3.zero
-                        r.CFrame = CFrame.new(p.top + Vector3.new(0, 12, 0))
+                        r.CFrame = CFrame.new(p.top + Vector3.new(0, h, 0))
                     end
                     local hum = myHum()
                     local t0 = os.clock()
                     repeat
                         RunService.Heartbeat:Wait()
-                    until not still() or (hum and hum.FloorMaterial ~= Enum.Material.Air and os.clock() - t0 > 0.2) or os.clock() - t0 > 1.2
-                    Combo.sent += 1
-                    lastLand = os.clock()
-                    task.wait(math.max(gap - (os.clock() - t0), 0.05))
+                    until not still() or (hum and hum.FloorMaterial ~= Enum.Material.Air and os.clock() - t0 > 0.15) or os.clock() - t0 > 1
                 end
-            end
-            -- not being counted? step down to a slower, more real way
-            tries += 1
-            if tries >= 10 then
-                if Combo.landed == landedAt and mi < #methods then
-                    mi += 1
-                    Combo.why ..= " → trying " .. methods[mi]
+                used[p.model] = os.clock()
+                prev = p
+                Combo.sent += 1
+                lastLand = os.clock()
+                -- not being counted? step down to a slower, more real way
+                tries += 1
+                if tries >= 12 then
+                    if Combo.landed == landedAt and mi < #methods then
+                        mi += 1
+                        Combo.why ..= " → trying " .. methods[mi]
+                    end
+                    tries, landedAt = 0, Combo.landed
                 end
-                tries, landedAt = 0, Combo.landed
+                Combo.info = ("%s · %.1f/s · x%d · +$%s waiting · %d counted of %d · %d platforms%s"):format(methods[mi], 1 / gap, count,
+                    comma(attr("ComboCash")), Combo.landed, Combo.sent, #plats, home and (" · " .. home.Name) or "")
             end
-            Combo.info = ("%s · x%d · +$%s waiting · %d counted of %d"):format(methods[mi], count, comma(attr("ComboCash")), Combo.landed, Combo.sent)
         end
     end
 end
@@ -1515,14 +1542,13 @@ do
     local Tab = Window:AddTab("Eggs", "egg", "Farm, steal, plant")
     local F = Tab:AddLeftGroupbox("Egg farm", "egg")
     jobToggle(F, "EggFarm", "Egg farm", "Auto egg farm", Eggs.farm,
-        "Goes to the best egg, grabs it, takes it to your pen and plants it, over and over. Turn on No splash first")
+        "Goes to the best egg, grabs it, takes it to your pen and plants it, over and over. Turn on Walk on water first")
     dropdown(F, "EggPick", "Pick", { "Best value", "Rarest", "Nearest" }, "Best value: what the pet will earn (the game's own formula)")
     dropdown(F, "EggMinRarity", "At least", RARITY_NAMES)
     multi(F, "EggBiomes", "Only these biomes", BIOMES, {}, "Leave empty for every biome")
     toggle(F, "GrabDropped", "Grab dropped eggs first", "Eggs other players dropped vanish after 15 s")
     toggle(F, "AutoPlant", "Plant in your pen by itself", "Plants the moment you walk into your pen with an egg")
-    dropdown(F, "MoveMethod", "Travel", { "Teleport", "Fly" }, "Fly goes in a straight line at the speed below")
-    slider(F, "FlySpeed", "Fly speed", 40, 500, 0, " studs/s")
+    slider(F, "FlySpeed", "Travel speed", 40, 500, 0, " studs/s", "Everything flies there in a straight line at this speed")
     status(F, function()
         return ("%s\nGrabbed %d · planted %d"):format(Eggs.info, Eggs.grabbed, Eggs.planted)
     end)
@@ -1543,8 +1569,7 @@ end
 do
     local Tab = Window:AddTab("Safety", "shield", "Splash, water, guardians")
     local W = Tab:AddLeftGroupbox("Water", "droplets")
-    toggle(W, "NoSplash", "No splash", "Your client is what tells the server you splashed: it's switched off, so the guardians never hear you")
-    toggle(W, "WalkOnWater", "Walk on water", "Water is solid for you: no sinking, no slowdown")
+    toggle(W, "WalkOnWater", "Walk on water", "An invisible floor on every liquid (water, lava, slime...) in every biome: no sinking, no slowdown, no splash")
     toggle(W, "AntiFling", "Anti-fling", "Guardian and bat hits don't throw or ragdoll you (the throw is done by your own client)")
     local G = Tab:AddRightGroupbox("Guardians", "skull")
     toggle(G, "RunFromGuardians", "Run home when chased", "Back to your pen when a guardian is chasing you")
@@ -1560,7 +1585,7 @@ do
         "Keeps your combo going forever: a new platform every hop (6+ studs apart, none again inside 10 s), never in the water")
     dropdown(C, "ComboMethod", "Way", { "Report only", "Teleport hop", "Real fall" },
         "Report only is fastest and doesn't move you; Teleport hop puts you on each platform; Real fall drops you on it. If one isn't counted it moves to the next by itself")
-    slider(C, "ComboRate", "Hops a second", 1, 3, 1, "", "Capped so no platform repeats inside its 10 s cooldown")
+    slider(C, "ComboRate", "Hops a second", 1, 4, 1, "", "Top speed is 4 (the game's minimum air time). Needs about 10 platforms per hop a second loaded; it borrows nearby biomes' platforms if needed")
     slider(C, "ComboBankAt", "Cash out at", 0, 500, 0, "x", "0 = never (combo grows forever). Otherwise it stops at this count and lets the timer pay it out")
     status(C, function()
         return ("%s\nServer says: %s\nBanked %d times · last $%s · broken %d"):format(Combo.info, Combo.why, Combo.banked, comma(Combo.lastBank), Combo.lost)
@@ -1619,7 +1644,7 @@ do
     toggle(E, "EspSteal", "Eggs you can steal")
     toggle(E, "EspPlayers", "Players", "Yellow when carrying an egg")
     slider(E, "EspDistance", "Max distance", 100, 8000, 0, " studs")
-    local T = Tab:AddRightGroupbox("Teleport", "map-pin")
+    local T = Tab:AddRightGroupbox("Go to", "map-pin")
     goButton(T, "My pen", function()
         local s = Game.penSpot()
         if s then
