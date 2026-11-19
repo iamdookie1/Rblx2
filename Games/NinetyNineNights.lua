@@ -1,6 +1,6 @@
 --// Survive 99 Nights ------------------------------------------------------------------
 -- Built against script dumps of the live game (place 126509999114328, versions
--- 712 and 720).
+-- 712, 720 and 731).
 --
 -- What the game's own client scripts show:
 --  * Every swing of an axe, sword or chainsaw ends in
@@ -151,8 +151,8 @@ local Settings = {
     AuraKinds = { Hostile = true, ["Can attack"] = true }, AuraPerSwing = 3, AuraPriority = "Chasing me first",
     AutoEquip = true, HitFrom = "Your position", ExtraDelay = 0, OneTool = true, SwingMode = "Fast",
     SilentAim = false, AimFov = 160, AimShowFov = true, AimShowTarget = true, AimPart = "Body", AimRange = 500,
-    AimWallCheck = true, AimKinds = { Hostile = true, ["Can attack"] = true, Passive = true }, AimLead = 0,
-    AimPriority = "Closest to crosshair", AimHits = true, AutoShoot = false, AutoShootEvery = 0.35,
+    AimWallCheck = true, AimKinds = { Hostile = true, ["Can attack"] = true, Passive = true }, AimPredict = true,
+    AimPriority = "Closest to crosshair", AimHoming = 720, AutoShoot = false, AutoShootEvery = 0.35,
     -- tree farm
     FarmTrees = false, FarmRadius = 250, FarmAround = "Camp fire", FarmNight = "Wait at camp",
     -- movement
@@ -181,7 +181,7 @@ local Settings = {
     KeepFireFed = false, FireBelow = 40, FuelOrder = "Strongest first", KeepScrapping = false,
     NightCamp = false, Escape = false, EscapeBelow = 25,
     AutoReviveOthers = false, AutoSelfRevive = false, ReviveGoTo = false, ReviveGoRange = 500, ReviveReturn = true,
-    InfSack = false, StashHeight = 12, BringFarTravel = false, UncoverHeight = 300, UncoverWait = 0.6, UncoverSpacing = 100, AutoGrab = false, GrabRange = 12, BringFar = false,
+    InfSack = false, StashHeight = 12, BringFarTravel = false, UncoverHeight = 300, UncoverWait = 0, UncoverReach = 70, KeepLoaded = false, AutoGrab = false, GrabRange = 12, BringFar = false,
     GrabKinds = { Fuel = true, Food = true, Heals = true, Scrap = true, Gems = true, Ammo = true, Gear = true, Seeds = true, Keys = true, Other = true },
     AutoCultistGems = false, AutoFrogKeys = false, AutoOwlFeathers = false, AutoSnowBell = false, AutoEasterEggs = false, AutoHappyPieces = false,
     AutoClearWeather = false, AutoNightSkip = false, AutoDryWood = false,
@@ -700,17 +700,25 @@ local function chasingMe(model)
 end
 
 --// Silent aim (guns, bows, throwables) \\--
--- With a ranged item in hand (ToolName Firearm / ThrownWeapon), the shot goes
--- to the mob picked near your crosshair, whatever way the game works it out:
--- the camera ray (ScreenPointToRay / ViewportPointToRay), the mouse (Hit,
--- Target, UnitRay) and the shot's own raycast from your gun all point at it,
--- and a ranged ToolDamageObject that would land on nothing is sent for it.
--- Only calls from the game's scripts are changed, and only while you hold a
--- ranged item and have a target. The hooks never call a method themselves
--- before handing a call on (that would change which method is being called).
-local Aim = { active = false, target = nil, hooked = false, info = "Off" }
+-- How this version shoots (ReplicatedStorage.Tools.Firearm / ThrownWeapon): the
+-- direction comes from Mouse.UnitRay (or a ray through the middle of the screen
+-- on mobile), then AimAssistClient.GetAimAssistDir from the barrel, and the shot
+-- is a ProjectileClass bullet the client flies itself (guns 350 studs/s with no
+-- drop, throwables 80 with gravity 35). It only does damage
+-- (ProjectileDamageEnemy) when one of its frame-to-frame raycasts touches the
+-- mob, so pointing the first ray isn't enough. Instead:
+--   * ProjectileClass.new: each of your bullets starts out pointed at where the
+--     target will be when it gets there (speed and drop from the weapon itself);
+--   * ProjectileClass.Step: on the way it keeps turning toward the target, so a
+--     mob that dodges or jumps still gets hit;
+--   * AimAssistClient.GetAimAssistDir: the game's aim assist would pull the shot
+--     onto whatever mob it likes (on mobile, any mob within 18 studs) and aims at
+--     where it is now; while you have a target it gets yours, which also makes
+--     the game's own Auto Fire button shoot at it.
+-- No metamethod hooks: only your own bullets are changed (other players' copies
+-- are Replica, mobs' are NPCBullet), and nothing else in the game slows down.
+local Aim = { active = false, target = nil, hooked = false, info = "Off", shots = 0, curved = 0 }
 ;(function()
-    local Mouse = LocalPlayer:GetMouse()
     local RANGED_WORDS = { "gun", "rifle", "revolver", "pistol", "shotgun", "bow", "crossbow", "kunai", "spear", "flintlock",
         "blaster", "launcher", "sniper", "musket", "javelin", "throw" }
     local function rangedItem()
@@ -784,7 +792,7 @@ local Aim = { active = false, target = nil, hooked = false, info = "Off" }
         end
         local sp = screenPoint()
         local from = cam.CFrame.Position
-        local best, bestScore
+        local list = {}
         for model in Index.mobs do
             if model.Parent then
                 local kind = mobKind(model)
@@ -796,7 +804,7 @@ local Aim = { active = false, target = nil, hooked = false, info = "Off" }
                             local v, on = cam:WorldToViewportPoint(part.Position)
                             if on and v.Z > 0 then
                                 local px = (Vector2.new(v.X, v.Y) - sp).Magnitude
-                                if px <= Settings.AimFov and (not Settings.AimWallCheck or clearShot(from, part, model)) then
+                                if px <= Settings.AimFov then
                                     local score = Settings.AimPriority == "Closest to you" and d or px
                                     if chasingMe(model) then
                                         score *= 0.75
@@ -804,9 +812,7 @@ local Aim = { active = false, target = nil, hooked = false, info = "Off" }
                                     if Aim.target and Aim.target.model == model then
                                         score *= 0.85
                                     end
-                                    if not bestScore or score < bestScore then
-                                        best, bestScore = { model = model, part = part, kind = kind, d = d }, score
-                                    end
+                                    table.insert(list, { model = model, part = part, kind = kind, d = d, score = score })
                                 end
                             end
                         end
@@ -814,144 +820,204 @@ local Aim = { active = false, target = nil, hooked = false, info = "Off" }
                 end
             end
         end
-        return best
+        table.sort(list, function(a, b)
+            return a.score < b.score
+        end)
+        -- The wall check only for the best few, not for every mob on screen.
+        for i = 1, math.min(#list, 4) do
+            local e = list[i]
+            if not Settings.AimWallCheck or clearShot(from, e.part, e.model) then
+                return e
+            end
+        end
+        return nil
     end
 
-    -- Where the shot goes: the aim part, led by its velocity.
-    function Aim.point()
-        local t = Aim.target
-        local part = t and t.part
-        if not (part and part.Parent) then
-            return nil
-        end
+    -- Where to shoot from `from` so a bullet at `speed` (falling at `gravity`)
+    -- meets the part: it's led by the mob's movement and lifted for the drop.
+    local function lead(from, part, speed, gravity)
         local p = part.Position
-        if Settings.AimLead > 0 then
-            p += part.AssemblyLinearVelocity * Settings.AimLead
+        local v = part.AssemblyLinearVelocity
+        if not Settings.AimPredict or v.Magnitude > 150 then
+            v = Vector3.zero
+        else
+            -- mobs hop while they run: only a little of the up/down counts
+            v = Vector3.new(v.X, v.Y * 0.3, v.Z)
         end
-        return p
+        speed = math.max(speed, 1)
+        local t = (p - from).Magnitude / speed
+        local aim = p
+        for _ = 1, 3 do
+            aim = p + v * t
+            t = (aim - from).Magnitude / speed
+        end
+        aim = p + v * t
+        if gravity > 0 then
+            aim += Vector3.new(0, 0.5 * gravity * t * t, 0)
+        end
+        return aim, t
     end
-    -- A ray the game casts for the shot: starts at you or the camera, goes
-    -- the way you aim, and is long enough to be a shot (not a ground check).
-    function Aim.redirect(origin, dir)
-        if typeof(origin) ~= "Vector3" or typeof(dir) ~= "Vector3" then
-            return nil
+    Aim.lead = lead
+
+    local function findModule(name)
+        local hub = gameModule(name)
+        if type(hub) == "table" then
+            return hub
         end
-        local len = dir.Magnitude
-        if len < 20 then
-            return nil
+        local ps = LocalPlayer:FindFirstChild("PlayerScripts")
+        local client = ps and ps:FindFirstChild("Client")
+        local m = client and client:FindFirstChild(name, true)
+        if m and m:IsA("ModuleScript") then
+            local ok, r = pcall(require, m)
+            if ok and type(r) == "table" then
+                return r
+            end
         end
-        local nearCam = Aim.camPos and (origin - Aim.camPos).Magnitude < 25
-        local nearMe = Aim.rootPos and (origin - Aim.rootPos).Magnitude < 25
-        if not (nearCam or nearMe) then
-            return nil
-        end
-        local unit = dir / len
-        if Aim.aimDir and unit:Dot(Aim.aimDir) < 0.8 then
-            return nil
-        end
-        local p = Aim.point()
-        if not p then
-            return nil
-        end
-        local to = p - origin
-        if to.Magnitude < 0.5 then
-            return nil
-        end
-        return to.Unit * math.max(len, to.Magnitude + 5)
+        return nil
     end
 
+    -- Your bullets, each with the mob it's after.
+    local mine = setmetatable({}, { __mode = "k" })
+    local function targetAlive(t)
+        return t and t.part and t.part.Parent and t.model.Parent and mobKind(t.model) ~= "Dead"
+    end
+    local function steer(proj, s, dt)
+        if not targetAlive(s) or os.clock() - s.born > 4 then
+            mine[proj] = nil
+            return
+        end
+        local pos, vel = rawget(proj, "Position"), rawget(proj, "Velocity")
+        if typeof(pos) ~= "Vector3" or typeof(vel) ~= "Vector3" then
+            return
+        end
+        local speed = vel.Magnitude
+        if speed < 1 then
+            return
+        end
+        local fa = rawget(proj, "Firearm")
+        local g = tonumber(type(fa) == "table" and fa.ProjectileGravity) or 196.2
+        local aim = lead(pos, s.part, speed, g)
+        local want = aim - pos
+        if want.Magnitude < 0.05 then
+            return
+        end
+        want = want.Unit
+        local cur = vel / speed
+        local angle = math.acos(math.clamp(cur:Dot(want), -1, 1))
+        if angle < 1e-3 then
+            return
+        end
+        local f = math.min(math.rad(Settings.AimHoming) * dt / angle, 1)
+        local new = cur + (want - cur) * f
+        if new.Magnitude < 1e-4 then
+            new = want
+        end
+        proj.Velocity = new.Unit * speed
+        if not s.curved then
+            s.curved = true
+            Aim.curved += 1
+        end
+    end
+
+    local Orig = {}
+    local PC, AA
     local function install()
         if Aim.hooked then
             return true
         end
-        if typeof(hookmetamethod) ~= "function" or typeof(getnamecallmethod) ~= "function" then
-            Aim.info = "Your executor can't hook (no hookmetamethod)"
+        PC = findModule("ProjectileClass")
+        AA = findModule("AimAssistClient")
+        if not (PC and type(PC.new) == "function" and type(PC.Step) == "function") then
+            Aim.info = "Couldn't find the game's bullet code"
             return false
         end
-        local isOurs = typeof(checkcaller) == "function" and checkcaller or function()
-            return false
-        end
-        local wrap = typeof(newcclosure) == "function" and newcclosure or function(f)
-            return f
-        end
-        local damage = remote("ToolDamageObject")
-        local setMethod = typeof(setnamecallmethod) == "function" and setnamecallmethod or function() end
-        local oldNamecall
-        oldNamecall = hookmetamethod(game, "__namecall", wrap(function(self, ...)
-            if Unloaded or not Aim.active or isOurs() then
-                return oldNamecall(self, ...)
+        Orig.new, Orig.step = PC.new, PC.Step
+        PC.new = function(firearm, origin, velocity, id, headPos, extras, noModel, params, ...)
+            local t = Aim.target
+            local child = type(extras) == "table" and (extras.IgnoreList or extras.SecondBounce or extras.PunchedEnemies)
+            local ours = Aim.active and not Unloaded and type(firearm) == "table" and typeof(rawget(firearm, "RealModel")) == "Instance"
+                and not (type(extras) == "table" and (extras.Replica or extras.NPCBullet)) and not child
+            if ours and targetAlive(t) and typeof(origin) == "Vector3" and typeof(velocity) == "Vector3" then
+                local speed = velocity.Magnitude
+                local g = tonumber(firearm.ProjectileGravity) or 196.2
+                local aim = lead(origin, t.part, speed, g)
+                local dir = aim - origin
+                if dir.Magnitude > 0.1 and speed > 0 then
+                    velocity = dir.Unit * speed
+                end
+                local proj = Orig.new(firearm, origin, velocity, id, headPos, extras, noModel, params, ...)
+                if type(proj) == "table" then
+                    mine[proj] = { model = t.model, part = t.part, born = os.clock() }
+                    Aim.shots += 1
+                end
+                return proj
             end
-            local method = getnamecallmethod()
-            if self == Workspace then
-                if method == "Raycast" then
-                    local origin, dir, params = ...
-                    local nd = Aim.redirect(origin, dir)
-                    if nd then
-                        setMethod(method)
-                        return oldNamecall(self, origin, nd, params)
-                    end
-                elseif method == "FindPartOnRay" or method == "FindPartOnRayWithIgnoreList" or method == "FindPartOnRayWithWhitelist" then
-                    local ray = ...
-                    if typeof(ray) == "Ray" then
-                        local nd = Aim.redirect(ray.Origin, ray.Direction)
-                        if nd then
-                            setMethod(method)
-                            return oldNamecall(self, Ray.new(ray.Origin, nd), select(2, ...))
+            return Orig.new(firearm, origin, velocity, id, headPos, extras, noModel, params, ...)
+        end
+        PC.Step = function(self, dt, ...)
+            local s = mine[self]
+            if s and Settings.AimHoming > 0 and type(dt) == "number" and not Unloaded then
+                pcall(steer, self, s, dt)
+            end
+            return Orig.step(self, dt, ...)
+        end
+        if AA and type(AA.GetAimAssistDir) == "function" then
+            Orig.assist = AA.GetAimAssistDir
+            AA.GetAimAssistDir = function(from, dir, name, angle, range, ...)
+                -- angle is only given by a bullet's own homing (TrackStrength); the
+                -- aim and "hovering an enemy" checks don't pass one
+                -- (and only from your gun: a bullet bouncing on from a mob it hit
+                -- asks too, and that one should find the next mob)
+                local hrp = rootPart()
+                if angle == nil and Aim.active and not Unloaded and typeof(from) == "Vector3" and hrp
+                    and (from - hrp.Position).Magnitude < 20 then
+                    local t = Aim.target
+                    if targetAlive(t) then
+                        local d = t.part.Position - from
+                        if d.Magnitude > 0.1 then
+                            return d.Unit, { t.model }
                         end
                     end
                 end
-            elseif method == "ScreenPointToRay" or method == "ViewportPointToRay" then
-                if self == Workspace.CurrentCamera then
-                    local ray = oldNamecall(self, ...)
-                    local p = Aim.point()
-                    if p and typeof(ray) == "Ray" then
-                        return Ray.new(ray.Origin, (p - ray.Origin).Unit)
-                    end
-                    return ray
-                end
-            elseif method == "InvokeServer" and self == damage and Settings.AimHits then
-                local hitTarget, tool = ...
-                local t = Aim.target
-                if t and t.model.Parent and typeof(tool) == "Instance" then
-                    local getAttr = tool.GetAttribute
-                    local ranged = RANGED[getAttr(tool, "ToolName") or ""]
-                    local onMob = typeof(hitTarget) == "Instance" and hitTarget.FindFirstChild(hitTarget, "NPC") ~= nil
-                    if ranged and not onMob then
-                        local args = table.pack(...)
-                        args[1] = t.model
-                        setMethod(method)
-                        return oldNamecall(self, table.unpack(args, 1, args.n))
-                    end
-                end
+                return Orig.assist(from, dir, name, angle, range, ...)
             end
-            setMethod(method)
-            return oldNamecall(self, ...)
-        end))
-        local oldIndex
-        oldIndex = hookmetamethod(game, "__index", wrap(function(self, key)
-            if Aim.active and not Unloaded and self == Mouse and not isOurs() then
-                if key == "Hit" then
-                    local p = Aim.point()
-                    if p then
-                        return CFrame.new(p)
-                    end
-                elseif key == "Target" then
-                    local t = Aim.target
-                    if t and t.part.Parent then
-                        return t.part
-                    end
-                elseif key == "UnitRay" then
-                    local p = Aim.point()
-                    if p and Aim.camPos then
-                        return Ray.new(Aim.camPos, (p - Aim.camPos).Unit)
-                    end
-                end
-            end
-            return oldIndex(self, key)
-        end))
+        end
         Aim.hooked = true
         return true
     end
+    function Aim.restore()
+        if PC and Orig.new then
+            PC.new, PC.Step = Orig.new, Orig.step
+        end
+        if AA and Orig.assist then
+            AA.GetAimAssistDir = Orig.assist
+        end
+        Aim.hooked = false
+        Aim.active = false
+    end
+
+    -- The gun you're holding, as the game's own object (InventoryHandler keeps it
+    -- in an upvalue of RequestEquipItem), so auto shoot can fire it directly:
+    -- reloading, fire rate, sound and animation all stay the game's.
+    local Inv
+    local function equippedTool()
+        Inv = Inv or findModule("InventoryHandler")
+        local fn = Inv and Inv.RequestEquipItem
+        if type(fn) ~= "function" or type(debug) ~= "table" or type(debug.getupvalues) ~= "function" then
+            return nil
+        end
+        local ok, ups = pcall(debug.getupvalues, fn)
+        if not ok or type(ups) ~= "table" then
+            return nil
+        end
+        for _, v in ups do
+            if type(v) == "table" and rawget(v, "Model") ~= nil and type(rawget(v, "Tool")) == "table" then
+                return v.Tool, v.Model
+            end
+        end
+        return nil
+    end
+    Aim.equippedTool = equippedTool
 
     -- FOV circle and target outline
     local ring = Instance.new("Frame")
@@ -975,31 +1041,31 @@ local Aim = { active = false, target = nil, hooked = false, info = "Off" }
     outline.Enabled = false
     outline.Parent = VisualGui
 
-    local lastShot = 0
+    local lastShot, lastPick, held = 0, 0, nil
     bind(RunService.RenderStepped, function()
         if not alive() then
             Aim.active = false
             return
         end
-        local held = Settings.SilentAim and rangedItem() or nil
-        local cam = Workspace.CurrentCamera
-        local hrp = rootPart()
-        Aim.camPos = cam and cam.CFrame.Position or nil
-        Aim.rootPos = hrp and hrp.Position or nil
-        if Settings.SilentAim and not Aim.hooked then
-            install()
-        end
-        if held and Aim.hooked then
-            Aim.target = pick()
-            local sp = screenPoint()
-            if cam then
-                local ray = cam:ViewportPointToRay(sp.X, sp.Y)
-                Aim.aimDir = ray.Direction.Unit
+        local now = os.clock()
+        -- Picking a target 20 times a second is plenty and keeps it light.
+        if now - lastPick >= 0.05 then
+            lastPick = now
+            held = Settings.SilentAim and rangedItem() or nil
+            if Settings.SilentAim and not Aim.hooked then
+                install()
             end
-            Aim.active = Aim.target ~= nil
-        else
-            Aim.target, Aim.active = nil, false
+            if held and Aim.hooked then
+                Aim.target = pick()
+            else
+                Aim.target = nil
+            end
         end
+        local t = Aim.target
+        if t and not targetAlive(t) then
+            Aim.target, t = nil, nil
+        end
+        Aim.active = Settings.SilentAim and held ~= nil and Aim.hooked and t ~= nil
 
         local showRing = Settings.SilentAim and Settings.AimShowFov and held ~= nil
         ring.Visible = showRing
@@ -1007,9 +1073,8 @@ local Aim = { active = false, target = nil, hooked = false, info = "Off" }
             local sp = screenPoint()
             ring.Position = UDim2.fromOffset(sp.X, sp.Y)
             ring.Size = UDim2.fromOffset(Settings.AimFov * 2, Settings.AimFov * 2)
-            stroke.Color = Aim.target and Color3.fromRGB(255, 90, 90) or Color3.fromRGB(235, 235, 235)
+            stroke.Color = t and Color3.fromRGB(255, 90, 90) or Color3.fromRGB(235, 235, 235)
         end
-        local t = Aim.target
         if t and Settings.AimShowTarget then
             outline.Adornee = t.model
             outline.Enabled = true
@@ -1022,27 +1087,33 @@ local Aim = { active = false, target = nil, hooked = false, info = "Off" }
         elseif not Aim.hooked then
             -- install() left its reason
         elseif not held then
-            Aim.info = "Hold a gun, bow or throwable"
+            Aim.info = ("Hold a gun, bow or throwable · %d shots aimed"):format(Aim.shots)
         elseif t then
-            Aim.info = string.format("Target: %s (%s) · %dm", cleanName(t.model:GetAttribute("Name") or t.model.Name), t.kind, math.floor(t.d))
+            Aim.info = ("Target: %s (%s) · %dm · %d shots aimed, %d curved"):format(cleanName(t.model:GetAttribute("Name") or t.model.Name),
+                t.kind, math.floor(t.d), Aim.shots, Aim.curved)
         else
             Aim.info = "No mob in the circle"
         end
 
-        -- Auto shoot: a click on the target while you hold a ranged item.
-        if Settings.AutoShoot and t and held and os.clock() - lastShot >= Settings.AutoShootEvery
-            and not UserInputService:GetFocusedTextBox() then
-            lastShot = os.clock()
-            local v = cam and cam:WorldToViewportPoint(t.part.Position)
-            if v then
-                local at = Vector2.new(v.X, v.Y)
-                task.spawn(function()
-                    pcall(function()
-                        VirtualUser:Button1Down(at, cam.CFrame)
-                        task.wait(0.03)
-                        VirtualUser:Button1Up(at, cam.CFrame)
+        -- Auto shoot: fires the gun you hold (the game's own Fire) at the target.
+        if Settings.AutoShoot and t and held and now - lastShot >= Settings.AutoShootEvery and not UserInputService:GetFocusedTextBox() then
+            lastShot = now
+            local tool = equippedTool()
+            if tool and type(tool.Fire) == "function" then
+                task.spawn(pcall, tool.Fire, tool)
+            else
+                local cam = Workspace.CurrentCamera
+                local v = cam and cam:WorldToViewportPoint(t.part.Position)
+                if v then
+                    local at = Vector2.new(v.X, v.Y)
+                    task.spawn(function()
+                        pcall(function()
+                            VirtualUser:Button1Down(at, cam.CFrame)
+                            task.wait(0.03)
+                            VirtualUser:Button1Up(at, cam.CFrame)
+                        end)
                     end)
-                end)
+                end
             end
         end
     end)
@@ -5924,33 +5995,269 @@ function Extra.clearFogWalls()
     end
     return n
 end
-function Extra.revealMapCells()
-    local batch, sent = {}, 0
-    for row = 0, 69 do
-        for col = 0, 69 do
-            table.insert(batch, { Row = row, Col = col })
-            if #batch >= 140 then
-                fire("MapCellsDiscovered", batch, {})
-                sent += #batch
-                batch = {}
-                task.wait(0.05)
+-- The map screen ---------------------------------------------------------------
+-- From the game's MapDrawClient: a 71 x 71 grid of 40-stud cells, cell (row, col)
+-- at x = col * 40 - 1400, z = row * 40 - 1400 (its corner). Every half second
+-- UncoverTilesAroundPlayer marks each "Fog" cell whose corner is within 75 studs
+-- (flat) of a player and reports them with MapCellsDiscovered(cells, caveCells);
+-- the server keeps them for the whole server (RequestServerMapProgress). Cells
+-- past MapRange + 25 (and past 1410) are "Boundary" and never open; the middle
+-- (105 studs) starts open.
+local CELL, HALF = 40, 1400
+local function cellPoint(r, c)
+    return c * CELL - HALF, r * CELL - HALF
+end
+local function cellKeyRC(r, c)
+    return r * 100 + c
+end
+
+-- The game's own map functions, found once by name (no getfenv, so the game's
+-- code keeps running at full speed).
+local MapGame
+local function mapGame()
+    if MapGame ~= nil then
+        return MapGame or nil
+    end
+    MapGame = false
+    if typeof(getgc) ~= "function" or type(debug) ~= "table" or type(debug.info) ~= "function" then
+        return nil
+    end
+    local ok, list = pcall(getgc)
+    if not ok or type(list) ~= "table" then
+        return nil
+    end
+    local found = {}
+    local want = { UncoverTilesAroundPlayer = "uncover", LoadMapOnRejoin = "reload" }
+    for i, f in list do
+        if type(f) == "function" then
+            local okName, name = pcall(debug.info, f, "n")
+            local key = okName and want[name]
+            if key and not found[key] then
+                local okSrc, src = pcall(debug.info, f, "s")
+                if okSrc and tostring(src):find("MapDrawClient", 1, true) then
+                    found[key] = f
+                end
             end
+        end
+        if i % 25000 == 0 then
+            task.wait()
+        end
+    end
+    if found.uncover and type(debug.getupvalues) == "function" then
+        local okUp, ups = pcall(debug.getupvalues, found.uncover)
+        for _, v in okUp and ups or {} do
+            -- the surface grid: every row 0..70, corners "Boundary", the middle open
+            if type(v) == "table" and type(v[0]) == "table" and type(v[70]) == "table" and type(v[35]) == "table"
+                and v[0][0] == "Boundary" and v[35][35] == "Discovered" then
+                found.grid = v
+                break
+            end
+        end
+    end
+    MapGame = found
+    return found
+end
+Extra.mapGame = mapGame
+
+-- What the server has: { [row * 100 + col] = true }
+local function serverCells()
+    local r = remote("RequestServerMapProgress")
+    if not r then
+        return nil
+    end
+    local ok, prog = pcall(r.InvokeServer, r, LocalPlayer)
+    if not ok or type(prog) ~= "table" then
+        return nil
+    end
+    local have = {}
+    for row, cols in prog do
+        row = tonumber(row)
+        if row and type(cols) == "table" then
+            for col in cols do
+                col = tonumber(col)
+                if col then
+                    have[cellKeyRC(row, col)] = true
+                end
+            end
+        end
+    end
+    return have
+end
+
+local function ping()
+    local ok, p = pcall(LocalPlayer.GetNetworkPing, LocalPlayer)
+    return (ok and tonumber(p)) or 0.1
+end
+
+-- Every cell that can still be opened and the server doesn't have yet.
+local function cellsToFind(have)
+    local mapRange = Workspace:GetAttribute("MapRange") or 1400
+    local reach = math.min(mapRange + 25, 1410)
+    local grid = (mapGame() or {}).grid
+    local todo = {}
+    for r = 0, 70 do
+        for c = 0, 70 do
+            local x, z = cellPoint(r, c)
+            local d2 = x * x + z * z
+            local open = grid and grid[r] and grid[r][c]
+            if d2 <= reach * reach and d2 > 105 * 105 and not have[cellKeyRC(r, c)] and open ~= "Boundary" then
+                table.insert(todo, { r = r, c = c, x = x, z = z, key = cellKeyRC(r, c) })
+            end
+        end
+    end
+    return todo, mapRange
+end
+
+-- The fewest stops that open every cell: candidate spots every 20 studs inside
+-- the map (never outside it), then greedy picks of the spot that opens the most
+-- cells still closed. Stops are then put in nearest-next order from you.
+local function planStops(todo, mapRange, from)
+    local reach = math.clamp(Settings.UncoverReach, 40, 74)
+    local step = 20
+    local limit = mapRange - 5
+    local cands = {}
+    local function cand(ix, iz)
+        local id = ix * 1000 + iz
+        local cnd = cands[id]
+        if cnd == nil then
+            local x, z = ix * step - limit, iz * step - limit
+            if x * x + z * z <= limit * limit then
+                cnd = { x = x, z = z, cells = {}, n = 0 }
+            else
+                cnd = false
+            end
+            cands[id] = cnd
+        end
+        return cnd or nil
+    end
+    for i, cell in todo do
+        cell.cands = {}
+        local lo = math.ceil((cell.x - reach + limit) / step)
+        local hi = math.floor((cell.x + reach + limit) / step)
+        local loz = math.ceil((cell.z - reach + limit) / step)
+        local hiz = math.floor((cell.z + reach + limit) / step)
+        for ix = lo, hi do
+            for iz = loz, hiz do
+                local cnd = cand(ix, iz)
+                if cnd and (cnd.x - cell.x) ^ 2 + (cnd.z - cell.z) ^ 2 < reach * reach then
+                    table.insert(cnd.cells, cell)
+                    cnd.n += 1
+                    table.insert(cell.cands, cnd)
+                end
+            end
+        end
+        if i % 400 == 0 then
+            task.wait()
+        end
+    end
+    -- lazy greedy on a max-heap
+    local heap = {}
+    local function push(cnd)
+        table.insert(heap, { cnd.n, cnd })
+        local i = #heap
+        while i > 1 do
+            local p = i // 2
+            if heap[p][1] >= heap[i][1] then
+                break
+            end
+            heap[p], heap[i] = heap[i], heap[p]
+            i = p
+        end
+    end
+    local function pop()
+        local top = heap[1]
+        local last = table.remove(heap)
+        if #heap > 0 then
+            heap[1] = last
+            local i = 1
+            while true do
+                local l, r, m = i * 2, i * 2 + 1, i
+                if heap[l] and heap[l][1] > heap[m][1] then
+                    m = l
+                end
+                if heap[r] and heap[r][1] > heap[m][1] then
+                    m = r
+                end
+                if m == i then
+                    break
+                end
+                heap[m], heap[i] = heap[i], heap[m]
+                i = m
+            end
+        end
+        return top
+    end
+    for _, cnd in cands do
+        if cnd and cnd.n > 0 then
+            push(cnd)
+        end
+    end
+    local picked, spins = {}, 0
+    while #heap > 0 do
+        local top = pop()
+        local n, cnd = top[1], top[2]
+        if cnd.n > 0 then
+            if n ~= cnd.n then
+                push(cnd)
+            else
+                local cells = {}
+                for _, cell in cnd.cells do
+                    if not cell.covered then
+                        cell.covered = true
+                        table.insert(cells, cell)
+                        for _, other in cell.cands do
+                            other.n -= 1
+                        end
+                    end
+                end
+                table.insert(picked, { pos = Vector3.new(cnd.x, 0, cnd.z), cells = cells })
+            end
+        end
+        spins += 1
+        if spins % 2000 == 0 then
+            task.wait()
+        end
+    end
+    -- nearest next from where you are
+    local order, left = {}, picked
+    local at = Vector3.new(from.X, 0, from.Z)
+    while #left > 0 do
+        local bi, bd = 1, math.huge
+        for i, s in left do
+            local d = (s.pos - at).Magnitude
+            if d < bd then
+                bi, bd = i, d
+            end
+        end
+        local s = table.remove(left, bi)
+        table.insert(order, s)
+        at = s.pos
+    end
+    return order
+end
+
+local function report(cells)
+    local batch = {}
+    for _, cell in cells do
+        table.insert(batch, { Row = cell.r, Col = cell.c })
+        if #batch >= 140 then
+            fire("MapCellsDiscovered", batch, {})
+            batch = {}
         end
     end
     if #batch > 0 then
         fire("MapCellsDiscovered", batch, {})
-        sent += #batch
     end
-    return sent
 end
 
--- The map only opens where a player has been: every half second the game
--- marks the cells within 75 studs (flat distance, height doesn't count) of
--- each player and reports them to the server, which keeps them for the whole
--- server. So the route flies a grid of stops ~100 studs apart over the whole
--- map (MapRange + 25 from the centre), held high above the ground every
--- frame so nothing can reach you, waits at each stop for the game's check,
--- skips what the server already has, and brings you back after.
+-- Uncovers the whole map for everyone. First it checks whether the server takes
+-- cells from anywhere (then it's instant, no travel); if not, it flies the
+-- fewest stops that open every closed cell, held high in the air inside the map
+-- every frame, waits at each one only as long as your ping needs for the server
+-- to see you there, reports what the stop opened (the game's own way, plus what
+-- the game wouldn't send again), checks with the server every 25 stops, slows
+-- down if cells didn't count and goes back for those at the end. Whatever
+-- happens (stopped, error, death) the hold lets go and you're put back.
 function Extra.uncoverRoute(still, status)
     status = status or function(text)
         setStatus(text)
@@ -5961,66 +6268,98 @@ function Extra.uncoverRoute(still, status)
         return
     end
     local start = hrp.CFrame
-    local range = (Workspace:GetAttribute("MapRange") or 1300) + 25
-    local done = {}
-    local function mark(r, c)
-        done[r] = done[r] or {}
-        done[r][c] = true
+    local t0 = os.clock()
+    status("Map: asking the server what's already uncovered")
+    Extra.clearFogWalls()
+    local have = serverCells() or {}
+    local todo, mapRange = cellsToFind(have)
+    if #todo == 0 then
+        status("The whole map is already uncovered")
+        return
     end
-    local ok, progress = pcall(function()
-        return remote("RequestServerMapProgress"):InvokeServer(LocalPlayer)
-    end)
-    if ok and type(progress) == "table" then
-        for r, cols in progress do
-            for c in type(cols) == "table" and cols or {} do
-                if tonumber(r) and tonumber(c) then
-                    mark(tonumber(r), tonumber(c))
+    local mg = mapGame() or {}
+
+    -- 1. Does the server take cells from anywhere?
+    if Extra.mapTrust == nil then
+        local probe = {}
+        for _, cell in todo do
+            local far = true
+            for _, p in Players:GetPlayers() do
+                local ch = p.Character
+                local root = ch and ch:FindFirstChild("HumanoidRootPart")
+                if root and (Vector3.new(root.Position.X, 0, root.Position.Z) - Vector3.new(cell.x, 0, cell.z)).Magnitude < 400 then
+                    far = false
+                    break
                 end
             end
-        end
-    end
-    -- Cells still to find: inside the map, outside the always-open middle.
-    local todo = {}
-    for r = 0, 70 do
-        for c = 0, 70 do
-            local x, z = c * 40 - 1400, r * 40 - 1400
-            local d2 = x * x + z * z
-            if d2 <= range * range and d2 > 11025 and not (done[r] and done[r][c]) then
-                table.insert(todo, { r = r, c = c, x = x, z = z })
-            end
-        end
-    end
-    -- Stops on a grid, kept only where some cell is still to find; rows run
-    -- back and forth so each hop is short.
-    local step = Settings.UncoverSpacing
-    local stops, row = {}, 0
-    for z = -range, range, step do
-        local line = {}
-        for x = -range, range, step do
-            for _, cell in todo do
-                if (cell.x - x) ^ 2 + (cell.z - z) ^ 2 < 70 * 70 then
-                    table.insert(line, Vector3.new(x, Settings.UncoverHeight, z))
+            if far then
+                table.insert(probe, cell)
+                if #probe >= 3 then
                     break
                 end
             end
         end
-        if row % 2 == 1 then
-            for i = 1, #line // 2 do
-                line[i], line[#line - i + 1] = line[#line - i + 1], line[i]
+        if #probe > 0 then
+            report(probe)
+            task.wait(0.4 + ping() * 3)
+            local check = serverCells()
+            local got = 0
+            for _, cell in probe do
+                if check and check[cell.key] then
+                    got += 1
+                end
             end
+            Extra.mapTrust = check ~= nil and got == #probe
         end
-        for _, p in line do
-            table.insert(stops, p)
-        end
-        row += 1
     end
-    if #stops == 0 then
-        status("The whole map is already uncovered")
+    if Extra.mapTrust then
+        status(("Map: the server takes it from here · sending %d cells"):format(#todo))
+        for i = 1, #todo, 140 do
+            if not still() then
+                return
+            end
+            report(table.move(todo, i, math.min(i + 139, #todo), 1, {}))
+            task.wait(0.05)
+        end
+        if mg.reload then
+            task.spawn(pcall, mg.reload)
+        end
+        status(("Map uncovered in %.1fs (%d cells, no travel)"):format(os.clock() - t0, #todo))
         return
     end
-    -- Hold the current stop every frame (no falling, no velocity).
-    local hold = CFrame.new(start.Position)
-    local holding = RunService.Heartbeat:Connect(function()
+
+    -- 2. The route.
+    status(("Map: planning stops for %d closed cells"):format(#todo))
+    local stops = planStops(todo, mapRange, hrp.Position)
+    if not still() then
+        return
+    end
+    local hold = start
+    local released = false
+    local holding
+    local char = character()
+    local function release()
+        if released then
+            return
+        end
+        released = true
+        if holding then
+            holding:Disconnect()
+        end
+        local r = rootPart()
+        if r and character() == char then
+            r.CFrame = start
+            r.AssemblyLinearVelocity = Vector3.zero
+            r.AssemblyAngularVelocity = Vector3.zero
+        end
+    end
+    -- Held there every frame; the moment the job stops (or the script unloads, or
+    -- you die) it lets go by itself, even if the route never gets to finish.
+    holding = RunService.Heartbeat:Connect(function()
+        if not still() or not alive() or character() ~= char then
+            release()
+            return
+        end
         local r = rootPart()
         if r then
             r.CFrame = hold
@@ -6028,37 +6367,211 @@ function Extra.uncoverRoute(still, status)
             r.AssemblyAngularVelocity = Vector3.zero
         end
     end)
-    Extra.clearFogWalls()
-    local t0 = os.clock()
-    for i, stop in stops do
-        if not still() or not alive() then
-            break
+    local settle = math.clamp(0.08 + ping() * 2, 0.15, 1)
+    local opened, retry, sent = 0, {}, {}
+    local ok, err = pcall(function()
+        local function visit(list, label)
+            local i = 0
+            while i < #list do
+                i += 1
+                if not still() or released then
+                    return false
+                end
+                local stop = list[i]
+                -- skip it if everything it would open is open by now
+                local need = {}
+                for _, cell in stop.cells do
+                    if not have[cell.key] then
+                        table.insert(need, cell)
+                    end
+                end
+                if #need > 0 then
+                    hold = CFrame.new(stop.pos.X, Settings.UncoverHeight, stop.pos.Z)
+                    local wait = settle + Settings.UncoverWait
+                    local left = (#list - i) * (wait + 0.05)
+                    status(("%s %d/%d · %d cells left · about %ds"):format(label, i, #list, #todo - opened, math.ceil(left)))
+                    task.wait(wait)
+                    if not still() or released then
+                        return false
+                    end
+                    -- the game's own report (also updates your map screen)...
+                    if mg.uncover then
+                        pcall(mg.uncover)
+                    end
+                    -- ...and the cells the game thinks it already sent
+                    local extra = {}
+                    for _, cell in need do
+                        local local_ = mg.grid and mg.grid[cell.r] and mg.grid[cell.r][cell.c]
+                        if local_ ~= "Fog" or not mg.uncover then
+                            table.insert(extra, cell)
+                        end
+                        sent[cell.key] = cell
+                    end
+                    if #extra > 0 then
+                        report(extra)
+                    end
+                    opened += #need
+                    task.wait(0.03)
+                end
+                -- every 25 stops: what did the server keep?
+                if i % 25 == 0 then
+                    local now = serverCells()
+                    if now then
+                        have = now
+                        local missed, total = 0, 0
+                        for key, cell in sent do
+                            total += 1
+                            if not now[key] then
+                                missed += 1
+                                retry[key] = cell
+                            end
+                        end
+                        sent = {}
+                        if total > 0 and missed / total > 0.05 then
+                            settle = math.min(settle + 0.12, 1.2)
+                        end
+                    end
+                end
+            end
+            return true
         end
-        hold = CFrame.new(stop)
-        pcall(LocalPlayer.RequestStreamAroundAsync, LocalPlayer, stop, 0.2)
-        local left = (#stops - i) * Settings.UncoverWait
-        status(("Uncovering %d/%d · about %ds left"):format(i, #stops, math.ceil(left)))
-        task.wait(Settings.UncoverWait)
-    end
-    holding:Disconnect()
-    if rootPart() then
-        rootPart().CFrame = start
-        rootPart().AssemblyLinearVelocity = Vector3.zero
-    end
-    -- What the server has now.
-    local after = 0
-    local ok2, now = pcall(function()
-        return remote("RequestServerMapProgress"):InvokeServer(LocalPlayer)
+        if not visit(stops, "Uncovering") then
+            return
+        end
+        -- last check, then go back once for anything that didn't count
+        local now = serverCells()
+        if now then
+            have = now
+            for key, cell in sent do
+                if not now[key] then
+                    retry[key] = cell
+                end
+            end
+        end
+        local again = {}
+        for key, cell in retry do
+            if not have[key] then
+                cell.covered = nil
+                table.insert(again, cell)
+            end
+        end
+        if #again > 0 then
+            settle = math.min(settle * 1.5 + 0.1, 1.5)
+            visit(planStops(again, mapRange, rootPart() and rootPart().Position or start.Position), "Second pass")
+        end
     end)
-    if ok2 and type(now) == "table" then
-        for _, cols in now do
-            for _ in type(cols) == "table" and cols or {} do
-                after += 1
+    release()
+    if not ok then
+        error(err, 0)
+    end
+    if mg.reload then
+        -- puts the server's progress on your own map screen too
+        task.spawn(pcall, mg.reload)
+    end
+    local final = serverCells()
+    local count = 0
+    for _ in final or {} do
+        count += 1
+    end
+    status(("Map route done in %ds · %d stops%s"):format(math.floor(os.clock() - t0), #stops,
+        final and (" · server has " .. count .. " cells") or ""))
+end
+
+-- Keep the whole map loaded --------------------------------------------------------
+-- The map streams: the server only sends what's around you, so items far away
+-- aren't in your game at all and bring can't see them. This asks the server for
+-- the map spot by spot (RequestStreamAroundAsync), the spots where the tracker
+-- remembers far items first, and keeps going round so what came in stays in.
+-- Your client is also asked to keep what it has (StreamOutBehavior LowMemory)
+-- where the executor allows it. A fully loaded map takes memory: on a weak
+-- phone it can make the game heavier.
+local Keep = { info = "Off", round = 0, i = 0, spots = nil }
+Extra.Keep = Keep
+local function streaming()
+    local ok, on = pcall(function()
+        return Workspace.StreamingEnabled
+    end)
+    return ok and on == true
+end
+local function keepSpots()
+    local radius = 64
+    pcall(function()
+        radius = math.max(Workspace.StreamingMinRadius or 64, 64)
+    end)
+    local step = math.clamp(radius * 1.5, 96, 400)
+    local mapRange = (Workspace:GetAttribute("MapRange") or 1400) + 50
+    local spots = {}
+    for z = -mapRange, mapRange, step do
+        for x = -mapRange, mapRange, step do
+            if x * x + z * z <= mapRange * mapRange then
+                table.insert(spots, Vector3.new(x, 10, z))
             end
         end
     end
-    status(("Map route done in %ds%s"):format(math.floor(os.clock() - t0), after > 0 and (" · server has " .. after .. " cells") or ""))
+    -- nearest first, outwards
+    local hrp = rootPart()
+    local from = hrp and hrp.Position or Vector3.zero
+    table.sort(spots, function(a, b)
+        return (a - from).Magnitude < (b - from).Magnitude
+    end)
+    return spots
 end
+local oldStreamOut
+local function setStreamOut(on)
+    if typeof(sethiddenproperty) ~= "function" then
+        return
+    end
+    pcall(function()
+        if on then
+            if oldStreamOut == nil and typeof(gethiddenproperty) == "function" then
+                oldStreamOut = gethiddenproperty(Workspace, "StreamOutBehavior")
+            end
+            sethiddenproperty(Workspace, "StreamOutBehavior", Enum.StreamOutBehavior.LowMemory)
+        elseif oldStreamOut ~= nil then
+            sethiddenproperty(Workspace, "StreamOutBehavior", oldStreamOut)
+            oldStreamOut = nil
+        end
+    end)
+end
+Extra.setStreamOut = setStreamOut
+task.spawn(function()
+    local wasOn = false
+    local lastFar = 0
+    while alive() do
+        if Settings.KeepLoaded and streaming() then
+            if not wasOn then
+                wasOn = true
+                setStreamOut(true)
+                Keep.spots, Keep.i, Keep.round = keepSpots(), 0, 1
+            end
+            -- far items first, every 10 s
+            if os.clock() - lastFar > 10 then
+                lastFar = os.clock()
+                Keep.info = "Loading the areas with far items"
+                Extra.loadFor({}, 8)
+            end
+            Keep.i += 1
+            if Keep.i > #Keep.spots then
+                Keep.i, Keep.round = 1, Keep.round + 1
+                Keep.spots = keepSpots()
+            end
+            local spot = Keep.spots[Keep.i]
+            if spot then
+                pcall(LocalPlayer.RequestStreamAroundAsync, LocalPlayer, spot, 2)
+                Keep.info = ("Loading the map: spot %d/%d (round %d)"):format(Keep.i, #Keep.spots, Keep.round)
+            end
+            task.wait(0.05)
+        else
+            if wasOn then
+                wasOn = false
+                setStreamOut(false)
+            end
+            Keep.info = Settings.KeepLoaded and "This server doesn't stream the map: everything is already loaded" or "Off"
+            task.wait(0.5)
+        end
+    end
+    setStreamOut(false)
+end)
 
 local TICKS = { "trackerTick", "stashTick", "sackLabelTick", "grabTick", "cultistGemsTick", "frogKeysTick", "owlFeathersTick",
     "snowBellTick", "easterTick", "happyTick" }
@@ -6527,11 +7040,12 @@ multi(UI.AimBox, "AimKinds", "Targets", "AimKinds", { "Hostile", "Can attack", "
     "Passive covers animals you hunt for food")
 choice(UI.AimBox, "AimPriority", "Pick", "AimPriority", { "Closest to crosshair", "Closest to you" },
     "Mobs chasing you are picked first either way")
-slider(UI.AimBox, "AimLead", "Lead moving mobs", "AimLead", 0, 0.5, " s",
-    "Aims where a moving mob will be. Leave at 0 for guns that hit instantly; raise it for bows and throwables")
-toggle(UI.AimBox, "AimHits", "Count near misses", "AimHits",
-    "A ranged hit the game would send for nothing is sent for your target instead")
-toggle(UI.AimBox, "AutoShoot", "Auto shoot", "AutoShoot", "Clicks for you while a target is in the circle")
+toggle(UI.AimBox, "AimPredict", "Lead moving mobs", "AimPredict",
+    "Shoots where the mob will be when the bullet gets there, from your weapon's own bullet speed and drop")
+slider(UI.AimBox, "AimHoming", "Bullet curve", "AimHoming", 0, 2000, " °/s",
+    "How fast your bullets turn toward the target on the way, so dodging mobs still get hit. 0 = straight shots")
+toggle(UI.AimBox, "AutoShoot", "Auto shoot", "AutoShoot",
+    "Fires the gun you hold at the target (the game's own shot, so reloads and fire rate stay normal)")
 slider(UI.AimBox, "AutoShootEvery", "Shoot every", "AutoShootEvery", 0.05, 2, " s")
 UI.AimLabel = UI.AimBox:AddLabel("Off", true)
 loop(0.3, function()
@@ -6707,6 +7221,12 @@ do
         "After the loaded ones, Bring now loads each area where the tracker last saw picked items (nearest first) and brings them as they appear")
     toggle(GoBox, "BringFarTravel", "Go there if an area won't load", "BringFarTravel",
         "Visits areas the server won't stream to you, brings from there, and comes back. Items still go to where you started")
+    toggle(GoBox, "KeepLoaded", "Keep the whole map loaded", "KeepLoaded",
+        "The map only loads around you, so far items aren't in your game and bring can't see them. This keeps asking the server for every part of the map (spots with far items first) so bring finds everything. Uses more memory")
+    UI.KeepLabel = GoBox:AddLabel("Off", true)
+    loop(0.5, function()
+        setText(UI.KeepLabel, Extra.Keep.info)
+    end)
 
     local SackBox = BringTab:AddRightGroupbox("Endless sack", "infinity")
     toggle(SackBox, "InfSack", "Endless sack", "InfSack",
@@ -7158,9 +7678,10 @@ do
         end,
     })
     slider(MapBox, "UncoverHeight", "Fly at height", "UncoverHeight", 100, 800, " studs", "Held up there every frame, out of reach")
-    slider(MapBox, "UncoverWait", "Wait at each stop", "UncoverWait", 0.5, 2, " s",
-        "The game checks where you are every half second; a bit more makes sure each stop counts")
-    slider(MapBox, "UncoverSpacing", "Stop spacing", "UncoverSpacing", 60, 105, " studs", "Each stop uncovers 75 studs around it; 105 is the widest with no gaps")
+    slider(MapBox, "UncoverWait", "Extra wait at each stop", "UncoverWait", 0, 1.5, " s",
+        "Each stop already waits as long as your ping needs (and longer by itself if the server misses cells). Only add more on a very laggy server")
+    slider(MapBox, "UncoverReach", "Reach per stop", "UncoverReach", 50, 74, " studs",
+        "The game opens 75 studs around you. A bit less leaves room for lag; less means more stops")
     MapBox:AddButton({
         Text = "Clear fog walls only",
         Func = function()
@@ -7169,7 +7690,7 @@ do
             end)
         end,
     })
-    MapBox:AddLabel("Flies the map high up (stops you already uncovered are skipped) and brings you back. The server keeps map progress for everyone, and fog walls fade for everyone", true)
+    MapBox:AddLabel("Only goes where the map is still closed, with the fewest stops that open it all, and never leaves the map. Waits at each stop just long enough for the server, checks as it goes and goes back for anything that didn't count. Stopping (or dying) lets go of you at once and puts you back. Progress is kept for everyone, and fog walls fade for everyone", true)
 
     local KidsBox = ExploreTab:AddRightGroupbox("Lost kids", "baby")
     toggle(KidsBox, "AutoBagKids", "Auto pick up kids", "AutoBagKids",
@@ -7718,6 +8239,7 @@ local function cleanup()
         Settings.InstantPrompts = false
         setInstantPrompts(false)
     end
+    pcall(Aim.restore)
     stopFly()
     restoreNoclip()
     restoreJump()
