@@ -38,7 +38,7 @@ function World.new(cfg)
     self.events = {}
     self.result = nil
     self.stats = { requests = 0, taken = 0, ignored = 0, passes = 0, success = 0, deaths = 0, uses = {}, reasons = {},
-        my_hits = 0, bot_kills = 0, wasted = 0, flights = {}, doubles = 0 }
+        my_hits = 0, bot_kills = 0, wasted = 0, flights = {}, doubles = 0, plog = {} }
     M.reset_scheduler()
     M.now = 0
     return self
@@ -158,17 +158,21 @@ function World:new_pass(B, from, target, aim, speed, t)
     B.pass_t0 = t
     B.from = from
     local h = self.cfg.homing
-    B.law = h.law
-    B.k = self:rand(h.k[1], h.k[2])
-    if h.law == "turn" then B.w = self:rand(h.w[1], h.w[2]) end
-    if h.law == "ramp" then B.k0 = self:rand(h.k0[1], h.k0[2]); B.k1 = self:rand(h.k1[1], h.k1[2]) end
+    if not self.law or self.cfg.vary_law then
+        local L = { law = h.law, k = self:rand(h.k[1], h.k[2]) }
+        if h.law == "turn" then L.w = self:rand(h.w[1], h.w[2]) end
+        if h.law == "ramp" then L.k0 = self:rand(h.k0[1], h.k0[2]); L.k1 = self:rand(h.k1[1], h.k1[2]) end
+        self.law = L
+    end
+    local L = self.law
+    B.law, B.k, B.w, B.k0, B.k1 = L.law, L.k, L.w, L.k0, L.k1
     B.sscale = h.speed_scale
     B.bot_req = nil
     B.pass_id = (B.pass_id or 0) + 1
     self:wlog("pass %d -> %s speed %.0f curve %s", B.pass_id, target, speed, tostring(B.curve))
     if target == self.me_name then
         self.stats.passes = self.stats.passes + 1
-        self.pass = { t0 = t, from = from, speed = speed, reqs = {}, curve = B.curve, id = B.pass_id }
+        self.pass = { t0 = t, from = from, speed = speed, reqs = {}, curve = B.curve, id = B.pass_id, dist = self.sv.players[from] and (self.sv.players[from].pos - self:me_pos(t)).Magnitude }
     end
     local inst = self.ball_inst
     self:send_down(function() inst:SetAttribute("target", target) end, true)
@@ -207,11 +211,15 @@ function World:server_deflect(P, B, t)
         stats.success = stats.success + 1
         stats.my_hits = stats.my_hits + 1
         if self.pass then
+            self.pass.t_range = self.pass.t_range or t
             stats.uses[#stats.uses + 1] = t - (P.win_start or t)
             self.shots = self.shots or {}
             self.shots[#self.shots + 1] = { u = t - (P.win_start or t), speed = B.speed, curve = self.pass.curve or B.curve }
             self.pass.result = "success"
             stats.flights[#stats.flights + 1] = t - self.pass.t0
+            stats.plog[#stats.plog + 1] = { flight = t - self.pass.t0, ok = true, speed = self.pass.speed, curve = self.pass.curve,
+                dist = self.pass.dist, t_range = self.pass.t_range, t0 = self.pass.t0 }
+            self:take_fires(stats.plog[#stats.plog])
         end
         self.pass = nil
         local remotes = self.remotes
@@ -257,6 +265,9 @@ function World:server_kill(P, B, t)
             pass.result = "dead"
             pass.reason = reason
             stats.flights[#stats.flights + 1] = t - pass.t0
+            stats.plog[#stats.plog + 1] = { flight = t - pass.t0, ok = false, reason = reason, speed = pass.speed, curve = pass.curve,
+                dist = pass.dist, t_range = pass.t_range, t0 = pass.t0 }
+            self:take_fires(stats.plog[#stats.plog])
         end
         stats.reasons[reason] = (stats.reasons[reason] or 0) + 1
         self.last_death = { t = t, reason = reason, speed = B.speed, curve = B.curve }
@@ -349,6 +360,7 @@ function World:server_request(P, t)
 end
 
 function World:server_tick(t)
+    if self.on_server_tick then self:on_server_tick(t) end
     local B = self.sv.ball
     local keep = {}
     for _, r in ipairs(self.sv_req) do
@@ -400,6 +412,13 @@ function World:server_tick(t)
             self:server_deflect(T, B, t + SERVER_DT * s)
             self:replicate(t)
             return
+        end
+    end
+    if T.is_me and self.pass and not self.pass.t_range then
+        if (p0 - tp).Magnitude <= R then self.pass.t_range = t
+        else
+            local s = seg_entry(p0, p1, tp, R)
+            if s then self.pass.t_range = t + SERVER_DT * s end
         end
     end
     local sk = seg_entry(p0, p1, tp, self.cfg.kill_dist)
@@ -698,8 +717,81 @@ function World:make_env(genv)
     return env
 end
 
+function World:take_fires(pl)
+    local F = self.pend_fire
+    self.pend_fire = nil
+    if not F then return end
+    pl.via, pl.fires, pl.info, pl.fire_at, pl.E, pl.vias = F.via, F.n, F.info, F.t - pl.t0, F.E, F.vias
+end
+
 function World:load_script(chunk, opts)
     local genv = { BBStop = 1 }
+    -- every auto parry goes on the record of the next pass of yours that ends (a pre-parry fires before
+    -- its pass starts)
+    genv.__ONFIRE = function(via, info)
+        local F = self.pend_fire or { n = 0 }
+        self.pend_fire = F
+        F.n, F.via, F.t = F.n + 1, via, M.now
+        local short = via:match("^pre%-parry") and "pre" or via:match("^dot") and "dot" or via:match("%((%a+)%)$") or via:sub(1, 8)
+        F.vias = (F.vias and (F.vias .. ">") or "") .. short
+        F.info = info and ("%.3f/%.3f/%.3f lead %.3f depth %s"):format(info.A_lo or 0, info.A_mid or 0, info.A_hi or 0, info.lead or 0,
+            info.depth and ("%.2f"):format(info.depth) or "-") or "-"
+        local E = self.last_E
+        F.E = (E and self.last_E_now == M.now) and { lo = M.now + E.lo, mid = M.now + E.mid, hi = M.now + E.hi } or nil
+        if os.getenv("SIM_CHK") and self.sv.ball and self.pass and self.sim and self.sim.Parry.__Pred then
+            -- server's own future from its true state vs the predictor run from the same true state with the true law
+            local B, t = self.sv.ball, M.now
+            local me = self.sv.players[self.me_name]
+            local tp = self:server_pos(me, t)
+            local R = self:deflect_range(B.speed)
+            local pos, dir, tt, ts = B.pos, B.dir, 0, nil
+            local tmp = { law = B.law, k = B.k, w = B.w, k0 = B.k0, k1 = B.k1, pass_t0 = B.pass_t0, sscale = B.sscale, speed = B.speed }
+            while tt < 4 do
+                local want = tp - pos
+                if want.Magnitude <= R then ts = tt; break end
+                dir = self:steer(tmp, dir, want / want.Magnitude, 1 / 60, t + tt)
+                local p1 = pos + dir * B.speed / 60
+                if p1.y < (self.cfg.floor or 1.5) then p1 = v3(p1.x, self.cfg.floor or 1.5, p1.z) end
+                local se = seg_entry(pos, p1, tp, R)
+                if se then ts = tt + se / 60; break end
+                pos = p1
+                tt = tt + 1 / 60
+            end
+            local L, h = self.law, self.cfg.homing
+            local Pr = self.sim.Parry.__Pred
+            local mdl, a, b = 4, L.k and L.k / 60 or 0, 0
+            if L.law == "ramp" then a, b = L.k0 / 60, L.k1 / 60 elseif L.law == "turn" then mdl, a = 2, L.w / 60 end
+            local z = (B.speed / 150) ^ (h.speed_scale or 0)
+            local tpred = Pr.run(B.pos, B.dir, B.speed, 0, tp, nil, R, 4, mdl, a * z, b * z, t - B.pass_t0, nil, self.cfg.floor or 1.5)
+            if os.getenv("SIM_CHK") == "2" and math.abs(t - tonumber(os.getenv("SIM_CHK_T") or "-1")) < 0.002 then
+                local p2, d2 = B.pos, B.dir
+                local q2, e2 = B.pos, B.dir
+                for i = 0, 40 do
+                    local want = tp - p2
+                    local wq = tp - q2
+                    self.log[#self.log + 1] = ("   tick %d server d %.2f th %.1f | pred-copy d %.2f th %.1f\n"):format(i, want.Magnitude,
+                        math.deg(math.acos(math.max(-1, math.min(1, d2:Dot(want.Unit))))), wq.Magnitude,
+                        math.deg(math.acos(math.max(-1, math.min(1, e2:Dot(wq.Unit))))))
+                    d2 = self:steer(tmp, d2, want.Unit, 1 / 60, t + i / 60)
+                    p2 = p2 + d2 * B.speed / 60
+                    if p2.y < 1.5 then p2 = v3(p2.x, 1.5, p2.z) end
+                    local c = e2:Dot(wq.Unit)
+                    local th = math.acos(math.max(-1, math.min(1, c)))
+                    local r = Pr.phiLerp((a + b * (t - B.pass_t0 + i / 60)) * z, th)
+                    local perp = wq.Unit - e2 * c
+                    if perp.Magnitude > 1e-6 then e2 = e2 * math.cos(r) + perp.Unit * math.sin(r) end
+                    q2 = q2 + e2 * B.speed / 60
+                    if q2.y < 1.5 then q2 = v3(q2.x, 1.5, q2.z) end
+                end
+                self.log[#self.log + 1] = ("   speed %.1f law %s k0 %s k1 %s k %s sscale %s pass_t0 %.3f t %.3f\n"):format(B.speed, B.law, tostring(B.k0), tostring(B.k1), tostring(B.k), tostring(B.sscale), B.pass_t0, t)
+            end
+            local E2 = self.last_E
+            self.log = self.log or {}
+            self.log[#self.log + 1] = ("t=%.3f CHK server-true arrival %s | predictor from true state %s | script E lo/mid/hi %s (R %.1f, d %.1f)\n"):format(t,
+                tostring(ts and ("%.3f"):format(ts)), tostring(tpred and ("%.3f"):format(tpred)),
+                E2 and ("%.3f/%.3f/%.3f"):format(E2.lo, E2.mid, E2.hi) or "-", R, (B.pos - tp).Magnitude)
+        end
+    end
     local env = self:make_env(genv)
     setfenv(chunk, env)
     local co = coroutine.create(chunk)
@@ -709,6 +801,15 @@ function World:load_script(chunk, opts)
     if not sim then error("script did not export __SIM (load failed): " .. tostring(next(M.errors) and select(2, next(M.errors)))) end
     self.sim = sim
     self.genv = genv
+    local AP = sim.Parry.__AP
+    if AP and AP.predict then
+        local orig = AP.predict
+        AP.predict = function(...)
+            local E = orig(...)
+            if E then self.last_E, self.last_E_now = E, M.now end
+            return E
+        end
+    end
     local P = sim.Parry
     local S = P.S
     S.parry_mode = opts.mode or "Remote"

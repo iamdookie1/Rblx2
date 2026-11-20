@@ -22,6 +22,8 @@ local function load_chunk(path)
     src, n2 = src:gsub("function Parry%.isMe%(name%) return name == me end",
         "function Parry.isMe(name) return name == me end\n    Parry.__Core = Core; Parry.__AP = AP; Parry.__Pred = Pred", 1)
     assert(n1 == 1 and n2 == 1, "patch anchors missing in " .. path)
+    src = src:gsub("Core%.last_parry = { t = now, via = via, info = info }",
+        "Core.last_parry = { t = now, via = via, info = info }; if getgenv().__ONFIRE then getgenv().__ONFIRE(via, info) end", 1)
     return assert(loadstring(src, "=" .. path))
 end
 local chunk = load_chunk(script)
@@ -33,6 +35,22 @@ local VARIANTS = {
     tbkey = { mode = "Keypress", triggerbot = true },
 }
 local opts = VARIANTS[variant] or error("unknown variant " .. variant)
+if os.getenv("SIM_TRUELAW") then
+    local prev = opts.after_load
+    opts.after_load = function(sim, w)
+        if prev then prev(sim, w) end
+        local Pr = sim.Parry.__Pred
+        if not Pr then return end
+        Pr.globalFit = function()
+            local L, h = w.law, w.cfg.homing
+            if not L then return nil end
+            local tk = 1 / 60
+            if L.law == "prop" then return { m = 4, a = L.k * tk, b = 0, al = h.speed_scale or 0, u = 0.06, n = 999 } end
+            if L.law == "ramp" then return { m = 4, a = L.k0 * tk, b = L.k1 * tk, al = h.speed_scale or 0, u = 0.06, n = 999 } end
+            return { m = 2, a = L.w * tk, b = 0, al = h.speed_scale or 0, u = 0.06, n = 999 }
+        end
+    end
+end
 if os.getenv("SIM_NOCAL") then
     local prev = opts.after_load
     opts.after_load = function(sim, w)
@@ -41,8 +59,18 @@ if os.getenv("SIM_NOCAL") then
     end
 end
 if os.getenv("SIM_DBG") then
+    local prev = opts.after_load
     opts.after_load = function(sim, w)
+        if prev then prev(sim, w) end
         sim.Parry.DBG.on = true
+        if os.getenv("SIM_LOG") then
+            local ev = sim.Parry.DBG.ev
+            sim.Parry.DBG.ev = function(text)
+                w.log = w.log or {}
+                w.log[#w.log + 1] = ("t=%.3f dbg %s\n"):format(M.now, tostring(text))
+                return ev(text)
+            end
+        end
         w.tick_hook = function(w2)
             local e = sim.Parry.DBG.eval
             if e.t and e.t ~= w2.last_eval_t and os.getenv("SIM_EVAL") then
@@ -103,6 +131,7 @@ local function base_world(i, seed, o)
     local cfg = { seed = seed + 17, rtt = p.rtt, jitter = p.jitter, fps = p.fps, buffer = p.buffer, homing = p.homing,
         W = 0.5, cooldown = 1.3, kill_dist = 3.5, deflect_extra = p.dx, deflect_speed = p.ds, move = p.move, spikes = p.spikes,
         ping_bias = p.ping_bias, frame_jitter = 0.1, attr_first = probe.rng() < 0.5, log = os.getenv("SIM_LOG") ~= nil, deferred = p.deferred, wlog = os.getenv("SIM_WLOG") ~= nil, perfect_bots = true }
+    if os.getenv("SIM_DEFERRED") then cfg.deferred = os.getenv("SIM_DEFERRED") == "1" end
     if os.getenv("SIM_PINGBIAS") then cfg.ping_bias = tonumber(os.getenv("SIM_PINGBIAS")) end
     if os.getenv("SIM_BUF") then cfg.buffer = tonumber(os.getenv("SIM_BUF")) end
     local w = World.new(cfg)
@@ -324,14 +353,99 @@ local function run_dots(i, seed)
     w:load_script(chunk, opts)
     w:run(60)
     return { rtt = p.rtt, out = (w.stats.deaths > 0) and ("dead:" .. (w.last_death.reason or "?")) or "survived",
-        hits = w.stats.my_hits, dist = dist, errs = M.err_count, fps = p.fps, doubles = w.stats.doubles }
+        hits = w.stats.my_hits, dist = dist, errs = M.err_count, fps = p.fps, doubles = w.stats.doubles, log = w.log }
+end
+
+local function run_match(i, seed)
+    local w, p, probe = base_world(i, seed, { no_move = os.getenv("SIM_MATCH_MOVE") == nil })
+    local nbots = tonumber(os.getenv("SIM_BOTS") or "1")
+    local names, P = {}, {}
+    for b = 1, nbots do
+        local a = probe:rand(0, 2 * math.pi)
+        local r = probe:rand(15, 70)
+        local name = "Bot" .. b
+        P[name] = w:add_player(name, v3(math.cos(a) * r, 3, math.sin(a) * r), false, { up = 0.04 })
+        names[#names + 1] = name
+        local root = w.player_inst[name].Character:FindFirstChild("HumanoidRootPart")
+        M.set_getter(root, "Position", function() return P[name].pos end)
+        M.set_getter(root, "CFrame", function() return M.CFrame.lookAt(P[name].pos, w.me_base) end)
+        P[name].wp = P[name].pos
+    end
+    w.on_server_tick = function(w2, t)
+        for _, n in ipairs(names) do
+            local B = P[n]
+            local to = B.wp - B.pos
+            if to.Magnitude < 1 then
+                local a, r = w2:rand(0, 2 * math.pi), w2:rand(12, 80)
+                B.wp = w2.me_base + v3(math.cos(a) * r, 0, math.sin(a) * r)
+            else
+                B.pos = B.pos + to.Unit * math.min(16 / 60, to.Magnitude)
+            end
+            local off = B.pos - w2.me_base
+            local flat = v3(off.X, 0, off.Z)
+            if flat.Magnitude < 10 then
+                local d = flat.Magnitude > 0.1 and flat.Unit or v3(1, 0, 0)
+                B.pos = v3(w2.me_base.X + d.X * 10, B.pos.Y, w2.me_base.Z + d.Z * 10)
+            end
+        end
+    end
+    local function next_speed(s2)
+        if s2 > 1000 or w.rng() < 0.08 then return w:rand(40, 90) end
+        return s2 * w:rand(1.04, 1.08) + 3
+    end
+    w.scenario = {
+        choose_target = function(w2, Pl)
+            if Pl.is_me then return w2:pick(names) end
+            if nbots == 1 or w2.rng() < 0.5 then return "Me" end
+            local o = {}
+            for _, n in ipairs(names) do if n ~= Pl.name then o[#o + 1] = n end end
+            return w2:pick(o)
+        end,
+        choose_curve = function(w2, Pl) if Pl.is_me then return "straight" end; return w2:pick(CURVES) end,
+        next_speed = function(w2, s2, Pl) return next_speed(s2) end,
+    }
+    local ball, B = start_ball(w, P[names[1]].pos, names[1], 60, "straight")
+    local restart_at
+    w.on_my_death = function(w2, t)
+        B.target = nil
+        restart_at = t + 2
+    end
+    local move_bots = w.on_server_tick
+    w.on_server_tick = function(w2, t)
+        move_bots(w2, t)
+        if restart_at and t >= restart_at then
+            restart_at = nil
+            local me = w2.sv.players[w2.me_name]
+            me.win_until, me.cool_until, me.win_start = -1, -1, -1
+            w2.cl.win_until, w2.cl.cool_until = -1, -1
+            local src = P[w2:pick(names)]
+            local a = w2:rand(0, 2 * math.pi)
+            local rd = v3(math.cos(a), 0.2, math.sin(a)).Unit
+            B.pos = src.pos + rd * 30
+            w2:new_pass(B, nil, src.name, -rd, w2:rand(40, 90), t)
+        end
+    end
+    w:load_script(chunk, opts)
+    w:run(tonumber(os.getenv("SIM_MATCH_SECS") or "90"))
+    if os.getenv("SIM_LOG") and w.log then for _, l in ipairs(w.log) do io.write(l) end end
+    if os.getenv("SIM_DBG") and w.sim then for _, e in ipairs(w.sim.Parry.DBG.list) do io.write(("dbg %.3f %s\n"):format(e.t, e.text)) end end
+    if os.getenv("SIM_GFIT") and w.sim and w.sim.Parry.__Pred then
+        local Pr = w.sim.Parry.__Pred
+        local gf = Pr.globalFit(M.now + 10)
+        local L = w.law or {}
+        io.write(("match %d true: %s k %.2f w %s k0 %s k1 %s speedpow %s | learned: %s\n"):format(i, tostring(L.law), L.k or 0, tostring(L.w and ("%.2f"):format(L.w)),
+            tostring(L.k0 and ("%.2f"):format(L.k0)), tostring(L.k1 and ("%.2f"):format(L.k1)), tostring(p.homing.speed_scale and ("%.2f"):format(p.homing.speed_scale)),
+            gf and ("model %d a %.2f b %.2f pow %.1f fit-err %.0f%% n %d"):format(gf.m, gf.a, gf.b or 0, gf.al, gf.u * 100, gf.n) or "none"))
+    end
+    return { rtt = p.rtt, out = "match", plog = w.stats.plog, fps = p.fps, errs = M.err_count, doubles = w.stats.doubles,
+        law = p.homing.law }
 end
 
 ---------------------------------------------------------------- report
 local function bucket(r) return math.floor(r.rtt * 1000 + 0.5) end
 local results = {}
 local t0 = os.clock()
-local runner = ({ pass = run_pass, rally = run_rally, ffa = run_ffa, smoke = run_pass, session = run_session, ability = run_ability, dots = run_dots })[suite]
+local runner = ({ pass = run_pass, rally = run_rally, ffa = run_ffa, smoke = run_pass, session = run_session, ability = run_ability, dots = run_dots, match = run_match })[suite]
 if suite == "smoke" then trials = math.min(trials, 3) end
 local only = os.getenv("SIM_ONLY")
 for i = 1, trials do
@@ -376,6 +490,64 @@ if csv then
     f:close()
 end
 
+if suite == "match" and os.getenv("SIM_PLOG") then
+    local f = assert(io.open(os.getenv("SIM_PLOG"), "w"))
+    f:write("i,rtt,k,flight,ok,reason,speed,curve,law,via,fires,dist,info,fire_at,range_at,e_lo,e_mid,e_hi,vias\n")
+    for _, r in ipairs(results) do
+        for k, pl in ipairs(r.plog or {}) do
+            local via = tostring(pl.via or "none"):gsub(",", ";")
+            f:write(("%d,%d,%d,%.4f,%d,%s,%.0f,%s,%s,%s,%d,%.1f,%s,%s"):format(r.i, bucket(r), k, pl.flight, pl.ok and 1 or 0, tostring(pl.reason), pl.speed or 0,
+                tostring(pl.curve), tostring(r.law), via, pl.fires or 0, pl.dist or 0, tostring(pl.info or "-"),
+                pl.fire_at and ("%.3f"):format(pl.fire_at) or "-") .. "," ..
+                (pl.t_range and ("%.3f"):format(pl.t_range - pl.t0) or "-") .. "," ..
+                ((pl.E and pl.t_range) and ("%.3f,%.3f,%.3f"):format(pl.E.lo - pl.t_range, pl.E.mid - pl.t_range, pl.E.hi - pl.t_range) or "-,-,-") ..
+                "," .. tostring(pl.vias or "-") .. "\n")
+        end
+    end
+    f:close()
+end
+if suite == "match" then
+    local agg, tot = {}, { n = 0, ok = 0, wn = 0, wok = 0, rs = {} }
+    local laws = {}
+    for _, r in ipairs(results) do
+        local b = bucket(r)
+        agg[b] = agg[b] or { n = 0, ok = 0, wn = 0, wok = 0, un = 0, uok = 0 }
+        local A = agg[b]
+        laws[r.law] = laws[r.law] or { n = 0, ok = 0 }
+        for k, pl in ipairs(r.plog or {}) do
+            if pl.flight >= r.rtt + 0.035 then
+                A.n, A.ok = A.n + 1, A.ok + (pl.ok and 1 or 0)
+                tot.n, tot.ok = tot.n + 1, tot.ok + (pl.ok and 1 or 0)
+                laws[r.law].n, laws[r.law].ok = laws[r.law].n + 1, laws[r.law].ok + (pl.ok and 1 or 0)
+                if k > 8 then A.wn, A.wok, tot.wn, tot.wok = A.wn + 1, A.wok + (pl.ok and 1 or 0), tot.wn + 1, tot.wok + (pl.ok and 1 or 0) end
+                if not pl.ok then tot.rs[pl.reason or "?"] = (tot.rs[pl.reason or "?"] or 0) + 1 end
+            else
+                A.un, A.uok = A.un + 1, A.uok + (pl.ok and 1 or 0)
+            end
+        end
+    end
+    local ks = {}
+    for k in pairs(agg) do ks[#ks + 1] = k end
+    table.sort(ks)
+    print(("== match | %s | %s | %d matches"):format(script, variant, #results))
+    for _, k in ipairs(ks) do
+        local A = agg[k]
+        print(("ping %3dms  reachable %5.1f%% of %4d  (after the first 8 passes %5.1f%%)  unreachable hit %d/%d"):format(k,
+            A.ok / math.max(A.n, 1) * 100, A.n, A.wok / math.max(A.wn, 1) * 100, A.uok, A.un))
+    end
+    local rs = {}
+    for k, v in pairs(tot.rs) do rs[#rs + 1] = k .. " " .. v end
+    table.sort(rs)
+    local ls = {}
+    for k, v in pairs(laws) do ls[#ls + 1] = ("%s %.1f%%"):format(k, v.ok / math.max(v.n, 1) * 100) end
+    table.sort(ls)
+    print(("total reachable %.1f%% (%d/%d), after warm-up %.1f%%  [%s]  by law: %s"):format(tot.ok / math.max(tot.n, 1) * 100, tot.ok, tot.n,
+        tot.wok / math.max(tot.wn, 1) * 100, table.concat(rs, ", "), table.concat(ls, ", ")))
+    local dbl = 0
+    for _, r in ipairs(results) do dbl = dbl + (r.doubles or 0) end
+    print(("double parries: %d"):format(dbl))
+    os.exit(0)
+end
 if suite == "session" then
     local agg = {}
     for _, r in ipairs(results) do

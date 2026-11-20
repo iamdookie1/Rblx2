@@ -1,6 +1,6 @@
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.6.3"
+local SCRIPT_VERSION = "rewrite-0.6.4"
 
 local genv = (getgenv and getgenv()) or _G
 if type(genv.__BladeBallShutdown) == 'function' then pcall(genv.__BladeBallShutdown) end
@@ -258,8 +258,6 @@ do
     local S = {
         autoparry = false, triggerbot = false, parry_mode = "Remote",
         one_parry_capture = true, rescue_press = true, preparry = false, preparry_range = 30, hp_preparry = true, dot_protect = true,
-        accuracy = 50, accuracy_base = 50,
-        random_accuracy = false, random_accuracy_amount = 10,
         target_mode = 1, target_method = "Angle", curve_mode = 1, random_curve = false,
         auto_ability = false, cooldown_protection = false,
     }
@@ -300,14 +298,6 @@ do
         return out
     end
 
-    function Util.rollAcc()
-        local acc = S.accuracy_base or 50
-        if S.random_accuracy and S.random_accuracy_amount > 0 then
-            acc = acc + math.random(-S.random_accuracy_amount, S.random_accuracy_amount)
-        end
-        S.accuracy = math.clamp(acc, 1, 100)
-    end
-    Parry.roll = Util.rollAcc
     function Util.indexOf(list, name)
         for i, n in ipairs(list) do if n == name then return i end end
     end
@@ -1229,24 +1219,6 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
     end
     function Core.ap_gap(ball) return contactGap(ball) + 1.5 end
     local Pred, AP = { prior = {}, buf = 0.08, buf_n = 0, hist = setmetatable({}, { __mode = 'k' }) }, {}
-    function Pred.priorK(speed)
-        local p = Pred.prior
-        if #p < 4 then return 6, 2.5, math.max(16, speed * 0.05) end
-        local ks, rs = {}, {}
-        for i, e in ipairs(p) do ks[i], rs[i] = e.k, e.k / e.sp end
-        table.sort(ks)
-        table.sort(rs)
-        local n = #ks
-        local i50, i15, i90 = math.ceil(n * 0.5), math.max(math.floor(n * 0.15), 1), math.min(math.ceil(n * 0.9), n)
-        local med = math.sqrt(ks[i50] * rs[i50] * speed)
-        return med, math.min(ks[i15], rs[i15] * speed), math.max(ks[i90], rs[i90] * speed) * 1.15
-    end
-    function Pred.addPrior(k, sp)
-        if type(k) ~= "number" or k ~= k or k <= 0 or not sp or sp < 1 then return end
-        local p = Pred.prior
-        p[#p + 1] = { k = math.clamp(k, 0.5, 150), sp = sp }
-        if #p > 32 then table.remove(p, 1) end
-    end
     Pred.tick, Pred.gaps = 1 / 60, {}
     function Pred.noteZoom(ball, v, now)
         local h = Pred.hist[ball]
@@ -1327,8 +1299,8 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         if sp < 1 then return end
         local T = st.trk
         if not T or T.pass ~= st.pass_n then
-            if T and T.fit and T.fit.m == 1 and (T.fit.n or 0) >= 4 then Pred.addPrior(T.fit.a, T.fit.sp) end
-            T = { pass = st.pass_n, t0 = now, s = {} }
+            if T and T.sp0 then AP.noteGrowth(sp / T.sp0) end
+            T = { pass = st.pass_n, t0 = now, s = {}, sp0 = sp }
             st.trk = T
         end
         local d = v / sp
@@ -1359,6 +1331,89 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         s[#s + 1] = { t = now, d = d, th = th, sp = sp }
         if #s > 16 then table.remove(s, 1) end
         T.fit, T.ver = nil, (T.ver or 0) + 1
+        local g = Pred.seg(s[#s - 1], s[#s], T.t0)
+        if g and not st.hold then Pred.addSeg(g) end
+    end
+    function Pred.lerpA(phi, th)
+        if th < 0.02 then return nil end
+        local tp = math.tan(math.min(phi, 1.3))
+        local den = math.sin(th) + tp * (1 - math.cos(th))
+        if den < 1e-3 then return nil end
+        return tp / den
+    end
+    function Pred.seg(a, b, t0)
+        if not a or not b or a.th < 0.03 or b.th > a.th + 0.01 then return nil end
+        if b.t - a.t > Pred.tick * 4.5 then return nil end
+        local phi = math.acos(math.clamp(a.d:Dot(b.d), -1, 1))
+        if phi > 1.2 then return nil end
+        return { phi = phi, th = a.th, a = Pred.lerpA(phi, a.th), v = (a.sp + b.sp) * 0.5, tau = (a.t + b.t) * 0.5 - t0 }
+    end
+    function Pred.phiLerp(a, th)
+        a = math.clamp(a, 0, 1)
+        return math.atan2(a * math.sin(th), 1 - a * (1 - math.cos(th)))
+    end
+    function Pred.fitSegs(L, pows)
+        local n = #L
+        if n < 1 then return nil end
+        local pm = 0
+        for _, g in ipairs(L) do pm = pm + g.phi end
+        pm = pm / n
+        local all = {}
+        for _, al in ipairs(pows) do
+            local s11, s12, s22, t1, t2, szz, szp = 0, 0, 0, 0, 0, 0, 0
+            for _, g in ipairs(L) do
+                local z = (g.v / 150) ^ al
+                if g.a then
+                    local q = math.sin(math.min(g.th, 1.57)) ^ 2 + 0.05
+                    local x2 = z * g.tau
+                    s11, s12, s22 = s11 + q * z * z, s12 + q * z * x2, s22 + q * x2 * x2
+                    t1, t2 = t1 + q * z * g.a, t2 + q * x2 * g.a
+                end
+                if g.th > g.phi * 1.5 then szz, szp = szz + z * z, szp + z * g.phi end
+            end
+            local c0 = t1 / math.max(s11, 1e-12)
+            local det = s11 * s22 - s12 * s12
+            local ca, cb
+            if n >= 6 and math.abs(det) > 1e-14 then ca, cb = (t1 * s22 - t2 * s12) / det, (s11 * t2 - s12 * t1) / det end
+            local om = szp / math.max(szz, 1e-12)
+            local r0, rr, rt = 0, 0, 0
+            for _, g in ipairs(L) do
+                local z = (g.v / 150) ^ al
+                r0 = r0 + (g.phi - Pred.phiLerp(c0 * z, g.th)) ^ 2
+                if ca then rr = rr + (g.phi - Pred.phiLerp((ca + cb * g.tau) * z, g.th)) ^ 2 end
+                rt = rt + (g.phi - math.min(om * z, g.th)) ^ 2
+            end
+            if c0 > 0 then all[#all + 1] = { m = 4, a = c0, b = 0, al = al, r = math.sqrt(r0 / n) } end
+            if ca and cb > 0 and ca > -0.02 then all[#all + 1] = { m = 4, a = ca, b = cb, al = al, r = math.sqrt(rr / n) * 1.03 } end
+            if om > 0 then all[#all + 1] = { m = 2, a = om, b = 0, al = al, r = math.sqrt(rt / n) * 1.01 } end
+        end
+        local best
+        for _, c in ipairs(all) do if not best or c.r < best.r then best = c end end
+        if not best then return nil end
+        best.u = math.clamp(best.r / math.max(pm, 1e-3), 0.03, 0.8)
+        best.n, best.all = n, all
+        return best
+    end
+    Pred.G = { segs = {}, dirty = 0, fit = nil, at = -1 }
+    function Pred.addSeg(g)
+        local G = Pred.G
+        local L = G.segs
+        L[#L + 1] = g
+        if #L > 600 then table.remove(L, 1) end
+        G.dirty = G.dirty + 1
+    end
+    function Pred.globalFit(now)
+        local G = Pred.G
+        if G.fit ~= nil and (G.dirty < 15 or now - G.at < 0.3) then return G.fit or nil end
+        G.at, G.dirty = now, 0
+        if #G.segs < 40 then G.fit = false; return nil end
+        local best = Pred.fitSegs(G.segs, { 0, 0.5, 1 })
+        G.fit = best or false
+        if best and DBG.on then
+            DBG.ev(("server steering learned: %s %.3f%s, speed power %.1f, error %.0f%% (%d samples)"):format(
+                best.m == 2 and "turn/tick" or "blend/tick", best.a, best.b > 0 and (" +%.3f/s"):format(best.b) or "", best.al, best.u * 100, best.n))
+        end
+        return best
     end
     function Pred.targetPos(st)
         local tg = st.target
@@ -1369,58 +1424,17 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
     function Pred.fit(T)
         if T.fit ~= nil then return T.fit or nil end
         local s, segs = T.s, {}
-        local n, j = #s, 1
-        local tk = Pred.tick
-        for i = 2, n do
-            while j < i - 1 and s[i].t - s[j + 1].t >= 0.05 do j = j + 1 end
-            local a, b = s[j], s[i]
-            local span = math.max(math.floor((b.t - a.t) / tk + 0.5), 1) * tk
-            if a.th > 0.03 then
-                local turn = math.acos(math.clamp(a.d:Dot(b.d), -1, 1))
-                local th = (a.th + b.th) * 0.5
-                segs[#segs + 1] = { w = turn / span, s = math.max(math.sin(th), 0.02), tau = (a.t + b.t) * 0.5 - T.t0 }
-            end
+        for i = 2, #s do
+            local g = Pred.seg(s[i - 1], s[i], T.t0)
+            if g then segs[#segs + 1] = g end
         end
-        local m = #segs
-        if m < 1 then T.fit = false; return nil end
-        local sws, sss, sw, sw2 = 0, 0, 0, 0
-        for _, g in ipairs(segs) do sws, sss, sw, sw2 = sws + g.w * g.s, sss + g.s * g.s, sw + g.w, sw2 + g.w * g.w end
-        local k1 = sws / math.max(sss, 1e-6)
-        local wb = sw / m
-        local r1, r2 = 0, 0
-        for _, g in ipairs(segs) do
-            r1 = r1 + (g.w - k1 * g.s) ^ 2
-            r2 = r2 + (g.w - wb) ^ 2
-        end
-        r1, r2 = math.sqrt(r1 / m), math.sqrt(r2 / m)
-        local all = { { m = 1, a = k1, b = 0, r = r1 }, { m = 2, a = wb, b = 0, r = r2 } }
-        local best = all[1]
-        if r2 < r1 * 0.9 then best = all[2] end
-        if m >= 5 then
-            local a11, a12, a22, b1, b2 = 0, 0, 0, 0, 0
-            for _, g in ipairs(segs) do
-                local x1, x2 = g.s, g.s * g.tau
-                a11, a12, a22 = a11 + x1 * x1, a12 + x1 * x2, a22 + x2 * x2
-                b1, b2 = b1 + x1 * g.w, b2 + x2 * g.w
-            end
-            local det = a11 * a22 - a12 * a12
-            if math.abs(det) > 1e-9 then
-                local ka, kb = (b1 * a22 - b2 * a12) / det, (a11 * b2 - a12 * b1) / det
-                if kb > 0 and ka > -2 then
-                    local r3 = 0
-                    for _, g in ipairs(segs) do r3 = r3 + (g.w - g.s * (ka + kb * g.tau)) ^ 2 end
-                    r3 = math.sqrt(r3 / m)
-                    all[3] = { m = 3, a = ka, b = kb, r = r3 }
-                    if r3 < best.r * 0.8 then best = all[3] end
-                end
-            end
-        end
-        local scale = math.max(wb, 0.3)
-        best.u = math.clamp(best.r / scale, 0.04, 0.45) + 0.35 / m
-        best.n, best.sp = m, s[n].sp
+        if #segs < 2 then T.fit = false; return nil end
+        local best = Pred.fitSegs(segs, { 0 })
+        if not best then T.fit = false; return nil end
+        best.u = math.clamp(best.u + 0.3 / #segs, 0.05, 0.8)
         best.alt = {}
-        for _, c in ipairs(all) do
-            if c ~= best and c.a > 0 and c.r <= math.max(best.r * 2.5, scale * 0.25) then best.alt[#best.alt + 1] = c end
+        for _, c in ipairs(best.all) do
+            if c ~= best and c.r <= best.r * 2 then best.alt[#best.alt + 1] = c end
         end
         T.fit = best
         return best
@@ -1428,13 +1442,13 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
     function Pred.run(pos, dir, speed, accel, tp, tv, gap, horizon, mdl, a, b, tau0, cap, minH)
         if speed < 1 then return nil end
         local t, best, bestT, prev, start = 0, math.huge, nil, math.huge, nil
-        local dt = math.clamp(6 / speed, 1 / 240, 1 / 60)
+        local dt = (mdl == 4 or mdl == 2) and Pred.tick or math.clamp(6 / speed, 1 / 240, 1 / 60)
         local sin, cos, acos = math.sin, math.cos, math.acos
         while t < horizon do
             local tg = tv and (tp + tv * t) or tp
             local to = tg - pos
             local dist = to.Magnitude
-            if dist <= gap then return t end
+            if dist <= gap then return t, gap end
             if cap then
                 start = start or dist
                 if dist < best then best, bestT = dist, t end
@@ -1444,12 +1458,12 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
             local want = to / dist
             local c = math.clamp(dir:Dot(want), -1, 1)
             local move = speed * dt
-            if c > 0.2 and move * c >= dist - gap then return t + (dist - gap) / (speed * c) end
             local th = acos(c)
             if th > 1e-4 then
-                local w
-                if mdl == 2 then w = a else w = (a + b * (tau0 + t)) * math.max(sin(th), 0.02) end
-                local r = math.min(math.max(w, 0) * dt, th)
+                local r
+                if mdl == 4 then r = Pred.phiLerp(a + b * (tau0 + t), th)
+                elseif mdl == 2 then r = math.min(math.max(a, 0), th)
+                else r = math.min(math.max((a + b * (tau0 + t)) * math.max(sin(th), 0.02), 0) * dt, th) end
                 local perp = want - dir * c
                 local pm = perp.Magnitude
                 if pm < 1e-6 then
@@ -1458,6 +1472,16 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
                     pm = perp.Magnitude
                 end
                 dir = dir * cos(r) + (perp / pm) * sin(r)
+            end
+            -- the server turns the ball, then moves it a step: it's a hit only if that step's segment
+            -- really enters the hit sphere (a ball sliding past just outside it loops back instead)
+            local proj = dir:Dot(to)
+            if proj > 0 then
+                local off2 = dist * dist - proj * proj
+                if off2 <= gap * gap then
+                    local tin = proj - math.sqrt(gap * gap - off2)
+                    if tin <= move then return t + math.max(tin, 0) / speed, gap - math.sqrt(math.max(off2, 0)) end
+                end
             end
             speed = speed + accel * dt
             pos = pos + dir * move
@@ -1509,31 +1533,40 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
             return res
         end
         local mdl, a, b, u, alo, ahi
-        if f then
+        local gf = Pred.globalFit(now)
+        if gf and gf.u < 0.6 then
+            local z = (speed / 150) ^ gf.al
+            mdl, a, b, u = gf.m, gf.a * z, gf.b * z, math.clamp(gf.u, 0.06, 0.5)
+            if f and (f.n or 0) >= 6 and f.m == mdl and math.abs(f.a - a) / math.max(a, 1e-4) > 0.6 then u = math.max(u, 0.35) end
+            res.alts = (f and (f.n or 0) >= 4) and { { m = f.m, a = f.a, b = f.b } } or {}
+            res.global = true
+        elseif f then
             mdl, a, b, u = f.m, f.a, f.b, f.u
-            alo, ahi = a * (1 - u), a * (1 + u)
-            res.k, res.model, res.u = a, mdl, u
         else
-            local km, klo, khi = Pred.priorK(speed)
-            mdl, a, b, alo, ahi = 1, km, 0, klo, khi
-            res.k, res.model, res.u = km, 0, 1
+            local tk = Pred.tick
+            mdl, a, b, u = 4, 6 * tk, 0, 0.6
         end
+        alo, ahi = a * (1 - u), a * (1 + u)
+        if mdl == 4 then ahi = math.min(ahi, 1) end
+        if not gf and not f then alo, ahi = 2.5 * Pred.tick, math.min(math.max(16, speed * 0.05) * Pred.tick, 1) end
+        res.k, res.model, res.u = a, mdl, u
         if T and T.away_at and now - T.away_at < 0.12 then alo = math.min(alo, a * 0.5) end
         local hz = horizon or 3
         local minH = ball:GetAttribute("minHeight")
         if type(minH) ~= "number" then minH = nil end
-        local lo = Pred.run(p, dir, speed, accel * 1.5 + speed * 0.05, tp, tv, gap, hz, mdl, ahi, b * (ahi / math.max(a, 1e-3)), tau0, 12, minH)
-        local alts = f and f.alt
+        local lo = Pred.run(p, dir, speed, accel * 1.5 + speed * 0.05, tp, tv, gap, hz, mdl, ahi, b * (ahi / math.max(a, 1e-3)), tau0,
+            math.min(1.5 + speed * 0.01, 4), minH)
+        local alts = res.alts or (f and f.alt)
         local alo_t, ahi_t = math.huge, 0
         if alts then
             for _, c in ipairs(alts) do
-                local e = Pred.run(p, dir, speed, accel, tp, tv, gap, hz + 1, c.m, c.a, c.b, tau0, 3, minH)
+                local e = Pred.run(p, dir, speed, accel, tp, tv, gap, hz + 1, c.m, c.a, c.b, tau0, 1, minH)
                 if e then alo_t, ahi_t = math.min(alo_t, e), math.max(ahi_t, e) else ahi_t = math.huge end
             end
         end
         res.lo = math.max(math.min(lo or math.huge, alo_t), straight * 0.97)
         if res.lo > hz then res.mid, res.hi = math.huge, math.huge; return res end
-        local mid = Pred.run(p, dir, speed, accel, tp, tv, gap, hz + 1, mdl, a, b, tau0, 3, minH)
+        local mid = Pred.run(p, dir, speed, accel, tp, tv, gap, hz + 1, mdl, a, b, tau0, 1, minH)
         local hi = Pred.run(p, dir, speed, 0, tp, tv, gap, hz + 1.5, mdl, alo, b * (alo / math.max(a, 1e-3)), tau0, nil, minH)
         res.mid = math.max(mid or (ahi_t > 0 and math.min(ahi_t, hz + 1)) or hz + 1, res.lo)
         res.hi = math.max(hi or math.huge, ahi_t, res.mid)
@@ -1583,7 +1616,6 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         if st.preparried then
             st.parried, st.parry_until, st.preparried = true, st.preparry_until, false
         end
-        if S.random_accuracy then Util.rollAcc() end
     end
     function Util.hookZoomies(ball, st, z)
         if st.zinst == z then return end
@@ -1592,6 +1624,7 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
             if not active or not isLive() then return end
             local now = clock_()
             Pred.noteZoom(ball, z.VectorVelocity, now)
+            if st.aim then AP.readAim(ball, st, now) end
             Pred.sample(ball, st, now)
             if st.target == me then onVelocity(ball, st) end
         end)
@@ -1623,7 +1656,14 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
                     st.react = st.react and (st.react * 0.5 + r * 0.5) or r
                 end
             end
+            local from = st.target
             st.target_at, st.target, st.pass_n, st.pc = now, new, (st.pass_n or 1) + 1, nil
+            if type(from) == 'string' and from ~= '' and type(new) == 'string' and new ~= '' and from ~= new then
+                st.aim = { from = from, to = new, t = now, z = Pred.zat[ball] or -1 }
+                AP.readAim(ball, st, now)
+            else
+                st.aim = nil
+            end
             if type(new) == 'string' and new ~= '' and new ~= me then
                 st.pass_open, st.parried, st.landed = false, false, false
                 if wasMe then G.until_t = 0 end
@@ -2064,7 +2104,7 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
 
     AP.net = { win = {}, at = -1, echo_rem = {}, echo_key = {} }
     AP.cal = { res = {}, bias = 0, n = 0, uses = {} }
-    AP.MARGIN_EARLY, AP.MARGIN_LATE, AP.CLOSE, AP.CLOSE_STUDS, AP.LEAN = 0.02, 0.03, 0.06, 3, 0.7
+    AP.MARGIN_EARLY, AP.MARGIN_LATE, AP.LEAN = 0.02, 0.03, 0.7
     function AP.netTick(now)
         local N = AP.net
         if now - N.at < 0.05 then return end
@@ -2097,27 +2137,13 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         local add = off or (((kind == "key") and frameDt * 1.5 or frameDt * 0.5) + 0.008)
         return math.max(lo + add, 0), math.max(med + add, 0), math.max(hi + add, 0)
     end
-    function AP.closeness()
-        if S.smart_timing then return 0 end
-        return math.clamp(((S.accuracy or 50) - 1) / 99, 0, 1)
-    end
-    function AP.closeMargin(speed, r_mid, r_hi)
-        local jit = math.max(r_hi - r_mid, 0)
-        return math.min(math.max(AP.CLOSE, jit * 2 + 0.03, AP.CLOSE_STUDS / math.max(speed or 100, 1)), 0.2)
-    end
     function AP.plan(E, r_lo, r_mid, r_hi, W)
         local b = AP.cal.bias
         local A_lo, A_mid, A_hi = E.lo - r_hi + b, E.mid - r_mid + b, E.hi - r_lo + b
         local me_, ml = AP.MARGIN_EARLY, AP.MARGIN_LATE
         local step = frameDt * 0.5
         local slack = W - (A_hi - A_lo) - me_ - ml
-        local c = AP.closeness()
-        local e = me_
-        if slack > 0 then
-            local safe = slack * AP.LEAN
-            local close = math.min(safe, AP.closeMargin(E.speed, r_mid, r_hi))
-            e = me_ + close + (safe - close) * (1 - c)
-        end
+        local e = me_ + math.max(slack, 0) * AP.LEAN
         if A_lo <= me_ + step then return "must", A_lo, A_mid, A_hi, e end
         if slack > 0 and A_lo <= e + step then return slack < 0.1 and "tight" or "planned", A_lo, A_mid, A_hi, e end
         return nil, A_lo, A_mid, A_hi, e
@@ -2156,6 +2182,10 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         local E = AP.predict(ball, st, now, r_hi + W + 0.3)
         if not E then return end
         local verdict, A_lo, A_mid, A_hi, e = AP.plan(E, r_lo, r_mid, r_hi, W)
+        if verdict and A_hi < -0.1 then
+            verdict = nil
+            DBG.held("too late to matter: even the latest landing is before a parry could be up", now)
+        end
         if verdict == "must" and not E.straight_in and A_mid > W - AP.MARGIN_LATE then
             local T = st.trk
             local f = T and T.pass == st.pass_n and Pred.fit(T)
@@ -2209,40 +2239,113 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         end
         return true
     end
-    AP.ret, AP.retStart = {}, setmetatable({}, { __mode = 'k' })
-    function AP.noteReturnStart(ball, st, now)
-        local sw = st.swaps[#st.swaps]
-        local from = sw and sw.from
-        if type(from) ~= 'string' or from == '' or from == me then AP.retStart[ball] = nil; return end
-        local their, root = charRoot(from), getRoot()
-        local sp = ballVel(ball).Magnitude
-        if not (their and root) or sp < 1 then AP.retStart[ball] = nil; return end
-        AP.retStart[ball] = { from = from, t = now, straight = math.max((their.Position - root.Position).Magnitude - Core.ap_gap(ball), 0) / sp }
+    -- Every hit anyone makes is read the moment its new direction shows: the angle between where the
+    -- ball leaves and the player it's sent at (0 = a dot, straight at them; big = a curve). Each
+    -- player's recent angles are what their next return to you is simulated with.
+    AP.ret, AP.GROWTH, AP.holders = {}, 1.08, {}
+    AP.DOT_ANGLE, AP.DOT_RANGE = 0.35, 20
+    function AP.noteGrowth(r)
+        if r ~= r or r < 0.7 or r > 2.5 then return end
+        AP.GROWTH = AP.GROWTH + (math.clamp(r, 0.95, 1.6) - AP.GROWTH) * 0.25
     end
-    function AP.noteReturnEnd(ball, now)
-        local r = ball and AP.retStart[ball]
-        if not r then return end
-        AP.retStart[ball] = nil
-        local flight = now - r.t
-        if flight < 0 or flight > 4 then return end
-        local L = AP.ret[r.from] or {}
-        AP.ret[r.from] = L
-        L[#L + 1] = flight <= r.straight * 1.6 + 0.12
-        if #L > 6 then table.remove(L, 1) end
+    function AP.readAim(ball, st, now)
+        local A = st.aim
+        if not A then return end
+        if now - A.t > 0.3 or st.target ~= A.to then st.aim = nil; return end
+        local v = ballVel(ball)
+        local sp = v.Magnitude
+        if sp < 1 then return end
+        local hitter, tp = charRoot(A.from), Pred.targetPos(st)
+        if not (hitter and tp) then st.aim = nil; return end
+        local p = Pred.statePos(ball, v)
+        local d = v / sp
+        local back = hitter.Position - p
+        local fresh = (Pred.zat[ball] or -1) > A.z
+        if not fresh and back.Magnitude > 1 and d:Dot(back.Unit) > 0.5 then return end
+        local to = tp - p
+        if to.Magnitude < 1 then st.aim = nil; return end
+        st.aim = nil
+        AP.noteAim(A.from, math.acos(math.clamp(d:Dot(to.Unit), -1, 1)), A.to == me)
     end
-    function AP.returnStyle(X)
-        local L = AP.ret[X]
-        if not L or #L < 2 then return nil end
-        local fast = 0
-        for _, f in ipairs(L) do if f then fast = fast + 1 end end
-        return fast / #L
+    function AP.noteAim(X, th, atMe)
+        local L = AP.ret[X] or {}
+        AP.ret[X] = L
+        L[#L + 1] = th
+        if #L > 12 then table.remove(L, 1) end
+        if DBG.on and atMe then
+            DBG.ev(("%s sent it at you %s (%.0f deg off; %.0f%% of their recent hits were dots)"):format(X,
+                th < AP.DOT_ANGLE and "STRAIGHT (dot)" or "curved", math.deg(th), AP.dotShare(X) * 100))
+        end
     end
-    function AP.straightReturns(X) local f = AP.returnStyle(X); return f ~= nil and f >= 0.7 end
-    AP.DOT_RANGE = 20
+    function AP.dotShare(X)
+        local L = AP.ret[X] or {}
+        local n = 0
+        for _, th in ipairs(L) do if th < AP.DOT_ANGLE then n = n + 1 end end
+        return (n + 0.5) / (#L + 1)
+    end
+    -- What X's next hit could look like: their recent angles (newest weigh most), plus a prior of a dot,
+    -- a soft curve and a hard curve that fades as their own hits come in. Point blank, dots are the
+    -- usual play, so the prior leans to a dot there.
+    AP.AIM_PRIOR = { { 0.05, 1 / 3, 0.6 }, { 0.7, 1 / 3, 0.25 }, { 1.5, 1 / 3, 0.15 } }
+    function AP.aimSamples(X, close)
+        local L, out = AP.ret[X] or {}, {}
+        local n = #L
+        for i, th in ipairs(L) do out[#out + 1] = { th = th, w = 0.85 ^ (n - i) } end
+        local pw = 2 / (2 + n)
+        for _, p in ipairs(AP.AIM_PRIOR) do out[#out + 1] = { th = p[1], w = pw * (close and p[3] or p[2]) } end
+        return out
+    end
+    AP.AIM_GRID = { 0, 0.2, 0.4, 0.7, 1.0, 1.4, 1.9, 2.5, 3.1 }
+    -- Return flight time from X to you for each launch angle on the grid, with the steering law learned
+    -- from every ball this session (cached while the distance and speed barely change).
+    function AP.returnTable(ball, st, their, root, speed, now)
+        local c = st.retc
+        local gap = (their.Position - root.Position).Magnitude
+        local gf = Pred.globalFit(now)
+        if c and c.pass == st.pass_n and math.abs(c.gap - gap) < 1.5 and math.abs(c.v - speed) < speed * 0.03
+            and c.gf == gf and now - c.at < 0.5 then return c end
+        local mdl, a, b = 4, 6 * Pred.tick, 0
+        if gf and gf.u < 0.6 then
+            local z = (speed / 150) ^ gf.al
+            mdl, a, b = gf.m, gf.a * z, gf.b * z
+        end
+        local tp = root.Position
+        local to = tp - their.Position
+        local d = math.max(to.Magnitude, 0.5)
+        local u = to / d
+        local side = u:Cross(Vector3.yAxis)
+        side = side.Magnitude > 1e-3 and side.Unit or Vector3.xAxis
+        local cg = Core.ap_gap(ball)
+        local start = their.Position + u * math.min(cg, d * 0.5)
+        local minH = ball:GetAttribute("minHeight")
+        if type(minH) ~= "number" then minH = nil end
+        local fl = {}
+        for i, th in ipairs(AP.AIM_GRID) do
+            local dir = u * math.cos(th) + side * math.sin(th)
+            fl[i] = Pred.run(start, dir, speed, 0, tp, nil, cg, 3, mdl, a, b, 0, nil, minH) or 3
+        end
+        c = { pass = st.pass_n, gap = gap, v = speed, gf = gf, at = now, fl = fl }
+        st.retc = c
+        return c
+    end
+    function AP.flightAt(c, th)
+        local G, fl = AP.AIM_GRID, c.fl
+        if th <= 0 then return fl[1] end
+        for i = 2, #G do
+            if th <= G[i] then
+                local k = (th - G[i - 1]) / (G[i] - G[i - 1])
+                return fl[i - 1] + (fl[i] - fl[i - 1]) * k
+            end
+        end
+        return fl[#fl]
+    end
+    -- Pre-parry / dot protection. The ball is on X and X can send it back to you. For every way X's next
+    -- hit could go (their own recent hits), it works out when that return would land and whether you could
+    -- still react to it after seeing it. It parries ahead only when that catches clearly more returns than
+    -- waiting and reacting would, at the moment that catches the most, and as late as that moment allows.
     function AP.anticipate(ball, st, root, now)
         local duel = AP.alive() == 2
-        local pre = S.preparry or (S.hp_preparry and duel and AP.rtt() >= 0.08)
-        if not (pre or S.dot_protect) then return end
+        if not (S.preparry or S.dot_protect or (S.hp_preparry and duel)) then return end
         if st.preparried then
             if now < st.preparry_until then return end
             st.preparried = false
@@ -2255,27 +2358,84 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         if not their then return end
         local gap = (their.Position - root.Position).Magnitude
         local dot = S.dot_protect and gap <= AP.DOT_RANGE
-        local style = AP.returnStyle(X)
-        if dot then
-            if style ~= nil and style < 0.5 then return end
-        elseif not (style ~= nil and style >= 0.7) then return end
-        if not duel and ((not dot and gap > (S.preparry_range or 30)) or not AP.likelyNext(X, st, root, their)) then return end
+        local pre = (S.preparry and (duel or gap <= (S.preparry_range or 30))) or (S.hp_preparry and duel)
+        if not (dot or pre) then return end
+        local p_me = 1
+        if not duel then
+            if not AP.likelyNext(X, st, root, their) then return end
+            p_me = 0.8
+        end
         local kind = AP.kind()
         local r_lo, r_mid, r_hi = AP.reach(kind)
         local W = parryWin() or 0.5
-        local E = AP.predict(ball, st, now, r_hi + W + 0.3)
+        local E = AP.predict(ball, st, now, r_hi + W + 1)
         if not E or E.lo == math.huge or E.hi == math.huge then return end
-        local speed = E.speed
-        local cg = Core.ap_gap(ball)
-        local back_lo = math.max(gap - cg, 0) / (speed * 1.25 + 15)
-        local back_hi = math.max(gap - cg, 0) / (speed * 0.95) + 0.04
-        if back_lo >= r_hi + AP.MARGIN_EARLY + 0.03 then return end
-        local R = { lo = math.max(E.lo - 8 / speed, 0) + back_lo, mid = E.mid + (back_lo + back_hi) * 0.5,
-            hi = E.hi + back_hi, speed = speed, dist = gap, heading = E.heading, k = E.k }
-        local verdict, A_lo, A_mid, A_hi, e = AP.plan(R, r_lo, r_mid, r_hi, W)
-        if not verdict or (verdict == "must" and A_mid < 0) then return end
-        local info = AP.info(R, A_lo, A_mid, A_hi, e, r_mid)
-        if fire(st, now, (dot and "dot protection (%s is point blank)" or "pre-parry (%s returns it)"):format(X), info, ball) then
+        local me_, ml, bias = AP.MARGIN_EARLY, AP.MARGIN_LATE, AP.cal.bias
+        local step = frameDt * 0.5
+        local v = E.speed * AP.GROWTH
+        local c = AP.returnTable(ball, st, their, root, v, now)
+        local detect = frameDt + 0.02
+        local samples = AP.aimSamples(X, gap <= AP.DOT_RANGE)
+        local wsum, react = 0, 0
+        for _, sm in ipairs(samples) do
+            local f = AP.flightAt(c, sm.th)
+            sm.lo = E.lo + f / 1.1 - r_hi + bias
+            sm.hi = E.hi + f / 0.93 - r_lo + bias + 0.01
+            wsum = wsum + sm.w
+            if f / 1.1 - detect - r_hi + bias >= me_ then react = react + sm.w end
+        end
+        if wsum <= 0 then return end
+        -- someone who has caught the ball with an ability (Singularity, Slashes of Fury) may hold it
+        -- again instead of hitting it: a parry ahead would be wasted, the hold guard handles the launch
+        local held = AP.holders[X]
+        if held then
+            local hw = wsum * ((now - held < 60) and 0.3 or 0.15)
+            wsum, react = wsum + hw, react + hw
+        end
+        local function score(dl)
+            local a0, a1, sc = dl + me_, dl + W - ml, 0
+            for _, sm in ipairs(samples) do
+                local span = sm.hi - sm.lo
+                if span <= 1e-3 then
+                    if sm.lo >= a0 and sm.lo <= a1 then sc = sc + sm.w end
+                else
+                    local o = math.min(a1, sm.hi) - math.max(a0, sm.lo)
+                    if o > 0 then sc = sc + sm.w * math.min(o / span, 1) end
+                end
+            end
+            return sc / wsum
+        end
+        local last = math.max(E.lo - frameDt * 1.5, 0)
+        local best, bestD = score(0), 0
+        for _, sm in ipairs(samples) do
+            for _, dl in ipairs({ sm.lo - me_, sm.hi - (W - ml) }) do
+                if dl > 0 and dl <= last then
+                    local sc = score(dl)
+                    if sc > best + 0.02 or (sc >= best - 0.02 and dl > bestD) then best, bestD = math.max(sc, best), dl end
+                end
+            end
+        end
+        local now_sc = score(0) * p_me
+        local wait_sc = react / wsum * AP.REACT
+        if DBG.on then
+            local msg = bestD > step and ("pre-parry on %s: waiting %.2fs for the best moment (%.0f%%)"):format(X, bestD, best * 100)
+                or now_sc < wait_sc + 0.08 and ("pre-parry on %s: no, ahead %.0f%% vs reacting %.0f%%"):format(X, now_sc * 100, wait_sc * 100) or nil
+            if msg and msg:sub(1, 30) ~= (st.ant_msg or ""):sub(1, 30) then st.ant_msg = msg; DBG.ev(msg) end
+        end
+        if bestD > step then return end
+        if now_sc < wait_sc + 0.08 then return end
+        local lo, hi, mid, mw = math.huge, -math.huge, 0, 0
+        for _, sm in ipairs(samples) do
+            if sm.lo <= W and sm.hi >= 0 then
+                lo, hi = math.min(lo, sm.lo), math.max(hi, sm.hi)
+                mid, mw = mid + (sm.lo + sm.hi) * 0.5 * sm.w, mw + sm.w
+            end
+        end
+        mid = mw > 0 and mid / mw or W * 0.5
+        if lo > hi then lo, hi = mid, mid end
+        local info = { speed = v, dist = gap, eta = mid, lead = 0, A_lo = lo, A_mid = mid, A_hi = hi, reach = r_mid, spread = 0 }
+        local why = ("%s: catches %.0f%% of their returns ahead vs %.0f%% by reacting"):format(X, now_sc * 100, wait_sc * 100)
+        if fire(st, now, (dot and "dot protection (" or "pre-parry (") .. why .. ")", info, ball) then
             st.preparried, st.preparry_until = true, now + r_hi + W + 0.15
             Core.pending, Core.watch = nil, nil
             if AP.shot then AP.shot.pre = true end
@@ -2310,8 +2470,12 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         C.bias = math.clamp(o[math.ceil(#o * 0.5)] * (#o >= 3 and 0.8 or 0.4), -0.25, 0.08)
         C.n = C.n + 1
     end
+    -- How often a normal (reacting) parry lands this session: what waiting instead of pre-parrying is worth.
+    AP.REACT = 0.9
+    function AP.noteReact(ok) AP.REACT = math.clamp(AP.REACT + ((ok and 1 or 0) - AP.REACT) * 0.08, 0.55, 0.97) end
     function AP.onLanded(now)
         local s = AP.shot
+        if s and not s.rated and not s.pre and now - s.t < 2.5 then s.rated = true; AP.noteReact(true) end
         if not s or s.void or s.done or not s.echo or now - s.echo > 1.2 then return end
         s.done = true
         if Core.sends ~= s.sends then return end
@@ -2326,6 +2490,7 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
     end
     function AP.onMiss(verdict)
         local s = AP.shot
+        if s and not s.rated and not s.pre then s.rated = true; AP.noteReact(false) end
         if not s or s.done or s.pre then return end
         s.done = true
         if not verdict or not s.spread or s.spread > 0.12 then return end
@@ -2358,6 +2523,7 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
             by = best
         end
         st.hold_by = by
+        if type(by) == 'string' and by ~= '' and by ~= me then AP.holders[by] = now end
         DBG.ev(("ball held by an ability (%s, %s): auto parry waits for the release"):format(tostring(st.hold), tostring(by)))
     end
     function AP.holdGuard(ball, st, root, now)
@@ -2438,7 +2604,6 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
 
     onRetarget = function(ball, st, new, now)
         if new == me then
-            AP.noteReturnStart(ball, st, now)
             if SP.auto then clashCheck(ball, now) end
             if Util.hasClash(ball, now) then spamInstant() end
             if S.autoparry and not S.triggerbot then
@@ -2672,10 +2837,6 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
                         if Core.verdict > 0 then D.late = D.late + 1 else D.early = D.early + 1 end
                     elseif Core.watch and Core.watch.min_d <= 15 then D.ontime = D.ontime + 1 end
                 end
-                if Core.cap and Core.cap.adopted and Core.misses >= 2 then
-                    Core.cap = nil
-                    logp("capture: two parries unanswered on the carried-over hash -- dropped, parry once to recapture")
-                end
                 if DBG.on then DBG.ev("MISS: " .. Util.missVerdict(Core.watch):gsub("\n.*", "")) end
                 AP.onMiss(Core.verdict)
                 if AP.cal.n > 0 then logp(("  timing correction now %+.0fms"):format(AP.cal.bias * 1000)) end
@@ -2684,10 +2845,7 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
                     Core.misses = 0
                 elseif echoed then
                     logp("  the server took the parry: a timing miss, the capture is fine")
-                elseif Core.misses >= 2 then
-                    Core.cap, Core.misses = nil, 0
-                    logp("  2 unanswered in a row: capture dropped, the next parry takes a fresh one")
-                else
+                elseif Capture.auto() then
                     logp("  the next parry is a native press that refreshes the capture")
                 end
             end
@@ -2704,6 +2862,7 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
                 for _, ball in ipairs(liveBalls()) do
                     local st = ballState(ball)
                     if point == 1 then
+                        if st.aim then AP.readAim(ball, st, now) end
                         Pred.measureBuf(ball, now)
                         if not ball:FindFirstChild('zoomies') then Pred.sample(ball, st, now) end
                     end
@@ -2895,7 +3054,6 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
             if D.landed % 10 == 0 then for _, l in ipairs(Parry.timingLines()) do logp("  [timing] " .. l) end end
         end
         local firedBall = w and w.ball
-        AP.noteReturnEnd(firedBall, now0)
         Core.watch = nil
         Core.pending, Core.misses = nil, 0
         local fst = firedBall and tracked[firedBall]
@@ -3002,7 +3160,7 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
             L[#L + 1] = ("check (%s%s): spd %.0f  d %.0f  heading %.2f"):format(e.via, e.feed and ", feed" or "", e.speed, e.dist, e.heading)
             L[#L + 1] = ("  lands %.2f / %.2f / %.2fs after a parry now  fires at %.2fs%s"):format(math.min(e.lo or 0, 9.99),
                 math.min(e.mid or 0, 9.99), math.min(e.hi or 0, 9.99), e.lead or 0,
-                e.k and ("  turn %s %.1f"):format(({ [0] = "guess", "prop", "rate", "ramp" })[e.model or 0] or "?", e.k) or "")
+                e.k and ("  turn %s %.1f"):format(({ [1] = "prop", [2] = "rate", [4] = "blend" })[e.model or 0] or "?", e.k) or "")
         end
         if DBG.block and now - DBG.block_at < 2 then L[#L + 1] = ("held: %s (%.1fs ago)"):format(DBG.block, now - DBG.block_at) end
         for _, l in ipairs(Parry.timingLines()) do L[#L + 1] = l end
@@ -3499,23 +3657,6 @@ Gui.AP:AddToggle("UnlockFPS", {
     end,
 })
 
-Gui.APS = Gui.Tabs.Parry:AddRightGroupbox("Timing", "sliders-horizontal")
-Gui.APS:AddToggle("SmartTiming", {
-    Text = "Smart timing (ignores Accuracy)", Default = false,
-    Tooltip = "Picks the safest moment for every ball by itself: early in the parry window whenever the ball's arrival is known well enough (lag spikes make balls land sooner, so it leaves more room on that side), the last safe moment only for curves it can't be sure about. Accuracy and Randomize do nothing while this is on.",
-    Callback = function(v) S.smart_timing = v end,
-})
-Gui.APS:AddSlider("Accuracy", {
-    Text = "Accuracy", Default = 50, Min = 1, Max = 100, Rounding = 0,
-    Tooltip = "How close to the ball the parry goes up. 100 = just before it lands: a small safety margin that is never under 3 studs of the ball's travel or twice your ping jitter, so slow and fast balls both stay safe. 1 = early in the parry, the most room for lag spikes (leaning to the side they push the ball). A curve the prediction isn't sure about waits until the last safe moment at any setting.",
-    Callback = function(v) S.accuracy_base = v; Parry.roll() end,
-})
-Gui.APS:AddToggle("RandomAccuracy", { Text = "Randomize accuracy", Default = false, Callback = function(v) S.random_accuracy = v; Parry.roll() end })
-Gui.APS:AddSlider("RandomAccuracyAmount", {
-    Text = "Randomize amount", Default = 10, Min = 0, Max = 50, Rounding = 0, Suffix = " +/-",
-    Callback = function(v) S.random_accuracy_amount = v; Parry.roll() end,
-})
-
 Gui.AIM = Gui.Tabs.Parry:AddRightGroupbox("Aim & Curve", "spline")
 Gui.AIM:AddDropdown("TargetMode", {
     Values = Parry.targetNames, Default = "Cursor", Text = "Target mode",
@@ -3586,7 +3727,7 @@ Gui.CAP:AddButton({
 Gui.PP = Gui.Tabs.Parry:AddLeftGroupbox("Pre-parry", "fast-forward")
 Gui.PP:AddToggle("PreParry", {
     Text = "Pre-parry", Default = false,
-    Tooltip = "The ball is on a player near you and their return would land faster than your ping lets you react: parry ahead of it. Only when it really can't be reacted to, only against players whose last returns came straight back (it learns each player; curvers are left to the normal parry), and in a crowd only when you're their likely target. Can waste a parry in a crowd.",
+    Tooltip = "Parries ahead of a return your ping can't react to. It reads every hit's first direction to learn how each player hits (straight dots or curves, and how hard), simulates their next return to you with the curve physics it learned from the session's balls, and only parries ahead when that catches clearly more of their returns than waiting and reacting. Any range in a 1v1; in a crowd only within Pre-parry range and when you're their likely target (can waste a parry there).",
     Callback = function(v) S.preparry = v end,
 })
 Gui.PP:AddSlider("PreParryRange", {
@@ -3595,12 +3736,12 @@ Gui.PP:AddSlider("PreParryRange", {
 })
 Gui.PP:AddToggle("DotProtect", {
     Text = "Dot protection", Default = true,
-    Tooltip = "A player within 20 studs has the ball and their straight point-blank return (a dot) would land faster than your ping lets you react: parry ahead of it, the same frame it becomes possible. Skipped against a player whose recent returns were curves (those get parried normally).",
+    Tooltip = "Pre-parry for anyone within 20 studs, on by default: a point-blank dot lands before your ping lets you react. Same rules as pre-parry: only when parrying ahead catches more of that player's returns (their real dots and curves) than reacting would.",
     Callback = function(v) S.dot_protect = v end,
 })
 Gui.PP:AddToggle("HighPingPreParry", {
-    Text = "Auto pre-parry at high ping", Default = true,
-    Tooltip = "In a 1v1 at 80ms+ ping, pre-parry turns itself on: the ball can only come back to you, so a straight return your ping can't react to gets parried ahead of time (only against an opponent whose returns have been coming straight back). Off = only the Pre-parry toggle does it.",
+    Text = "Auto pre-parry in 1v1", Default = true,
+    Tooltip = "In a 1v1 the ball can only come back to you, so pre-parry runs by itself. It only fires when parrying ahead catches more returns than reacting, so at low ping it rarely does. Off = only the Pre-parry toggle does it.",
     Callback = function(v) S.hp_preparry = v end,
 })
 

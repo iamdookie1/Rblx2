@@ -18,6 +18,13 @@ Suites
 - `ability`: a bot holds the ball with a Singularity / Slashes of Fury style hold (orbit, hold
   attribute, sometimes already targeting you), then launches it at you 2-5x faster.
 - `dots`: a 1v1 at 8-20 studs where the bot hits straight back (a dot) 75% of the time.
+- `match`: 90s matches with respawns (2s after a death) against `SIM_BOTS` bots (default 1; 3 = a
+  crowd where bots also hit each other), random curves, speed climbing 4-8% a hit with resets. Reports
+  every pass sent at you, split into "reachable" (the flight is longer than your round trip, so a
+  reaction can catch it) and "unreachable" (only a pre-parry can). `SIM_MATCH_SECS` match length,
+  `SIM_MATCH_MOVE=1` bots walk around, `SIM_PLOG=path` one CSV row per pass (flight, result, which rule
+  fired, the predicted arrival bounds against the true one), `SIM_GFIT=1` the true steering law next to
+  the one the script learned, `SIM_TRUELAW=1` hands the script the true law (a ceiling for learning).
 - `smoke`: three quick pass trials with the flight log.
 
 Every suite also reports double parries (a second parry reaching the server within 0.8s of the
@@ -39,7 +46,7 @@ Environment switches
   how long the parry was up before the ball landed, `SIM_VERBOSE=1` one line per trial,
   `SIM_ONLY=n` run only trial n, `SIM_LOG=1` the script's flight log, `SIM_DBG=1` debug events and
   holds, `SIM_EVAL=1` every auto parry evaluation, `SIM_WLOG=1` server events.
-- `SIM_S=key=value,...` override settings (`accuracy_base=100,accuracy=100`, `hp_preparry=true`, ...).
+- `SIM_S=key=value,...` override settings (`hp_preparry=false`, `dot_protect=false`, `preparry=true`, ...).
 - `SIM_PINGBIAS=0.5` Data Ping reports half the real round trip; `SIM_BUF=0.22` a long render
   smoothing delay; `SIM_NOCAL=1` turns off the residual timing correction.
 
