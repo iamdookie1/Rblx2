@@ -68,6 +68,7 @@ end
 local Settings = {
     -- steal
     FastSteal = false, StealTimePct = 60, StealAura = false, StealRange = 11, StealMinWorth = 0, StealThroughWalls = false,
+    StealMulti = 3, StealRetry = 0.5, AutoCalibrate = true,
     AutoDeliver = false, DeliverAt = 9.9, DeliverReturn = true,
     StealOrder = "Best worth first", SkipGuarded = true, GuardRadius = 18, StealAllReturn = true,
     -- stealth
@@ -77,11 +78,11 @@ local Settings = {
     AutoMinigames = false, MinigameDelay = 0.6, InstantLockpick = false, InstantATM = false, InstantSafe = false,
     InstantPowerBox = false, AutoLockpickDoors = false,
     -- doors and crowbar
-    AutoOpenDoors = false, DoorRange = 10, CrowbarAura = false, CrowbarRange = 9, CrowbarEquip = false,
+    AutoOpenDoors = false, DoorRange = 10, CrowbarAura = false, CrowbarRange = 9, CrowbarEquip = true,
     CrowbarGuards = true, CrowbarDoors = true, CrowbarGlass = true, CrowbarCashiers = true,
     -- esp
     ItemEsp = false, ItemMinWorth = 0, GuardEsp = false, GuardCones = true, CameraEsp = false, VanEsp = false,
-    PlayerEsp = false, EspDistance = 600,
+    PlayerEsp = false, PowerBoxEsp = false, EspDistance = 600,
     -- world
     Fullbright = false, AutoEscape = false, EscapeAt = 20, AutoReplay = false, ReplayMode = "Same map", ReplayDelay = 4,
     AntiAfk = true,
@@ -276,8 +277,47 @@ local Mutations
 pcall(function()
     Mutations = require(ReplicatedStorage:WaitForChild("MutationCatalog", 5))
 end)
-local Scan = { items = {}, guards = {}, cameras = {} }
+local Scan = { items = {}, guards = {}, cameras = {}, powerBoxes = {} }
 do
+    -- Power boxes: the game's ElectricBox model (its StartElectricity part holds
+    -- the "Hack" prompt). It sits in Workspace in the dump; also looked for
+    -- inside the Map, and any other "Hack" prompt is picked up too.
+    loop(1.5, function()
+        local found, seen = {}, {}
+        local function add(model)
+            if model and model.Parent and not seen[model] and not model:IsDescendantOf(ReplicatedStorage) then
+                seen[model] = true
+                local prompt
+                for _, d in model:GetDescendants() do
+                    if d:IsA("ProximityPrompt") then
+                        prompt = d
+                        break
+                    end
+                end
+                table.insert(found, { model = model, prompt = prompt })
+            end
+        end
+        for _, c in Workspace:GetChildren() do
+            if c.Name == "ElectricBox" or c.Name == "PowerBox" then
+                add(c)
+            end
+        end
+        local m = map()
+        if m then
+            for _, d in m:GetDescendants() do
+                if d.Name == "ElectricBox" or d.Name == "PowerBox" then
+                    add(d)
+                elseif d:IsA("ProximityPrompt") and d.ActionText == "Hack" then
+                    local top = d:FindFirstAncestorWhichIsA("Model")
+                    while top and top.Parent and top.Parent:IsA("Model") and top.Parent ~= m do
+                        top = top.Parent
+                    end
+                    add(top)
+                end
+            end
+        end
+        Scan.powerBoxes = found
+    end)
     local function itemName(model, prompt)
         local asset = model:GetAttribute("Asset")
         if type(asset) == "string" and asset ~= "" then
@@ -374,14 +414,32 @@ do
     function Steal.normalHold(p)
         return holds[p] or p.HoldDuration
     end
+    -- When the server refuses a steal that was held too briefly, the share is
+    -- raised for the rest of the session (Auto calibrate) so fast steal settles
+    -- on the quickest time the server accepts instead of silently failing.
+    Steal.floorPct = 0
+    function Steal.pct()
+        return math.clamp(math.max(Settings.StealTimePct, Settings.AutoCalibrate and Steal.floorPct or 0), 5, 100)
+    end
     local function wantHold(p)
         local normal = Steal.normalHold(p)
         if Settings.FastSteal then
-            return math.max(normal * Settings.StealTimePct / 100, 0.05)
+            return math.max(normal * Steal.pct() / 100, 0.05)
         end
         return normal
     end
-    loop(0.25, function()
+    -- Sets the hold for one prompt right now (also called just before a steal).
+    local function applyHold(p)
+        if not holds[p] or (setTo[p] and math.abs(p.HoldDuration - setTo[p]) > 1e-3) then
+            holds[p] = p.HoldDuration
+        end
+        local want = wantHold(p)
+        if math.abs(p.HoldDuration - want) > 1e-3 then
+            p.HoldDuration = want
+        end
+        setTo[p] = p.HoldDuration
+    end
+    loop(0.1, function()
         for _, it in Scan.items do
             local p = it.prompt
             if p.Parent then
@@ -429,12 +487,17 @@ do
         return bagFill() >= Settings.DeliverAt
     end
     -- One steal, the way a player does it: the game shows the prompt, it's
-    -- held for its hold time and let go.
+    -- held for its hold time and let go. Safe to run several at once (each
+    -- prompt is held on its own).
+    Steal.active, Steal.activeCount = {}, 0
     function Steal.take(it)
         local p = it.prompt
-        if not (p.Parent and p.Enabled) then
+        if not (p.Parent and p.Enabled) or Steal.active[p] then
             return false
         end
+        Steal.active[p] = true
+        Steal.activeCount += 1
+        local solo = Steal.activeCount == 1
         local before = bagFill()
         if seen and p:GetAttribute("LayedEyesUpon") == false then
             pcall(seen.FireServer, seen, p)
@@ -445,18 +508,19 @@ do
         if p.MaxActivationDistance <= 0 then
             p.MaxActivationDistance = reach[p] or 12
         end
+        applyHold(p)
         local fired = false
         local conn = p.Triggered:Connect(function()
             fired = true
         end)
         local t0 = os.clock()
-        while not shown[p] and os.clock() - t0 < 0.5 and p.Parent do
+        while not shown[p] and os.clock() - t0 < 0.25 and p.Parent do
             RunService.Heartbeat:Wait()
         end
         local hold = p.HoldDuration
-        pcall(p.InputHoldBegin, p)
         local h0 = os.clock()
-        while not fired and os.clock() - h0 < hold + 0.1 and p.Parent do
+        pcall(p.InputHoldBegin, p)
+        while not fired and os.clock() - h0 < hold + 0.06 and p.Parent do
             RunService.Heartbeat:Wait()
         end
         pcall(p.InputHoldEnd, p)
@@ -466,22 +530,30 @@ do
         end
         local ok = false
         local w0 = os.clock()
-        while alive() and os.clock() - w0 < 1.5 do
-            if not p.Parent or not p.Enabled or bagFill() > before then
+        while alive() and os.clock() - w0 < 0.9 do
+            if not p.Parent or not p.Enabled or (solo and bagFill() > before) then
                 ok = true
                 break
             end
-            task.wait(0.05)
+            RunService.Heartbeat:Wait()
         end
         conn:Disconnect()
         if p.Parent then
             p.Exclusivity, p.RequiresLineOfSight = excl, los
         end
+        Steal.active[p] = nil
+        Steal.activeCount -= 1
         if ok then
             Steal.stolen += 1
             Steal.last = "took " .. it.name
+            Tried[p] = nil
         elseif fired then
             Steal.last = it.name .. " wasn't given (steal time too short?)"
+            -- the server wants a longer hold: settle on a slower share
+            if Settings.FastSteal and Settings.AutoCalibrate and Steal.pct() < 100 then
+                Steal.floorPct = math.min(100, Steal.pct() + 10)
+                Steal.last ..= (" - raised to %d%%"):format(Steal.floorPct)
+            end
         else
             Steal.last = "couldn't hold " .. it.name
         end
@@ -528,10 +600,37 @@ do
         return done
     end
 
-    -- Steal aura: whatever's in reach, best first.
-    local working = false
-    loop(0.12, function()
-        if not Settings.StealAura or working or Busy.reason or busyMinigame() then
+    -- Steal aura: whatever's in reach, best first, several at a time, and a
+    -- failed one is tried again after a short wait.
+    function Steal.inReach(root)
+        local list = {}
+        for _, it in Scan.items do
+            local p = it.prompt
+            if p.Parent and p.Enabled and not Steal.active[p] and it.worth >= Settings.StealMinWorth then
+                local pos = promptPos(p)
+                local range = math.min(Settings.StealRange, (reach[p] or p.MaxActivationDistance or 12))
+                if pos and (pos - root.Position).Magnitude <= range
+                    and (not Tried[p] or os.clock() - Tried[p] > Settings.StealRetry) then
+                    table.insert(list, it)
+                end
+            end
+        end
+        table.sort(list, function(a, b)
+            return a.worth > b.worth
+        end)
+        return list
+    end
+    function Steal.launch(it)
+        Tried[it.prompt] = os.clock()
+        task.spawn(function()
+            local ok, err = pcall(Steal.take, it)
+            if not ok then
+                warn("[ROB IT] steal: " .. tostring(err))
+            end
+        end)
+    end
+    loop(0.05, function()
+        if not Settings.StealAura or Busy.reason or busyMinigame() then
             if not Settings.StealAura then
                 Steal.info = "off"
             end
@@ -545,29 +644,16 @@ do
         if not root then
             return
         end
-        local best, bestWorth
-        for _, it in Scan.items do
-            local p = it.prompt
-            if p.Parent and p.Enabled and it.worth >= Settings.StealMinWorth then
-                local pos = promptPos(p)
-                local range = math.min(Settings.StealRange, (reach[p] or p.MaxActivationDistance or 12))
-                if pos and (pos - root.Position).Magnitude <= range and (not Tried[p] or os.clock() - Tried[p] > 2) then
-                    if not bestWorth or it.worth > bestWorth then
-                        best, bestWorth = it, it.worth
-                    end
-                end
+        local room = math.max(1, Settings.StealMulti) - Steal.activeCount
+        local list = Steal.inReach(root)
+        if room > 0 and #list > 0 then
+            local names = {}
+            for i = 1, math.min(room, #list) do
+                Steal.launch(list[i])
+                table.insert(names, list[i].name)
             end
-        end
-        if best then
-            working = true
-            Tried[best.prompt] = os.clock()
-            Steal.info = "taking " .. best.name
-            local ok, err = pcall(Steal.take, best)
-            working = false
-            if not ok then
-                warn("[ROB IT] steal: " .. tostring(err))
-            end
-        else
+            Steal.info = "taking " .. table.concat(names, ", ")
+        elseif Steal.activeCount == 0 then
             Steal.info = "nothing in reach"
         end
     end)
@@ -634,8 +720,34 @@ do
             if not still() then
                 break
             end
-            if Steal.take(it) then
-                taken += 1
+            -- Take this one and whatever else is in reach at the same time.
+            local batch = { it }
+            local here = myRoot()
+            if here then
+                for _, other in Steal.inReach(here) do
+                    if #batch >= math.max(1, Settings.StealMulti) then
+                        break
+                    end
+                    if other ~= it and not skip[other.prompt] and other.prompt.Enabled
+                        and not (Settings.SkipGuarded and Scan.guardNear(promptPos(other.prompt), Settings.GuardRadius)) then
+                        skip[other.prompt] = true
+                        table.insert(batch, other)
+                    end
+                end
+            end
+            local pending = #batch
+            for _, b in batch do
+                task.spawn(function()
+                    local called, got = pcall(Steal.take, b)
+                    if called and got then
+                        taken += 1
+                    end
+                    pending -= 1
+                end)
+            end
+            local w0 = os.clock()
+            while pending > 0 and still() and os.clock() - w0 < 6 do
+                task.wait(0.05)
             end
         end
         if still() then
@@ -979,15 +1091,40 @@ do
         end
     end)
 
-    -- Crowbar aura: the hits the crowbar's swing sends, for everything in reach.
+    -- Crowbar aura: swings the crowbar for real (so the game's own swing and
+    -- hit code runs) and also sends the hits that swing would send, for
+    -- everything within reach of its edge (not just its middle).
     local hitNpc, breakDoor = remote("Tools.HitNPC"), remote("Utilities.BreakDoor")
     local breakWindow, hitCashier = remote("Utilities.BreakWindow"), remote("Utilities.HitCashier")
-    loop(0.35, function()
-        if not Settings.CrowbarAura then
+    -- How far you are from the nearest point of something's bounding box.
+    local function reachTo(inst, root)
+        local ok, dist = pcall(function()
+            local cf, size
+            if inst:IsA("Model") then
+                cf, size = inst:GetBoundingBox()
+            elseif inst:IsA("BasePart") then
+                cf, size = inst.CFrame, inst.Size
+            else
+                return nil
+            end
+            local lp = cf:PointToObjectSpace(root.Position)
+            local h = size / 2
+            local nearest = Vector3.new(math.clamp(lp.X, -h.X, h.X), math.clamp(lp.Y, -h.Y, h.Y), math.clamp(lp.Z, -h.Z, h.Z))
+            return (lp - nearest).Magnitude
+        end)
+        if ok and dist then
+            return dist
+        end
+        local pos = pivotOf(inst)
+        return pos and (pos - root.Position).Magnitude or math.huge
+    end
+    local lastSwing = 0
+    loop(0.12, function()
+        if not Settings.CrowbarAura or busyMinigame() then
             return
         end
         local root, hum = myRoot(), myHum()
-        if not (root and hum) then
+        if not (root and hum) or hum.Health <= 0 then
             return
         end
         local bar, inHand = tool("Crowbar")
@@ -999,18 +1136,23 @@ do
                 return
             end
             hum:EquipTool(bar)
-            task.wait(0.15)
+            task.wait(0.3)
+            bar, inHand = tool("Crowbar")
+            if not inHand then
+                return
+            end
         end
         local range = Settings.CrowbarRange
         local function close(inst)
-            local pos = pivotOf(inst)
-            return pos and (pos - root.Position).Magnitude <= range
+            return reachTo(inst, root) <= range
         end
+        local targets = {}
         if Settings.CrowbarGuards and hitNpc then
             for _, g in Scan.guards do
-                if not Scan.knocked(g) and close(g) and tryOnce(g, 1.2) then
-                    hitNpc:FireServer(g, "Crowbar")
-                    Doors.hits += 1
+                if not Scan.knocked(g) and close(g) then
+                    table.insert(targets, { g, 0.7, function()
+                        hitNpc:FireServer(g, "Crowbar")
+                    end })
                 end
             end
         end
@@ -1018,7 +1160,7 @@ do
             local doors = mapChild("Doors")
             if doors then
                 for _, door in doors:GetChildren() do
-                    if door:IsA("Model") and close(door) and tryOnce(door, 2) then
+                    if door:IsA("Model") and close(door) then
                         local locked = false
                         for _, d in door:GetDescendants() do
                             if d:IsA("ProximityPrompt") and d.ActionText == "Locked" then
@@ -1027,8 +1169,9 @@ do
                             end
                         end
                         if locked then
-                            breakDoor:FireServer(door)
-                            Doors.hits += 1
+                            table.insert(targets, { door, 1.5, function()
+                                breakDoor:FireServer(door)
+                            end })
                         end
                     end
                 end
@@ -1036,18 +1179,34 @@ do
         end
         if Settings.CrowbarGlass and breakWindow then
             for _, glass in CollectionService:GetTagged("BreakableGlass") do
-                if glass:IsDescendantOf(Workspace) and close(glass) and tryOnce(glass, 2) then
-                    breakWindow:FireServer(glass)
-                    Doors.hits += 1
+                if glass:IsDescendantOf(Workspace) and close(glass) then
+                    table.insert(targets, { glass, 2.5, function()
+                        breakWindow:FireServer(glass)
+                    end })
                 end
             end
         end
         if Settings.CrowbarCashiers and hitCashier then
             for _, c in CollectionService:GetTagged("Cashiers") do
-                if c:IsDescendantOf(Workspace) and close(c) and tryOnce(c, 1.5) then
-                    hitCashier:FireServer(c, "Crowbar")
-                    Doors.hits += 1
+                if c:IsDescendantOf(Workspace) and close(c) then
+                    table.insert(targets, { c, 1, function()
+                        hitCashier:FireServer(c, "Crowbar")
+                    end })
                 end
+            end
+        end
+        if #targets == 0 then
+            return
+        end
+        -- the swing (the game ignores a new one for half a second)
+        if os.clock() - lastSwing > 0.6 then
+            lastSwing = os.clock()
+            pcall(bar.Activate, bar)
+        end
+        for _, t in targets do
+            if tryOnce(t[1], t[2]) then
+                pcall(t[3])
+                Doors.hits += 1
             end
         end
     end)
@@ -1169,6 +1328,18 @@ do
             local van = mapChild("Truck") or mapChild("Boat")
             if van then
                 mark(van, van, Color3.fromRGB(120, 200, 255), ("Getaway [%dm]"):format(dist(pivotOf(van))), false)
+            end
+        end
+        if Settings.PowerBoxEsp then
+            for _, box in Scan.powerBoxes do
+                if box.model.Parent then
+                    local pos = pivotOf(box.model)
+                    if dist(pos) <= Settings.EspDistance then
+                        local done = box.prompt and (not box.prompt.Parent or not box.prompt.Enabled)
+                        local color = done and Color3.fromRGB(140, 140, 140) or Color3.fromRGB(255, 235, 60)
+                        mark(box.model, box.model, color, ("Power box%s [%dm]"):format(done and " (done)" or "", dist(pos)), true)
+                    end
+                end
             end
         end
         if Settings.PlayerEsp then
@@ -1526,12 +1697,16 @@ do
     toggle(S, "FastSteal", "Faster steal", "Steals take the share of their normal time set below")
     slider(S, "StealTimePct", "Steal time", 5, 100, 0, "% of normal",
         "Lower is faster. If steals stop counting, the server wants more time: raise it")
-    toggle(S, "StealAura", "Steal aura", "Takes the best item in reach as you walk around")
+    toggle(S, "AutoCalibrate", "Auto calibrate steal time", "When the server refuses a steal that was too quick, raises the steal time by itself")
+    toggle(S, "StealAura", "Steal aura", "Takes the best items in reach as you walk around")
+    slider(S, "StealMulti", "Items at once", 1, 8, 0, "", "How many items are picked up at the same time")
+    slider(S, "StealRetry", "Retry after", 0.1, 3, 1, " s", "How long before a failed item is tried again")
     slider(S, "StealRange", "Reach", 4, 12, 0, " studs", "The game's own reach is 12")
     slider(S, "StealMinWorth", "Only items worth at least", 0, 50000, 0, " $")
     toggle(S, "StealThroughWalls", "Steal through walls", "Items stay in reach when a wall is in the way (the game only blocks this on your side)")
     status(S, function()
-        return ("Aura: %s\nLast: %s\nStolen: %d"):format(Steal.info, Steal.last or "-", Steal.stolen)
+        return ("Aura: %s\nLast: %s\nStolen: %d · steal time %d%%"):format(Steal.info, Steal.last or "-", Steal.stolen,
+            Settings.FastSteal and Steal.pct() or 100)
     end)
     local D = Tab:AddRightGroupbox("Hand in", "truck")
     toggle(D, "AutoDeliver", "Auto hand in", "Takes a full bag to the van and comes back")
@@ -1595,7 +1770,7 @@ do
     slider(Dr, "DoorRange", "Door reach", 4, 10, 0, " studs")
     local C = Tab:AddRightGroupbox("Crowbar", "hammer")
     toggle(C, "CrowbarAura", "Crowbar aura", "While you hold the crowbar, it hits everything picked below in reach")
-    toggle(C, "CrowbarEquip", "Take the crowbar out by itself")
+    toggle(C, "CrowbarEquip", "Take the crowbar out by itself", "The aura only works with the crowbar in hand")
     slider(C, "CrowbarRange", "Reach", 4, 15, 0, " studs")
     toggle(C, "CrowbarGuards", "Knock out guards")
     toggle(C, "CrowbarDoors", "Break locked doors")
@@ -1615,6 +1790,7 @@ do
     toggle(E, "GuardCones", "Guard vision cones", "What each guard can see: its detect range ahead, spread to the sides and the ring behind it")
     toggle(E, "CameraEsp", "Cameras", "Yellow, red when alarmed, grey when off")
     toggle(E, "VanEsp", "Van and getaway")
+    toggle(E, "PowerBoxEsp", "Power box", "Yellow, grey once it's been hacked. Only shows if the map has one")
     toggle(E, "PlayerEsp", "Players", "Police in blue in Cops vs Robbers")
     slider(E, "EspDistance", "Max distance", 50, 2000, 0, " studs")
 end
