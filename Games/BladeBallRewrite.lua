@@ -1,6 +1,6 @@
 task.spawn(function()
 
-local SCRIPT_VERSION = "rewrite-0.6.4"
+local SCRIPT_VERSION = "rewrite-0.6.5"
 
 local genv = (getgenv and getgenv()) or _G
 if type(genv.__BladeBallShutdown) == 'function' then pcall(genv.__BladeBallShutdown) end
@@ -258,6 +258,8 @@ do
     local S = {
         autoparry = false, triggerbot = false, parry_mode = "Remote",
         one_parry_capture = true, rescue_press = true, preparry = false, preparry_range = 30, hp_preparry = true, dot_protect = true,
+        accuracy = 50, accuracy_base = 50, smart_timing = false,
+        random_accuracy = false, random_accuracy_amount = 10,
         target_mode = 1, target_method = "Angle", curve_mode = 1, random_curve = false,
         auto_ability = false, cooldown_protection = false,
     }
@@ -298,6 +300,14 @@ do
         return out
     end
 
+    function Util.rollAcc()
+        local acc = S.accuracy_base or 50
+        if S.random_accuracy and S.random_accuracy_amount > 0 then
+            acc = acc + math.random(-S.random_accuracy_amount, S.random_accuracy_amount)
+        end
+        S.accuracy = math.clamp(acc, 1, 100)
+    end
+    Parry.roll = Util.rollAcc
     function Util.indexOf(list, name)
         for i, n in ipairs(list) do if n == name then return i end end
     end
@@ -1219,6 +1229,24 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
     end
     function Core.ap_gap(ball) return contactGap(ball) + 1.5 end
     local Pred, AP = { prior = {}, buf = 0.08, buf_n = 0, hist = setmetatable({}, { __mode = 'k' }) }, {}
+    function Pred.priorK(speed)
+        local p = Pred.prior
+        if #p < 4 then return 6, 2.5, math.max(16, speed * 0.05) end
+        local ks, rs = {}, {}
+        for i, e in ipairs(p) do ks[i], rs[i] = e.k, e.k / e.sp end
+        table.sort(ks)
+        table.sort(rs)
+        local n = #ks
+        local i50, i15, i90 = math.ceil(n * 0.5), math.max(math.floor(n * 0.15), 1), math.min(math.ceil(n * 0.9), n)
+        local med = math.sqrt(ks[i50] * rs[i50] * speed)
+        return med, math.min(ks[i15], rs[i15] * speed), math.max(ks[i90], rs[i90] * speed) * 1.15
+    end
+    function Pred.addPrior(k, sp)
+        if type(k) ~= "number" or k ~= k or k <= 0 or not sp or sp < 1 then return end
+        local p = Pred.prior
+        p[#p + 1] = { k = math.clamp(k, 0.5, 150), sp = sp }
+        if #p > 32 then table.remove(p, 1) end
+    end
     Pred.tick, Pred.gaps = 1 / 60, {}
     function Pred.noteZoom(ball, v, now)
         local h = Pred.hist[ball]
@@ -1300,6 +1328,7 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         local T = st.trk
         if not T or T.pass ~= st.pass_n then
             if T and T.sp0 then AP.noteGrowth(sp / T.sp0) end
+            if T and T.fit and T.fit.m == 1 and (T.fit.n or 0) >= 4 then Pred.addPrior(T.fit.a, T.fit.sp) end
             T = { pass = st.pass_n, t0 = now, s = {}, sp0 = sp }
             st.trk = T
         end
@@ -1399,12 +1428,12 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         local G = Pred.G
         local L = G.segs
         L[#L + 1] = g
-        if #L > 600 then table.remove(L, 1) end
+        if #L > 400 then table.remove(L, 1) end
         G.dirty = G.dirty + 1
     end
     function Pred.globalFit(now)
         local G = Pred.G
-        if G.fit ~= nil and (G.dirty < 15 or now - G.at < 0.3) then return G.fit or nil end
+        if G.fit ~= nil and (G.dirty < 30 or now - G.at < 1) then return G.fit or nil end
         G.at, G.dirty = now, 0
         if #G.segs < 40 then G.fit = false; return nil end
         local best = Pred.fitSegs(G.segs, { 0, 0.5, 1 })
@@ -1421,20 +1450,62 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         local r = charRoot(tg)
         return r and r.Position
     end
+    -- This ball's own curve, measured as turn rate per second (the session-wide law is Pred.globalFit).
     function Pred.fit(T)
         if T.fit ~= nil then return T.fit or nil end
         local s, segs = T.s, {}
-        for i = 2, #s do
-            local g = Pred.seg(s[i - 1], s[i], T.t0)
-            if g then segs[#segs + 1] = g end
+        local n, j = #s, 1
+        local tk = Pred.tick
+        for i = 2, n do
+            while j < i - 1 and s[i].t - s[j + 1].t >= 0.05 do j = j + 1 end
+            local a, b = s[j], s[i]
+            local span = math.max(math.floor((b.t - a.t) / tk + 0.5), 1) * tk
+            if a.th > 0.03 then
+                local turn = math.acos(math.clamp(a.d:Dot(b.d), -1, 1))
+                local th = (a.th + b.th) * 0.5
+                segs[#segs + 1] = { w = turn / span, s = math.max(math.sin(th), 0.02), tau = (a.t + b.t) * 0.5 - T.t0 }
+            end
         end
-        if #segs < 2 then T.fit = false; return nil end
-        local best = Pred.fitSegs(segs, { 0 })
-        if not best then T.fit = false; return nil end
-        best.u = math.clamp(best.u + 0.3 / #segs, 0.05, 0.8)
+        local m = #segs
+        if m < 1 then T.fit = false; return nil end
+        local sws, sss, sw, sw2 = 0, 0, 0, 0
+        for _, g in ipairs(segs) do sws, sss, sw, sw2 = sws + g.w * g.s, sss + g.s * g.s, sw + g.w, sw2 + g.w * g.w end
+        local k1 = sws / math.max(sss, 1e-6)
+        local wb = sw / m
+        local r1, r2 = 0, 0
+        for _, g in ipairs(segs) do
+            r1 = r1 + (g.w - k1 * g.s) ^ 2
+            r2 = r2 + (g.w - wb) ^ 2
+        end
+        r1, r2 = math.sqrt(r1 / m), math.sqrt(r2 / m)
+        local all = { { m = 1, a = k1, b = 0, r = r1 }, { m = 5, a = wb, b = 0, r = r2 } }
+        local best = all[1]
+        if r2 < r1 * 0.9 then best = all[2] end
+        if m >= 5 then
+            local a11, a12, a22, b1, b2 = 0, 0, 0, 0, 0
+            for _, g in ipairs(segs) do
+                local x1, x2 = g.s, g.s * g.tau
+                a11, a12, a22 = a11 + x1 * x1, a12 + x1 * x2, a22 + x2 * x2
+                b1, b2 = b1 + x1 * g.w, b2 + x2 * g.w
+            end
+            local det = a11 * a22 - a12 * a12
+            if math.abs(det) > 1e-9 then
+                local ka, kb = (b1 * a22 - b2 * a12) / det, (a11 * b2 - a12 * b1) / det
+                if kb > 0 and ka > -2 then
+                    local r3 = 0
+                    for _, g in ipairs(segs) do r3 = r3 + (g.w - g.s * (ka + kb * g.tau)) ^ 2 end
+                    r3 = math.sqrt(r3 / m)
+                    all[3] = { m = 3, a = ka, b = kb, r = r3 }
+                    if r3 < best.r * 0.8 then best = all[3] end
+                end
+            end
+        end
+        local scale = math.max(wb, 0.3)
+        best.u = math.clamp(best.r / scale, 0.04, 0.45) + 0.35 / m
+        best.n, best.sp = m, s[n].sp
         best.alt = {}
-        for _, c in ipairs(best.all) do
-            if c ~= best and c.r <= best.r * 2 then best.alt[#best.alt + 1] = c end
+        for _, c in ipairs(all) do
+            if c ~= best and c.a > 0 and c.r <= math.max(best.r * 2.5, scale * 0.25) then best.alt[#best.alt + 1] = c end
         end
         T.fit = best
         return best
@@ -1463,6 +1534,7 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
                 local r
                 if mdl == 4 then r = Pred.phiLerp(a + b * (tau0 + t), th)
                 elseif mdl == 2 then r = math.min(math.max(a, 0), th)
+                elseif mdl == 5 then r = math.min(math.max(a, 0) * dt, th)
                 else r = math.min(math.max((a + b * (tau0 + t)) * math.max(sin(th), 0.02), 0) * dt, th) end
                 local perp = want - dir * c
                 local pm = perp.Magnitude
@@ -1537,25 +1609,26 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         if gf and gf.u < 0.6 then
             local z = (speed / 150) ^ gf.al
             mdl, a, b, u = gf.m, gf.a * z, gf.b * z, math.clamp(gf.u, 0.06, 0.5)
-            if f and (f.n or 0) >= 6 and f.m == mdl and math.abs(f.a - a) / math.max(a, 1e-4) > 0.6 then u = math.max(u, 0.35) end
             res.alts = (f and (f.n or 0) >= 4) and { { m = f.m, a = f.a, b = f.b } } or {}
             res.global = true
         elseif f then
             mdl, a, b, u = f.m, f.a, f.b, f.u
-        else
-            local tk = Pred.tick
-            mdl, a, b, u = 4, 6 * tk, 0, 0.6
         end
-        alo, ahi = a * (1 - u), a * (1 + u)
-        if mdl == 4 then ahi = math.min(ahi, 1) end
-        if not gf and not f then alo, ahi = 2.5 * Pred.tick, math.min(math.max(16, speed * 0.05) * Pred.tick, 1) end
-        res.k, res.model, res.u = a, mdl, u
+        if mdl then
+            alo, ahi = a * (1 - u), a * (1 + u)
+            if mdl == 4 then ahi = math.min(ahi, 1) end
+            res.k, res.model, res.u = a, mdl, u
+        else
+            local km, klo, khi = Pred.priorK(speed)
+            mdl, a, b, alo, ahi = 1, km, 0, klo, khi
+            res.k, res.model, res.u = km, 0, 1
+        end
         if T and T.away_at and now - T.away_at < 0.12 then alo = math.min(alo, a * 0.5) end
         local hz = horizon or 3
         local minH = ball:GetAttribute("minHeight")
         if type(minH) ~= "number" then minH = nil end
         local lo = Pred.run(p, dir, speed, accel * 1.5 + speed * 0.05, tp, tv, gap, hz, mdl, ahi, b * (ahi / math.max(a, 1e-3)), tau0,
-            math.min(1.5 + speed * 0.01, 4), minH)
+            math.min(3 + speed * 0.02, 8), minH)
         local alts = res.alts or (f and f.alt)
         local alo_t, ahi_t = math.huge, 0
         if alts then
@@ -1566,7 +1639,7 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         end
         res.lo = math.max(math.min(lo or math.huge, alo_t), straight * 0.97)
         if res.lo > hz then res.mid, res.hi = math.huge, math.huge; return res end
-        local mid = Pred.run(p, dir, speed, accel, tp, tv, gap, hz + 1, mdl, a, b, tau0, 1, minH)
+        local mid = Pred.run(p, dir, speed, accel, tp, tv, gap, hz + 1, mdl, a, b, tau0, 2, minH)
         local hi = Pred.run(p, dir, speed, 0, tp, tv, gap, hz + 1.5, mdl, alo, b * (alo / math.max(a, 1e-3)), tau0, nil, minH)
         res.mid = math.max(mid or (ahi_t > 0 and math.min(ahi_t, hz + 1)) or hz + 1, res.lo)
         res.hi = math.max(hi or math.huge, ahi_t, res.mid)
@@ -1616,6 +1689,7 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         if st.preparried then
             st.parried, st.parry_until, st.preparried = true, st.preparry_until, false
         end
+        if S.random_accuracy then Util.rollAcc() end
     end
     function Util.hookZoomies(ball, st, z)
         if st.zinst == z then return end
@@ -2104,7 +2178,17 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
 
     AP.net = { win = {}, at = -1, echo_rem = {}, echo_key = {} }
     AP.cal = { res = {}, bias = 0, n = 0, uses = {} }
-    AP.MARGIN_EARLY, AP.MARGIN_LATE, AP.LEAN = 0.02, 0.03, 0.7
+    AP.MARGIN_EARLY, AP.MARGIN_LATE, AP.CLOSE, AP.CLOSE_STUDS, AP.LEAN = 0.02, 0.03, 0.06, 3, 0.7
+    -- Accuracy 1 = parry early in the window (most room for lag spikes), 100 = just before the ball lands
+    -- (a margin never under 3 studs of travel or twice your ping jitter). Smart timing = always early.
+    function AP.closeness()
+        if S.smart_timing then return 0 end
+        return math.clamp(((S.accuracy or 50) - 1) / 99, 0, 1)
+    end
+    function AP.closeMargin(speed, r_mid, r_hi)
+        local jit = math.max(r_hi - r_mid, 0)
+        return math.min(math.max(AP.CLOSE, jit * 2 + 0.03, AP.CLOSE_STUDS / math.max(speed or 100, 1)), 0.2)
+    end
     function AP.netTick(now)
         local N = AP.net
         if now - N.at < 0.05 then return end
@@ -2143,7 +2227,12 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         local me_, ml = AP.MARGIN_EARLY, AP.MARGIN_LATE
         local step = frameDt * 0.5
         local slack = W - (A_hi - A_lo) - me_ - ml
-        local e = me_ + math.max(slack, 0) * AP.LEAN
+        local e = me_
+        if slack > 0 then
+            local safe = slack * AP.LEAN
+            local close = math.min(safe, AP.closeMargin(E.speed, r_mid, r_hi))
+            e = me_ + close + (safe - close) * (1 - AP.closeness())
+        end
         if A_lo <= me_ + step then return "must", A_lo, A_mid, A_hi, e end
         if slack > 0 and A_lo <= e + step then return slack < 0.1 and "tight" or "planned", A_lo, A_mid, A_hi, e end
         return nil, A_lo, A_mid, A_hi, e
@@ -2302,8 +2391,8 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         local c = st.retc
         local gap = (their.Position - root.Position).Magnitude
         local gf = Pred.globalFit(now)
-        if c and c.pass == st.pass_n and math.abs(c.gap - gap) < 1.5 and math.abs(c.v - speed) < speed * 0.03
-            and c.gf == gf and now - c.at < 0.5 then return c end
+        if c and c.pass == st.pass_n and ((math.abs(c.gap - gap) < 3 and math.abs(c.v - speed) < speed * 0.06
+            and c.gf == gf and now - c.at < 0.5) or now - c.at < 0.05) then return c end
         local mdl, a, b = 4, 6 * Pred.tick, 0
         if gf and gf.u < 0.6 then
             local z = (speed / 150) ^ gf.al
@@ -2322,7 +2411,7 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         local fl = {}
         for i, th in ipairs(AP.AIM_GRID) do
             local dir = u * math.cos(th) + side * math.sin(th)
-            fl[i] = Pred.run(start, dir, speed, 0, tp, nil, cg, 3, mdl, a, b, 0, nil, minH) or 3
+            fl[i] = Pred.run(start, dir, speed, 0, tp, nil, cg, 2, mdl, a, b, 0, nil, minH) or 2
         end
         c = { pass = st.pass_n, gap = gap, v = speed, gf = gf, at = now, fl = fl }
         st.retc = c
@@ -2372,6 +2461,8 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
         if not E or E.lo == math.huge or E.hi == math.huge then return end
         local me_, ml, bias = AP.MARGIN_EARLY, AP.MARGIN_LATE, AP.cal.bias
         local step = frameDt * 0.5
+        -- no return can need a parry yet while their hit is further off than your reach: skip the work
+        if E.lo - r_hi - me_ > step + 0.03 then return end
         local v = E.speed * AP.GROWTH
         local c = AP.returnTable(ball, st, their, root, v, now)
         local detect = frameDt + 0.02
@@ -3160,7 +3251,7 @@ return function() fn(table.unpack(job, 1, job.n)) end]], chunk, job, fn)
             L[#L + 1] = ("check (%s%s): spd %.0f  d %.0f  heading %.2f"):format(e.via, e.feed and ", feed" or "", e.speed, e.dist, e.heading)
             L[#L + 1] = ("  lands %.2f / %.2f / %.2fs after a parry now  fires at %.2fs%s"):format(math.min(e.lo or 0, 9.99),
                 math.min(e.mid or 0, 9.99), math.min(e.hi or 0, 9.99), e.lead or 0,
-                e.k and ("  turn %s %.1f"):format(({ [1] = "prop", [2] = "rate", [4] = "blend" })[e.model or 0] or "?", e.k) or "")
+                e.k and ("  turn %s %.1f"):format(({ [1] = "prop", [2] = "rate", [3] = "ramp", [4] = "blend", [5] = "rate" })[e.model or 0] or "?", e.k) or "")
         end
         if DBG.block and now - DBG.block_at < 2 then L[#L + 1] = ("held: %s (%.1fs ago)"):format(DBG.block, now - DBG.block_at) end
         for _, l in ipairs(Parry.timingLines()) do L[#L + 1] = l end
@@ -3655,6 +3746,23 @@ Gui.AP:AddToggle("UnlockFPS", {
         local function apply() pcall(function() if type(setfpscap) == "function" then setfpscap(v and 240 or 60) end end) end
         if v and Stagger.active() then Stagger.push("fps", "Unlock FPS", apply) else apply() end
     end,
+})
+
+Gui.APS = Gui.Tabs.Parry:AddRightGroupbox("Timing", "sliders-horizontal")
+Gui.APS:AddSlider("Accuracy", {
+    Text = "Accuracy", Default = 50, Min = 1, Max = 100, Rounding = 0,
+    Tooltip = "How close to the ball the parry goes up. 100 = just before it lands (a safety margin that is never under 3 studs of the ball's travel or twice your ping jitter). 1 = early in the parry, the most room for lag spikes. A curve the prediction isn't sure about waits for the last safe moment at any setting.",
+    Callback = function(v) S.accuracy_base = v; Parry.roll() end,
+})
+Gui.APS:AddToggle("SmartTiming", {
+    Text = "Smart timing (ignores Accuracy)", Default = false,
+    Tooltip = "Picks the safest moment for every ball by itself (early in the window, room for lag spikes). Accuracy and Randomize do nothing while this is on.",
+    Callback = function(v) S.smart_timing = v end,
+})
+Gui.APS:AddToggle("RandomAccuracy", { Text = "Randomize accuracy", Default = false, Callback = function(v) S.random_accuracy = v; Parry.roll() end })
+Gui.APS:AddSlider("RandomAccuracyAmount", {
+    Text = "Randomize amount", Default = 10, Min = 0, Max = 50, Rounding = 0, Suffix = " +/-",
+    Callback = function(v) S.random_accuracy_amount = v; Parry.roll() end,
 })
 
 Gui.AIM = Gui.Tabs.Parry:AddRightGroupbox("Aim & Curve", "spline")
