@@ -172,6 +172,8 @@ local GameIds = {
     [10774204862] = { Name = 'Volley Bomb', Script = 'Games/VolleyBomb.lua' },
     -- Half Punch (game 10773149360), from its dump's own place id.
     [73547227876007] = { Name = 'Half Punch', Script = 'Games/HalfPunch.lua' },
+    -- [CLANS] Depth Incremental (game 10769835283), from its dump's own place id.
+    [119101118479978] = { Name = 'Depth Incremental', Script = 'Games/DepthIncremental.lua' },
 }
 
 -- Games whose other modes (ranked, duels, events...) each have their own place
