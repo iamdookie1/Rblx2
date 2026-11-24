@@ -66,7 +66,7 @@ end
 local Settings = {
     -- hit aura
     HitAura = false, HitRange = 10, HitDelay = 0.25, HitSpeed = 60, HitExtreme = false, HitExtremeSpeed = 5000,
-    HitJitter = false, HitBurst = 1, HitPart = "Closest", HitAllParts = false,
+    HitJitter = false, HitSpoof = false, SpoofFrames = 3, HitBurst = 1, HitPart = "Closest", HitAllParts = false,
     SlamAura = false, SlamImpulse = 5000, SlamRange = 14,
     -- grab
     AutoGrab = false, GrabAura = false, GrabRange = 7, ForceGrabUnlock = false, GrabStrengthOn = false, GrabStrength = 5,
@@ -334,6 +334,59 @@ do
         end
         return dir * speed
     end
+    -- Real velocity: the server can see how fast your hand is really moving (your
+    -- parts replicate to it), so a hit that only claims a high velocity may be
+    -- treated as an ordinary punch. Here the rest of your body is anchored (so you
+    -- don't go anywhere), the hitting part is driven at the target at the chosen
+    -- speed for a few frames, the hit is sent while it's moving, then everything is
+    -- released and the part's velocity zeroed.
+    local anchoredNow = {}
+    function Combat.release()
+        for p, was in anchoredNow do
+            if p.Parent then
+                p.Anchored = was
+            end
+        end
+        table.clear(anchoredNow)
+    end
+    table.insert(Cleanups, Combat.release)
+    function Combat.spoof(mp, targets)
+        local char = myChar()
+        if not (char and mp.Parent) then
+            return
+        end
+        for _, n in BODY do
+            local p = part(char, n)
+            if p and p ~= mp and not p.Anchored then
+                anchoredNow[p] = false
+                p.Anchored = true
+            end
+        end
+        local frames = math.max(1, math.floor(Settings.SpoofFrames))
+        local fireAt = math.min(2, frames)
+        for i = 1, frames do
+            if not (alive() and mp.Parent) then
+                break
+            end
+            local main = targets[1]
+            local v = velocity(mp.Position, main.Position)
+            mp.AssemblyLinearVelocity = v
+            if i == fireAt then
+                for _, t in targets do
+                    for _ = 1, math.max(1, Settings.HitBurst) do
+                        pcall(R.Hit.FireServer, R.Hit, mp, t, velocity(mp.Position, t.Position))
+                        Combat.hits += 1
+                    end
+                end
+            end
+            RunService.Heartbeat:Wait()
+        end
+        if mp.Parent then
+            mp.AssemblyLinearVelocity = Vector3.zero
+        end
+        Combat.release()
+    end
+
     -- Hit aura: sends the same Hit(myPart, theirPart, relativeVelocity) a real swing
     -- sends, for every fighter in range. The velocity is what the game's damage is
     -- worked out from, so the high-velocity test just raises it past the 90 the
@@ -363,11 +416,23 @@ do
                             end
                         end
                     end
-                    for _, t in targets do
-                        for _ = 1, math.max(1, Settings.HitBurst) do
-                            pcall(R.Hit.FireServer, R.Hit, mp, t, velocity(mp.Position, t.Position))
-                            Combat.hits += 1
-                            fired += 1
+                    if Settings.HitSpoof then
+                        -- the hit is sent while your hand really is moving that fast
+                        if not Combat.spoofing then
+                            Combat.spoofing = true
+                            task.spawn(function()
+                                pcall(Combat.spoof, mp, targets)
+                                Combat.spoofing = false
+                            end)
+                            fired += #targets
+                        end
+                    else
+                        for _, t in targets do
+                            for _ = 1, math.max(1, Settings.HitBurst) do
+                                pcall(R.Hit.FireServer, R.Hit, mp, t, velocity(mp.Position, t.Position))
+                                Combat.hits += 1
+                                fired += 1
+                            end
                         end
                     end
                 end
@@ -1000,6 +1065,8 @@ do
     slider(H, "HitSpeed", "Velocity", 5, 90, 0, "", "Normal swings are 5 to 90")
     toggle(H, "HitExtreme", "Very high velocity (test)", "Uses the slider below instead, far past what a real swing reaches")
     slider(H, "HitExtremeSpeed", "High velocity", 100, 1000000, 0, "", "Damage and knockback are worked out from this. The server may clamp or reject it")
+    toggle(H, "HitSpoof", "Real velocity (test)", "Anchors the rest of you and really drives the hitting hand at the target at the velocity above while the hit is sent. Use this if high velocities only act like a normal punch")
+    slider(H, "SpoofFrames", "Real velocity frames", 1, 10, 0, "", "How many frames the hand is driven. More frames is more likely to be seen by the server but moves the arm more")
     toggle(H, "HitJitter", "Randomise velocity", "+/- 15% so hits aren't identical")
     status(H, function()
         return ("Hits sent: %d\n%s"):format(Combat.hits, Combat.info)
