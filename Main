@@ -158,6 +158,10 @@ local Games = {
 -- match servers included, should load the same script. Checked when the
 -- place id itself isn't in Games.
 local GameIds = {
+    -- Half Punch and Depth Incremental by GameId too, so a place id the dump didn't
+    -- see (another server type, private servers) still detects them.
+    [10773149360] = { Name = 'Half Punch', Script = 'Games/HalfPunch.lua' },
+    [10769835283] = { Name = 'Depth Incremental', Script = 'Games/DepthIncremental.lua' },
     [7872343282] = { Name = 'OVERKILL', Script = 'Games/Overkill.lua', AutoLoad = true },
     [9845585365] = { Name = 'Dodge or Die', Script = 'Games/DodgeOrDie.lua', AutoLoad = true },
     [10756011174] = { Name = 'Needle in a Haystack', Script = 'Games/NeedleHaystack.lua', AutoLoad = true },

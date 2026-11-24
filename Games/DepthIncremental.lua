@@ -69,6 +69,8 @@ local Settings = {
     -- collecting
     AutoWorms = false, AutoEssence = false, AutoCoalDrop = false, AutoPrompts = false, PromptRange = 14,
     PromptAvoid = true,
+    -- extras
+    AutoTitle = false, TitleSet = "Dirt", AutoEnchant = false, EnchantDelay = 1.2, AutoMerchant = false, CodeText = "",
     -- esp
     EggEsp = false, WormEsp = false, PromptEsp = false, EspDistance = 400,
     -- misc
@@ -664,6 +666,145 @@ do
     end)
 end
 
+--// Titles, enchants, merchant, rewards \\--
+local Extra = { titles = 0, enchants = 0, merch = 0, info = "" }
+do
+    -- Title rolls: stand in the set's zone, ask for a roll, wait for the result, then
+    -- tell the server the reveal is over (what the game's own roll screen does).
+    local rolledEv = remote("TitleRolled")
+    local lastResult = 0
+    if rolledEv then
+        bind(rolledEv.OnClientEvent, function()
+            lastResult = os.clock()
+        end)
+    end
+    function Extra.titleSets()
+        local out = {}
+        if Cfg and Cfg.TitleSetOrder then
+            for _, id in Cfg.TitleSetOrder do
+                table.insert(out, id)
+            end
+        end
+        return #out > 0 and out or { "Dirt" }
+    end
+    local function inside(zone, root)
+        local lp = zone.CFrame:PointToObjectSpace(root.Position)
+        local h = zone.Size / 2
+        return math.abs(lp.X) <= h.X and math.abs(lp.Z) <= h.Z
+    end
+    loop(0.5, function()
+        if not Settings.AutoTitle or Busy.reason or not (Cfg and Cfg.TitleSets) then
+            return
+        end
+        local def = Cfg.TitleSets[Settings.TitleSet]
+        if not def then
+            return
+        end
+        if num(def.currency or "Cash") < (def.cost or math.huge) then
+            Extra.info = "can't afford " .. def.name
+            return
+        end
+        if not flag("Room_" .. tostring(def.room)) then
+            Extra.info = def.name .. ": room not bought"
+            return
+        end
+        local root = myRoot()
+        local zone = CollectionService:GetTagged(def.zoneTag)[1]
+        if root and zone and zone:IsA("BasePart") and not inside(zone, root) then
+            moveTo(zone.Position + Vector3.new(0, 3, 0))
+            task.wait(0.3)
+        end
+        local before = lastResult
+        fire("RollTitle", def.id)
+        local t0 = os.clock()
+        while alive() and lastResult == before and os.clock() - t0 < 2.5 do
+            task.wait(0.05)
+        end
+        local ok, wait = pcall(Cfg.RollTime, num("Up_RollSpeed"))
+        task.wait(math.clamp((ok and tonumber(wait) or 1) * 0.6, 0.25, 4))
+        fire("RevealDone", "title")
+        Extra.titles += 1
+        Extra.info = ("rolled %s (%d)"):format(def.name, Extra.titles)
+    end)
+
+    -- Enchant rolls for every slot you have, skipping slots already on their goal.
+    loop(0.5, function()
+        if not Settings.AutoEnchant then
+            return
+        end
+        local slots = math.max(1, num("EnchantSlots"))
+        for slot = 1, slots do
+            local goal, cur = LocalPlayer:GetAttribute("EnchGoal_" .. slot), LocalPlayer:GetAttribute("Ench_" .. slot)
+            if not (goal and goal ~= "" and goal == cur) and num("Embers") > 0 then
+                fire("EnchantRoll", slot)
+                Extra.enchants += 1
+                task.wait(Settings.EnchantDelay)
+            end
+        end
+    end)
+
+    -- Merchant: buy whatever in the stock you can pay for (Robux items are never touched).
+    local stock = {}
+    local stockEv = remote("MerchantStock")
+    if stockEv then
+        bind(stockEv.OnClientEvent, function(list, _, shop)
+            if type(list) == "table" then
+                stock[shop or "Trading"] = list
+            end
+        end)
+    end
+    loop(2, function()
+        if not (Settings.AutoMerchant and Cfg and Cfg.MerchantById and Cfg.MerchantCost) then
+            return
+        end
+        for _, list in stock do
+            for key, value in list do
+                local id = type(key) == "string" and key or (type(value) == "string" and value) or (type(value) == "table" and value.id)
+                local item = id and Cfg.MerchantById[id]
+                if item then
+                    local level = num("Merch_" .. id)
+                    local ok, cost = pcall(Cfg.MerchantCost, id, level)
+                    local okShop, shop = pcall(Cfg.MerchantShop, item)
+                    local currency = okShop and type(shop) == "table" and shop.currency or "Cash"
+                    if ok and cost and level < (item.max or 1) and num(currency) >= cost then
+                        fire("MerchantBuy", id)
+                        Extra.merch += 1
+                        Extra.info = "bought " .. tostring(id)
+                        task.wait(0.4)
+                    end
+                end
+            end
+        end
+    end)
+
+    -- Free rewards (the "like" and "follow" ones need ~30 s between asking and claiming).
+    local function invoke(name, ...)
+        local r = remote(name)
+        if r and r:IsA("RemoteFunction") then
+            local ok, res = pcall(r.InvokeServer, r, ...)
+            return ok and res or nil
+        end
+        return nil
+    end
+    function Extra.claim()
+        for _, id in { "Like", "Follow", "Group" } do
+            local res = invoke("ClaimReward", id)
+            Extra.info = ("reward %s: %s"):format(id, tostring(res))
+            task.wait(0.5)
+        end
+        notify("Asked for the free rewards; run it again in about 30 s to claim Like and Follow", 5)
+    end
+    function Extra.redeem(code)
+        code = tostring(code or ""):gsub("^%s+", ""):gsub("%s+$", "")
+        if code == "" then
+            return
+        end
+        local res = invoke("RedeemCommunityCode", code)
+        Extra.info = ("code %s: %s"):format(code, tostring(res))
+        notify(Extra.info, 4)
+    end
+end
+
 --// ESP \\--
 do
     local folder = Instance.new("Folder")
@@ -959,6 +1100,32 @@ do
     dropdown(T, "TeleportTo", "Room", rooms)
     T:AddButton({ Text = "Teleport", Func = function()
         fire("Teleport", Settings.TeleportTo)
+    end })
+end
+
+do
+    local Tab = Window:AddTab("Extras", "zap", "Titles, enchants, merchant, rewards")
+    local T = Tab:AddLeftGroupbox("Rolling", "zap")
+    dropdown(T, "TitleSet", "Title set", Extra.titleSets())
+    toggle(T, "AutoTitle", "Auto roll titles", "Walks into the set's zone, rolls, and ends the reveal for you. Needs the room and the cash")
+    toggle(T, "AutoEnchant", "Auto roll enchants", "Rolls every slot that isn't on its goal (set goals in the game's own enchant menu)")
+    slider(T, "EnchantDelay", "Wait between enchant rolls", 0.3, 5, 1, " s")
+    status(T, function()
+        return ("Titles rolled: %d · enchant rolls: %d\n%s"):format(Extra.titles, Extra.enchants, Extra.info)
+    end)
+    local M = Tab:AddRightGroupbox("Shops and rewards", "truck")
+    toggle(M, "AutoMerchant", "Auto buy merchant stock", "Anything in stock you can pay for with in-game currency")
+    M:AddButton({ Text = "Claim free rewards", Func = function()
+        task.spawn(Extra.claim)
+    end })
+    M:AddInput("CodeText", {
+        Text = "Community code", Placeholder = "Enter a code", Default = "", Finished = true,
+        Callback = function(t)
+            Settings.CodeText = t
+        end,
+    })
+    M:AddButton({ Text = "Redeem code", Func = function()
+        task.spawn(Extra.redeem, Settings.CodeText)
     end })
 end
 
