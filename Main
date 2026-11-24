@@ -185,6 +185,28 @@ local GameIds = {
 -- game has, so detection doesn't depend on a hard-coded place id. Checked only
 -- when the place id itself isn't in Games.
 local Fingerprints = {
+    -- Half Punch in any place or server: its own HalfPunch folder in ReplicatedStorage
+    -- with the Remotes folder and the Controller module.
+    {
+        Name = 'Half Punch',
+        Script = 'Games/HalfPunch.lua',
+        Match = function()
+            local folder = game:GetService('ReplicatedStorage'):FindFirstChild('HalfPunch')
+            return folder ~= nil
+                and folder:FindFirstChild('Remotes') ~= nil
+                and folder:FindFirstChild('Controller') ~= nil
+        end,
+    },
+    -- Depth Incremental in any place or server: its PitRemotes folder and PitConfig module.
+    {
+        Name = 'Depth Incremental',
+        Script = 'Games/DepthIncremental.lua',
+        Match = function()
+            local ReplicatedStorage = game:GetService('ReplicatedStorage')
+            return ReplicatedStorage:FindFirstChild('PitRemotes') ~= nil
+                and ReplicatedStorage:FindFirstChild('PitConfig') ~= nil
+        end,
+    },
     -- Dodge or Die in any mode or server we don't know the id of: its own
     -- ServerModeConfig module and safe-net package, both in ReplicatedStorage.
     {
