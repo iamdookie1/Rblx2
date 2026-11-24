@@ -170,6 +170,8 @@ local GameIds = {
     [1335695570] = { Name = 'Ninja Legends', Script = 'Games/NinjaLegends.lua' },
     [10769958564] = { Name = 'Math Wars', Script = 'Games/MathWars.lua' },
     [10774204862] = { Name = 'Volley Bomb', Script = 'Games/VolleyBomb.lua' },
+    -- Half Punch (game 10773149360), from its dump's own place id.
+    [73547227876007] = { Name = 'Half Punch', Script = 'Games/HalfPunch.lua' },
 }
 
 -- Games whose other modes (ranked, duels, events...) each have their own place
