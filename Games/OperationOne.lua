@@ -28,6 +28,15 @@
 --              and fires states.shoot:fire_instant(look, hits). Whatever get_shoot_look returns is
 --              both where the rays go and the look that is sent. That is the one place silent aim
 --              needs: this script wraps get_shoot_look on the gun in your hand.
+--   Bullets    send_shoot casts the rays itself with ray_damage. A bullet starts at the muzzle (kept
+--              within 3 studs of the camera by validate_position) and points along item.shot (the
+--              barrel's Shoot part) blended toward the front sight by item.accuracy.Value. It passes
+--              anything you can't collide with and "Soft" parts (two at most), and stops at solid,
+--              "Hard" and invisible-but-collidable parts. Targets.clear ports those rules, so
+--              "visible" here means a bullet can reach the point, not that a plain raycast can: a
+--              plain raycast also stops at trails, triggers and other parts bullets fly through.
+--              Spread is added around the look after get_shoot_look, so a redirected shot still
+--              scatters unless the gun's spread is zero (silent aim zeroes it for that shot).
 --   Firing     item:input_shoot(down) is what the fire button, the mouse and the mobile joystick
 --              all call; item.shoot_hold is true while a shot is held; item.states.sights is ADS.
 --   Gun states Numbers in item.states[x].value: recoil_up, recoil_side, spread, firerate, ads
@@ -88,13 +97,16 @@ local IsTouch = UserInputService.TouchEnabled and not UserInputService.MouseEnab
 local Settings = {
     -- aimbot (turns the camera)
     Aimbot = false, AimWhen = IsTouch and "While shooting" or "Aiming down sights", AimPart = "Head",
-    AimFOV = 140, ShowFOV = true, Smoothness = 6, AimMaxDistance = 300, VisibleOnly = true,
-    StickyTarget = true, AimTeammates = false,
+    AimFOV = 140, ShowFOV = true, Smoothness = 4, AimMaxDistance = 250, VisibleOnly = true,
+    StickyTarget = true, AimTeammates = false, RecoilAware = true,
     -- silent aim (the shot goes to the target, the camera stays)
     SilentAim = false, SilentPart = "Head", SilentFOV = 200, SilentShowFOV = true, SilentHitChance = 100,
-    SilentMaxDistance = 400, SilentVisible = true, SilentLook = false,
+    SilentMaxDistance = 250, SilentVisible = true, SilentLook = false, SilentNoSpread = true,
+    -- targeting (aimbot, silent aim)
+    PartlyVisible = true, AnyBodyPart = true, GunRange = false, RangeScale = 2,
     -- triggerbot
     Triggerbot = false, TriggerDelay = 60, TriggerHeadOnly = false, TriggerOnlyAiming = not IsTouch,
+    TriggerMaxDistance = 250,
     -- gun
     NoRecoil = false, NoSpread = false, RapidFire = false, RapidScale = 1.5, FastAds = false,
     FastReload = false, ReloadScale = 1.6, AutoReload = false,
@@ -215,6 +227,42 @@ do
         end
         return nil
     end
+    -- Where the next bullet would go, as a CFrame at the muzzle. This is the game's own
+    -- get_shoot_look worked out without calling it (it also resets some game state): the barrel's
+    -- "Shoot" part blended toward the front sight by the item's accuracy value. nil if the gun's
+    -- parts aren't found, in which case callers use the camera instead.
+    function Game.shotLook(item)
+        local ok, cf = pcall(function()
+            local shot = item.shot
+            if typeof(shot) ~= "Instance" then
+                return nil
+            end
+            local base = shot:IsA("Attachment") and shot.WorldCFrame or shot.CFrame
+            local sight = item.reticule
+            if typeof(sight) ~= "Instance" then
+                local root = item.instance and item.instance:FindFirstChild("Root")
+                sight = root and root:FindFirstChild("FrontSight", true)
+            end
+            local acc = item.accuracy and item.accuracy.Value
+            if typeof(sight) == "Instance" and sight:IsA("Attachment") and type(acc) == "number" then
+                return base:Lerp(sight.WorldCFrame, math.clamp(acc, 0, 1))
+            end
+            return base
+        end)
+        if ok and typeof(cf) == "CFrame" then
+            return cf
+        end
+        return nil
+    end
+    -- The gun's range stat (an abstract 0-100 score in the game's own stat bar), or nil.
+    function Game.gunRange(item)
+        local st = type(item.states) == "table" and item.states.range
+        local v = type(st) == "table" and st.value
+        if type(v) ~= "number" then
+            v = type(item.stats) == "table" and item.stats.range
+        end
+        return type(v) == "number" and v > 0 and v or nil
+    end
     function Game.teamColor(name)
         local t = name and game:GetService("Teams"):FindFirstChild(name)
         local c = t and t:GetAttribute("Color")
@@ -233,6 +281,8 @@ local Targets = {}
 do
     local ENEMY, TEAM = Color3.fromRGB(255, 70, 70), Color3.fromRGB(90, 170, 255)
     local cache, cacheAt = nil, 0
+    local owners = {} -- body (viewmodel) -> its entry in the cached list
+    Targets.owners = owners
 
     -- A value from a player's "Character" config (equipped, look, class_name, ...).
     function Targets.charValue(model, name)
@@ -256,6 +306,7 @@ do
             return cache
         end
         local out = {}
+        table.clear(owners)
         local mine = LocalPlayer.Character
         local folder = Workspace:FindFirstChild("Viewmodels")
         local bodies = {}
@@ -286,7 +337,11 @@ do
                             end
                         end
                     end
-                    table.insert(out, { model = model, hum = hum, root = root, vm = vm, team = Targets.teammate(model) })
+                    local entry = { model = model, hum = hum, root = root, vm = vm, team = Targets.teammate(model) }
+                    table.insert(out, entry)
+                    if vm then
+                        owners[vm] = entry
+                    end
                 end
             end
         end
@@ -302,8 +357,8 @@ do
         end
         return out
     end
-    -- Where to aim at a player: their head or torso part, or a guess from the root if the
-    -- body isn't found.
+    -- The middle of a player's head or torso part, or a guess from the root if the body isn't
+    -- found.
     function Targets.aimPos(t, choice)
         if choice == "Random" then
             choice = math.random() < 0.5 and "Head" or "Torso"
@@ -315,49 +370,286 @@ do
         return t.root.Position + Vector3.new(0, choice == "Head" and 1.6 or 0.3, 0)
     end
 
+    -- The furthest a target can be: your slider, or (with "Limit to gun range") also the gun's
+    -- range stat times the scale.
+    function Targets.limit(setting)
+        if Settings.GunRange then
+            local item = Game.gun()
+            local r = item and Game.gunRange(item)
+            if r then
+                return math.min(setting, r * Settings.RangeScale)
+            end
+        end
+        return setting
+    end
+    -- Where the game really starts a shot: the muzzle, but never more than 3 studs sideways from
+    -- the camera (its own validate_position).
+    function Targets.shotOrigin(camPos, muzzle)
+        local flat = Vector3.new(muzzle.X - camPos.X, 0, muzzle.Z - camPos.Z)
+        if flat.Magnitude > 3 then
+            local f = flat.Unit * 3
+            return Vector3.new(camPos.X + f.X, muzzle.Y, camPos.Z + f.Z)
+        end
+        return muzzle
+    end
+
+    --// What a bullet can pass \\--
+    -- Ported from the game's ray_damage: bullets go through anything you can't collide with, and
+    -- through "Soft" parts (twice at most), and stop at solid parts, "Hard" ones and invisible walls
+    -- you can collide with. The old check used a plain raycast, which also stopped at trails,
+    -- triggers and other parts the bullet flies straight through, so players looked hidden when
+    -- they weren't.
+    -- Returns whether the bullet stops at part p, and how many soft/breakable parts it has gone
+    -- through so far.
+    local function stops(p, passed)
+        if p.CollisionGroup == "char_block" then
+            return false, passed
+        end
+        local par = p.Parent
+        local softSelf = p:GetAttribute("Soft")
+        local soft = softSelf or (par and par:GetAttribute("Soft"))
+        local hard = p:GetAttribute("Hard") or (par and par:GetAttribute("Hard"))
+        local breakable = (p:HasTag("Breakable") or (par and par:HasTag("Breakable"))) and p.CanCollide and p.CanQuery
+        if breakable and not p:GetAttribute("BulletImmune") then
+            passed += 1
+        elseif (p.CanCollide or softSelf) and p.Transparency < 1 then
+            if p.CollisionGroup == "prop" then
+                return false, passed
+            end
+            if not soft then
+                return true, passed
+            end
+            passed += 1
+        end
+        if passed > 1 or hard then
+            return true, passed
+        end
+        if p.CanQuery and p.CanCollide and not soft then
+            return true, passed
+        end
+        return false, passed
+    end
+
+    -- What every wall check ignores: the camera, every body and every player model (their own
+    -- bodies are what we are looking for, and their models hold no solid parts).
+    local ignoreList, ignoreAt = {}, 0
+    local function ignores()
+        local now = os.clock()
+        if now - ignoreAt > 0.05 then
+            ignoreAt = now
+            table.clear(ignoreList)
+            local cam = camera()
+            if cam then
+                table.insert(ignoreList, cam)
+            end
+            local folder = Workspace:FindFirstChild("Viewmodels")
+            if folder then
+                table.insert(ignoreList, folder)
+            end
+            for _, model in CollectionService:GetTagged("Character") do
+                table.insert(ignoreList, model)
+            end
+        end
+        return ignoreList
+    end
     local params = RaycastParams.new()
     params.FilterType = Enum.RaycastFilterType.Exclude
-    -- Nothing solid between your camera and a point (bodies don't count).
-    function Targets.visible(pos)
+    local STEPS = 12
+
+    -- Would a bullet fired from `from` reach `to`?
+    function Targets.clear(from, to)
+        local vec = to - from
+        if vec.Magnitude < 0.05 then
+            return true
+        end
+        params.FilterDescendantsInstances = ignores()
+        local passed = 0
+        for _ = 1, STEPS do
+            local hit = Workspace:Raycast(from, vec, params)
+            if not hit then
+                return true
+            end
+            -- Something right at the target (a wall it stands against) doesn't hide it.
+            if (hit.Position - to).Magnitude <= 0.3 then
+                return true
+            end
+            local stop
+            stop, passed = stops(hit.Instance, passed)
+            if stop then
+                return false
+            end
+            params:AddToFilter(hit.Instance)
+        end
+        return false
+    end
+    -- Can a bullet from the camera (or `from`) reach this point.
+    function Targets.visible(pos, from)
         local cam = camera()
         if not cam then
             return false
         end
-        local ignore = { cam }
-        local folder = Workspace:FindFirstChild("Viewmodels")
-        if folder then
-            table.insert(ignore, folder)
-        end
-        for _, model in CollectionService:GetTagged("Character") do
-            table.insert(ignore, model)
-        end
-        params.FilterDescendantsInstances = ignore
-        local from = cam.CFrame.Position
-        return Workspace:Raycast(from, pos - from, params) == nil
+        return Targets.clear(from or cam.CFrame.Position, pos)
     end
+
+    -- The first enemy or teammate body a bullet along `vec` from `from` would hit, walking through
+    -- whatever bullets pass. Returns the part and its entry, or nil if a wall comes first.
+    local bodyParams = RaycastParams.new()
+    bodyParams.FilterType = Enum.RaycastFilterType.Exclude
+    function Targets.firstBody(from, vec)
+        Targets.all() -- keeps the body -> player lookup fresh
+        local ignore = {}
+        local cam = camera()
+        if cam then
+            table.insert(ignore, cam)
+        end
+        if LocalPlayer.Character then
+            table.insert(ignore, LocalPlayer.Character)
+        end
+        local folder = Workspace:FindFirstChild("Viewmodels")
+        local mine = folder and folder:FindFirstChild("LocalViewmodel")
+        if mine then
+            table.insert(ignore, mine)
+        end
+        bodyParams.FilterDescendantsInstances = ignore
+        local passed = 0
+        for _ = 1, STEPS do
+            local hit = Workspace:Raycast(from, vec, bodyParams)
+            if not hit then
+                return nil
+            end
+            local p = hit.Instance
+            local owner = owners[p.Parent]
+            if owner then
+                return p, owner
+            end
+            local stop
+            stop, passed = stops(p, passed)
+            if stop then
+                return nil
+            end
+            bodyParams:AddToFilter(p)
+        end
+        return nil
+    end
+
+    --// Aim points \\--
+    -- Body parts to try, best first: the one you chose, then (if allowed) the rest of the body.
+    local PART_ORDER = { "head", "torso", "shoulder1", "shoulder2", "arm1", "arm2", "hip1", "hip2", "leg1", "leg2" }
+    local ONLY, WITH_REST = {}, {}
+    for _, first in { "head", "torso" } do
+        ONLY[first] = { first }
+        local list = { first }
+        for _, name in PART_ORDER do
+            if name ~= first then
+                table.insert(list, name)
+            end
+        end
+        WITH_REST[first] = list
+    end
+    -- Spots on a part, as fractions of its size: the middle first, then the top, bottom and sides,
+    -- so a player whose middle is behind cover but whose edge shows is still a target.
+    local OFFSETS = {
+        Vector3.new(0, 0, 0), Vector3.new(0, 0.35, 0), Vector3.new(0, -0.35, 0),
+        Vector3.new(0.35, 0, 0), Vector3.new(-0.35, 0, 0),
+    }
+    local function pointOf(part, idx)
+        return part.CFrame:PointToWorldSpace(OFFSETS[idx] * part.Size)
+    end
+
+    -- The point to aim at on a player: the first spot a bullet from `from` can reach, trying the
+    -- chosen part's spots, then (opts.fallback) the other parts. Without opts.visible it is just
+    -- the middle of the chosen part. Returns position, part name and spot number, or nil.
+    -- opts: visible, multi, fallback
+    function Targets.resolve(t, choice, opts, from)
+        local first = choice == "Head" and "head" or "torso"
+        if not opts.visible then
+            return Targets.aimPos(t, choice), first, 1
+        end
+        local vm = t.vm
+        if not vm then
+            local pos = Targets.aimPos(t, choice)
+            if Targets.clear(from, pos) then
+                return pos, nil, 1
+            end
+            return nil
+        end
+        for _, name in (opts.fallback and WITH_REST or ONLY)[first] do
+            local part = vm:FindFirstChild(name)
+            if part and part:IsA("BasePart") then
+                local n = 1
+                if opts.multi then
+                    n = name == first and #OFFSETS or ((name == "head" or name == "torso") and 3 or 1)
+                end
+                for idx = 1, n do
+                    local pos = pointOf(part, idx)
+                    if Targets.clear(from, pos) then
+                        return pos, name, idx
+                    end
+                end
+            end
+        end
+        return nil
+    end
+
     function Targets.screen(pos)
         local sp = camera():WorldToViewportPoint(pos)
         return Vector2.new(sp.X, sp.Y), sp.Z > 0
     end
-    -- The player closest to the middle of the screen inside a FOV (px), or nil.
-    -- opts: fov, maxDist, visible, part, teammates
+    -- The player closest to the middle of the screen inside a FOV (px) that a bullet can reach,
+    -- or nil. Also returns how many players were inside the FOV and the distance limit.
+    -- opts: fov, maxDist, visible, part, teammates, multi, fallback, from
     function Targets.pick(opts)
         local cam = camera()
+        local camPos = cam.CFrame.Position
+        local from = opts.from or camPos
         local centre = cam.ViewportSize / 2
-        local best, bestD
+        local choice = opts.part
+        if choice == "Random" then
+            choice = math.random() < 0.5 and "Head" or "Torso"
+        end
+        local cands = {}
         for _, t in Targets.list(opts.teammates) do
-            local pos = Targets.aimPos(t, opts.part)
+            local pos = Targets.aimPos(t, choice)
             local sp, front = Targets.screen(pos)
             if front then
                 local d = (sp - centre).Magnitude
-                local dist = (pos - cam.CFrame.Position).Magnitude
-                if d <= opts.fov and dist <= opts.maxDist and (not bestD or d < bestD)
-                    and (not opts.visible or Targets.visible(pos)) then
-                    best, bestD = { t = t, pos = pos, d = d }, d
+                if d <= opts.fov and (pos - camPos).Magnitude <= opts.maxDist then
+                    table.insert(cands, { t = t, d = d })
                 end
             end
         end
-        return best
+        table.sort(cands, function(a, b)
+            return a.d < b.d
+        end)
+        for _, c in cands do
+            local pos, part, idx = Targets.resolve(c.t, choice, opts, from)
+            if pos then
+                return { t = c.t, pos = pos, d = c.d, part = part, idx = idx, choice = choice }, #cands
+            end
+        end
+        return nil, #cands
+    end
+    -- Is an earlier pick still good (alive, still near the middle, still reachable)? Returns the
+    -- pick with a fresh aim point, or nil.
+    function Targets.recheck(a, opts)
+        local t = a.t
+        if not (t.model.Parent == Workspace and t.hum.Health > 0) then
+            return nil
+        end
+        local cam = camera()
+        local pos = Targets.aimPos(t, a.choice)
+        local sp, front = Targets.screen(pos)
+        if not front or (sp - cam.ViewportSize / 2).Magnitude > opts.fov * 1.5 then
+            return nil
+        end
+        if (pos - cam.CFrame.Position).Magnitude > opts.maxDist * 1.1 then
+            return nil
+        end
+        local p, part, idx = Targets.resolve(t, a.choice, opts, opts.from or cam.CFrame.Position)
+        if not p then
+            return nil
+        end
+        return { t = t, pos = p, d = (sp - cam.ViewportSize / 2).Magnitude, part = part, idx = idx, choice = a.choice }
     end
 end
 
@@ -412,6 +704,23 @@ do
     end
     table.insert(Cleanups, Gun.restore)
 
+    -- Zeroes the gun's spread for the shot being fired right now and puts it back straight after
+    -- (the game reads it in the same call, right after get_shoot_look). A redirected shot would
+    -- otherwise still scatter around the target, so hip-fired shots missed.
+    function Gun.noSpreadOnce(item)
+        local st = item.states and item.states.spread
+        if type(st) ~= "table" or type(st.value) ~= "number" or st.value == 0 then
+            return
+        end
+        local prev = st.value
+        st.value = 0
+        task.defer(function()
+            if st.value == 0 then
+                st.value = prev
+            end
+        end)
+    end
+
     -- Reloads on its own when the magazine is empty (the game's own reload, so it still takes
     -- the normal time and its own checks apply).
     local lastReload = 0
@@ -435,28 +744,35 @@ local Silent = { last = nil, hooked = setmetatable({}, { __mode = "k" }) }
 do
     local OPTS = {}
     -- What the shot's look becomes: from the muzzle straight at the target part.
-    function Silent.redirect(cf)
+    function Silent.redirect(cf, item)
         if Settings.SilentHitChance < 100 and math.random() * 100 >= Settings.SilentHitChance then
             return cf
         end
-        OPTS.fov, OPTS.maxDist, OPTS.visible = Settings.SilentFOV, Settings.SilentMaxDistance, Settings.SilentVisible
-        OPTS.part, OPTS.teammates = Settings.SilentPart, false
+        -- The bullet really leaves from the muzzle (kept within 3 studs of the camera), so the
+        -- wall check and the direction both start there.
+        local origin = Targets.shotOrigin(camera().CFrame.Position, cf.Position)
+        OPTS.fov, OPTS.maxDist = Settings.SilentFOV, Targets.limit(Settings.SilentMaxDistance)
+        OPTS.visible, OPTS.part, OPTS.teammates = Settings.SilentVisible, Settings.SilentPart, false
+        OPTS.multi, OPTS.fallback, OPTS.from = Settings.PartlyVisible, Settings.AnyBodyPart, origin
         local pick = Targets.pick(OPTS)
         if not pick then
             return cf
         end
-        local to = pick.pos
-        if (to - cf.Position).Magnitude < 0.5 then
+        local dir = pick.pos - origin
+        if dir.Magnitude < 0.5 then
             return cf
         end
-        Silent.last = { name = pick.t.model.Name, at = os.clock() }
+        Silent.last = { name = pick.t.model.Name, part = pick.part, at = os.clock() }
         if Settings.SilentLook then
             local me = Game.me()
             if me and me.states.look then
-                pcall(me.states.look.set, me.states.look, (to - cf.Position).Unit)
+                pcall(me.states.look.set, me.states.look, dir.Unit)
             end
         end
-        return CFrame.lookAt(cf.Position, to)
+        if Settings.SilentNoSpread and item then
+            Gun.noSpreadOnce(item)
+        end
+        return CFrame.lookAt(cf.Position, cf.Position + dir.Unit)
     end
 
     -- Wraps get_shoot_look on the item in your hand. Everything else about the shot stays the
@@ -475,7 +791,7 @@ do
             if not (alive() and Settings.SilentAim) then
                 return cf
             end
-            local ok, res = pcall(Silent.redirect, cf)
+            local ok, res = pcall(Silent.redirect, cf, self)
             if ok and typeof(res) == "CFrame" then
                 return res
             end
@@ -526,24 +842,29 @@ do
             when == "Aiming down sights" and Enum.UserInputType.MouseButton2 or Enum.UserInputType.MouseButton1)
     end
 
-    local function stillValid(a)
-        if not (a and a.t.model.Parent == Workspace and a.t.hum.Health > 0) then
-            return false
-        end
-        a.pos = Targets.aimPos(a.t, Settings.AimPart)
-        local sp, front = Targets.screen(a.pos)
-        if not front or (sp - camera().ViewportSize / 2).Magnitude > Settings.AimFOV * 1.5 then
-            return false
-        end
-        return not Settings.VisibleOnly or Targets.visible(a.pos)
-    end
+    -- What the status line says: why the aimbot is or isn't locked on.
+    Aim.status = "Off"
 
-    -- Turns the camera toward `to` by a fraction of the angle, keeping its roll (the game's
-    -- lean) and its position untouched.
-    local function turn(cam, to, alpha)
+    -- Turns the camera by a fraction of the angle needed to put the *bullet* on `to`. When the gun's
+    -- parts are found it measures from where the gun really points (muzzle and barrel direction), so
+    -- recoil and sway are corrected too; otherwise from the camera. Keeps the camera's roll and
+    -- position untouched.
+    local function turn(cam, to, alpha, item)
         local cf = cam.CFrame
-        local look = cf.LookVector
-        local dir = (to - cf.Position).Unit
+        local origin, look = cf.Position, cf.LookVector
+        if item and Settings.RecoilAware then
+            local shot = Game.shotLook(item)
+            if shot and shot.LookVector:Dot(look) > 0.5 then
+                origin, look = Targets.shotOrigin(cf.Position, shot.Position), shot.LookVector
+                -- The gun follows the camera a moment late, so don't correct all of it at once.
+                alpha = math.min(alpha, 0.5)
+            end
+        end
+        local dir = to - origin
+        if dir.Magnitude < 0.05 then
+            return
+        end
+        dir = dir.Unit
         local axis = look:Cross(dir)
         if axis.Magnitude < 1e-4 then
             return
@@ -553,38 +874,56 @@ do
     end
 
     function Aim.step(dt)
-        if not Settings.Aimbot or camera().CameraType == Enum.CameraType.Scriptable then
-            Aim.target = nil
+        if not Settings.Aimbot then
+            Aim.target, Aim.status = nil, "Off"
             return
         end
-        if not holding(Game.gun()) then
-            Aim.target = nil
+        if camera().CameraType == Enum.CameraType.Scriptable then
+            Aim.target, Aim.status = nil, "The game controls the camera right now"
             return
         end
-        if not (Settings.StickyTarget and stillValid(Aim.target)) then
-            OPTS.fov, OPTS.maxDist, OPTS.visible = Settings.AimFOV, Settings.AimMaxDistance, Settings.VisibleOnly
-            OPTS.part, OPTS.teammates = Settings.AimPart, Settings.AimTeammates
-            Aim.target = Targets.pick(OPTS)
+        local item = Game.gun()
+        if not holding(item) then
+            Aim.target, Aim.status = nil, "Waiting for: " .. tostring(Settings.AimWhen)
+            return
         end
-        local a = Aim.target
+        OPTS.fov, OPTS.maxDist = Settings.AimFOV, Targets.limit(Settings.AimMaxDistance)
+        OPTS.visible, OPTS.part, OPTS.teammates = Settings.VisibleOnly, Settings.AimPart, Settings.AimTeammates
+        OPTS.multi, OPTS.fallback, OPTS.from = Settings.PartlyVisible, Settings.AnyBodyPart, nil
+        local a, inView = nil, 0
+        if Aim.target and Settings.StickyTarget then
+            a = Targets.recheck(Aim.target, OPTS)
+        end
         if not a then
+            a, inView = Targets.pick(OPTS)
+        end
+        Aim.target = a
+        if not a then
+            Aim.status = inView > 0 and ("%d in the circle, none reachable"):format(inView) or "No player in the circle"
             return
         end
+        Aim.status = ("Locked: %s (%s)"):format(a.t.model.Name, a.part or "body")
         local k = math.max(Settings.Smoothness, 1)
         local alpha = 1 - (1 - 1 / k) ^ (math.clamp(dt, 0, 0.1) * 60)
-        turn(camera(), a.pos, alpha)
+        turn(camera(), a.pos, alpha, item)
     end
 
-    -- Trigger: when your crosshair is on an enemy body, fires the game's own input_shoot (or,
-    -- without the gun found, a mouse click).
+    -- Trigger: when a bullet from your gun would hit an enemy body, fires the game's own
+    -- input_shoot (or, without the gun found, a mouse click).
     local lastShot, armedAt = 0, nil
-    local rayParams = RaycastParams.new()
-    rayParams.FilterType = Enum.RaycastFilterType.Exclude
     local function fire(item)
         if item and type(item.input_shoot) == "function" then
+            -- input_shoot also puts the sights up on a press and down on a release when the game's
+            -- own "auto ADS" setting is on, which would drop your aim after every shot. Put them back
+            -- if they were up.
+            local sights = item.states and item.states.sights
+            local wasUp = sights ~= nil and sights:get() == true
             pcall(item.input_shoot, item, true)
             task.delay(0.04, function()
                 pcall(item.input_shoot, item, false)
+                if wasUp and sights:get() ~= true and type(item.input_ads) == "function" then
+                    pcall(item.input_ads, item, true, true)
+                end
             end)
         elseif typeof(mouse1click) == "function" then
             mouse1click()
@@ -608,28 +947,16 @@ do
                 return
             end
         end
+        -- Where the next bullet really goes: your gun's own direction when it can be worked out,
+        -- else the camera's.
         local cam = camera()
-        local ignore = { cam }
-        if LocalPlayer.Character then
-            table.insert(ignore, LocalPlayer.Character)
+        local from, dir = cam.CFrame.Position, cam.CFrame.LookVector
+        local shot = item and Game.shotLook(item)
+        if shot and shot.LookVector:Dot(dir) > 0.5 then
+            from, dir = Targets.shotOrigin(from, shot.Position), shot.LookVector
         end
-        local folder = Workspace:FindFirstChild("Viewmodels")
-        local mine = folder and folder:FindFirstChild("LocalViewmodel")
-        if mine then
-            table.insert(ignore, mine)
-        end
-        rayParams.FilterDescendantsInstances = ignore
-        local hit = Workspace:Raycast(cam.CFrame.Position, cam.CFrame.LookVector * Settings.AimMaxDistance, rayParams)
-        local inst = hit and hit.Instance
-        local onEnemy = false
-        if inst and inst:GetAttribute("Humanoid") then
-            for _, t in Targets.list(Settings.AimTeammates) do
-                if t.vm and inst.Parent == t.vm then
-                    onEnemy = not Settings.TriggerHeadOnly or inst.Name == "head"
-                    break
-                end
-            end
-        end
+        local part, owner = Targets.firstBody(from, dir * Targets.limit(Settings.TriggerMaxDistance))
+        local onEnemy = part ~= nil and not owner.team and (not Settings.TriggerHeadOnly or part.Name == "head")
         if not onEnemy then
             armedAt = nil
             return
@@ -1207,12 +1534,22 @@ do
         "Sights and shooting come from the gun itself, so they work on mobile")
     dropdown(A, "AimPart", "Aim at", { "Head", "Torso" })
     slider(A, "AimFOV", "FOV", 30, 600, 0, " px")
-    slider(A, "Smoothness", "Smoothness", 1, 30, 0, "", "1 snaps, higher is slower and harder to spot")
+    slider(A, "Smoothness", "Smoothness", 1, 30, 0, "", "1 snaps to the target, higher is slower and smoother")
     slider(A, "AimMaxDistance", "Max distance", 50, 1000, 0, " studs")
-    toggle(A, "VisibleOnly", "Visible only", "Ignores enemies behind walls (bullets pass some thin walls, this doesn't)")
+    toggle(A, "VisibleOnly", "Visible only", "Skips enemies a bullet can't reach. Uses the game's own bullet rules, so thin walls and soft cover that bullets pass don't count as hiding")
     toggle(A, "StickyTarget", "Sticky target")
     toggle(A, "AimTeammates", "Include teammates")
+    toggle(A, "RecoilAware", "Aim with the gun", "Measures from where your gun really points, so recoil and sway are corrected too. Turn off if the view shakes")
     toggle(A, "ShowFOV", "Show FOV circle")
+    status(A, function()
+        return Aim.status
+    end)
+
+    local G = Tab:AddLeftGroupbox("Targeting", "target")
+    toggle(G, "PartlyVisible", "Partly visible counts", "Checks the middle, top, bottom and sides of the part, so a player with only an edge showing is still a target")
+    toggle(G, "AnyBodyPart", "Fall back to other parts", "If the part you chose is hidden, aims at any other part of the body a bullet can reach")
+    toggle(G, "GunRange", "Limit to gun range", "Caps distances at the gun's range stat times the scale below (the stat is a 0-100 score, so the scale is a guess to tune)")
+    slider(G, "RangeScale", "Range scale", 1, 5, 1, " studs/pt")
 
     local S = Tab:AddRightGroupbox("Silent aim", "ghost")
     toggle(S, "SilentAim", "Silent aim", "The shot goes at the target; your camera doesn't move")
@@ -1220,13 +1557,14 @@ do
     slider(S, "SilentFOV", "FOV", 30, 800, 0, " px", "Measured from the middle of the screen")
     slider(S, "SilentHitChance", "Hit chance", 1, 100, 0, "%", "Chance per shot that it is redirected")
     slider(S, "SilentMaxDistance", "Max distance", 50, 1000, 0, " studs")
-    toggle(S, "SilentVisible", "Visible only", "Bullets stop at walls, so shots at hidden players just hit the wall")
+    toggle(S, "SilentVisible", "Visible only", "Skips players a bullet can't reach (the game's own bullet rules, from your muzzle), so shots don't just hit a wall")
+    toggle(S, "SilentNoSpread", "Cancel spread on redirect", "Zeroes the gun's spread for the shot it redirects, so hip-fired shots don't scatter around the target")
     toggle(S, "SilentLook", "Face target on shot", "Also sets your replicated look direction. Try it if shots don't register")
     toggle(S, "SilentShowFOV", "Show FOV circle")
     status(S, function()
         local l = Silent.last
         if l and os.clock() - l.at < 3 then
-            return "Last redirect: " .. l.name
+            return "Last redirect: " .. l.name .. (l.part and (" (" .. l.part .. ")") or "")
         end
         if not Game.live() then
             return Game.searching and "Looking for the game's gun data..." or "Gun data not found: silent aim is off"
@@ -1235,8 +1573,9 @@ do
     end)
 
     local T = Tab:AddRightGroupbox("Triggerbot", "mouse-pointer-click")
-    toggle(T, "Triggerbot", "Triggerbot", "Fires the game's own shoot when your crosshair is on an enemy. Works with touch")
+    toggle(T, "Triggerbot", "Triggerbot", "Fires the game's own shoot when a bullet from your gun would hit an enemy (never a teammate). Works with touch")
     slider(T, "TriggerDelay", "Delay", 0, 300, 0, " ms")
+    slider(T, "TriggerMaxDistance", "Max distance", 50, 1000, 0, " studs")
     toggle(T, "TriggerHeadOnly", "Head only")
     toggle(T, "TriggerOnlyAiming", "Only while aiming", "Needs the sights up")
 end
