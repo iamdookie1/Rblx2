@@ -103,7 +103,7 @@ local Settings = {
     SilentAim = false, SilentPart = "Head", SilentFOV = 200, SilentShowFOV = true, SilentHitChance = 100,
     SilentMaxDistance = 250, SilentVisible = true, SilentLook = false, SilentNoSpread = true,
     -- targeting (aimbot, silent aim)
-    PartlyVisible = true, AnyBodyPart = true, GunRange = false, RangeScale = 2,
+    PartlyVisible = true, AnyBodyPart = true, AimThroughWalls = false, GunRange = false, RangeScale = 2,
     -- triggerbot
     Triggerbot = false, TriggerDelay = 60, TriggerHeadOnly = false, TriggerOnlyAiming = not IsTouch,
     TriggerMaxDistance = 250,
@@ -399,9 +399,12 @@ do
     -- you can collide with. The old check used a plain raycast, which also stopped at trails,
     -- triggers and other parts the bullet flies straight through, so players looked hidden when
     -- they weren't.
+    -- "Soft" parts are the walls bullets can go through. Whether a target behind one counts as
+    -- reachable is the "Aim through shootable walls" setting (`through`): off, a visible soft part
+    -- blocks like any other wall; on, it is passed like the bullet would.
     -- Returns whether the bullet stops at part p, and how many soft/breakable parts it has gone
     -- through so far.
-    local function stops(p, passed)
+    local function stops(p, passed, through)
         if p.CollisionGroup == "char_block" then
             return false, passed
         end
@@ -416,7 +419,7 @@ do
             if p.CollisionGroup == "prop" then
                 return false, passed
             end
-            if not soft then
+            if not soft or not through then
                 return true, passed
             end
             passed += 1
@@ -424,7 +427,7 @@ do
         if passed > 1 or hard then
             return true, passed
         end
-        if p.CanQuery and p.CanCollide and not soft then
+        if p.CanQuery and p.CanCollide and (not soft or (not through and p.Transparency < 1)) then
             return true, passed
         end
         return false, passed
@@ -463,7 +466,7 @@ do
             return true
         end
         params.FilterDescendantsInstances = ignores()
-        local passed = 0
+        local passed, through = 0, Settings.AimThroughWalls
         for _ = 1, STEPS do
             local hit = Workspace:Raycast(from, vec, params)
             if not hit then
@@ -474,7 +477,7 @@ do
                 return true
             end
             local stop
-            stop, passed = stops(hit.Instance, passed)
+            stop, passed = stops(hit.Instance, passed, through)
             if stop then
                 return false
             end
@@ -511,7 +514,7 @@ do
             table.insert(ignore, mine)
         end
         bodyParams.FilterDescendantsInstances = ignore
-        local passed = 0
+        local passed, through = 0, Settings.AimThroughWalls
         for _ = 1, STEPS do
             local hit = Workspace:Raycast(from, vec, bodyParams)
             if not hit then
@@ -523,7 +526,7 @@ do
                 return p, owner
             end
             local stop
-            stop, passed = stops(p, passed)
+            stop, passed = stops(p, passed, through)
             if stop then
                 return nil
             end
@@ -1548,6 +1551,7 @@ do
     local G = Tab:AddLeftGroupbox("Targeting", "target")
     toggle(G, "PartlyVisible", "Partly visible counts", "Checks the middle, top, bottom and sides of the part, so a player with only an edge showing is still a target")
     toggle(G, "AnyBodyPart", "Fall back to other parts", "If the part you chose is hidden, aims at any other part of the body a bullet can reach")
+    toggle(G, "AimThroughWalls", "Aim through shootable walls", "Off: players behind soft or thin walls (the ones bullets pass through) count as hidden. On: they are targets too. Applies to the triggerbot, and to the aimbot and silent aim while their Visible only is on")
     toggle(G, "GunRange", "Limit to gun range", "Caps distances at the gun's range stat times the scale below (the stat is a 0-100 score, so the scale is a guess to tune)")
     slider(G, "RangeScale", "Range scale", 1, 5, 1, " studs/pt")
 
