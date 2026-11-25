@@ -9,11 +9,16 @@
 --              leg2, arm1, arm2, shoulder1, shoulder2, hip1, hip2) that setup_viewmodels moves
 --              into Workspace.Viewmodels.Viewmodel[n]. Yours is LocalViewmodel. Dead players'
 --              models go to ReplicatedStorage.Garbage.
---   State      ReplicatedStorage.Modules.StateObject.get_all("Character") gives every Character
---              state object keyed by its model: .instance, .states, .values.
---                states.equipped / look / class_name / speed_multiplier ...
---                values.viewmodels   the Viewmodel model of that body
---                values.equipped     your gun's item object (.states, .instance, .shoot_hold)
+--   Players    Found in the world, not in the game's modules: models tagged "Character" in
+--              Workspace, each with a "Character" Configuration holding equipped (ObjectValue,
+--              the gun model, which sits inside that player's Viewmodel), look (Vector3Value),
+--              class_name (StringValue).
+--   State      The game's own Loader (an obfuscated VM) runs the real modules, so require() from
+--              an executor returns a fresh copy whose StateObject.classes is empty (the dump shows
+--              {} there). The live module is found in memory with getgc (a table with get_all,
+--              class and a non-empty classes). Only your own gun needs it:
+--                get_all("Character")[yourModel].values.equipped   your gun's item object
+--                                                                  (.states, .instance, .shoot_hold)
 --   Camera     CameraType stays Custom: Roblox's own camera module turns the view from mouse or
 --              touch, then Character.render_camera layers lean / recoil / bobbing on top and takes
 --              the same offset off again next frame. Rotating Camera.CFrame after all of that
@@ -120,21 +125,82 @@ local function camera()
     return Workspace.CurrentCamera
 end
 
---// The game's state objects \\--
-local Game = {}
+--// The game's world \\--
+-- Players are read from the world itself, not from the game's modules: the game's own Loader
+-- (an obfuscated VM) runs the real modules, and a plain require() from here returns a fresh copy
+-- whose StateObject.classes is empty (the dump shows exactly that), so nothing found through it
+-- would ever be a player. Characters are tagged "Character"; each has a "Character" config with
+-- equipped / look / class_name values; the bodies sit in Workspace.Viewmodels. Only your own gun
+-- (recoil, silent aim, reload...) needs the game's live state objects, and those are found in
+-- memory with getgc.
+local Game = { SO = nil, searching = false }
 do
-    local ok, mod = pcall(function()
-        return require(ReplicatedStorage:WaitForChild("Modules", 10):WaitForChild("StateObject", 10))
-    end)
-    Game.SO = ok and type(mod) == "table" and mod or nil
+    local function live(mod)
+        return type(mod) == "table" and type(rawget(mod, "get_all")) == "function"
+            and type(rawget(mod, "class")) == "function" and type(rawget(mod, "classes")) == "table"
+            and next(mod.classes) ~= nil
+    end
+    function Game.live()
+        return Game.SO ~= nil and live(Game.SO)
+    end
+    function Game.find()
+        local ok, mod = pcall(function()
+            return require(ReplicatedStorage:WaitForChild("Modules", 5):WaitForChild("StateObject", 5))
+        end)
+        if ok and live(mod) then
+            return mod
+        end
+        if type(getgc) ~= "function" then
+            return nil
+        end
+        local ok2, list = pcall(getgc, true)
+        if not ok2 or type(list) ~= "table" then
+            return nil
+        end
+        for i, v in list do
+            if type(v) == "table" and live(v) then
+                return v
+            end
+            if i % 3000 == 0 then
+                task.wait()
+            end
+        end
+        return nil
+    end
+    -- Looks for the live module, again and again with growing pauses (the game may still be
+    -- loading), up to `tries` scans. Safe to call again from a button.
+    function Game.start(onFound, tries)
+        if Game.searching then
+            return
+        end
+        Game.searching = true
+        task.spawn(function()
+            local delay = 1
+            for _ = 1, tries or 8 do
+                if not alive() or Game.live() then
+                    break
+                end
+                local mod = Game.find()
+                if mod then
+                    Game.SO = mod
+                    if onFound then
+                        onFound()
+                    end
+                    break
+                end
+                task.wait(delay)
+                delay = math.min(delay * 2, 15)
+            end
+            Game.searching = false
+        end)
+    end
 
     function Game.characters()
-        local so = Game.SO
-        if not so then
+        if not Game.live() then
             return {}
         end
-        local ok2, all = pcall(so.get_all, "Character")
-        return ok2 and type(all) == "table" and all or {}
+        local ok, all = pcall(Game.SO.get_all, "Character")
+        return ok and type(all) == "table" and all or {}
     end
     function Game.me()
         local char = LocalPlayer.Character
@@ -166,7 +232,14 @@ end
 local Targets = {}
 do
     local ENEMY, TEAM = Color3.fromRGB(255, 70, 70), Color3.fromRGB(90, 170, 255)
+    local cache, cacheAt = nil, 0
 
+    -- A value from a player's "Character" config (equipped, look, class_name, ...).
+    function Targets.charValue(model, name)
+        local c = model:FindFirstChild("Character")
+        local v = c and c:FindFirstChild(name)
+        return v and v.Value
+    end
     function Targets.teammate(model)
         local mine, theirs = LocalPlayer:GetAttribute("Team"), model:GetAttribute("Team")
         return mine ~= nil and mine ~= "" and mine == theirs
@@ -174,81 +247,113 @@ do
     function Targets.color(model, team)
         return Game.teamColor(model:GetAttribute("Team")) or (team and TEAM or ENEMY)
     end
-    -- Every other living body that is in the world right now.
-    function Targets.list(includeTeam)
+
+    -- Every other living player in the world: model, humanoid, root, body (vm) and team flag.
+    -- The body is the Viewmodel their equipped gun sits in, or else the one nearest their root.
+    function Targets.all()
+        local now = os.clock()
+        if cache and now - cacheAt < 0.03 then
+            return cache
+        end
         local out = {}
         local mine = LocalPlayer.Character
-        for model, obj in Game.characters() do
+        local folder = Workspace:FindFirstChild("Viewmodels")
+        local bodies = {}
+        if folder then
+            for _, vm in folder:GetChildren() do
+                local torso = vm:IsA("Model") and vm.Name ~= "LocalViewmodel" and vm:FindFirstChild("torso")
+                if torso then
+                    table.insert(bodies, { vm = vm, pos = torso.Position })
+                end
+            end
+        end
+        for _, model in CollectionService:GetTagged("Character") do
             if model ~= mine and model.Parent == Workspace then
                 local hum = model:FindFirstChildOfClass("Humanoid")
                 local root = model:FindFirstChild("HumanoidRootPart")
                 if hum and root and hum.Health > 0 then
-                    local team = Targets.teammate(model)
-                    if includeTeam or not team then
-                        local vm = obj.values and obj.values.viewmodels
-                        table.insert(out, {
-                            model = model, obj = obj, hum = hum, root = root, team = team,
-                            vm = (typeof(vm) == "Instance" and vm.Parent) and vm or nil,
-                        })
+                    local vm
+                    local eq = Targets.charValue(model, "equipped")
+                    if folder and typeof(eq) == "Instance" and eq.Parent and eq.Parent.Parent == folder then
+                        vm = eq.Parent
                     end
+                    if not vm then
+                        local bestD = 12
+                        for _, b in bodies do
+                            local d = (b.pos - root.Position).Magnitude
+                            if d < bestD then
+                                vm, bestD = b.vm, d
+                            end
+                        end
+                    end
+                    table.insert(out, { model = model, hum = hum, root = root, vm = vm, team = Targets.teammate(model) })
                 end
+            end
+        end
+        cache, cacheAt = out, now
+        return out
+    end
+    function Targets.list(includeTeam)
+        local out = {}
+        for _, t in Targets.all() do
+            if includeTeam or not t.team then
+                table.insert(out, t)
             end
         end
         return out
     end
-    function Targets.part(t, choice)
+    -- Where to aim at a player: their head or torso part, or a guess from the root if the
+    -- body isn't found.
+    function Targets.aimPos(t, choice)
         if choice == "Random" then
             choice = math.random() < 0.5 and "Head" or "Torso"
         end
-        local vm = t.vm
-        if vm then
-            local p = vm:FindFirstChild(choice == "Head" and "head" or "torso")
-            if p then
-                return p
-            end
+        local p = t.vm and t.vm:FindFirstChild(choice == "Head" and "head" or "torso")
+        if p then
+            return p.Position
         end
-        return t.root
+        return t.root.Position + Vector3.new(0, choice == "Head" and 1.6 or 0.3, 0)
     end
 
     local params = RaycastParams.new()
     params.FilterType = Enum.RaycastFilterType.Exclude
-    -- Nothing solid between your camera and the part (bodies don't count).
-    function Targets.visible(part)
+    -- Nothing solid between your camera and a point (bodies don't count).
+    function Targets.visible(pos)
         local cam = camera()
-        if not (cam and part) then
+        if not cam then
             return false
         end
         local ignore = { cam }
-        local vms = Workspace:FindFirstChild("Viewmodels")
-        if vms then
-            table.insert(ignore, vms)
+        local folder = Workspace:FindFirstChild("Viewmodels")
+        if folder then
+            table.insert(ignore, folder)
         end
-        for model in Game.characters() do
+        for _, model in CollectionService:GetTagged("Character") do
             table.insert(ignore, model)
         end
         params.FilterDescendantsInstances = ignore
         local from = cam.CFrame.Position
-        return Workspace:Raycast(from, part.Position - from, params) == nil
+        return Workspace:Raycast(from, pos - from, params) == nil
     end
     function Targets.screen(pos)
         local sp = camera():WorldToViewportPoint(pos)
         return Vector2.new(sp.X, sp.Y), sp.Z > 0
     end
-    -- The enemy closest to the middle of the screen inside a FOV (px), or nil.
+    -- The player closest to the middle of the screen inside a FOV (px), or nil.
     -- opts: fov, maxDist, visible, part, teammates
     function Targets.pick(opts)
         local cam = camera()
         local centre = cam.ViewportSize / 2
         local best, bestD
         for _, t in Targets.list(opts.teammates) do
-            local part = Targets.part(t, opts.part)
-            local sp, front = Targets.screen(part.Position)
+            local pos = Targets.aimPos(t, opts.part)
+            local sp, front = Targets.screen(pos)
             if front then
                 local d = (sp - centre).Magnitude
-                local dist = (part.Position - cam.CFrame.Position).Magnitude
+                local dist = (pos - cam.CFrame.Position).Magnitude
                 if d <= opts.fov and dist <= opts.maxDist and (not bestD or d < bestD)
-                    and (not opts.visible or Targets.visible(part)) then
-                    best, bestD = { t = t, part = part, d = d }, d
+                    and (not opts.visible or Targets.visible(pos)) then
+                    best, bestD = { t = t, pos = pos, d = d }, d
                 end
             end
         end
@@ -340,7 +445,7 @@ do
         if not pick then
             return cf
         end
-        local to = pick.part.Position
+        local to = pick.pos
         if (to - cf.Position).Magnitude < 0.5 then
             return cf
         end
@@ -397,31 +502,40 @@ local Aim = { target = nil }
 local FovCircle, SilentCircle
 do
     local OPTS = {}
+    -- Is the aim key down? Sights and shooting come from your gun's own state when it is found
+    -- (so they work on touch); otherwise they fall back to the mouse buttons, or always on touch.
     local function holding(item)
         local when = Settings.AimWhen
         if when == "Always" then
             return true
-        elseif when == "Aiming down sights" then
-            return item ~= nil and item.states.sights and item.states.sights:get() == true
-        elseif when == "While shooting" then
-            return item ~= nil and item.shoot_hold == true
         elseif when == "Left mouse" then
             return UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton1)
+        elseif when == "Right mouse" then
+            return UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton2)
         end
-        return UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton2)
+        if item then
+            if when == "Aiming down sights" then
+                return item.states.sights ~= nil and item.states.sights:get() == true
+            end
+            return item.shoot_hold == true
+        end
+        if UserInputService.TouchEnabled and not UserInputService.MouseEnabled then
+            return true
+        end
+        return UserInputService:IsMouseButtonPressed(
+            when == "Aiming down sights" and Enum.UserInputType.MouseButton2 or Enum.UserInputType.MouseButton1)
     end
 
     local function stillValid(a)
         if not (a and a.t.model.Parent == Workspace and a.t.hum.Health > 0) then
             return false
         end
-        local part = Targets.part(a.t, Settings.AimPart)
-        a.part = part
-        local sp, front = Targets.screen(part.Position)
+        a.pos = Targets.aimPos(a.t, Settings.AimPart)
+        local sp, front = Targets.screen(a.pos)
         if not front or (sp - camera().ViewportSize / 2).Magnitude > Settings.AimFOV * 1.5 then
             return false
         end
-        return not Settings.VisibleOnly or Targets.visible(part)
+        return not Settings.VisibleOnly or Targets.visible(a.pos)
     end
 
     -- Turns the camera toward `to` by a fraction of the angle, keeping its roll (the game's
@@ -443,8 +557,7 @@ do
             Aim.target = nil
             return
         end
-        local item = Game.gun()
-        if not holding(item) then
+        if not holding(Game.gun()) then
             Aim.target = nil
             return
         end
@@ -459,30 +572,49 @@ do
         end
         local k = math.max(Settings.Smoothness, 1)
         local alpha = 1 - (1 - 1 / k) ^ (math.clamp(dt, 0, 0.1) * 60)
-        turn(camera(), a.part.Position, alpha)
+        turn(camera(), a.pos, alpha)
     end
 
-    -- Trigger: fires the game's own input_shoot when your crosshair is on an enemy body.
+    -- Trigger: when your crosshair is on an enemy body, fires the game's own input_shoot (or,
+    -- without the gun found, a mouse click).
     local lastShot, armedAt = 0, nil
     local rayParams = RaycastParams.new()
     rayParams.FilterType = Enum.RaycastFilterType.Exclude
+    local function fire(item)
+        if item and type(item.input_shoot) == "function" then
+            pcall(item.input_shoot, item, true)
+            task.delay(0.04, function()
+                pcall(item.input_shoot, item, false)
+            end)
+        elseif typeof(mouse1click) == "function" then
+            mouse1click()
+        end
+    end
     function Aim.trigger()
-        local item = Game.gun()
-        if not (Settings.Triggerbot and item and type(item.input_shoot) == "function") then
+        if not Settings.Triggerbot then
             armedAt = nil
             return
         end
-        if Settings.TriggerOnlyAiming and not (item.states.sights and item.states.sights:get()) then
-            armedAt = nil
-            return
+        local item = Game.gun()
+        if Settings.TriggerOnlyAiming then
+            local aiming
+            if item then
+                aiming = item.states.sights ~= nil and item.states.sights:get() == true
+            else
+                aiming = UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton2)
+            end
+            if not aiming then
+                armedAt = nil
+                return
+            end
         end
         local cam = camera()
         local ignore = { cam }
         if LocalPlayer.Character then
             table.insert(ignore, LocalPlayer.Character)
         end
-        local vms = Workspace:FindFirstChild("Viewmodels")
-        local mine = vms and vms:FindFirstChild("LocalViewmodel")
+        local folder = Workspace:FindFirstChild("Viewmodels")
+        local mine = folder and folder:FindFirstChild("LocalViewmodel")
         if mine then
             table.insert(ignore, mine)
         end
@@ -506,10 +638,7 @@ do
         armedAt = armedAt or now
         if now - armedAt >= Settings.TriggerDelay / 1000 and now - lastShot >= 0.08 then
             lastShot = now
-            pcall(item.input_shoot, item, true)
-            task.delay(0.04, function()
-                pcall(item.input_shoot, item, false)
-            end)
+            fire(item)
         end
     end
 
@@ -646,19 +775,15 @@ do
         return minX - 8, minY - 6, maxX + 8, maxY + 6
     end
 
-    local function equippedName(obj)
-        local ok, inst = pcall(function()
-            return obj.states.equipped:get()
-        end)
-        if ok and typeof(inst) == "Instance" then
+    local function equippedName(model)
+        local inst = Targets.charValue(model, "equipped")
+        if typeof(inst) == "Instance" then
             return inst.Name
         end
     end
-    local function className(obj)
-        local ok, v = pcall(function()
-            return obj.states.class_name:get()
-        end)
-        return ok and v or nil
+    local function className(model)
+        local v = Targets.charValue(model, "class_name")
+        return type(v) == "string" and v ~= "" and v or nil
     end
     local function line(d, a, b, color)
         local sa, fa = Targets.screen(a)
@@ -714,10 +839,10 @@ do
                         end
                         local bits = {}
                         if Settings.EspWeapon then
-                            bits[#bits + 1] = equippedName(t.obj)
+                            bits[#bits + 1] = equippedName(t.model)
                         end
                         if Settings.EspClass then
-                            bits[#bits + 1] = className(t.obj)
+                            bits[#bits + 1] = className(t.model)
                         end
                         if Settings.EspDistance then
                             bits[#bits + 1] = ("%dm"):format(math.floor(dist))
@@ -745,10 +870,8 @@ do
                             end
                         end
                         local head = vm and vm:FindFirstChild("head")
-                        local ok, dir = pcall(function()
-                            return t.obj.states.look:get()
-                        end)
-                        if Settings.EspLook and head and ok and typeof(dir) == "Vector3" and dir.Magnitude > 0.01 and e.look then
+                        local dir = Targets.charValue(t.model, "look")
+                        if Settings.EspLook and head and typeof(dir) == "Vector3" and dir.Magnitude > 0.01 and e.look then
                             line(e.look, head.Position, head.Position + dir.Unit * 8, Color3.fromRGB(255, 220, 80))
                         elseif e.look then
                             e.look.Visible = false
@@ -986,11 +1109,19 @@ end)
 --// Main loop \\--
 -- The camera step runs after everything else bound to the render step, so the game's own
 -- offsets are already on the frame it turns.
+local Reported = {}
+local function guard(name, fn, ...)
+    local ok, err = pcall(fn, ...)
+    if not ok and not Reported[name] then
+        Reported[name] = true
+        warn(("[OperationOne] %s: %s"):format(name, tostring(err)))
+    end
+end
 local BIND = "OperationOneAim"
 pcall(RunService.UnbindFromRenderStep, RunService, BIND)
 RunService:BindToRenderStep(BIND, Enum.RenderPriority.Last.Value + 10, function(dt)
     if alive() then
-        pcall(Aim.step, dt)
+        guard("aimbot", Aim.step, dt)
     end
 end)
 table.insert(Cleanups, function()
@@ -1001,7 +1132,7 @@ bind(RunService.RenderStepped, function()
     if not alive() then
         return
     end
-    pcall(function()
+    guard("circles", function()
         local centre = camera().ViewportSize / 2
         if FovCircle then
             FovCircle.Visible = Settings.Aimbot and Settings.ShowFOV
@@ -1011,14 +1142,14 @@ bind(RunService.RenderStepped, function()
             SilentCircle.Visible = Settings.SilentAim and Settings.SilentShowFOV
             SilentCircle.Radius, SilentCircle.Position = Settings.SilentFOV, centre
         end
-        Silent.step()
-        Gun.step()
-        Gun.autoReload()
-        Aim.trigger()
-        Esp.step()
-        World.fov()
-        World.noFlash()
     end)
+    guard("esp", Esp.step)
+    guard("triggerbot", Aim.trigger)
+    guard("silent aim", Silent.step)
+    guard("gun", Gun.step)
+    guard("auto reload", Gun.autoReload)
+    guard("fov", World.fov)
+    guard("no flash", World.noFlash)
 end)
 
 --// UI \\--
@@ -1097,6 +1228,9 @@ do
         if l and os.clock() - l.at < 3 then
             return "Last redirect: " .. l.name
         end
+        if not Game.live() then
+            return Game.searching and "Looking for the game's gun data..." or "Gun data not found: silent aim is off"
+        end
         return Game.gun() and "Waiting for a shot" or "No gun in hand"
     end)
 
@@ -1119,6 +1253,9 @@ do
     slider(G, "RapidScale", "Fire rate", 1, 3, 1, "x")
     toggle(G, "AutoReload", "Auto reload", "Reloads when the magazine is empty")
     status(G, function()
+        if not Game.live() then
+            return Game.searching and "Looking for the game's gun data..." or "Gun data not found: gun mods are off"
+        end
         local item = Game.gun()
         if not item then
             return "No gun in hand"
@@ -1157,7 +1294,7 @@ do
     slider(B, "UtilMax", "Max distance", 50, 600, 0, " studs")
     status(B, function()
         local ws = Workspace
-        return ("%s on %s\nRound %s / %s\nYou: %s"):format(
+        return ("Players found: %d\n%s on %s\nRound %s / %s\nYou: %s"):format(#Targets.all(),
             tostring(ws:GetAttribute("Gamemode") or "?"), tostring(ws:GetAttribute("CurrentMap") or "?"),
             tostring(ws:GetAttribute("Round") or "?"), tostring(ws:GetAttribute("BestOf") or "?"),
             tostring(LocalPlayer:GetAttribute("Team") or "no team"))
@@ -1174,6 +1311,17 @@ do
     slider(W, "FovValue", "FOV", 60, 120, 0, "")
     local M = Tab:AddRightGroupbox("Script", "settings")
     toggle(M, "AntiAfk", "Anti-AFK")
+    status(M, function()
+        if Game.live() then
+            return "Gun data: found"
+        end
+        return Game.searching and "Gun data: searching..." or "Gun data: not found"
+    end)
+    M:AddButton({ Text = "Search for gun data again", Func = function()
+        Game.start(function()
+            notify("Found the game's gun data", 3)
+        end, 3)
+    end, Tooltip = "Needed only for silent aim and the gun options; ESP and aimbot don't use it" })
     M:AddButton({ Text = "Unload", Func = function()
         if Genv.__OperationOneUnload then
             Genv.__OperationOneUnload()
@@ -1200,4 +1348,7 @@ Genv.__OperationOneUnload = function()
     pcall(Library.Unload, Library)
 end
 
-notify(Game.SO and "Loaded" or "Loaded (StateObject module not found: gun and body data won't work)", 4)
+Game.start(function()
+    notify("Found the game's gun data: gun mods and silent aim are ready", 4)
+end)
+notify("Loaded. ESP and aimbot read players from the world; gun features wait for the game's data", 5)
