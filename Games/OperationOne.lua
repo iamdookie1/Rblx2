@@ -155,22 +155,94 @@ end
 -- game isn't in an Actor (or the executor can't run code in one) the same agent runs in this VM.
 -- What this script sees of your gun is a plain table the agent keeps sending: Game.gun().
 local AGENT = [==[
-local a1 = ...
-local ok, err = pcall(function(...)
 -- AGENT. Runs where the game's own code runs: inside its Actor (a separate Luau VM, which is why
 -- the script's own getgc can't see the game), or in the script's VM if the game isn't in an Actor.
 -- It finds the game's live StateObject module, applies the gun mods, hooks get_shoot_look for
--- silent aim and reports the gun in your hand over the `up` channel. The script talks to it over
--- the `down` channel. Arguments: up channel (or its id), down channel (or its id), max scans.
-local upArg, downArg, maxTries = ...
+-- silent aim and reports the gun in your hand to the script. Arguments: up channel (or its id),
+-- down channel (or its id), max scans, beacon key, up and down BindableEvent names, run number.
+-- Messages go both ways over every route that works (the executor's comm channels and plain
+-- BindableEvents the script left in a hidden container), each tagged with a sequence number so the
+-- copy that arrives second is dropped. Progress is also written to an attribute (the beacon),
+-- which needs no channel at all, so the script can see how far the agent got even if nothing
+-- else gets through.
+local upArg, downArg, maxTries, beaconKey, upName, downName, runId = ...
 maxTries = tonumber(maxTries)
-local function channel(x)
-    if type(x) == "string" then
-        return get_comm_channel(x)
+
+local beaconLines = 0
+local function beacon(text)
+    if not beaconKey then
+        return
     end
-    return x
+    pcall(function()
+        local inst = game:GetService("Lighting")
+        local cur = inst:GetAttribute(beaconKey)
+        cur = type(cur) == "string" and cur or ""
+        local last = tonumber(cur:match("(%d+)|[^\n]*$")) or 0
+        beaconLines = math.max(beaconLines, last) + 1
+        cur = cur .. (cur == "" and "" or "\n") .. beaconLines .. "|" .. text
+        if #cur > 1500 then
+            cur = cur:sub(-1500):gsub("^[^\n]*\n", "")
+        end
+        inst:SetAttribute(beaconKey, cur)
+    end)
 end
-local up, down = channel(upArg), channel(downArg)
+local function kind(f)
+    return type(f) == "function" and "yes" or "NO"
+end
+local hasExtras = false
+pcall(function()
+    hasExtras = shared.extras ~= nil
+end)
+beacon(("agent running; getgc=%s filtergc=%s get_comm_channel=%s gethui=%s shared.extras=%s"):format(
+    kind(getgc), kind(filtergc), kind(get_comm_channel), kind(gethui), tostring(hasExtras)))
+
+local ups, downs = {}, {}
+local function addChannel(list, x, what)
+    if type(x) == "string" then
+        if type(get_comm_channel) ~= "function" then
+            beacon(what .. ": get_comm_channel is not available here")
+            return
+        end
+        local ok, ev = pcall(get_comm_channel, x)
+        if ok and ev then
+            table.insert(list, ev)
+            beacon(what .. ": comm channel ok")
+        else
+            beacon(what .. ": get_comm_channel failed (" .. tostring(ev) .. ")")
+        end
+    elseif x ~= nil then
+        table.insert(list, x)
+    end
+end
+local function addBindable(list, name, what)
+    if type(name) ~= "string" then
+        return
+    end
+    local ok, ev = pcall(function()
+        local box = (type(gethui) == "function" and gethui()) or game:GetService("CoreGui")
+        return box:FindFirstChild(name)
+    end)
+    if ok and ev then
+        table.insert(list, ev)
+        beacon(what .. ": BindableEvent ok")
+    else
+        beacon(what .. ": BindableEvent not found (" .. tostring(ev) .. ")")
+    end
+end
+addChannel(ups, upArg, "up")
+addChannel(downs, downArg, "down")
+addBindable(ups, upName, "up")
+addBindable(downs, downName, "down")
+if #ups == 0 or #downs == 0 then
+    beacon(("no way to talk to the script (up routes %d, down routes %d)"):format(#ups, #downs))
+end
+local upSeq = 0
+local function say(...)
+    upSeq += 1
+    for _, ev in ups do
+        pcall(ev.Fire, ev, upSeq, ...)
+    end
+end
 local RunService = game:GetService("RunService")
 local Players = game:GetService("Players")
 local CollectionService = game:GetService("CollectionService")
@@ -183,10 +255,6 @@ local S = {} -- the script's settings, as last sent
 local Aim = nil -- the silent aim target: { pos, part, name, at }
 local SO = nil -- the game's live StateObject module
 local rescan = false
-
-local function say(...)
-    pcall(up.Fire, up, ...)
-end
 
 --// Finding the game's live StateObject \\--
 -- The live module is a table with get_all, class and a non-empty classes. It is found by scanning
@@ -222,15 +290,22 @@ local function find()
     if not ok or type(list) ~= "table" then
         return nil, "getgc failed"
     end
+    local empty = 0
     for i, v in list do
-        if type(v) == "table" and live(v) then
-            return v
+        if type(v) == "table" then
+            if live(v) then
+                return v
+            end
+            if type(rawget(v, "get_all")) == "function" and type(rawget(v, "class")) == "function"
+                and type(rawget(v, "classes")) == "table" then
+                empty += 1
+            end
         end
         if i % 3000 == 0 then
             task.wait()
         end
     end
-    return nil, ("scanned %d objects, no live StateObject"):format(#list)
+    return nil, ("scanned %d objects, %d StateObject-like table(s) with no classes yet"):format(#list, empty)
 end
 
 --// Your character and your gun \\--
@@ -486,11 +561,13 @@ local function shutdown()
     say("stopped")
 end
 -- An older agent in this VM (the script was run again) is stopped first.
+-- An agent left in this VM by an earlier run of the script (not one of this run's own) is stopped.
 pcall(function()
-    if type(shared.__OperationOneAgent) == "function" then
-        shared.__OperationOneAgent()
+    local prev = shared.__OperationOneAgent
+    if type(prev) == "table" and prev.run ~= runId and type(prev.stop) == "function" then
+        prev.stop()
     end
-    shared.__OperationOneAgent = shutdown
+    shared.__OperationOneAgent = { stop = shutdown, run = runId }
 end)
 
 local function onFrame()
@@ -501,6 +578,7 @@ local function onFrame()
     if not ok and not stepError then
         stepError = true
         say("log", "step: " .. tostring(err))
+        beacon("step error: " .. tostring(err))
     end
 end
 local okFrame, frameConn = pcall(function()
@@ -511,25 +589,34 @@ if not okFrame then
     frameConn = RunService.Heartbeat:Connect(onFrame)
 end
 conns[#conns + 1] = frameConn
-conns[#conns + 1] = down.Event:Connect(function(kind, a, b, c)
-    if kind == "cfg" then
+local seenDown = {}
+local function onDown(seq, what, a, b, c)
+    if seenDown[seq] then
+        return
+    end
+    seenDown[seq] = true
+    seenDown[seq - 300] = nil
+    if what == "cfg" then
         if type(a) == "table" then
             S = a
         end
-    elseif kind == "aim" then
+    elseif what == "aim" then
         if typeof(a) == "Vector3" then
             Aim = { pos = a, part = b, name = c, at = os.clock() }
         else
             Aim = nil
         end
-    elseif kind == "fire" then
+    elseif what == "fire" then
         pcall(fire)
-    elseif kind == "rescan" then
+    elseif what == "rescan" then
         rescan = true
-    elseif kind == "stop" then
+    elseif what == "stop" then
         shutdown()
     end
-end)
+end
+for _, ev in downs do
+    conns[#conns + 1] = ev.Event:Connect(onDown)
+end
 
 -- Does the live module still describe the game? It goes stale if the game rebuilds its modules, or
 -- if you have a tagged character that it no longer knows.
@@ -545,6 +632,7 @@ local function stale()
 end
 
 say("hello")
+beacon(("hello sent; listening on %d route(s), reporting on %d"):format(#downs, #ups))
 task.spawn(function()
     local delay, tries = 1, 0
     while alive do
@@ -555,8 +643,12 @@ task.spawn(function()
                 SO = m
                 delay = 1
                 say("found", tries)
+                beacon(("found the live StateObject on scan %d"):format(tries))
             else
                 say("miss", tries, why)
+                if tries == 1 or tries % 4 == 0 then
+                    beacon(("scan %d: %s"):format(tries, tostring(why)))
+                end
                 if maxTries and maxTries > 0 and tries >= maxTries then
                     say("gaveup", tries)
                     return
@@ -576,18 +668,53 @@ task.spawn(function()
                 pcall(restore)
                 tries, delay = 0, 1
                 say("lost")
+                beacon("the live StateObject went stale, searching again")
             end
         end
     end
 end)
-end, ...)
-if not ok then
+]==]
+
+-- What is run inside an Actor: a tiny plain-Lua bootstrap that reports (through the beacon) that it
+-- ran, whether the agent compiled there, and whether it crashed, then starts the agent. Nothing
+-- depends on run_on_actor passing arguments: the values are written into the source.
+local BOOT_HEAD = [==[
+local function beacon(text)
     pcall(function()
-        local up = type(a1) == "string" and get_comm_channel(a1) or a1
-        up:Fire("log", "agent crashed: " .. tostring(err))
+        local inst = game:GetService("Lighting")
+        local cur = inst:GetAttribute(KEY)
+        cur = type(cur) == "string" and cur or ""
+        local n = (tonumber(cur:match("(%d+)|[^\n]*$")) or 0) + 1
+        inst:SetAttribute(KEY, cur .. (cur == "" and "" or "\n") .. n .. "|" .. text)
     end)
 end
+beacon("bootstrap ran")
+local compile = loadstring or load
+if not compile then
+    beacon("this VM has no loadstring or load")
+    return
+end
+local fn, compileError = compile(SRC, "=OperationOneAgent")
+if not fn then
+    beacon("the agent did not compile here: " .. tostring(compileError))
+    return
+end
+local ok, err = pcall(fn, UPID, DOWNID, TRIES, KEY, UPNAME, DOWNNAME, RUNID)
+if not ok then
+    beacon("the agent crashed: " .. tostring(err))
+end
 ]==]
+local function lit(x)
+    return x ~= nil and ("%q"):format(x) or "nil"
+end
+local function bootSource(key, upId, downId, tries, upName, downName)
+    return table.concat({
+        "local KEY, UPID, DOWNID, TRIES, UPNAME, DOWNNAME, RUNID = ", lit(key), ", ", lit(upId), ", ", lit(downId), ", ",
+        tostring(tries), ", ", lit(upName), ", ", lit(downName), ", ", tostring(RUN), "\n",
+        "local SRC = [=====[\n", AGENT, "\n]=====]\n",
+        BOOT_HEAD,
+    })
+end
 
 local Game = {
     found = false, mode = nil, active = nil, searching = false,
@@ -596,7 +723,7 @@ local Game = {
 }
 do
     local agents, lines = {}, {}
-    local clock0, lastStart, cfgAt = os.clock(), -10, 0
+    local clock0, lastStart, cfgAt, beaconAt, onUp = os.clock(), -10, 0, 0, nil
     local cfgLast = {}
     -- The settings the agent needs, sent whenever one changes.
     local CFG = {
@@ -611,8 +738,13 @@ do
         end
     end
     Game.log = log
+    -- Messages go over every route the agent was given, tagged with a number so the copy that
+    -- arrives second is dropped.
     local function send(agent, ...)
-        pcall(agent.down.Fire, agent.down, ...)
+        agent.seq = (agent.seq or 0) + 1
+        for _, ev in agent.downs do
+            pcall(ev.Fire, ev, agent.seq, ...)
+        end
     end
     local function stopAgent(agent)
         if agent.dead then
@@ -623,6 +755,28 @@ do
         for _, c in agent.conns do
             pcall(c.Disconnect, c)
         end
+        -- Left in place a moment so the stop message gets through.
+        task.delay(2, function()
+            for _, inst in agent.owned do
+                pcall(inst.Destroy, inst)
+            end
+            if agent.key then
+                pcall(function()
+                    game:GetService("Lighting"):SetAttribute(agent.key, nil)
+                end)
+            end
+        end)
+    end
+    local function listen(agent, ev)
+        local ok, conn = pcall(function()
+            return ev.Event:Connect(function(...)
+                onUp(agent, ...)
+            end)
+        end)
+        if ok and conn then
+            table.insert(agent.conns, conn)
+        end
+        return ok
     end
 
     function Game.pushCfg(force)
@@ -649,10 +803,12 @@ do
     end
 
     -- Everything an agent says arrives here.
-    local function onUp(agent, kind, a, b)
-        if agent.dead then
+    function onUp(agent, seq, kind, a, b)
+        if agent.dead or type(seq) ~= "number" or agent.seen[seq] then
             return
         end
+        agent.seen[seq] = true
+        agent.seen[seq - 300] = nil
         if kind == "state" then
             if agent == Game.active then
                 Game.state, Game.stateAt, Game.heard = a or nil, os.clock(), os.clock()
@@ -700,48 +856,68 @@ do
     end
 
     local function launchLocal(maxTries)
-        local agent = { kind = "local", label = "this VM", conns = {} }
+        local agent = { kind = "local", label = "this VM", conns = {}, downs = {}, owned = {}, seen = {} }
         local fn, compileError = loadstring(AGENT)
         if type(fn) ~= "function" then
             log("the agent didn't compile here: " .. tostring(compileError))
             return
         end
-        agent.up, agent.down = Instance.new("BindableEvent"), Instance.new("BindableEvent")
-        agent.conns[1] = agent.up.Event:Connect(function(...)
-            onUp(agent, ...)
-        end)
+        local up, down = Instance.new("BindableEvent"), Instance.new("BindableEvent")
+        listen(agent, up)
+        table.insert(agent.downs, down)
         table.insert(agents, agent)
         task.spawn(function()
-            local ran, err = pcall(fn, agent.up, agent.down, maxTries)
+            local ran, err = pcall(fn, up, down, maxTries, nil, nil, nil, RUN)
             if not ran then
                 log("the agent crashed in this VM: " .. tostring(err))
             end
         end)
     end
+    local actorCount = 0
     local function launchActor(actor)
-        local agent = { kind = "actor", conns = {} }
+        actorCount += 1
+        local agent = { kind = "actor", conns = {}, downs = {}, owned = {}, seen = {} }
         agent.label = "actor " .. (actor.Parent and actor.Parent.Name .. "/" or "") .. actor.Name
-        local okA, upId, upEv = pcall(create_comm_channel)
-        local okB, downId, downEv = pcall(create_comm_channel)
-        if not (okA and okB and upEv and downEv) then
-            log(agent.label .. ": couldn't create a comm channel (" .. tostring(upId) .. ")")
-            return
+        agent.key = ("oo%d_%d"):format(actorCount, math.random(100000, 999999))
+        -- Two ways to reach the agent, both given to it: the executor's comm channels, and plain
+        -- BindableEvents in a hidden container (these work between VMs without any executor help).
+        local upId, downId, upName, downName
+        if type(create_comm_channel) == "function" then
+            local okA, idA, evA = pcall(create_comm_channel)
+            local okB, idB, evB = pcall(create_comm_channel)
+            if okA and okB and evA and evB and listen(agent, evA) then
+                upId, downId = idA, idB
+                table.insert(agent.downs, evB)
+            else
+                log(agent.label .. ": couldn't set up comm channels (" .. tostring(idA) .. ")")
+            end
         end
-        agent.up, agent.down = upEv, downEv
-        local okC, connOrErr = pcall(function()
-            return upEv.Event:Connect(function(...)
-                onUp(agent, ...)
-            end)
+        local okC, errC = pcall(function()
+            local box = (type(gethui) == "function" and gethui()) or game:GetService("CoreGui")
+            local upB, downB = Instance.new("BindableEvent"), Instance.new("BindableEvent")
+            upName, downName = agent.key .. "u", agent.key .. "d"
+            upB.Name, downB.Name = upName, downName
+            upB.Parent, downB.Parent = box, box
+            table.insert(agent.owned, upB)
+            table.insert(agent.owned, downB)
+            listen(agent, upB)
+            table.insert(agent.downs, downB)
         end)
         if not okC then
-            log(agent.label .. ": couldn't listen on the channel (" .. tostring(connOrErr) .. ")")
+            log(agent.label .. ": couldn't make the hidden BindableEvents (" .. tostring(errC) .. ")")
+        end
+        if #agent.downs == 0 then
+            log(agent.label .. ": no way to reach it, skipped")
             return
         end
-        agent.conns[1] = connOrErr
         agent.launchedAt = os.clock()
         table.insert(agents, agent)
-        local ran, err = pcall(run_on_actor, actor, AGENT, upId, downId, 0)
-        if not ran then
+        local source = bootSource(agent.key, upId, downId, 0, upName, downName)
+        local ran, err = pcall(run_on_actor, actor, source, upId, downId, 0, agent.key, upName, downName, RUN)
+        if ran then
+            log(("%s: sent the agent (%d routes: %s)"):format(agent.label, #agent.downs,
+                (upId and "comm channel" or "no comm channel") .. (upName and " + BindableEvents" or "")))
+        else
             log(agent.label .. ": run_on_actor failed (" .. tostring(err) .. ")")
             stopAgent(agent)
         end
@@ -763,7 +939,6 @@ do
         Game.found, Game.active, Game.state, Game.mode, Game.detail = false, nil, nil, nil, nil
         Game.searching = true
         local canActor = type(getactors) == "function" and type(run_on_actor) == "function"
-            and type(create_comm_channel) == "function"
         local actors = {}
         if canActor then
             local ok, list = pcall(getactors)
@@ -797,11 +972,37 @@ do
             cfgAt = now
             Game.pushCfg(false)
         end
-        -- An Actor agent that never says hello: the code didn't run there, or can't reach us.
+        -- The beacons: what each Actor agent wrote to its attribute, readable even when no channel
+        -- works. Every new line goes in the report.
+        if now - beaconAt > 0.4 then
+            beaconAt = now
+            for _, a in agents do
+                if a.key and not a.dead then
+                    local ok, text = pcall(function()
+                        return game:GetService("Lighting"):GetAttribute(a.key)
+                    end)
+                    if ok and type(text) == "string" then
+                        for line in text:gmatch("[^\n]+") do
+                            local n, msg = line:match("^(%d+)|(.*)$")
+                            n = tonumber(n)
+                            if n and n > (a.beaconN or 0) then
+                                a.beaconN = n
+                                log(a.label .. " [beacon]: " .. msg)
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        -- An Actor agent that never says hello.
         for _, a in agents do
             if a.launchedAt and not a.hello and not a.warned and not a.dead and now - a.launchedAt > 6 then
                 a.warned = true
-                log(a.label .. ": no sign of the agent after 6s (run_on_actor ran nothing there, or its channel isn't reaching this script)")
+                if (a.beaconN or 0) == 0 then
+                    log(a.label .. ": nothing from the agent after 6s, not even a beacon: the code was never run there")
+                else
+                    log(a.label .. ": the agent ran (see its beacon lines) but nothing it sent reached this script")
+                end
             end
         end
     end
@@ -863,8 +1064,8 @@ do
         end
         local out = {
             "Operation One gun-data report",
-            ("executor functions: getgc %s, filtergc %s, getactors %s, run_on_actor %s, create_comm_channel %s, loadstring %s"):format(
-                has(getgc), has(filtergc), has(getactors), has(run_on_actor), has(create_comm_channel), has(loadstring)),
+            ("executor functions: getgc %s, filtergc %s, getactors %s, run_on_actor %s, create_comm_channel %s, gethui %s, loadstring %s"):format(
+                has(getgc), has(filtergc), has(getactors), has(run_on_actor), has(create_comm_channel), has(gethui), has(loadstring)),
             ("state: found=%s mode=%s live=%s agents=%d"):format(
                 tostring(Game.found), tostring(Game.mode), tostring(Game.live()), #agents),
         }
