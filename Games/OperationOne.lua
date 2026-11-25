@@ -13,10 +13,13 @@
 --              Workspace, each with a "Character" Configuration holding equipped (ObjectValue,
 --              the gun model, which sits inside that player's Viewmodel), look (Vector3Value),
 --              class_name (StringValue).
---   State      The game's own Loader (an obfuscated VM) runs the real modules, so require() from
---              an executor returns a fresh copy whose StateObject.classes is empty (the dump shows
---              {} there). The live module is found in memory with getgc (a table with get_all,
---              class and a non-empty classes). Only your own gun needs it:
+--   State      The game's code runs inside an Actor (PlayerScripts.Folder, holding the Loader), which
+--              is its own Luau VM: getgc from the executor's VM never sees its tables, `shared` is
+--              empty there while the game uses shared.extras, and require() from outside gives a
+--              fresh copy whose StateObject.classes is empty (the dump shows {} there). So the
+--              live module (a table with get_all, class and a non-empty classes) is found by an
+--              agent run inside the Actor with run_on_actor, which does everything that touches
+--              your own gun and reports back over comm channels (see AGENT). Inside it:
 --                get_all("Character")[yourModel].values.equipped   your gun's item object
 --                                                                  (.states, .instance, .shoot_hold)
 --   Camera     CameraType stays Custom: Roblox's own camera module turns the view from mouse or
@@ -138,131 +141,739 @@ local function camera()
 end
 
 --// The game's world \\--
--- Players are read from the world itself, not from the game's modules: the game's own Loader
--- (an obfuscated VM) runs the real modules, and a plain require() from here returns a fresh copy
--- whose StateObject.classes is empty (the dump shows exactly that), so nothing found through it
--- would ever be a player. Characters are tagged "Character"; each has a "Character" config with
--- equipped / look / class_name values; the bodies sit in Workspace.Viewmodels. Only your own gun
--- (recoil, silent aim, reload...) needs the game's live state objects, and those are found in
--- memory with getgc.
-local Game = { SO = nil, searching = false }
-do
-    local function live(mod)
-        return type(mod) == "table" and type(rawget(mod, "get_all")) == "function"
-            and type(rawget(mod, "class")) == "function" and type(rawget(mod, "classes")) == "table"
-            and next(mod.classes) ~= nil
+-- Players are read from the world itself: characters are tagged "Character"; each has a
+-- "Character" config with equipped / look / class_name values; the bodies sit in
+-- Workspace.Viewmodels.
+--
+-- Your own gun (recoil, silent aim, reload...) needs the game's live state objects, and those are
+-- not reachable from this VM. The game's code runs inside an Actor (PlayerScripts.Folder, holding
+-- the obfuscated Loader) and an Actor is a separate Luau VM: getgc from here never sees its
+-- tables, `shared` is empty here while the game itself uses shared.extras, and require() gives a
+-- fresh copy whose StateObject.classes is empty (the dump shows exactly that). So a small agent
+-- (AGENT, below) is run inside the Actor with run_on_actor. It finds the live module there,
+-- applies the gun mods, hooks the shot, and talks to this script over two comm channels. If the
+-- game isn't in an Actor (or the executor can't run code in one) the same agent runs in this VM.
+-- What this script sees of your gun is a plain table the agent keeps sending: Game.gun().
+local AGENT = [==[
+local a1 = ...
+local ok, err = pcall(function(...)
+-- AGENT. Runs where the game's own code runs: inside its Actor (a separate Luau VM, which is why
+-- the script's own getgc can't see the game), or in the script's VM if the game isn't in an Actor.
+-- It finds the game's live StateObject module, applies the gun mods, hooks get_shoot_look for
+-- silent aim and reports the gun in your hand over the `up` channel. The script talks to it over
+-- the `down` channel. Arguments: up channel (or its id), down channel (or its id), max scans.
+local upArg, downArg, maxTries = ...
+maxTries = tonumber(maxTries)
+local function channel(x)
+    if type(x) == "string" then
+        return get_comm_channel(x)
     end
-    function Game.live()
-        return Game.SO ~= nil and live(Game.SO)
+    return x
+end
+local up, down = channel(upArg), channel(downArg)
+local RunService = game:GetService("RunService")
+local Players = game:GetService("Players")
+local CollectionService = game:GetService("CollectionService")
+local LocalPlayer = Players.LocalPlayer
+local Workspace = workspace
+
+local alive = true
+local conns = {}
+local S = {} -- the script's settings, as last sent
+local Aim = nil -- the silent aim target: { pos, part, name, at }
+local SO = nil -- the game's live StateObject module
+local rescan = false
+
+local function say(...)
+    pcall(up.Fire, up, ...)
+end
+
+--// Finding the game's live StateObject \\--
+-- The live module is a table with get_all, class and a non-empty classes. It is found by scanning
+-- this VM's memory. (require() is not used: it would run the game's modules a second time.)
+local function live(m)
+    if type(m) ~= "table" then
+        return false
     end
-    function Game.find()
-        local ok, mod = pcall(function()
-            return require(ReplicatedStorage:WaitForChild("Modules", 5):WaitForChild("StateObject", 5))
-        end)
-        if ok and live(mod) then
-            return mod
-        end
-        if type(getgc) ~= "function" then
-            return nil
-        end
-        local ok2, list = pcall(getgc, true)
-        if not ok2 or type(list) ~= "table" then
-            return nil
-        end
-        for i, v in list do
-            if type(v) == "table" and live(v) then
-                return v
+    local classes = rawget(m, "classes")
+    return type(classes) == "table" and type(rawget(m, "get_all")) == "function"
+        and type(rawget(m, "class")) == "function" and next(classes) ~= nil
+end
+local function find()
+    if type(filtergc) == "function" then
+        local ok, res = pcall(filtergc, "table", { Keys = { "get_all", "class", "classes" } }, true)
+        if ok then
+            if live(res) then
+                return res
             end
-            if i % 3000 == 0 then
-                task.wait()
+            if type(res) == "table" then
+                for _, v in res do
+                    if live(v) then
+                        return v
+                    end
+                end
             end
         end
+    end
+    if type(getgc) ~= "function" then
+        return nil, "this executor has no getgc"
+    end
+    local ok, list = pcall(getgc, true)
+    if not ok or type(list) ~= "table" then
+        return nil, "getgc failed"
+    end
+    for i, v in list do
+        if type(v) == "table" and live(v) then
+            return v
+        end
+        if i % 3000 == 0 then
+            task.wait()
+        end
+    end
+    return nil, ("scanned %d objects, no live StateObject"):format(#list)
+end
+
+--// Your character and your gun \\--
+local function me()
+    local char = LocalPlayer.Character
+    if not (SO and char) then
         return nil
     end
-    -- Looks for the live module, again and again with growing pauses (the game may still be
-    -- loading), up to `tries` scans. Safe to call again from a button.
-    function Game.start(onFound, tries)
-        if Game.searching then
+    local ok, all = pcall(SO.get_all, "Character")
+    return ok and type(all) == "table" and all[char] or nil
+end
+local function gunOf(m)
+    local item = m and m.values and m.values.equipped
+    if type(item) == "table" and type(item.states) == "table" and item.states.recoil_up then
+        return item
+    end
+    return nil
+end
+-- Where the next bullet would go, as a CFrame at the muzzle: the game's own get_shoot_look worked
+-- out without calling it (it also resets some game state).
+local function shotLook(item)
+    local ok, cf = pcall(function()
+        local shot = item.shot
+        if typeof(shot) ~= "Instance" then
+            return nil
+        end
+        local base = shot:IsA("Attachment") and shot.WorldCFrame or shot.CFrame
+        local sight = item.reticule
+        if typeof(sight) ~= "Instance" then
+            local root = item.instance and item.instance:FindFirstChild("Root")
+            sight = root and root:FindFirstChild("FrontSight", true)
+        end
+        local acc = item.accuracy and item.accuracy.Value
+        if typeof(sight) == "Instance" and sight:IsA("Attachment") and type(acc) == "number" then
+            return base:Lerp(sight.WorldCFrame, math.clamp(acc, 0, 1))
+        end
+        return base
+    end)
+    if ok and typeof(cf) == "CFrame" then
+        return cf
+    end
+    return nil
+end
+local function gunRange(item)
+    local st = type(item.states) == "table" and item.states.range
+    local v = type(st) == "table" and st.value
+    if type(v) ~= "number" then
+        v = type(item.stats) == "table" and item.stats.range
+    end
+    return type(v) == "number" and v > 0 and v or nil
+end
+-- Where the game really starts a shot: the muzzle, but never more than 3 studs sideways from the
+-- camera (its own validate_position).
+local function shotOrigin(camPos, muzzle)
+    local flat = Vector3.new(muzzle.X - camPos.X, 0, muzzle.Z - camPos.Z)
+    if flat.Magnitude > 3 then
+        local f = flat.Unit * 3
+        return Vector3.new(camPos.X + f.X, muzzle.Y, camPos.Z + f.Z)
+    end
+    return muzzle
+end
+
+--// Gun mods (local values the game's own client reads) \\--
+local Scaled = setmetatable({}, { __mode = "k" })
+-- Multiplies a State's .value by `mult`, remembering what the game itself set so that a change the
+-- game makes (equip, attachment, effect) becomes the new base.
+local function scale(state, mult)
+    if type(state) ~= "table" or type(state.value) ~= "number" then
+        return
+    end
+    local rec = Scaled[state]
+    if not rec then
+        if mult == 1 then
             return
         end
-        Game.searching = true
-        task.spawn(function()
-            local delay = 1
-            for _ = 1, tries or 8 do
-                if not alive() or Game.live() then
-                    break
-                end
-                local mod = Game.find()
-                if mod then
-                    Game.SO = mod
-                    if onFound then
-                        onFound()
-                    end
-                    break
-                end
-                task.wait(delay)
-                delay = math.min(delay * 2, 15)
-            end
-            Game.searching = false
-        end)
+        rec = { base = state.value, last = state.value }
+        Scaled[state] = rec
     end
+    if math.abs(state.value - rec.last) > 1e-4 then
+        rec.base = state.value
+    end
+    rec.last = rec.base * mult
+    state.value = rec.last
+end
+local function restore()
+    for state, rec in Scaled do
+        if type(state.value) == "number" and math.abs(state.value - rec.last) < 1e-4 then
+            state.value = rec.base
+        end
+    end
+end
+local function mods(item, m)
+    if item then
+        local s = item.states
+        scale(s.recoil_up, S.NoRecoil and 0 or 1)
+        scale(s.recoil_side, S.NoRecoil and 0 or 1)
+        scale(s.spread, S.NoSpread and 0 or 1)
+        scale(s.firerate, S.RapidFire and (S.RapidScale or 1.5) or 1)
+        scale(s.ads, S.FastAds and 0.15 or 1)
+        scale(s.reload_speed, S.FastReload and (S.ReloadScale or 1.6) or 1)
+    end
+    if m then
+        scale(m.states.speed_multiplier, S.SpeedHack and (S.SpeedScale or 1.2) or 1)
+    end
+end
+-- Reloads on its own when the magazine is empty (the game's own reload, so it still takes the
+-- normal time and its own checks apply).
+local lastReload = 0
+local function autoReload(item)
+    if not (S.AutoReload and item) then
+        return
+    end
+    if not (item.states.mag and item.states.bullets and type(item.prepare_reload) == "function") then
+        return
+    end
+    if item.states.mag:get() <= 0 and item.states.bullets:get() > 0 and os.clock() - lastReload > 0.6 then
+        lastReload = os.clock()
+        pcall(item.prepare_reload, item)
+    end
+end
+-- Zeroes the gun's spread for the shot being fired right now and puts it back straight after (the
+-- game reads it in the same call, right after get_shoot_look).
+local function noSpreadOnce(item)
+    local st = item.states and item.states.spread
+    if type(st) ~= "table" or type(st.value) ~= "number" or st.value == 0 then
+        return
+    end
+    local prev = st.value
+    st.value = 0
+    task.defer(function()
+        if st.value == 0 then
+            st.value = prev
+        end
+    end)
+end
 
-    function Game.characters()
-        if not Game.live() then
-            return {}
+--// Silent aim \\--
+-- The script works out the target each frame and sends it; the shot is redirected here, in the
+-- game's own call, so the rays and the look that is sent both go at the target.
+local hooked = setmetatable({}, { __mode = "k" })
+local function redirect(cf, item)
+    if S.SilentHitChance and S.SilentHitChance < 100 and math.random() * 100 >= S.SilentHitChance then
+        return cf
+    end
+    local a = Aim
+    if not a or os.clock() - a.at > 0.4 then
+        return cf
+    end
+    local cam = Workspace.CurrentCamera
+    local origin = shotOrigin(cam.CFrame.Position, cf.Position)
+    local dir = a.pos - origin
+    if dir.Magnitude < 0.5 then
+        return cf
+    end
+    if S.SilentLook then
+        local m = me()
+        if m and m.states.look then
+            pcall(m.states.look.set, m.states.look, dir.Unit)
         end
-        local ok, all = pcall(Game.SO.get_all, "Character")
-        return ok and type(all) == "table" and all or {}
     end
-    function Game.me()
-        local char = LocalPlayer.Character
-        return char and Game.characters()[char] or nil
+    if S.SilentNoSpread then
+        noSpreadOnce(item)
     end
-    -- The gun in your hand (any item with the gun states), or nil.
-    function Game.gun()
-        local me = Game.me()
-        local item = me and me.values and me.values.equipped
-        if type(item) == "table" and type(item.states) == "table" and item.states.recoil_up then
-            return item
-        end
-        return nil
+    say("redirect", a.name, a.part)
+    return CFrame.lookAt(cf.Position, cf.Position + dir.Unit)
+end
+local function attach(item)
+    if hooked[item] then
+        return
     end
-    -- Where the next bullet would go, as a CFrame at the muzzle. This is the game's own
-    -- get_shoot_look worked out without calling it (it also resets some game state): the barrel's
-    -- "Shoot" part blended toward the front sight by the item's accuracy value. nil if the gun's
-    -- parts aren't found, in which case callers use the camera instead.
-    function Game.shotLook(item)
-        local ok, cf = pcall(function()
-            local shot = item.shot
-            if typeof(shot) ~= "Instance" then
-                return nil
-            end
-            local base = shot:IsA("Attachment") and shot.WorldCFrame or shot.CFrame
-            local sight = item.reticule
-            if typeof(sight) ~= "Instance" then
-                local root = item.instance and item.instance:FindFirstChild("Root")
-                sight = root and root:FindFirstChild("FrontSight", true)
-            end
-            local acc = item.accuracy and item.accuracy.Value
-            if typeof(sight) == "Instance" and sight:IsA("Attachment") and type(acc) == "number" then
-                return base:Lerp(sight.WorldCFrame, math.clamp(acc, 0, 1))
-            end
-            return base
-        end)
-        if ok and typeof(cf) == "CFrame" then
+    local orig = item.get_shoot_look
+    if type(orig) ~= "function" then
+        return
+    end
+    hooked[item] = true
+    rawset(item, "get_shoot_look", function(self, ...)
+        local cf = orig(self, ...)
+        if not (alive and S.SilentAim) then
             return cf
         end
+        local ok, res = pcall(redirect, cf, self)
+        if ok and typeof(res) == "CFrame" then
+            return res
+        end
+        return cf
+    end)
+end
+
+--// Trigger: one tap of the game's own shoot \\--
+local function fire()
+    local item = gunOf(me())
+    if not (item and type(item.input_shoot) == "function") then
+        return
+    end
+    -- input_shoot also puts the sights up on a press and down on a release when the game's own
+    -- "auto ADS" setting is on, which would drop your aim after every shot. Put them back if they
+    -- were up.
+    local sights = item.states.sights
+    local wasUp = sights ~= nil and sights:get() == true
+    pcall(item.input_shoot, item, true)
+    task.delay(0.04, function()
+        pcall(item.input_shoot, item, false)
+        if wasUp and sights:get() ~= true and type(item.input_ads) == "function" then
+            pcall(item.input_ads, item, true, true)
+        end
+    end)
+end
+
+--// What the script sees of your gun \\--
+local function snapshot(item)
+    local s = item.states
+    local function num(st)
+        return type(st) == "table" and type(st.value) == "number" and st.value or nil
+    end
+    return {
+        name = item.instance and item.instance.Name or "gun",
+        sights = s.sights ~= nil and s.sights:get() == true,
+        shoot = item.shoot_hold == true,
+        shot = shotLook(item),
+        range = gunRange(item),
+        recoil_up = num(s.recoil_up),
+        recoil_side = num(s.recoil_side),
+        spread = num(s.spread),
+        firerate = num(s.firerate),
+    }
+end
+
+local stepError = false
+local function step()
+    local m = me()
+    local item = gunOf(m)
+    mods(item, m)
+    autoReload(item)
+    if item then
+        attach(item)
+    end
+    say("state", item and snapshot(item) or false)
+end
+
+local function shutdown()
+    if not alive then
+        return
+    end
+    alive = false
+    for _, c in conns do
+        pcall(c.Disconnect, c)
+    end
+    pcall(restore)
+    for item in hooked do
+        pcall(rawset, item, "get_shoot_look", nil)
+    end
+    table.clear(hooked)
+    say("stopped")
+end
+-- An older agent in this VM (the script was run again) is stopped first.
+pcall(function()
+    if type(shared.__OperationOneAgent) == "function" then
+        shared.__OperationOneAgent()
+    end
+    shared.__OperationOneAgent = shutdown
+end)
+
+local function onFrame()
+    if not alive or not SO then
+        return
+    end
+    local ok, err = pcall(step)
+    if not ok and not stepError then
+        stepError = true
+        say("log", "step: " .. tostring(err))
+    end
+end
+local okFrame, frameConn = pcall(function()
+    return RunService.RenderStepped:Connect(onFrame)
+end)
+if not okFrame then
+    say("log", "RenderStepped not available here, using Heartbeat")
+    frameConn = RunService.Heartbeat:Connect(onFrame)
+end
+conns[#conns + 1] = frameConn
+conns[#conns + 1] = down.Event:Connect(function(kind, a, b, c)
+    if kind == "cfg" then
+        if type(a) == "table" then
+            S = a
+        end
+    elseif kind == "aim" then
+        if typeof(a) == "Vector3" then
+            Aim = { pos = a, part = b, name = c, at = os.clock() }
+        else
+            Aim = nil
+        end
+    elseif kind == "fire" then
+        pcall(fire)
+    elseif kind == "rescan" then
+        rescan = true
+    elseif kind == "stop" then
+        shutdown()
+    end
+end)
+
+-- Does the live module still describe the game? It goes stale if the game rebuilds its modules, or
+-- if you have a tagged character that it no longer knows.
+local staleSince = nil
+local function stale()
+    local char = LocalPlayer.Character
+    if not (char and CollectionService:HasTag(char, "Character")) or me() then
+        staleSince = nil
+        return false
+    end
+    staleSince = staleSince or os.clock()
+    return os.clock() - staleSince > 5
+end
+
+say("hello")
+task.spawn(function()
+    local delay, tries = 1, 0
+    while alive do
+        if SO == nil then
+            tries += 1
+            local m, why = find()
+            if m then
+                SO = m
+                delay = 1
+                say("found", tries)
+            else
+                say("miss", tries, why)
+                if maxTries and maxTries > 0 and tries >= maxTries then
+                    say("gaveup", tries)
+                    return
+                end
+                local waited = 0
+                while alive and waited < delay and not rescan do
+                    task.wait(0.25)
+                    waited += 0.25
+                end
+                rescan = false
+                delay = math.min(delay * 2, 15)
+            end
+        else
+            task.wait(1)
+            if not live(SO) or stale() then
+                SO = nil
+                pcall(restore)
+                tries, delay = 0, 1
+                say("lost")
+            end
+        end
+    end
+end)
+end, ...)
+if not ok then
+    pcall(function()
+        local up = type(a1) == "string" and get_comm_channel(a1) or a1
+        up:Fire("log", "agent crashed: " .. tostring(err))
+    end)
+end
+]==]
+
+local Game = {
+    found = false, mode = nil, active = nil, searching = false,
+    state = nil, stateAt = 0, heard = 0, detail = nil,
+    onFound = nil, onRedirect = nil,
+}
+do
+    local agents, lines = {}, {}
+    local clock0, lastStart, cfgAt = os.clock(), -10, 0
+    local cfgLast = {}
+    -- The settings the agent needs, sent whenever one changes.
+    local CFG = {
+        "NoRecoil", "NoSpread", "RapidFire", "RapidScale", "FastAds", "FastReload", "ReloadScale", "AutoReload",
+        "SpeedHack", "SpeedScale", "SilentAim", "SilentHitChance", "SilentLook", "SilentNoSpread",
+    }
+
+    local function log(text)
+        table.insert(lines, ("[%5.1fs] %s"):format(os.clock() - clock0, text))
+        if #lines > 80 then
+            table.remove(lines, 1)
+        end
+    end
+    Game.log = log
+    local function send(agent, ...)
+        pcall(agent.down.Fire, agent.down, ...)
+    end
+    local function stopAgent(agent)
+        if agent.dead then
+            return
+        end
+        agent.dead = true
+        send(agent, "stop")
+        for _, c in agent.conns do
+            pcall(c.Disconnect, c)
+        end
+    end
+
+    function Game.pushCfg(force)
+        local agent = Game.active
+        if not agent then
+            return
+        end
+        local changed = force
+        for _, k in CFG do
+            if cfgLast[k] ~= Settings[k] then
+                changed = true
+                break
+            end
+        end
+        if not changed then
+            return
+        end
+        local t = {}
+        for _, k in CFG do
+            t[k] = Settings[k]
+            cfgLast[k] = Settings[k]
+        end
+        send(agent, "cfg", t)
+    end
+
+    -- Everything an agent says arrives here.
+    local function onUp(agent, kind, a, b)
+        if agent.dead then
+            return
+        end
+        if kind == "state" then
+            if agent == Game.active then
+                Game.state, Game.stateAt, Game.heard = a or nil, os.clock(), os.clock()
+            end
+        elseif kind == "redirect" then
+            if agent == Game.active and Game.onRedirect then
+                Game.onRedirect(a, b)
+            end
+        elseif kind == "found" then
+            if Game.active == nil then
+                Game.active, Game.found, Game.mode, Game.searching = agent, true, agent.kind, false
+                Game.heard = os.clock()
+                log(("%s: found the game's live data (scan %s), using it"):format(agent.label, tostring(a)))
+                for _, other in agents do
+                    if other ~= agent then
+                        stopAgent(other)
+                    end
+                end
+                table.clear(cfgLast)
+                Game.pushCfg(true)
+                if Game.onFound then
+                    task.spawn(Game.onFound)
+                end
+            end
+        elseif kind == "miss" then
+            Game.detail = ("%s, scan %s: %s"):format(agent.label, tostring(a), tostring(b))
+            if a == 1 or a % 4 == 0 then
+                log(Game.detail)
+            end
+        elseif kind == "lost" then
+            if agent == Game.active then
+                log(agent.label .. ": the game's data went stale, searching again")
+                Game.found, Game.active, Game.state = false, nil, nil
+                lastStart = -10
+                task.defer(Game.start)
+            end
+        elseif kind == "hello" then
+            agent.hello = true
+            log(agent.label .. ": agent is running")
+        elseif kind == "gaveup" then
+            log(agent.label .. ": gave up after " .. tostring(a) .. " scans")
+        elseif kind == "log" then
+            log(agent.label .. ": " .. tostring(a))
+        end
+    end
+
+    local function launchLocal(maxTries)
+        local agent = { kind = "local", label = "this VM", conns = {} }
+        local fn, compileError = loadstring(AGENT)
+        if type(fn) ~= "function" then
+            log("the agent didn't compile here: " .. tostring(compileError))
+            return
+        end
+        agent.up, agent.down = Instance.new("BindableEvent"), Instance.new("BindableEvent")
+        agent.conns[1] = agent.up.Event:Connect(function(...)
+            onUp(agent, ...)
+        end)
+        table.insert(agents, agent)
+        task.spawn(function()
+            local ran, err = pcall(fn, agent.up, agent.down, maxTries)
+            if not ran then
+                log("the agent crashed in this VM: " .. tostring(err))
+            end
+        end)
+    end
+    local function launchActor(actor)
+        local agent = { kind = "actor", conns = {} }
+        agent.label = "actor " .. (actor.Parent and actor.Parent.Name .. "/" or "") .. actor.Name
+        local okA, upId, upEv = pcall(create_comm_channel)
+        local okB, downId, downEv = pcall(create_comm_channel)
+        if not (okA and okB and upEv and downEv) then
+            log(agent.label .. ": couldn't create a comm channel (" .. tostring(upId) .. ")")
+            return
+        end
+        agent.up, agent.down = upEv, downEv
+        local okC, connOrErr = pcall(function()
+            return upEv.Event:Connect(function(...)
+                onUp(agent, ...)
+            end)
+        end)
+        if not okC then
+            log(agent.label .. ": couldn't listen on the channel (" .. tostring(connOrErr) .. ")")
+            return
+        end
+        agent.conns[1] = connOrErr
+        agent.launchedAt = os.clock()
+        table.insert(agents, agent)
+        local ran, err = pcall(run_on_actor, actor, AGENT, upId, downId, 0)
+        if not ran then
+            log(agent.label .. ": run_on_actor failed (" .. tostring(err) .. ")")
+            stopAgent(agent)
+        end
+    end
+
+    -- Starts (or restarts) the search: an agent in every Actor, plus one in this VM.
+    function Game.start(onFound)
+        if onFound then
+            Game.onFound = onFound
+        end
+        if os.clock() - lastStart < 2 then
+            return
+        end
+        lastStart = os.clock()
+        for _, a in agents do
+            stopAgent(a)
+        end
+        table.clear(agents)
+        Game.found, Game.active, Game.state, Game.mode, Game.detail = false, nil, nil, nil, nil
+        Game.searching = true
+        local canActor = type(getactors) == "function" and type(run_on_actor) == "function"
+            and type(create_comm_channel) == "function"
+        local actors = {}
+        if canActor then
+            local ok, list = pcall(getactors)
+            if ok and type(list) == "table" then
+                actors = list
+            else
+                log("getactors failed: " .. tostring(list))
+            end
+        end
+        log(("searching: %d actor(s); running code in actors is %s"):format(
+            #actors, canActor and "supported" or "NOT supported by this executor"))
+        -- This VM first (a couple of scans when there are Actors to try, otherwise for as long as
+        -- it takes), then every Actor.
+        launchLocal(#actors > 0 and 2 or 0)
+        for _, actor in actors do
+            launchActor(actor)
+        end
+    end
+
+    -- Every frame: settings to the agent, and a search restart if the agent has gone quiet.
+    function Game.pump()
+        local now = os.clock()
+        if Game.found and now - Game.heard > 4 then
+            log("lost contact with the agent, searching again")
+            Game.found, Game.active, Game.state = false, nil, nil
+            lastStart = -10
+            Game.start()
+            return
+        end
+        if Game.active and now - cfgAt > 0.2 then
+            cfgAt = now
+            Game.pushCfg(false)
+        end
+        -- An Actor agent that never says hello: the code didn't run there, or can't reach us.
+        for _, a in agents do
+            if a.launchedAt and not a.hello and not a.warned and not a.dead and now - a.launchedAt > 6 then
+                a.warned = true
+                log(a.label .. ": no sign of the agent after 6s (run_on_actor ran nothing there, or its channel isn't reaching this script)")
+            end
+        end
+    end
+
+    function Game.live()
+        return Game.found and os.clock() - Game.heard < 3
+    end
+    -- The gun in your hand as the agent last saw it (a plain table: name, sights, shoot, shot, range,
+    -- recoil_up, recoil_side, spread, firerate), or nil.
+    function Game.gun()
+        local st = Game.state
+        if st and os.clock() - Game.stateAt < 0.5 then
+            return st
+        end
         return nil
     end
-    -- The gun's range stat (an abstract 0-100 score in the game's own stat bar), or nil.
-    function Game.gunRange(item)
-        local st = type(item.states) == "table" and item.states.range
-        local v = type(st) == "table" and st.value
-        if type(v) ~= "number" then
-            v = type(item.stats) == "table" and item.stats.range
-        end
-        return type(v) == "number" and v > 0 and v or nil
+    -- Where your gun's next bullet would go (a CFrame at the muzzle), or nil.
+    function Game.shotLook(item)
+        return item and item.shot or nil
     end
+    function Game.gunRange(item)
+        return item and item.range or nil
+    end
+    function Game.fire()
+        if Game.active then
+            send(Game.active, "fire")
+        end
+    end
+    function Game.aim(pos, part, name)
+        if Game.active then
+            send(Game.active, "aim", pos or false, part or "", name or "")
+        end
+    end
+    function Game.stop()
+        for _, a in agents do
+            stopAgent(a)
+        end
+        table.clear(agents)
+        Game.found, Game.active, Game.state = false, nil, nil
+    end
+
+    -- One line for the status labels.
+    function Game.statusText()
+        if Game.live() then
+            return Game.mode == "actor" and "Gun data: found (inside the game's Actor)" or "Gun data: found"
+        end
+        if Game.found then
+            return "Gun data: lost, searching again..."
+        end
+        if #agents == 0 then
+            return "Gun data: not found. Tap Search again; Copy report shows why"
+        end
+        return "Gun data: searching... " .. (Game.detail and ("(" .. Game.detail .. ")") or "")
+    end
+    -- Everything useful for working out why the search failed, for the clipboard.
+    function Game.report()
+        local function has(f)
+            return type(f) == "function" and "yes" or "NO"
+        end
+        local out = {
+            "Operation One gun-data report",
+            ("executor functions: getgc %s, filtergc %s, getactors %s, run_on_actor %s, create_comm_channel %s, loadstring %s"):format(
+                has(getgc), has(filtergc), has(getactors), has(run_on_actor), has(create_comm_channel), has(loadstring)),
+            ("state: found=%s mode=%s live=%s agents=%d"):format(
+                tostring(Game.found), tostring(Game.mode), tostring(Game.live()), #agents),
+        }
+        for _, l in lines do
+            table.insert(out, l)
+        end
+        return table.concat(out, "\n")
+    end
+
     function Game.teamColor(name)
         local t = name and game:GetService("Teams"):FindFirstChild(name)
         local c = t and t:GetAttribute("Color")
@@ -274,6 +885,7 @@ do
         end
         return nil
     end
+    table.insert(Cleanups, Game.stop)
 end
 
 --// Who is a target \\--
@@ -656,164 +1268,43 @@ do
     end
 end
 
---// Gun values (local only) \\--
-local Gun = {}
-local Scaled = setmetatable({}, { __mode = "k" })
-do
-    -- Multiplies a State's .value by `mult`, remembering what the game itself set so that a
-    -- change the game makes (equip, attachment, effect) becomes the new base.
-    local function scale(state, mult)
-        if type(state) ~= "table" or type(state.value) ~= "number" then
-            return
-        end
-        local rec = Scaled[state]
-        if not rec then
-            if mult == 1 then
-                return
-            end
-            rec = { base = state.value, last = state.value }
-            Scaled[state] = rec
-        end
-        if math.abs(state.value - rec.last) > 1e-4 then
-            rec.base = state.value
-        end
-        rec.last = rec.base * mult
-        state.value = rec.last
-    end
-    Gun.scale = scale
-
-    function Gun.step()
-        local item = Game.gun()
-        if item then
-            local s = item.states
-            scale(s.recoil_up, Settings.NoRecoil and 0 or 1)
-            scale(s.recoil_side, Settings.NoRecoil and 0 or 1)
-            scale(s.spread, Settings.NoSpread and 0 or 1)
-            scale(s.firerate, Settings.RapidFire and Settings.RapidScale or 1)
-            scale(s.ads, Settings.FastAds and 0.15 or 1)
-            scale(s.reload_speed, Settings.FastReload and Settings.ReloadScale or 1)
-        end
-        local me = Game.me()
-        if me then
-            scale(me.states.speed_multiplier, Settings.SpeedHack and Settings.SpeedScale or 1)
-        end
-    end
-    function Gun.restore()
-        for state, rec in Scaled do
-            if type(state.value) == "number" and math.abs(state.value - rec.last) < 1e-4 then
-                state.value = rec.base
-            end
-        end
-    end
-    table.insert(Cleanups, Gun.restore)
-
-    -- Zeroes the gun's spread for the shot being fired right now and puts it back straight after
-    -- (the game reads it in the same call, right after get_shoot_look). A redirected shot would
-    -- otherwise still scatter around the target, so hip-fired shots missed.
-    function Gun.noSpreadOnce(item)
-        local st = item.states and item.states.spread
-        if type(st) ~= "table" or type(st.value) ~= "number" or st.value == 0 then
-            return
-        end
-        local prev = st.value
-        st.value = 0
-        task.defer(function()
-            if st.value == 0 then
-                st.value = prev
-            end
-        end)
-    end
-
-    -- Reloads on its own when the magazine is empty (the game's own reload, so it still takes
-    -- the normal time and its own checks apply).
-    local lastReload = 0
-    function Gun.autoReload()
-        if not Settings.AutoReload then
-            return
-        end
-        local item = Game.gun()
-        if not (item and item.states.mag and item.states.bullets and type(item.prepare_reload) == "function") then
-            return
-        end
-        if item.states.mag:get() <= 0 and item.states.bullets:get() > 0 and os.clock() - lastReload > 0.6 then
-            lastReload = os.clock()
-            pcall(item.prepare_reload, item)
-        end
-    end
-end
-
 --// Silent aim \\--
-local Silent = { last = nil, hooked = setmetatable({}, { __mode = "k" }) }
+-- The gun mods (recoil, spread, fire rate, aim and reload speed, speed boost, auto reload) and the
+-- shot hook itself run in the agent, next to the game's own code; Game.pump sends it the settings.
+-- What stays here is choosing who a shot goes at: every frame the best target a bullet from your
+-- muzzle can reach is worked out and sent to the agent, which redirects the shot when the game
+-- asks where it goes (the rays and the look that is sent both follow).
+local Silent = { last = nil, sent = false }
 do
     local OPTS = {}
-    -- What the shot's look becomes: from the muzzle straight at the target part.
-    function Silent.redirect(cf, item)
-        if Settings.SilentHitChance < 100 and math.random() * 100 >= Settings.SilentHitChance then
-            return cf
+    Game.onRedirect = function(name, part)
+        Silent.last = { name = name, part = (part ~= "" and part) or nil, at = os.clock() }
+    end
+
+    function Silent.step()
+        local gun = Game.gun()
+        if not (Settings.SilentAim and gun) then
+            if Silent.sent then
+                Silent.sent = false
+                Game.aim(nil)
+            end
+            return
         end
-        -- The bullet really leaves from the muzzle (kept within 3 studs of the camera), so the
-        -- wall check and the direction both start there.
-        local origin = Targets.shotOrigin(camera().CFrame.Position, cf.Position)
+        local cam = camera()
+        local muzzle = Game.shotLook(gun)
+        local origin = Targets.shotOrigin(cam.CFrame.Position, muzzle and muzzle.Position or cam.CFrame.Position)
         OPTS.fov, OPTS.maxDist = Settings.SilentFOV, Targets.limit(Settings.SilentMaxDistance)
         OPTS.visible, OPTS.part, OPTS.teammates = Settings.SilentVisible, Settings.SilentPart, false
         OPTS.multi, OPTS.fallback, OPTS.from = Settings.PartlyVisible, Settings.AnyBodyPart, origin
         local pick = Targets.pick(OPTS)
-        if not pick then
-            return cf
-        end
-        local dir = pick.pos - origin
-        if dir.Magnitude < 0.5 then
-            return cf
-        end
-        Silent.last = { name = pick.t.model.Name, part = pick.part, at = os.clock() }
-        if Settings.SilentLook then
-            local me = Game.me()
-            if me and me.states.look then
-                pcall(me.states.look.set, me.states.look, dir.Unit)
-            end
-        end
-        if Settings.SilentNoSpread and item then
-            Gun.noSpreadOnce(item)
-        end
-        return CFrame.lookAt(cf.Position, cf.Position + dir.Unit)
-    end
-
-    -- Wraps get_shoot_look on the item in your hand. Everything else about the shot stays the
-    -- game's own: the rays, the spread, the hit list, what gets sent.
-    function Silent.attach(item)
-        if Silent.hooked[item] then
-            return
-        end
-        local orig = item.get_shoot_look
-        if type(orig) ~= "function" then
-            return
-        end
-        Silent.hooked[item] = true
-        rawset(item, "get_shoot_look", function(self, ...)
-            local cf = orig(self, ...)
-            if not (alive() and Settings.SilentAim) then
-                return cf
-            end
-            local ok, res = pcall(Silent.redirect, cf, self)
-            if ok and typeof(res) == "CFrame" then
-                return res
-            end
-            return cf
-        end)
-    end
-    function Silent.detach()
-        for item in Silent.hooked do
-            pcall(rawset, item, "get_shoot_look", nil)
-        end
-        table.clear(Silent.hooked)
-    end
-    function Silent.step()
-        local item = Game.gun()
-        if item then
-            Silent.attach(item)
+        if pick then
+            Silent.sent = true
+            Game.aim(pick.pos, pick.part, pick.t.model.Name)
+        elseif Silent.sent then
+            Silent.sent = false
+            Game.aim(nil)
         end
     end
-    table.insert(Cleanups, Silent.detach)
 end
 
 --// Aimbot + triggerbot \\--
@@ -834,9 +1325,9 @@ do
         end
         if item then
             if when == "Aiming down sights" then
-                return item.states.sights ~= nil and item.states.sights:get() == true
+                return item.sights == true
             end
-            return item.shoot_hold == true
+            return item.shoot == true
         end
         if UserInputService.TouchEnabled and not UserInputService.MouseEnabled then
             return true
@@ -859,8 +1350,9 @@ do
             local shot = Game.shotLook(item)
             if shot and shot.LookVector:Dot(look) > 0.5 then
                 origin, look = Targets.shotOrigin(cf.Position, shot.Position), shot.LookVector
-                -- The gun follows the camera a moment late, so don't correct all of it at once.
-                alpha = math.min(alpha, 0.5)
+                -- The gun follows the camera a moment late (and its position reaches here a frame
+                -- late), so don't correct all of it at once.
+                alpha = math.min(alpha, 0.4)
             end
         end
         local dir = to - origin
@@ -911,23 +1403,13 @@ do
         turn(camera(), a.pos, alpha, item)
     end
 
-    -- Trigger: when a bullet from your gun would hit an enemy body, fires the game's own
-    -- input_shoot (or, without the gun found, a mouse click).
+    -- Trigger: when a bullet from your gun would hit an enemy body, taps the game's own
+    -- input_shoot (done by the agent, which also keeps your sights up afterwards) or, without the
+    -- gun found, a mouse click.
     local lastShot, armedAt = 0, nil
     local function fire(item)
-        if item and type(item.input_shoot) == "function" then
-            -- input_shoot also puts the sights up on a press and down on a release when the game's
-            -- own "auto ADS" setting is on, which would drop your aim after every shot. Put them back
-            -- if they were up.
-            local sights = item.states and item.states.sights
-            local wasUp = sights ~= nil and sights:get() == true
-            pcall(item.input_shoot, item, true)
-            task.delay(0.04, function()
-                pcall(item.input_shoot, item, false)
-                if wasUp and sights:get() ~= true and type(item.input_ads) == "function" then
-                    pcall(item.input_ads, item, true, true)
-                end
-            end)
+        if item and Game.active then
+            Game.fire()
         elseif typeof(mouse1click) == "function" then
             mouse1click()
         end
@@ -941,7 +1423,7 @@ do
         if Settings.TriggerOnlyAiming then
             local aiming
             if item then
-                aiming = item.states.sights ~= nil and item.states.sights:get() == true
+                aiming = item.sights == true
             else
                 aiming = UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton2)
             end
@@ -1475,9 +1957,8 @@ bind(RunService.RenderStepped, function()
     end)
     guard("esp", Esp.step)
     guard("triggerbot", Aim.trigger)
+    guard("gun data", Game.pump)
     guard("silent aim", Silent.step)
-    guard("gun", Gun.step)
-    guard("auto reload", Gun.autoReload)
     guard("fov", World.fov)
     guard("no flash", World.noFlash)
 end)
@@ -1571,7 +2052,7 @@ do
             return "Last redirect: " .. l.name .. (l.part and (" (" .. l.part .. ")") or "")
         end
         if not Game.live() then
-            return Game.searching and "Looking for the game's gun data..." or "Gun data not found: silent aim is off"
+            return Game.statusText() .. "\nSilent aim is off until it is found"
         end
         return Game.gun() and "Waiting for a shot" or "No gun in hand"
     end)
@@ -1597,16 +2078,15 @@ do
     toggle(G, "AutoReload", "Auto reload", "Reloads when the magazine is empty")
     status(G, function()
         if not Game.live() then
-            return Game.searching and "Looking for the game's gun data..." or "Gun data not found: gun mods are off"
+            return Game.statusText() .. "\nGun mods are off until it is found"
         end
         local item = Game.gun()
         if not item then
             return "No gun in hand"
         end
-        local s = item.states
         return ("%s\nrecoil %.1f/%.1f  spread %.2f  rate %d"):format(
-            item.instance and item.instance.Name or "gun", s.recoil_up.value or 0, s.recoil_side.value or 0,
-            s.spread.value or 0, math.floor(s.firerate.value or 0))
+            item.name or "gun", item.recoil_up or 0, item.recoil_side or 0, item.spread or 0,
+            math.floor(item.firerate or 0))
     end)
     local P = Tab:AddRightGroupbox("Player", "user")
     toggle(P, "SpeedHack", "Speed boost", "Multiplies your speed_multiplier. Risky: the server may pull you back")
@@ -1655,16 +2135,24 @@ do
     local M = Tab:AddRightGroupbox("Script", "settings")
     toggle(M, "AntiAfk", "Anti-AFK")
     status(M, function()
-        if Game.live() then
-            return "Gun data: found"
-        end
-        return Game.searching and "Gun data: searching..." or "Gun data: not found"
+        return Game.statusText()
     end)
     M:AddButton({ Text = "Search for gun data again", Func = function()
         Game.start(function()
             notify("Found the game's gun data", 3)
-        end, 3)
+        end)
+        notify("Searching for the game's gun data...", 2)
     end, Tooltip = "Needed only for silent aim and the gun options; ESP and aimbot don't use it" })
+    M:AddButton({ Text = "Copy gun data report", Func = function()
+        local text = Game.report()
+        if typeof(setclipboard) == "function" then
+            pcall(setclipboard, text)
+            notify("Copied the gun data report", 3)
+        else
+            print(text)
+            notify("No clipboard here: the report is in the console", 4)
+        end
+    end, Tooltip = "Copies what the search tried and found, to work out why gun data isn't found" })
     M:AddButton({ Text = "Unload", Func = function()
         if Genv.__OperationOneUnload then
             Genv.__OperationOneUnload()
