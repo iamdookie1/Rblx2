@@ -36,6 +36,8 @@ local Games = {
     [89727004942007] = { Name = 'Throw Food For Baddies', Script = 'Games/ThrowFoodForBaddies.lua' },
     -- RIVALS (game 6035872082), from its dump's own place id.
     [17625359962] = { Name = 'RIVALS', Script = 'Games/Rivals.lua' },
+    -- Operation One (game 8307114974), from its dump's own place id.
+    [72920620366355] = { Name = 'Operation One', Script = 'Games/OperationOne.lua' },
     -- Fight in a Streamer University (game 7761516673): the fight servers from
     -- the game's own RankedConfig, plus the Beginner server its dump came from.
     -- The trade and AFK places have no fighting, so they're left out.
@@ -162,6 +164,7 @@ local GameIds = {
     -- see (another server type, private servers) still detects them.
     [10773149360] = { Name = 'Half Punch', Script = 'Games/HalfPunch.lua' },
     [10769835283] = { Name = 'Depth Incremental', Script = 'Games/DepthIncremental.lua' },
+    [8307114974] = { Name = 'Operation One', Script = 'Games/OperationOne.lua' },
     [7872343282] = { Name = 'OVERKILL', Script = 'Games/Overkill.lua', AutoLoad = true },
     [9845585365] = { Name = 'Dodge or Die', Script = 'Games/DodgeOrDie.lua', AutoLoad = true },
     [10756011174] = { Name = 'Needle in a Haystack', Script = 'Games/NeedleHaystack.lua', AutoLoad = true },
@@ -205,6 +208,21 @@ local Fingerprints = {
             local ReplicatedStorage = game:GetService('ReplicatedStorage')
             return ReplicatedStorage:FindFirstChild('PitRemotes') ~= nil
                 and ReplicatedStorage:FindFirstChild('PitConfig') ~= nil
+        end,
+    },
+    -- Operation One in any place or server: its Modules folder with the StateObject and Items
+    -- modules, plus the single Net RemoteEvent in ReplicatedStorage.
+    {
+        Name = 'Operation One',
+        Script = 'Games/OperationOne.lua',
+        Match = function()
+            local ReplicatedStorage = game:GetService('ReplicatedStorage')
+            local modules = ReplicatedStorage:FindFirstChild('Modules')
+            return modules ~= nil
+                and modules:FindFirstChild('StateObject') ~= nil
+                and modules:FindFirstChild('Items') ~= nil
+                and modules:FindFirstChild('Loadout') ~= nil
+                and ReplicatedStorage:FindFirstChild('UnreliableRemoteEvent') ~= nil
         end,
     },
     -- Dodge or Die in any mode or server we don't know the id of: its own
