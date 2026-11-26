@@ -156,7 +156,7 @@ local Settings = {
     NavCell = 3, NavRadius = 140, NavMaxNodes = 4000, NavGreed = 1.4, NavDetour = 2, NavBudget = 3, NavReplan = 1.5, NavDeviate = 6, NavSmooth = true,
     NavDraw = true, NavLabels = true, NavHud = true, NavThickness = 2, NavHeight = 0.5,
     -- misc
-    AntiAfk = true,
+    AntiAfk = true, GunData = true,
 }
 
 --// Plumbing \\--
@@ -505,6 +505,10 @@ local function redirect(cf, item)
     say("redirect", a.name, a.part)
     return CFrame.lookAt(cf.Position, cf.Position + dir.Unit)
 end
+-- Only here while silent aim is on: the game guards get_shoot_look (it calls shared.extras.ResetEnv()
+-- inside it), so it is left alone otherwise. If the game's own function objects to being called through
+-- the hook, the same maths is used instead, so a shot is never lost; the problem is reported.
+local hookError = nil
 local function attach(item)
     if hooked[item] then
         return
@@ -515,17 +519,47 @@ local function attach(item)
     end
     hooked[item] = true
     rawset(item, "get_shoot_look", function(self, ...)
-        local cf = orig(self, ...)
-        say("shot")
+        local ok, cf = pcall(orig, self, ...)
+        if not ok then
+            local err = cf
+            if not hookError then
+                hookError = tostring(err)
+                say("log", "get_shoot_look failed under the shot hook: " .. hookError)
+                beacon("get_shoot_look failed under the shot hook: " .. hookError)
+            end
+            cf = shotLook(self)
+            if typeof(cf) ~= "CFrame" then
+                error(err, 0)
+            end
+        end
         if not (alive and S.SilentAim) then
             return cf
         end
-        local ok, res = pcall(redirect, cf, self)
-        if ok and typeof(res) == "CFrame" then
+        local ok2, res = pcall(redirect, cf, self)
+        if ok2 and typeof(res) == "CFrame" then
             return res
         end
         return cf
     end)
+end
+local function detach()
+    for item in hooked do
+        pcall(rawset, item, "get_shoot_look", nil)
+    end
+    table.clear(hooked)
+end
+-- Shots are told from the gun's own last_shot time, which the game sets on every shot: no hook needed.
+local lastSeen = setmetatable({}, { __mode = "k" })
+local function watchShots(item)
+    local t = item.last_shot
+    if type(t) ~= "number" then
+        return
+    end
+    local prev = lastSeen[item]
+    lastSeen[item] = t
+    if prev ~= nil and t ~= prev then
+        say("shot")
+    end
 end
 
 --// Trigger: one tap of the game's own shoot \\--
@@ -564,6 +598,8 @@ local function snapshot(item)
         recoil_side = num(s.recoil_side),
         spread = num(s.spread),
         firerate = num(s.firerate),
+        hooked = hooked[item] == true,
+        hookError = hookError,
     }
 end
 
@@ -574,7 +610,13 @@ local function step()
     mods(item, m)
     autoReload(item)
     if item then
-        attach(item)
+        if S.SilentAim then
+            attach(item)
+        end
+        watchShots(item)
+    end
+    if not S.SilentAim and next(hooked) ~= nil then
+        detach()
     end
     say("state", item and snapshot(item) or false)
 end
@@ -588,10 +630,7 @@ local function shutdown()
         pcall(c.Disconnect, c)
     end
     pcall(restore)
-    for item in hooked do
-        pcall(rawset, item, "get_shoot_look", nil)
-    end
-    table.clear(hooked)
+    detach()
     say("stopped")
 end
 -- An older agent in this VM (the script was run again) is stopped first.
@@ -967,6 +1006,9 @@ do
         if onFound then
             Game.onFound = onFound
         end
+        if not Settings.GunData then
+            return
+        end
         if os.clock() - lastStart < 2 then
             return
         end
@@ -1000,6 +1042,17 @@ do
     -- Every frame: settings to the agent, and a search restart if the agent has gone quiet.
     function Game.pump()
         local now = os.clock()
+        if not Settings.GunData then
+            -- switched off: nothing of ours is running inside the game
+            if #agents > 0 or Game.found then
+                Game.stop()
+            end
+            return
+        elseif #agents == 0 and not Game.found then
+            lastStart = -10
+            Game.start()
+            return
+        end
         if Game.found and now - Game.heard > 4 then
             log("lost contact with the agent, searching again")
             Game.found, Game.active, Game.state = false, nil, nil
@@ -1085,6 +1138,9 @@ do
 
     -- One line for the status labels.
     function Game.statusText()
+        if not Settings.GunData then
+            return "Gun data: switched off (nothing of this script runs inside the game)"
+        end
         if Game.live() then
             return Game.mode == "actor" and "Gun data: found (inside the game's Actor)" or "Gun data: found"
         end
@@ -4144,7 +4200,14 @@ do
         if not Game.live() then
             return Game.statusText() .. "\nSilent aim is off until it is found"
         end
-        return Game.gun() and "Waiting for a shot" or "No gun in hand"
+        local gun = Game.gun()
+        if gun and gun.hookError then
+            return "Shot hook problem (shots still fire): " .. tostring(gun.hookError):sub(1, 90)
+        end
+        if gun and Settings.SilentAim and not gun.hooked then
+            return "Hooking the shot..."
+        end
+        return gun and "Waiting for a shot" or "No gun in hand"
     end)
 
     local T = Tab:AddRightGroupbox("Triggerbot", "mouse-pointer-click")
@@ -4367,6 +4430,7 @@ do
     slider(W, "FovValue", "FOV", 60, 120, 0, "")
     local M = Tab:AddRightGroupbox("Script", "settings")
     toggle(M, "AntiAfk", "Anti-AFK")
+    toggle(M, "GunData", "Use the gun data", "Needed for the gun mods, silent aim and the trigger's precise shot. Turn it off to stop everything this script runs inside the game: if your guns misbehave, try that first")
     status(M, function()
         return Game.statusText()
     end)
