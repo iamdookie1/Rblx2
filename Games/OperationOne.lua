@@ -1508,6 +1508,105 @@ do
     end
 end
 
+--// Pressing the game's fire button \\--
+-- The triggerbot's way to shoot when the gun data isn't found (and the only one that makes sense on
+-- a phone: mouse1click does nothing there). The game's on-screen fire buttons (ShootLeftButton and
+-- the ShootJoystickFrame) listen on InputBegan for a Touch or MouseButton1 and call the gun's own
+-- input_shoot, so a virtual click on one fires like a thumb would: the left button shoots on press,
+-- the joystick shoots on press for automatic guns and on release for the rest, which a press and
+-- release at the same spot covers.
+local Press = { busy = false, method = nil }
+do
+    local NAMES = { "ShootLeftButton", "ShootJoystickFrame" }
+    local TAP = 0.06
+    local vim, gui, held
+    local function service(name)
+        local ok, svc = pcall(function()
+            return game:GetService(name)
+        end)
+        return ok and svc or nil
+    end
+    -- On screen, enabled and big enough to hit, all the way up.
+    local function shown(g)
+        local o = g
+        while o and o:IsA("GuiObject") do
+            if not o.Visible then
+                return false
+            end
+            o = o.Parent
+        end
+        local sg = g:FindFirstAncestorWhichIsA("ScreenGui")
+        return sg ~= nil and sg.Enabled and g.AbsoluteSize.X > 4 and g.AbsoluteSize.Y > 4
+    end
+    -- The first fire button that is showing right now, or nil.
+    function Press.find()
+        local pg = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+        if not pg then
+            return nil
+        end
+        for _, name in NAMES do
+            local b = pg:FindFirstChild(name, true)
+            if b and b:IsA("GuiObject") and shown(b) then
+                return b
+            end
+        end
+        return nil
+    end
+    local function send(down, x, y, how)
+        if how == "touch" then
+            vim:SendTouchEvent(1, down and 0 or 2, x, y)
+        else
+            vim:SendMouseButtonEvent(x, y, 0, down, game, 1)
+        end
+    end
+    -- Presses and releases the fire button. False if there is nothing to press with or on.
+    function Press.tap()
+        if Press.busy then
+            return true
+        end
+        vim = vim or service("VirtualInputManager")
+        if not vim then
+            return false
+        end
+        local b = Press.find()
+        if not b then
+            return false
+        end
+        -- Virtual input is in screen pixels, which include the top bar unless the gui ignores it.
+        local inset = Vector2.new(0, 0)
+        local sg = b:FindFirstAncestorWhichIsA("ScreenGui")
+        gui = gui or service("GuiService")
+        if gui and not (sg and sg.IgnoreGuiInset) then
+            local ok, v = pcall(gui.GetGuiInset, gui)
+            if ok and typeof(v) == "Vector2" then
+                inset = v
+            end
+        end
+        local c = b.AbsolutePosition + b.AbsoluteSize / 2 + inset
+        local how = "mouse"
+        if not pcall(send, true, c.X, c.Y, how) then
+            how = "touch"
+            if not pcall(send, true, c.X, c.Y, how) then
+                return false
+            end
+        end
+        Press.busy, Press.method = true, ("%s (%s)"):format(b.Name, how)
+        held = { x = c.X, y = c.Y, how = how }
+        task.delay(TAP, function()
+            pcall(send, false, c.X, c.Y, how)
+            Press.busy, held = false, nil
+        end)
+        return true
+    end
+    -- Unloading in the middle of a press lets go of the button.
+    table.insert(Cleanups, function()
+        if held and vim then
+            pcall(send, false, held.x, held.y, held.how)
+            Press.busy, held = false, nil
+        end
+    end)
+end
+
 --// Aimbot + triggerbot \\--
 local Aim = { target = nil }
 local FovCircle, SilentCircle
@@ -1604,15 +1703,24 @@ do
         turn(camera(), a.pos, alpha, item)
     end
 
-    -- Trigger: when a bullet from your gun would hit an enemy body, taps the game's own
-    -- input_shoot (done by the agent, which also keeps your sights up afterwards) or, without the
-    -- gun found, a mouse click.
+    -- Trigger: when a bullet from your gun would hit an enemy body, fires. First choice is the gun
+    -- data: the game's own input_shoot, tapped by the agent (which also keeps your sights up
+    -- afterwards). Without it, a tap on the game's on-screen fire button, which is what works on a
+    -- phone, and last a mouse click.
     local lastShot, armedAt = 0, nil
+    Aim.fireMethod = nil
     local function fire(item)
-        if item and Game.active then
+        if item and Game.live() then
+            Aim.fireMethod = "the gun's own shoot (gun data)"
             Game.fire()
-        elseif typeof(mouse1click) == "function" then
+        elseif Press.tap() then
+            -- No gun data, or it sees no gun: the on-screen button only shows when one is equipped.
+            Aim.fireMethod = "tap on the " .. tostring(Press.method)
+        elseif not IsTouch and typeof(mouse1click) == "function" then
+            Aim.fireMethod = "mouse click"
             mouse1click()
+        else
+            Aim.fireMethod = "no way to fire found"
         end
     end
     function Aim.trigger()
@@ -1625,6 +1733,8 @@ do
             local aiming
             if item then
                 aiming = item.sights == true
+            elseif IsTouch then
+                aiming = true -- can't tell without the gun data, and there is no right mouse button
             else
                 aiming = UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton2)
             end
@@ -1649,7 +1759,7 @@ do
         end
         local now = os.clock()
         armedAt = armedAt or now
-        if now - armedAt >= Settings.TriggerDelay / 1000 and now - lastShot >= 0.08 then
+        if now - armedAt >= Settings.TriggerDelay / 1000 and now - lastShot >= (Game.live() and 0.08 or 0.14) then
             lastShot = now
             fire(item)
         end
@@ -2263,7 +2373,17 @@ do
     slider(T, "TriggerDelay", "Delay", 0, 300, 0, " ms")
     slider(T, "TriggerMaxDistance", "Max distance", 50, 1000, 0, " studs")
     toggle(T, "TriggerHeadOnly", "Head only")
-    toggle(T, "TriggerOnlyAiming", "Only while aiming", "Needs the sights up")
+    toggle(T, "TriggerOnlyAiming", "Only while aiming", "Needs the sights up. Without the gun data on a phone it can't tell, so it doesn't hold anything back")
+    status(T, function()
+        local method
+        if Game.live() and Game.gun() then
+            method = "the gun's own shoot"
+        else
+            local b = Press.find()
+            method = b and ("a tap on " .. b.Name) or (IsTouch and "no fire button on screen" or "mouse click")
+        end
+        return "Fires with: " .. method .. (Aim.fireMethod and ("\nLast shot: " .. Aim.fireMethod) or "")
+    end)
 end
 
 do
