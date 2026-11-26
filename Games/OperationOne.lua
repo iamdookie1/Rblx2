@@ -52,6 +52,17 @@
 --              BarbedWire, StickyCamera, BulletproofCamera, Drone, DeployableShield, the grenades
 --              (Frag, Smoke, Stun, EMP, Impact, Incendiary, Launched) and Bomb (Root part).
 --   Smoke      Smoke grenades clone their script.SmokePart into Workspace.
+--   Bomb       The defuser is tagged Defuser (Root part). A player carrying it has the attribute
+--              HasDefuser on their Player; once planted, the instance has Planted = true and the game
+--              counts down 40 seconds on the client (paused while Workspace has frozen_time).
+--   Players    Each player's Character config also replicates walk_state ("stand", "crouch", "prone"),
+--              running, walking, look (where they face), vault, climbing and spotted: what the route
+--              planner reads to guess who can see or hear you.
+--   Movement   Speed is the base (about 7.9) x 1.5 running, x 0.9 walking, x 0.5 crouched, x 0.3 prone,
+--              halved again when walking quietly. Vaulting uses the game's own checks (RespectCanCollide
+--              raycasts in the "weak" collision group), which the planner copies.
+--   Hits       The game raises its own hit marker from your local rays; the extra hit feedback here
+--              watches enemies' health instead and credits drops that follow one of your shots.
 --
 -- No remote is fired. The ESP and circles are Drawing objects, the aimbot only turns your camera,
 -- the gun changes are local values the game's own client reads. Silent aim changes the look and
@@ -122,6 +133,28 @@ local Settings = {
     UtilTraps = false, UtilCameras = false, UtilGrenades = false, BombEsp = false, UtilMax = 250,
     -- world
     Fullbright = false, NoFlash = false, NoSmoke = false, FovChanger = false, FovValue = 80,
+    -- esp extras
+    EspReachable = true, ReachVisible = Color3.fromRGB(80, 255, 110), ReachWall = Color3.fromRGB(255, 210, 60),
+    ReachHidden = Color3.fromRGB(255, 70, 70),
+    EspArrows = true, ArrowAlways = false, ArrowRadius = 0.42, ArrowSize = 16, ArrowMax = 600, ArrowDistance = true,
+    WallEsp = false, WallSoft = true, WallBreakable = true, WallHard = false, WallMax = 60, WallCount = 40,
+    WallAlpha = 0.7, WallSoftColor = Color3.fromRGB(90, 255, 140), WallBreakColor = Color3.fromRGB(255, 160, 50),
+    WallHardColor = Color3.fromRGB(255, 80, 80),
+    BombTimer = true, BombCarrier = true,
+    HitMarkers = true, HitNumbers = true, HitSounds = true, HitSize = 9, HitTime = 0.3, HitVolume = 0.6,
+    KillSound = true, HitSoundId = "", KillSoundId = "",
+    -- route planner (Help tab)
+    Nav = false, NavGoal = "Defuser", NavStyle = "Balanced", NavTarget = "", NavMoveStyle = "Run", NavAlt = false,
+    NavBaseSpeed = 7.9, NavVault = true, NavJump = true, NavDrop = true, NavCrouch = true, NavProne = false,
+    NavBreach = false, NavVaultMax = 4, NavVaultMin = 1.3, NavVaultDepth = 3.5, NavStep = 1.4, NavJumpMax = 3.2,
+    NavDropMax = 10, NavBodyW = 1.9, NavStandH = 5.2, NavCrouchH = 3.3, NavProneH = 1.6, NavVaultTime = 0.9,
+    NavJumpTime = 0.5, NavBreachTime = 3,
+    NavSight = 120, NavFov = 110, NavBehind = 0.25, NavUseLook = true, NavWallbang = true, NavWallbangW = 0.4,
+    NavHear = 45, NavMuffle = 0.5,
+    NavTimeW = 1, NavSightW = 6, NavNoiseW = 3, NavDwell = 3, NavTeamCover = 0.3, NavHighGround = 0.5,
+    NavFirstStrike = 1, NavEngageMin = 10, NavEngageMax = 28, NavArrive = 4,
+    NavCell = 3, NavRadius = 140, NavMaxNodes = 4000, NavGreed = 1.4, NavDetour = 2, NavBudget = 3, NavReplan = 1.5, NavDeviate = 6, NavSmooth = true,
+    NavDraw = true, NavLabels = true, NavHud = true, NavThickness = 2, NavHeight = 0.5,
     -- misc
     AntiAfk = true,
 }
@@ -483,6 +516,7 @@ local function attach(item)
     hooked[item] = true
     rawset(item, "get_shoot_look", function(self, ...)
         local cf = orig(self, ...)
+        say("shot")
         if not (alive and S.SilentAim) then
             return cf
         end
@@ -719,7 +753,7 @@ end
 local Game = {
     found = false, mode = nil, active = nil, searching = false,
     state = nil, stateAt = 0, heard = 0, detail = nil,
-    onFound = nil, onRedirect = nil,
+    onFound = nil, onRedirect = nil, onShot = nil, lastShot = -10,
 }
 do
     local agents, lines = {}, {}
@@ -816,6 +850,11 @@ do
         elseif kind == "redirect" then
             if agent == Game.active and Game.onRedirect then
                 Game.onRedirect(a, b)
+            end
+        elseif kind == "shot" then
+            Game.lastShot = os.clock()
+            if agent == Game.active and Game.onShot then
+                Game.onShot()
             end
         elseif kind == "found" then
             if Game.active == nil then
@@ -1268,18 +1307,23 @@ do
         end
         return ignoreList
     end
+    Targets.ignores = ignores
     local params = RaycastParams.new()
     params.FilterType = Enum.RaycastFilterType.Exclude
     local STEPS = 12
 
-    -- Would a bullet fired from `from` reach `to`?
-    function Targets.clear(from, to)
+    -- Would a bullet fired from `from` reach `to`? `through` says whether soft walls count as passable
+    -- (nil: the "Aim through shootable walls" setting).
+    function Targets.clear(from, to, through)
         local vec = to - from
         if vec.Magnitude < 0.05 then
             return true
         end
         params.FilterDescendantsInstances = ignores()
-        local passed, through = 0, Settings.AimThroughWalls
+        local passed = 0
+        if through == nil then
+            through = Settings.AimThroughWalls
+        end
         for _ = 1, STEPS do
             local hit = Workspace:Raycast(from, vec, params)
             if not hit then
@@ -1867,6 +1911,27 @@ do
         return (typeof(gethui) == "function" and gethui()) or game:GetService("CoreGui")
     end
 
+    -- How a bullet from your camera stands with a player, as a word: "visible" (it reaches them),
+    -- "wall" (only through soft walls) or "hidden". Worked out a few times a second.
+    local reachCache = {}
+    function Esp.reach(t)
+        local c = reachCache[t.model]
+        local now = os.clock()
+        if c and now - c.at < 0.12 then
+            return c.state
+        end
+        local from = camera().CFrame.Position
+        local head, torso = Targets.aimPos(t, "Head"), Targets.aimPos(t, "Torso")
+        local state = "hidden"
+        if Targets.clear(from, head, false) or Targets.clear(from, torso, false) then
+            state = "visible"
+        elseif Targets.clear(from, head, true) or Targets.clear(from, torso, true) then
+            state = "wall"
+        end
+        reachCache[t.model] = { state = state, at = now }
+        return state
+    end
+
     local function bounds(t)
         local cam = camera()
         local minX, minY, maxX, maxY = math.huge, math.huge, -math.huge, -math.huge
@@ -1937,11 +2002,19 @@ do
                         hide(e)
                     else
                         local color = Targets.color(t.model, t.team)
+                        -- the box and the lines take the "can I hit them" colour, the name keeps the team's
+                        local boxColor, reachTag = color, nil
+                        if Settings.EspReachable and not t.team then
+                            local st = Esp.reach(t)
+                            boxColor = (st == "visible" and Settings.ReachVisible) or (st == "wall" and Settings.ReachWall)
+                                or Settings.ReachHidden
+                            reachTag = st == "wall" and "through wall" or nil
+                        end
                         local w, h = x2 - x1, y2 - y1
                         local mid = (x1 + x2) / 2
                         if Settings.EspBox and e.box then
                             e.outline.Position, e.outline.Size, e.outline.Visible = Vector2.new(x1, y1), Vector2.new(w, h), true
-                            e.box.Position, e.box.Size, e.box.Color, e.box.Visible = Vector2.new(x1, y1), Vector2.new(w, h), color, true
+                            e.box.Position, e.box.Size, e.box.Color, e.box.Visible = Vector2.new(x1, y1), Vector2.new(w, h), boxColor, true
                         else
                             e.box.Visible, e.outline.Visible = false, false
                         end
@@ -1970,6 +2043,9 @@ do
                         if Settings.EspDistance then
                             bits[#bits + 1] = ("%dm"):format(math.floor(dist))
                         end
+                        if reachTag then
+                            bits[#bits + 1] = reachTag
+                        end
                         if #bits > 0 and e.info then
                             e.info.Text = table.concat(bits, "  ")
                             e.info.Position, e.info.Color, e.info.Visible = Vector2.new(mid, y2 + 2), Color3.new(1, 1, 1), true
@@ -1978,7 +2054,7 @@ do
                         end
                         if Settings.EspTracer and e.tracer then
                             e.tracer.From = Vector2.new(viewport.X / 2, viewport.Y)
-                            e.tracer.To, e.tracer.Color, e.tracer.Visible = Vector2.new(mid, y2), color, true
+                            e.tracer.To, e.tracer.Color, e.tracer.Visible = Vector2.new(mid, y2), boxColor, true
                         else
                             e.tracer.Visible = false
                         end
@@ -1987,7 +2063,7 @@ do
                             local a = Settings.EspSkeleton and vm and vm:FindFirstChild(pair[1])
                             local b = a and vm:FindFirstChild(pair[2])
                             if a and b and e.bones[i] then
-                                line(e.bones[i], a.Position, b.Position, color)
+                                line(e.bones[i], a.Position, b.Position, boxColor)
                             elseif e.bones[i] then
                                 e.bones[i].Visible = false
                             end
@@ -2007,6 +2083,7 @@ do
             if not seen[model] then
                 kill(e)
                 Esp.drawings[model] = nil
+                reachCache[model] = nil
             end
         end
 
@@ -2218,6 +2295,1686 @@ do
     end)
 end
 
+--// Extra visuals \\--
+-- Off-screen arrows, wall ESP (which walls bullets pass or break), the bomb timer and carrier, and
+-- hit feedback. Each part keeps its own Drawing objects and is cleaned up on unload.
+local Extras = {}
+local Walls, Hits = { parts = {}, adorn = {}, counts = { soft = 0, breakable = 0, hard = 0 }, scanned = nil }, {}
+do
+    local sqrt, floor, clamp = math.sqrt, math.floor, math.clamp
+    local S = Settings
+    local function mk(class, props)
+        local ok, d = pcall(Drawing.new, class)
+        if not ok then
+            return nil
+        end
+        for k, v in props do
+            d[k] = v
+        end
+        return d
+    end
+    local function container()
+        return (typeof(gethui) == "function" and gethui()) or game:GetService("CoreGui")
+    end
+
+    --// Arrows to players who are not on screen \\--
+    local arrows = {}
+    local function arrowFor(model)
+        local a = arrows[model]
+        if not a then
+            a = {
+                tri = mk("Triangle", { Filled = true, Visible = false, Thickness = 1 }),
+                text = mk("Text", { Size = 12, Center = true, Outline = true, Visible = false }),
+            }
+            arrows[model] = a
+        end
+        return a
+    end
+    local function dropArrow(model, a)
+        for _, d in a do
+            pcall(d.Remove, d)
+        end
+        arrows[model] = nil
+    end
+    -- Points at each player who is off screen, around an oval the size of ArrowRadius, the way they lie
+    -- on the ground relative to where you look.
+    local function stepArrows(cam)
+        local seen = {}
+        if S.EspArrows then
+            local vp = cam.ViewportSize
+            local centre = vp / 2
+            local rx, ry = vp.X * S.ArrowRadius, vp.Y * S.ArrowRadius
+            for _, t in Targets.list(S.EspTeammates) do
+                local pos = t.root.Position
+                local dist = (pos - cam.CFrame.Position).Magnitude
+                if dist <= S.ArrowMax then
+                    local sp, on = cam:WorldToViewportPoint(pos)
+                    local inside = on and sp.X >= 0 and sp.X <= vp.X and sp.Y >= 0 and sp.Y <= vp.Y
+                    if S.ArrowAlways or not inside then
+                        seen[t.model] = true
+                        local a = arrowFor(t.model)
+                        local rel = cam.CFrame:PointToObjectSpace(pos)
+                        local dir = Vector2.new(rel.X, rel.Z) -- right, and forward is up the screen
+                        local m = dir.Magnitude
+                        dir = m > 1e-3 and dir / m or Vector2.new(0, -1)
+                        local p = centre + Vector2.new(dir.X * rx, dir.Y * ry)
+                        local size = S.ArrowSize
+                        local perp = Vector2.new(-dir.Y, dir.X)
+                        local base = p - dir * size * 0.5
+                        local color = Targets.color(t.model, t.team)
+                        if S.EspReachable and not t.team then
+                            local st = Esp.reach(t)
+                            color = (st == "visible" and S.ReachVisible) or (st == "wall" and S.ReachWall) or S.ReachHidden
+                        end
+                        if a.tri then
+                            a.tri.PointA, a.tri.PointB, a.tri.PointC = p + dir * size, base + perp * size * 0.6, base - perp * size * 0.6
+                            a.tri.Color, a.tri.Visible = color, true
+                        end
+                        if a.text then
+                            if S.ArrowDistance then
+                                a.text.Text = ("%dm"):format(floor(dist))
+                                a.text.Position, a.text.Color, a.text.Visible = p - dir * (size + 8), color, true
+                            else
+                                a.text.Visible = false
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        for model, a in arrows do
+            if not seen[model] then
+                if a.tri then
+                    a.tri.Visible = false
+                end
+                if a.text then
+                    a.text.Visible = false
+                end
+                if not model.Parent then
+                    dropArrow(model, a)
+                end
+            end
+        end
+    end
+
+    --// Walls: soft (bullets pass), breakable (they break it), hard (nothing passes) \\--
+    -- Found once per map by looking through the world in small slices, then drawn as see-through
+    -- boxes around the ones near you.
+    local scanning = false
+    local function isBody(d)
+        local vm = Workspace:FindFirstChild("Viewmodels")
+        if vm and d:IsDescendantOf(vm) then
+            return true
+        end
+        local m = d:FindFirstAncestorWhichIsA("Model")
+        return m ~= nil and CollectionService:HasTag(m, "Character")
+    end
+    function Walls.rescan()
+        if scanning then
+            return
+        end
+        scanning = true
+        task.spawn(function()
+            local out = {}
+            local counts = { soft = 0, breakable = 0, hard = 0 }
+            local all = Workspace:GetDescendants()
+            for i, d in all do
+                if d:IsA("BasePart") then
+                    local par = d.Parent
+                    local brk = d:HasTag("Breakable") or (par and par:HasTag("Breakable"))
+                    local hard = d:GetAttribute("Hard") or (par and par:GetAttribute("Hard"))
+                    local soft = d:GetAttribute("Soft") or (par and par:GetAttribute("Soft"))
+                    if (brk or hard or soft) and not isBody(d) then
+                        local kind = brk and "breakable" or (hard and "hard" or "soft")
+                        counts[kind] += 1
+                        table.insert(out, { part = d, kind = kind })
+                    end
+                end
+                if i % 1500 == 0 then
+                    task.wait()
+                end
+            end
+            Walls.parts, Walls.counts = out, counts
+            Walls.scanned = Workspace:GetAttribute("CurrentMap") or true
+            scanning = false
+        end)
+    end
+    local function wallColor(kind)
+        return kind == "soft" and S.WallSoftColor or (kind == "breakable" and S.WallBreakColor or S.WallHardColor)
+    end
+    local wallAt = 0
+    local function stepWalls(cam)
+        local on = S.WallEsp
+        if on and Walls.scanned ~= (Workspace:GetAttribute("CurrentMap") or true) then
+            Walls.rescan()
+        end
+        local now = os.clock()
+        if not on then
+            for part, a in Walls.adorn do
+                pcall(a.Destroy, a)
+                Walls.adorn[part] = nil
+            end
+            return
+        end
+        if now - wallAt < 0.3 then
+            return
+        end
+        wallAt = now
+        local camPos = cam.CFrame.Position
+        local cands = {}
+        for _, w in Walls.parts do
+            local p = w.part
+            if p.Parent and ((w.kind == "soft" and S.WallSoft) or (w.kind == "breakable" and S.WallBreakable)
+                or (w.kind == "hard" and S.WallHard)) then
+                local d = (p.Position - camPos).Magnitude
+                if d <= S.WallMax then
+                    table.insert(cands, { w = w, d = d })
+                end
+            end
+        end
+        table.sort(cands, function(a, b)
+            return a.d < b.d
+        end)
+        local keep = {}
+        for i = 1, math.min(#cands, S.WallCount) do
+            local w = cands[i].w
+            local part = w.part
+            keep[part] = true
+            local a = Walls.adorn[part]
+            if not a then
+                local ok, adorn = pcall(Instance.new, "BoxHandleAdornment")
+                if ok then
+                    adorn.AlwaysOnTop, adorn.ZIndex, adorn.Adornee, adorn.Parent = true, 5, part, container()
+                    a = adorn
+                    Walls.adorn[part] = a
+                end
+            end
+            if a then
+                a.Size, a.Color3, a.Transparency = part.Size, wallColor(w.kind), S.WallAlpha
+            end
+        end
+        for part, a in Walls.adorn do
+            if not keep[part] then
+                pcall(a.Destroy, a)
+                Walls.adorn[part] = nil
+            end
+        end
+    end
+
+    --// The bomb: who carries the defuser, where it is, how long is left \\--
+    -- The carrier has the HasDefuser attribute on their player. The defuser itself is tagged Defuser;
+    -- once it is planted (its Planted attribute) the game counts down 40 seconds, paused while the
+    -- Workspace has a frozen_time attribute. The countdown is kept here from when the plant is first
+    -- seen, so it is only exact if you saw it happen.
+    local PLANT_TIME = 40
+    local timers, markers = {}, {}
+    local hudText, firstScan = nil, true
+    local lastBomb = nil
+    local function bombMarker(i)
+        local m = markers[i]
+        if m == nil then
+            m = mk("Text", { Size = 13, Center = true, Outline = true, Visible = false }) or false
+            markers[i] = m
+        end
+        return m
+    end
+    local function side(cam, pos)
+        local rel = cam.CFrame:PointToObjectSpace(pos)
+        if math.abs(rel.X) > math.abs(rel.Z) then
+            return rel.X > 0 and "to your right" or "to your left"
+        end
+        return rel.Z < 0 and "ahead" or "behind you"
+    end
+    local function clockText(sec)
+        sec = math.max(0, sec)
+        return ("%d:%02d"):format(floor(sec / 60), floor(sec % 60))
+    end
+    local function stepBomb(cam, dt)
+        local show = S.BombTimer or S.BombCarrier
+        local now = os.clock()
+        local mi = 0
+        local lines = {}
+        if show then
+            local frozen = Workspace:GetAttribute("frozen_time") ~= nil
+            -- the defuser out in the world
+            local seenDef = {}
+            for _, inst in CollectionService:GetTagged("Defuser") do
+                if inst:IsDescendantOf(Workspace) then
+                    local root = inst:FindFirstChild("Root") or inst
+                    local pos = root:IsA("BasePart") and root.Position or (inst:IsA("Model") and inst:GetPivot().Position)
+                    if pos then
+                        seenDef[inst] = true
+                        local planted = inst:GetAttribute("Planted") == true
+                        local tm = timers[inst]
+                        if planted and not tm then
+                            tm = { at = now, paused = 0, left = PLANT_TIME, late = firstScan }
+                            timers[inst] = tm
+                        elseif not planted then
+                            timers[inst] = nil
+                            tm = nil
+                        end
+                        if tm then
+                            -- wall-clock time since the plant, with the time spent frozen added back
+                            if frozen then
+                                tm.paused += dt
+                            end
+                            tm.left = PLANT_TIME - (now - tm.at) + tm.paused
+                        end
+                        local dist = (pos - cam.CFrame.Position).Magnitude
+                        local label
+                        if planted then
+                            label = "DEFUSER PLANTED"
+                            if S.BombTimer then
+                                label = ("%s %s%s%s"):format(label, tm.late and "~" or "", clockText(tm.left),
+                                    frozen and " (paused)" or "")
+                            end
+                            table.insert(lines, { text = label, color = Color3.fromRGB(255, 80, 80), pos = pos, dist = dist })
+                        elseif S.BombCarrier then
+                            label = "DEFUSER (dropped)"
+                            table.insert(lines, { text = label, color = Color3.fromRGB(255, 220, 80), pos = pos, dist = dist })
+                        end
+                        if label then
+                            local sp, onScreen = cam:WorldToViewportPoint(pos + Vector3.new(0, 2, 0))
+                            if onScreen and mi < 6 then
+                                mi += 1
+                                local m = bombMarker(mi)
+                                if m then
+                                    m.Text, m.Position, m.Color, m.Visible = ("%s %dm"):format(label, floor(dist)), Vector2.new(sp.X, sp.Y),
+                                        planted and Color3.fromRGB(255, 80, 80) or Color3.fromRGB(255, 220, 80), true
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+            for inst in timers do
+                if not seenDef[inst] then
+                    timers[inst] = nil
+                end
+            end
+            -- the carrier
+            if S.BombCarrier then
+                for _, plr in Players:GetPlayers() do
+                    if plr:GetAttribute("HasDefuser") then
+                        if plr == LocalPlayer then
+                            table.insert(lines, { text = "You carry the defuser", color = Color3.fromRGB(255, 160, 40) })
+                        else
+                            local root = plr.Character and plr.Character:FindFirstChild("HumanoidRootPart")
+                            if root then
+                                local dist = (root.Position - cam.CFrame.Position).Magnitude
+                                table.insert(lines, {
+                                    text = "DEFUSER: " .. plr.DisplayName, color = Color3.fromRGB(255, 160, 40), pos = root.Position, dist = dist,
+                                })
+                                local sp, onScreen = cam:WorldToViewportPoint(root.Position + Vector3.new(0, 3.2, 0))
+                                if onScreen and mi < 6 then
+                                    mi += 1
+                                    local m = bombMarker(mi)
+                                    if m then
+                                        m.Text, m.Position, m.Color, m.Visible = ("DEFUSER %dm"):format(floor(dist)), Vector2.new(sp.X, sp.Y),
+                                            Color3.fromRGB(255, 160, 40), true
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        firstScan = false
+        for i = mi + 1, #markers do
+            if markers[i] then
+                markers[i].Visible = false
+            end
+        end
+        if #lines > 0 then
+            hudText = hudText or mk("Text", { Size = 15, Center = true, Outline = true, Visible = false })
+            if hudText then
+                local out = {}
+                for _, l in lines do
+                    table.insert(out, l.pos and ("%s  %dm %s"):format(l.text, floor(l.dist), side(cam, l.pos)) or l.text)
+                end
+                hudText.Text, hudText.Color = table.concat(out, "\n"), lines[1].color
+                hudText.Position, hudText.Visible = Vector2.new(cam.ViewportSize.X / 2, 38), true
+            end
+        elseif hudText then
+            hudText.Visible = false
+        end
+    end
+
+    --// Hit feedback \\--
+    -- Your hits are told from the enemies' health: a drop within a moment of one of your shots (the agent
+    -- reports each shot) counts as your hit; a drop to nothing as your kill. Without the gun data it is
+    -- a guess from who is near your crosshair.
+    local watch, marks = {}, {}
+    local hlines, htexts = {}, {}
+    Game.onShot = function()
+        Hits.lastShot = os.clock()
+    end
+    Hits.lastShot = -10
+    local function soundFor(kill)
+        local id = kill and S.KillSoundId or S.HitSoundId
+        local snd
+        if id ~= "" then
+            snd = Instance.new("Sound")
+            snd.SoundId = id:match("^%d+$") and ("rbxassetid://" .. id) or id
+        else
+            local ok, tpl = pcall(function()
+                return game:GetService("ReplicatedStorage").Modules.Game.Feed.Sounds.KillConfirm
+            end)
+            if not (ok and tpl) then
+                return
+            end
+            snd = tpl:Clone()
+            snd.PlaybackSpeed = kill and 1 or 1.8
+        end
+        snd.Volume = clamp(S.HitVolume * (kill and 1.2 or 0.8), 0, 10)
+        snd.Parent = game:GetService("SoundService")
+        snd:Play()
+        game:GetService("Debris"):AddItem(snd, 4)
+    end
+    local lastSound = 0
+    local function credit(w, cam)
+        if Game.live() then
+            return os.clock() - Hits.lastShot <= 0.6
+        end
+        -- no gun data: close to where you are aiming and in the open
+        local sp, on = cam:WorldToViewportPoint(w.root.Position + Vector3.new(0, 1.5, 0))
+        if not on then
+            return false
+        end
+        return (Vector2.new(sp.X, sp.Y) - cam.ViewportSize / 2).Magnitude <= 160
+    end
+    local function stepHits(cam)
+        for _, t in Targets.list(false) do
+            if not watch[t.model] then
+                watch[t.model] = { hum = t.hum, hp = t.hum.Health, root = t.root, model = t.model }
+            end
+        end
+        for model, w in watch do
+            local hp = w.hum.Health
+            if hp < w.hp - 0.5 and credit(w, cam) then
+                local dmg = w.hp - hp
+                local kill = hp <= 0
+                table.insert(marks, { at = os.clock(), kill = kill, dmg = dmg })
+                local now = os.clock()
+                if now - lastSound > 0.05 then
+                    lastSound = now
+                    if (kill and S.KillSound) or (not kill and S.HitSounds) then
+                        pcall(soundFor, kill)
+                    end
+                end
+            end
+            w.hp = hp
+            if hp <= 0 or not model.Parent then
+                watch[model] = nil
+            end
+        end
+        -- draw the marks that are still fading
+        local li, ti = 0, 0
+        local centre = cam.ViewportSize / 2
+        local i = 1
+        while i <= #marks do
+            local m = marks[i]
+            local age = os.clock() - m.at
+            if age > S.HitTime then
+                table.remove(marks, i)
+            else
+                i += 1
+                if S.HitMarkers then
+                    local fade = 1 - age / S.HitTime
+                    local gap, len = (m.kill and 7 or 5) + age * 8, S.HitSize * (m.kill and 1.6 or 1)
+                    local color = m.kill and Color3.fromRGB(255, 70, 70) or Color3.new(1, 1, 1)
+                    for _, d in { { 1, 1 }, { 1, -1 }, { -1, 1 }, { -1, -1 } } do
+                        li += 1
+                        local l = hlines[li]
+                        if l == nil then
+                            l = mk("Line", { Visible = false, Thickness = 2 }) or false
+                            hlines[li] = l
+                        end
+                        if l then
+                            local dir = Vector2.new(d[1], d[2]).Unit
+                            l.From, l.To = centre + dir * gap, centre + dir * (gap + len)
+                            l.Color, l.Transparency, l.Visible = color, fade, true
+                        end
+                    end
+                end
+                if S.HitNumbers and ti < 3 then
+                    ti += 1
+                    local t = htexts[ti]
+                    if t == nil then
+                        t = mk("Text", { Visible = false, Size = 16, Center = true, Outline = true }) or false
+                        htexts[ti] = t
+                    end
+                    if t then
+                        t.Text = m.kill and "KILL" or ("-%d"):format(floor(m.dmg + 0.5))
+                        t.Position = centre + Vector2.new(0, -40 - age * 60)
+                        t.Color, t.Transparency, t.Visible = m.kill and Color3.fromRGB(255, 70, 70) or Color3.fromRGB(255, 220, 80), 1 - age / S.HitTime, true
+                    end
+                end
+            end
+        end
+        for j = li + 1, #hlines do
+            if hlines[j] then
+                hlines[j].Visible = false
+            end
+        end
+        for j = ti + 1, #htexts do
+            if htexts[j] then
+                htexts[j].Visible = false
+            end
+        end
+    end
+
+    function Extras.step()
+        local cam = camera()
+        if not cam then
+            return
+        end
+        local now = os.clock()
+        local dt = lastBomb and now - lastBomb or 0
+        lastBomb = now
+        stepArrows(cam)
+        stepWalls(cam)
+        stepBomb(cam, dt)
+        stepHits(cam)
+    end
+    function Extras.clear()
+        for model, a in arrows do
+            dropArrow(model, a)
+        end
+        for part, a in Walls.adorn do
+            pcall(a.Destroy, a)
+            Walls.adorn[part] = nil
+        end
+        for _, list in { markers, hlines, htexts } do
+            for _, d in list do
+                if d then
+                    pcall(d.Remove, d)
+                end
+            end
+        end
+        if hudText then
+            pcall(hudText.Remove, hudText)
+        end
+        Game.onShot = nil
+    end
+    table.insert(Cleanups, Extras.clear)
+    Extras._internal = { stepHits = stepHits, watch = watch, marks = marks, timers = timers }
+end
+
+--// Route planner \\--
+-- Suggests a route (it never moves you): from where you stand to a goal, weighing how long it takes
+-- against how likely the enemies are to see or hear you on the way. It is a custom planner on
+-- purpose: the game's own movement (vaulting over low cover, crouching under beams, jumping up
+-- ledges, dropping down, breaching barricades) is not something Roblox's PathfindingService knows.
+--
+--  World    The map is sampled with raycasts and swept boxes, using the same collision rules as the
+--           game's own vault checks (RespectCanCollide, the "weak" collision group), into a grid of
+--           standable spots (cells, any number of floors). A spot's links to its eight neighbours
+--           are worked out once and cached, because the map doesn't change: walking, jumping up a
+--           ledge, mantling a higher one, dropping, crouching or going prone where there is little
+--           headroom, vaulting over an obstacle low and thin enough (the game's limits, adjustable),
+--           and breaching a barricade.
+--  Enemies  Every other player's position, which way they are looking (their look value), and
+--           whether they are crouched or prone. A spot is exposed to an enemy that has a clear line
+--           to your chest at your posture (low cover hides a crouched player), is in range and has
+--           you in their field of view; one that could only shoot you through a soft wall counts
+--           for less; one behind you counts for little. Footsteps are heard through walls at a
+--           range that grows with your speed, so sneaking and crouching are quieter than running.
+--  Search   A* over that grid, time-sliced over frames so the game doesn't hitch. Cost is seconds of
+--           travel plus seconds spent exposed times a weight plus noise times a weight. Goals that
+--           are an enemy end at a firing position instead: a spot with a clear line to them at a
+--           chosen range, scored for how badly the enemies see it, whether the target is looking
+--           at it (a flank scores best) and height over them.
+local Nav = { path = nil, alt = nil, status = "Off", summary = nil, marked = nil }
+do
+    local sqrt, abs, floor, max, min, huge, clamp = math.sqrt, math.abs, math.floor, math.max, math.min, math.huge, math.clamp
+    local S = Settings
+    local LEVEL = 1.4 -- floors closer than this in height share a spot
+    local DIRS = {
+        { 1, 0, 1 }, { -1, 0, 1 }, { 0, 1, 1 }, { 0, -1, 1 },
+        { 1, 1, 1.4142 }, { 1, -1, 1.4142 }, { -1, 1, 1.4142 }, { -1, -1, 1.4142 },
+    }
+
+    --// Collision queries, like the game's own \\--
+    local P
+    local function newParams(extra)
+        local p = RaycastParams.new()
+        p.FilterType = Enum.RaycastFilterType.Exclude
+        local list = {}
+        for _, v in Targets.ignores() do
+            table.insert(list, v)
+        end
+        for _, v in extra or {} do
+            table.insert(list, v)
+        end
+        p.FilterDescendantsInstances = list
+        pcall(function()
+            p.RespectCanCollide = true
+        end)
+        pcall(function()
+            p.CollisionGroup = "weak"
+        end)
+        return p
+    end
+    local function ray(o, d, params)
+        return Workspace:Raycast(o, d, params or P)
+    end
+    local function stanceH(s)
+        return s == 0 and S.NavStandH or (s == 1 and S.NavCrouchH or S.NavProneH)
+    end
+
+    --// The grid \\--
+    local cache = { nodes = {}, count = 0, cs = nil, map = nil }
+    local function resetCache()
+        cache.nodes, cache.count = {}, 0
+    end
+    function Nav.rebuild()
+        resetCache()
+        Nav.force = true
+    end
+    local function nodeKey(ix, iz, lv)
+        return ((ix + 4096) * 8192 + (iz + 4096)) * 512 + (lv + 256)
+    end
+
+    -- The standable surface below (x, ?, z), looking from yRef up as far as a vault reaches: its
+    -- height and steepness, or nil. A ceiling above is respected, so a room upstairs isn't mistaken
+    -- for this floor.
+    local function surfaceAt(x, yRef, z)
+        local up = max(S.NavVaultMax, S.NavJumpMax) + 0.4
+        local top = yRef + up
+        local c = ray(Vector3.new(x, yRef + 0.4, z), Vector3.new(0, up - 0.4, 0))
+        if c then
+            top = c.Position.Y - 0.15
+        end
+        local reach = top - (yRef - S.NavDropMax - 0.5)
+        local d = ray(Vector3.new(x, top, z), Vector3.new(0, -reach, 0))
+        if d then
+            return d.Position.Y, d.Normal.Y
+        end
+        return nil
+    end
+    -- Free height above a floor spot, and the lowest posture that fits under it (3: none).
+    local function headroom(x, y, z)
+        local len = S.NavStandH + 0.3
+        local h = ray(Vector3.new(x, y + 0.08, z), Vector3.new(0, len, 0))
+        return h and (h.Position.Y - y) or len
+    end
+    local function reqStance(clear)
+        if clear >= S.NavStandH then
+            return 0
+        elseif S.NavCrouch and clear >= S.NavCrouchH then
+            return 1
+        elseif S.NavProne and clear >= S.NavProneH then
+            return 2
+        end
+        return 3
+    end
+    local function nodeAt(ix, iz, y)
+        local cs = cache.cs
+        local lv = floor(y / LEVEL + 0.5)
+        local key = nodeKey(ix, iz, lv)
+        local n = cache.nodes[key]
+        if n then
+            return n
+        end
+        local x, z = ix * cs, iz * cs
+        local clear = headroom(x, y, z)
+        n = { x = x, y = y, z = z, ix = ix, iz = iz, key = key, clear = clear, req = reqStance(clear) }
+        cache.nodes[key] = n
+        cache.count += 1
+        return n
+    end
+    local function nearestNode(pos)
+        local cs = cache.cs
+        local ix0, iz0 = floor(pos.X / cs + 0.5), floor(pos.Z / cs + 0.5)
+        local best, bestD
+        for r = 0, 2 do
+            for ix = ix0 - r, ix0 + r do
+                for iz = iz0 - r, iz0 + r do
+                    if r == 0 or ix == ix0 - r or ix == ix0 + r or iz == iz0 - r or iz == iz0 + r then
+                        local y, ny = surfaceAt(ix * cs, pos.Y + 0.5, iz * cs)
+                        if y and ny >= 0.55 then
+                            local n = nodeAt(ix, iz, y)
+                            if n.req < 3 then
+                                local d = (n.x - pos.X) ^ 2 + (n.z - pos.Z) ^ 2 + (n.y - pos.Y) ^ 2
+                                if not bestD or d < bestD then
+                                    best, bestD = n, d
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+            if best then
+                return best
+            end
+        end
+        return nil
+    end
+
+    --// Links between spots \\--
+    -- Is the body clear when swept (hx, hz) from (x, z) over a floor at `level`? Steps and curbs up
+    -- to the step height are stepped over, so the swept box starts above them.
+    local function sweep(x, level, z, hx, hz, s, params)
+        local h = stanceH(s)
+        local lift = min(S.NavStep + 0.1, h - 0.6)
+        local bh = h - lift
+        local hit = Workspace:Blockcast(
+            CFrame.new(Vector3.new(x, level + lift + bh / 2, z)), Vector3.new(S.NavBodyW, bh, S.NavBodyW),
+            Vector3.new(hx, 0, hz), params or P)
+        return hit == nil, hit
+    end
+    local function breakable(inst)
+        return inst and (CollectionService:HasTag(inst, "Breakable")
+            or (inst.Parent and CollectionService:HasTag(inst.Parent, "Breakable")))
+    end
+    -- Is there a low obstacle ahead that can be vaulted, and how thick is it? The game's own check
+    -- looks a few studs ahead for a wall-like face, a top to go over, clear air above it and ground
+    -- beyond. The same here, scanning forward in half-stud steps: what is in the way, whether its top
+    -- is low enough (and not so low that it is just a step), where the ground comes back, and room
+    -- over the top.
+    local function vaultOver(node, ux, uz, len)
+        local top0 = S.NavVaultMax + 0.3
+        local function topAt(f)
+            local h = ray(Vector3.new(node.x + ux * f, node.y + top0, node.z + uz * f), Vector3.new(0, -(top0 + 0.4), 0))
+            return h and h.Position.Y or nil
+        end
+        local limit = len + S.NavBodyW * 0.75
+        local f1, t1
+        local f = S.NavBodyW * 0.5 + 0.3
+        while f <= limit do
+            local ty = topAt(f)
+            if ty then
+                local h = ty - node.y
+                if h > S.NavVaultMax then
+                    return nil -- too tall to go over
+                elseif h >= S.NavVaultMin then
+                    f1, t1 = f, ty
+                    break
+                end
+            end
+            f += 0.5
+        end
+        if not f1 then
+            return nil
+        end
+        local landing
+        local g = f1
+        while g < f1 + S.NavVaultDepth + 0.01 do
+            g += 0.5
+            local ty = topAt(g)
+            if ty and ty - node.y <= S.NavStep then
+                landing = g
+                break
+            end
+        end
+        if not landing or landing > limit + 0.01 then
+            return nil
+        end
+        if ray(Vector3.new(node.x + ux * f1, t1 + 0.1, node.z + uz * f1), Vector3.new(0, S.NavCrouchH, 0)) then
+            return nil -- no room over the top
+        end
+        return landing - f1
+    end
+
+    local function buildEdges(node)
+        local edges = {}
+        local cs = cache.cs
+        local maxS = S.NavProne and 2 or (S.NavCrouch and 1 or 0)
+        for _, d in DIRS do
+            local dx, dz, mul = d[1], d[2], d[3]
+            local hx, hz = dx * cs, dz * cs
+            local ty, ny = surfaceAt(node.x + hx, node.y, node.z + hz)
+            if ty and ny >= 0.55 then
+                local dy = ty - node.y
+                local to = nodeAt(node.ix + dx, node.iz + dz, ty)
+                local len = cs * mul
+                if to.req <= maxS then
+                    local e
+                    if dy >= -S.NavStep and dy <= S.NavStep then
+                        local firstHit
+                        for s = max(node.req, to.req), maxS do
+                            local ok, hit = sweep(node.x, max(node.y, ty), node.z, hx, hz, s)
+                            if ok then
+                                e = { to = to, kind = "walk", stance = s, len = len, extra = 0, loud = 1 }
+                                break
+                            end
+                            firstHit = firstHit or hit
+                        end
+                        if not e and firstHit and S.NavBreach and node.req == 0 and breakable(firstHit.Instance) then
+                            local inst = breakable(firstHit.Instance) and firstHit.Instance
+                            local p2 = newParams({ inst, inst.Parent })
+                            if sweep(node.x, max(node.y, ty), node.z, hx, hz, 0, p2) then
+                                e = { to = to, kind = "breach", stance = 0, len = len, extra = S.NavBreachTime, loud = 3 }
+                            end
+                        end
+                        if not e and S.NavVault and node.req == 0 and to.req == 0 then
+                            local depth = vaultOver(node, dx / mul, dz / mul, len)
+                            if depth then
+                                e = { to = to, kind = "vault", stance = 0, len = len, extra = S.NavVaultTime + depth * 0.1, loud = 1.4 }
+                            end
+                        end
+                    elseif dy > S.NavStep and dy <= S.NavVaultMax and node.req == 0 and to.req == 0 then
+                        local jump = dy <= S.NavJumpMax
+                        if jump and S.NavJump or (not jump and S.NavVault) then
+                            if sweep(node.x, ty, node.z, hx, hz, 0) then
+                                e = {
+                                    to = to, kind = jump and "jump" or "mantle", stance = 0, len = len,
+                                    extra = jump and S.NavJumpTime or S.NavVaultTime, loud = 1.4,
+                                }
+                            end
+                        end
+                    elseif dy < -S.NavStep and dy >= -S.NavDropMax and S.NavDrop then
+                        for s = max(node.req, to.req), maxS do
+                            if sweep(node.x, node.y, node.z, hx, hz, s) then
+                                e = { to = to, kind = "drop", stance = s, len = len, extra = 0.2 + 0.08 * -dy, loud = 1.6 }
+                                break
+                            end
+                        end
+                    end
+                    if e then
+                        table.insert(edges, e)
+                    end
+                end
+            end
+        end
+        return edges
+    end
+    local function edgesOf(node)
+        if not node.edges then
+            node.edges = buildEdges(node)
+        end
+        return node.edges
+    end
+
+    --// What the enemies can see and hear \\--
+    local function styleMult()
+        local st = S.NavStyle
+        if st == "Fastest" then
+            return 0.1, 0.1
+        elseif st == "Stealth" then
+            return 2.5, 2.5
+        end
+        return 1, 1
+    end
+    local function speedFor(s)
+        local base = S.NavBaseSpeed
+        local ms = S.NavMoveStyle
+        local v
+        if s == 2 then
+            v = base * 0.3
+        elseif s == 1 then
+            v = base * 0.5
+        elseif ms == "Run" then
+            v = base * 1.5
+        elseif ms == "Walk" then
+            v = base * 0.9
+        else
+            v = base * 0.45
+        end
+        if s > 0 and ms == "Sneak" then
+            v *= 0.5
+        end
+        return v
+    end
+    local function hearRadius(speed, loud)
+        return S.NavHear * speed / (S.NavBaseSpeed * 1.5) * loud
+    end
+    -- How much an enemy is looking toward a spot (1 inside their field of view, down to NavBehind
+    -- directly behind them).
+    local function facingFactor(e, dx, dz)
+        if not (S.NavUseLook and e.look) then
+            return 1
+        end
+        local m = sqrt(dx * dx + dz * dz)
+        if m < 0.01 then
+            return 1
+        end
+        local cosT = (e.look.X * dx + e.look.Z * dz) / m
+        local cosHalf = math.cos(math.rad(S.NavFov / 2))
+        if cosT >= cosHalf then
+            return 1
+        end
+        return S.NavBehind + (1 - S.NavBehind) * clamp((cosT + 1) / (cosHalf + 1), 0, 1)
+    end
+    local function chestAt(node, s)
+        return Vector3.new(node.x, node.y + stanceH(s) * 0.65, node.z)
+    end
+    -- Exposure of a spot at a posture: how badly it is seen (summed over enemies) plus who is near
+    -- enough to hear it. Cached for the plan.
+    local function exposure(plan, node, s)
+        local k = node.key * 4 + s
+        local c = plan.expo[k]
+        if c then
+            return c[1], c[2]
+        end
+        local chest = chestAt(node, s)
+        local risk, near = 0, {}
+        for _, e in plan.enemies do
+            local dx, dy, dz = chest.X - e.head.X, chest.Y - e.head.Y, chest.Z - e.head.Z
+            local d = sqrt(dx * dx + dy * dy + dz * dz)
+            if d <= S.NavSight or d <= S.NavHear * 1.6 then
+                local seen = false
+                if d <= S.NavSight then
+                    local facing = facingFactor(e, dx, dz)
+                    local f = 0
+                    if Targets.clear(e.head, chest, false) then
+                        f, seen = 1, true
+                    elseif S.NavWallbang and Targets.clear(e.head, chest, true) then
+                        f = S.NavWallbangW
+                    end
+                    risk += f * facing * (1 - 0.65 * d / S.NavSight)
+                end
+                table.insert(near, { dist = d, seen = seen })
+            end
+        end
+        plan.expo[k] = { risk, near }
+        return risk, near
+    end
+    local function teamCover(plan, node)
+        local best = huge
+        for _, p in plan.team do
+            local d = sqrt((p.X - node.x) ^ 2 + (p.Z - node.z) ^ 2)
+            if d < best then
+                best = d
+            end
+        end
+        return best < 15 and S.NavTeamCover * (1 - best / 15) or 0
+    end
+    local function edgeCost(plan, e)
+        local to = e.to
+        local speed = speedFor(e.stance)
+        local time = e.len / speed + e.extra
+        local sm, nm = styleMult()
+        local risk, near = exposure(plan, to, e.stance)
+        risk *= 1 - teamCover(plan, to)
+        local cost = S.NavTimeW * time + S.NavSightW * sm * risk * time
+        local hr = hearRadius(speed, e.loud)
+        local noise = 0
+        for _, n in near do
+            if n.dist < hr then
+                noise += (1 - n.dist / hr) * (n.seen and 1 or S.NavMuffle)
+            end
+        end
+        cost += S.NavNoiseW * nm * noise * time
+        if plan.avoid and plan.avoid[to.key] then
+            cost += plan.avoidCost
+        end
+        return cost, time, risk
+    end
+
+    --// Goals \\--
+    local function hdist(node, pos)
+        return sqrt((node.x - pos.X) ^ 2 + (node.z - pos.Z) ^ 2)
+    end
+    -- A goal that is a place: arrive within a few studs; the cost of standing there a while goes in.
+    local function pointGoal(pos, label)
+        local maxSpeed = S.NavBaseSpeed * 1.5
+        return {
+            label = label, pos = pos,
+            test = function(node)
+                return hdist(node, pos) <= S.NavArrive and abs(node.y - pos.Y) <= 5
+            end,
+            h = function(node)
+                return max(0, hdist(node, pos) - S.NavArrive) / maxSpeed * S.NavTimeW
+            end,
+            terminal = function(plan, node)
+                local sm = styleMult()
+                return S.NavSightW * sm * (exposure(plan, node, 0)) * S.NavDwell
+            end,
+        }
+    end
+    -- A goal that is an enemy: a firing position at the chosen range with a clear line to them.
+    local function enemyGoal(tgt, label)
+        local maxSpeed = S.NavBaseSpeed * 1.5
+        local ideal = (S.NavEngageMin + S.NavEngageMax) / 2
+        return {
+            label = label, pos = tgt.pos, enemy = true,
+            test = function(node)
+                local d = hdist(node, tgt.pos)
+                if d < S.NavEngageMin or d > S.NavEngageMax or abs(node.y - tgt.pos.Y) > 12 or node.req > 0 then
+                    return false
+                end
+                return Targets.clear(chestAt(node, 0), tgt.head, S.AimThroughWalls)
+            end,
+            h = function(node)
+                return max(0, hdist(node, tgt.pos) - S.NavEngageMax) / maxSpeed * S.NavTimeW
+            end,
+            terminal = function(plan, node)
+                local sm = styleMult()
+                local risk = exposure(plan, node, 0)
+                local d = hdist(node, tgt.pos)
+                local first = facingFactor(tgt, node.x - tgt.pos.X, node.z - tgt.pos.Z) * S.NavFirstStrike
+                local high = clamp((node.y - tgt.pos.Y) / 6, -1, 1) * S.NavHighGround
+                local rangePen = abs(d - ideal) / max(1, S.NavEngageMax - S.NavEngageMin) * 1.5
+                return max(0, S.NavSightW * sm * risk * S.NavDwell + first * 4 + rangePen - high * 2 + 3)
+            end,
+        }
+    end
+
+    --// The search \\--
+    local function hpush(h, item, f)
+        local n = #h.items + 1
+        h.items[n], h.fs[n] = item, f
+        while n > 1 do
+            local p = n // 2
+            if h.fs[p] <= h.fs[n] then
+                break
+            end
+            h.items[p], h.items[n], h.fs[p], h.fs[n] = h.items[n], h.items[p], h.fs[n], h.fs[p]
+            n = p
+        end
+    end
+    local function hpop(h)
+        local n = #h.items
+        if n == 0 then
+            return nil
+        end
+        local top, topF = h.items[1], h.fs[1]
+        h.items[1], h.fs[1] = h.items[n], h.fs[n]
+        h.items[n], h.fs[n] = nil, nil
+        n -= 1
+        local i = 1
+        while true do
+            local l, r, m = i * 2, i * 2 + 1, i
+            if l <= n and h.fs[l] < h.fs[m] then
+                m = l
+            end
+            if r <= n and h.fs[r] < h.fs[m] then
+                m = r
+            end
+            if m == i then
+                break
+            end
+            h.items[m], h.items[i], h.fs[m], h.fs[i] = h.items[i], h.items[m], h.fs[i], h.fs[m]
+            i = m
+        end
+        return top, topF
+    end
+
+    local function newPlan(startNode, goal, enemies, team, avoid)
+        local plan = {
+            start = startNode, goal = goal, enemies = enemies, team = team, avoid = avoid, avoidCost = 8,
+            heap = { items = {}, fs = {} }, g = { [startNode.key] = 0 }, parent = {}, via = {}, closed = {},
+            expo = {}, exp = 0, nodes = { [startNode.key] = startNode }, done = false,
+            -- greed > 1 searches far fewer spots (weighted A*) for a route that may be a little longer
+            hw = max(1, S.NavGreed) * (S.NavStyle == "Stealth" and 1.4 or 1),
+        }
+        hpush(plan.heap, { node = startNode }, goal.h(startNode) * plan.hw)
+        return plan
+    end
+    -- Works on the search until the deadline. Sets plan.done, and plan.final when a route was found.
+    local function planStep(plan, deadline)
+        local goal, heap = plan.goal, plan.heap
+        local limit = plan.limit
+        local sx, sz = plan.start.x, plan.start.z
+        local gx, gz = goal.pos.X, goal.pos.Z
+        local ellipse = plan.ellipse
+        while os.clock() < deadline do
+            local item, f = hpop(heap)
+            if not item then
+                plan.done = true
+                return
+            end
+            if item.goal then
+                plan.done, plan.final, plan.total = true, item.from, f
+                return
+            end
+            local node = item.node
+            if not plan.closed[node.key] then
+                plan.closed[node.key] = true
+                plan.exp += 1
+                if goal.test(node) then
+                    hpush(heap, { goal = true, from = node }, plan.g[node.key] + goal.terminal(plan, node))
+                end
+                if plan.exp >= S.NavMaxNodes then
+                    -- out of budget: settle for the closest the search got to the goal
+                    plan.done, plan.capped = true, true
+                    local bestN, bestH
+                    for key in plan.closed do
+                        local n = plan.nodes[key]
+                        local h = goal.h(n)
+                        if not bestH or h < bestH then
+                            bestN, bestH = n, h
+                        end
+                    end
+                    if bestN and bestN ~= plan.start then
+                        plan.final, plan.partial, plan.total = bestN, true, plan.g[bestN.key]
+                    end
+                    return
+                end
+                local gHere = plan.g[node.key]
+                for _, e in edgesOf(node) do
+                    local to = e.to
+                    -- only places a sensible detour could pass through: not too far from where you are, and
+                    -- start -> here -> goal not much longer than start -> goal
+                    local fromStart = sqrt((to.x - sx) ^ 2 + (to.z - sz) ^ 2)
+                    if not plan.closed[to.key] and fromStart <= limit
+                        and fromStart + sqrt((to.x - gx) ^ 2 + (to.z - gz) ^ 2) <= ellipse then
+                        local c, time, risk = edgeCost(plan, e)
+                        local ng = gHere + c
+                        if ng < (plan.g[to.key] or huge) then
+                            plan.g[to.key], plan.parent[to.key] = ng, node
+                            plan.via[to.key] = { edge = e, time = time, risk = risk }
+                            plan.nodes[to.key] = to
+                            hpush(heap, { node = to }, ng + goal.h(to) * plan.hw)
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    -- The route found, as points from your position on: where, how you get there, at what posture,
+    -- how exposed. Straight runs are merged into one segment; nothing that matters is dropped.
+    local function buildPath(plan, startPos)
+        local chain = {}
+        local n = plan.final
+        while n and n ~= plan.start do
+            table.insert(chain, 1, n)
+            n = plan.parent[n.key]
+        end
+        local pts = { { pos = startPos, kind = "start", stance = plan.start.req, risk = 0, time = 0 } }
+        local length, time, vaults, jumps, drops, breaches = 0, 0, 0, 0, 0, 0
+        local riskSum, riskMax, exposed = 0, 0, 0
+        for _, node in chain do
+            local v = plan.via[node.key]
+            local e = v.edge
+            table.insert(pts, {
+                pos = Vector3.new(node.x, node.y, node.z), kind = e.kind, stance = e.stance, risk = v.risk, time = v.time,
+            })
+            length += e.len
+            time += v.time
+            riskSum += v.risk * v.time
+            riskMax = max(riskMax, v.risk)
+            if v.risk > 0.2 then
+                exposed += v.time
+            end
+            if e.kind == "vault" or e.kind == "mantle" then
+                vaults += 1
+            elseif e.kind == "jump" then
+                jumps += 1
+            elseif e.kind == "drop" then
+                drops += 1
+            elseif e.kind == "breach" then
+                breaches += 1
+            end
+        end
+        if S.NavSmooth then
+            -- merge points that lie on one straight run (same posture, plain walking, flat)
+            local out = { pts[1] }
+            local i = 2
+            while i <= #pts do
+                local a, b = out[#out], pts[i]
+                local c = pts[i + 1]
+                if c and b.kind == "walk" and c.kind == "walk" and b.stance == c.stance and abs(b.pos.Y - c.pos.Y) < 0.3
+                    and abs(b.pos.Y - a.pos.Y) < 0.3 then
+                    local ab = Vector3.new(b.pos.X - a.pos.X, 0, b.pos.Z - a.pos.Z)
+                    local bc = Vector3.new(c.pos.X - b.pos.X, 0, c.pos.Z - b.pos.Z)
+                    local cross = abs(ab.X * bc.Z - ab.Z * bc.X)
+                    if cross < 0.01 * ab.Magnitude * bc.Magnitude + 0.001 then
+                        b = nil
+                    end
+                end
+                if b then
+                    table.insert(out, b)
+                end
+                i += 1
+            end
+            pts = out
+        end
+        return {
+            points = pts, length = length, time = time, vaults = vaults, jumps = jumps, drops = drops, breaches = breaches,
+            risk = time > 0 and riskSum / time or 0, riskMax = riskMax, exposed = exposed, cost = plan.total, nodes = plan.exp,
+        }
+    end
+
+    --// Reading the game \\--
+    local function myRoot()
+        local c = LocalPlayer.Character
+        return c and c:FindFirstChild("HumanoidRootPart")
+    end
+    local function lookOf(t)
+        local v = Targets.charValue(t.model, "look")
+        if typeof(v) == "Vector3" then
+            local m = sqrt(v.X * v.X + v.Z * v.Z)
+            if m > 0.05 then
+                return Vector3.new(v.X / m, 0, v.Z / m)
+            end
+        end
+        return nil
+    end
+    local function snapshot()
+        local enemies, team = {}, {}
+        for _, t in Targets.all() do
+            if t.team then
+                table.insert(team, t.root.Position)
+            else
+                table.insert(enemies, {
+                    head = Targets.aimPos(t, "Head"), pos = t.root.Position, look = lookOf(t), t = t,
+                    name = t.model.Name,
+                })
+            end
+        end
+        return enemies, team
+    end
+    local function findByName(list, text)
+        text = (text or ""):lower()
+        if text == "" then
+            return nil
+        end
+        for _, e in list do
+            local plr = Players:GetPlayerFromCharacter(e.t.model)
+            local names = (e.name .. " " .. (plr and plr.DisplayName or "")):lower()
+            if names:find(text, 1, true) then
+                return e
+            end
+        end
+        return nil
+    end
+    local function nearest(list, from)
+        local best, bestD
+        for _, e in list do
+            local d = (e.pos - from).Magnitude
+            if not bestD or d < bestD then
+                best, bestD = e, d
+            end
+        end
+        return best
+    end
+    -- Where the defuser is and what is going on with it: carried (by whom), dropped or planted.
+    local function defuserState()
+        for _, plr in Players:GetPlayers() do
+            if plr:GetAttribute("HasDefuser") then
+                return "carried", plr
+            end
+        end
+        for _, inst in CollectionService:GetTagged("Defuser") do
+            if inst:IsDescendantOf(Workspace) then
+                local root = inst:FindFirstChild("Root") or inst
+                local pos = root:IsA("BasePart") and root.Position or (inst:IsA("Model") and inst:GetPivot().Position)
+                if pos then
+                    return inst:GetAttribute("Planted") and "planted" or "dropped", pos
+                end
+            end
+        end
+        return nil
+    end
+    local function zonePos(text)
+        text = (text or ""):lower()
+        if text == "" then
+            return nil
+        end
+        local best
+        for _, f in CollectionService:GetTagged("Zone") do
+            local cfg = f:FindFirstChild("Zone")
+            local nm = cfg and cfg:FindFirstChild("name")
+            if (f.Name:lower():find(text, 1, true) or (nm and tostring(nm.Value):lower() == text))
+                and not f:FindFirstAncestor("LoadoutCubicle") then
+                local sum, n = Vector3.new(0, 0, 0), 0
+                for _, d in f:GetDescendants() do
+                    if d:IsA("BasePart") then
+                        sum += d.Position
+                        n += 1
+                    end
+                end
+                if n > 0 then
+                    best = best or { pos = sum / n, name = f.Name }
+                end
+            end
+        end
+        return best
+    end
+    -- The goal to plan for, or nil and why.
+    local function resolveGoal(enemies, team, from)
+        local g = S.NavGoal
+        if g == "Defuser" then
+            local state, what = defuserState()
+            if not state then
+                return nil, "no defuser around"
+            end
+            if state == "carried" then
+                if what == LocalPlayer then
+                    return nil, "you carry the defuser: pick a zone or mark a point"
+                end
+                local char = what.Character
+                local root = char and char:FindFirstChild("HumanoidRootPart")
+                if not root then
+                    return nil, "the defuser carrier isn't in the world"
+                end
+                return pointGoal(root.Position, "the defuser carrier (" .. what.Name .. ")")
+            end
+            return pointGoal(what, "the " .. state .. " defuser")
+        elseif g == "Enemy (nearest)" or g == "Enemy (by name)" then
+            local e = g == "Enemy (nearest)" and nearest(enemies, from) or findByName(enemies, S.NavTarget)
+            if not e then
+                return nil, g == "Enemy (nearest)" and "no enemies" or "no enemy matches that name"
+            end
+            return enemyGoal(e, "enemy " .. e.name)
+        elseif g == "Enemy cluster" then
+            if #enemies == 0 then
+                return nil, "no enemies"
+            end
+            local sum = Vector3.new(0, 0, 0)
+            for _, e in enemies do
+                sum += e.pos
+            end
+            local c = sum / #enemies
+            local tgt = nearest(enemies, c)
+            return enemyGoal({ pos = c, head = c + Vector3.new(0, 1.6, 0), look = tgt.look }, "the enemy group")
+        elseif g == "Teammate" then
+            if #team == 0 then
+                return nil, "no teammates"
+            end
+            local best, bd
+            for _, p in team do
+                local d = (p - from).Magnitude
+                if not bd or d < bd then
+                    best, bd = p, d
+                end
+            end
+            return pointGoal(best, "your nearest teammate")
+        elseif g == "Zone (by name)" then
+            local z = zonePos(S.NavTarget)
+            if not z then
+                return nil, "no zone matches that name"
+            end
+            return pointGoal(z.pos, "zone " .. z.name)
+        elseif g == "Crosshair point" then
+            local cam = camera()
+            local hit = Workspace:Raycast(cam.CFrame.Position, cam.CFrame.LookVector * 400, newParams())
+            if not hit then
+                return nil, "nothing under the crosshair"
+            end
+            return pointGoal(hit.Position, "the crosshair point")
+        elseif g == "Marked point" then
+            if not Nav.marked then
+                return nil, "no point marked yet"
+            end
+            return pointGoal(Nav.marked, "the marked point")
+        end
+        return nil, "unknown goal"
+    end
+    -- Remembers where the crosshair points as the "Marked point" goal.
+    function Nav.mark()
+        local cam = camera()
+        local hit = Workspace:Raycast(cam.CFrame.Position, cam.CFrame.LookVector * 400, newParams())
+        Nav.marked = hit and hit.Position or nil
+        return Nav.marked ~= nil
+    end
+
+    --// Planning, replanning \\--
+    local current, lastPlan, altPlan = nil, -10, nil
+    -- What the cached links depend on: change any of it and they are worked out again.
+    local MOVE_KEYS = {
+        "NavVault", "NavJump", "NavDrop", "NavCrouch", "NavProne", "NavBreach", "NavVaultMax", "NavVaultMin",
+        "NavVaultDepth", "NavStep", "NavJumpMax", "NavDropMax", "NavBodyW", "NavStandH", "NavCrouchH", "NavProneH",
+        "NavCell", "NavVaultTime", "NavJumpTime", "NavBreachTime",
+    }
+    local function moveSignature()
+        local t = {}
+        for i, k in MOVE_KEYS do
+            t[i] = tostring(S[k])
+        end
+        return table.concat(t, ",")
+    end
+    local function describe(path)
+        local bits = { ("%dm"):format(floor(path.length + 0.5)), ("%ds"):format(floor(path.time + 0.5)) }
+        if path.vaults > 0 then
+            table.insert(bits, path.vaults .. " vault")
+        end
+        if path.jumps > 0 then
+            table.insert(bits, path.jumps .. " jump")
+        end
+        if path.drops > 0 then
+            table.insert(bits, path.drops .. " drop")
+        end
+        if path.breaches > 0 then
+            table.insert(bits, path.breaches .. " breach")
+        end
+        local rating = path.risk < 0.1 and "hidden" or (path.risk < 0.4 and "low" or (path.risk < 0.9 and "medium" or "high"))
+        table.insert(bits, "exposure " .. rating)
+        if path.exposed > 0.5 then
+            table.insert(bits, ("%ds in view"):format(floor(path.exposed + 0.5)))
+        end
+        return table.concat(bits, ", ")
+    end
+    local function startPlan(avoid, quiet)
+        local root = myRoot()
+        if not root then
+            if not quiet then
+                Nav.status = "Waiting for your character"
+            end
+            return false
+        end
+        local cs = clamp(S.NavCell, 1.5, 6)
+        if cache.cs ~= cs or cache.count > 60000 then
+            cache.cs = cs
+            resetCache()
+        end
+        P = newParams()
+        local from = root.Position
+        local enemies, team = snapshot()
+        local goal, why = resolveGoal(enemies, team, from)
+        if not goal then
+            if not quiet then
+                Nav.status, Nav.path, Nav.alt = "No route: " .. tostring(why), nil, nil
+            end
+            return false
+        end
+        local startNode = nearestNode(from - Vector3.new(0, 2.8, 0)) or nearestNode(from)
+        if not startNode then
+            if not quiet then
+                Nav.status = "No route: nowhere to stand here"
+            end
+            return false
+        end
+        local plan = newPlan(startNode, goal, enemies, team, avoid)
+        local straight = sqrt((goal.pos.X - from.X) ^ 2 + (goal.pos.Z - from.Z) ^ 2)
+        plan.limit = max(S.NavRadius, straight * 1.6)
+        plan.ellipse = S.NavDetour * straight + 24
+        plan.startPos = Vector3.new(from.X, startNode.y, from.Z)
+        plan.begun = os.clock()
+        return plan
+    end
+    local function finish(plan, isAlt)
+        if not plan.final then
+            if not isAlt then
+                Nav.path, Nav.alt = nil, nil
+                Nav.status = plan.capped and "No route found within the node limit (raise it, or the goal is far)"
+                    or ("No route to " .. plan.goal.label .. " (blocked, or too far for the search radius)")
+            end
+            return
+        end
+        local path = buildPath(plan, plan.startPos)
+        path.goal, path.partial = plan.goal, plan.partial
+        if isAlt then
+            Nav.alt = path
+        else
+            Nav.path = path
+            Nav.summary = (plan.partial and "Partial route toward " or "Route to ") .. plan.goal.label .. ": " .. describe(path)
+                .. (plan.partial and " (search limit reached: raise Max spots or Search greed)" or "")
+            Nav.status = Nav.summary
+        end
+    end
+    -- Keys of the spots near the route, to push a second route away from it.
+    local function nearPath(path)
+        local avoid = {}
+        for _, p in path.points do
+            local n = nearestNode(p.pos)
+            if n then
+                for ix = -1, 1 do
+                    for iz = -1, 1 do
+                        avoid[nodeKey(n.ix + ix, n.iz + iz, floor(n.y / LEVEL + 0.5))] = true
+                    end
+                end
+            end
+        end
+        return avoid
+    end
+
+    -- Called every frame: advances whatever is being planned, starts replans, and drops the path
+    -- if the planner is off. Returns nothing.
+    function Nav.update()
+        if not S.Nav then
+            if Nav.path or current then
+                Nav.path, Nav.alt, current, altPlan = nil, nil, nil, nil
+            end
+            Nav.status = "Off"
+            return
+        end
+        local now = os.clock()
+        local map = Workspace:GetAttribute("CurrentMap")
+        local sig = moveSignature()
+        if cache.map ~= map or cache.sig ~= sig then
+            cache.map, cache.sig = map, sig
+            resetCache()
+        end
+        if not current and not altPlan then
+            local stale = now - lastPlan >= S.NavReplan
+            if Nav.path and not stale and not Nav.force then
+                -- off the route? plan again now
+                local root = myRoot()
+                if root then
+                    local best = huge
+                    for _, p in Nav.path.points do
+                        best = min(best, sqrt((p.pos.X - root.Position.X) ^ 2 + (p.pos.Z - root.Position.Z) ^ 2))
+                    end
+                    stale = best > S.NavDeviate
+                end
+            end
+            if stale or Nav.force or not Nav.path then
+                Nav.force = false
+                local plan = startPlan(nil)
+                if plan then
+                    current = plan
+                end
+            end
+        end
+        local budget = S.NavBudget / 1000
+        if current then
+            planStep(current, os.clock() + budget)
+            if current.done then
+                local plan = current
+                current, lastPlan = nil, os.clock()
+                finish(plan, false)
+                if plan.final and S.NavAlt then
+                    local alt = startPlan(nearPath(Nav.path), true)
+                    if alt then
+                        altPlan = alt
+                    end
+                elseif not S.NavAlt then
+                    Nav.alt = nil
+                end
+            else
+                Nav.status = ("Planning... %d spots looked at"):format(current.exp)
+            end
+        elseif altPlan then
+            planStep(altPlan, os.clock() + budget)
+            if altPlan.done then
+                local plan = altPlan
+                altPlan = nil
+                finish(plan, true)
+            end
+        end
+    end
+
+    --// Drawing the route \\--
+    -- World-space lines on screen. A segment half behind the camera is cut at the camera's near plane
+    -- so the part in front still shows.
+    local lines, texts = {}, {}
+    local GREEN, YELLOW, RED = Color3.fromRGB(80, 255, 110), Color3.fromRGB(255, 210, 60), Color3.fromRGB(255, 70, 70)
+    local ALT = Color3.fromRGB(90, 170, 255)
+    local function mk(class, props)
+        local ok, d = pcall(Drawing.new, class)
+        if not ok then
+            return nil
+        end
+        for k, v in props do
+            d[k] = v
+        end
+        return d
+    end
+    local function line(i)
+        local l = lines[i]
+        if l == nil then
+            l = mk("Line", { Visible = false, Thickness = 2 }) or false
+            lines[i] = l
+        end
+        return l
+    end
+    local function text(i)
+        local t = texts[i]
+        if t == nil then
+            t = mk("Text", { Visible = false, Size = 13, Center = true, Outline = true }) or false
+            texts[i] = t
+        end
+        return t
+    end
+    local function riskColor(r)
+        local t = clamp(r / 1.2, 0, 1)
+        if t < 0.5 then
+            return GREEN:Lerp(YELLOW, t * 2)
+        end
+        return YELLOW:Lerp(RED, (t - 0.5) * 2)
+    end
+    local NEAR = -0.5
+    local function segment(cam, a, b)
+        local cf = cam.CFrame
+        local la, lb = cf:PointToObjectSpace(a), cf:PointToObjectSpace(b)
+        if la.Z > NEAR and lb.Z > NEAR then
+            return nil
+        end
+        if la.Z > NEAR then
+            a = a + (b - a) * ((NEAR - la.Z) / (lb.Z - la.Z))
+        elseif lb.Z > NEAR then
+            b = b + (a - b) * ((NEAR - lb.Z) / (la.Z - lb.Z))
+        end
+        local sa, sb = cam:WorldToViewportPoint(a), cam:WorldToViewportPoint(b)
+        return Vector2.new(sa.X, sa.Y), Vector2.new(sb.X, sb.Y)
+    end
+    local LABEL = { vault = "VAULT", mantle = "CLIMB UP", jump = "JUMP", drop = "DROP", breach = "BREACH" }
+    local STANCE = { [1] = "CROUCH", [2] = "PRONE" }
+    local hud
+    local function hide(from)
+        for i = from, #lines do
+            if lines[i] then
+                lines[i].Visible = false
+            end
+        end
+    end
+    local function hideTexts(from)
+        for i = from, #texts do
+            if texts[i] then
+                texts[i].Visible = false
+            end
+        end
+    end
+
+    function Nav.draw()
+        local path = Nav.path
+        if not (S.Nav and S.NavDraw and path) or #path.points < 2 then
+            hide(1)
+            hideTexts(1)
+            if hud then
+                hud.Visible = false
+            end
+            return
+        end
+        local cam = camera()
+        local root = myRoot()
+        local lift = Vector3.new(0, S.NavHeight, 0)
+        -- the part of the route still ahead of you
+        local first = 1
+        if root then
+            local best = huge
+            for i, p in path.points do
+                local d = (p.pos.X - root.Position.X) ^ 2 + (p.pos.Z - root.Position.Z) ^ 2
+                if d < best then
+                    best, first = d, i
+                end
+            end
+        end
+        local li, ti = 0, 0
+        local function drawRun(points, from, colorOf)
+            -- from your own position (at the route's height) to the next point, then on along it
+            local prev = root and Vector3.new(root.Position.X, points[from].pos.Y, root.Position.Z) or points[from].pos
+            for i = root and from or from + 1, #points do
+                local p = points[i]
+                local a, b = segment(cam, prev + lift, p.pos + lift)
+                if a and li < 160 then
+                    li += 1
+                    local l = line(li)
+                    if l then
+                        l.From, l.To, l.Color, l.Thickness, l.Visible = a, b, colorOf(p), S.NavThickness, true
+                    end
+                end
+                prev = p.pos
+            end
+        end
+        drawRun(path.points, first, function(p)
+            return riskColor(p.risk)
+        end)
+        if Nav.alt and #Nav.alt.points > 1 then
+            drawRun(Nav.alt.points, 1, function()
+                return ALT
+            end)
+        end
+        hide(li + 1)
+        local nextAction
+        if S.NavLabels then
+            local lastStance = path.points[first].stance
+            for i = first + 1, #path.points do
+                local p = path.points[i]
+                local label = LABEL[p.kind] or (p.stance ~= lastStance and STANCE[p.stance]) or nil
+                lastStance = p.stance
+                if label then
+                    if not nextAction and root then
+                        nextAction = { label = label, dist = (p.pos - root.Position).Magnitude }
+                    end
+                    local sp, on = cam:WorldToViewportPoint(p.pos + lift * 3)
+                    if on and ti < 12 then
+                        ti += 1
+                        local t = text(ti)
+                        if t then
+                            t.Text, t.Position, t.Color, t.Visible = label, Vector2.new(sp.X, sp.Y), Color3.new(1, 1, 1), true
+                        end
+                    end
+                end
+            end
+            local goalP = path.points[#path.points]
+            local gp, on = cam:WorldToViewportPoint(goalP.pos + lift * 3)
+            if on and ti < 12 then
+                ti += 1
+                local t = text(ti)
+                if t then
+                    t.Text, t.Position, t.Color, t.Visible = "GOAL", Vector2.new(gp.X, gp.Y), Color3.fromRGB(255, 255, 255), true
+                end
+            end
+        end
+        hideTexts(ti + 1)
+        if S.NavHud then
+            hud = hud or mk("Text", { Size = 14, Center = true, Outline = true, Visible = false })
+            if hud then
+                local msg = Nav.summary or ""
+                if nextAction then
+                    msg = ("%s\nNext: %s in %dm"):format(msg, nextAction.label, floor(nextAction.dist + 0.5))
+                end
+                hud.Text, hud.Color = msg, Color3.new(1, 1, 1)
+                hud.Position = Vector2.new(cam.ViewportSize.X / 2, 96)
+                hud.Visible = true
+            end
+        elseif hud then
+            hud.Visible = false
+        end
+    end
+    function Nav.clear()
+        for _, l in lines do
+            if l then
+                pcall(l.Remove, l)
+            end
+        end
+        for _, t in texts do
+            if t then
+                pcall(t.Remove, t)
+            end
+        end
+        if hud then
+            pcall(hud.Remove, hud)
+        end
+        lines, texts, hud = {}, {}, nil
+    end
+    table.insert(Cleanups, Nav.clear)
+
+    Nav.describe = describe
+    Nav.speedFor = speedFor
+    Nav._internal = { surfaceAt = surfaceAt, nearestNode = nearestNode, edgesOf = edgesOf, resetCache = resetCache,
+        newParams = function() P = newParams() return P end, setCs = function(cs) cache.cs = cs end, cache = cache,
+        exposure = exposure, newPlan = newPlan, planStep = planStep, buildPath = buildPath, pointGoal = pointGoal,
+        enemyGoal = enemyGoal, startPlan = startPlan, snapshot = snapshot }
+end
+
 --// Anti-AFK \\--
 bind(LocalPlayer.Idled, function()
     if Settings.AntiAfk and alive() then
@@ -2269,6 +4026,9 @@ bind(RunService.RenderStepped, function()
     guard("esp", Esp.step)
     guard("triggerbot", Aim.trigger)
     guard("gun data", Game.pump)
+    guard("extras", Extras.step)
+    guard("route planner", Nav.update)
+    guard("route drawing", Nav.draw)
     guard("silent aim", Silent.step)
     guard("fov", World.fov)
     guard("no flash", World.noFlash)
@@ -2304,6 +4064,25 @@ end
 local function dropdown(box, key, text, values, tip)
     return box:AddDropdown(key, {
         Text = text, Values = values, Default = Settings[key], Tooltip = tip,
+        Callback = function(v)
+            Settings[key] = v
+        end,
+    })
+end
+local function color(box, key, text)
+    local label = box:AddLabel(text)
+    pcall(function()
+        label:AddColorPicker(key .. "Pick", {
+            Default = Settings[key], Title = text,
+            Callback = function(c)
+                Settings[key] = c
+            end,
+        })
+    end)
+end
+local function input(box, key, text, placeholder, tip)
+    return box:AddInput(key, {
+        Text = text, Placeholder = placeholder or "", Default = Settings[key] or "", Finished = true, Tooltip = tip,
         Callback = function(v)
             Settings[key] = v
         end,
@@ -2443,6 +4222,139 @@ do
             tostring(ws:GetAttribute("Round") or "?"), tostring(ws:GetAttribute("BestOf") or "?"),
             tostring(LocalPlayer:GetAttribute("Team") or "no team"))
     end)
+
+    local R = Tab:AddLeftGroupbox("Reachable", "crosshair")
+    toggle(R, "EspReachable", "Colour by reach", "Boxes, lines and arrows take a colour for whether a bullet from you can reach the player: reachable, only through soft walls, or hidden")
+    color(R, "ReachVisible", "Reachable")
+    color(R, "ReachWall", "Through soft walls only")
+    color(R, "ReachHidden", "Hidden")
+
+    local A = Tab:AddLeftGroupbox("Off-screen arrows", "navigation")
+    toggle(A, "EspArrows", "Arrows", "Points at players who are off screen (behind you, to the side), around an oval, the way they lie on the ground")
+    toggle(A, "ArrowAlways", "Even when on screen")
+    toggle(A, "ArrowDistance", "Show distance")
+    slider(A, "ArrowRadius", "Oval size", 0.2, 0.48, 2, "", "How far from the middle of the screen the arrows sit")
+    slider(A, "ArrowSize", "Arrow size", 8, 40, 0, " px")
+    slider(A, "ArrowMax", "Max distance", 50, 1500, 0, " studs")
+
+    local Wl = Tab:AddRightGroupbox("Walls", "brick-wall")
+    toggle(Wl, "WallEsp", "Wall ESP", "Highlights walls through walls: green ones bullets pass through, orange ones they break, red ones nothing passes")
+    toggle(Wl, "WallSoft", "Soft (bullets pass)")
+    toggle(Wl, "WallBreakable", "Breakable")
+    toggle(Wl, "WallHard", "Hard (nothing passes)")
+    slider(Wl, "WallMax", "Max distance", 10, 200, 0, " studs")
+    slider(Wl, "WallCount", "Most shown", 5, 120, 0, "", "The nearest ones are drawn; each one is a see-through box, so keep it low on a phone")
+    slider(Wl, "WallAlpha", "Transparency", 0.3, 0.95, 2, "")
+    color(Wl, "WallSoftColor", "Soft colour")
+    color(Wl, "WallBreakColor", "Breakable colour")
+    color(Wl, "WallHardColor", "Hard colour")
+    Wl:AddButton({ Text = "Rescan walls", Func = function()
+        Walls.rescan()
+    end, Tooltip = "Looks through the map again (it is done once per map)" })
+    status(Wl, function()
+        return ("Found: %d soft, %d breakable, %d hard"):format(Walls.counts.soft, Walls.counts.breakable, Walls.counts.hard)
+    end)
+
+    local Bm = Tab:AddRightGroupbox("Bomb", "bomb")
+    toggle(Bm, "BombTimer", "Timer", "When the defuser is planted, counts down the 40 seconds from when you saw it planted (a ~ means you joined after it was planted)")
+    toggle(Bm, "BombCarrier", "Carrier and drop", "Marks who carries the defuser, where it was dropped, and says how far and which way")
+
+    local Ht = Tab:AddRightGroupbox("Hit feedback", "zap")
+    toggle(Ht, "HitMarkers", "Hit markers", "An X around the crosshair when you hit someone, red and bigger for a kill. Worked out from their health dropping right after one of your shots")
+    toggle(Ht, "HitNumbers", "Damage numbers")
+    toggle(Ht, "HitSounds", "Hit sound")
+    toggle(Ht, "KillSound", "Kill sound")
+    slider(Ht, "HitSize", "Marker size", 4, 24, 0, " px")
+    slider(Ht, "HitTime", "Marker time", 0.1, 1, 2, " s")
+    slider(Ht, "HitVolume", "Volume", 0.1, 3, 1, "")
+    input(Ht, "HitSoundId", "Hit sound id", "asset id (blank: the game's own)", "A Roblox asset id for the hit sound")
+    input(Ht, "KillSoundId", "Kill sound id", "asset id (blank: the game's own)", "A Roblox asset id for the kill sound")
+end
+
+do
+    local Tab = Window:AddTab("Help", "compass", "Route planner")
+    local N = Tab:AddLeftGroupbox("Route planner", "route")
+    toggle(N, "Nav", "Show best route", "Draws a suggested way to your goal, weighing speed against being seen and heard, using every player's position and facing. It only draws: it never moves you")
+    dropdown(N, "NavGoal", "Goal", { "Defuser", "Enemy (nearest)", "Enemy cluster", "Enemy (by name)", "Teammate", "Zone (by name)", "Crosshair point", "Marked point" },
+        "Defuser: where it was dropped or planted, or its carrier. Enemy goals end at a firing position at your chosen range instead of on top of them")
+    input(N, "NavTarget", "Name", "player or zone name", "Used by the goals that say (by name): part of a player's name or of a room's name")
+    N:AddButton({ Text = "Mark crosshair point", Func = function()
+        notify(Nav.mark() and "Marked. Set the goal to Marked point" or "Nothing under the crosshair", 3)
+    end, Tooltip = "Remembers where you are looking, for the Marked point goal" })
+    dropdown(N, "NavStyle", "Style", { "Fastest", "Balanced", "Stealth" }, "How much being seen or heard counts against time: barely, normally, a lot")
+    dropdown(N, "NavMoveStyle", "How you move", { "Run", "Walk", "Sneak" }, "Sets your speed and how far your footsteps carry. Crouching and going prone are slower and quieter still")
+    toggle(N, "NavAlt", "Also show another route", "A second route that keeps away from the first (blue)")
+    status(N, function()
+        return Nav.status
+    end)
+    N:AddButton({ Text = "Plan again now", Func = function()
+        Nav.force = true
+    end })
+    N:AddButton({ Text = "Forget the map cache", Func = function()
+        Nav.rebuild()
+    end, Tooltip = "The map is sampled once and remembered; use this if doors or walls changed" })
+
+    local M = Tab:AddRightGroupbox("Movement", "footprints")
+    toggle(M, "NavVault", "Vault and climb up", "Go over obstacles low and thin enough, like the game's own vault")
+    toggle(M, "NavJump", "Jump up ledges")
+    toggle(M, "NavDrop", "Drop down")
+    toggle(M, "NavCrouch", "Crouch under things")
+    toggle(M, "NavProne", "Go prone under things")
+    toggle(M, "NavBreach", "Breach barricades", "Counts a breakable barricade as passable, slowly and loudly")
+    slider(M, "NavBaseSpeed", "Base speed", 4, 14, 1, " studs/s", "Your walking speed: running is 1.5x, crouching 0.5x, prone 0.3x")
+    slider(M, "NavVaultMax", "Vault up to", 2, 6, 1, " studs")
+    slider(M, "NavVaultMin", "Vault from", 0.6, 3, 1, " studs", "Lower than this is just a step")
+    slider(M, "NavVaultDepth", "Vault depth", 1, 6, 1, " studs", "How thick an obstacle can be")
+    slider(M, "NavStep", "Step height", 0.5, 2.5, 1, " studs", "Steps and curbs this low are walked over")
+    slider(M, "NavJumpMax", "Jump up to", 1.5, 6, 1, " studs")
+    slider(M, "NavDropMax", "Drop down up to", 3, 25, 0, " studs")
+    slider(M, "NavBodyW", "Body width", 1, 3, 1, " studs")
+    slider(M, "NavStandH", "Standing height", 3.5, 7, 1, " studs")
+    slider(M, "NavCrouchH", "Crouching height", 2, 5, 1, " studs")
+    slider(M, "NavProneH", "Prone height", 0.8, 3, 1, " studs")
+    slider(M, "NavVaultTime", "Vault time", 0.2, 2.5, 1, " s")
+    slider(M, "NavJumpTime", "Jump time", 0.1, 2, 1, " s")
+    slider(M, "NavBreachTime", "Breach time", 0.5, 8, 1, " s")
+
+    local Pc = Tab:AddLeftGroupbox("What enemies notice", "eye")
+    toggle(Pc, "NavUseLook", "Use which way they face", "Off: every enemy is assumed to be looking at you")
+    toggle(Pc, "NavWallbang", "Count shots through soft walls", "A spot an enemy could only hit through a soft wall is still risky, but less")
+    slider(Pc, "NavSight", "Sight range", 30, 300, 0, " studs")
+    slider(Pc, "NavFov", "Field of view", 40, 180, 0, " deg")
+    slider(Pc, "NavBehind", "Noticed from behind", 0, 1, 2, "", "How much an enemy notices you directly behind them: 0 never, 1 as if facing you")
+    slider(Pc, "NavWallbangW", "Through-wall weight", 0, 1, 2, "")
+    slider(Pc, "NavHear", "Hearing range (running)", 10, 120, 0, " studs", "How far a running player's footsteps carry; walking, crouching and sneaking scale down from it")
+    slider(Pc, "NavMuffle", "Walls muffle sound", 0, 1, 2, "", "How much of the noise gets through when there is no line to the enemy")
+
+    local Wg = Tab:AddRightGroupbox("What matters", "sliders-horizontal")
+    slider(Wg, "NavTimeW", "Time", 0, 3, 1, "x", "Weight of seconds spent travelling")
+    slider(Wg, "NavSightW", "Being seen", 0, 20, 1, "x", "Seconds of detour you will take to avoid one second in an enemy's view")
+    slider(Wg, "NavNoiseW", "Being heard", 0, 20, 1, "x")
+    slider(Wg, "NavDwell", "Time spent at the goal", 0, 15, 1, " s", "How long you will stand there, which makes exposed spots at the goal cost more (planting takes 5 s)")
+    slider(Wg, "NavTeamCover", "Teammates nearby", 0, 1, 2, "", "How much a teammate close by lowers the risk")
+    slider(Wg, "NavHighGround", "High ground", 0, 3, 1, "x", "Bonus for a firing position above the target")
+    slider(Wg, "NavFirstStrike", "Being in their sights", 0, 3, 1, "x", "Penalty for a firing position the target is looking at (they shoot first): flanks score best")
+    slider(Wg, "NavEngageMin", "Closest firing position", 3, 40, 0, " studs")
+    slider(Wg, "NavEngageMax", "Furthest firing position", 8, 80, 0, " studs")
+    slider(Wg, "NavArrive", "Arrive within", 1.5, 10, 1, " studs", "For goals that are a place")
+
+    local Sr = Tab:AddLeftGroupbox("Search", "cpu")
+    slider(Sr, "NavCell", "Grid cell", 2, 5, 1, " studs", "Smaller finds tighter gaps but searches more")
+    slider(Sr, "NavRadius", "Search radius", 40, 300, 0, " studs")
+    slider(Sr, "NavDetour", "Detour allowed", 1.1, 4, 1, "x", "How much longer than a straight line a route may be")
+    slider(Sr, "NavMaxNodes", "Most spots looked at", 500, 15000, 0, "", "If a plan says it hit the limit, raise this or Search greed")
+    slider(Sr, "NavGreed", "Search greed", 1, 4, 1, "x", "1 finds the best route; higher looks at far fewer spots and may pick a slightly worse one")
+    slider(Sr, "NavBudget", "Time per frame", 1, 12, 0, " ms", "How much work the planner may do each frame; lower keeps the game smooth")
+    slider(Sr, "NavReplan", "Plan again every", 0.5, 10, 1, " s")
+    slider(Sr, "NavDeviate", "Plan again if off by", 2, 20, 0, " studs")
+    toggle(Sr, "NavSmooth", "Merge straight runs")
+
+    local D = Tab:AddRightGroupbox("Display", "paintbrush")
+    toggle(D, "NavDraw", "Draw the route", "Green is safe, yellow exposed, red badly exposed")
+    toggle(D, "NavLabels", "Labels", "VAULT, JUMP, CROUCH and so on where they happen")
+    toggle(D, "NavHud", "Summary text")
+    slider(D, "NavThickness", "Line thickness", 1, 5, 0, " px")
+    slider(D, "NavHeight", "Draw height", 0, 4, 1, " studs")
 end
 
 do
