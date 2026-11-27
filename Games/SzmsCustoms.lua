@@ -59,7 +59,8 @@ local Settings = {
     -- parry
     AutoParry = false, Trigger = false, Spam = false,
     ParryTiming = "Middle", LeadMs = 150,
-    ParryMethod = "Forged remote (like Blade Ball)", AimMode = "Cursor", Jitter = 0, CheckCooldown = true, SpamRate = 30, SpamRange = 35,
+    ParryMethod = "Forged remote (like Blade Ball)", AimMode = "Cursor", Jitter = 0, Animation = true,
+    SpamMode = "Smart (clash)", SpamEta = 300, CheckCooldown = true, SpamRate = 30, SpamRange = 60,
     -- abilities
     AutoAbility = false, AbilityWhen = "Ball on me + parry on cooldown", AbilityRange = 40, IncludeDash = false,
     -- esp
@@ -108,7 +109,7 @@ local function aliveInMatch()
 end
 
 --// Game hooks \\--
-local Game = { ev = nil, dashEv = nil, S = nil, myBall = nil, parry = nil, info = "looking for the game's parry code" }
+local Game = { ev = nil, dashEv = nil, S = nil, myBall = nil, parry = nil, swing = nil, info = "looking for the game's parry code" }
 local function findEvent(scriptName, eventName)
     local ps = LocalPlayer:FindFirstChild("PlayerScripts")
     local s = ps and ps:FindFirstChild(scriptName)
@@ -143,6 +144,8 @@ local function dive(fn, depth, seen, out)
             local okn, name = pcall(debug.info, v, "n")
             if okn and name == "myBall" then
                 out.myBall = v
+            elseif okn and name == "swing" then
+                out.swing = v
             end
             dive(v, depth - 1, seen, out)
         end
@@ -175,7 +178,7 @@ local function discover()
         end
     end
     if out.S then
-        Game.S, Game.parry = out.S, out.parry
+        Game.S, Game.parry, Game.swing = out.S, out.parry, out.swing
         Game.myBall = out.myBall or (out.small ~= out.parry and out.small) or nil
         Game.info = "hooked the game's own ball helpers"
     else
@@ -233,13 +236,30 @@ local function nameOf(id)
     end
     return tostring(id)
 end
+-- Harbor = "leg|fromUserId|toUserId|travel": the ball's current hit between two players, only set during a
+-- clash (BallRenderer's updateClash). A new value is a new hit.
+local function readLegs(b, t, now)
+    local h = b:GetAttribute("Harbor")
+    if h ~= t.harbor then
+        t.harbor = h
+        if type(h) == "string" and h ~= "" then
+            local parts = string.split(h, "|")
+            t.legFrom, t.legTo = tonumber(parts[2]), tonumber(parts[3])
+            t.legAt = now
+        else
+            t.legFrom, t.legTo = nil, nil
+        end
+    end
+end
 local function sample(b, now)
     local t = Track[b]
     if not t then
         t = { pos = b.Position, t = now, vel = Vector3.new(0, 0, 0), speed = 0 }
         Track[b] = t
+        readLegs(b, t, now)
         return t
     end
+    readLegs(b, t, now)
     local dt = now - t.t
     if dt > 0.004 then
         local v = (b.Position - t.pos) / dt
@@ -312,10 +332,34 @@ end
 --   FireServer(cameraCFrame, ballIsMine, pickCFrame, settings.sample(pitch, yaw, serverTime), source, touch)
 -- and nothing on the client stops a press before the ball is in range (only your cooldown), so it is built here
 -- the same way and sent directly. pickCFrame is the ray the ball is curved along: it is where the aim options act.
-local Parry = { count = 0, sent = 0, how = "-", lastTry = 0, blockUntil = 0, info = "off", ping = 0.05, eta = nil }
+local Log = {}
+local function addLog(ctx)
+    ctx.t = os.clock()
+    Log[#Log + 1] = ctx
+    if #Log > 6 then
+        table.remove(Log, 1)
+    end
+end
+local Parry = { count = 0, landed = 0, sent = 0, how = "-", lastTry = 0, blockUntil = 0, info = "off", ping = 0.05, eta = nil }
 connect(LocalPlayer:GetAttributeChangedSignal("ParryCooldownEnd"), function()
     if (LocalPlayer:GetAttribute("ParryCooldownEnd") or 0) > Workspace:GetServerTimeNow() then
         Parry.count = Parry.count + 1
+    end
+end)
+task.spawn(function()
+    local fx = ReplicatedStorage:WaitForChild("ParryFX", 30)
+    if fx and alive() then
+        connect(fx.OnClientEvent, function(char)
+            if char == LocalPlayer.Character then
+                Parry.landed = Parry.landed + 1
+                for i = #Log, 1, -1 do
+                    if not Log[i].result and os.clock() - Log[i].t < 1.5 then
+                        Log[i].result = "landed"
+                        break
+                    end
+                end
+            end
+        end)
     end
 end)
 task.spawn(function()
@@ -428,10 +472,27 @@ local function forgeParry(balls)
     LocalPlayer:SetAttribute("LocalParryAt", os.clock())
     LocalPlayer:SetAttribute("LocalWhiteStart", now)
     LocalPlayer:SetAttribute("LocalWhiteEnd", now + cd)
+    if Settings.Animation then
+        -- the game's own swing animation and sound, as its press path plays them
+        local played = false
+        if Game.swing then
+            played = pcall(Game.swing)
+        end
+        if not played then
+            LocalPlayer:SetAttribute("SwingCount", (LocalPlayer:GetAttribute("SwingCount") or 0) + 1)
+        end
+        pcall(function()
+            local fx = require(ReplicatedStorage:WaitForChild("Shared", 5):WaitForChild("SlashFX", 5))
+            fx.PlaySwing(LocalPlayer.Character)
+        end)
+    end
     return true, "forged remote"
 end
-local function fireParry(balls)
+local function fireParry(balls, ctx)
     Parry.lastTry = os.clock()
+    if ctx then
+        addLog(ctx)
+    end
     Parry.blockUntil = Parry.lastTry + 0.35
     Parry.sent = Parry.sent + 1
     local method = Settings.ParryMethod
@@ -504,11 +565,31 @@ local function leadFor(window)
 end
 local lastSpam = 0
 local armedLead = nil
+local function distTo(b)
+    local root = myRoot()
+    return root and (b.Position - root.Position).Magnitude or math.huge
+end
+local function nearestEnemyDist()
+    local root = myRoot()
+    if not root then
+        return math.huge
+    end
+    local best = math.huge
+    for _, e in ipairs(enemies()) do
+        best = math.min(best, (e.hrp.Position - root.Position).Magnitude)
+    end
+    return best
+end
+local function ctxFor(b, why)
+    local t = b and Track[b]
+    return { why = why, dist = b and distTo(b) or 0, speed = t and t.speed or 0, eta = b and etaOf(b) }
+end
 local function parryStep(now, balls)
     local b = ballOnMe(balls)
     for _, ball in ipairs(balls) do
         sample(ball, now)
     end
+    local uid = LocalPlayer.UserId
     if not b then
         Parry.eta, armedLead = nil, nil
         Parry.info = "no ball on you"
@@ -525,7 +606,7 @@ local function parryStep(now, balls)
         if Settings.Trigger then
             Parry.info = ready and "triggerbot: pressing" or "triggerbot: waiting for the cooldown"
             if ready and now >= Parry.blockUntil then
-                fireParry(balls)
+                fireParry(balls, ctxFor(b, "trigger"))
             end
         elseif Settings.AutoParry then
             if not ready then
@@ -534,7 +615,7 @@ local function parryStep(now, balls)
                 Parry.info = "just pressed"
             elseif inRange or (eta and eta <= armedLead) then
                 Parry.info = "pressing"
-                if fireParry(balls) then
+                if fireParry(balls, ctxFor(b, inRange and "game says in range" or "eta under lead")) then
                     armedLead = nil
                 end
             else
@@ -543,19 +624,51 @@ local function parryStep(now, balls)
             end
         end
     end
+    Parry.spamInfo = "off"
     if Settings.Spam and aliveInMatch() then
-        local root = myRoot()
         local gap = 1 / math.max(Settings.SpamRate, 1)
-        if root and now - lastSpam >= gap and now - Parry.lastTry >= 0.02 then
+        local go, why, target = false, nil, nil
+        if Settings.SpamMode == "Range only" then
             for _, ball in ipairs(balls) do
-                if (ball.Position - root.Position).Magnitude <= Settings.SpamRange then
-                    lastSpam = now
-                    fireParry(balls)
+                if distTo(ball) <= Settings.SpamRange then
+                    go, why, target = true, "ball in range", ball
                     break
                 end
             end
+        else
+            -- a clash: the ball is bouncing between you and someone close (the game marks each hit in Harbor)
+            for _, ball in ipairs(balls) do
+                local t = Track[ball]
+                if t and t.legAt and now - t.legAt < 0.8 and (t.legFrom == uid or t.legTo == uid) and distTo(ball) <= Settings.SpamRange then
+                    go, why, target = true, "clash with someone", ball
+                    break
+                end
+            end
+            -- about to become one: the ball is on you, about to land, and an opponent is right next to you
+            if not go and b then
+                local eta = etaOf(b)
+                if eta and eta <= Settings.SpamEta / 1000 + Parry.ping and nearestEnemyDist() <= Settings.SpamRange then
+                    go, why, target = true, "ball arriving, opponent close", b
+                end
+            end
+        end
+        Parry.spamInfo = go and why or "waiting for a clash"
+        if go and now - lastSpam >= gap and now - Parry.lastTry >= 0.02 then
+            lastSpam = now
+            fireParry(balls, ctxFor(target, "spam: " .. why))
         end
     end
+end
+local function logText()
+    local now = os.clock()
+    local lines = {}
+    for i = #Log, math.max(#Log - 3, 1), -1 do
+        local e = Log[i]
+        local res = e.result or (now - e.t > 1.5 and "no hit" or "...")
+        lines[#lines + 1] = ("%s · d %d · %d st/s · eta %s → %s"):format(e.why or "?", math.floor(e.dist or 0), math.floor(e.speed or 0),
+            e.eta and (math.floor(e.eta * 1000) .. "ms") or "?", res)
+    end
+    return #lines > 0 and table.concat(lines, "\n") or "no presses yet"
 end
 
 --// Abilities \\--
@@ -757,9 +870,11 @@ local function hudText()
     lines[#lines + 1] = Parry.eta and ("Ball arrives in %dms"):format(math.floor(Parry.eta * 1000)) or "Ball arrival: unknown"
     lines[#lines + 1] = type(doomed) == "number" and ("Game says in hit range (%+.2fs)"):format(os.clock() - doomed) or "Game says in hit range: no"
     lines[#lines + 1] = ("Auto parry: %s"):format(Parry.info)
-    lines[#lines + 1] = ("Presses %d · server started a cooldown %d times · ping %dms"):format(Parry.sent, Parry.count, math.floor(Parry.ping * 1000))
+    lines[#lines + 1] = ("Auto spam: %s"):format(Parry.spamInfo or "off")
+    lines[#lines + 1] = ("Presses %d · landed %d · server cooldowns %d · ping %dms"):format(Parry.sent, Parry.landed, Parry.count, math.floor(Parry.ping * 1000))
     lines[#lines + 1] = ("Last press: %s"):format(Parry.how)
     lines[#lines + 1] = "Game hook: " .. Game.info
+    lines[#lines + 1] = "Recent presses:\n" .. logText()
     return table.concat(lines, "\n")
 end
 
@@ -976,11 +1091,15 @@ do
         "How long before the ball arrives it presses, as a share of the parry window. Late curves the ball harder (the game's own tip) but leaves less room")
     slider(A, "LeadMs", "Custom lead", 0, 500, 0, " ms", "For Custom timing")
     slider(A, "Jitter", "Random +/-", 0, 120, 0, " ms", "Varies the lead each ball")
+    toggle(A, "Animation", "Play the parry animation", "Swing animation and sound on every press, like a normal parry (forged remote only: the game's other paths play it themselves)")
+    toggle(A, "CheckCooldown", "Check the cooldown first", "Skips the press while your parry is on cooldown (the server would refuse it anyway)")
     local T = Tab:AddLeftGroupbox("Triggerbot & spam", "zap")
     toggle(T, "Trigger", "Triggerbot", "Presses as soon as a ball is on you, at any distance (usually early). Overrides auto parry's timing")
-    toggle(T, "Spam", "Auto spam", "Presses at a capped rate while a ball is close to you, on you or not (clashes)")
-    slider(T, "SpamRate", "Spam rate", 5, 60, 0, " /s")
-    slider(T, "SpamRange", "Spam range", 10, 80, 0, " studs")
+    toggle(T, "Spam", "Auto spam", "Smart: only spams in a real clash (the ball bouncing between you and someone close) or when the ball is about to land on you with the opponent right next to you. Range only: spams whenever a ball is in range")
+    dropdown(T, "SpamMode", "Spam mode", { "Smart (clash)", "Range only" })
+    slider(T, "SpamRate", "Spam rate", 5, 120, 0, " /s")
+    slider(T, "SpamRange", "Spam range", 10, 300, 0, " studs", "Smart: how close the clash / opponent has to be. Range only: how close the ball has to be")
+    slider(T, "SpamEta", "Start spam when ball is", 50, 800, 0, " ms away", "Smart mode, when it's not in a clash yet")
     local C = Tab:AddRightGroupbox("Curve & aim", "spline")
     dropdown(C, "AimMode", "Aim at", { "Cursor", "Camera", "Closest to crosshair", "Nearest player", "Lowest health", "Random player" },
         "Where the parried ball is sent: your cursor, your camera, or a player (nearest, lowest health, random, closest to your crosshair)")
