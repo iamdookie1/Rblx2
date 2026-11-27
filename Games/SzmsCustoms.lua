@@ -18,6 +18,7 @@
 --            UseAbility:FireServer(). DashReadyAt (os.clock) says when it is ready.
 
 local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
 local CollectionService = game:GetService("CollectionService")
@@ -58,7 +59,7 @@ local Settings = {
     -- parry
     AutoParry = false, Trigger = false, Spam = false,
     ParryTiming = "Instant", DelayMs = 60, LateFrac = 50, RandMin = 20, RandMax = 160,
-    AimMode = "Camera", CheckCooldown = true, SpamRate = 30, SpamRange = 35,
+    ParryMethod = "Keypress (real input)", AimMode = "Cursor", CheckCooldown = true, SpamRate = 30, SpamRange = 35,
     -- abilities
     AutoAbility = false, AbilityWhen = "Ball on me + parry on cooldown", AbilityRange = 40, IncludeDash = false,
     -- esp
@@ -295,7 +296,7 @@ local function enemies()
 end
 
 --// Parry \\--
-local Parry = { count = 0, sent = 0, doomed = nil, delay = 0, countAtDoom = 0, lastTry = 0, info = "off", ping = 0.05 }
+local Parry = { count = 0, sent = 0, how = "-", doomed = nil, delay = 0, countAtDoom = 0, lastTry = 0, info = "off", ping = 0.05 }
 connect(LocalPlayer:GetAttributeChangedSignal("LocalParryAt"), function()
     Parry.count = Parry.count + 1
 end)
@@ -336,13 +337,82 @@ local function pickTarget(mode)
     end
     return best
 end
-local function fireParry()
-    local ev = Game.ev
-    if not ev then
-        return false
+-- A real keypress: the game's own InputBegan path runs, so it sends exactly what a real press sends
+-- (the source tag is your key's name). ParryRequest is the game's mobile-tap path and tags the press "TAP".
+local VIM
+pcall(function()
+    VIM = game:GetService("VirtualInputManager")
+end)
+local Keybinds, keyAt, keyCached = nil, -10, Enum.KeyCode.F
+local function parryKey()
+    if os.clock() - keyAt < 2 then
+        return keyCached
     end
+    keyAt = os.clock()
+    if Keybinds == nil then
+        local ok, m = pcall(function()
+            return require(ReplicatedStorage:WaitForChild("Shared", 5):WaitForChild("Keybinds", 5))
+        end)
+        Keybinds = ok and m or false
+    end
+    if Keybinds then
+        for slot = 1, (Keybinds.SLOTS or 2) do
+            local ok, k = pcall(Keybinds.Get, "Parry", slot)
+            if ok and typeof(k) == "EnumItem" and k.EnumType == Enum.KeyCode then
+                keyCached = k
+                return k
+            end
+        end
+    end
+    keyCached = Enum.KeyCode.F
+    return keyCached
+end
+local function pressKey()
+    local key = parryKey()
+    if VIM then
+        local ok = pcall(function()
+            VIM:SendKeyEvent(true, key, false, game)
+        end)
+        if ok then
+            task.delay(0.03, function()
+                pcall(function()
+                    VIM:SendKeyEvent(false, key, false, game)
+                end)
+            end)
+            return true, "VirtualInputManager " .. key.Name
+        end
+    end
+    if typeof(keypress) == "function" and typeof(keyrelease) == "function" then
+        local v = key.Value
+        if v >= 97 and v <= 122 then
+            v = v - 32
+        end
+        local ok = pcall(keypress, v)
+        if ok then
+            task.delay(0.03, function()
+                pcall(keyrelease, v)
+            end)
+            return true, "executor keypress " .. key.Name
+        end
+    end
+    return false
+end
+local function fireParry()
     Parry.lastTry = os.clock()
     Parry.sent = Parry.sent + 1
+    if Settings.ParryMethod ~= "Game request (ParryRequest)" then
+        local ok, how = pressKey()
+        if ok then
+            Parry.how = how
+            return true
+        end
+    end
+    local ev = Game.ev
+    if not ev then
+        Parry.how = "no way to press"
+        return false
+    end
+    Parry.how = "ParryRequest (source TAP)"
     local mode = Settings.AimMode
     if mode == "Cursor" then
         ev:Fire(true)
@@ -637,7 +707,8 @@ local function hudText()
     local doomed = LocalPlayer:GetAttribute("LocalDoomedAt")
     lines[#lines + 1] = type(doomed) == "number" and ("In hit range: %+.2fs"):format(os.clock() - doomed) or "In hit range: no"
     lines[#lines + 1] = ("Auto parry: %s"):format(Parry.info)
-    lines[#lines + 1] = ("Parries landed locally %d · presses %d · ping %dms"):format(Parry.count, Parry.sent, math.floor(Parry.ping * 1000))
+    lines[#lines + 1] = ("Presses %d · accepted by the game %d · ping %dms"):format(Parry.sent, Parry.count, math.floor(Parry.ping * 1000))
+    lines[#lines + 1] = ("Last press: %s"):format(Parry.how)
     lines[#lines + 1] = "Game hook: " .. Game.info
     return table.concat(lines, "\n")
 end
@@ -855,6 +926,8 @@ do
     slider(A, "LateFrac", "Late amount", 0, 90, 0, "%", "How far into the parry window Late waits. Too high and the ball gets through")
     slider(A, "RandMin", "Random from", 0, 400, 0, " ms")
     slider(A, "RandMax", "Random to", 0, 400, 0, " ms")
+    dropdown(A, "ParryMethod", "How it presses", { "Keypress (real input)", "Game request (ParryRequest)" },
+        "Keypress presses your real Parry key (read from the game's keybinds) so the game sends a normal packet, aimed at your cursor. Game request uses the game's mobile-tap path (tagged TAP) and is the only one the aim options below work with")
     toggle(A, "CheckCooldown", "Check the cooldown first", "Skips the press while your parry is on cooldown (the game would ignore it anyway)")
     local T = Tab:AddLeftGroupbox("Triggerbot & spam", "zap")
     toggle(T, "Trigger", "Triggerbot", "Presses every frame while a ball is on you; the game lets the first valid one through. Overrides auto parry's timing")
@@ -862,8 +935,11 @@ do
     slider(T, "SpamRate", "Spam rate", 5, 60, 0, " /s")
     slider(T, "SpamRange", "Spam range", 10, 80, 0, " studs")
     local C = Tab:AddRightGroupbox("Curve & aim", "spline")
-    dropdown(C, "AimMode", "Aim at", { "Camera", "Cursor", "Closest to crosshair", "Nearest player", "Lowest health", "Random player" },
-        "Where the parried ball goes. Camera and Cursor are the game's own; the others turn your camera to that player for the press")
+    dropdown(C, "AimMode", "Aim at", { "Cursor", "Camera", "Closest to crosshair", "Nearest player", "Lowest health", "Random player" },
+        "Only with the Game request method. Keypress always curves toward your cursor, like a normal press. Camera and Cursor are the game's own; the others turn your camera to that player for the press")
+    C:AddButton({ Text = "Test parry now", Func = function()
+        fireParry()
+    end })
     local S = Tab:AddRightGroupbox("Status", "layout-dashboard")
     status(S, hudText)
 end
