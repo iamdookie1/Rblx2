@@ -58,8 +58,8 @@ end
 local Settings = {
     -- parry
     AutoParry = false, Trigger = false, Spam = false,
-    ParryTiming = "Instant", DelayMs = 60, LateFrac = 50, RandMin = 20, RandMax = 160,
-    ParryMethod = "Keypress (real input)", AimMode = "Cursor", CheckCooldown = true, SpamRate = 30, SpamRange = 35,
+    ParryTiming = "Middle", LeadMs = 150,
+    ParryMethod = "Forged remote (like Blade Ball)", AimMode = "Cursor", Jitter = 0, CheckCooldown = true, SpamRate = 30, SpamRange = 35,
     -- abilities
     AutoAbility = false, AbilityWhen = "Ball on me + parry on cooldown", AbilityRange = 40, IncludeDash = false,
     -- esp
@@ -108,7 +108,7 @@ local function aliveInMatch()
 end
 
 --// Game hooks \\--
-local Game = { ev = nil, dashEv = nil, S = nil, myBall = nil, info = "looking for the game's parry code" }
+local Game = { ev = nil, dashEv = nil, S = nil, myBall = nil, parry = nil, info = "looking for the game's parry code" }
 local function findEvent(scriptName, eventName)
     local ps = LocalPlayer:FindFirstChild("PlayerScripts")
     local s = ps and ps:FindFirstChild(scriptName)
@@ -123,10 +123,21 @@ local function dive(fn, depth, seen, out)
     if not ok or type(ups) ~= "table" then
         return
     end
+    local n = 0
+    for _ in pairs(ups) do
+        n = n + 1
+    end
     for _, v in pairs(ups) do
         if type(v) == "table" then
             if type(rawget(v, "slot")) == "function" and type(rawget(v, "active")) == "function" then
                 out.S = v
+                -- the parry function has the most upvalues of the ones that hold the settings table
+                if n > (out.parryN or 0) then
+                    out.parry, out.parryN = fn, n
+                end
+                if n < (out.smallN or math.huge) then
+                    out.small, out.smallN = fn, n
+                end
             end
         elseif type(v) == "function" then
             local okn, name = pcall(debug.info, v, "n")
@@ -164,7 +175,8 @@ local function discover()
         end
     end
     if out.S then
-        Game.S, Game.myBall = out.S, out.myBall
+        Game.S, Game.parry = out.S, out.parry
+        Game.myBall = out.myBall or (out.small ~= out.parry and out.small) or nil
         Game.info = "hooked the game's own ball helpers"
     else
         Game.info = "ParryRequest found, ball helpers not (using the Wisp tag)"
@@ -296,9 +308,15 @@ local function enemies()
 end
 
 --// Parry \\--
-local Parry = { count = 0, sent = 0, how = "-", doomed = nil, delay = 0, countAtDoom = 0, lastTry = 0, info = "off", ping = 0.05 }
-connect(LocalPlayer:GetAttributeChangedSignal("LocalParryAt"), function()
-    Parry.count = Parry.count + 1
+-- The parry is one RemoteEvent whose name is a per-session "route" (settings.route()). PlayerClient fires it as
+--   FireServer(cameraCFrame, ballIsMine, pickCFrame, settings.sample(pitch, yaw, serverTime), source, touch)
+-- and nothing on the client stops a press before the ball is in range (only your cooldown), so it is built here
+-- the same way and sent directly. pickCFrame is the ray the ball is curved along: it is where the aim options act.
+local Parry = { count = 0, sent = 0, how = "-", lastTry = 0, blockUntil = 0, info = "off", ping = 0.05, eta = nil }
+connect(LocalPlayer:GetAttributeChangedSignal("ParryCooldownEnd"), function()
+    if (LocalPlayer:GetAttribute("ParryCooldownEnd") or 0) > Workspace:GetServerTimeNow() then
+        Parry.count = Parry.count + 1
+    end
 end)
 task.spawn(function()
     while alive() do
@@ -337,18 +355,13 @@ local function pickTarget(mode)
     end
     return best
 end
--- A real keypress: the game's own InputBegan path runs, so it sends exactly what a real press sends
--- (the source tag is your key's name). ParryRequest is the game's mobile-tap path and tags the press "TAP".
-local VIM
-pcall(function()
-    VIM = game:GetService("VirtualInputManager")
-end)
-local Keybinds, keyAt, keyCached = nil, -10, Enum.KeyCode.F
-local function parryKey()
-    if os.clock() - keyAt < 2 then
-        return keyCached
+-- what the game calls the source of a press (your Parry key's name)
+local Keybinds, srcAt, srcCached = nil, -10, "F"
+local function parrySource()
+    if os.clock() - srcAt < 3 then
+        return srcCached
     end
-    keyAt = os.clock()
+    srcAt = os.clock()
     if Keybinds == nil then
         local ok, m = pcall(function()
             return require(ReplicatedStorage:WaitForChild("Shared", 5):WaitForChild("Keybinds", 5))
@@ -359,79 +372,81 @@ local function parryKey()
         for slot = 1, (Keybinds.SLOTS or 2) do
             local ok, k = pcall(Keybinds.Get, "Parry", slot)
             if ok and typeof(k) == "EnumItem" and k.EnumType == Enum.KeyCode then
-                keyCached = k
-                return k
+                local okn, name = pcall(Keybinds.Name, k)
+                srcCached = (okn and type(name) == "string") and name or k.Name
+                return srcCached
             end
         end
     end
-    keyCached = Enum.KeyCode.F
-    return keyCached
+    return srcCached
 end
-local function pressKey()
-    local key = parryKey()
-    if VIM then
-        local ok = pcall(function()
-            VIM:SendKeyEvent(true, key, false, game)
-        end)
-        if ok then
-            task.delay(0.03, function()
-                pcall(function()
-                    VIM:SendKeyEvent(false, key, false, game)
-                end)
-            end)
-            return true, "VirtualInputManager " .. key.Name
-        end
-    end
-    if typeof(keypress) == "function" and typeof(keyrelease) == "function" then
-        local v = key.Value
-        if v >= 97 and v <= 122 then
-            v = v - 32
-        end
-        local ok = pcall(keypress, v)
-        if ok then
-            task.delay(0.03, function()
-                pcall(keyrelease, v)
-            end)
-            return true, "executor keypress " .. key.Name
-        end
-    end
-    return false
-end
-local function fireParry()
-    Parry.lastTry = os.clock()
-    Parry.sent = Parry.sent + 1
-    if Settings.ParryMethod ~= "Game request (ParryRequest)" then
-        local ok, how = pressKey()
-        if ok then
-            Parry.how = how
-            return true
-        end
-    end
-    local ev = Game.ev
-    if not ev then
-        Parry.how = "no way to press"
-        return false
-    end
-    Parry.how = "ParryRequest (source TAP)"
+local function pickCFrame(cam, aimCursor)
     local mode = Settings.AimMode
-    if mode == "Cursor" then
-        ev:Fire(true)
-        return true
+    if mode ~= "Cursor" and mode ~= "Camera" then
+        local t = pickTarget(mode)
+        if t then
+            return CFrame.lookAt(cam.CFrame.Position, t.hrp.Position)
+        end
     end
+    if mode == "Camera" or not UserInputService.MouseEnabled then
+        return cam.CFrame
+    end
+    local m = UserInputService:GetMouseLocation()
+    local ray = cam:ViewportPointToRay(m.X, m.Y)
+    return CFrame.lookAt(ray.Origin, ray.Origin + ray.Direction)
+end
+local function forgeParry(balls)
+    local S = Game.S
+    if not (S and S.route and S.sample) then
+        return false, "the game's helpers weren't found"
+    end
+    local okR, route = pcall(S.route)
+    if not okR or type(route) ~= "string" then
+        return false, "no parry route yet (settings not synced)"
+    end
+    local remote = ReplicatedStorage:FindFirstChild(route)
     local cam = Workspace.CurrentCamera
-    local target = (mode ~= "Camera") and cam and pickTarget(mode) or nil
-    if not target then
-        ev:Fire(false)
+    if not remote or not cam then
+        return false, "parry remote missing"
+    end
+    local camCF = cam.CFrame
+    local pitch, yaw = camCF:ToEulerAnglesYXZ()
+    local sample = S.sample(pitch, yaw, Workspace:GetServerTimeNow())
+    local first = Game.myBall and select(2, pcall(Game.myBall)) or balls[1]
+    local mine = false
+    if typeof(first) == "Instance" then
+        local okS, id = pcall(S.slot, first)
+        mine = okS and id == LocalPlayer.UserId
+    end
+    local pick = pickCFrame(cam)
+    remote:FireServer(camCF, mine, pick, sample, parrySource(), false)
+    -- what the game's own press does on your side (the ball's local prediction and the white flash use these)
+    local now = Workspace:GetServerTimeNow()
+    local cd = (typeof(first) == "Instance" and first:GetAttribute("Maple")) or 1.5
+    LocalPlayer:SetAttribute("LocalParryAim", camCF)
+    LocalPlayer:SetAttribute("LocalParryPick", pick)
+    LocalPlayer:SetAttribute("LocalParryAt", os.clock())
+    LocalPlayer:SetAttribute("LocalWhiteStart", now)
+    LocalPlayer:SetAttribute("LocalWhiteEnd", now + cd)
+    return true, "forged remote"
+end
+local function fireParry(balls)
+    Parry.lastTry = os.clock()
+    Parry.blockUntil = Parry.lastTry + 0.35
+    Parry.sent = Parry.sent + 1
+    local method = Settings.ParryMethod
+    if method == "Game function (direct call)" and Game.parry then
+        local ok = pcall(Game.parry, Settings.AimMode ~= "Camera", parrySource())
+        Parry.how = ok and "the game's parry function" or "the game's parry function (errored)"
+        return ok
+    elseif method == "ParryRequest (mobile tap path)" and Game.ev then
+        Game.ev:Fire(Settings.AimMode ~= "Camera")
+        Parry.how = "ParryRequest (tagged TAP)"
         return true
     end
-    -- the game sends your camera CFrame and the ray it picks the curve from: look at them for the press
-    local saved = cam.CFrame
-    cam.CFrame = CFrame.lookAt(saved.Position, target.hrp.Position)
-    ev:Fire(false)
-    task.defer(function()
-        cam.CFrame = saved
-    end)
-    return true
+    local ok, why = forgeParry(balls or {})
+    Parry.how = ok and why or ("failed: " .. why)
+    return ok
 end
 local function parryReady()
     if not aliveInMatch() then
@@ -445,63 +460,97 @@ local function parryReady()
     end
     return true
 end
-local function pickDelay(window)
-    local m = Settings.ParryTiming
-    local d = 0
-    if m == "Delay" then
-        d = Settings.DelayMs / 1000
-    elseif m == "Late (bigger curve)" then
-        d = window * Settings.LateFrac / 100
-    elseif m == "Random" then
-        d = (Settings.RandMin + math.random() * math.max(Settings.RandMax - Settings.RandMin, 0)) / 1000
+-- seconds until the ball reaches you (its closing speed along the line to you)
+local function etaOf(b)
+    local root = myRoot()
+    if not root then
+        return nil
     end
-    return math.min(d, math.max(window - 0.06 - Parry.ping * 0.5, 0))
+    local t = Track[b]
+    if not t then
+        return nil
+    end
+    local to = root.Position - b.Position
+    local d = to.Magnitude
+    local reach = b:GetAttribute("Pearl")
+    if type(reach) ~= "number" then
+        reach = 5
+    end
+    local closing = t.vel:Dot(d > 1e-3 and to / d or Vector3.new(0, 0, 0))
+    if d - reach <= 0 then
+        return 0
+    end
+    if closing < 8 then
+        return nil
+    end
+    return (d - reach) / closing
+end
+local function leadFor(window)
+    local m = Settings.ParryTiming
+    local lead
+    if m == "Early" then
+        lead = window * 0.9
+    elseif m == "Middle" then
+        lead = window * 0.5
+    elseif m == "Late (bigger curve)" then
+        lead = window * 0.2
+    else
+        lead = Settings.LeadMs / 1000
+    end
+    if Settings.Jitter > 0 then
+        lead = lead + (math.random() * 2 - 1) * Settings.Jitter / 1000
+    end
+    return math.max(lead, 0) + Parry.ping
 end
 local lastSpam = 0
+local armedLead = nil
 local function parryStep(now, balls)
-    local doomed = LocalPlayer:GetAttribute("LocalDoomedAt")
-    if type(doomed) ~= "number" then
-        Parry.doomed = nil
-        Parry.info = "no ball on you"
+    local b = ballOnMe(balls)
+    for _, ball in ipairs(balls) do
+        sample(ball, now)
     end
-    local ready = parryReady()
-    if Settings.Trigger then
-        if type(doomed) == "number" then
+    if not b then
+        Parry.eta, armedLead = nil, nil
+        Parry.info = "no ball on you"
+    else
+        local window = ballWindow(b)
+        local eta = etaOf(b)
+        Parry.eta = eta
+        local doomed = LocalPlayer:GetAttribute("LocalDoomedAt")
+        local inRange = type(doomed) == "number"
+        if not armedLead then
+            armedLead = leadFor(window)
+        end
+        local ready = parryReady()
+        if Settings.Trigger then
             Parry.info = ready and "triggerbot: pressing" or "triggerbot: waiting for the cooldown"
-            if ready and now - Parry.lastTry >= 0.03 then
-                fireParry()
+            if ready and now >= Parry.blockUntil then
+                fireParry(balls)
             end
-        end
-    elseif Settings.AutoParry and type(doomed) == "number" then
-        if doomed ~= Parry.doomed then
-            Parry.doomed = doomed
-            Parry.countAtDoom = Parry.count
-            Parry.delay = pickDelay(ballWindow(ballOnMe(balls)))
-        end
-        local window = ballWindow(ballOnMe(balls))
-        if Parry.count > Parry.countAtDoom then
-            Parry.info = "parried"
-        elseif not ready then
-            Parry.info = "ball in range, parry on cooldown"
-        elseif now > doomed + window + 0.15 then
-            Parry.info = "window passed"
-        elseif now >= doomed + Parry.delay then
-            Parry.info = "pressing"
-            if now - Parry.lastTry >= 0.04 then
-                fireParry()
+        elseif Settings.AutoParry then
+            if not ready then
+                Parry.info = "parry on cooldown"
+            elseif now < Parry.blockUntil then
+                Parry.info = "just pressed"
+            elseif inRange or (eta and eta <= armedLead) then
+                Parry.info = "pressing"
+                if fireParry(balls) then
+                    armedLead = nil
+                end
+            else
+                Parry.info = eta and ("ball in %dms, pressing at %dms"):format(math.floor(eta * 1000), math.floor(armedLead * 1000))
+                    or "ball on you, not closing in"
             end
-        else
-            Parry.info = ("waiting %dms"):format(math.floor((doomed + Parry.delay - now) * 1000))
         end
     end
     if Settings.Spam and aliveInMatch() then
         local root = myRoot()
         local gap = 1 / math.max(Settings.SpamRate, 1)
         if root and now - lastSpam >= gap and now - Parry.lastTry >= 0.02 then
-            for _, b in ipairs(balls) do
-                if (b.Position - root.Position).Magnitude <= Settings.SpamRange then
+            for _, ball in ipairs(balls) do
+                if (ball.Position - root.Position).Magnitude <= Settings.SpamRange then
                     lastSpam = now
-                    fireParry()
+                    fireParry(balls)
                     break
                 end
             end
@@ -705,9 +754,10 @@ local function hudText()
         lines[#lines + 1] = "Ball: not on you"
     end
     local doomed = LocalPlayer:GetAttribute("LocalDoomedAt")
-    lines[#lines + 1] = type(doomed) == "number" and ("In hit range: %+.2fs"):format(os.clock() - doomed) or "In hit range: no"
+    lines[#lines + 1] = Parry.eta and ("Ball arrives in %dms"):format(math.floor(Parry.eta * 1000)) or "Ball arrival: unknown"
+    lines[#lines + 1] = type(doomed) == "number" and ("Game says in hit range (%+.2fs)"):format(os.clock() - doomed) or "Game says in hit range: no"
     lines[#lines + 1] = ("Auto parry: %s"):format(Parry.info)
-    lines[#lines + 1] = ("Presses %d · accepted by the game %d · ping %dms"):format(Parry.sent, Parry.count, math.floor(Parry.ping * 1000))
+    lines[#lines + 1] = ("Presses %d · server started a cooldown %d times · ping %dms"):format(Parry.sent, Parry.count, math.floor(Parry.ping * 1000))
     lines[#lines + 1] = ("Last press: %s"):format(Parry.how)
     lines[#lines + 1] = "Game hook: " .. Game.info
     return table.concat(lines, "\n")
@@ -919,26 +969,23 @@ do
     local Tab = Window:AddTab("Parry", "swords", "Auto parry, triggerbot, spam")
     local A = Tab:AddLeftGroupbox("Auto parry", "shield")
     toggle(A, "AutoParry", "Auto parry",
-        "Presses the game's own parry the moment the ball is in hit range (the game ignores presses before that), then waits the timing below")
-    dropdown(A, "ParryTiming", "Timing", { "Instant", "Delay", "Late (bigger curve)", "Random" },
-        "Instant: first moment the game allows it. Late: the game curves the ball harder the later you parry inside the window")
-    slider(A, "DelayMs", "Delay", 0, 400, 0, " ms", "For Delay timing")
-    slider(A, "LateFrac", "Late amount", 0, 90, 0, "%", "How far into the parry window Late waits. Too high and the ball gets through")
-    slider(A, "RandMin", "Random from", 0, 400, 0, " ms")
-    slider(A, "RandMax", "Random to", 0, 400, 0, " ms")
-    dropdown(A, "ParryMethod", "How it presses", { "Keypress (real input)", "Game request (ParryRequest)" },
-        "Keypress presses your real Parry key (read from the game's keybinds) so the game sends a normal packet, aimed at your cursor. Game request uses the game's mobile-tap path (tagged TAP) and is the only one the aim options below work with")
-    toggle(A, "CheckCooldown", "Check the cooldown first", "Skips the press while your parry is on cooldown (the game would ignore it anyway)")
+        "Sends the parry when the ball on you is about to reach you: its time to arrive (from its measured speed) is under the lead below plus your ping")
+    dropdown(A, "ParryMethod", "How it parries", { "Forged remote (like Blade Ball)", "Game function (direct call)", "ParryRequest (mobile tap path)" },
+        "Forged remote: builds the packet itself with the game's own route and signed sample (aim options work). Game function: calls the game's parry code directly. ParryRequest: the game's mobile-tap path (tagged TAP)")
+    dropdown(A, "ParryTiming", "Timing", { "Early", "Middle", "Late (bigger curve)", "Custom" },
+        "How long before the ball arrives it presses, as a share of the parry window. Late curves the ball harder (the game's own tip) but leaves less room")
+    slider(A, "LeadMs", "Custom lead", 0, 500, 0, " ms", "For Custom timing")
+    slider(A, "Jitter", "Random +/-", 0, 120, 0, " ms", "Varies the lead each ball")
     local T = Tab:AddLeftGroupbox("Triggerbot & spam", "zap")
-    toggle(T, "Trigger", "Triggerbot", "Presses every frame while a ball is on you; the game lets the first valid one through. Overrides auto parry's timing")
+    toggle(T, "Trigger", "Triggerbot", "Presses as soon as a ball is on you, at any distance (usually early). Overrides auto parry's timing")
     toggle(T, "Spam", "Auto spam", "Presses at a capped rate while a ball is close to you, on you or not (clashes)")
     slider(T, "SpamRate", "Spam rate", 5, 60, 0, " /s")
     slider(T, "SpamRange", "Spam range", 10, 80, 0, " studs")
     local C = Tab:AddRightGroupbox("Curve & aim", "spline")
     dropdown(C, "AimMode", "Aim at", { "Cursor", "Camera", "Closest to crosshair", "Nearest player", "Lowest health", "Random player" },
-        "Only with the Game request method. Keypress always curves toward your cursor, like a normal press. Camera and Cursor are the game's own; the others turn your camera to that player for the press")
+        "Where the parried ball is sent: your cursor, your camera, or a player (nearest, lowest health, random, closest to your crosshair)")
     C:AddButton({ Text = "Test parry now", Func = function()
-        fireParry()
+        fireParry(inMatch() and ballsInMatch() or {})
     end })
     local S = Tab:AddRightGroupbox("Status", "layout-dashboard")
     status(S, hudText)
