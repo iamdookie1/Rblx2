@@ -38,6 +38,8 @@ local Games = {
     [17625359962] = { Name = 'RIVALS', Script = 'Games/Rivals.lua' },
     -- Operation One (game 8307114974), from its dump's own place id.
     [72920620366355] = { Name = 'Operation One', Script = 'Games/OperationOne.lua' },
+    -- Unstable SMP FFA (game 10772281976), from its dump's own place id.
+    [76870565041704] = { Name = 'Unstable SMP FFA', Script = 'Games/UnstableSMP.lua' },
     -- Fight in a Streamer University (game 7761516673): the fight servers from
     -- the game's own RankedConfig, plus the Beginner server its dump came from.
     -- The trade and AFK places have no fighting, so they're left out.
@@ -165,6 +167,7 @@ local GameIds = {
     [10773149360] = { Name = 'Half Punch', Script = 'Games/HalfPunch.lua' },
     [10769835283] = { Name = 'Depth Incremental', Script = 'Games/DepthIncremental.lua' },
     [8307114974] = { Name = 'Operation One', Script = 'Games/OperationOne.lua' },
+    [10772281976] = { Name = 'Unstable SMP FFA', Script = 'Games/UnstableSMP.lua' },
     [7872343282] = { Name = 'OVERKILL', Script = 'Games/Overkill.lua', AutoLoad = true },
     [9845585365] = { Name = 'Dodge or Die', Script = 'Games/DodgeOrDie.lua', AutoLoad = true },
     [10756011174] = { Name = 'Needle in a Haystack', Script = 'Games/NeedleHaystack.lua', AutoLoad = true },
